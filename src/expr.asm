@@ -66,6 +66,21 @@ emit_store_type:
 ; comparison). A marker is valid only while code_pos still equals its end position, i.e.
 ; nothing has been emitted since. Rewinding the code buffer clears every marker.
 
+; tail_is: rdi = end position of a peephole marker -> eax = 1 if that instruction is the
+; last thing emitted AND no jump target was bound after it (a label at the very end means
+; the code before it is only part of a bigger construct, e.g. the end of a ?: branch)
+tail_is:
+    xor eax, eax
+    test rdi, rdi
+    jz .no
+    cmp rdi, [code_pos]
+    jne .no
+    cmp rdi, [last_label]
+    je .no
+    mov eax, 1
+.no:
+    ret
+
 ; rewind_code: rdi = new code position (preserves all registers)
 rewind_code:
     mov [code_pos], rdi
@@ -73,6 +88,7 @@ rewind_code:
     mov qword [imm_end], 0
     mov qword [ld_end], 0
     mov qword [cmp_end], 0
+    mov qword [pi_end], 0
     ret
 
 ; gen_imm_a: rdi = value. Emits  A = value  and records it for the optimiser
@@ -92,21 +108,28 @@ gen_imm_a:
 ; Leaves B = right and A = left, using a single instruction when the right operand was
 ; just a constant or a plain local variable.
 finish_operands:
-    mov rax, [code_pos]
-    cmp rax, [imm_end]
-    jne .noimm
     cmp rsi, [imm_pos]
     jne .noimm
+    push rdi
+    mov rdi, [imm_end]
+    call tail_is
+    pop rdi
+    test eax, eax
+    jz .noimm
     mov r8, [imm_val]
     call rewind_code
     mov rdi, r8
     CG imm_b
     ret
 .noimm:
-    cmp rax, [ld_end]
-    jne .plain
     cmp rsi, [ld_pos]
     jne .plain
+    push rdi
+    mov rdi, [ld_end]
+    call tail_is
+    pop rdi
+    test eax, eax
+    jz .plain
     mov r8d, [ld_off]
     mov r9d, [ld_size]
     call rewind_code
@@ -128,9 +151,10 @@ finish_operands:
 cond_jz:
     push rbx
     mov rbx, rdi
-    mov rax, [code_pos]
-    cmp rax, [cmp_end]
-    jne .plain
+    mov rdi, [cmp_end]
+    call tail_is
+    test eax, eax
+    jz .plain
     mov eax, [cmp_cc]
     movzx r8d, byte [cc_invert + rax]
     mov rdi, [cmp_pos]
@@ -149,9 +173,10 @@ cond_jz:
 cond_jnz:
     push rbx
     mov rbx, rdi
-    mov rax, [code_pos]
-    cmp rax, [cmp_end]
-    jne .plain
+    mov rdi, [cmp_end]
+    call tail_is
+    test eax, eax
+    jz .plain
     mov r8d, [cmp_cc]
     mov rdi, [cmp_pos]
     call rewind_code
@@ -179,9 +204,11 @@ to_rvalue:
     bt rdi, TF_ARRAY_BIT
     jc .arr
     ; a local variable whose address was just computed: load it directly
-    mov rax, [code_pos]
-    cmp rax, [pk_end]
-    jne .plain
+    mov rdi, [pk_end]
+    call tail_is
+    test eax, eax
+    jz .plain
+    mov rdi, [e_type]
     call type_ls
     cmp eax, 8
     je .f8
@@ -1205,9 +1232,10 @@ emit_incdec_postfix:
     call type_pointee_size
     imul r13, rax
 .step1:
-    mov rax, [code_pos]
-    cmp rax, [pk_end]
-    jne .stepg
+    mov rdi, [pk_end]
+    call tail_is
+    test eax, eax
+    jz .stepg
     ; local variable: load, modify, store back - no address register needed
     mov r14d, [pk_off]
     mov rdi, [pk_pos]
@@ -1263,9 +1291,10 @@ emit_incdec_postfix:
 ; postfix ++ / -- of a local variable, the old value is not needed: regenerate it as
 ; a plain  load / add / store.
 discard_result:
-    mov rax, [code_pos]
-    cmp rax, [pi_end]
-    jne .ret
+    mov rdi, [pi_end]
+    call tail_is
+    test eax, eax
+    jz .ret
     mov rdi, [pi_pos]
     call rewind_code
     mov edi, [pi_off]
@@ -1302,11 +1331,16 @@ parse_unary:
     jmp parse_postfix
 .neg:
     call next_token
+    push qword [code_pos]
     call parse_unary
     call to_rvalue
-    mov rax, [code_pos]
-    cmp rax, [imm_end]
+    pop rax
+    cmp rax, [imm_pos]
     jne .negreal
+    mov rdi, [imm_end]
+    call tail_is
+    test eax, eax
+    jz .negreal
     mov r8, [imm_val]
     mov rdi, [imm_pos]
     call rewind_code
@@ -1597,9 +1631,10 @@ parse_assign:
     ERR "cannot assign to an array"
 .p2:
     ; fast path: assignment to a plain local scalar, no address needs to be kept
-    mov rax, [code_pos]
-    cmp rax, [pk_end]
-    jne .p3
+    mov rdi, [pk_end]
+    call tail_is
+    test eax, eax
+    jz .p3
     mov rdi, rbx
     call type_ls
     test eax, eax
@@ -1645,21 +1680,27 @@ parse_assign:
     jnz .c3
     ERR "compound assignment needs a scalar variable"
 .c3:
-    mov rax, [code_pos]
-    cmp rax, [pk_end]
-    jne .cgen
+    mov rdi, [pk_end]
+    call tail_is
+    test eax, eax
+    jz .cgen
     ; local scalar: right side first, then load, operate, store - nothing on the stack
     push r14
+    push r15
     mov r14d, [pk_off]
     mov rdi, [pk_pos]
     call rewind_code
+    mov r15, [code_pos]
     call next_token
     call parse_assign
     call to_rvalue
     mov r13, [e_type]
-    mov rax, [code_pos]
-    cmp rax, [imm_end]
+    cmp r15, [imm_pos]
     jne .c3ld
+    mov rdi, [imm_end]
+    call tail_is
+    test eax, eax
+    jz .c3ld
     mov r8, [imm_val]
     mov rdi, [imm_pos]
     call rewind_code
@@ -1670,8 +1711,12 @@ parse_assign:
     CG imm_b
     jmp .c3op
 .c3ld:
-    cmp rax, [ld_end]
+    cmp r15, [ld_pos]
     jne .c3gen
+    mov rdi, [ld_end]
+    call tail_is
+    test eax, eax
+    jz .c3gen
     mov r8d, [ld_off]
     mov r9d, [ld_size]
     mov rdi, [ld_pos]
@@ -1703,6 +1748,7 @@ parse_assign:
     call store_local_typed
     mov [e_type], rbx
     mov qword [e_lval], 0
+    pop r15
     pop r14
     jmp .ret
 .cgen:

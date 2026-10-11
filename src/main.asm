@@ -1462,6 +1462,7 @@ binprec:        resb 256
 
 err_msg:        resq 1
 pk_pos:         resq 1
+last_label:     resq 1
 pk_end:         resq 1
 imm_pos:        resq 1
 imm_end:        resq 1

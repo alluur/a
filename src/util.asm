@@ -409,6 +409,7 @@ add_reloc:
 patch_here:
     push rsi
     mov rsi, [code_pos]
+    mov [last_label], rsi
     CG patch_chain
     pop rsi
     ret

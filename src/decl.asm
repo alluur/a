@@ -210,6 +210,7 @@ define_function:
     push rsi
     push rdi
     mov rax, [code_pos]
+    mov [last_label], rax
     mov [rdi+SYM_VAL], rax
     mov eax, [rdi+SYM_PATCH]
     mov dword [rdi+SYM_PATCH], 0
