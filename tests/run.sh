@@ -2,16 +2,22 @@
 # Runs every tests/*.a program and compares stdout (.out) and exit code (.exit, default 0).
 # Usage: tests/run.sh [pattern]            (Linux x86-64 native)
 #        TARGET=windows tests/run.sh       (PE executables, run through Wine)
+#        TARGET=linux-arm64 tests/run.sh   (AArch64 ELF, run through qemu-aarch64)
+#        TARGET=android tests/run.sh       (Android ARM64 ELF, run through qemu-aarch64)
+#        TARGET=android-x64 tests/run.sh   (Android x86-64 ELF, run natively)
 cd "$(dirname "$0")/.."
 AC=./build/ac
 TARGET=${TARGET:-linux}
 RUN=""
 EXT=elf
-if [ "$TARGET" = "windows" ]; then
+case "$TARGET" in
+windows)
     EXT=exe
     export WINEDEBUG=-all WINEPREFIX=${WINEPREFIX:-/tmp/wineprefix}
-    RUN=$(command -v wine64 || echo /usr/lib/wine/wine64)
-fi
+    RUN=$(command -v wine64 || echo /usr/lib/wine/wine64) ;;
+linux-arm64|android|android-arm64)
+    RUN=$(command -v qemu-aarch64) ;;
+esac
 pass=0; fail=0
 mkdir -p build/tests
 for src in tests/${1:-t}*.a; do

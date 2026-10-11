@@ -15,6 +15,12 @@ s_windows:      db "windows", 0
 s_win:          db "win", 0
 s_win64:        db "win64", 0
 s_android:      db "android", 0
+s_linux_x64:    db "linux-x64", 0
+s_linux_arm64:  db "linux-arm64", 0
+s_android_arm64: db "android-arm64", 0
+s_android_x64:  db "android-x64", 0
+s_ext_arm_elf:  db ".arm64.elf", 0
+s_ext_x64_bin:  db ".x64.bin", 0
 s_ver_default:  db "1", 0
 s_rel_default:  db "debug", 0
 s_ext_linux:    db ".elf", 0
@@ -33,7 +39,8 @@ s_usage:
     db 10
     db "Options:", 10
     db "  -o FILE     output file (default: NAME-VERSION-RELEASE.EXT)", 10
-    db "  -t TARGET   linux (default) | windows | android", 10
+    db "  -t TARGET   linux (default) | windows | android | linux-arm64 | android-x64", 10
+    db "              linux = linux-x64, android = android-arm64, windows = windows x64", 10
     db "  -v CODE     version code used in the default output name (default 1)", 10
     db "  -r TYPE     release type used in the default output name (default debug)", 10
     db "  -h          show this help", 10
@@ -42,7 +49,7 @@ s_usage:
 s_version_text: db "ac ", VERSION_NAME, 10, 0
 s_err_noinput:  db "no input file (try: ac -h)", 0
 s_err_badopt:   db "unknown option or missing value (try: ac -h)", 0
-s_err_badtgt:   db "unknown target, use linux, windows or android", 0
+s_err_badtgt:   db "unknown target, use linux, windows, android, linux-arm64 or android-x64", 0
 s_err_read:     db "cannot read the input file", 0
 s_err_nomain:   db "no 'main' function found", 0
 s_err_write:    db "cannot write the output file", 0
@@ -76,12 +83,14 @@ s_win_init: db "__win_init_args", 0
 s_win_argv: db "__win_argv_get", 0
 
 align 8
+; name, parameter count, then start/end of the runtime code for: x86-64 Linux/Android,
+; Windows x64, AArch64 Linux/Android (64 bytes per entry)
 builtin_tab:
-    dq bn_write,   3, bl_lin_write,   bl_lin_write_end,   bl_win_write,  bl_win_write_end
-    dq bn_read,    3, bl_lin_read,    bl_lin_read_end,    bl_win_read,   bl_win_read_end
-    dq bn_exit,    1, bl_lin_exit,    bl_lin_exit_end,    bl_win_exit,   bl_win_exit_end
-    dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, 0,             0
-    dq bn_cmdline, 0, bl_lin_cmdline, bl_lin_cmdline_end, bl_win_cmdline, bl_win_cmdline_end
+    dq bn_write,   3, bl_lin_write,   bl_lin_write_end,   bl_win_write,   bl_win_write_end,   bl_a64_write,   bl_a64_write_end
+    dq bn_read,    3, bl_lin_read,    bl_lin_read_end,    bl_win_read,    bl_win_read_end,    bl_a64_read,    bl_a64_read_end
+    dq bn_exit,    1, bl_lin_exit,    bl_lin_exit_end,    bl_win_exit,    bl_win_exit_end,    bl_a64_exit,    bl_a64_exit_end
+    dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, 0,              0,                  bl_a64_syscall, bl_a64_syscall_end
+    dq bn_cmdline, 0, bl_lin_cmdline, bl_lin_cmdline_end, bl_win_cmdline, bl_win_cmdline_end, bl_a64_cmdline, bl_a64_cmdline_end
     dq 0
 
 ; Linux / Android x86-64 runtime (raw syscalls). Arguments were pushed left to
@@ -422,19 +431,30 @@ compile_all:
     jmp compile_file
 
 ; ---- builtins ------------------------------------------------------------------------------
+; builtin_col -> eax = byte offset of the (start, end) columns for the current target
+builtin_col:
+    mov eax, 16
+    cmp dword [arch], ARCH_A64
+    jne .x
+    mov eax, 48
+    ret
+.x: cmp dword [target], TGT_WINDOWS
+    jne .r
+    mov eax, 32
+.r: ret
+
 register_builtins:
     push rbx
+    push r12
+    call builtin_col
+    mov r12d, eax
     mov rbx, builtin_tab
 .l:
     mov rdi, [rbx]
     test rdi, rdi
     jz .done
-    cmp dword [target], TGT_WINDOWS
-    jne .reg
-    cmp qword [rbx+32], 0
+    cmp qword [rbx+r12], 0
     je .next
-.reg:
-    mov rdi, [rbx]
     call cstrlen
     mov esi, eax
     mov rdi, [rbx]
@@ -446,9 +466,10 @@ register_builtins:
     mov qword [rax+SYM_TYPE], TY_INT
     mov dword [rax+SYM_FLAGS], F_BUILTIN | F_DEFINED
 .next:
-    add rbx, 48
+    add rbx, 64
     jmp .l
 .done:
+    pop r12
     pop rbx
     ret
 
@@ -560,22 +581,16 @@ emit_prologue:
     mov rdi, s_exit_name
     call emit_call_named
     ; builtin runtime blobs
+    call builtin_col
+    mov r12d, eax
     mov rbx, builtin_tab
 .bl:
-    mov rdi, [rbx]
-    test rdi, rdi
-    jz .done
-    cmp dword [target], TGT_WINDOWS
-    je .wb
-    mov r8, [rbx+16]
-    mov r9, [rbx+24]
-    jmp .b2
-.wb:
-    mov r8, [rbx+32]
-    mov r9, [rbx+40]
+    cmp qword [rbx], 0
+    je .done
+    mov r8, [rbx+r12]
     test r8, r8
     jz .bnext
-.b2:
+    mov r9, [rbx+r12+8]
     push r8
     push r9
     mov rdi, [rbx]
@@ -590,7 +605,7 @@ emit_prologue:
     pop rsi
     call emit_blob
 .bnext:
-    add rbx, 48
+    add rbx, 64
     jmp .bl
 .done:
     pop r12
@@ -670,16 +685,28 @@ install_backend:
 
 ; ---- ELF64 -----------------------------------------------------------------------------------
 %define ELF_BASE 0x400000
+%define ELF_CODE_OFF 0x100
 
 ; build_elf -> rax = image size (image at outbuf)
 build_elf:
     push rbx
     push r12
+    push r13
+    mov r13d, 0x1000                        ; page / segment alignment
+    mov ebx, 0x3E                           ; e_machine x86-64
+    cmp dword [arch], ARCH_A64
+    jne .a
+    mov r13d, 0x4000                        ; AArch64: 16 KiB (works on 4K and 16K kernels)
+    mov ebx, 0xB7                           ; EM_AARCH64
+.a:
     mov rax, [code_pos]
-    add rax, 0x1000 + 0xFFF
-    and rax, -0x1000
+    add rax, ELF_CODE_OFF
+    lea rax, [rax + r13 - 1]
+    mov rcx, r13
+    neg rcx
+    and rax, rcx
     mov r12, rax                            ; data file offset
-    mov rax, ELF_BASE + 0x1000
+    mov rax, ELF_BASE + ELF_CODE_OFF
     mov [code_vaddr], rax
     mov rax, ELF_BASE
     add rax, r12
@@ -693,7 +720,7 @@ build_elf:
     call apply_relocs
     ; copy code and data
     mov rsi, code_buf
-    mov rdi, outbuf + 0x1000
+    mov rdi, outbuf + ELF_CODE_OFF
     mov rcx, [code_pos]
     rep movsb
     mov rsi, data_buf
@@ -707,7 +734,7 @@ build_elf:
     mov byte [rdi+5], 1
     mov byte [rdi+6], 1
     mov word [rdi+16], 2
-    mov word [rdi+18], 0x3E
+    mov [rdi+18], bx
     mov dword [rdi+20], 1
     mov rax, [code_vaddr]
     mov [rdi+24], rax
@@ -716,17 +743,17 @@ build_elf:
     mov word [rdi+54], 56
     mov word [rdi+56], 3
     mov word [rdi+58], 64
-    ; PT_LOAD code (R+X)
+    ; PT_LOAD headers + code (R+X)
     mov dword [rdi+64], 1
     mov dword [rdi+68], 5
     mov qword [rdi+72], 0
     mov qword [rdi+80], ELF_BASE
     mov qword [rdi+88], ELF_BASE
     mov rax, [code_pos]
-    add rax, 0x1000
+    add rax, ELF_CODE_OFF
     mov [rdi+96], rax
     mov [rdi+104], rax
-    mov qword [rdi+112], 0x1000
+    mov [rdi+112], r13
     ; PT_LOAD data + bss (R+W)
     mov dword [rdi+120], 1
     mov dword [rdi+124], 6
@@ -741,13 +768,14 @@ build_elf:
     and rcx, -16
     add rcx, [bss_pos]
     mov [rdi+160], rcx
-    mov qword [rdi+168], 0x1000
+    mov [rdi+168], r13
     ; PT_GNU_STACK
     mov dword [rdi+176], 0x6474E551
     mov dword [rdi+180], 6
     mov qword [rdi+224], 16
     lea rax, [r12 + 0]
     add rax, [data_pos]
+    pop r13
     pop r12
     pop rbx
     ret
@@ -1058,6 +1086,16 @@ _start:
     test eax, eax
     jnz .t_linux
     mov rdi, rbx
+    mov rsi, s_linux_x64
+    call cstr_eq
+    test eax, eax
+    jnz .t_linux
+    mov rdi, rbx
+    mov rsi, s_linux_arm64
+    call cstr_eq
+    test eax, eax
+    jnz .t_linux_arm
+    mov rdi, rbx
     mov rsi, s_windows
     call cstr_eq
     test eax, eax
@@ -1077,16 +1115,37 @@ _start:
     call cstr_eq
     test eax, eax
     jnz .t_android
+    mov rdi, rbx
+    mov rsi, s_android_arm64
+    call cstr_eq
+    test eax, eax
+    jnz .t_android
+    mov rdi, rbx
+    mov rsi, s_android_x64
+    call cstr_eq
+    test eax, eax
+    jnz .t_android_x64
     mov edi, s_err_badtgt
     call fatal_error
 .t_linux:
     mov dword [target], TGT_LINUX
+    mov dword [arch], ARCH_X64
+    jmp .arg
+.t_linux_arm:
+    mov dword [target], TGT_LINUX
+    mov dword [arch], ARCH_A64
     jmp .arg
 .t_win:
     mov dword [target], TGT_WINDOWS
+    mov dword [arch], ARCH_X64
     jmp .arg
 .t_android:
     mov dword [target], TGT_ANDROID
+    mov dword [arch], ARCH_A64
+    jmp .arg
+.t_android_x64:
+    mov dword [target], TGT_ANDROID
+    mov dword [arch], ARCH_X64
     jmp .arg
 .badopt:
     mov edi, s_err_badopt
@@ -1111,7 +1170,7 @@ _start:
     call fatal_error
 .have_input:
     call init_tables
-    mov edi, ARCH_X64
+    mov edi, [arch]
     call install_backend
     ; --- directory of the main file (for lib/ lookups)
     mov rsi, [opt_input]
@@ -1271,11 +1330,22 @@ choose_outname:
     cmp dword [target], TGT_WINDOWS
     jne .e1
     mov rsi, s_ext_win
+    jmp .e3
 .e1:
     cmp dword [target], TGT_ANDROID
-    jne .e2
+    je .and
+    ; Linux: .elf for x86-64, .arm64.elf for AArch64
+    cmp dword [arch], ARCH_A64
+    jne .e3
+    mov rsi, s_ext_arm_elf
+    jmp .e3
+.and:
+    ; Android: .bin for AArch64 (default), .x64.bin for x86-64
     mov rsi, s_ext_android
-.e2:
+    cmp dword [arch], ARCH_A64
+    je .e3
+    mov rsi, s_ext_x64_bin
+.e3:
     call cstr_copy
     mov rax, outnamebuf
     ret
