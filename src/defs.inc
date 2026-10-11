@@ -322,4 +322,15 @@ CGLIST CGI_DEF
 %define ARCH_X64        0
 %define ARCH_A64        1
 
+; Windows builtin blob: lea r10,[rip + start of the import address table]
+%macro IATLEA 0
+        db 0x4C, 0x8D, 0x15
+%%d:    dd 0
+    [section .iatfix]
+        dq %%d
+        dd 0
+        dd 0
+    __SECT__
+%endmacro
+
 %endif

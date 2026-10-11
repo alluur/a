@@ -843,6 +843,10 @@ bl_a64_close:
     dd 0xD4000001
     dd 0xD65F03C0
 bl_a64_close_end:
+bl_a64_fail:
+    dd 0x92800000                   ; mov x0, #-1
+    dd 0xD65F03C0                   ; ret
+bl_a64_fail_end:
 bl_a64_cmdline:
     dd 0xD2800000                   ; mov x0, #0
     dd 0xD65F03C0

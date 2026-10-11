@@ -58,7 +58,11 @@ s_err_missing:  db "internal error: standard library function missing:", 0
 s_err_nofile:   db "cannot find the imported file", 0
 s_err_mainpar:  db "main may take at most (int argc, char** argv)", 0
 
-; embedded standard library written in A
+; embedded modules written in A: standard library and networking
+net_src:
+    incbin "lib/net.a"
+    db 0
+net_src_end:
 std_src:
     incbin "lib/std.a"
     db 0
@@ -73,6 +77,7 @@ std_src_end:
 %define IAT_CloseHandle     5
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
+%define IAT_SLOTS           18      ; kernel32 (7) + null + ws2_32 (9) + null
 
 bn_write:   db "__write", 0
 bn_read:    db "__read", 0
@@ -80,6 +85,11 @@ bn_exit:    db "__exit", 0
 bn_syscall: db "__syscall", 0
 bn_cmdline: db "__cmdline", 0
 bn_open:    db "__open", 0
+bn_winapi:  db "__winapi", 0
+s_os_name:  db "__OS", 0
+s_arch_name: db "__ARCH", 0
+s_net_a:    db "net.a", 0
+s_net_name: db "<net>", 0
 bn_close:   db "__close", 0
 s_win_init: db "__win_init_args", 0
 s_win_argv: db "__win_argv_get", 0
@@ -91,7 +101,8 @@ builtin_tab:
     dq bn_write,   3, bl_lin_write,   bl_lin_write_end,   bl_win_write,   bl_win_write_end,   bl_a64_write,   bl_a64_write_end
     dq bn_read,    3, bl_lin_read,    bl_lin_read_end,    bl_win_read,    bl_win_read_end,    bl_a64_read,    bl_a64_read_end
     dq bn_exit,    1, bl_lin_exit,    bl_lin_exit_end,    bl_win_exit,    bl_win_exit_end,    bl_a64_exit,    bl_a64_exit_end
-    dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, 0,              0,                  bl_a64_syscall, bl_a64_syscall_end
+    dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, bl_win_fail,    bl_win_fail_end,    bl_a64_syscall, bl_a64_syscall_end
+    dq bn_winapi,  5, bl_lin_fail,    bl_lin_fail_end,    bl_win_winapi,  bl_win_winapi_end,  bl_a64_fail,    bl_a64_fail_end
     dq bn_cmdline, 0, bl_lin_cmdline, bl_lin_cmdline_end, bl_win_cmdline, bl_win_cmdline_end, bl_a64_cmdline, bl_a64_cmdline_end
     dq bn_open,    2, bl_lin_open,    bl_lin_open_end,    bl_win_open,    bl_win_open_end,    bl_a64_open,    bl_a64_open_end
     dq bn_close,   1, bl_lin_close,   bl_lin_close_end,   bl_win_close,   bl_win_close_end,   bl_a64_close,   bl_a64_close_end
@@ -133,6 +144,29 @@ bl_lin_syscall:
     ret
 bl_lin_syscall_end:
 
+bl_lin_fail:
+    mov rax, -1
+    ret
+bl_lin_fail_end:
+bl_win_fail:
+    mov rax, -1
+    ret
+bl_win_fail_end:
+; __winapi(index, a1, a2, a3, a4): call the imported function in IAT slot 'index'
+bl_win_winapi:
+    mov rcx, [rsp+32]
+    mov rdx, [rsp+24]
+    mov r8,  [rsp+16]
+    mov r9,  [rsp+8]
+    mov rax, [rsp+40]
+    mov r12, rsp
+    sub rsp, 48
+    and rsp, -16
+    IATLEA
+    db 0x41, 0xFF, 0x14, 0xC2
+    mov rsp, r12
+    ret
+bl_win_winapi_end:
 bl_lin_cmdline:
     xor eax, eax
     ret
@@ -275,7 +309,20 @@ imp_names:
     db "CloseHandle", 0
     db "GetCommandLineA", 0
     db 0
+; WS2_32.DLL imports: slots 8..16 (slot 7 is the null terminator of the kernel32 list)
+imp_names_ws2:
+    db "WSAStartup", 0
+    db "socket", 0
+    db "connect", 0
+    db "bind", 0
+    db "listen", 0
+    db "accept", 0
+    db "send", 0
+    db "recv", 0
+    db "closesocket", 0
+    db 0
 s_kernel32: db "KERNEL32.DLL", 0
+s_ws2_32:   db "WS2_32.DLL", 0
 
 section .text
 
@@ -378,6 +425,15 @@ file_try:
 file_include:
     push rbx
     push r12
+    ; the networking module is built into the compiler
+    mov rdi, importbuf
+    mov rsi, s_net_a
+    call cstr_eq
+    test eax, eax
+    jz .notnet
+    mov rax, [net_entry]
+    jmp .found
+.notnet:
     ; 1) next to the importing file
     mov rsi, [cur_file_name]
     mov rdi, candbuf
@@ -508,8 +564,7 @@ compile_all:
     mov qword [cur_func], 0
     mov rdi, file_table
     call compile_file
-    mov rdi, file_table
-    add rdi, 64
+    mov rdi, [main_entry]
     jmp compile_file
 
 ; ---- builtins ------------------------------------------------------------------------------
@@ -528,6 +583,21 @@ builtin_col:
 register_builtins:
     push rbx
     push r12
+    ; predefined constants __OS (0 Linux, 1 Windows, 2 Android) and __ARCH (0 x86-64, 1 ARM64)
+    mov rdi, s_os_name
+    mov esi, 4
+    mov edx, S_CONST
+    call sym_new
+    mov dword [rax+SYM_TYPE], TY_INT
+    mov ecx, [target]
+    mov [rax+SYM_VAL], rcx
+    mov rdi, s_arch_name
+    mov esi, 6
+    mov edx, S_CONST
+    call sym_new
+    mov qword [rax+SYM_TYPE], TY_INT
+    mov ecx, [arch]
+    mov [rax+SYM_VAL], rcx
     call builtin_col
     mov r12d, eax
     mov rbx, builtin_tab
@@ -873,9 +943,9 @@ build_elf:
 
 ; ---- PE32+ (Windows x64) -----------------------------------------------------------------
 %define PE_BASE 0x140000000
-%define PE_IDATA_ILT 40
-%define PE_IDATA_IAT (40 + (IAT_COUNT+1)*8)
-%define PE_IDATA_NAMES (PE_IDATA_IAT + (IAT_COUNT+1)*8)
+%define PE_IDATA_ILT 60
+%define PE_IDATA_IAT (60 + IAT_SLOTS*8)
+%define PE_IDATA_NAMES (PE_IDATA_IAT + IAT_SLOTS*8)
 
 ; align_up: rax = value, rcx = alignment (power of two) -> rax
 %macro ALIGNUP 2
@@ -994,10 +1064,10 @@ build_pe:
     mov dword [rdi+108], 16
     mov rax, [pe_idata_rva]
     mov [rdi+112+8], eax                    ; import directory
-    mov dword [rdi+112+8+4], 40
+    mov dword [rdi+112+8+4], 60
     add rax, PE_IDATA_IAT
     mov [rdi+112+96], eax                   ; IAT directory
-    mov dword [rdi+112+96+4], (IAT_COUNT+1)*8
+    mov dword [rdi+112+96+4], IAT_SLOTS*8
     ; section table at 0x148
     lea rdi, [outbuf + 0x148]
     ; .text
@@ -1043,22 +1113,12 @@ build_pe:
     pop rbx
     ret
 
-; build_idata: builds the import section contents into idata_buf using the RVA in
-; [pe_idata_rva]. -> rax = size
-build_idata:
-    push rbx
-    push r12
-    push r13
-    mov rdi, idata_buf
-    mov rbx, [pe_idata_rva]
-    ; name table starts at PE_IDATA_NAMES
-    mov r12d, PE_IDATA_NAMES                ; running offset
-    mov rsi, imp_names
-    xor r13d, r13d                          ; import index
+; idata_list: rsi = list of import names (ends with an empty string), rbx = section RVA,
+; r12 = running offset of the name area, r13 = IAT slot index. Advances rsi / r12 / r13.
+idata_list:
 .imp:
     cmp byte [rsi], 0
-    je .names_done
-    ; hint/name entry at offset r12 (2 byte aligned)
+    je .done
     lea rax, [rbx + r12]
     mov [idata_buf + PE_IDATA_ILT + r13*8], rax
     mov [idata_buf + PE_IDATA_IAT + r13*8], rax
@@ -1076,25 +1136,56 @@ build_idata:
     mov r12, rdi
     inc r13d
     jmp .imp
-.names_done:
-    ; dll name
+.done:
+    inc rsi
+    ret
+
+; build_idata: builds the import section contents (KERNEL32 + WS2_32) into idata_buf using
+; the RVA in [pe_idata_rva]. -> rax = size
+build_idata:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, [pe_idata_rva]
+    mov r12d, PE_IDATA_NAMES
+    xor r13d, r13d
+    mov rsi, imp_names
+    call idata_list
+    inc r13d                                ; null slot ends the kernel32 thunk array
+    mov rsi, imp_names_ws2
+    call idata_list
+    ; DLL name strings
     lea rdi, [idata_buf + r12]
-    mov r13, rdi
+    mov r14, rdi
     mov rsi, s_kernel32
     call cstr_copy
-    sub r13, idata_buf                      ; offset of dll name
     lea rax, [r12 + 13]
     mov r12, rax
-    ; import descriptor
-    mov rax, rbx
-    add rax, PE_IDATA_ILT
-    mov [idata_buf], eax                    ; OriginalFirstThunk
+    lea rdi, [idata_buf + r12]
+    mov r13, rdi
+    mov rsi, s_ws2_32
+    call cstr_copy
+    lea rax, [r12 + 11]
+    mov r12, rax
+    sub r14, idata_buf
+    sub r13, idata_buf
+    ; descriptor 0: KERNEL32
+    lea rax, [rbx + PE_IDATA_ILT]
+    mov [idata_buf], eax
+    lea rax, [rbx + r14]
+    mov [idata_buf + 12], eax
+    lea rax, [rbx + PE_IDATA_IAT]
+    mov [idata_buf + 16], eax
+    ; descriptor 1: WS2_32 (its thunks start after the 8 kernel32 slots)
+    lea rax, [rbx + PE_IDATA_ILT + 8*8]
+    mov [idata_buf + 20], eax
     lea rax, [rbx + r13]
-    mov [idata_buf + 12], eax               ; Name
-    mov rax, rbx
-    add rax, PE_IDATA_IAT
-    mov [idata_buf + 16], eax               ; FirstThunk
+    mov [idata_buf + 32], eax
+    lea rax, [rbx + PE_IDATA_IAT + 8*8]
+    mov [idata_buf + 36], eax
     mov rax, r12
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -1295,8 +1386,14 @@ _start:
     mov rsi, std_src
     mov rdx, std_src_end - std_src - 1
     call add_embedded_file
+    mov rdi, s_net_name
+    mov rsi, net_src
+    mov rdx, net_src_end - net_src - 1
+    call add_embedded_file
+    mov [net_entry], rcx
     mov rdi, [opt_input]
     call file_try
+    mov [main_entry], rax
     test rax, rax
     jnz .loaded
     mov edi, s_err_read
@@ -1470,6 +1567,8 @@ ptmp_nlen:      resd MAXPARAM
 binprec:        resb 256
 
 err_msg:        resq 1
+net_entry:      resq 1
+main_entry:     resq 1
 pk_pos:         resq 1
 last_label:     resq 1
 pk_end:         resq 1

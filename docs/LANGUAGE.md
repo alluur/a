@@ -329,9 +329,53 @@ Everything in `lib/std.a` is compiled into your program automatically; no import
 | `char* readFile(char* path)` | whole file as a NUL-terminated string on the heap, `null` on error |
 | `bool writeFile(char* path, char* text)` | create/overwrite a file |
 
+**Networking** is a separate module: `import net;` (built into the compiler, no files to install). See
+[section 12a](#12a-networking).
+
 **Process and memory**
 
 `exit(code)`, `alloc(n)` (zeroed heap memory, never freed).
+
+## 12a. Networking
+
+`import net;` gives TCP over IPv4 on Linux, Android and Windows with identical code. Handles are
+`int`s; functions return a negative number on failure.
+
+```c
+import net;
+
+int main() {
+    int s = net.listen(9000, 8);              // server: all interfaces, backlog 8
+    int c = net.accept(s);                    // blocks until a client connects
+    char line[256];
+    net.recvLine(c, line, 256);               // one line, without the newline
+    net.sendText(c, "echo: ");
+    net.sendText(c, line);
+    net.close(c);
+
+    int h = net.connect("127.0.0.1", 80);     // client
+    char* page = net.httpGet("93.184.216.34", 80, "/");
+    return 0;
+}
+```
+
+| Function | Description |
+|---|---|
+| `net.connect(host, port)` | connect to a server, returns a handle |
+| `net.listen(port, backlog)` / `net.listenOn(host, port, backlog)` | start a server (`listen` binds `0.0.0.0`) |
+| `net.accept(server)` | wait for a client, returns its handle |
+| `net.send(h, buf, n)` | sends all `n` bytes, returns `n` |
+| `net.sendText(h, text)` | sends a string, returns `true` on success |
+| `net.recv(h, buf, max)` | bytes received, `0` when the peer closed |
+| `net.recvLine(h, buf, max)` | one line (`\n` or `\r\n` removed), `-1` when closed |
+| `net.close(h)` | close a socket |
+| `net.httpGet(host, port, path)` | tiny HTTP/1.0 client, returns the body (plain HTTP only) |
+| `net.parseIp(text)` | `"1.2.3.4"` to a number, `-1` if invalid |
+
+Limits of this first version: IPv4 and TCP only (no UDP, IPv6, TLS), hosts must be IP addresses or
+`localhost` (no DNS yet), calls block (no timeouts or `select`).
+On Linux and Android the module uses socket system calls; on Windows it calls Winsock
+(`ws2_32.dll`, started automatically) through the built-in `__winapi`.
 
 ## 13. Built-in runtime functions
 
@@ -345,6 +389,8 @@ They are plain functions with a leading `__`.
 | `__open(path, mode)` / `__close(h)` | files; `mode` is 0 read, 1 write, 2 append |
 | `__exit(code)` | terminate the process |
 | `__syscall(nr, a1, …, a6)` | raw system call (Linux and Android only; numbers differ between x86-64 and ARM64) |
+| `__winapi(slot, a1, a2, a3, a4)` | call an imported Windows function by import-table slot (returns -1 elsewhere); used by `net` |
+| `__OS`, `__ARCH` | predefined constants: OS 0 Linux, 1 Windows, 2 Android; architecture 0 x86-64, 1 ARM64 |
 | `__cmdline()` | the Windows command line (used to build `argv`; returns `null` elsewhere) |
 
 ## 14. Compile errors

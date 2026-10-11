@@ -1,0 +1,303 @@
+// =============================================================================
+//  net - TCP networking for A (IPv4)                       import net;
+//
+//  Works on Linux, Android and Windows with the same code:
+//    * Linux / Android: socket system calls (numbers differ between x86-64 and ARM64)
+//    * Windows: Winsock (ws2_32.dll) through the compiler's __winapi built-in
+//
+//  Handles are plain ints. Functions return a negative number on error.
+//  Host names must be IPv4 addresses ("192.168.1.10") or "localhost" - there is no DNS yet.
+//
+//    int  net.connect(host, port)          connect to a server
+//    int  net.listen(port, backlog)        listen on all interfaces
+//    int  net.listenOn(host, port, backlog)
+//    int  net.accept(server)               wait for a client
+//    int  net.send(h, buf, n)              sends all n bytes, returns n
+//    bool net.sendText(h, text)
+//    int  net.recv(h, buf, max)            bytes received, 0 = connection closed
+//    int  net.recvLine(h, buf, max)        one line without the newline, -1 = closed
+//    void net.close(h)
+//    char* net.httpGet(host, port, path)   very small HTTP/1.0 client, returns the body
+//    int  net.parseIp(text)                "1.2.3.4" -> 0x01020304, -1 if invalid
+// =============================================================================
+module net;
+
+const AF_INET = 2;
+const SOCK_STREAM = 1;
+const MSG_NOSIGNAL = 0x4000;
+
+// import address table slots of the Windows ws2_32 functions
+const WS_STARTUP = 8;
+const WS_SOCKET = 9;
+const WS_CONNECT = 10;
+const WS_BIND = 11;
+const WS_LISTEN = 12;
+const WS_ACCEPT = 13;
+const WS_SEND = 14;
+const WS_RECV = 15;
+const WS_CLOSE = 16;
+
+private bool started;
+private char wsadata[512];
+
+// system call number for the current CPU: x86-64 or ARM64
+private int nr(int x64, int a64) {
+    if (__ARCH == 1) {
+        return a64;
+    }
+    return x64;
+}
+
+// Winsock functions return a 32 bit int in eax: sign extend it
+private int i32(int x) {
+    return (x << 32) >> 32;
+}
+
+private bool windows() {
+    return __OS == 1;
+}
+
+// starts Winsock on Windows (called automatically by the functions below)
+public int init() {
+    if (windows() && !started) {
+        started = true;
+        return i32(__winapi(WS_STARTUP, 0x202, &wsadata[0], 0, 0));
+    }
+    return 0;
+}
+
+// "127.0.0.1" -> 0x7F000001 (host order), "localhost" too; -1 if the text is not valid
+public int parseIp(char* s) {
+    if (streq(s, "localhost")) {
+        return 0x7F000001;
+    }
+    int ip = 0;
+    int parts = 0;
+    int i = 0;
+    while (parts < 4) {
+        if (!isDigit(s[i])) {
+            return -1;
+        }
+        int v = 0;
+        while (isDigit(s[i])) {
+            v = v * 10 + (s[i] - '0');
+            if (v > 255) {
+                return -1;
+            }
+            i++;
+        }
+        ip = ip * 256 + v;
+        parts++;
+        if (parts < 4) {
+            if (s[i] != '.') {
+                return -1;
+            }
+            i++;
+        }
+    }
+    if (s[i] != 0) {
+        return -1;
+    }
+    return ip;
+}
+
+// builds a struct sockaddr_in (16 bytes) for an IPv4 address and a port
+private void fillAddr(char* sa, int ip, int port) {
+    for (int i = 0; i < 16; i++) {
+        sa[i] = 0;
+    }
+    sa[0] = AF_INET;
+    sa[2] = (port >> 8) & 255;
+    sa[3] = port & 255;
+    sa[4] = (ip >> 24) & 255;
+    sa[5] = (ip >> 16) & 255;
+    sa[6] = (ip >> 8) & 255;
+    sa[7] = ip & 255;
+}
+
+private int newSocket() {
+    init();
+    if (windows()) {
+        int s = __winapi(WS_SOCKET, AF_INET, SOCK_STREAM, 6, 0);
+        if (s == -1) {
+            return -1;
+        }
+        return s;
+    }
+    return __syscall(nr(41, 198), AF_INET, SOCK_STREAM, 0, 0, 0, 0);
+}
+
+public void close(int h) {
+    if (windows()) {
+        __winapi(WS_CLOSE, h, 0, 0, 0);
+    } else {
+        __syscall(nr(3, 57), h, 0, 0, 0, 0, 0);
+    }
+}
+
+// connects to host:port, returns a handle or a negative number
+public int connect(char* host, int port) {
+    int ip = parseIp(host);
+    if (ip < 0) {
+        return -1;
+    }
+    int s = newSocket();
+    if (s < 0) {
+        return s;
+    }
+    char sa[16];
+    fillAddr(&sa[0], ip, port);
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_CONNECT, s, &sa[0], 16, 0));
+    } else {
+        r = __syscall(nr(42, 203), s, &sa[0], 16, 0, 0, 0);
+    }
+    if (r < 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+// starts a server on host:port ("0.0.0.0" = every interface)
+public int listenOn(char* host, int port, int backlog) {
+    int ip = parseIp(host);
+    if (ip < 0) {
+        return -1;
+    }
+    int s = newSocket();
+    if (s < 0) {
+        return s;
+    }
+    if (!windows()) {
+        int one = 1;
+        __syscall(nr(54, 208), s, 1, 2, &one, 4, 0);          // SOL_SOCKET, SO_REUSEADDR
+    }
+    char sa[16];
+    fillAddr(&sa[0], ip, port);
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_BIND, s, &sa[0], 16, 0));
+    } else {
+        r = __syscall(nr(49, 200), s, &sa[0], 16, 0, 0, 0);
+    }
+    if (r < 0) {
+        close(s);
+        return -1;
+    }
+    if (windows()) {
+        r = i32(__winapi(WS_LISTEN, s, backlog, 0, 0));
+    } else {
+        r = __syscall(nr(50, 201), s, backlog, 0, 0, 0, 0);
+    }
+    if (r < 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+public int listen(int port, int backlog) {
+    return listenOn("0.0.0.0", port, backlog);
+}
+
+// waits for a client, returns its handle or a negative number
+public int accept(int server) {
+    if (windows()) {
+        int c = __winapi(WS_ACCEPT, server, 0, 0, 0);
+        if (c == -1) {
+            return -1;
+        }
+        return c;
+    }
+    return __syscall(nr(43, 202), server, 0, 0, 0, 0, 0);
+}
+
+// sends exactly n bytes; returns n, or a negative number on error
+public int send(int h, char* buf, int n) {
+    int done = 0;
+    while (done < n) {
+        int r;
+        if (windows()) {
+            r = i32(__winapi(WS_SEND, h, buf + done, n - done, 0));
+        } else {
+            r = __syscall(nr(44, 206), h, buf + done, n - done, MSG_NOSIGNAL, 0, 0);
+        }
+        if (r <= 0) {
+            return -1;
+        }
+        done = done + r;
+    }
+    return n;
+}
+
+public bool sendText(int h, char* text) {
+    int n = strlen(text);
+    return send(h, text, n) == n;
+}
+
+// receives up to max bytes: >0 bytes, 0 when the other side closed, <0 on error
+public int recv(int h, char* buf, int max) {
+    if (windows()) {
+        return i32(__winapi(WS_RECV, h, buf, max, 0));
+    }
+    return __syscall(nr(45, 207), h, buf, max, 0, 0, 0);
+}
+
+// reads one line (the "\r\n" or "\n" is removed). Returns its length, -1 if closed before any byte
+public int recvLine(int h, char* buf, int max) {
+    int n = 0;
+    char c;
+    while (n < max - 1) {
+        int r = recv(h, &c, 1);
+        if (r <= 0) {
+            if (n == 0) {
+                return -1;
+            }
+            break;
+        }
+        if (c == 10) {
+            break;
+        }
+        if (c != 13) {
+            buf[n] = c;
+            n++;
+        }
+    }
+    buf[n] = 0;
+    return n;
+}
+
+// minimal HTTP/1.0 GET: returns the response body as a heap string, or null on error
+public char* httpGet(char* host, int port, char* path) {
+    int h = connect(host, port);
+    if (h < 0) {
+        return null;
+    }
+    sendText(h, "GET ");
+    sendText(h, path);
+    sendText(h, " HTTP/1.0\r\nHost: ");
+    sendText(h, host);
+    sendText(h, "\r\nConnection: close\r\n\r\n");
+    char* start = &__heap[__heap_pos];
+    int len = 0;
+    int room = 64 * 1024 * 1024 - __heap_pos - 16;
+    for (;;) {
+        int r = recv(h, &start[len], room - len);
+        if (r <= 0) {
+            break;
+        }
+        len = len + r;
+    }
+    close(h);
+    start[len] = 0;
+    __heap_pos = (__heap_pos + len + 16) & ~15;
+    // skip the headers
+    for (int i = 0; i + 3 < len; i++) {
+        if (start[i] == 13 && start[i + 1] == 10 && start[i + 2] == 13 && start[i + 3] == 10) {
+            return &start[i + 4];
+        }
+    }
+    return start;
+}

@@ -20,7 +20,7 @@ RELEASE ?= release
 VERSION_NAME := $(shell sed -n 's/^%define VERSION_NAME *"\(.*\)"/\1/p' src/defs.inc)
 VERSION_CODE := $(shell sed -n 's/^%define VERSION_CODE *\([0-9]*\).*/\1/p' src/defs.inc)
 STEM         := $(VERSION_CODE)-$(RELEASE)
-SRC           = $(wildcard src/*.asm) src/defs.inc lib/std.a
+SRC           = $(wildcard src/*.asm) src/defs.inc $(wildcard lib/*.a)
 
 all: build/ac
 

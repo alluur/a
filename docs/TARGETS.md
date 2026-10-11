@@ -38,7 +38,7 @@ An ARM64 file can be tried on an x86-64 machine with QEMU user mode emulation
 ## Windows
 
 PE32+ console executables importing only `kernel32.dll` (`GetStdHandle`, `ReadFile`, `WriteFile`,
-`CreateFileA`, `CloseHandle`, `ExitProcess`, `GetCommandLineA`). The image is linked at
+`CreateFileA`, `CloseHandle`, `ExitProcess`, `GetCommandLineA`) and `ws2_32.dll` (Winsock, for the `net` module). The image is linked at
 `0x140000000` without ASLR; it reserves an 8 MiB stack and probes the stack for large frames the
 way `__chkstk` does. Command line arguments are parsed with the standard Windows rules, so
 `argv` works as expected.
