@@ -252,6 +252,12 @@ parse_return:
     je .void
     call parse_expr
     call to_rvalue
+    mov rax, [cur_func]
+    test rax, rax
+    jz .j
+    cmp qword [rax+SYM_TYPE], TY_BOOL
+    jne .j
+    CG tobool
     jmp .j
 .void:
     xor edi, edi

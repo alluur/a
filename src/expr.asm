@@ -49,7 +49,13 @@ emit_store_type:
     jmp .out
 .q: CG store8
     jmp .out
-.b: CG store1
+.b: test edi, 0xFF00
+    jnz .b1
+    cmp dil, TY_BOOL
+    jne .b1
+    CG tobool
+.b1:
+    CG store1
 .out:
     pop rdi
     ret
@@ -428,6 +434,17 @@ gen_call:
     jne .push
     ERR "structs cannot be passed by value, pass a pointer"
 .push:
+    ; bool parameters are normalised to 0 / 1
+    mov rax, [r12+SYM_EXTRA]
+    test rax, rax
+    jz .pushit
+    cmp ebx, [r12+SYM_NPAR]
+    jae .pushit
+    mov rax, [rax+rbx*8]
+    cmp rax, TY_BOOL
+    jne .pushit
+    CG tobool
+.pushit:
     CG push_a
     inc ebx
     cmp qword [tk], ','

@@ -580,6 +580,15 @@ emit_prologue:
     CG push_a
     mov rdi, s_exit_name
     call emit_call_named
+    ; Windows stack probe helper (used by every function prologue)
+    cmp dword [target], TGT_WINDOWS
+    jne .nochk
+    mov rax, [code_pos]
+    mov [chkstk_pos], rax
+    mov rsi, chkstk_blob
+    mov ecx, chkstk_blob_end - chkstk_blob
+    call emit_bytes
+.nochk:
     ; builtin runtime blobs
     call builtin_col
     mov r12d, eax
@@ -896,8 +905,8 @@ build_pe:
     mov dword [rdi+60], 0x200
     mov word [rdi+68], 3                    ; console subsystem
     mov word [rdi+70], 0x8100               ; NX compatible, no ASLR
-    mov qword [rdi+72], 0x100000
-    mov qword [rdi+80], 0x1000
+    mov qword [rdi+72], 0x800000
+    mov qword [rdi+80], 0x10000
     mov qword [rdi+88], 0x100000
     mov qword [rdi+96], 0x1000
     mov dword [rdi+108], 16
@@ -1422,6 +1431,7 @@ e_lval:         resq 1
 ret_chain:      resq 1
 cur_func:       resq 1
 frame_patch:    resq 1
+chkstk_pos:     resq 1
 agg_mname:      resq 1
 agg_mtype:      resq 1
 agg_gtype:      resq 1

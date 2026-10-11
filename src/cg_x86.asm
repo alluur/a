@@ -347,11 +347,28 @@ x86_call_sym:
 x86_prologue:
     push rax
     push rdi
+    cmp dword [target], TGT_WINDOWS
+    je .win
     EM 0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC
     mov rax, [code_pos]
     mov [frame_patch], rax
     xor edi, edi
     call emit_d
+    jmp .out
+.win:
+    ; push rbp; mov rbp,rsp; mov eax,<frame>; call chkstk; sub rsp,rax
+    EM 0x55, 0x48, 0x89, 0xE5, 0xB8
+    mov rax, [code_pos]
+    mov [frame_patch], rax
+    xor edi, edi
+    call emit_d
+    EM 0xE8
+    mov rdi, [chkstk_pos]
+    sub rdi, [code_pos]
+    sub rdi, 4
+    call emit_d
+    EM 0x48, 0x29, 0xC4
+.out:
     pop rdi
     pop rax
     ret
@@ -437,4 +454,26 @@ section .rodata
 %endmacro
 cg_tab_x86:
     CGLIST CGT_X86
+section .text
+
+; Windows stack probe: eax = bytes about to be allocated. Touches every page in
+; descending order so the guard page mechanism can commit the stack.
+section .rodata
+chkstk_blob:
+    push rcx
+    push rax
+    lea rcx, [rsp+24]
+.l: cmp rax, 4096
+    jbe .last
+    sub rcx, 4096
+    test [rcx], al
+    sub rax, 4096
+    jmp .l
+.last:
+    sub rcx, rax
+    test [rcx], al
+    pop rax
+    pop rcx
+    ret
+chkstk_blob_end:
 section .text
