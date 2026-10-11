@@ -78,9 +78,23 @@ parse_params:
     call expect
     mov dword [ptmp_count], 0
     mov dword [ptmp_nreq], 0x7FFFFFFF
+    mov dword [ptmp_variadic], 0
     cmp qword [tk], ')'
     je .end
 .p:
+    cmp qword [tk], '.'
+    jne .ptype
+    ; "..." : any number of further arguments (they are read with va_arg(i), counted by va_count())
+    call next_token
+    mov edi, '.'
+    call expect
+    mov edi, '.'
+    call expect
+    mov dword [ptmp_variadic], 1
+    cmp dword [ptmp_nreq], 0x7FFFFFFF
+    je .end
+    ERR "a function with default values cannot also take ..."
+.ptype:
     call parse_type
     mov rbx, rax
     cmp rbx, TY_VOID
@@ -88,11 +102,6 @@ parse_params:
     cmp qword [tk], ')'
     je .end
 .nv:
-    test ebx, 0xFF00
-    jnz .ok
-    cmp bl, TY_STRUCT
-    jne .ok
-    ERR "structs cannot be passed by value, use a pointer"
 .ok:
     mov eax, [ptmp_count]
     cmp eax, MAXPARAM
@@ -119,7 +128,8 @@ parse_params:
     call const_expr
     cmp edx, 1
     jne .defok
-    ERR "a default value must be a number, character, bool or null"
+    mov rcx, 0x5A5A000000000000         ; a text: its data offset with a marker in the top 16 bits
+    or rax, rcx
 .defok:
     mov [ptmp_def+r12*8], rax
     cmp r12d, [ptmp_nreq]
@@ -158,11 +168,6 @@ func_register:
     mov r14, rdx
     mov r15d, ecx
     mov ebx, r8d
-    test edx, 0xFF00
-    jnz .retok
-    cmp dl, TY_STRUCT
-    jne .retok
-    ERR "functions cannot return a struct by value, return a pointer"
 .retok:
     cmp r15d, -1
     jne .member
@@ -200,6 +205,10 @@ func_register:
 .have:
     mov [rax+SYM_TYPE], r14
     or [rax+SYM_FLAGS], ebx
+    cmp dword [ptmp_variadic], 0
+    je .notvar
+    or dword [rax+SYM_FLAGS], F_VARIADIC
+.notvar:
     mov ecx, [ptmp_count]
     mov [rax+SYM_NPAR], ecx
     ; copy the parameter types into the pool
@@ -280,6 +289,14 @@ compile_function:
     ; total number of stack slots = params (+ this)
     mov ebx, [r12+SYM_NPAR]
     xor r14d, r14d
+    ; a function that returns a struct gets the address of the result as a hidden last argument
+    mov rax, [r12+SYM_TYPE]
+    test eax, 0xFF00
+    jnz .noretstruct
+    cmp al, TY_STRUCT
+    jne .noretstruct
+    inc ebx
+.noretstruct:
     test dword [r12+SYM_FLAGS], F_METHOD
     jz .params
     inc ebx
@@ -289,6 +306,22 @@ compile_function:
     add eax, 16
     mov [cur_this_off], eax
 .params:
+    test dword [r12+SYM_FLAGS], F_VARIADIC
+    jz .pstart
+    test r14d, r14d
+    jz .vok
+    ERR "methods cannot take ..."
+.vok:
+    ; the caller pushed the arguments in order and then the number of extra ones; remember that number
+    add dword [frame_size], 8
+    mov eax, [frame_size]
+    neg eax
+    mov [cur_va_cnt], eax
+    mov edi, 16
+    CG load_local_a
+    mov edi, [cur_va_cnt]
+    CG store_local_a
+.pstart:
     xor ecx, ecx
 .pl:
     cmp ecx, [ptmp_count]
@@ -303,6 +336,41 @@ compile_function:
     pop rcx
     mov rdx, [ptmp_type+rcx*8]
     mov [rax+SYM_TYPE], rdx
+    test edx, 0xFF00
+    jnz .notstructp
+    cmp dl, TY_STRUCT
+    jne .notstructp
+    or dword [rax+SYM_FLAGS], F_BYREF   ; the slot holds the address of a copy made by the caller
+.notstructp:
+    test dword [r12+SYM_FLAGS], F_VARIADIC
+    jz .posoff
+    ; variadic: the named parameter sits (1 + extras + ...) slots up the stack; copy it into a local of its own
+    push rax
+    add dword [frame_size], 8
+    mov esi, [frame_size]
+    neg esi
+    movsxd rsi, esi
+    push rsi
+    mov edi, [cur_va_cnt]
+    CG load_local_a
+    mov edi, [slot_bytes]
+    CG mul_imm_a
+    CG mov_b_a
+    mov eax, ebx
+    sub eax, ecx
+    imul eax, [slot_bytes]
+    add eax, 16
+    mov edi, eax
+    CG lea_local_a
+    CG add
+    CG load8_a
+    pop rsi
+    mov edi, esi
+    CG store_local_a
+    pop rax
+    mov [rax+SYM_VAL], rsi
+    jmp .pn
+.posoff:
     lea edx, [rcx+r14]
     mov esi, ebx
     dec esi
@@ -425,6 +493,10 @@ parse_aggregate:
     xor r14d, r14d
     cmp qword [tk], K_CLASS
     sete r14b
+    xor eax, eax
+    cmp qword [tk], K_UNION
+    sete al
+    mov [agg_union], eax
     call next_token
     cmp qword [tk], T_ID
     je .n1
@@ -596,6 +668,10 @@ parse_aggregate:
     add rcx, rsi
     not rsi
     and rcx, rsi                        ; aligned offset
+    cmp dword [agg_union], 0
+    je .notunion
+    xor ecx, ecx                        ; every member of a union starts at offset 0
+.notunion:
     ; new field entry
     mov esi, [field_count]
     cmp esi, FIELD_MAX
@@ -614,7 +690,13 @@ parse_aggregate:
     mov [rdi+FD_OFFSET], ecx
     inc dword [rax+ST_NFIELDS]
     add rcx, r12
+    cmp dword [agg_union], 0
+    je .setsize
+    cmp ecx, [rax+ST_SIZE]              ; the size of a union is the size of its largest member
+    jbe .nosize
+.setsize:
     mov [rax+ST_SIZE], ecx
+.nosize:
     mov edi, ';'
     call expect
     jmp .mloop
@@ -919,8 +1001,14 @@ parse_items:
     jmp .vdone
 .v1:
     cmp qword [tk], K_PRIVATE
-    jne .vdone
+    jne .v2
     mov ebx, 1
+    call next_token
+    jmp .vdone
+.v2:
+    cmp qword [tk], K_STATIC
+    jne .vdone
+    mov ebx, 1                          ; static = private to the file
     call next_token
 .vdone:
     mov [agg_vis], ebx
@@ -933,6 +1021,10 @@ parse_items:
     je .aggr
     cmp eax, K_CLASS
     je .aggr
+    cmp eax, K_UNION
+    je .aggr
+    cmp eax, K_TYPEDEF
+    je .typedef
     cmp eax, K_ENUM
     je .enum
     cmp eax, K_CONST
@@ -957,6 +1049,21 @@ parse_items:
 .enum:
     mov edi, ebx
     call parse_enum
+    jmp .loop
+.typedef:
+    cmp dword [pass], 1
+    jne .tdskip
+    call parse_typedef
+    cmp dword [agg_vis], 0
+    je .loop
+    mov eax, [sym_count]
+    dec eax
+    shl rax, 6
+    add rax, symtab
+    or dword [rax+SYM_FLAGS], F_PRIVATE
+    jmp .loop
+.tdskip:
+    call skip_to_semi
     jmp .loop
 .const:
     cmp dword [pass], 1

@@ -95,6 +95,9 @@
 %define K_SWITCH        186
 %define K_CASE          187
 %define K_DEFAULT       188
+%define K_TYPEDEF       189
+%define K_UNION         190
+%define K_STATIC        191
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1
@@ -104,6 +107,7 @@
 %define S_STRUCT        5
 %define S_ENUM          6
 %define S_MODULE        7
+%define S_TYPEDEF       8
 
 ; ---- symbol entry layout (64 bytes) ------------------------------------------
 %define SYM_NAME        0       ; qword  pointer to name
@@ -132,6 +136,8 @@
 %define F_ENUMVAL       128
 %define F_USED          256     ; reachable from main (dead function elimination)
 %define F_FUNCTYPE      512     ; the predefined type name "func"
+%define F_VARIADIC      1024    ; the parameter list ends with ...
+%define F_BYREF         2048    ; a struct parameter: the slot holds the address of the caller's copy
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
 %define ST_NAME         0       ; qword

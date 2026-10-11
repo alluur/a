@@ -72,6 +72,10 @@ parse_stmt:
     je parse_switch
     cmp eax, K_CONST
     je parse_local_const
+    cmp eax, K_TYPEDEF
+    je parse_typedef
+    cmp eax, K_STATIC
+    je parse_static_local
     cmp eax, ';'
     je .empty
     cmp eax, K_PUBLIC
@@ -258,8 +262,20 @@ parse_return:
     test rax, rax
     jz .j
     cmp qword [rax+SYM_TYPE], TY_BOOL
-    jne .j
+    jne .notbool
     CG tobool
+    jmp .j
+.notbool:
+    ; a struct result is copied to the address that the caller passed as the hidden last argument
+    mov rdx, [rax+SYM_TYPE]
+    test edx, 0xFF00
+    jnz .j
+    cmp dl, TY_STRUCT
+    jne .j
+    mov edi, 16
+    CG load_local_b
+    mov rdi, rdx
+    call emit_store_type                ; the copy leaves the destination address in A
     jmp .j
 .void:
     xor edi, edi
@@ -602,3 +618,136 @@ parse_const_decl:
 
 parse_local_const:
     jmp parse_const_decl
+
+; typedef Type Name;   (top level in pass 1, or inside a function body)
+parse_typedef:
+    push rbx
+    push r12
+    push r13
+    call next_token
+    call parse_type
+    mov rbx, rax
+    cmp qword [tk], T_ID
+    je .n1
+    ERR "expected a name for the new type"
+.n1:
+    mov r12, [tk_ptr]
+    mov r13d, [tk_len]
+    call next_token
+    mov edi, ';'
+    call expect
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, S_TYPEDEF
+    call sym_new
+    mov [rax+SYM_TYPE], rbx
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; static Type name [= constant] [, name ...];   a local variable that keeps its value between calls
+parse_static_local:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    call next_token
+    call parse_type
+    mov r12, rax                        ; element type
+    cmp qword [tk], T_ID
+    je .name
+    ERR "expected a variable name"
+.name:
+    mov rax, [tk_ptr]
+    mov [agg_mname], rax
+    mov eax, [tk_len]
+    mov [agg_mnlen], eax
+    call next_token
+    mov rbx, r12
+    xor r14d, r14d                      ; array element count (0 = scalar)
+    cmp qword [tk], '['
+    jne .noarr
+    call next_token
+    call const_expr
+    test rax, rax
+    jg .a1
+    ERR "array size must be positive"
+.a1:
+    mov r14, rax
+    mov edi, ']'
+    call expect
+    add rbx, TY_PTR1
+    bts rbx, TF_ARRAY_BIT
+    mov rdi, r12
+    call type_size
+    imul rax, r14
+    jmp .sized
+.noarr:
+    mov rdi, rbx
+    call type_size
+.sized:
+    mov r15, rax
+    cmp r15, 8
+    jae .big
+    mov r15d, 8
+.big:
+    cmp qword [tk], '='
+    je .init
+    mov rdi, r15
+    mov esi, 8
+    call bss_alloc
+    mov r13d, eax
+    mov edx, F_BSS
+    jmp .reg
+.init:
+    bt rbx, TF_ARRAY_BIT
+    jnc .i0
+    ERR "array initializers are not supported, assign the elements in code"
+.i0:
+    call next_token
+    call const_expr
+    push rax
+    push rdx
+    mov rdi, 8
+    mov esi, 8
+    call data_alloc
+    mov r13, rax
+    pop rdx
+    pop rcx
+    mov [data_buf+r13], rcx
+    test edx, edx
+    jz .i1
+    mov edi, r13d
+    mov esi, R_DATA64
+    xor edx, edx
+    call add_reloc
+.i1:
+    xor edx, edx
+.reg:
+    push rdx
+    mov rdi, [agg_mname]
+    mov esi, [agg_mnlen]
+    mov edx, S_GLOBAL
+    call sym_new
+    pop rdx
+    mov [rax+SYM_TYPE], rbx
+    mov [rax+SYM_VAL], r13
+    or [rax+SYM_FLAGS], edx
+    mov [rax+SYM_EXTRA], r14
+    cmp qword [tk], ','
+    jne .end
+    call next_token
+    cmp qword [tk], T_ID
+    je .name
+    ERR "expected a variable name"
+.end:
+    mov edi, ';'
+    call expect
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret

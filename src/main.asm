@@ -1882,7 +1882,10 @@ loop_sp:        resd 1
 case_sp:        resd 1
 ptmp_count:     resd 1
 ptmp_nreq:      resd 1
+ptmp_variadic:  resd 1
+cur_va_cnt:     resd 1
 agg_vis:        resd 1
+agg_union:      resd 1
 agg_mnlen:      resd 1
 agg_isctor:     resd 1
 src_ptr:        resq 1

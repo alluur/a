@@ -36,6 +36,9 @@ kw_table:
     KW "switch",   K_SWITCH
     KW "case",     K_CASE
     KW "default",  K_DEFAULT
+    KW "typedef",  K_TYPEDEF
+    KW "union",    K_UNION
+    KW "static",   K_STATIC
     db 0
 
 ops3:

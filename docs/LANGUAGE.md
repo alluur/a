@@ -165,9 +165,8 @@ int helper() { return 41; }
 ```
 
 * Parameters and results are passed by value. Arguments are evaluated **left to right**.
-* Allowed parameter and result types: integers, `char`, `bool`, `enum`, pointers.
-  **Structs cannot be passed or returned by value** — pass a pointer (`Point*`).
-  The compiler reports an error if you try.
+* Allowed parameter and result types: integers, `char`, `bool`, `enum`, pointers, `func`, and **structs and classes by value**
+  (see below).
 * Recursion works; the stack is 8 MiB (see [Memory](#11-memory)).
 * There is no overloading. A *prototype* (`int f(int a);`) is accepted but never necessary.
 * A function that reaches its end without `return` returns 0. `return;` also returns 0.
@@ -189,7 +188,63 @@ area(5, 4, 200);    // 40
 
 This works for functions, methods and constructors (`new Counter()` / `Counter c;` with `Counter(int start = 1)`), and it is
 how the standard library's `printf(fmt, a, b, c, d, e, f, g, h)` accepts one to eight values.
-(Text defaults such as `char* sep = ","` are not possible: the default has to be a number or `null`.)
+Text defaults are fine too: `char* sep = ", "`. (A function cannot have default values and `...` together.)
+
+### Structs by value
+
+A struct or class can be a parameter and a result. The caller makes a copy for the callee (so changes to the parameter do
+not reach the original) and results are returned through a hidden destination:
+
+```c
+struct Point { int x; int y; }
+
+Point add(Point a, Point b) {
+    Point r;
+    r.x = a.x + b.x;
+    r.y = a.y + b.y;
+    return r;
+}
+
+int main() {
+    Point p = add(add(make(1, 2), make(3, 4)), make(5, 6));      // nested calls are fine
+    printlnInt(add(p, p).x);
+    return 0;
+}
+```
+
+A struct result lives in a temporary of the caller's frame: `add(a, b).x` works, `Point q = add(a, b);` and `q = add(a, b);`
+copy it. Calling a struct-returning function through a `func` pointer is not supported.
+
+### Variable argument lists
+
+A parameter list can end in `...`. The extra arguments are read with the built-in `va_arg(i)` (the i-th extra argument, from 0)
+and counted by `va_count()`; both are only available inside such a function:
+
+```c
+int sum(int scale, ...) {
+    int total = 0;
+    for (int i = 0; i < va_count(); i++) {
+        total += va_arg(i) * scale;
+    }
+    return total;
+}
+
+// a printf-like function: put the extra arguments in an array and use vformat
+void logf(char* tag, char* fmt, ...) {
+    int args[8];
+    int n = va_count();
+    for (int i = 0; i < n; i++) args[i] = va_arg(i);
+    char buf[256];
+    vformat(buf, 256, fmt, args, n);
+    print(tag); print(": "); println(buf);
+}
+
+sum(10, 1, 2, 3);          // 60
+logf("info", "%d items", 3);
+```
+
+All extra arguments are 64-bit values (numbers, characters, pointers, doubles as bit patterns). There is no check that `i` is
+below `va_count()`. A function with `...` cannot be a method or be called through a `func` pointer.
 
 ### Function pointers
 
@@ -219,6 +274,31 @@ int main() {
 A `func` carries no signature: the arguments are not checked against the function, and the call returns an `int` (the
 function's result as a 64-bit value). Only ordinary functions have an address (not methods or built-in `__...` functions).
 `qsort`, `bsearch`, `atexit` and `signal` of the C library take `func` arguments.
+
+### `typedef`, `static` and `union`
+
+```c
+typedef int Number;                    // another name for a type (at top level or inside a function)
+typedef char* Text;
+typedef Point* PointRef;
+
+union Value {                          // all members share the same memory; the size is the largest member
+    int i;
+    char bytes[8];
+    char* text;
+}
+
+static int helper() { return 1; }      // at top level: the same as private
+int next() {
+    static int calls;                  // inside a function: keeps its value between calls
+    static int start = 100;            // optional constant initializer, set once
+    calls++;
+    return start + calls;
+}
+```
+
+A `static` local is zero-initialized (or set from its constant initializer once, before the program starts), is visible only
+in its block and may be an array (`static int table[16];`).
 
 ## 8. Structs and classes
 
@@ -587,7 +667,8 @@ The process exit code is 1; on success it is 0.
 * All variables start zeroed; `new` returns zeroed memory; `new` has no `free` (`malloc` / `free` come with `cstdlib`).
 * Functions may be used before their definition without prototypes.
 * `const NAME = value;` declares a compile-time constant.
-* No floating point *types* (the `cmath` module computes with doubles held in ints), no `unsigned`, `typedef`, `union`, bit-fields,
-  variable argument lists or preprocessor — yet. Function pointers exist as the type `func`; parameters can have default values.
-* Struct values cannot be function arguments or results.
+* No floating point *types* (the `cmath` module computes with doubles held in ints), no `unsigned`, bit-fields or preprocessor —
+  yet. Function pointers exist as the type `func`; parameters can have default values.
+* Structs can be passed and returned by value (a hidden copy), `typedef`, `union`, `static` locals, default values (also text) and
+  variadic functions (`...` with `va_arg`) exist; `unsigned` types, bit-fields and the preprocessor do not.
 * `switch` labels must be constant expressions (like C), and `case` values must fit in 32 bits.

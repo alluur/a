@@ -444,6 +444,8 @@ is_type_start_impl:
     je .yes
     cmp ecx, S_ENUM
     je .yes
+    cmp ecx, S_TYPEDEF
+    je .yes
     cmp ecx, S_MODULE
     jne .no
     ; module.Type ?  look ahead
@@ -466,6 +468,8 @@ is_type_start_impl:
     jz .la_done
     mov ecx, [rax+SYM_KIND]
     cmp ecx, S_STRUCT
+    je .la_yes
+    cmp ecx, S_TYPEDEF
     je .la_yes
     cmp ecx, S_ENUM
     jne .la_done
@@ -525,6 +529,8 @@ parse_type:
     je .struct
     cmp ecx, S_ENUM
     je .enum
+    cmp ecx, S_TYPEDEF
+    je .typedef
 .unk:
     mov edi, msg_unktype
     cmp qword [tk], T_ID
@@ -554,6 +560,10 @@ parse_type:
     mov rbx, [rax+SYM_VAL]
     shl rbx, 16
     or rbx, TY_STRUCT
+    jmp .star0
+.typedef:
+    call check_access
+    mov rbx, [rax+SYM_TYPE]
 .star0:
     call next_token
 .star:
@@ -648,6 +658,7 @@ gen_call:
     push rbx
     push r12
     push r13
+    push r14
     mov r12, rdi
     mov r13d, esi
     xor ebx, ebx
@@ -663,7 +674,18 @@ gen_call:
     jnz .push
     cmp al, TY_STRUCT
     jne .push
-    ERR "structs cannot be passed by value, pass a pointer"
+    ; a struct argument: copy it into a temporary of the caller's frame and pass the address of the copy
+    mov rdi, rax
+    call type_size
+    mov r9d, eax
+    add eax, 7
+    and eax, -8
+    add [frame_size], eax
+    mov edi, [frame_size]
+    neg edi
+    CG lea_local_b
+    mov edi, r9d
+    CG copy_mem
 .push:
     ; bool parameters are normalised to 0 / 1
     mov rax, [r12+SYM_EXTRA]
@@ -685,6 +707,20 @@ gen_call:
 .args_done:
     mov edi, ')'
     call expect
+    test dword [r12+SYM_FLAGS], F_VARIADIC
+    jz .fixedargs
+    ; variadic callee: after the arguments comes the number of extra ones
+    cmp ebx, [r12+SYM_NPAR]
+    jae .vcount
+    ERR "wrong number of arguments in call"
+.vcount:
+    mov edi, ebx
+    sub edi, [r12+SYM_NPAR]
+    CG imm_a
+    CG push_a
+    inc ebx
+    jmp .ok
+.fixedargs:
     cmp ebx, [r12+SYM_NPAR]
     je .ok
     jb .fewer
@@ -707,13 +743,44 @@ gen_call:
     jae .ok
     lea esi, [rcx+rbx]
     mov rdi, [rax+rsi*8]
+    mov rcx, rdi
+    shr rcx, 48
+    cmp ecx, 0x5A5A
+    jne .fillnum
+    mov rcx, 0x5A5A000000000000         ; a text default: its address in the data section
+    xor rdi, rcx
+    mov edx, edi
+    mov esi, R_DATA
+    CG lea_global_a
+    jmp .fillpush
+.fillnum:
     call gen_imm_a
+.fillpush:
     CG push_a
     inc ebx
     mov rax, [r12+SYM_EXTRA]
     mov ecx, [r12+SYM_NPAR]
     jmp .fill
 .ok:
+    ; a function that returns a struct: pass the address of a temporary for the result as the last argument
+    mov r14d, 0
+    mov rax, [r12+SYM_TYPE]
+    test eax, 0xFF00
+    jnz .noretst
+    cmp al, TY_STRUCT
+    jne .noretst
+    mov rdi, rax
+    call type_size
+    add eax, 7
+    and eax, -8
+    add [frame_size], eax
+    mov edi, [frame_size]
+    neg edi
+    CG lea_local_a
+    CG push_a
+    inc ebx
+    mov r14d, 1
+.noretst:
     mov rdi, r12
     call emit_call_sym
     lea edi, [rbx+r13]
@@ -721,10 +788,23 @@ gen_call:
 .noadd:
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
-    mov qword [e_lval], 0
+    mov qword [e_lval], r14                  ; a struct result is an address (the temporary)
+    pop r14
     pop r13
     pop r12
     pop rbx
+    ret
+
+; va_check: va_arg / va_count are only available in a function whose parameter list ends in ...
+va_check:
+    mov rax, [cur_func]
+    test rax, rax
+    jz .bad
+    test dword [rax+SYM_FLAGS], F_VARIADIC
+    jnz .ok
+.bad:
+    ERR "va_arg and va_count can only be used in a function declared with ..."
+.ok:
     ret
 
 ; ---- primary expressions -------------------------------------------------------
@@ -924,10 +1004,61 @@ parse_primary:
     mov qword [e_lval], 0
     jmp .out
 
+; ---- va_arg(i) and va_count(): the extra arguments of a function declared with ...
+.vaarg:
+    call va_check
+    call next_token
+    mov edi, '('
+    call expect
+    call parse_expr
+    call to_rvalue
+    mov edi, ')'
+    call expect
+    CG mov_b_a
+    mov edi, [cur_va_cnt]
+    CG load_local_a
+    CG sub
+    mov edi, [slot_bytes]
+    CG mul_imm_a
+    CG mov_b_a
+    mov edi, 16
+    CG lea_local_a
+    CG add
+    CG load8_a
+    mov qword [e_type], TY_INT
+    mov qword [e_lval], 0
+    jmp .out
+.vacount:
+    call va_check
+    call next_token
+    mov edi, '('
+    call expect
+    mov edi, ')'
+    call expect
+    mov edi, [cur_va_cnt]
+    CG load_local_a
+    mov qword [e_type], TY_INT
+    mov qword [e_lval], 0
+    jmp .out
+
 ; ---- identifiers
 .id:
     mov r13, [tk_ptr]
     mov r14d, [tk_len]
+    cmp r14d, 6
+    jne .nova1
+    cmp dword [r13], 'va_a'
+    jne .nova1
+    cmp word [r13+4], 'rg'
+    je .vaarg
+.nova1:
+    cmp r14d, 8
+    jne .nova2
+    cmp dword [r13], 'va_c'
+    jne .nova2
+    cmp dword [r13+4], 'ount'
+    je .vacount
+.nova2:
     mov rdi, r13
     mov esi, r14d
     call sym_lookup
@@ -975,6 +1106,15 @@ parse_primary:
     ERR "a type name cannot be used as a value"
 
 .local:
+    test dword [r12+SYM_FLAGS], F_BYREF
+    jz .local1
+    mov edi, [r12+SYM_VAL]
+    CG load_local_a
+    mov rax, [r12+SYM_TYPE]
+    mov [e_type], rax
+    mov qword [e_lval], 1
+    jmp .out
+.local1:
     mov rax, [code_pos]
     mov [pk_pos], rax
     mov edi, [r12+SYM_VAL]
@@ -1031,6 +1171,10 @@ parse_primary:
     jz .funcval
     ERR "only ordinary functions can be used as values"
 .funcval:
+    test dword [r12+SYM_FLAGS], F_VARIADIC
+    jz .funcval2
+    ERR "a function with ... cannot be used as a value"
+.funcval2:
     mov rdi, r12
     call emit_funcaddr_sym
     mov qword [e_type], TY_FUNC

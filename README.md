@@ -181,9 +181,9 @@ Version 0.1.0 is deliberately small. Known limitations — all of them are on th
 
 * **No floating point types** yet (`float` / `double`): the `cmath` module does IEEE 754 arithmetic and all of `<math.h>` in
   software on doubles held in ints. No `unsigned` or sized integer types.
-* Function pointers are the type `func` (no signature checking); no `union`, `typedef`, variable argument lists or
-  preprocessor (modules replace `#include`, default parameter values replace most `va_list` uses).
-* **Structs are passed and returned by pointer only** (copying with `=` works).
+* Function pointers are the type `func` (no signature checking); no bit-fields or preprocessor (modules replace `#include`).
+  `typedef`, `union`, `static` locals, structs by value, default parameter values and `...` with `va_arg` exist.
+
 * **No inheritance / virtual methods** yet; classes are structs with methods.
 * **`new` / `alloc` never free** (a bump allocator); `malloc` / `free` of the C library do.
 * **Light type checking:** pointer types convert freely; this is a systems language in the C

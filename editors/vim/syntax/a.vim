@@ -7,7 +7,7 @@ syn keyword aConditional if else switch case default
 syn keyword aRepeat      while do for
 syn keyword aStatement   break continue return
 syn keyword aStructure   struct class enum
-syn keyword aStorage     const
+syn keyword aStorage     const static typedef union
 syn keyword aAccess      public private
 syn keyword aModule      module import
 syn keyword aType        int long char byte bool void func
@@ -24,7 +24,7 @@ syn match aModuleName "\<\h\w*\ze\.\h\w*\s*("
 syn match aFunction "\<\h\w*\ze\s*("
 " built-in runtime functions
 syn match aBuiltin "\<__\(write\|read\|exit\|open\|close\|syscall\|cmdline\|winapi\|winapix\)\>"
-syn keyword aBuiltin setjmp longjmp
+syn keyword aBuiltin setjmp longjmp va_arg va_count
 " standard library
 syn keyword aStdlib print println printInt printlnInt printChar printBool printHex eprint eprintln
 syn keyword aStdlib readChar readLine atoi strlen streq strcmp strcpy strcat strdup memcpy memset
