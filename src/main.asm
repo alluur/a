@@ -79,6 +79,8 @@ bn_read:    db "__read", 0
 bn_exit:    db "__exit", 0
 bn_syscall: db "__syscall", 0
 bn_cmdline: db "__cmdline", 0
+bn_open:    db "__open", 0
+bn_close:   db "__close", 0
 s_win_init: db "__win_init_args", 0
 s_win_argv: db "__win_argv_get", 0
 
@@ -91,6 +93,8 @@ builtin_tab:
     dq bn_exit,    1, bl_lin_exit,    bl_lin_exit_end,    bl_win_exit,    bl_win_exit_end,    bl_a64_exit,    bl_a64_exit_end
     dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, 0,              0,                  bl_a64_syscall, bl_a64_syscall_end
     dq bn_cmdline, 0, bl_lin_cmdline, bl_lin_cmdline_end, bl_win_cmdline, bl_win_cmdline_end, bl_a64_cmdline, bl_a64_cmdline_end
+    dq bn_open,    2, bl_lin_open,    bl_lin_open_end,    bl_win_open,    bl_win_open_end,    bl_a64_open,    bl_a64_open_end
+    dq bn_close,   1, bl_lin_close,   bl_lin_close_end,   bl_win_close,   bl_win_close_end,   bl_a64_close,   bl_a64_close_end
     dq 0
 
 ; Linux / Android x86-64 runtime (raw syscalls). Arguments were pushed left to
@@ -133,6 +137,31 @@ bl_lin_cmdline:
     xor eax, eax
     ret
 bl_lin_cmdline_end:
+; __open(path, mode): mode 0 = read, 1 = write (create / truncate), 2 = append
+bl_lin_open:
+    mov rdi, [rsp+16]
+    mov rax, [rsp+8]
+    xor esi, esi
+    cmp rax, 1
+    jne .n1
+    mov esi, 0x241
+    jmp .go
+.n1:
+    cmp rax, 2
+    jne .go
+    mov esi, 0x441
+.go:
+    mov edx, 0x1A4
+    mov eax, 2
+    syscall
+    ret
+bl_lin_open_end:
+bl_lin_close:
+    mov rdi, [rsp+8]
+    mov eax, 3
+    syscall
+    ret
+bl_lin_close_end:
 
 ; Windows x64 runtime (kernel32 imports through the IAT)
 bl_win_cmdline:
@@ -148,11 +177,14 @@ bl_win_write:
     mov rsi, [rsp+16]
     mov rax, [rsp+24]
     mov r12, rsp
-    mov rcx, -10
-    sub rcx, rax
     sub rsp, 64
     and rsp, -16
+    cmp rax, 2
+    ja .have
+    mov rcx, -10
+    sub rcx, rax
     IATCALL IAT_GetStdHandle
+.have:
     mov rcx, rax
     mov rdx, rsi
     mov r8, rdi
@@ -169,11 +201,14 @@ bl_win_read:
     mov rsi, [rsp+16]
     mov rax, [rsp+24]
     mov r12, rsp
-    mov rcx, -10
-    sub rcx, rax
     sub rsp, 64
     and rsp, -16
+    cmp rax, 2
+    ja .have
+    mov rcx, -10
+    sub rcx, rax
     IATCALL IAT_GetStdHandle
+.have:
     mov rcx, rax
     mov rdx, rsi
     mov r8, rdi
@@ -185,6 +220,43 @@ bl_win_read:
     mov rsp, r12
     ret
 bl_win_read_end:
+bl_win_open:
+    mov rcx, [rsp+16]
+    mov rax, [rsp+8]
+    mov edx, 0x80000000
+    mov r10d, 3
+    cmp rax, 1
+    jne .n1
+    mov edx, 0x40000000
+    mov r10d, 2
+    jmp .go
+.n1:
+    cmp rax, 2
+    jne .go
+    mov edx, 4
+    mov r10d, 4
+.go:
+    mov r12, rsp
+    sub rsp, 80
+    and rsp, -16
+    mov r8d, 3
+    xor r9d, r9d
+    mov [rsp+32], r10
+    mov qword [rsp+40], 0x80
+    mov qword [rsp+48], 0
+    IATCALL IAT_CreateFileA
+    mov rsp, r12
+    ret
+bl_win_open_end:
+bl_win_close:
+    mov rcx, [rsp+8]
+    mov r12, rsp
+    sub rsp, 48
+    and rsp, -16
+    IATCALL IAT_CloseHandle
+    mov rsp, r12
+    ret
+bl_win_close_end:
 bl_win_exit:
     mov rcx, [rsp+8]
     and rsp, -16
@@ -400,6 +472,7 @@ compile_file:
     call lex_save
     mov rax, [r12+8]
     mov [src_ptr], rax
+    mov [cur_src_base], rax
     add rax, [r12+16]
     mov [src_end], rax
     mov qword [src_line], 1
@@ -1388,6 +1461,8 @@ ptmp_nlen:      resd MAXPARAM
 binprec:        resb 256
 
 err_msg:        resq 1
+cur_src_base:   resq 1
+tk_start:       resq 1
 cg_vt:          resq CGI_COUNT
 arch:           resd 1
 slot_bytes:     resd 1

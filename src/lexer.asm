@@ -271,6 +271,7 @@ next_token:
     ERR "unterminated block comment"
 
 .eof:
+    mov [tk_start], rsi
     mov qword [tk], T_EOF
     mov rax, [src_line]
     mov [tk_line], rax
@@ -280,6 +281,7 @@ next_token:
 .tok:
     mov rdx, [src_line]
     mov [tk_line], rdx
+    mov [tk_start], rsi
     cmp al, '_'
     je .ident
     mov dl, al
@@ -519,6 +521,10 @@ lex_save:
     mov [rdi+72], rax
     mov rax, [cur_file_name]
     mov [rdi+80], rax
+    mov rax, [cur_src_base]
+    mov [rdi+88], rax
+    mov rax, [tk_start]
+    mov [rdi+96], rax
     ret
 
 ; lex_restore: rsi = buffer written by lex_save
@@ -545,6 +551,10 @@ lex_restore:
     mov [cur_module], eax
     mov rax, [rsi+80]
     mov [cur_file_name], rax
+    mov rax, [rsi+88]
+    mov [cur_src_base], rax
+    mov rax, [rsi+96]
+    mov [tk_start], rax
     ret
 
 ; expect: edi = token kind. Consumes it or reports an error

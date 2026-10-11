@@ -58,8 +58,13 @@ CSTR s_colon,   ":"
 CSTR s_errsep,  ": error: "
 CSTR s_acerr,   "ac: error: "
 CSTR s_nl,      10
+CSTR s_indent,  "  "
 
-; fatal_error: edi = message (cstring). Prints "file:line: error: msg" and exits 1
+; fatal_error: edi = message (cstring). Prints
+;     file:line: error: message
+;       <the source line>
+;       <caret under the offending token>
+; and exits with status 1
 fatal_error:
     mov [err_msg], rdi
     mov rsi, [cur_file_name]
@@ -86,8 +91,94 @@ fatal_error:
     mov esi, s_nl
     mov edi, 2
     call print_cstr
+    call print_source_line
     mov edi, 1
     jmp sys_exit
+
+; print_source_line: shows the line of the current token and a caret below it
+print_source_line:
+    cmp qword [cur_file_name], 0
+    je .ret
+    mov rsi, [cur_src_base]
+    test rsi, rsi
+    jz .ret
+    mov rcx, [tk_line]
+    cmp rcx, 1
+    jbe .found
+.skip:
+    mov al, [rsi]
+    test al, al
+    jz .ret
+    inc rsi
+    cmp al, 10
+    jne .skip
+    dec rcx
+    cmp rcx, 1
+    ja .skip
+.found:
+    ; rsi = start of the line
+    mov r8, rsi
+    xor edx, edx
+.len:
+    mov al, [rsi+rdx]
+    test al, al
+    jz .lend
+    cmp al, 10
+    je .lend
+    inc rdx
+    jmp .len
+.lend:
+    test rdx, rdx
+    jz .ret
+    push r8
+    push rdx
+    mov edi, 2
+    mov esi, s_indent
+    call print_cstr
+    pop rdx
+    pop rsi
+    push rsi
+    push rdx
+    mov edi, 2
+    mov eax, SYS_WRITE
+    syscall
+    mov edi, 2
+    mov esi, s_nl
+    call print_cstr
+    pop rdx
+    pop r8
+    ; caret line: copy the line's leading whitespace (tabs) and use spaces elsewhere
+    mov rax, [tk_start]
+    sub rax, r8
+    js .ret
+    cmp rax, rdx
+    ja .ret
+    mov rdi, errbuf
+    mov byte [rdi], ' '
+    mov byte [rdi+1], ' '
+    add rdi, 2
+    xor ecx, ecx
+.pad:
+    cmp rcx, rax
+    jae .caret
+    mov bl, ' '
+    cmp byte [r8+rcx], 9
+    jne .pp
+    mov bl, 9
+.pp:
+    mov [rdi], bl
+    inc rdi
+    inc rcx
+    jmp .pad
+.caret:
+    mov byte [rdi], '^'
+    mov byte [rdi+1], 10
+    mov byte [rdi+2], 0
+    mov edi, 2
+    mov esi, errbuf
+    call print_cstr
+.ret:
+    ret
 
 ; fatal_error with the identifier currently held in tk_ptr/tk_len appended:
 ; edi = message prefix (cstring), message becomes  "<prefix> 'name'"

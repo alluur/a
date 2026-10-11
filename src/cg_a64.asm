@@ -732,6 +732,29 @@ bl_a64_syscall:
     dd 0xD4000001                   ; svc #0
     dd 0xD65F03C0
 bl_a64_syscall_end:
+bl_a64_open:
+    dd 0xF9400BE1                   ; ldr x1, [sp, #16]   path
+    dd 0xF94003E3                   ; ldr x3, [sp]        mode (0 read, 1 write, 2 append)
+    dd 0xD2800002                   ; mov x2, #0
+    dd 0xF100047F                   ; cmp x3, #1
+    dd 0x54000061                   ; b.ne +12
+    dd 0xD2804822                   ; mov x2, #0x241      O_WRONLY|O_CREAT|O_TRUNC
+    dd 0x14000004                   ; b +16
+    dd 0xF100087F                   ; cmp x3, #2
+    dd 0x54000041                   ; b.ne +8
+    dd 0xD2808822                   ; mov x2, #0x441      O_WRONLY|O_CREAT|O_APPEND
+    dd 0x92800C60                   ; mov x0, #-100       AT_FDCWD
+    dd 0xD2803483                   ; mov x3, #0644
+    dd 0xD2800708                   ; mov x8, #56         openat
+    dd 0xD4000001                   ; svc #0
+    dd 0xD65F03C0                   ; ret
+bl_a64_open_end:
+bl_a64_close:
+    dd 0xF94003E0                   ; ldr x0, [sp]
+    dd 0xD2800728                   ; mov x8, #57         close
+    dd 0xD4000001
+    dd 0xD65F03C0
+bl_a64_close_end:
 bl_a64_cmdline:
     dd 0xD2800000                   ; mov x0, #0
     dd 0xD65F03C0
