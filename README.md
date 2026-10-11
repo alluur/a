@@ -76,7 +76,7 @@ Example programs live in [`examples/`](examples/): `greet`, `calc` (interactive 
 `table`, `colors`, `wordfreq`, `clock`, `checksums`, `primes`, `jsonpretty`, `grep`, `bignum`, `dirlist`, `quiz`, `bank`, `modules`, `net_server` / `net_client` and more.
 Built-in modules: `math`, `bigint`, `decimal`, `random`, `sort`, `collections`, `strings`, `regex`, `utf8`, `json`, `csv`,
 `path`, `os`, `datetime`, `encoding`, `hash`, `cli`, `log`, `testing`, `net`, and **the C standard library** (`import clib;`):
-`ctype errno limits string stdlib stdio time math (correctly rounded libm) unistd signal locale wchar` with the C names,
+`ctype errno limits string stdlib stdio time math (correctly rounded libm) complex unistd signal locale wchar` with the C names,
 see [`docs/CLIB.md`](docs/CLIB.md).
 
 Details for every platform (adb, Termux, Wine, QEMU) are in [`docs/TARGETS.md`](docs/TARGETS.md).

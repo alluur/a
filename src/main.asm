@@ -110,6 +110,7 @@ EMB "cfloat",      "lib/cfloat.a"
 EMB "clib",        "lib/clib.a"
 EMB "clocale",     "lib/clocale.a"
 EMB "cwchar",      "lib/cwchar.a"
+EMB "ccomplex",    "lib/ccomplex.a"
 section .data
         dq 0
 section .rodata

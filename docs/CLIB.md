@@ -14,9 +14,10 @@ namespace** like the C headers do. Only the functions a program really uses end 
 | [`cstdlib`](#cstdlib) | `<stdlib.h>` | Memory allocation, number parsing, environment, processes, `qsort`. |
 | [`cstdio`](#cstdio) | `<stdio.h>` | Streams, `printf` and `scanf` families, files, pipes. |
 | [`ctime`](#ctime) | `<time.h>` | Clocks, calendar time, time zones, `strftime`. |
-| [`cmath`](#cmath) | `<math.h>` `<float.h>` | Floating point arithmetic and mathematical functions on software doubles. |
+| [`cmath`](#cmath) | `<math.h>` `<float.h>` `<fenv.h>` | Floating point arithmetic and mathematical functions on software doubles. |
 | [`cfloat`](#cfloat) | (`strtod`, `printf` conversions) | Text to double, double to text, `printf` with `%f %e %g %a`. |
 | [`cunistd`](#cunistd) | `<unistd.h>` `<sys/stat.h>` `<dirent.h>` `<fcntl.h>` `<signal.h>` `<fnmatch.h>` | POSIX files, directories, processes, signals, `getopt`. |
+| [`ccomplex`](#ccomplex) | `<complex.h>` | Complex numbers: `Complex*`, `cmplx cadd cmul cabs csqrt cexp clog csin ...`. |
 | [`clocale`](#clocale) | `<locale.h>` | The "C" locale. |
 | [`cwchar`](#cwchar) | `<wchar.h>` `<wctype.h>` | Wide characters and strings (Unicode code points in ints). |
 
@@ -35,6 +36,10 @@ Not modules because they are part of the language or the standard library that e
   functions (`dadd dsub dmul ddiv`, compare with `dlt dle deq ...`) in software, exactly rounded. Literals come from text:
   `dlit("3.14")`, `itod(3)`. The `printf` family of the standard library prints integers; **`printfd`, `sprintfd`,
   `snprintfd`, `fprintfd`, `vformatd`** (module `cfloat`) understand `%f %e %g %a` as well.
+* **Speed of the floating point functions.** Everything is done in software with integer instructions, bit-exact on every
+  platform. On a current x86-64 machine: `dadd dsub dmul ddiv` about 0.1-0.3 microseconds, `sqrt` 0.4 microseconds,
+  `sin cos exp log` 40-60 microseconds, `pow atan` 100-160 microseconds, `erf tgamma` 250-330 microseconds. That is fast enough
+  for tools, simulations with thousands of steps and plots, but not for millions of calls.
 * **Function pointers** are values of the type `func`: `func f = compare; f(a, b);`. `qsort`, `bsearch`, `atexit` and `signal`
   use them. A function called through a `func` returns an `int` and its arguments are not checked.
 * **Structs cannot be passed or returned by value.** `div` / `ldiv` return a pointer to a static `div_t`; `gmtime` /
@@ -285,6 +290,7 @@ Types: `div_t`
 | `div_t* div(int a, int b)` | quotient and remainder at once. The result is a pointer to a static div_t:  div_t* d = div(7, 2); |
 | `div_t* ldiv(int a, int b)` |  |
 | `div_t* lldiv(int a, int b)` |  |
+| `div_t* imaxdiv(int a, int b)` |  |
 | `int strtol(char* s, char** end, int base = 10)` | converts text to a number: leading white space, optional sign, base 2-36 (0 = from the prefix: 0x hex, 0 octal, otherwise decimal). *end (when not null) is set to the first character that was not used. Out of range values give the limit and set errno to ERANGE. |
 | `int strtoll(char* s, char** end, int base = 10)` |  |
 | `int strtoimax(char* s, char** end, int base = 10)` |  |
@@ -393,6 +399,8 @@ Types: `FILE`
 | `int vsnprintf(char* out, int size, char* fmt, int* args, int n)` | writes at most size-1 characters and a zero; returns the length the full result has |
 | `int sprintf(char* out, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0)` |  |
 | `int snprintf(char* out, int size, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0)` |  |
+| `int vasprintf(char** out, char* fmt, int* args, int n)` | like sprintf into a new malloc'ed buffer; *out receives it (free it with free). Returns the length, -1 on failure |
+| `int asprintf(char** out, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0)` |  |
 | `int dprintf(int fd, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0)` | printf to a raw file descriptor |
 | `int remove(char* path)` | deletes a file or an empty directory; 0 on success, -1 with errno set |
 | `int rename(char* from, char* to)` | renames or moves a file or directory (an existing destination is replaced); 0 on success, -1 with errno set |
@@ -453,7 +461,7 @@ Types: `tm`, `timespec`, `timeval`
 | `bool strncasecmp_(char* a, char* b, int n)` |  |
 
 ### cmath
-`<math.h>` `<float.h>` - Floating point arithmetic and mathematical functions on software doubles.  
+`<math.h>` `<float.h>` `<fenv.h>` - Floating point arithmetic and mathematical functions on software doubles.  
 `import cmath;`
 
 ```text
@@ -472,7 +480,7 @@ sqrt and the basic operations are exact (error 0); exp, log, sin, pow ... are co
 and rounded once, so they are within 1 ulp (nearly always correctly rounded).
 ```
 
-Constants: `INFINITY`, `HUGE_VAL`, `NAN`, `NEG_INFINITY`, `M_E`, `M_LOG2E`, `M_LOG10E`, `M_LN2`, `M_LN10`, `M_PI`, `M_PI_2`, `M_PI_4`, `M_1_PI`, `M_2_PI`, `M_2_SQRTPI`, `M_SQRT2`, `M_SQRT1_2`, `DBL_MANT_DIG`, `DBL_DIG`, `DBL_DECIMAL_DIG`, `DBL_MIN_EXP`, `DBL_MAX_EXP`, `DBL_MIN_10_EXP`, `DBL_MAX_10_EXP`, `DBL_MAX`, `DBL_MIN`, `DBL_TRUE_MIN`, `DBL_EPSILON`, `FLT_RADIX`, `FP_NAN`, `FP_INFINITE`, `FP_ZERO`, `FP_SUBNORMAL`, `FP_NORMAL`, `DD_LN2_H`, `DD_LN2_L`, `DD_LN10_H`, `DD_LN10_L`, `DD_PI_H`, `DD_PI_L`, `DD_PI2_H`, `DD_PI2_L`, `DD_PI4_H`, `DD_PI4_L`, `DD_3PI4_H`, `DD_3PI4_L`, `DD_E_H`, `DD_E_L`, `DD_SQRTPI_H`, `DD_SQRTPI_L`, `DD_2_SQRTPI_H`, `DD_2_SQRTPI_L`, `DD_HLN2PI_H`, `DD_HLN2PI_L`, `DD_SQRT2_H`, `DD_SQRT2_L`, `DD_INVLN2_H`, `DD_INVLN2_L`, `STIR1_H`, `STIR1_L`, `STIR2_H`, `STIR2_L`, `STIR3_H`, `STIR3_L`, `STIR4_H`, `STIR4_L`, `STIR5_H`, `STIR5_L`, `STIR6_H`, `STIR6_L`, `STIR7_H`, `STIR7_L`, `STIR8_H`, `STIR8_L`, `STIR9_H`, `STIR9_L`, `STIR10_H`, `STIR10_L`, `STIR11_H`, `STIR11_L`, `STIR12_H`, `STIR12_L`, `STIR13_H`, `STIR13_L`, `STIR14_H`, `STIR14_L`, `STIR15_H`, `STIR15_L`, `STIR16_H`, `STIR16_L`, `STIR17_H`, `STIR17_L`, `STIR18_H`, `STIR18_L`, `STIR19_H`, `STIR19_L`, `STIR20_H`, `STIR20_L`, `DD_EULER_H`, `DD_EULER_L`, `DD_ZETA2_H`, `DD_ZETA2_L`, `DD_ZETA3_H`, `DD_ZETA3_L`, `DD_ZETA4_H`, `DD_ZETA4_L`, `DD_ZETA5_H`, `DD_ZETA5_L`, `DD_ZETA6_H`, `DD_ZETA6_L`, `DD_ZETA7_H`, `DD_ZETA7_L`, `DD_ZETA8_H`, `DD_ZETA8_L`, `DD_ZETA9_H`, `DD_ZETA9_L`, `DD_ZETA10_H`, `DD_ZETA10_L`, `DD_ZETA11_H`, `DD_ZETA11_L`, `DD_ZETA12_H`, `DD_ZETA12_L`, `DD_ZETA13_H`, `DD_ZETA13_L`
+Constants: `INFINITY`, `HUGE_VAL`, `NAN`, `NEG_INFINITY`, `M_E`, `M_LOG2E`, `M_LOG10E`, `M_LN2`, `M_LN10`, `M_PI`, `M_PI_2`, `M_PI_4`, `M_1_PI`, `M_2_PI`, `M_2_SQRTPI`, `M_SQRT2`, `M_SQRT1_2`, `DBL_MANT_DIG`, `DBL_DIG`, `DBL_DECIMAL_DIG`, `DBL_MIN_EXP`, `DBL_MAX_EXP`, `DBL_MIN_10_EXP`, `DBL_MAX_10_EXP`, `DBL_MAX`, `DBL_MIN`, `DBL_TRUE_MIN`, `DBL_EPSILON`, `FLT_RADIX`, `FP_NAN`, `FP_INFINITE`, `FP_ZERO`, `FP_SUBNORMAL`, `FP_NORMAL`, `DD_LN2_H`, `DD_LN2_L`, `DD_LN10_H`, `DD_LN10_L`, `DD_PI_H`, `DD_PI_L`, `DD_PI2_H`, `DD_PI2_L`, `DD_PI4_H`, `DD_PI4_L`, `DD_3PI4_H`, `DD_3PI4_L`, `DD_E_H`, `DD_E_L`, `DD_SQRTPI_H`, `DD_SQRTPI_L`, `DD_2_SQRTPI_H`, `DD_2_SQRTPI_L`, `DD_HLN2PI_H`, `DD_HLN2PI_L`, `DD_SQRT2_H`, `DD_SQRT2_L`, `DD_INVLN2_H`, `DD_INVLN2_L`, `STIR1_H`, `STIR1_L`, `STIR2_H`, `STIR2_L`, `STIR3_H`, `STIR3_L`, `STIR4_H`, `STIR4_L`, `STIR5_H`, `STIR5_L`, `STIR6_H`, `STIR6_L`, `STIR7_H`, `STIR7_L`, `STIR8_H`, `STIR8_L`, `STIR9_H`, `STIR9_L`, `STIR10_H`, `STIR10_L`, `STIR11_H`, `STIR11_L`, `STIR12_H`, `STIR12_L`, `STIR13_H`, `STIR13_L`, `STIR14_H`, `STIR14_L`, `STIR15_H`, `STIR15_L`, `STIR16_H`, `STIR16_L`, `STIR17_H`, `STIR17_L`, `STIR18_H`, `STIR18_L`, `STIR19_H`, `STIR19_L`, `STIR20_H`, `STIR20_L`, `DD_EULER_H`, `DD_EULER_L`, `DD_ZETA2_H`, `DD_ZETA2_L`, `DD_ZETA3_H`, `DD_ZETA3_L`, `DD_ZETA4_H`, `DD_ZETA4_L`, `DD_ZETA5_H`, `DD_ZETA5_L`, `DD_ZETA6_H`, `DD_ZETA6_L`, `DD_ZETA7_H`, `DD_ZETA7_L`, `DD_ZETA8_H`, `DD_ZETA8_L`, `DD_ZETA9_H`, `DD_ZETA9_L`, `DD_ZETA10_H`, `DD_ZETA10_L`, `DD_ZETA11_H`, `DD_ZETA11_L`, `DD_ZETA12_H`, `DD_ZETA12_L`, `DD_ZETA13_H`, `DD_ZETA13_L`, `FE_TONEAREST`, `FE_DOWNWARD`, `FE_UPWARD`, `FE_TOWARDZERO`, `FE_INVALID`, `FE_DIVBYZERO`, `FE_OVERFLOW`, `FE_UNDERFLOW`, `FE_INEXACT`, `FE_ALL_EXCEPT`
 
 | Function | Description |
 |---|---|
@@ -547,6 +555,11 @@ Constants: `INFINITY`, `HUGE_VAL`, `NAN`, `NEG_INFINITY`, `M_E`, `M_LOG2E`, `M_L
 | `int erfc(int x)` | erfc(x) = 1 - erf(x) without losing the small result for large x |
 | `int lgamma(int x)` |  |
 | `int tgamma(int x)` |  |
+| `int fegetround()` |  |
+| `int fesetround(int mode)` | 0 if the mode is the supported one (FE_TONEAREST), nonzero otherwise |
+| `int feclearexcept(int excepts)` |  |
+| `int fetestexcept(int excepts)` |  |
+| `int feraiseexcept(int excepts)` |  |
 
 ### cfloat
 (`strtod`, `printf` conversions) - Text to double, double to text, `printf` with `%f %e %g %a`.  
@@ -661,6 +674,59 @@ Types: `Stat`, `Dirent`, `DIR`
 | `int alarm(int seconds)` | delivers a SIGALRM to the program after the given number of seconds (0 cancels); returns the seconds that were left |
 | `int pause()` | waits until a signal arrives; returns -1 with errno EINTR |
 
+### ccomplex
+`<complex.h>` - Complex numbers: `Complex*`, `cmplx cadd cmul cabs csqrt cexp clog csin ...`.  
+`import ccomplex;`
+
+```text
+ccomplex - C <complex.h>                                    import ccomplex;
+
+A complex number is a pointer to a `Complex` record with two doubles (bit patterns, see cmath). Functions that make
+a number return a new one on the heap, so expressions can be nested:
+
+    Complex* z = cmplx(dlit("3"), dlit("4"));
+    printfd("|z| = %g, z*z = %s\n", cabs(z), cstr(cmul(z, z)));     // |z| = 5, z*z = -7+24i
+
+creal cimag conj cabs carg cproj  cadd csub cmul cdiv cneg  cexp clog csqrt cpow  csin ccos ctan csinh ccosh ctanh
+casin cacos catan  cpolar  cstr. Results are accurate to a few ulp (they are built from the correctly rounded functions
+of cmath).
+```
+
+Constants: `CMPLX_ONE`
+
+Types: `Complex`
+
+| Function | Description |
+|---|---|
+| `Complex* cmplx(int re, int im)` |  |
+| `Complex* cpolar(int r, int theta)` | r * (cos theta + i sin theta) |
+| `int creal(Complex* z)` |  |
+| `int cimag(Complex* z)` |  |
+| `Complex* conj(Complex* z)` |  |
+| `Complex* cneg(Complex* z)` |  |
+| `int cabs(Complex* z)` | the modulus \|z\| |
+| `int carg(Complex* z)` | the argument (angle) in -pi ... pi |
+| `Complex* cproj(Complex* z)` |  |
+| `Complex* cadd(Complex* a, Complex* b)` |  |
+| `Complex* csub(Complex* a, Complex* b)` |  |
+| `Complex* cmul(Complex* a, Complex* b)` |  |
+| `Complex* cdiv(Complex* a, Complex* b)` | a / b (scaled to avoid overflow, Smith's algorithm) |
+| `Complex* cexp(Complex* z)` |  |
+| `Complex* clog(Complex* z)` | the principal natural logarithm |
+| `Complex* csqrt(Complex* z)` | the principal square root |
+| `Complex* cpow(Complex* a, Complex* b)` |  |
+| `Complex* csinh(Complex* z)` |  |
+| `Complex* ccosh(Complex* z)` |  |
+| `Complex* ctanh(Complex* z)` | tanh(x+iy) = (sinh 2x + i sin 2y) / (cosh 2x + cos 2y) |
+| `Complex* csin(Complex* z)` |  |
+| `Complex* ccos(Complex* z)` |  |
+| `Complex* ctan(Complex* z)` | tan(x+iy) = (sin 2x + i sinh 2y) / (cos 2x + cosh 2y) |
+| `Complex* casin(Complex* z)` | asin(z) = asin(B) + i sign(y) acosh(A) with A = (\|z+1\| + \|z-1\|) / 2 and B = x / A |
+| `Complex* cacos(Complex* z)` | acos(z) = acos(B) - i sign(y) acosh(A) |
+| `int dmax_(int a, int b)` |  |
+| `Complex* catan(Complex* z)` | atan(x+iy) = atan2(2x, 1 - x^2 - y^2) / 2 + i/4 ln((x^2 + (y+1)^2) / (x^2 + (y-1)^2)) |
+| `char* cstr(Complex* z)` | "3+4i" (shortest exact representation of both parts) |
+
 ### clocale
 `<locale.h>` - The "C" locale.  
 `import clocale;`
@@ -724,6 +790,10 @@ Constants: `WEOF`
 | `int* wmemchr(int* s, int c, int n)` |  |
 | `int wcstol(int* s, int** end, int base = 10)` | number conversion (digits are ASCII): the same rules as strtol |
 | `int wcstoul(int* s, int** end, int base = 10)` |  |
+| `int mbrtowc(int* wc, char* s, int n, int* state = null)` | restartable conversions: the state argument is ignored (UTF-8 here is stateless) |
+| `int wcrtomb(char* s, int wc, int* state = null)` |  |
+| `int wcsnlen(int* s, int max)` |  |
+| `int wcscoll(int* a, int* b)` |  |
 | `int btowc(int c)` | single byte <-> wide character (ASCII only: other bytes give WEOF / -1) |
 | `int wctob(int c)` |  |
 | `bool iswupper(int c)` | ---- classification ---------------------------------------------------------------------------------------------- |

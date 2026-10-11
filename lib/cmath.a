@@ -867,13 +867,52 @@ void __quick_two_sum(int a, int b) {
     __sl = dsub(b, dsub(s, a));
 }
 
-// p + e = a * b exactly (Dekker)
+// p + e = a * b exactly. p is the rounded product; the error e comes from the 106-bit integer product
+// (for zero, infinite or NaN operands and for results that underflow, e is 0).
 void __two_prod(int a, int b) {
     int p = dmul(a, b);
-    int ta = dmul(a, 0x41a0000002000000);        // a * (2^27 + 1)
+    int ca = __funpack(a);
+    int sa = __us;
+    int ea = __ue;
+    int ma = __um;
+    int cb = __funpack(b);
+    int sb = __us;
+    int eb = __ue;
+    int mb = __um;
+    int ap = p & 0x7FFFFFFFFFFFFFFF;
+    if (ca != __F_FINITE || cb != __F_FINITE || ap >= 0x7FF0000000000000 || ap < 0x0010000000000000) {
+        __sh = p;
+        __sl = 0;
+        return;
+    }
+    int x = ma << 10;
+    int y = mb << 11;
+    int hi = __fmulhi(x, y);
+    int lo = x * y;
+    int low64 = (hi << 43) | __fshr(lo, 21);                  // the exact product modulo 2^64
+    __funpack(p);
+    int s = __ue - (ea + eb);
+    int e = low64 - (__um << s);                               // the exact error: a signed integer, |e| <= 2^52
+    int sign = sa ^ sb;
+    __sh = p;
+    if (e == 0) {
+        __sl = 0;
+        return;
+    }
+    if (e < 0) {
+        sign = 1 - sign;
+        e = -e;
+    }
+    __sl = __fpack(sign, ea + eb, e);
+}
+
+// the same with the Dekker splitting (slow; kept for the tests)
+void __two_prod_dekker(int a, int b) {
+    int p = dmul(a, b);
+    int ta = dmul(a, 0x41A0000002000000);
     int ah = dsub(ta, dsub(ta, a));
     int al = dsub(a, ah);
-    int tb = dmul(b, 0x41a0000002000000);
+    int tb = dmul(b, 0x41A0000002000000);
     int bh = dsub(tb, dsub(tb, b));
     int bl = dsub(b, bh);
     int e = dadd(dadd(dadd(dsub(dmul(ah, bh), p), dmul(ah, bl)), dmul(al, bh)), dmul(al, bl));
@@ -894,6 +933,16 @@ void __dd_add(int ah, int al, int bh, int bl) {
     s2 = __sl;
     s2 = dadd(s2, t2);
     __quick_two_sum(s1, s2);
+    __dh = __sh;
+    __dl = __sl;
+}
+
+// a + b with a smaller error guarantee relative to |a| + |b| instead of |a + b|: fine for series without cancellation
+void __dd_add_s(int ah, int al, int bh, int bl) {
+    __two_sum(ah, bh);
+    int s = __sh;
+    int e = dadd(__sl, dadd(al, bl));
+    __quick_two_sum(s, e);
     __dh = __sh;
     __dl = __sl;
 }
@@ -981,6 +1030,36 @@ void __dd_sqrt(int ah, int al) {
     __dl = __sl;
 }
 
+// ---- tables of reciprocals (computed on first use) ---------------------------------------------------------------------
+// __rk[k] = 1/k for k = 1 ... 63 as dd; __sp[k] = 1/((2k)(2k+1)) and __cp[k] = 1/((2k-1)(2k)) for the sin / cos series
+int __rk_h[64];
+int __rk_l[64];
+int __sp_h[16];
+int __sp_l[16];
+int __cp_h[16];
+int __cp_l[16];
+bool __rk_ready;
+
+void __rk_init() {
+    if (__rk_ready) {
+        return;
+    }
+    __rk_ready = true;
+    for (int k = 1; k < 64; k++) {
+        __dd_div_d(0x3FF0000000000000, 0, itod(k));
+        __rk_h[k] = __dh;
+        __rk_l[k] = __dl;
+    }
+    for (int k = 1; k < 16; k++) {
+        __dd_div_d(0x3FF0000000000000, 0, itod((2 * k) * (2 * k + 1)));
+        __sp_h[k] = __dh;
+        __sp_l[k] = __dl;
+        __dd_div_d(0x3FF0000000000000, 0, itod((2 * k - 1) * (2 * k)));
+        __cp_h[k] = __dh;
+        __cp_l[k] = __dl;
+    }
+}
+
 // multiplies by 2^k (both parts)
 void __dd_scale(int ah, int al, int k) {
     __dh = scalbn(ah, k);
@@ -1010,8 +1089,9 @@ void __exp_dd(int xh, int xl, bool sub) {
     // expm1(s) = s (1 + s/2 (1 + s/3 (1 + ... )))
     int ah = 0x3FF0000000000000;
     int al = 0;
+    __rk_init();
     for (int n = 11; n >= 2; n--) {
-        __dd_div_d(sh, sl, itod(n));
+        __dd_mul(sh, sl, __rk_h[n], __rk_l[n]);
         __dd_mul(__dh, __dl, ah, al);
         __dd_add_d(__dh, __dl, 0x3FF0000000000000);
         ah = __dh;
@@ -1024,8 +1104,7 @@ void __exp_dd(int xh, int xl, bool sub) {
         __dd_mul(eh, el, eh, el);
         int th = __dh;
         int tl = __dl;
-        __dd_add(eh, el, eh, el);
-        __dd_add(__dh, __dl, th, tl);
+        __dd_add_s(scalbn(eh, 1), scalbn(el, 1), th, tl);
         eh = __dh;
         el = __dl;
     }
@@ -1134,15 +1213,14 @@ void __log_dd(int xh, int xl) {
     // atanh(f) = f (1 + z/3 + z^2/5 + ...)
     int th = 0x3FF0000000000000;
     int tl = 0;
-    __dd_div_d(0x3FF0000000000000, 0, itod(47));
-    th = __dh;
-    tl = __dl;
+    __rk_init();
+    th = __rk_h[47];
+    tl = __rk_l[47];
     for (int n = 22; n >= 0; n--) {
         __dd_mul(th, tl, zh, zl);
         int ph = __dh;
         int pl = __dl;
-        __dd_div_d(0x3FF0000000000000, 0, itod(2 * n + 1));
-        __dd_add(ph, pl, __dh, __dl);
+        __dd_add_s(ph, pl, __rk_h[2 * n + 1], __rk_l[2 * n + 1]);
         th = __dh;
         tl = __dl;
     }
@@ -1713,35 +1791,52 @@ int __s_l;
 int __c_h;
 int __c_l;
 
-void __sincos_dd(int rh, int rl) {
+// sin(r) and cos(r) for |r| <= ~0.8 as dd: __sin_dd leaves its result in __dh / __dl, as does __cos_dd
+void __sin_dd(int rh, int rl) {
+    __rk_init();
     __dd_mul(rh, rl, rh, rl);
     int zh = __dh;
     int zl = __dl;
-    // sin: r (1 - z/(2*3) (1 - z/(4*5) (1 - ... )))
+    // r (1 - z/(2*3) (1 - z/(4*5) (1 - ... )))
     int ah = 0x3FF0000000000000;
     int al = 0;
     for (int k = 15; k >= 1; k--) {
         __dd_mul(zh, zl, ah, al);
-        __dd_div_d(__dh, __dl, itod((2 * k) * (2 * k + 1)));
-        __dd_sub(0x3FF0000000000000, 0, __dh, __dl);
+        __dd_mul(__dh, __dl, __sp_h[k], __sp_l[k]);
+        __dd_add_s(0x3FF0000000000000, 0, dneg(__dh), dneg(__dl));
         ah = __dh;
         al = __dl;
     }
     __dd_mul(rh, rl, ah, al);
-    __s_h = __dh;
-    __s_l = __dl;
-    // cos: 1 - z/(1*2) (1 - z/(3*4) (1 - ...))
-    ah = 0x3FF0000000000000;
-    al = 0;
+}
+
+void __cos_dd(int rh, int rl) {
+    __rk_init();
+    __dd_mul(rh, rl, rh, rl);
+    int zh = __dh;
+    int zl = __dl;
+    // 1 - z/(1*2) (1 - z/(3*4) (1 - ...))
+    int ah = 0x3FF0000000000000;
+    int al = 0;
     for (int k = 15; k >= 1; k--) {
         __dd_mul(zh, zl, ah, al);
-        __dd_div_d(__dh, __dl, itod((2 * k - 1) * (2 * k)));
-        __dd_sub(0x3FF0000000000000, 0, __dh, __dl);
+        __dd_mul(__dh, __dl, __cp_h[k], __cp_l[k]);
+        __dd_add_s(0x3FF0000000000000, 0, dneg(__dh), dneg(__dl));
         ah = __dh;
         al = __dl;
     }
-    __c_h = ah;
-    __c_l = al;
+    __dh = ah;
+    __dl = al;
+}
+
+// both at once (for tan)
+void __sincos_dd(int rh, int rl) {
+    __sin_dd(rh, rl);
+    __s_h = __dh;
+    __s_l = __dl;
+    __cos_dd(rh, rl);
+    __c_h = __dh;
+    __c_l = __dl;
 }
 
 // prepares the reduction: sets __rq, __rh, __rl for |x|
@@ -1754,22 +1849,22 @@ void __trig_prepare(int x) {
     } else {
         __reduce(ax);
     }
-    __sincos_dd(__rh, __rl);
 }
 
 int sin(int x) {
     if (!isfinite(x)) { return NAN; }
     if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3E40000000000000) { return x; }
     __trig_prepare(x);
-    int h;
-    int l;
     int q = __rq;
-    if (q == 0) { h = __s_h; l = __s_l; }
-    else if (q == 1) { h = __c_h; l = __c_l; }
-    else if (q == 2) { h = dneg(__s_h); l = dneg(__s_l); }
-    else { h = dneg(__c_h); l = dneg(__c_l); }
-    __dd_add(h, l, 0, 0);
+    if ((q & 1) == 0) {
+        __sin_dd(__rh, __rl);
+    } else {
+        __cos_dd(__rh, __rl);
+    }
     int r = __dh;
+    if (q >= 2) {
+        r = dneg(r);
+    }
     if (x < 0) {
         return dneg(r);
     }
@@ -1780,21 +1875,24 @@ int cos(int x) {
     if (!isfinite(x)) { return NAN; }
     if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3E40000000000000) { return 0x3FF0000000000000; }
     __trig_prepare(x);
-    int h;
-    int l;
     int q = __rq;
-    if (q == 0) { h = __c_h; l = __c_l; }
-    else if (q == 1) { h = dneg(__s_h); l = dneg(__s_l); }
-    else if (q == 2) { h = dneg(__c_h); l = dneg(__c_l); }
-    else { h = __s_h; l = __s_l; }
-    __dd_add(h, l, 0, 0);
-    return __dh;
+    if ((q & 1) == 0) {
+        __cos_dd(__rh, __rl);
+    } else {
+        __sin_dd(__rh, __rl);
+    }
+    int r = __dh;
+    if (q == 1 || q == 2) {
+        r = dneg(r);
+    }
+    return r;
 }
 
 int tan(int x) {
     if (!isfinite(x)) { return NAN; }
     if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3E40000000000000) { return x; }
     __trig_prepare(x);
+    __sincos_dd(__rh, __rl);
     if ((__rq & 1) == 0) {
         __dd_div(__s_h, __s_l, __c_h, __c_l);
     } else {
@@ -1946,15 +2044,14 @@ void __atan_dd(int th, int tl) {
     int zh = __dh;
     int zl = __dl;
     // atan(t) = t (1/1 - z/3 + z^2/5 - ...)
-    __dd_div_d(0x3FF0000000000000, 0, itod(31));
-    int ah = __dh;
-    int al = __dl;
+    __rk_init();
+    int ah = __rk_h[31];
+    int al = __rk_l[31];
     for (int n = 14; n >= 0; n--) {
         __dd_mul(zh, zl, ah, al);
         int ph = __dh;
         int pl = __dl;
-        __dd_div_d(0x3FF0000000000000, 0, itod(2 * n + 1));
-        __dd_sub(__dh, __dl, ph, pl);
+        __dd_sub(__rk_h[2 * n + 1], __rk_l[2 * n + 1], ph, pl);
         ah = __dh;
         al = __dl;
     }
@@ -2298,14 +2395,10 @@ int erfc(int x) {
 void __sinpi_dd(int f) {
     if (dle(f, 0x3FD0000000000000)) {
         __dd_mul_d(DD_PI_H, DD_PI_L, f);
-        __sincos_dd(__dh, __dl);
-        __dh = __s_h;
-        __dl = __s_l;
+        __sin_dd(__dh, __dl);
     } else {
         __dd_mul_d(DD_PI_H, DD_PI_L, dsub(0x3FE0000000000000, f));
-        __sincos_dd(__dh, __dl);
-        __dh = __c_h;
-        __dl = __c_l;
+        __cos_dd(__dh, __dl);
     }
 }
 
@@ -2479,4 +2572,42 @@ int tgamma(int x) {
         return dneg(r);
     }
     return r;
+}
+
+// ---- <fenv.h> -----------------------------------------------------------------------------------------------------------------
+// The arithmetic always rounds to nearest (ties to even) and does not record exception flags; these functions exist so that
+// code written for <fenv.h> compiles and sees the default environment.
+const FE_TONEAREST = 0;
+const FE_DOWNWARD = 1;
+const FE_UPWARD = 2;
+const FE_TOWARDZERO = 3;
+const FE_INVALID = 1;
+const FE_DIVBYZERO = 4;
+const FE_OVERFLOW = 8;
+const FE_UNDERFLOW = 16;
+const FE_INEXACT = 32;
+const FE_ALL_EXCEPT = 61;
+
+int fegetround() {
+    return FE_TONEAREST;
+}
+
+// 0 if the mode is the supported one (FE_TONEAREST), nonzero otherwise
+int fesetround(int mode) {
+    if (mode == FE_TONEAREST) {
+        return 0;
+    }
+    return 1;
+}
+
+int feclearexcept(int excepts) {
+    return 0;
+}
+
+int fetestexcept(int excepts) {
+    return 0;
+}
+
+int feraiseexcept(int excepts) {
+    return 0;
 }

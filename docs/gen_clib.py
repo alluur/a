@@ -14,9 +14,10 @@ MODULES = [
  ('cstdlib', '<stdlib.h>', 'Memory allocation, number parsing, environment, processes, `qsort`.'),
  ('cstdio', '<stdio.h>', 'Streams, `printf` and `scanf` families, files, pipes.'),
  ('ctime', '<time.h>', 'Clocks, calendar time, time zones, `strftime`.'),
- ('cmath', '<math.h> <float.h>', 'Floating point arithmetic and mathematical functions on software doubles.'),
+ ('cmath', '<math.h> <float.h> <fenv.h>', 'Floating point arithmetic and mathematical functions on software doubles.'),
  ('cfloat', '(`strtod`, `printf` conversions)', 'Text to double, double to text, `printf` with `%f %e %g %a`.'),
  ('cunistd', '<unistd.h> <sys/stat.h> <dirent.h> <fcntl.h> <signal.h> <fnmatch.h>', 'POSIX files, directories, processes, signals, `getopt`.'),
+ ('ccomplex', '<complex.h>', 'Complex numbers: `Complex*`, `cmplx cadd cmul cabs csqrt cexp clog csin ...`.'),
  ('clocale', '<locale.h>', 'The "C" locale.'),
  ('cwchar', '<wchar.h> <wctype.h>', 'Wide characters and strings (Unicode code points in ints).'),
 ]
@@ -76,6 +77,10 @@ Not modules because they are part of the language or the standard library that e
   functions (`dadd dsub dmul ddiv`, compare with `dlt dle deq ...`) in software, exactly rounded. Literals come from text:
   `dlit("3.14")`, `itod(3)`. The `printf` family of the standard library prints integers; **`printfd`, `sprintfd`,
   `snprintfd`, `fprintfd`, `vformatd`** (module `cfloat`) understand `%f %e %g %a` as well.
+* **Speed of the floating point functions.** Everything is done in software with integer instructions, bit-exact on every
+  platform. On a current x86-64 machine: `dadd dsub dmul ddiv` about 0.1-0.3 microseconds, `sqrt` 0.4 microseconds,
+  `sin cos exp log` 40-60 microseconds, `pow atan` 100-160 microseconds, `erf tgamma` 250-330 microseconds. That is fast enough
+  for tools, simulations with thousands of steps and plots, but not for millions of calls.
 * **Function pointers** are values of the type `func`: `func f = compare; f(a, b);`. `qsort`, `bsearch`, `atexit` and `signal`
   use them. A function called through a `func` returns an `int` and its arguments are not checked.
 * **Structs cannot be passed or returned by value.** `div` / `ldiv` return a pointer to a static `div_t`; `gmtime` /

@@ -496,7 +496,7 @@ code only to programs that import them, and a file of the same name next to your
 | `cli` | class `ArgParser`: `addFlag addOption parse flag option optionInt positional positionalCount printHelp` (short, long, `--x=value`, combined `-abc`) |
 | `log` | leveled logging with timestamps and colours: `debug info warn error` (+ `f` variants), `setLevel setFd setTimestamps` |
 | `testing` | `assertEq assertStrEq check summary` for unit tests |
-| `clib` (and `cctype climits cerrno cassert cstring cstdlib cstdio ctime cunistd cmath cfloat clocale cwchar`) | the C standard library, see [12c](#12c-the-c-library) and [CLIB.md](CLIB.md) |
+| `clib` (and `cctype climits cerrno cassert cstring cstdlib cstdio ctime cunistd cmath cfloat ccomplex clocale cwchar`) | the C standard library, see [12c](#12c-the-c-library) and [CLIB.md](CLIB.md) |
 | `net` | TCP networking, see [12a](#12a-networking) |
 
 ```c
@@ -524,7 +524,7 @@ Notes: collections never free memory (see section 11), `StrMap` copies its keys,
 `import clib;` provides the C standard library with its C names and behaviour (`<ctype.h> <errno.h> <limits.h> <locale.h>
 <math.h> <setjmp.h> <signal.h> <stdio.h> <stdlib.h> <string.h> <time.h> <wchar.h>` and parts of `<unistd.h>`,
 `<sys/stat.h>`, `<dirent.h>`): `malloc free`, `fopen fgets fprintf sscanf popen`, `strtol getenv system qsort`,
-`strstr strtok memmove`, `time localtime strftime mktime`, `stat opendir getopt`, and all of `<math.h>` — `sqrt sin cos pow exp
+`strstr strtok memmove`, `time localtime strftime mktime`, `stat opendir getopt`, `<complex.h>`, and all of `<math.h>` — `sqrt sin cos pow exp
 log erf tgamma ...` with **correctly rounded** results — and more. The modules (`cstring`, `cstdio`, `cmath` ...) can also be
 imported one at a time. A has no floating point types, so a `double` is an `int` holding the IEEE 754 bit pattern and the
 operations are functions (`dadd`, `dmul`, `sqrt`), printed with `printfd("%.3f", x)`. Everything is documented in
