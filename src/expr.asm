@@ -673,7 +673,32 @@ gen_call:
     call expect
     cmp ebx, [r12+SYM_NPAR]
     je .ok
+    jb .fewer
     ERR "wrong number of arguments in call"
+.fewer:
+    ; fewer arguments than parameters: the missing ones need default values
+    mov rax, [r12+SYM_EXTRA]
+    test rax, rax
+    jnz .hasdef
+    ERR "wrong number of arguments in call"
+.hasdef:
+    mov ecx, [r12+SYM_NPAR]
+    lea edx, [rcx*2]
+    mov edx, [rax+rdx*8]
+    cmp ebx, edx
+    jae .fill
+    ERR "wrong number of arguments in call"
+.fill:
+    cmp ebx, ecx
+    jae .ok
+    lea esi, [rcx+rbx]
+    mov rdi, [rax+rsi*8]
+    call gen_imm_a
+    CG push_a
+    inc ebx
+    mov rax, [r12+SYM_EXTRA]
+    mov ecx, [r12+SYM_NPAR]
+    jmp .fill
 .ok:
     mov rdi, r12
     call emit_call_sym

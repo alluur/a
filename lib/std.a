@@ -44,7 +44,18 @@ void memset(char* dst, int value, int n) {
 }
 
 // ---- process ------------------------------------------------------------------
+// Output streams with a write buffer (see the cstdio module) register themselves here: the first three
+// words of each record are { handle, buffer address, bytes waiting }. exit writes out what is still waiting.
+int* __wreg[64];
+
 void exit(int code) {
+    for (int i = 0; i < 64; i++) {
+        int* r = __wreg[i];
+        if (r != null && r[2] > 0) {
+            __write(r[0], (char*) r[1], r[2]);
+            r[2] = 0;
+        }
+    }
     __exit(code);
 }
 
@@ -557,112 +568,295 @@ void hexToStr(int n, char* buf) {
 }
 
 // ---- formatted output -------------------------------------------------------------------------------------
-// format(out, max, fmt, a, b, c, d): printf style formatting into a buffer, returns the length.
-//   %d  number    %x  hex    %c  character    %s  string    %%  percent sign
-//   a width such as %5d or %-8s pads with spaces, %05d pads numbers with zeros
-// Up to four values; pass 0 for unused ones (text arguments are passed as they are).
-int format(char* out, int max, char* fmt, int a, int b, int c, int d) {
-    int args[4];
-    args[0] = a;
-    args[1] = b;
-    args[2] = c;
-    args[3] = d;
+// vformat(out, max, fmt, args, nargs): printf style formatting of an array of values into a buffer.
+// Returns the length the complete text has (like C's snprintf); at most max-1 characters are stored
+// and the text is always NUL terminated.
+//   flags       -  left-align   0  zero padding   +  always a sign   space  space for positive   #  0x / 0 / 0b prefix
+//   width       digits or *     precision  .digits or .*  (minimum digits for numbers, maximum length for %s)
+//   length      h hh l ll z j t are accepted; h and hh narrow the value, everything else is 64 bits
+//   conversions d i  signed decimal     u  unsigned decimal     x X  hex     o  octal     b  binary
+//               c  character    s  string    p  pointer    %  percent sign
+// Every value is one 64-bit slot of args (text and pointers are passed as their address).
+// (For %f %e %g use printfd / sprintfd from the cmath module.)
+void __fmt_put(char* out, int max, int pos, int ch) {
+    if (pos < max - 1) {
+        out[pos] = ch;
+    }
+}
+
+// digits of v (taken as an unsigned 64-bit number) written backwards so that the last digit is buf[end-1];
+// returns the index of the first digit
+int __fmt_digits(char* buf, int end, int v, int base, bool upper) {
+    int i = end;
+    if (v == 0) {
+        i--;
+        buf[i] = '0';
+        return i;
+    }
+    while (v != 0) {
+        int q;
+        int r;
+        if (v > 0) {
+            q = v / base;
+            r = v - q * base;
+        } else {
+            q = (((v >> 1) & 0x7FFFFFFFFFFFFFFF) / base) << 1;
+            r = v - q * base;
+            if (r >= base) {
+                q++;
+                r = r - base;
+            }
+        }
+        i--;
+        if (r < 10) {
+            buf[i] = '0' + r;
+        } else if (upper) {
+            buf[i] = 'A' + r - 10;
+        } else {
+            buf[i] = 'a' + r - 10;
+        }
+        v = q;
+    }
+    return i;
+}
+
+int vformat(char* out, int max, char* fmt, int* args, int nargs) {
     int ai = 0;
     int o = 0;
     int i = 0;
-    char tmp[24];
-    while (fmt[i] != 0 && o < max - 1) {
+    char dig[72];
+    while (fmt[i] != 0) {
         if (fmt[i] != '%') {
-            out[o] = fmt[i];
+            __fmt_put(out, max, o, fmt[i]);
             o++;
             i++;
             continue;
         }
+        int start = i;
         i++;
-        if (fmt[i] == '%') {
-            out[o] = '%';
-            o++;
-            i++;
-            continue;
-        }
         bool left = false;
         bool zero = false;
+        bool plus = false;
+        bool space = false;
+        bool alt = false;
+        bool again = true;
+        while (again) {
+            char f = fmt[i];
+            if (f == '-') { left = true; }
+            else if (f == '0') { zero = true; }
+            else if (f == '+') { plus = true; }
+            else if (f == ' ') { space = true; }
+            else if (f == '#') { alt = true; }
+            else { again = false; }
+            if (again) { i++; }
+        }
         int width = 0;
-        if (fmt[i] == '-') {
-            left = true;
+        if (fmt[i] == '*') {
+            if (ai < nargs) { width = args[ai]; }
+            ai++;
             i++;
+            if (width < 0) {
+                left = true;
+                width = -width;
+            }
+        } else {
+            while (isDigit(fmt[i])) {
+                width = width * 10 + (fmt[i] - '0');
+                i++;
+            }
         }
-        if (fmt[i] == '0') {
-            zero = true;
+        int prec = -1;
+        if (fmt[i] == '.') {
             i++;
+            prec = 0;
+            if (fmt[i] == '*') {
+                if (ai < nargs) { prec = args[ai]; }
+                ai++;
+                i++;
+            } else {
+                while (isDigit(fmt[i])) {
+                    prec = prec * 10 + (fmt[i] - '0');
+                    i++;
+                }
+            }
         }
-        while (isDigit(fmt[i])) {
-            width = width * 10 + (fmt[i] - '0');
-            i++;
+        int narrow = 0;
+        again = true;
+        while (again) {
+            char m = fmt[i];
+            if (m == 'h') { narrow = narrow + 1; }
+            else if (m == 'l' || m == 'L' || m == 'z' || m == 'j' || m == 't' || m == 'q') { narrow = 0; }
+            else { again = false; }
+            if (again) { i++; }
         }
         char t = fmt[i];
         if (t == 0) {
+            // incomplete specification at the end: print it as it is
+            for (int k = start; k < i; k++) {
+                __fmt_put(out, max, o, fmt[k]);
+                o++;
+            }
             break;
         }
         i++;
-        int v = 0;
-        if (ai < 4) {
-            v = args[ai];
+        if (t == '%') {
+            __fmt_put(out, max, o, '%');
+            o++;
+            continue;
         }
-        ai++;
-        char* s = tmp;
-        if (t == 'd') {
-            intToStr(v, tmp);
-        } else if (t == 'x') {
-            hexToStr(v, tmp);
+        int v = 0;
+        if (t == 'd' || t == 'i' || t == 'u' || t == 'x' || t == 'X' || t == 'o' || t == 'b' || t == 'c' || t == 's' || t == 'p') {
+            if (ai < nargs) { v = args[ai]; }
+            ai++;
+        }
+        // ---- pieces of the field: sign/prefix, zeros, body ----
+        char sgn[4];
+        int nsgn = 0;
+        int nzero = 0;
+        char* body = &dig[0];
+        int blen = 0;
+        bool numeric = false;
+        bool octfix = false;
+        if (t == 'd' || t == 'i') {
+            numeric = true;
+            if (narrow >= 2) { v = (v << 56) >> 56; }
+            else if (narrow == 1) { v = (v << 48) >> 48; }
+            bool neg = v < 0;
+            if (neg) { v = -v; }
+            if (neg) { sgn[nsgn] = '-'; nsgn++; }
+            else if (plus) { sgn[nsgn] = '+'; nsgn++; }
+            else if (space) { sgn[nsgn] = ' '; nsgn++; }
+            int st = __fmt_digits(&dig[0], 72, v, 10, false);
+            body = &dig[st];
+            blen = 72 - st;
+            if (prec == 0 && v == 0) { blen = 0; }
+        } else if (t == 'u' || t == 'x' || t == 'X' || t == 'o' || t == 'b' || t == 'p') {
+            numeric = true;
+            if (narrow >= 2) { v = v & 0xFF; }
+            else if (narrow == 1) { v = v & 0xFFFF; }
+            int base = 10;
+            if (t == 'x' || t == 'X' || t == 'p') { base = 16; }
+            else if (t == 'o') { base = 8; }
+            else if (t == 'b') { base = 2; }
+            if (t == 'p') {
+                alt = true;
+                if (v == 0) {
+                    numeric = false;
+                    body = "(nil)";
+                    blen = 5;
+                }
+            }
+            if (numeric) {
+                int st = __fmt_digits(&dig[0], 72, v, base, t == 'X');
+                body = &dig[st];
+                blen = 72 - st;
+                if (prec == 0 && v == 0) { blen = 0; }
+                if (alt && v != 0 && base == 16) {
+                    sgn[nsgn] = '0'; nsgn++;
+                    if (t == 'X') { sgn[nsgn] = 'X'; } else { sgn[nsgn] = 'x'; }
+                    nsgn++;
+                } else if (alt && v != 0 && base == 2) {
+                    sgn[nsgn] = '0'; nsgn++;
+                    sgn[nsgn] = 'b'; nsgn++;
+                } else if (alt && base == 8 && (blen == 0 || body[0] != '0')) {
+                    octfix = true;
+                }
+            }
         } else if (t == 'c') {
-            tmp[0] = v;
-            tmp[1] = 0;
+            dig[0] = v;
+            body = &dig[0];
+            blen = 1;
         } else if (t == 's') {
-            s = (char*) v;
+            body = (char*) v;
             if (v == 0) {
-                s = "(null)";
+                body = "(null)";
+            }
+            blen = 0;
+            while (body[blen] != 0 && (prec < 0 || blen < prec)) {
+                blen++;
             }
         } else {
-            tmp[0] = '%';
-            tmp[1] = t;
-            tmp[2] = 0;
-            ai--;
+            // unknown conversion: print the specification unchanged
+            for (int k = start; k < i; k++) {
+                __fmt_put(out, max, o, fmt[k]);
+                o++;
+            }
+            continue;
         }
-        int len = strlen(s);
+        if (numeric && prec > blen) {
+            nzero = prec - blen;
+        }
+        if (octfix && nzero == 0) {
+            nzero = 1;
+        }
+        int len = nsgn + nzero + blen;
         int pad = width - len;
-        if (pad < 0) {
-            pad = 0;
-        }
-        if (!left) {
-            while (pad > 0 && o < max - 1) {
-                if (zero) {
-                    out[o] = '0';
-                } else {
-                    out[o] = ' ';
-                }
+        if (pad < 0) { pad = 0; }
+        if (!left && !(zero && numeric && prec < 0)) {
+            while (pad > 0) {
+                __fmt_put(out, max, o, ' ');
                 o++;
                 pad--;
             }
         }
-        for (int k = 0; k < len && o < max - 1; k++) {
-            out[o] = s[k];
+        for (int k = 0; k < nsgn; k++) {
+            __fmt_put(out, max, o, sgn[k]);
             o++;
         }
-        while (pad > 0 && o < max - 1) {
-            out[o] = ' ';
+        if (!left && zero && numeric && prec < 0) {
+            while (pad > 0) {
+                __fmt_put(out, max, o, '0');
+                o++;
+                pad--;
+            }
+        }
+        for (int k = 0; k < nzero; k++) {
+            __fmt_put(out, max, o, '0');
+            o++;
+        }
+        for (int k = 0; k < blen; k++) {
+            __fmt_put(out, max, o, body[k]);
+            o++;
+        }
+        while (pad > 0) {
+            __fmt_put(out, max, o, ' ');
             o++;
             pad--;
         }
     }
-    out[o] = 0;
+    if (max > 0) {
+        if (o < max - 1) {
+            out[o] = 0;
+        } else {
+            out[max - 1] = 0;
+        }
+    }
     return o;
 }
 
-// printf("%s is %d years old\n", name, age, 0, 0)
-void printf(char* fmt, int a, int b, int c, int d) {
+// format(out, max, fmt, a, b, ...): vformat with up to eight values (unused ones can be left out);
+// returns the number of characters stored.
+int format(char* out, int max, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
+    int args[8];
+    args[0] = a;
+    args[1] = b;
+    args[2] = c;
+    args[3] = d;
+    args[4] = e;
+    args[5] = f;
+    args[6] = g;
+    args[7] = h;
+    int n = vformat(out, max, fmt, &args[0], 8);
+    if (n > max - 1) {
+        n = max - 1;
+    }
+    return n;
+}
+
+// printf("%s is %d years old\n", name, age)   - up to eight values, text is passed as it is
+void printf(char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
     char buf[2048];
-    format(&buf[0], 2048, fmt, a, b, c, d);
+    format(&buf[0], 2048, fmt, a, b, c, d, e, f, g, h);
     print(buf);
 }
 
@@ -849,12 +1043,51 @@ bool makeDir(char* path) {
 char __heap[64 * 1024 * 1024];
 int __heap_pos;
 
-// returns zeroed memory; it is never freed
-char* alloc(int size) {
-    size = (size + 15) & ~15;
-    if (__heap_pos + size > 64 * 1024 * 1024) {
+// Memory beyond the built-in 64 MiB region comes from the operating system (mmap / VirtualAlloc) in big chunks.
+char* __heap_extra;
+int __heap_extra_left;
+
+char* __alloc_more(int size) {
+    if (size < 0 || size > 0x3FFFFFFFFFFF) {
         eprintln("fatal: out of memory");
         exit(1);
+    }
+    if (size > __heap_extra_left) {
+        int chunk = 64 * 1024 * 1024;
+        if (size > chunk) {
+            chunk = (size + 0xFFFFF) & ~0xFFFFF;
+        }
+        int p;
+        if (__OS == 1) {
+            p = __winapi(34, 0, chunk, 0x3000, 4);        // VirtualAlloc(MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+        } else {
+            int nr = 9;
+            if (__ARCH == 1) {
+                nr = 222;
+            }
+            p = __syscall(nr, 0, chunk, 3, 0x22, -1, 0);  // mmap(PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS)
+            if (p < 0 && p > -4096) {
+                p = 0;
+            }
+        }
+        if (p == 0) {
+            eprintln("fatal: out of memory");
+            exit(1);
+        }
+        __heap_extra = (char*) p;
+        __heap_extra_left = chunk;
+    }
+    char* r = __heap_extra;
+    __heap_extra = &r[size];
+    __heap_extra_left = __heap_extra_left - size;
+    return r;
+}
+
+// returns zeroed memory; it is never freed (the cstdlib module has malloc / free)
+char* alloc(int size) {
+    size = (size + 15) & ~15;
+    if (size < 0 || __heap_pos + size > 64 * 1024 * 1024) {
+        return __alloc_more(size);
     }
     char* p = &__heap[__heap_pos];
     __heap_pos = __heap_pos + size;

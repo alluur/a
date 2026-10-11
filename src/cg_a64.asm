@@ -847,6 +847,26 @@ bl_a64_fail:
     dd 0x92800000                   ; mov x0, #-1
     dd 0xD65F03C0                   ; ret
 bl_a64_fail_end:
+bl_a64_setjmp:
+    dd 0xF94003E0                   ; ldr x0, [sp]
+    dd 0xF900001D                   ; str x29, [x0]
+    dd 0x910003E1                   ; mov x1, sp
+    dd 0xF9000401                   ; str x1, [x0, #8]
+    dd 0xF900081E                   ; str x30, [x0, #16]
+    dd 0xD2800000                   ; mov x0, #0
+    dd 0xD65F03C0                   ; ret
+bl_a64_setjmp_end:
+bl_a64_longjmp:
+    dd 0xF94003E0                   ; ldr x0, [sp]         value
+    dd 0xF9400BE1                   ; ldr x1, [sp, #16]    buffer
+    dd 0xB5000040                   ; cbnz x0, +8
+    dd 0xD2800020                   ; mov x0, #1
+    dd 0xF940003D                   ; ldr x29, [x1]
+    dd 0xF9400422                   ; ldr x2, [x1, #8]
+    dd 0xF940083E                   ; ldr x30, [x1, #16]
+    dd 0x9100005F                   ; mov sp, x2
+    dd 0xD61F03C0                   ; br x30
+bl_a64_longjmp_end:
 bl_a64_cmdline:
     dd 0xD2800000                   ; mov x0, #0
     dd 0xD65F03C0

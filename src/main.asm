@@ -96,6 +96,18 @@ EMB "log",         "lib/log.a"
 EMB "testing",     "lib/testing.a"
 EMB "cli",         "lib/cli.a"
 EMB "json",        "lib/json.a"
+EMB "cctype",      "lib/cctype.a"
+EMB "climits",     "lib/climits.a"
+EMB "cerrno",      "lib/cerrno.a"
+EMB "cassert",     "lib/cassert.a"
+EMB "cstring",     "lib/cstring.a"
+EMB "cstdlib",     "lib/cstdlib.a"
+EMB "cstdio",      "lib/cstdio.a"
+EMB "ctime",       "lib/ctime.a"
+EMB "cunistd",     "lib/cunistd.a"
+EMB "cmath",       "lib/cmath.a"
+EMB "cfloat",      "lib/cfloat.a"
+EMB "clib",        "lib/clib.a"
 section .data
         dq 0
 section .rodata
@@ -113,7 +125,7 @@ std_src_end:
 %define IAT_CloseHandle     5
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
-%define IAT_K32             21
+%define IAT_K32             39
 %define IAT_SLOTS           (IAT_K32 + 1 + 9 + 1)   ; kernel32 + null + ws2_32 + null
 
 bn_write:   db "__write", 0
@@ -123,6 +135,9 @@ bn_syscall: db "__syscall", 0
 bn_cmdline: db "__cmdline", 0
 bn_open:    db "__open", 0
 bn_winapi:  db "__winapi", 0
+bn_winapix: db "__winapix", 0
+bn_setjmp:  db "setjmp", 0
+bn_longjmp: db "longjmp", 0
 s_os_name:  db "__OS", 0
 s_arch_name: db "__ARCH", 0
 bn_close:   db "__close", 0
@@ -138,6 +153,9 @@ builtin_tab:
     dq bn_exit,    1, bl_lin_exit,    bl_lin_exit_end,    bl_win_exit,    bl_win_exit_end,    bl_a64_exit,    bl_a64_exit_end
     dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, bl_win_fail,    bl_win_fail_end,    bl_a64_syscall, bl_a64_syscall_end
     dq bn_winapi,  5, bl_lin_fail,    bl_lin_fail_end,    bl_win_winapi,  bl_win_winapi_end,  bl_a64_fail,    bl_a64_fail_end
+    dq bn_winapix, 11, bl_lin_fail,   bl_lin_fail_end,    bl_win_winapix, bl_win_winapix_end, bl_a64_fail,    bl_a64_fail_end
+    dq bn_setjmp,  1, bl_lin_setjmp,  bl_lin_setjmp_end,  bl_lin_setjmp,  bl_lin_setjmp_end,  bl_a64_setjmp,  bl_a64_setjmp_end
+    dq bn_longjmp, 2, bl_lin_longjmp, bl_lin_longjmp_end, bl_lin_longjmp, bl_lin_longjmp_end, bl_a64_longjmp, bl_a64_longjmp_end
     dq bn_cmdline, 0, bl_lin_cmdline, bl_lin_cmdline_end, bl_win_cmdline, bl_win_cmdline_end, bl_a64_cmdline, bl_a64_cmdline_end
     dq bn_open,    2, bl_lin_open,    bl_lin_open_end,    bl_win_open,    bl_win_open_end,    bl_a64_open,    bl_a64_open_end
     dq bn_close,   1, bl_lin_close,   bl_lin_close_end,   bl_win_close,   bl_win_close_end,   bl_a64_close,   bl_a64_close_end
@@ -202,10 +220,61 @@ bl_win_winapi:
     mov rsp, r12
     ret
 bl_win_winapi_end:
+; __winapix(index, a1 .. a10): like __winapi but with up to ten arguments (stack arguments a5..a10)
+bl_win_winapix:
+    mov r12, rsp
+    sub rsp, 112
+    and rsp, -16
+    mov rax, [r12+48]
+    mov [rsp+32], rax
+    mov rax, [r12+40]
+    mov [rsp+40], rax
+    mov rax, [r12+32]
+    mov [rsp+48], rax
+    mov rax, [r12+24]
+    mov [rsp+56], rax
+    mov rax, [r12+16]
+    mov [rsp+64], rax
+    mov rax, [r12+8]
+    mov [rsp+72], rax
+    mov rcx, [r12+80]
+    mov rdx, [r12+72]
+    mov r8,  [r12+64]
+    mov r9,  [r12+56]
+    mov rax, [r12+88]
+    IATLEA
+    db 0x41, 0xFF, 0x14, 0xC2
+    mov rsp, r12
+    ret
+bl_win_winapix_end:
 bl_lin_cmdline:
     xor eax, eax
     ret
 bl_lin_cmdline_end:
+; setjmp(buf): saves the frame pointer, the stack pointer after the return and the return address in buf[0..2];
+; returns 0. longjmp(buf, val) makes that setjmp call return val (1 if val is 0) again.
+; (the same code for Linux, Android and Windows: the generated code keeps no state in other registers)
+bl_lin_setjmp:
+    mov rax, [rsp+8]
+    mov [rax], rbp
+    lea rdx, [rsp+8]
+    mov [rax+8], rdx
+    mov rdx, [rsp]
+    mov [rax+16], rdx
+    xor eax, eax
+    ret
+bl_lin_setjmp_end:
+bl_lin_longjmp:
+    mov rax, [rsp+8]
+    mov rdx, [rsp+16]
+    test rax, rax
+    jnz .v
+    mov eax, 1
+.v: mov rbp, [rdx]
+    mov rcx, [rdx+16]
+    mov rsp, [rdx+8]
+    jmp rcx
+bl_lin_longjmp_end:
 ; __open(path, mode): mode 0 = read, 1 = write (create / truncate), 2 = append
 bl_lin_open:
     mov rdi, [rsp+16]
@@ -357,8 +426,26 @@ imp_names:
     db "FindFirstFileA", 0      ; slot 18
     db "FindNextFileA", 0       ; slot 19
     db "FindClose", 0           ; slot 20
+    db "SetFilePointerEx", 0    ; slot 21
+    db "SetCurrentDirectoryA", 0 ; slot 22
+    db "RemoveDirectoryA", 0    ; slot 23
+    db "GetCurrentProcessId", 0 ; slot 24
+    db "GetFileAttributesA", 0  ; slot 25
+    db "MoveFileExA", 0         ; slot 26
+    db "SetEndOfFile", 0        ; slot 27
+    db "FlushFileBuffers", 0    ; slot 28
+    db "GetFileSizeEx", 0       ; slot 29
+    db "CreateProcessA", 0      ; slot 30
+    db "WaitForSingleObject", 0 ; slot 31
+    db "GetExitCodeProcess", 0  ; slot 32
+    db "GetFileAttributesExA", 0 ; slot 33
+    db "VirtualAlloc", 0        ; slot 34
+    db "GetFullPathNameA", 0    ; slot 35
+    db "SetEnvironmentVariableA", 0 ; slot 36
+    db "CreatePipe", 0          ; slot 37
+    db "SetHandleInformation", 0 ; slot 38
     db 0
-; WS2_32.DLL imports: slots 22..30 (slot 21 is the null terminator of the kernel32 list)
+; WS2_32.DLL imports: slots 40..48 (slot 39 is the null terminator of the kernel32 list)
 imp_names_ws2:
     db "WSAStartup", 0
     db "socket", 0
@@ -1696,6 +1783,7 @@ loop_stack:     resb MAXLOOP * 32
 case_val:       resq 1024
 case_pos:       resq 1024
 ptmp_type:      resq MAXPARAM
+ptmp_def:       resq MAXPARAM
 ptmp_name:      resq MAXPARAM
 ptmp_nlen:      resd MAXPARAM
 binprec:        resb 256
@@ -1756,6 +1844,7 @@ frame_size:     resd 1
 loop_sp:        resd 1
 case_sp:        resd 1
 ptmp_count:     resd 1
+ptmp_nreq:      resd 1
 agg_vis:        resd 1
 agg_mnlen:      resd 1
 agg_isctor:     resd 1

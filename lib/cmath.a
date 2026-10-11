@@ -1,0 +1,2482 @@
+// =============================================================================
+//  cmath - C <math.h> and <float.h> for A                      import cmath;
+//
+//  A has no floating point types, so a `double` is an `int` that holds the 64-bit IEEE 754 bit pattern
+//  of the number. Every operation is done in software, exactly rounded like on a CPU (round to nearest even),
+//  and works the same on every platform. Names are the C names: sqrt, sin, pow, floor, fmod ...
+//
+//     int x = dlit("2.5");               // a double from text (or itod(3) from an int)
+//     int y = sqrt(dmul(x, x));          // arithmetic by function: dadd dsub dmul ddiv dneg
+//     printfd("%.3f\n", y);              // printing: printfd / sprintfd (import cfloat;)
+//
+//  Constants M_PI, M_E ... INFINITY, NAN, DBL_MAX ... are bit patterns too.
+//  sqrt and the basic operations are exact (error 0); exp, log, sin, pow ... are computed with ~100 bits
+//  and rounded once, so they are within 1 ulp (nearly always correctly rounded).
+// =============================================================================
+
+// ---- constants (bit patterns) ---------------------------------------------------------------------------------
+const INFINITY = 0x7FF0000000000000;
+const HUGE_VAL = 0x7FF0000000000000;
+const NAN = 0x7FF8000000000000;
+const NEG_INFINITY = 0xFFF0000000000000;
+
+const M_E = 0x4005BF0A8B145769;          // 2.718281828459045
+const M_LOG2E = 0x3FF71547652B82FE;
+const M_LOG10E = 0x3FDBCB7B1526E50E;
+const M_LN2 = 0x3FE62E42FEFA39EF;
+const M_LN10 = 0x40026BB1BBB55516;
+const M_PI = 0x400921FB54442D18;         // 3.141592653589793
+const M_PI_2 = 0x3FF921FB54442D18;
+const M_PI_4 = 0x3FE921FB54442D18;
+const M_1_PI = 0x3FD45F306DC9C883;
+const M_2_PI = 0x3FE45F306DC9C883;
+const M_2_SQRTPI = 0x3FF20DD750429B6D;
+const M_SQRT2 = 0x3FF6A09E667F3BCD;
+const M_SQRT1_2 = 0x3FE6A09E667F3BCD;
+
+const DBL_MANT_DIG = 53;
+const DBL_DIG = 15;
+const DBL_DECIMAL_DIG = 17;
+const DBL_MIN_EXP = -1021;
+const DBL_MAX_EXP = 1024;
+const DBL_MIN_10_EXP = -307;
+const DBL_MAX_10_EXP = 308;
+const DBL_MAX = 0x7FEFFFFFFFFFFFFF;      // 1.7976931348623157e308
+const DBL_MIN = 0x0010000000000000;      // 2.2250738585072014e-308
+const DBL_TRUE_MIN = 1;                  // 4.9406564584124654e-324
+const DBL_EPSILON = 0x3CB0000000000000;  // 2.220446049250313e-16
+const FLT_RADIX = 2;
+
+const FP_NAN = 0;
+const FP_INFINITE = 1;
+const FP_ZERO = 2;
+const FP_SUBNORMAL = 3;
+const FP_NORMAL = 4;
+
+// ---- integer helpers (unsigned 64-bit) ------------------------------------------------------------------------
+// logical shift right (n = 0 ... 63; 64 or more gives 0)
+int __fshr(int x, int n) {
+    if (n <= 0) {
+        return x;
+    }
+    if (n >= 64) {
+        return 0;
+    }
+    return (x >> n) & ((1 << (64 - n)) - 1);
+}
+
+// number of leading zero bits (64 for 0)
+int __fclz(int x) {
+    if (x == 0) {
+        return 64;
+    }
+    if (x < 0) {
+        return 0;
+    }
+    int n = 0;
+    if (__fshr(x, 32) == 0) { n = n + 32; x = x << 32; }
+    if (__fshr(x, 48) == 0) { n = n + 16; x = x << 16; }
+    if (__fshr(x, 56) == 0) { n = n + 8; x = x << 8; }
+    if (__fshr(x, 60) == 0) { n = n + 4; x = x << 4; }
+    if (__fshr(x, 62) == 0) { n = n + 2; x = x << 2; }
+    if (__fshr(x, 63) == 0) { n = n + 1; }
+    return n;
+}
+
+// x >> n where a 1 is kept in the lowest bit if any bit was lost ("jamming")
+int __fjam(int x, int n) {
+    if (n <= 0) {
+        return x;
+    }
+    if (n >= 64) {
+        if (x != 0) {
+            return 1;
+        }
+        return 0;
+    }
+    int r = __fshr(x, n);
+    if ((x & ((1 << n) - 1)) != 0) {
+        r = r | 1;
+    }
+    return r;
+}
+
+// unsigned a < b
+bool __fult(int a, int b) {
+    return (a ^ (1 << 63)) < (b ^ (1 << 63));
+}
+
+// high 64 bits of the unsigned 128-bit product a * b
+int __fmulhi(int a, int b) {
+    int a0 = a & 0xFFFFFFFF;
+    int a1 = __fshr(a, 32);
+    int b0 = b & 0xFFFFFFFF;
+    int b1 = __fshr(b, 32);
+    int p00 = a0 * b0;
+    int p01 = a0 * b1;
+    int p10 = a1 * b0;
+    int p11 = a1 * b1;
+    int mid = __fshr(p00, 32) + (p01 & 0xFFFFFFFF) + (p10 & 0xFFFFFFFF);
+    return p11 + __fshr(p01, 32) + __fshr(p10, 32) + __fshr(mid, 32);
+}
+
+// ---- unpacking and packing ------------------------------------------------------------------------------------
+// class codes of __funpack
+const __F_ZERO = 0;
+const __F_FINITE = 1;
+const __F_INF = 2;
+const __F_NAN = 3;
+
+int __us;       // sign (0 or 1)
+int __ue;       // exponent: value = __um * 2^__ue
+int __um;       // mantissa with bit 52 set (normalized, also for subnormals)
+
+int __funpack(int a) {
+    __us = __fshr(a, 63);
+    int ex = __fshr(a, 52) & 0x7FF;
+    int fr = a & 0x000FFFFFFFFFFFFF;
+    if (ex == 0x7FF) {
+        if (fr != 0) {
+            return __F_NAN;
+        }
+        return __F_INF;
+    }
+    if (ex == 0) {
+        if (fr == 0) {
+            return __F_ZERO;
+        }
+        int z = __fclz(fr) - 11;
+        __um = fr << z;
+        __ue = -1074 - z;
+        return __F_FINITE;
+    }
+    __um = fr | 0x0010000000000000;
+    __ue = ex - 1075;
+    return __F_FINITE;
+}
+
+// builds a double from sign, exponent and an unsigned significand: value = sig * 2^e (sig != 0 is rounded to nearest even;
+// a 1 in the lowest bit stands for "and a bit more")
+int __fpack(int sign, int e, int sig) {
+    int sbit = sign << 63;
+    if (sig == 0) {
+        return sbit;
+    }
+    int z = __fclz(sig);
+    if (z == 0) {
+        sig = __fjam(sig, 1);
+        e = e + 1;
+    } else {
+        sig = sig << (z - 1);
+        e = e - (z - 1);
+    }
+    // sig is now in 2^62 ... 2^63-1 and value = sig * 2^e
+    int ex = e + 62 + 1023;
+    if (ex >= 2047) {
+        return sbit | 0x7FF0000000000000;
+    }
+    if (ex <= 0) {
+        sig = __fjam(sig, 1 - ex);
+        int rb = sig & 0x3FF;
+        int m = __fshr(sig + 0x200, 10);
+        if (rb == 0x200) {
+            m = m & ~1;
+        }
+        return sbit | m;
+    }
+    int rb = sig & 0x3FF;
+    int m = __fshr(sig + 0x200, 10);
+    if (rb == 0x200) {
+        m = m & ~1;
+    }
+    return sbit + ((ex - 1) << 52) + m;
+}
+
+// ---- classification ----------------------------------------------------------------------------------------------
+bool isnan(int x) {
+    return (x & 0x7FFFFFFFFFFFFFFF) > 0x7FF0000000000000;
+}
+
+bool isinf(int x) {
+    return (x & 0x7FFFFFFFFFFFFFFF) == 0x7FF0000000000000;
+}
+
+bool isfinite(int x) {
+    return (x & 0x7FFFFFFFFFFFFFFF) < 0x7FF0000000000000;
+}
+
+bool isnormal(int x) {
+    int a = x & 0x7FFFFFFFFFFFFFFF;
+    return a >= 0x0010000000000000 && a < 0x7FF0000000000000;
+}
+
+bool signbit(int x) {
+    return x < 0;
+}
+
+// FP_NAN, FP_INFINITE, FP_ZERO, FP_SUBNORMAL or FP_NORMAL
+int fpclassify(int x) {
+    int a = x & 0x7FFFFFFFFFFFFFFF;
+    if (a > 0x7FF0000000000000) { return FP_NAN; }
+    if (a == 0x7FF0000000000000) { return FP_INFINITE; }
+    if (a == 0) { return FP_ZERO; }
+    if (a < 0x0010000000000000) { return FP_SUBNORMAL; }
+    return FP_NORMAL;
+}
+
+int fabs(int x) {
+    return x & 0x7FFFFFFFFFFFFFFF;
+}
+
+int dneg(int x) {
+    return x ^ (1 << 63);
+}
+
+int copysign(int x, int y) {
+    return (x & 0x7FFFFFFFFFFFFFFF) | (y & (1 << 63));
+}
+
+// ---- comparison -------------------------------------------------------------------------------------------------------
+// -1, 0, 1, or 2 when the numbers are unordered (a NaN is involved). -0 equals +0.
+int dcmp(int a, int b) {
+    if (isnan(a) || isnan(b)) {
+        return 2;
+    }
+    if (((a | b) & 0x7FFFFFFFFFFFFFFF) == 0) {
+        return 0;
+    }
+    if (a < 0 && b < 0) {
+        // both negative: larger magnitude is smaller
+        if (a == b) { return 0; }
+        if (a > b) { return -1; }
+        return 1;
+    }
+    if (a == b) {
+        return 0;
+    }
+    if (a < b) {
+        return -1;
+    }
+    return 1;
+}
+
+bool deq(int a, int b) { return dcmp(a, b) == 0; }
+bool dne(int a, int b) { return dcmp(a, b) != 0; }
+bool dlt(int a, int b) { return dcmp(a, b) == -1; }
+bool dle(int a, int b) { int c = dcmp(a, b); return c == -1 || c == 0; }
+bool dgt(int a, int b) { return dcmp(a, b) == 1; }
+bool dge(int a, int b) { int c = dcmp(a, b); return c == 1 || c == 0; }
+
+bool isgreater(int a, int b) { return dgt(a, b); }
+bool isgreaterequal(int a, int b) { return dge(a, b); }
+bool isless(int a, int b) { return dlt(a, b); }
+bool islessequal(int a, int b) { return dle(a, b); }
+bool islessgreater(int a, int b) { int c = dcmp(a, b); return c == -1 || c == 1; }
+bool isunordered(int a, int b) { return dcmp(a, b) == 2; }
+
+// ---- arithmetic (exactly rounded) -------------------------------------------------------------------------------------
+int dadd(int a, int b) {
+    int ca = __funpack(a);
+    int sa = __us;
+    int ea = __ue;
+    int ma = __um;
+    int cb = __funpack(b);
+    int sb = __us;
+    int eb = __ue;
+    int mb = __um;
+    if (ca == __F_NAN || cb == __F_NAN) {
+        return NAN;
+    }
+    if (ca == __F_INF) {
+        if (cb == __F_INF && sa != sb) {
+            return NAN;
+        }
+        return a;
+    }
+    if (cb == __F_INF) {
+        return b;
+    }
+    if (ca == __F_ZERO) {
+        if (cb == __F_ZERO) {
+            return (sa & sb) << 63;
+        }
+        return b;
+    }
+    if (cb == __F_ZERO) {
+        return a;
+    }
+    if (ea < eb || (ea == eb && ma < mb)) {
+        int t = ea; ea = eb; eb = t;
+        t = ma; ma = mb; mb = t;
+        t = sa; sa = sb; sb = t;
+    }
+    int sigA = ma << 9;
+    int sigB = __fjam(mb << 9, ea - eb);
+    int sig;
+    if (sa == sb) {
+        sig = sigA + sigB;
+    } else {
+        sig = sigA - sigB;
+        if (sig == 0) {
+            return 0;
+        }
+    }
+    return __fpack(sa, ea - 9, sig);
+}
+
+int dsub(int a, int b) {
+    return dadd(a, b ^ (1 << 63));
+}
+
+int dmul(int a, int b) {
+    int ca = __funpack(a);
+    int sa = __us;
+    int ea = __ue;
+    int ma = __um;
+    int cb = __funpack(b);
+    int sb = __us;
+    int eb = __ue;
+    int mb = __um;
+    int sign = sa ^ sb;
+    if (ca == __F_NAN || cb == __F_NAN) {
+        return NAN;
+    }
+    if (ca == __F_INF || cb == __F_INF) {
+        if (ca == __F_ZERO || cb == __F_ZERO) {
+            return NAN;
+        }
+        return (sign << 63) | 0x7FF0000000000000;
+    }
+    if (ca == __F_ZERO || cb == __F_ZERO) {
+        return sign << 63;
+    }
+    int x = ma << 10;
+    int y = mb << 11;
+    int hi = __fmulhi(x, y);
+    int lo = x * y;
+    if (lo != 0) {
+        hi = hi | 1;
+    }
+    return __fpack(sign, ea + eb + 43, hi);
+}
+
+int ddiv(int a, int b) {
+    int ca = __funpack(a);
+    int sa = __us;
+    int ea = __ue;
+    int ma = __um;
+    int cb = __funpack(b);
+    int sb = __us;
+    int eb = __ue;
+    int mb = __um;
+    int sign = sa ^ sb;
+    if (ca == __F_NAN || cb == __F_NAN) {
+        return NAN;
+    }
+    if (ca == __F_INF) {
+        if (cb == __F_INF) {
+            return NAN;
+        }
+        return (sign << 63) | 0x7FF0000000000000;
+    }
+    if (cb == __F_INF) {
+        return sign << 63;
+    }
+    if (cb == __F_ZERO) {
+        if (ca == __F_ZERO) {
+            return NAN;
+        }
+        return (sign << 63) | 0x7FF0000000000000;
+    }
+    if (ca == __F_ZERO) {
+        return sign << 63;
+    }
+    int q = 0;
+    int r = ma;
+    for (int i = 0; i < 63; i++) {
+        q = q << 1;
+        if (r >= mb) {
+            q = q | 1;
+            r = r - mb;
+        }
+        r = r << 1;
+    }
+    if (r != 0) {
+        q = q | 1;
+    }
+    return __fpack(sign, ea - eb - 62, q);
+}
+
+int sqrt(int a) {
+    int c = __funpack(a);
+    int e = __ue;
+    int m = __um;
+    if (c == __F_NAN) {
+        return NAN;
+    }
+    if (c == __F_ZERO) {
+        return a;
+    }
+    if (__us == 1) {
+        return NAN;
+    }
+    if (c == __F_INF) {
+        return a;
+    }
+    if ((e & 1) != 0) {
+        m = m << 1;
+        e = e - 1;
+    }
+    int x = m << 8;
+    int root = 0;
+    int rem = 0;
+    for (int i = 0; i < 55; i++) {
+        int pair = __fshr(x, 60) & 3;
+        x = (x << 2) & 0x3FFFFFFFFFFFFFFF;
+        rem = (rem << 2) | pair;
+        int t = (root << 2) | 1;
+        if (rem >= t) {
+            rem = rem - t;
+            root = (root << 1) | 1;
+        } else {
+            root = root << 1;
+        }
+    }
+    if (rem != 0) {
+        root = root | 1;
+    }
+    return __fpack(0, (e - 8) / 2 - 24, root);
+}
+
+// ---- conversion from and to integers ---------------------------------------------------------------------------------
+// the double closest to the integer n
+int itod(int n) {
+    if (n == 0) {
+        return 0;
+    }
+    if (n < 0) {
+        return __fpack(1, 0, -n);
+    }
+    return __fpack(0, 0, n);
+}
+
+// the integer part of x (cut towards zero); too large values give the largest / smallest int, NaN gives 0
+int dtoi(int x) {
+    int c = __funpack(x);
+    if (c == __F_NAN || c == __F_ZERO) {
+        return 0;
+    }
+    if (c == __F_INF || __ue > 10) {
+        if (__us == 1) {
+            return 1 << 63;
+        }
+        return 0x7FFFFFFFFFFFFFFF;
+    }
+    int v;
+    if (__ue >= 0) {
+        v = __um << __ue;
+    } else {
+        v = __fshr(__um, -__ue);
+    }
+    if (__us == 1) {
+        return -v;
+    }
+    return v;
+}
+
+// ---- rounding to integers ------------------------------------------------------------------------------------------------
+// cuts off the fraction (towards zero)
+int trunc(int x) {
+    int ex = (__fshr(x, 52) & 0x7FF) - 1023;
+    if (ex >= 52) {
+        return x;
+    }
+    if (ex < 0) {
+        return x & (1 << 63);
+    }
+    int mask = 0x000FFFFFFFFFFFFF >> ex;
+    return x & ~mask;
+}
+
+int floor(int x) {
+    int t = trunc(x);
+    if (x < 0 && t != x) {
+        return dsub(t, 0x3FF0000000000000);
+    }
+    return t;
+}
+
+int ceil(int x) {
+    int t = trunc(x);
+    if (x >= 0 && t != x && !isnan(x)) {
+        return dadd(t, 0x3FF0000000000000);
+    }
+    return t;
+}
+
+// nearest integer, halves away from zero
+int round(int x) {
+    int t = trunc(x);
+    int d = fabs(dsub(x, t));
+    if (isfinite(x) && d >= 0x3FE0000000000000) {
+        if (x < 0) {
+            return dsub(t, 0x3FF0000000000000);
+        }
+        return dadd(t, 0x3FF0000000000000);
+    }
+    return t;
+}
+
+// nearest integer, halves to the even one (the usual rounding mode)
+int rint(int x) {
+    int a = fabs(x);
+    if (a >= 0x4330000000000000) {
+        return x;
+    }
+    int big = 0x4330000000000000;
+    int r = dsub(dadd(a, big), big);
+    return copysign(r, x);
+}
+
+int nearbyint(int x) {
+    return rint(x);
+}
+
+int lround(int x) {
+    return dtoi(round(x));
+}
+
+int llround(int x) {
+    return dtoi(round(x));
+}
+
+int lrint(int x) {
+    return dtoi(rint(x));
+}
+
+int llrint(int x) {
+    return dtoi(rint(x));
+}
+
+// ---- exponent handling ------------------------------------------------------------------------------------------------------
+// x * 2^n, correctly rounded
+int scalbn(int x, int n) {
+    int c = __funpack(x);
+    if (c != __F_FINITE) {
+        return x;
+    }
+    if (n > 5000) { n = 5000; }
+    if (n < -5000) { n = -5000; }
+    return __fpack(__us, __ue + n, __um);
+}
+
+int ldexp(int x, int n) {
+    return scalbn(x, n);
+}
+
+int scalbln(int x, int n) {
+    return scalbn(x, n);
+}
+
+// splits x into m * 2^e with 0.5 <= |m| < 1; stores e in *e
+int frexp(int x, int* e) {
+    int c = __funpack(x);
+    if (c != __F_FINITE) {
+        *e = 0;
+        return x;
+    }
+    *e = __ue + 53;
+    return (__us << 63) | (1022 << 52) | (__um & 0x000FFFFFFFFFFFFF);
+}
+
+// splits x into integer part (stored in *ip) and fraction (returned), both with the sign of x
+int modf(int x, int* ip) {
+    if (isinf(x)) {
+        *ip = x;
+        return x & (1 << 63);
+    }
+    if (isnan(x)) {
+        *ip = x;
+        return x;
+    }
+    int t = trunc(x);
+    *ip = t;
+    int f = dsub(x, t);
+    return copysign(f, x);
+}
+
+// the exponent of x as a double (floor(log2(|x|)))
+int logb(int x) {
+    int c = __funpack(x);
+    if (c == __F_ZERO) {
+        return NEG_INFINITY;
+    }
+    if (c == __F_INF) {
+        return INFINITY;
+    }
+    if (c == __F_NAN) {
+        return x;
+    }
+    return itod(__ue + 52);
+}
+
+// the exponent of x as an int (-2147483648 for 0 and NaN)
+int ilogb(int x) {
+    int c = __funpack(x);
+    if (c == __F_FINITE) {
+        return __ue + 52;
+    }
+    if (c == __F_INF) {
+        return 2147483647;
+    }
+    return -2147483648;
+}
+
+int nan(char* tag) {
+    return NAN;
+}
+
+// the next representable number after x in the direction of y
+int nextafter(int x, int y) {
+    if (isnan(x) || isnan(y)) {
+        return NAN;
+    }
+    if (x == y || dcmp(x, y) == 0) {
+        return y;
+    }
+    if ((x & 0x7FFFFFFFFFFFFFFF) == 0) {
+        if (y < 0) {
+            return 0x8000000000000001;
+        }
+        return 1;
+    }
+    bool up = dcmp(y, x) == 1;
+    if ((x < 0) == up) {
+        return x - 1;
+    }
+    return x + 1;
+}
+
+int nexttoward(int x, int y) {
+    return nextafter(x, y);
+}
+
+// ---- min, max, remainder -----------------------------------------------------------------------------------------------------
+int fmax(int a, int b) {
+    if (isnan(a)) { return b; }
+    if (isnan(b)) { return a; }
+    if (dcmp(a, b) == 1) { return a; }
+    if (dcmp(a, b) == -1) { return b; }
+    if (a < 0) { return b; }
+    return a;
+}
+
+int fmin(int a, int b) {
+    if (isnan(a)) { return b; }
+    if (isnan(b)) { return a; }
+    if (dcmp(a, b) == -1) { return a; }
+    if (dcmp(a, b) == 1) { return b; }
+    if (a < 0) { return a; }
+    return b;
+}
+
+// positive difference: x - y if x > y, otherwise 0
+int fdim(int x, int y) {
+    if (isnan(x) || isnan(y)) {
+        return NAN;
+    }
+    if (dgt(x, y)) {
+        return dsub(x, y);
+    }
+    return 0;
+}
+
+// the remainder of x / y with the sign of x (exact). *qlow (when given) receives the low 3 bits of the integer quotient
+int __fmod_core(int x, int y, bool nearest, int* qlow) {
+    int cx = __funpack(x);
+    int sx = __us;
+    int ex = __ue;
+    int mx = __um;
+    int cy = __funpack(y);
+    int ey = __ue;
+    int my = __um;
+    if (qlow != null) {
+        *qlow = 0;
+    }
+    if (cx == __F_NAN || cy == __F_NAN || cx == __F_INF || cy == __F_ZERO) {
+        return NAN;
+    }
+    if (cx == __F_ZERO || cy == __F_INF) {
+        return x;
+    }
+    int q = 0;
+    int r = mx;
+    int d = ex - ey;
+    if (d < 0) {
+        // |x| < |y| / 2 at least: the remainder is x itself (fmod) or needs the rounding test (remainder)
+        if (!nearest || d < -1) {
+            return x;
+        }
+        // d == -1: 2|x| = mx*2^(ex+1) is compared with |y| = my*2^(ex+1)
+        if (mx <= my) {
+            return x;                       // below half (or a tie: the quotient 0 is even)
+        }
+        return __fpack(1 - sx, ex, 2 * my - mx);
+    }
+    while (d > 0) {
+        q = q << 1;
+        if (r >= my) {
+            r = r - my;
+            q = q | 1;
+        }
+        r = r << 1;
+        d--;
+    }
+    q = q << 1;
+    if (r >= my) {
+        r = r - my;
+        q = q | 1;
+    }
+    // now the quotient (mod 8 in q) and the remainder r * 2^ey, r < my
+    int sign = sx;
+    if (nearest) {
+        if (r * 2 > my || (r * 2 == my && (q & 1) != 0)) {
+            r = my - r;
+            sign = 1 - sx;
+            q = q + 1;
+        }
+    }
+    if (qlow != null) {
+        *qlow = q & 7;
+    }
+    if (r == 0) {
+        return sx << 63;
+    }
+    return __fpack(sign, ey, r);
+}
+
+int fmod(int x, int y) {
+    return __fmod_core(x, y, false, null);
+}
+
+// IEEE remainder: x - n*y where n is x/y rounded to nearest (halves to even)
+int remainder(int x, int y) {
+    return __fmod_core(x, y, true, null);
+}
+
+// like remainder; the low bits of the quotient go to *quo (with the sign of x/y)
+int remquo(int x, int y, int* quo) {
+    int q;
+    int r = __fmod_core(x, y, true, &q);
+    if ((x < 0) != (y < 0)) {
+        q = -q;
+    }
+    *quo = q;
+    return r;
+}
+
+// ---- constants of the extended precision layer --------------------------------------------------------------------------
+const DD_LN2_H = 0x3FE62E42FEFA39EF;   // 0.6931471805599453094172321214581765680755
+const DD_LN2_L = 0x3C7ABC9E3B39803F;
+const DD_LN10_H = 0x40026BB1BBB55516;   // 2.302585092994045684017991454684364207601
+const DD_LN10_L = 0xBCAF48AD494EA3E9;
+const DD_PI_H = 0x400921FB54442D18;   // 3.141592653589793238462643383279502884197
+const DD_PI_L = 0x3CA1A62633145C07;
+const DD_PI2_H = 0x3FF921FB54442D18;   // 1.570796326794896619231321691639751442099
+const DD_PI2_L = 0x3C91A62633145C07;
+const DD_PI4_H = 0x3FE921FB54442D18;   // 0.7853981633974483096156608458198757210493
+const DD_PI4_L = 0x3C81A62633145C07;
+const DD_3PI4_H = 0x4002D97C7F3321D2;   // 2.356194490192344928846982537459627163148
+const DD_3PI4_L = 0x3C9A79394C9E8A0A;
+const DD_E_H = 0x4005BF0A8B145769;   // 2.718281828459045235360287471352662497757
+const DD_E_L = 0x3CA4D57EE2B1013A;
+const DD_SQRTPI_H = 0x3FFC5BF891B4EF6B;   // 1.772453850905516027298167483341145182798
+const DD_SQRTPI_L = 0xBC9618F13EB7CA89;
+const DD_2_SQRTPI_H = 0x3FF20DD750429B6D;   // 1.128379167095512573896158903121545171688
+const DD_2_SQRTPI_L = 0x3C71AE3A914FED80;
+const DD_HLN2PI_H = 0x3FED67F1C864BEB5;   // 0.9189385332046727417803297364056176398614
+const DD_HLN2PI_L = 0xBC865B5A1B7FF5DF;
+const DD_SQRT2_H = 0x3FF6A09E667F3BCD;   // 1.41421356237309504880168872420969807857
+const DD_SQRT2_L = 0xBC9BDD3413B26456;
+const DD_INVLN2_H = 0x3FF71547652B82FE;   // 1.442695040888963407359924681001892137427
+const DD_INVLN2_L = 0x3C7777D0FFDA0D24;
+const STIR1_H = 0x3FB5555555555555;
+const STIR1_L = 0x3C55555555555555;
+const STIR2_H = 0xBF66C16C16C16C17;
+const STIR2_L = 0x3BFF49F49F49F49F;
+const STIR3_H = 0x3F4A01A01A01A01A;
+const STIR3_L = 0x3B8A01A01A01A01A;
+const STIR4_H = 0xBF43813813813814;
+const STIR4_L = 0x3BEFB1FB1FB1FB20;
+const STIR5_H = 0x3F4B951E2B18FF23;
+const STIR5_L = 0x3BE5C3A9CE01B952;
+const STIR6_H = 0xBF5F6AB0D9993C7D;
+const STIR6_L = 0x3BFF82553C999B0E;
+const STIR7_H = 0x3F7A41A41A41A41A;
+const STIR7_L = 0x3C10690690690690;
+const STIR8_H = 0xBF9E4286CB0F5398;
+const STIR8_L = 0x3C21EFCDAB896745;
+const STIR9_H = 0x3FC6FE96381E0680;
+const STIR9_L = 0xBC279E2405A71F88;
+const STIR10_H = 0xBFF6476701181F3A;
+const STIR10_L = 0x3C724246319DA678;
+const STIR11_H = 0x402ACE44322CE006;
+const STIR11_L = 0xBCC62C2B1BBCDD32;
+const STIR12_H = 0xC0639B2525CCCC1B;
+const STIR12_L = 0x3D052604768A30FC;
+const STIR13_H = 0x40A12234E81B4E82;
+const STIR13_L = 0xBD42C5F92C5F92C6;
+const STIR14_H = 0xC0E1A198AE1C4AB8;
+const STIR14_L = 0x3D64C012227B696E;
+const STIR15_H = 0x41251A2089A6E11A;
+const STIR15_L = 0x3DBC219EE4FDC447;
+const STIR16_H = 0xC16D1089B142D357;
+const STIR16_L = 0xBE0E2030B4D5DE20;
+const STIR17_H = 0x41B6D29A0F6433B8;
+const STIR17_L = 0xBE59DBCC48676F31;
+const STIR18_H = 0xC20445119D9E466F;
+const STIR18_L = 0x3E95159FDB2A3B69;
+const STIR19_H = 0x42543779BC9D4025;
+const STIR19_L = 0xBED95E8EFDB195E9;
+const STIR20_H = 0xC2A6800B7BC07A8D;
+const STIR20_L = 0x3F4EAEDE53F475A8;
+
+// 2/pi in hexadecimal (0.A2F9836E...) for the reduction of large arguments
+const __TWO_OVER_PI = "a2f9836e4e441529fc2757d1f534ddc0db6295993c439041fe5163abdebbc561b7246e3a424dd2e006492eea09d1921cfe1deb1cb129a73ee88235f52ebb4484e99c7026b45f7e413991d639835339f49c845f8bbdf9283b1ff897ffde05980fef2f118b5a0a6d1f6d367ecf27cb09b74f463f669e5fea2d7527bac7ebe5f17b3d0739f78a5292ea6bfb5fb11f8d5d0856033046fc7b6babf0cfbc209af4361da9e391615ee61b086599855f14a068";
+
+// ---- double-double arithmetic ---------------------------------------------------------------------------------------------
+// A number is the sum of two doubles h + l (l much smaller than h): about 106 bits of precision. The functions take
+// their operands as separate hi / lo values and leave the result in __dh / __dl.
+int __dh;
+int __dl;
+int __sh;
+int __sl;
+
+// s + e = a + b exactly
+void __two_sum(int a, int b) {
+    int s = dadd(a, b);
+    int bb = dsub(s, a);
+    __sh = s;
+    __sl = dadd(dsub(a, dsub(s, bb)), dsub(b, bb));
+}
+
+// the same when |a| >= |b|
+void __quick_two_sum(int a, int b) {
+    int s = dadd(a, b);
+    __sh = s;
+    __sl = dsub(b, dsub(s, a));
+}
+
+// p + e = a * b exactly (Dekker)
+void __two_prod(int a, int b) {
+    int p = dmul(a, b);
+    int ta = dmul(a, 0x41a0000002000000);        // a * (2^27 + 1)
+    int ah = dsub(ta, dsub(ta, a));
+    int al = dsub(a, ah);
+    int tb = dmul(b, 0x41a0000002000000);
+    int bh = dsub(tb, dsub(tb, b));
+    int bl = dsub(b, bh);
+    int e = dadd(dadd(dadd(dsub(dmul(ah, bh), p), dmul(ah, bl)), dmul(al, bh)), dmul(al, bl));
+    __sh = p;
+    __sl = e;
+}
+
+void __dd_add(int ah, int al, int bh, int bl) {
+    __two_sum(ah, bh);
+    int s1 = __sh;
+    int s2 = __sl;
+    __two_sum(al, bl);
+    int t1 = __sh;
+    int t2 = __sl;
+    s2 = dadd(s2, t1);
+    __quick_two_sum(s1, s2);
+    s1 = __sh;
+    s2 = __sl;
+    s2 = dadd(s2, t2);
+    __quick_two_sum(s1, s2);
+    __dh = __sh;
+    __dl = __sl;
+}
+
+void __dd_sub(int ah, int al, int bh, int bl) {
+    __dd_add(ah, al, dneg(bh), dneg(bl));
+}
+
+void __dd_add_d(int ah, int al, int b) {
+    __two_sum(ah, b);
+    int s1 = __sh;
+    int s2 = __sl;
+    s2 = dadd(s2, al);
+    __quick_two_sum(s1, s2);
+    __dh = __sh;
+    __dl = __sl;
+}
+
+void __dd_mul(int ah, int al, int bh, int bl) {
+    __two_prod(ah, bh);
+    int p1 = __sh;
+    int p2 = __sl;
+    p2 = dadd(p2, dadd(dmul(ah, bl), dmul(al, bh)));
+    __quick_two_sum(p1, p2);
+    __dh = __sh;
+    __dl = __sl;
+}
+
+void __dd_mul_d(int ah, int al, int b) {
+    __two_prod(ah, b);
+    int p1 = __sh;
+    int p2 = __sl;
+    p2 = dadd(p2, dmul(al, b));
+    __quick_two_sum(p1, p2);
+    __dh = __sh;
+    __dl = __sl;
+}
+
+void __dd_div(int ah, int al, int bh, int bl) {
+    int q1 = ddiv(ah, bh);
+    __dd_mul_d(bh, bl, q1);
+    __dd_sub(ah, al, __dh, __dl);
+    int rh = __dh;
+    int rl = __dl;
+    int q2 = ddiv(rh, bh);
+    __dd_mul_d(bh, bl, q2);
+    __dd_sub(rh, rl, __dh, __dl);
+    int q3 = ddiv(__dh, bh);
+    __quick_two_sum(q1, q2);
+    int sh = __sh;
+    int sl = __sl;
+    __dd_add_d(sh, sl, q3);
+}
+
+void __dd_div_d(int ah, int al, int b) {
+    int q1 = ddiv(ah, b);
+    __two_prod(q1, b);
+    __dd_sub(ah, al, __sh, __sl);
+    int rh = __dh;
+    int rl = __dl;
+    int q2 = ddiv(rh, b);
+    __two_prod(q2, b);
+    __dd_sub(rh, rl, __sh, __sl);
+    int q3 = ddiv(__dh, b);
+    __quick_two_sum(q1, q2);
+    int sh = __sh;
+    int sl = __sl;
+    __dd_add_d(sh, sl, q3);
+}
+
+// square root of a positive dd
+void __dd_sqrt(int ah, int al) {
+    if (ah == 0) {
+        __dh = 0;
+        __dl = 0;
+        return;
+    }
+    int s = sqrt(ah);
+    __two_prod(s, s);
+    __dd_sub(ah, al, __sh, __sl);
+    int r = __dh;
+    int c = ddiv(r, dmul(s, 0x4000000000000000));
+    __quick_two_sum(s, c);
+    __dh = __sh;
+    __dl = __sl;
+}
+
+// multiplies by 2^k (both parts)
+void __dd_scale(int ah, int al, int k) {
+    __dh = scalbn(ah, k);
+    __dl = scalbn(al, k);
+}
+
+// ---- exp ----------------------------------------------------------------------------------------------------------------------
+int __ek;       // power of two that goes with the result of __exp_dd
+
+// e^(x) as (__dh + __dl) * 2^__ek, x = xh + xl (|x| < 1000). If sub is true, __dh/__dl hold e^x - 1 for |x| < 0.35 (no scaling).
+void __exp_dd(int xh, int xl, bool sub) {
+    int k = 0;
+    int rh = xh;
+    int rl = xl;
+    if (!sub) {
+        k = dtoi(rint(dmul(xh, DD_INVLN2_H)));
+        if (k != 0) {
+            __dd_mul_d(DD_LN2_H, DD_LN2_L, itod(k));
+            __dd_sub(xh, xl, __dh, __dl);
+            rh = __dh;
+            rl = __dl;
+        }
+    }
+    // s = r / 512
+    int sh = scalbn(rh, -9);
+    int sl = scalbn(rl, -9);
+    // expm1(s) = s (1 + s/2 (1 + s/3 (1 + ... )))
+    int ah = 0x3FF0000000000000;
+    int al = 0;
+    for (int n = 11; n >= 2; n--) {
+        __dd_div_d(sh, sl, itod(n));
+        __dd_mul(__dh, __dl, ah, al);
+        __dd_add_d(__dh, __dl, 0x3FF0000000000000);
+        ah = __dh;
+        al = __dl;
+    }
+    __dd_mul(sh, sl, ah, al);
+    int eh = __dh;
+    int el = __dl;
+    for (int i = 0; i < 9; i++) {
+        __dd_mul(eh, el, eh, el);
+        int th = __dh;
+        int tl = __dl;
+        __dd_add(eh, el, eh, el);
+        __dd_add(__dh, __dl, th, tl);
+        eh = __dh;
+        el = __dl;
+    }
+    if (!sub) {
+        __dd_add_d(eh, el, 0x3FF0000000000000);
+        eh = __dh;
+        el = __dl;
+    }
+    __dh = eh;
+    __dl = el;
+    __ek = k;
+}
+
+// round(2^k * (h + l)) as a double, with a single rounding also for subnormal results
+int __dd_to_double(int h, int l, int k) {
+    if (h == 0) {
+        return 0;
+    }
+    int c = __funpack(h);
+    int e = __ue;
+    int s = __us;
+    int sig = __um << 10;
+    // the part l, in units of the lowest bit of sig
+    if (l != 0) {
+        int li = dtoi(scalbn(l, 10 - e));
+        int lf = dsub(scalbn(l, 10 - e), itod(li));
+        if (s == 1) {
+            sig = sig - li;
+            if (lf != 0) { sig = sig - 1; }
+        } else {
+            sig = sig + li;
+        }
+        if (lf != 0) {
+            sig = sig | 1;
+        }
+    }
+    return __fpack(s, e - 10 + k, sig);
+}
+
+int exp(int x) {
+    if (isnan(x)) { return x; }
+    if (x == INFINITY) { return x; }
+    if (x == NEG_INFINITY) { return 0; }
+    if (dgt(x, 0x40862E42FEFA39EF)) { return INFINITY; }
+    if (dlt(x, 0xC0874910D52D3052)) { return 0; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3C90000000000000) {
+        return dadd(0x3FF0000000000000, x);
+    }
+    __exp_dd(x, 0, false);
+    return __dd_to_double(__dh, __dl, __ek);
+}
+
+int exp2(int x) {
+    if (isnan(x)) { return x; }
+    if (x == INFINITY) { return x; }
+    if (x == NEG_INFINITY) { return 0; }
+    if (dge(x, 0x4090000000000000)) { return INFINITY; }
+    if (dlt(x, 0xC090CC0000000000)) { return 0; }
+    __dd_mul_d(DD_LN2_H, DD_LN2_L, x);
+    __exp_dd(__dh, __dl, false);
+    return __dd_to_double(__dh, __dl, __ek);
+}
+
+int expm1(int x) {
+    if (isnan(x)) { return x; }
+    if (x == INFINITY) { return x; }
+    if (x == NEG_INFINITY) { return 0xBFF0000000000000; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3C90000000000000) {
+        return x;
+    }
+    if (dgt(x, 0x40862E42FEFA39EF)) { return INFINITY; }
+    if (dlt(x, 0xC042B708872320E2)) { return 0xBFF0000000000000; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3FD6000000000000) {
+        __exp_dd(x, 0, true);
+        return __dd_to_double(__dh, __dl, 0);
+    }
+    __exp_dd(x, 0, false);
+    __dd_scale(__dh, __dl, __ek);
+    __dd_add_d(__dh, __dl, 0xBFF0000000000000);
+    return __dd_to_double(__dh, __dl, 0);
+}
+
+// ---- log ----------------------------------------------------------------------------------------------------------------------
+// ln(x) for a positive dd x = xh + xl; the result is left in __dh / __dl
+void __log_dd(int xh, int xl) {
+    int c = __funpack(xh);
+    int k = __ue + 52;
+    // m = x / 2^k in [1, 2); use [sqrt(1/2), sqrt(2)) by moving the exponent when m > sqrt(2)
+    int mh = scalbn(xh, -k);
+    int ml = scalbn(xl, -k);
+    if (dgt(mh, 0x3FF6A09E667F3BCD)) {
+        mh = scalbn(mh, -1);
+        ml = scalbn(ml, -1);
+        k = k + 1;
+    }
+    __dd_add_d(mh, ml, 0xBFF0000000000000);
+    int nh = __dh;
+    int nl = __dl;
+    __dd_add_d(mh, ml, 0x3FF0000000000000);
+    __dd_div(nh, nl, __dh, __dl);
+    int fh = __dh;
+    int fl = __dl;
+    __dd_mul(fh, fl, fh, fl);
+    int zh = __dh;
+    int zl = __dl;
+    // atanh(f) = f (1 + z/3 + z^2/5 + ...)
+    int th = 0x3FF0000000000000;
+    int tl = 0;
+    __dd_div_d(0x3FF0000000000000, 0, itod(47));
+    th = __dh;
+    tl = __dl;
+    for (int n = 22; n >= 0; n--) {
+        __dd_mul(th, tl, zh, zl);
+        int ph = __dh;
+        int pl = __dl;
+        __dd_div_d(0x3FF0000000000000, 0, itod(2 * n + 1));
+        __dd_add(ph, pl, __dh, __dl);
+        th = __dh;
+        tl = __dl;
+    }
+    __dd_mul(th, tl, fh, fl);
+    int ah = scalbn(__dh, 1);
+    int al = scalbn(__dl, 1);
+    if (k != 0) {
+        __dd_mul_d(DD_LN2_H, DD_LN2_L, itod(k));
+        __dd_add(__dh, __dl, ah, al);
+    } else {
+        __dh = ah;
+        __dl = al;
+    }
+}
+
+// shared by log, log2, log10 ... : 0 = ordinary positive number, otherwise the special result is in __special
+int __special;
+
+bool __log_special(int x) {
+    if (isnan(x)) { __special = x; return true; }
+    if (x < 0) { __special = NAN; return true; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) == 0) { __special = NEG_INFINITY; return true; }
+    if (x == INFINITY) { __special = x; return true; }
+    return false;
+}
+
+int log(int x) {
+    if (__log_special(x)) { return __special; }
+    if (x == 0x3FF0000000000000) { return 0; }
+    __log_dd(x, 0);
+    return __dh;
+}
+
+int log2(int x) {
+    if (__log_special(x)) { return __special; }
+    if (x == 0x3FF0000000000000) { return 0; }
+    __log_dd(x, 0);
+    __dd_mul(__dh, __dl, DD_INVLN2_H, DD_INVLN2_L);
+    return __dh;
+}
+
+int log10(int x) {
+    if (__log_special(x)) { return __special; }
+    if (x == 0x3FF0000000000000) { return 0; }
+    __log_dd(x, 0);
+    __dd_div(__dh, __dl, DD_LN10_H, DD_LN10_L);
+    return __dh;
+}
+
+int log1p(int x) {
+    if (isnan(x)) { return x; }
+    if (x == INFINITY) { return x; }
+    if (dlt(x, 0xBFF0000000000000)) { return NAN; }
+    if (x == 0xBFF0000000000000) { return NEG_INFINITY; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3C90000000000000) {
+        return x;
+    }
+    __two_sum(0x3FF0000000000000, x);
+    __log_dd(__sh, __sl);
+    return __dh;
+}
+
+// ---- pow, cbrt, hypot ---------------------------------------------------------------------------------------------------------
+// 0 = not an integer, 1 = odd integer, 2 = even integer (for finite y)
+int __int_kind(int y) {
+    if (!isfinite(y)) {
+        return 0;
+    }
+    if (trunc(y) != y) {
+        return 0;
+    }
+    if ((y & 0x7FFFFFFFFFFFFFFF) >= 0x4340000000000000) {
+        return 2;
+    }
+    if ((dtoi(y) & 1) != 0) {
+        return 1;
+    }
+    return 2;
+}
+
+int pow(int x, int y) {
+    if ((y & 0x7FFFFFFFFFFFFFFF) == 0) { return 0x3FF0000000000000; }
+    if (x == 0x3FF0000000000000) { return x; }
+    if (isnan(x) || isnan(y)) { return NAN; }
+    int ik = __int_kind(y);
+    int ax = fabs(x);
+    if (ax == 0) {
+        if (y < 0) {
+            if (ik == 1) { return copysign(INFINITY, x); }
+            return INFINITY;
+        }
+        if (ik == 1) { return x; }
+        return 0;
+    }
+    if (isinf(y)) {
+        if (ax == 0x3FF0000000000000) { return 0x3FF0000000000000; }
+        if ((dgt(ax, 0x3FF0000000000000)) == (y > 0)) { return INFINITY; }
+        return 0;
+    }
+    if (isinf(x)) {
+        if (x > 0) {
+            if (y > 0) { return INFINITY; }
+            return 0;
+        }
+        if (y > 0) {
+            if (ik == 1) { return NEG_INFINITY; }
+            return INFINITY;
+        }
+        if (ik == 1) { return 0x8000000000000000; }
+        return 0;
+    }
+    if (x < 0 && ik == 0) {
+        return NAN;
+    }
+    int neg = 0;
+    if (x < 0 && ik == 1) {
+        neg = 1;
+    }
+    __log_dd(ax, 0);
+    __dd_mul_d(__dh, __dl, y);
+    int th = __dh;
+    int tl = __dl;
+    int r;
+    if (dgt(th, 0x40862E42FEFA39EF + 0x100000000)) {
+        r = INFINITY;
+    } else if (dlt(th, 0xC0874910D52D3052 - 0x100000000)) {
+        r = 0;
+    } else {
+        __exp_dd(th, tl, false);
+        r = __dd_to_double(__dh, __dl, __ek);
+    }
+    if (neg == 1) {
+        return dneg(r);
+    }
+    return r;
+}
+
+// cube root
+int cbrt(int x) {
+    if (!isfinite(x) || (x & 0x7FFFFFFFFFFFFFFF) == 0) { return x; }
+    int ax = fabs(x);
+    __log_dd(ax, 0);
+    __dd_div_d(__dh, __dl, 0x4008000000000000);
+    __exp_dd(__dh, __dl, false);
+    int r = __dd_to_double(__dh, __dl, __ek);
+    if (x < 0) {
+        return dneg(r);
+    }
+    return r;
+}
+
+// sqrt(x*x + y*y) without overflow
+int hypot(int x, int y) {
+    if (isinf(x) || isinf(y)) { return INFINITY; }
+    if (isnan(x) || isnan(y)) { return NAN; }
+    int ax = fabs(x);
+    int ay = fabs(y);
+    if (ax == 0) { return ay; }
+    if (ay == 0) { return ax; }
+    int big = ax;
+    if (dgt(ay, ax)) { big = ay; }
+    int c = __funpack(big);
+    int k = __ue + 52;
+    int sx = scalbn(ax, -k);
+    int sy = scalbn(ay, -k);
+    __two_prod(sx, sx);
+    int xh = __sh;
+    int xl = __sl;
+    __two_prod(sy, sy);
+    __dd_add(xh, xl, __sh, __sl);
+    __dd_sqrt(__dh, __dl);
+    return __dd_to_double(__dh, __dl, k);
+}
+
+// x * y + z with a single rounding
+int fma(int x, int y, int z) {
+    if (!isfinite(x) || !isfinite(y) || !isfinite(z)) {
+        return dadd(dmul(x, y), z);
+    }
+    if ((x & 0x7FFFFFFFFFFFFFFF) == 0 || (y & 0x7FFFFFFFFFFFFFFF) == 0) {
+        return dadd(dmul(x, y), z);
+    }
+    // scale x and y to [1, 2) so that the exact product cannot overflow or underflow
+    __funpack(x);
+    int ex = __ue + 52;
+    __funpack(y);
+    int ey = __ue + 52;
+    int xs = scalbn(x, -ex);
+    int ys = scalbn(y, -ey);
+    int s = ex + ey;
+    __two_prod(xs, ys);
+    int ph = __sh;
+    int pl = __sl;
+    if ((z & 0x7FFFFFFFFFFFFFFF) == 0) {
+        return __dd_to_double(ph, pl, s);
+    }
+    int ez = __funpack(z) == __F_FINITE;
+    int zexp = __ue + 52;
+    if (zexp - s > 200) {
+        return z;                                  // the product is far below the last bit of z
+    }
+    if (zexp - s < -200) {
+        return __dd_to_double(ph, pl, s);          // z is far below the last bit of the product
+    }
+    int zs = scalbn(z, -s);
+    __dd_add_d(ph, pl, zs);
+    return __dd_to_double(__dh, __dl, s);
+}
+
+// ---- big integers (28-bit limbs) --------------------------------------------------------------------------------------------
+// a[0] = number of limbs, a[1] ... = limbs, least significant first. Arrays need __BN_CAP + 2 ints.
+// Used for the reduction of huge arguments of sin / cos and by cfloat (number <-> text).
+const __BN_CAP = 160;
+const __BN_MASK = 0xFFFFFFF;
+
+void __bn_trim(int* a) {
+    while (a[0] > 0 && a[a[0]] == 0) {
+        a[0] = a[0] - 1;
+    }
+}
+
+void __bn_set(int* a, int v) {
+    a[0] = 0;
+    while (v != 0) {
+        a[0] = a[0] + 1;
+        a[a[0]] = v & __BN_MASK;
+        v = v >> 28;
+    }
+}
+
+void __bn_copy(int* d, int* s) {
+    for (int i = 0; i <= s[0]; i++) {
+        d[i] = s[i];
+    }
+}
+
+void __bn_mul_small(int* a, int s) {
+    if (s == 0) {
+        a[0] = 0;
+        return;
+    }
+    int carry = 0;
+    int n = a[0];
+    for (int i = 1; i <= n; i++) {
+        int t = a[i] * s + carry;
+        a[i] = t & __BN_MASK;
+        carry = t >> 28;
+    }
+    while (carry != 0) {
+        n++;
+        a[n] = carry & __BN_MASK;
+        carry = carry >> 28;
+    }
+    a[0] = n;
+}
+
+void __bn_add_small(int* a, int s) {
+    int carry = s;
+    int i = 1;
+    while (carry != 0) {
+        if (i > a[0]) {
+            a[0] = i;
+            a[i] = 0;
+        }
+        int t = a[i] + carry;
+        a[i] = t & __BN_MASK;
+        carry = t >> 28;
+        i++;
+    }
+}
+
+// remainder of a / s (s < 2^31); a becomes the quotient
+int __bn_div_small(int* a, int s) {
+    int rem = 0;
+    for (int i = a[0]; i >= 1; i--) {
+        int cur = (rem << 28) | a[i];
+        a[i] = cur / s;
+        rem = cur % s;
+    }
+    __bn_trim(a);
+    return rem;
+}
+
+void __bn_shl(int* a, int n) {
+    if (a[0] == 0 || n == 0) {
+        return;
+    }
+    int limbs = n / 28;
+    int bits = n % 28;
+    int len = a[0];
+    if (bits != 0) {
+        int carry = 0;
+        for (int i = 1; i <= len; i++) {
+            int t = (a[i] << bits) | carry;
+            a[i] = t & __BN_MASK;
+            carry = t >> 28;
+        }
+        if (carry != 0) {
+            len++;
+            a[len] = carry;
+        }
+    }
+    if (limbs > 0) {
+        for (int i = len; i >= 1; i--) {
+            a[i + limbs] = a[i];
+        }
+        for (int i = 1; i <= limbs; i++) {
+            a[i] = 0;
+        }
+        len = len + limbs;
+    }
+    a[0] = len;
+}
+
+// shifts right by n bits; returns true if any 1 bits were shifted out
+bool __bn_shr(int* a, int n) {
+    int limbs = n / 28;
+    int bits = n % 28;
+    int len = a[0];
+    bool lost = false;
+    if (limbs >= len) {
+        if (len > 0) {
+            lost = true;
+        }
+        a[0] = 0;
+        return lost;
+    }
+    for (int i = 1; i <= limbs; i++) {
+        if (a[i] != 0) {
+            lost = true;
+        }
+    }
+    if (bits != 0 && (a[limbs + 1] & ((1 << bits) - 1)) != 0) {
+        lost = true;
+    }
+    for (int i = 1; i <= len - limbs; i++) {
+        int lo = a[i + limbs] >> bits;
+        int hi = 0;
+        if (i + limbs + 1 <= len) {
+            hi = (a[i + limbs + 1] << (28 - bits)) & __BN_MASK;
+        }
+        a[i] = lo | hi;
+    }
+    a[0] = len - limbs;
+    __bn_trim(a);
+    return lost;
+}
+
+int __bn_cmp(int* a, int* b) {
+    if (a[0] != b[0]) {
+        if (a[0] > b[0]) {
+            return 1;
+        }
+        return -1;
+    }
+    for (int i = a[0]; i >= 1; i--) {
+        if (a[i] != b[i]) {
+            if (a[i] > b[i]) {
+                return 1;
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+void __bn_add(int* a, int* b) {
+    int n = a[0];
+    if (b[0] > n) {
+        for (int i = n + 1; i <= b[0]; i++) {
+            a[i] = 0;
+        }
+        n = b[0];
+    }
+    int carry = 0;
+    for (int i = 1; i <= n; i++) {
+        int t = a[i] + carry;
+        if (i <= b[0]) {
+            t = t + b[i];
+        }
+        a[i] = t & __BN_MASK;
+        carry = t >> 28;
+    }
+    if (carry != 0) {
+        n++;
+        a[n] = carry;
+    }
+    a[0] = n;
+}
+
+// a -= b (a >= b)
+void __bn_sub(int* a, int* b) {
+    int borrow = 0;
+    for (int i = 1; i <= a[0]; i++) {
+        int t = a[i] - borrow;
+        if (i <= b[0]) {
+            t = t - b[i];
+        }
+        if (t < 0) {
+            t = t + (1 << 28);
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        a[i] = t;
+    }
+    __bn_trim(a);
+}
+
+int __bn_bitlen(int* a) {
+    if (a[0] == 0) {
+        return 0;
+    }
+    int top = a[a[0]];
+    int n = 0;
+    while (top != 0) {
+        n++;
+        top = top >> 1;
+    }
+    return (a[0] - 1) * 28 + n;
+}
+
+int __bn_bit(int* a, int i) {
+    int limb = i / 28 + 1;
+    if (limb > a[0]) {
+        return 0;
+    }
+    return (a[limb] >> (i % 28)) & 1;
+}
+
+// the low 62 bits as an int
+int __bn_low(int* a) {
+    int v = 0;
+    if (a[0] >= 3) { v = v | (a[3] << 56); }
+    if (a[0] >= 2) { v = v | (a[2] << 28); }
+    if (a[0] >= 1) { v = v | a[1]; }
+    return v;
+}
+
+// a *= 10^k
+void __bn_mul_pow10(int* a, int k) {
+    while (k >= 9) {
+        __bn_mul_small(a, 1000000000);
+        k = k - 9;
+    }
+    if (k > 0) {
+        int m = 1;
+        for (int i = 0; i < k; i++) {
+            m = m * 10;
+        }
+        __bn_mul_small(a, m);
+    }
+}
+
+// ---- argument reduction for sin / cos / tan ------------------------------------------------------------------------------------------
+int __rq;       // quadrant (0 - 3) of the reduced argument
+int __rh;       // remainder (dd) in [-pi/4, pi/4]
+int __rl;
+
+int __two_over_pi_bit(int i) {
+    if (i < 1) {
+        return 0;
+    }
+    int idx = (i - 1) / 4;
+    if (idx >= 340) {
+        return 0;
+    }
+    int c = __TWO_OVER_PI[idx];
+    int v = c - '0';
+    if (c >= 'a') {
+        v = c - 'a' + 10;
+    }
+    return (v >> (3 - (i - 1) % 4)) & 1;
+}
+
+// reduces |x| > pi/4 modulo pi/2 (Payne-Hanek with 260 bits of 2/pi)
+void __reduce(int x) {
+    int c = __funpack(x);
+    int ex = __ue;
+    int mx = __um;
+    int J = 260;
+    int B[__BN_CAP + 2];
+    int P[__BN_CAP + 2];
+    int T[__BN_CAP + 2];
+    B[0] = 0;
+    for (int j = 0; j <= J; j++) {
+        __bn_mul_small(B, 2);
+        if (__two_over_pi_bit(ex - 1 + j) == 1) {
+            __bn_add_small(B, 1);
+        }
+    }
+    __bn_copy(P, B);
+    __bn_copy(T, B);
+    __bn_mul_small(P, mx & 0x7FFFFFF);
+    __bn_mul_small(T, mx >> 27);
+    __bn_shl(T, 27);
+    __bn_add(P, T);
+    int q = __bn_bit(P, J - 1) | (__bn_bit(P, J) << 1);
+    // fraction bits: P mod 2^(J-1)
+    int half = __bn_bit(P, J - 2);
+    int F[__BN_CAP + 2];
+    __bn_copy(F, P);
+    // clear everything above bit J-2 : F = P mod 2^(J-1)
+    int hi[__BN_CAP + 2];
+    __bn_copy(hi, P);
+    __bn_shr(hi, J - 1);
+    __bn_shl(hi, J - 1);
+    __bn_sub(F, hi);
+    bool neg = false;
+    if (half == 1) {
+        q = (q + 1) & 3;
+        int one[__BN_CAP + 2];
+        __bn_set(one, 1);
+        __bn_shl(one, J - 1);
+        __bn_sub(one, F);
+        __bn_copy(F, one);
+        neg = true;
+    }
+    __rq = q;
+    int L = __bn_bitlen(F);
+    if (L == 0) {
+        __rh = 0;
+        __rl = 0;
+        return;
+    }
+    // top 53 bits and the next 53 bits
+    int G[__BN_CAP + 2];
+    __bn_copy(G, F);
+    int top;
+    int low = 0;
+    int s1 = L - 53;
+    if (s1 >= 0) {
+        __bn_shr(G, s1);
+        top = __bn_low(G);
+        int H[__BN_CAP + 2];
+        __bn_copy(H, F);
+        int s2 = L - 106;
+        if (s2 >= 0) {
+            __bn_shr(H, s2);
+            low = __bn_low(H) & 0x1FFFFFFFFFFFFF;
+        } else {
+            __bn_shl(H, -s2);
+            low = __bn_low(H) & 0x1FFFFFFFFFFFFF;
+        }
+    } else {
+        top = __bn_low(F) << (-s1);
+    }
+    int th = scalbn(itod(top), L - 53 - (J - 1));
+    int tl = 0;
+    if (low != 0) {
+        tl = scalbn(itod(low), L - 106 - (J - 1));
+    }
+    __quick_two_sum(th, tl);
+    __dd_mul(__sh, __sl, DD_PI2_H, DD_PI2_L);
+    if (neg) {
+        __rh = dneg(__dh);
+        __rl = dneg(__dl);
+    } else {
+        __rh = __dh;
+        __rl = __dl;
+    }
+}
+
+// ---- sin, cos, tan --------------------------------------------------------------------------------------------------------------------
+// sin(r) and cos(r) for |r| <= ~0.8 as dd; results in __s_h/__s_l and __c_h/__c_l
+int __s_h;
+int __s_l;
+int __c_h;
+int __c_l;
+
+void __sincos_dd(int rh, int rl) {
+    __dd_mul(rh, rl, rh, rl);
+    int zh = __dh;
+    int zl = __dl;
+    // sin: r (1 - z/(2*3) (1 - z/(4*5) (1 - ... )))
+    int ah = 0x3FF0000000000000;
+    int al = 0;
+    for (int k = 15; k >= 1; k--) {
+        __dd_mul(zh, zl, ah, al);
+        __dd_div_d(__dh, __dl, itod((2 * k) * (2 * k + 1)));
+        __dd_sub(0x3FF0000000000000, 0, __dh, __dl);
+        ah = __dh;
+        al = __dl;
+    }
+    __dd_mul(rh, rl, ah, al);
+    __s_h = __dh;
+    __s_l = __dl;
+    // cos: 1 - z/(1*2) (1 - z/(3*4) (1 - ...))
+    ah = 0x3FF0000000000000;
+    al = 0;
+    for (int k = 15; k >= 1; k--) {
+        __dd_mul(zh, zl, ah, al);
+        __dd_div_d(__dh, __dl, itod((2 * k - 1) * (2 * k)));
+        __dd_sub(0x3FF0000000000000, 0, __dh, __dl);
+        ah = __dh;
+        al = __dl;
+    }
+    __c_h = ah;
+    __c_l = al;
+}
+
+// prepares the reduction: sets __rq, __rh, __rl for |x|
+void __trig_prepare(int x) {
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ax <= 0x3FE921FB54442D18) {
+        __rq = 0;
+        __rh = ax;
+        __rl = 0;
+    } else {
+        __reduce(ax);
+    }
+    __sincos_dd(__rh, __rl);
+}
+
+int sin(int x) {
+    if (!isfinite(x)) { return NAN; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3E40000000000000) { return x; }
+    __trig_prepare(x);
+    int h;
+    int l;
+    int q = __rq;
+    if (q == 0) { h = __s_h; l = __s_l; }
+    else if (q == 1) { h = __c_h; l = __c_l; }
+    else if (q == 2) { h = dneg(__s_h); l = dneg(__s_l); }
+    else { h = dneg(__c_h); l = dneg(__c_l); }
+    __dd_add(h, l, 0, 0);
+    int r = __dh;
+    if (x < 0) {
+        return dneg(r);
+    }
+    return r;
+}
+
+int cos(int x) {
+    if (!isfinite(x)) { return NAN; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3E40000000000000) { return 0x3FF0000000000000; }
+    __trig_prepare(x);
+    int h;
+    int l;
+    int q = __rq;
+    if (q == 0) { h = __c_h; l = __c_l; }
+    else if (q == 1) { h = dneg(__s_h); l = dneg(__s_l); }
+    else if (q == 2) { h = dneg(__c_h); l = dneg(__c_l); }
+    else { h = __s_h; l = __s_l; }
+    __dd_add(h, l, 0, 0);
+    return __dh;
+}
+
+int tan(int x) {
+    if (!isfinite(x)) { return NAN; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) < 0x3E40000000000000) { return x; }
+    __trig_prepare(x);
+    if ((__rq & 1) == 0) {
+        __dd_div(__s_h, __s_l, __c_h, __c_l);
+    } else {
+        __dd_div(__c_h, __c_l, __s_h, __s_l);
+        __dh = dneg(__dh);
+        __dl = dneg(__dl);
+    }
+    int r = __dh;
+    if (x < 0) {
+        return dneg(r);
+    }
+    return r;
+}
+
+// ---- more constants ---------------------------------------------------------------------------------------------------
+const DD_EULER_H = 0x3FE2788CFC6FB619;
+const DD_EULER_L = 0xBC56CB90701FBFAB;
+const DD_ZETA2_H = 0x3FFA51A6625307D3;
+const DD_ZETA2_L = 0x3C81873D8912200C;
+const DD_ZETA3_H = 0x3FF33BA004F00621;
+const DD_ZETA3_L = 0x3C8C1B8B8AE2CF35;
+const DD_ZETA4_H = 0x3FF151322AC7D848;
+const DD_ZETA4_L = 0x3C8B5F91211196E5;
+const DD_ZETA5_H = 0x3FF097418ECA7CCE;
+const DD_ZETA5_L = 0xBC921773EC70B998;
+const DD_ZETA6_H = 0x3FF0470984C09245;
+const DD_ZETA6_L = 0xBC9C209343D2BFC4;
+const DD_ZETA7_H = 0x3FF02232DA14CF39;
+const DD_ZETA7_L = 0xBC9C95902995DE95;
+const DD_ZETA8_H = 0x3FF010B36AF86397;
+const DD_ZETA8_L = 0xBC7741A635B224A6;
+const DD_ZETA9_H = 0x3FF00839F3D816B5;
+const DD_ZETA9_L = 0x3C9C0BFE83EEC736;
+const DD_ZETA10_H = 0x3FF00412E33A5BB9;
+const DD_ZETA10_L = 0x3C9F86047CC150C0;
+const DD_ZETA11_H = 0x3FF0020631BE48B3;
+const DD_ZETA11_L = 0x3C8544704E316139;
+const DD_ZETA12_H = 0x3FF001020A5B2CD3;
+const DD_ZETA12_L = 0x3C5066E420BC2E16;
+const DD_ZETA13_H = 0x3FF00080AC9D08BC;
+const DD_ZETA13_L = 0xBC80A7CE669B825D;
+
+int __stir_h[21];
+int __stir_l[21];
+bool __stir_ready;
+
+void __stir_init() {
+    if (__stir_ready) {
+        return;
+    }
+    __stir_ready = true;
+    __stir_h[1] = STIR1_H;
+    __stir_l[1] = STIR1_L;
+    __stir_h[2] = STIR2_H;
+    __stir_l[2] = STIR2_L;
+    __stir_h[3] = STIR3_H;
+    __stir_l[3] = STIR3_L;
+    __stir_h[4] = STIR4_H;
+    __stir_l[4] = STIR4_L;
+    __stir_h[5] = STIR5_H;
+    __stir_l[5] = STIR5_L;
+    __stir_h[6] = STIR6_H;
+    __stir_l[6] = STIR6_L;
+    __stir_h[7] = STIR7_H;
+    __stir_l[7] = STIR7_L;
+    __stir_h[8] = STIR8_H;
+    __stir_l[8] = STIR8_L;
+    __stir_h[9] = STIR9_H;
+    __stir_l[9] = STIR9_L;
+    __stir_h[10] = STIR10_H;
+    __stir_l[10] = STIR10_L;
+    __stir_h[11] = STIR11_H;
+    __stir_l[11] = STIR11_L;
+    __stir_h[12] = STIR12_H;
+    __stir_l[12] = STIR12_L;
+    __stir_h[13] = STIR13_H;
+    __stir_l[13] = STIR13_L;
+    __stir_h[14] = STIR14_H;
+    __stir_l[14] = STIR14_L;
+    __stir_h[15] = STIR15_H;
+    __stir_l[15] = STIR15_L;
+    __stir_h[16] = STIR16_H;
+    __stir_l[16] = STIR16_L;
+    __stir_h[17] = STIR17_H;
+    __stir_l[17] = STIR17_L;
+    __stir_h[18] = STIR18_H;
+    __stir_l[18] = STIR18_L;
+    __stir_h[19] = STIR19_H;
+    __stir_l[19] = STIR19_L;
+    __stir_h[20] = STIR20_H;
+    __stir_l[20] = STIR20_L;
+}
+
+int __zeta_h[14];
+int __zeta_l[14];
+bool __zeta_ready;
+
+void __zeta_init() {
+    if (__zeta_ready) {
+        return;
+    }
+    __zeta_ready = true;
+    __zeta_h[2] = DD_ZETA2_H;
+    __zeta_l[2] = DD_ZETA2_L;
+    __zeta_h[3] = DD_ZETA3_H;
+    __zeta_l[3] = DD_ZETA3_L;
+    __zeta_h[4] = DD_ZETA4_H;
+    __zeta_l[4] = DD_ZETA4_L;
+    __zeta_h[5] = DD_ZETA5_H;
+    __zeta_l[5] = DD_ZETA5_L;
+    __zeta_h[6] = DD_ZETA6_H;
+    __zeta_l[6] = DD_ZETA6_L;
+    __zeta_h[7] = DD_ZETA7_H;
+    __zeta_l[7] = DD_ZETA7_L;
+    __zeta_h[8] = DD_ZETA8_H;
+    __zeta_l[8] = DD_ZETA8_L;
+    __zeta_h[9] = DD_ZETA9_H;
+    __zeta_l[9] = DD_ZETA9_L;
+    __zeta_h[10] = DD_ZETA10_H;
+    __zeta_l[10] = DD_ZETA10_L;
+    __zeta_h[11] = DD_ZETA11_H;
+    __zeta_l[11] = DD_ZETA11_L;
+    __zeta_h[12] = DD_ZETA12_H;
+    __zeta_l[12] = DD_ZETA12_L;
+    __zeta_h[13] = DD_ZETA13_H;
+    __zeta_l[13] = DD_ZETA13_L;
+}
+
+// ---- inverse trigonometric functions -------------------------------------------------------------------------------------------------------
+// atan of a non-negative dd (th + tl); result in __dh / __dl
+void __atan_dd(int th, int tl) {
+    bool inv = false;
+    if (dgt(th, 0x3FF0000000000000)) {
+        __dd_div(0x3FF0000000000000, 0, th, tl);
+        th = __dh;
+        tl = __dl;
+        inv = true;
+    }
+    for (int i = 0; i < 4; i++) {
+        __dd_mul(th, tl, th, tl);
+        __dd_add_d(__dh, __dl, 0x3FF0000000000000);
+        __dd_sqrt(__dh, __dl);
+        __dd_add_d(__dh, __dl, 0x3FF0000000000000);
+        __dd_div(th, tl, __dh, __dl);
+        th = __dh;
+        tl = __dl;
+    }
+    __dd_mul(th, tl, th, tl);
+    int zh = __dh;
+    int zl = __dl;
+    // atan(t) = t (1/1 - z/3 + z^2/5 - ...)
+    __dd_div_d(0x3FF0000000000000, 0, itod(31));
+    int ah = __dh;
+    int al = __dl;
+    for (int n = 14; n >= 0; n--) {
+        __dd_mul(zh, zl, ah, al);
+        int ph = __dh;
+        int pl = __dl;
+        __dd_div_d(0x3FF0000000000000, 0, itod(2 * n + 1));
+        __dd_sub(__dh, __dl, ph, pl);
+        ah = __dh;
+        al = __dl;
+    }
+    __dd_mul(th, tl, ah, al);
+    int rh = scalbn(__dh, 4);
+    int rl = scalbn(__dl, 4);
+    if (inv) {
+        __dd_sub(DD_PI2_H, DD_PI2_L, rh, rl);
+    } else {
+        __dh = rh;
+        __dl = rl;
+    }
+}
+
+int atan(int x) {
+    if (isnan(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ax < 0x3E40000000000000) { return x; }
+    if (ax == 0x7FF0000000000000) { return copysign(0x3FF921FB54442D18, x); }
+    __atan_dd(ax, 0);
+    return copysign(__dh, x);
+}
+
+int atan2(int y, int x) {
+    if (isnan(x) || isnan(y)) { return NAN; }
+    int ay = y & 0x7FFFFFFFFFFFFFFF;
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    int sy = y & (1 << 63);
+    bool xneg = x < 0;
+    if (ay == 0) {
+        if (xneg) { return sy | 0x400921FB54442D18; }
+        return y;
+    }
+    if (ax == 0) { return sy | 0x3FF921FB54442D18; }
+    if (ax == 0x7FF0000000000000) {
+        if (ay == 0x7FF0000000000000) {
+            if (xneg) { return sy | 0x4002D97C7F3321D2; }
+            return sy | 0x3FE921FB54442D18;
+        }
+        if (xneg) { return sy | 0x400921FB54442D18; }
+        return sy;
+    }
+    if (ay == 0x7FF0000000000000) { return sy | 0x3FF921FB54442D18; }
+    int ah;
+    int al;
+    bool swapped = false;
+    if (ay <= ax) {
+        if (dlt(ay, dmul(ax, 0x3C30000000000000))) {
+            ah = ddiv(ay, ax);
+            al = 0;
+        } else {
+            __dd_div(ay, 0, ax, 0);
+            __atan_dd(__dh, __dl);
+            ah = __dh;
+            al = __dl;
+        }
+    } else {
+        swapped = true;
+        if (dlt(ax, dmul(ay, 0x3C30000000000000))) {
+            ah = ddiv(ax, ay);
+            al = 0;
+        } else {
+            __dd_div(ax, 0, ay, 0);
+            __atan_dd(__dh, __dl);
+            ah = __dh;
+            al = __dl;
+        }
+        __dd_sub(DD_PI2_H, DD_PI2_L, ah, al);
+        ah = __dh;
+        al = __dl;
+    }
+    if (xneg) {
+        __dd_sub(DD_PI_H, DD_PI_L, ah, al);
+        ah = __dh;
+        al = __dl;
+    }
+    return sy | ah;
+}
+
+int asin(int x) {
+    if (isnan(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (dgt(ax, 0x3FF0000000000000)) { return NAN; }
+    if (ax < 0x3E40000000000000) { return x; }
+    if (ax == 0x3FF0000000000000) { return copysign(0x3FF921FB54442D18, x); }
+    __two_sum(0x3FF0000000000000, dneg(ax));
+    int ah = __sh;
+    int al = __sl;
+    __two_sum(0x3FF0000000000000, ax);
+    __dd_mul(ah, al, __sh, __sl);
+    __dd_sqrt(__dh, __dl);
+    __dd_div(ax, 0, __dh, __dl);
+    __atan_dd(__dh, __dl);
+    return copysign(__dh, x);
+}
+
+int acos(int x) {
+    if (isnan(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (dgt(ax, 0x3FF0000000000000)) { return NAN; }
+    if (x == 0x3FF0000000000000) { return 0; }
+    if (x == 0xBFF0000000000000) { return 0x400921FB54442D18; }
+    __two_sum(0x3FF0000000000000, dneg(x));
+    int ah = __sh;
+    int al = __sl;
+    __two_sum(0x3FF0000000000000, x);
+    __dd_div(ah, al, __sh, __sl);
+    __dd_sqrt(__dh, __dl);
+    __atan_dd(__dh, __dl);
+    return scalbn(__dh, 1);
+}
+
+// ---- hyperbolic functions --------------------------------------------------------------------------------------------------------------------
+// cosh and sinh: (E +- 1/E) / 2 with E = e^|x| ; sign = +1 / -1
+int __cosh_sinh(int x, bool sinh) {
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (dgt(ax, 0x408633CE8FB9F87E)) {
+        if (sinh) { return copysign(INFINITY, x); }
+        return INFINITY;
+    }
+    __exp_dd(ax, 0, false);
+    int eh = __dh;
+    int el = __dl;
+    int k = __ek;
+    __dd_div(0x3FF0000000000000, 0, eh, el);
+    int ih = __dh;
+    int il = __dl;
+    // E*2^(k-1) and (1/E)*2^(-k-1)
+    int ah = scalbn(eh, k - 1);
+    int al = scalbn(el, k - 1);
+    int bh = scalbn(ih, -k - 1);
+    int bl = scalbn(il, -k - 1);
+    if (sinh) {
+        __dd_sub(ah, al, bh, bl);
+    } else {
+        __dd_add(ah, al, bh, bl);
+    }
+    int r = __dd_to_double(__dh, __dl, 0);
+    if (sinh && x < 0) {
+        return dneg(r);
+    }
+    return r;
+}
+
+int cosh(int x) {
+    if (isnan(x)) { return x; }
+    return __cosh_sinh(x, false);
+}
+
+int sinh(int x) {
+    if (isnan(x) || isinf(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ax < 0x3E40000000000000) { return x; }
+    if (ax < 0x3FD6000000000000) {
+        __exp_dd(ax, 0, true);
+        int eh = __dh;
+        int el = __dl;
+        __dd_add_d(eh, el, 0x3FF0000000000000);
+        __dd_div(eh, el, __dh, __dl);
+        __dd_add(eh, el, __dh, __dl);
+        int r = __dd_to_double(scalbn(__dh, -1), scalbn(__dl, -1), 0);
+        if (x < 0) { return dneg(r); }
+        return r;
+    }
+    return __cosh_sinh(x, true);
+}
+
+int tanh(int x) {
+    if (isnan(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ax < 0x3E40000000000000) { return x; }
+    if (ax >= 0x4036000000000000) { return copysign(0x3FF0000000000000, x); }
+    int r;
+    if (ax < 0x3FE0000000000000) {
+        __exp_dd(scalbn(ax, 1), 0, true);
+        int eh = __dh;
+        int el = __dl;
+        __dd_add_d(eh, el, 0x4000000000000000);
+        __dd_div(eh, el, __dh, __dl);
+        r = __dh;
+    } else {
+        __exp_dd(scalbn(ax, 1), 0, false);
+        __dd_scale(__dh, __dl, __ek);
+        int eh = __dh;
+        int el = __dl;
+        __dd_add_d(eh, el, 0xBFF0000000000000);
+        int nh = __dh;
+        int nl = __dl;
+        __dd_add_d(eh, el, 0x3FF0000000000000);
+        __dd_div(nh, nl, __dh, __dl);
+        r = __dh;
+    }
+    return copysign(r, x);
+}
+
+int asinh(int x) {
+    if (isnan(x) || isinf(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ax < 0x3E40000000000000) { return x; }
+    int r;
+    if (ax > 0x5FE0000000000000) {
+        __log_dd(ax, 0);
+        __dd_add(__dh, __dl, DD_LN2_H, DD_LN2_L);
+        r = __dh;
+    } else {
+        __two_prod(ax, ax);
+        __dd_add_d(__sh, __sl, 0x3FF0000000000000);
+        __dd_sqrt(__dh, __dl);
+        __dd_add_d(__dh, __dl, ax);
+        __log_dd(__dh, __dl);
+        r = __dh;
+    }
+    return copysign(r, x);
+}
+
+int acosh(int x) {
+    if (isnan(x)) { return x; }
+    if (x < 0x3FF0000000000000) { return NAN; }
+    if (x == 0x3FF0000000000000) { return 0; }
+    if (x == INFINITY) { return x; }
+    if (x > 0x5FE0000000000000) {
+        __log_dd(x, 0);
+        __dd_add(__dh, __dl, DD_LN2_H, DD_LN2_L);
+        return __dh;
+    }
+    __two_sum(x, 0xBFF0000000000000);
+    int ah = __sh;
+    int al = __sl;
+    __two_sum(x, 0x3FF0000000000000);
+    __dd_mul(ah, al, __sh, __sl);
+    __dd_sqrt(__dh, __dl);
+    __dd_add_d(__dh, __dl, x);
+    __log_dd(__dh, __dl);
+    return __dh;
+}
+
+int atanh(int x) {
+    if (isnan(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (dgt(ax, 0x3FF0000000000000)) { return NAN; }
+    if (ax == 0x3FF0000000000000) { return copysign(INFINITY, x); }
+    if (ax < 0x3E40000000000000) { return x; }
+    __two_sum(0x3FF0000000000000, ax);
+    int ph = __sh;
+    int pl = __sl;
+    __two_sum(0x3FF0000000000000, dneg(ax));
+    __dd_div(ph, pl, __sh, __sl);
+    __log_dd(__dh, __dl);
+    return copysign(scalbn(__dh, -1), x);
+}
+
+// ---- error function ----------------------------------------------------------------------------------------------------------------------------
+// erf(x) for 0 <= x <= 6 as dd: 2/sqrt(pi) e^(-x^2) sum 2^n x^(2n+1) / (1*3*5*...*(2n+1))
+void __erf_dd(int x) {
+    __two_prod(x, x);
+    int z2h = scalbn(__sh, 1);
+    int z2l = scalbn(__sl, 1);
+    int th = x;
+    int tl = 0;
+    int sh = x;
+    int sl = 0;
+    for (int n = 0; n < 400; n++) {
+        __dd_mul(th, tl, z2h, z2l);
+        __dd_div_d(__dh, __dl, itod(2 * n + 3));
+        th = __dh;
+        tl = __dl;
+        __dd_add(sh, sl, th, tl);
+        sh = __dh;
+        sl = __dl;
+        if (dlt(th, dmul(sh, 0x3900000000000000))) {
+            break;
+        }
+    }
+    // times 2/sqrt(pi) * e^(-x^2)
+    __two_prod(x, x);
+    __exp_dd(dneg(__sh), dneg(__sl), false);
+    __dd_scale(__dh, __dl, __ek);
+    __dd_mul(sh, sl, __dh, __dl);
+    __dd_mul(__dh, __dl, DD_2_SQRTPI_H, DD_2_SQRTPI_L);
+}
+
+int erf(int x) {
+    if (isnan(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (ax >= 0x4018000000000000) { return copysign(0x3FF0000000000000, x); }
+    if (ax < 0x3E40000000000000) {
+        if (ax < 0x2000000000000000) {
+            return dmul(x, 0x3FF20DD750429B6D);
+        }
+        __dd_mul(x, 0, DD_2_SQRTPI_H, DD_2_SQRTPI_L);
+        return __dh;
+    }
+    __erf_dd(ax);
+    return copysign(__dh, x);
+}
+
+// erfc(x) = 1 - erf(x) without losing the small result for large x
+int erfc(int x) {
+    if (isnan(x)) { return x; }
+    int ax = x & 0x7FFFFFFFFFFFFFFF;
+    if (x >= 0x403B400000000000) { return 0; }
+    if (x < 0 && ax >= 0x4018000000000000) { return 0x4000000000000000; }
+    if (ax < 0x3E40000000000000) {
+        return dsub(0x3FF0000000000000, x);
+    }
+    int r;
+    if (dlt(ax, 0x4004000000000000)) {
+        __erf_dd(ax);
+        if (x < 0) {
+            __dd_add_d(__dh, __dl, 0x3FF0000000000000);
+        } else {
+            __dd_sub(0x3FF0000000000000, 0, __dh, __dl);
+        }
+        return __dd_to_double(__dh, __dl, 0);
+    }
+    // continued fraction: e^(-x^2) / (sqrt(pi) (x + (1/2)/(x + (2/2)/(x + (3/2)/(x + ...)))))
+    int th = ax;
+    int tl = 0;
+    for (int k = 240; k >= 1; k--) {
+        __dd_div(scalbn(itod(k), -1), 0, th, tl);
+        __dd_add_d(__dh, __dl, ax);
+        th = __dh;
+        tl = __dl;
+    }
+    __dd_mul(th, tl, DD_SQRTPI_H, DD_SQRTPI_L);
+    __dd_div(0x3FF0000000000000, 0, __dh, __dl);
+    int ch = __dh;
+    int cl = __dl;
+    __two_prod(ax, ax);
+    __exp_dd(dneg(__sh), dneg(__sl), false);
+    __dd_mul(__dh, __dl, ch, cl);
+    r = __dd_to_double(__dh, __dl, __ek);
+    if (x < 0) {
+        return dsub(0x4000000000000000, r);
+    }
+    return r;
+}
+
+// ---- gamma functions -------------------------------------------------------------------------------------------------------------------------------
+// sin(pi f) for 0 <= f <= 0.5 as dd
+void __sinpi_dd(int f) {
+    if (dle(f, 0x3FD0000000000000)) {
+        __dd_mul_d(DD_PI_H, DD_PI_L, f);
+        __sincos_dd(__dh, __dl);
+        __dh = __s_h;
+        __dl = __s_l;
+    } else {
+        __dd_mul_d(DD_PI_H, DD_PI_L, dsub(0x3FE0000000000000, f));
+        __sincos_dd(__dh, __dl);
+        __dh = __c_h;
+        __dl = __c_l;
+    }
+}
+
+// ln(Gamma(x)) for x > 0 as dd
+void __lgamma_pos(int xh, int xl) {
+    __stir_init();
+    __zeta_init();
+    // near 1 and 2 the general formula loses digits: use the Taylor series of ln Gamma(1 + t)
+    int t1h = dsub(xh, 0x3FF0000000000000);
+    int t2h = dsub(xh, 0x4000000000000000);
+    if (fabs(t1h) < 0x3F50624DD2F1A9FC || fabs(t2h) < 0x3F50624DD2F1A9FC) {
+        // t = x - 1 or x - 2 (exact for doubles close to 1 or 2)
+        int th = t1h;
+        bool two = false;
+        if (fabs(t2h) < 0x3F50624DD2F1A9FC) {
+            th = t2h;
+            two = true;
+        }
+        int tl = xl;
+        // sum_{k>=2} (-1)^k zeta(k) t^k / k   (+ the -ln(1+t) part for Gamma(2+t))
+        int sh = 0;
+        int sl = 0;
+        __dd_mul(th, tl, th, tl);
+        int t2h_ = __dh;
+        int t2l_ = __dl;
+        int ph = t2h_;
+        int pl = t2l_;
+        for (int k = 2; k <= 13; k++) {
+            int zh = __zeta_h[k];
+            int zl = __zeta_l[k];
+            if (two) {
+                __dd_add_d(zh, zl, 0xBFF0000000000000);
+                zh = __dh;
+                zl = __dl;
+            }
+            __dd_mul(zh, zl, ph, pl);
+            __dd_div_d(__dh, __dl, itod(k));
+            if ((k & 1) == 1) {
+                __dd_sub(sh, sl, __dh, __dl);
+            } else {
+                __dd_add(sh, sl, __dh, __dl);
+            }
+            sh = __dh;
+            sl = __dl;
+            __dd_mul(ph, pl, th, tl);
+            ph = __dh;
+            pl = __dl;
+        }
+        int ch = DD_EULER_H;
+        int cl = DD_EULER_L;
+        if (two) {
+            __dd_sub(0x3FF0000000000000, 0, ch, cl);
+            ch = __dh;
+            cl = __dl;
+        } else {
+            ch = dneg(ch);
+            cl = dneg(cl);
+        }
+        __dd_mul(ch, cl, th, tl);
+        __dd_add(__dh, __dl, sh, sl);
+        return;
+    }
+    // shift x up to at least 25, remembering the product x (x+1) ... (x+n-1)
+    int ph = 0x3FF0000000000000;
+    int pl = 0;
+    while (dlt(xh, 0x4039000000000000)) {
+        __dd_mul(ph, pl, xh, xl);
+        ph = __dh;
+        pl = __dl;
+        __dd_add_d(xh, xl, 0x3FF0000000000000);
+        xh = __dh;
+        xl = __dl;
+    }
+    // Stirling: (x - 1/2) ln x - x + ln(2 pi)/2 + sum c_k / x^(2k-1)
+    __log_dd(xh, xl);
+    int lh = __dh;
+    int ll = __dl;
+    __dd_add_d(xh, xl, 0xBFE0000000000000);
+    __dd_mul(__dh, __dl, lh, ll);
+    __dd_sub(__dh, __dl, xh, xl);
+    __dd_add(__dh, __dl, DD_HLN2PI_H, DD_HLN2PI_L);
+    int ah = __dh;
+    int al = __dl;
+    // 1/x and 1/x^2
+    __dd_div(0x3FF0000000000000, 0, xh, xl);
+    int ih = __dh;
+    int il = __dl;
+    __dd_mul(ih, il, ih, il);
+    int jh = __dh;
+    int jl = __dl;
+    int sh = 0;
+    int sl = 0;
+    for (int k = 20; k >= 1; k--) {
+        __dd_mul(sh, sl, jh, jl);
+        __dd_add(__dh, __dl, __stir_h[k], __stir_l[k]);
+        sh = __dh;
+        sl = __dl;
+    }
+    __dd_mul(sh, sl, ih, il);
+    __dd_add(ah, al, __dh, __dl);
+    int rh = __dh;
+    int rl = __dl;
+    if (ph != 0x3FF0000000000000) {
+        __log_dd(ph, pl);
+        __dd_sub(rh, rl, __dh, __dl);
+    }
+}
+
+// -1 if sin(pi x) is negative, +1 if positive (x not an integer)
+int __sinpi_sign(int x) {
+    int ax = fabs(x);
+    int fl = floor(ax);
+    int odd = 0;
+    if (ax < 0x4340000000000000 && (dtoi(fl) & 1) == 1) {
+        odd = 1;
+    }
+    int s = 1;
+    if (odd == 1) { s = -1; }
+    if (x < 0) { s = -s; }
+    return s;
+}
+
+// ln |Gamma(x)| for a negative non-integer x (dd): ln(pi / |sin(pi x)|) - lnGamma(1 - x)
+void __lgamma_neg(int x) {
+    int ax = fabs(x);
+    int f = dsub(ax, floor(ax));
+    if (dgt(f, 0x3FE0000000000000)) {
+        f = dsub(0x3FF0000000000000, f);
+    }
+    __sinpi_dd(f);
+    __dd_div(DD_PI_H, DD_PI_L, __dh, __dl);
+    __log_dd(__dh, __dl);
+    int ah = __dh;
+    int al = __dl;
+    __two_sum(0x3FF0000000000000, dneg(x));
+    __lgamma_pos(__sh, __sl);
+    __dd_sub(ah, al, __dh, __dl);
+}
+
+int lgamma(int x) {
+    if (isnan(x)) { return x; }
+    if (isinf(x)) { return INFINITY; }
+    if (x == 0 || (x < 0 && trunc(x) == x)) { return INFINITY; }
+    if (x == 0x3FF0000000000000 || x == 0x4000000000000000) { return 0; }
+    if (dgt(x, 0x7F5754D9278B51A7)) { return INFINITY; }
+    if (x < 0) {
+        __lgamma_neg(x);
+    } else {
+        __lgamma_pos(x, 0);
+    }
+    return __dh;
+}
+
+int tgamma(int x) {
+    if (isnan(x)) { return x; }
+    if (x == INFINITY) { return x; }
+    if (x == NEG_INFINITY) { return NAN; }
+    if ((x & 0x7FFFFFFFFFFFFFFF) == 0) { return copysign(INFINITY, x); }
+    if (x < 0 && trunc(x) == x) { return NAN; }
+    if (dgt(x, 0x406573FAE561F647)) { return INFINITY; }
+    if (x > 0 && x < 0x3C90000000000000) { return ddiv(0x3FF0000000000000, x); }
+    if (x > 0) {
+        __lgamma_pos(x, 0);
+        __exp_dd(__dh, __dl, false);
+        return __dd_to_double(__dh, __dl, __ek);
+    }
+    __lgamma_neg(x);
+    __exp_dd(__dh, __dl, false);
+    int r = __dd_to_double(__dh, __dl, __ek);
+    if (__sinpi_sign(x) < 0) {
+        return dneg(r);
+    }
+    return r;
+}

@@ -1,0 +1,760 @@
+// =============================================================================
+//  cstdlib - C <stdlib.h>                                     import cstdlib;
+//
+//    malloc calloc realloc free   a real allocator: freed memory is reused (std `alloc`/`new` never free)
+//    strtol strtoul strtoll strtoull strtoimax strtoumax atol atoll   number parsing with any base 2-36
+//    abs labs llabs imaxabs div ldiv lldiv
+//    getenv setenv putenv unsetenv clearenv environ
+//    system abort _Exit quick_exit
+//    mblen mbtowc wctomb mbstowcs wcstombs     (UTF-8; wide characters are ints)
+//
+//  Not possible without function pointers: qsort, bsearch and atexit (see the sort module for sorting).
+//  `exit`, `rand` and `srand` are in the standard library already.
+// =============================================================================
+import cerrno;
+import cctype;
+
+const EXIT_SUCCESS = 0;
+const EXIT_FAILURE = 1;
+const RAND_MAX = 2147483647;
+const MB_CUR_MAX = 4;
+
+// ---- memory ------------------------------------------------------------------------------------------------
+// Blocks have a 16-byte header with their size class (powers of two from 16 bytes up) and are
+// kept in one free list per class. Memory returned by malloc is always zeroed.
+int __malloc_free[56];
+
+void __zero_block(char* p, int n) {
+    int* w = (int*) p;
+    int words = n / 8;
+    for (int i = 0; i < words; i++) {
+        w[i] = 0;
+    }
+}
+
+char* malloc(int size) {
+    if (size < 0) {
+        errno = ENOMEM;
+        return null;
+    }
+    int c = 0;
+    int cap = 16;
+    while (cap < size) {
+        cap = cap * 2;
+        c++;
+    }
+    int head = __malloc_free[c];
+    if (head != 0) {
+        char* p = (char*) head;
+        int* link = (int*) p;
+        __malloc_free[c] = link[0];
+        __zero_block(p, cap);
+        return p;
+    }
+    char* raw = alloc(cap + 16);
+    int* hdr = (int*) raw;
+    hdr[0] = c;
+    return &raw[16];
+}
+
+char* calloc(int count, int size) {
+    return malloc(count * size);
+}
+
+// gives a block back for reuse; free(null) does nothing. Only pointers from malloc/calloc/realloc may be freed.
+void free(char* p) {
+    if (p == null) {
+        return;
+    }
+    int* hdr = (int*) (p - 16);
+    int c = hdr[0];
+    int* link = (int*) p;
+    link[0] = __malloc_free[c];
+    __malloc_free[c] = (int) p;
+}
+
+// capacity in bytes of a block from malloc
+int malloc_usable_size(char* p) {
+    if (p == null) {
+        return 0;
+    }
+    int* hdr = (int*) (p - 16);
+    return 16 << hdr[0];
+}
+
+char* realloc(char* p, int size) {
+    if (p == null) {
+        return malloc(size);
+    }
+    if (size == 0) {
+        free(p);
+        return null;
+    }
+    int cap = malloc_usable_size(p);
+    if (size <= cap) {
+        return p;
+    }
+    char* q = malloc(size);
+    if (q == null) {
+        return null;
+    }
+    for (int i = 0; i < cap; i++) {
+        q[i] = p[i];
+    }
+    free(p);
+    return q;
+}
+
+// ---- numbers -------------------------------------------------------------------------------------------------
+int abs64(int x) {
+    if (x < 0) {
+        return -x;
+    }
+    return x;
+}
+
+int labs(int x) {
+    return abs64(x);
+}
+
+int llabs(int x) {
+    return abs64(x);
+}
+
+int imaxabs(int x) {
+    return abs64(x);
+}
+
+struct div_t {
+    int quot;
+    int rem;
+}
+
+div_t __div_result;
+
+// quotient and remainder at once. The result is a pointer to a static div_t:  div_t* d = div(7, 2);
+div_t* div(int a, int b) {
+    __div_result.quot = a / b;
+    __div_result.rem = a % b;
+    return &__div_result;
+}
+
+div_t* ldiv(int a, int b) {
+    return div(a, b);
+}
+
+div_t* lldiv(int a, int b) {
+    return div(a, b);
+}
+
+// unsigned 64-bit division of v by a small positive number (the bit pattern of v is the number)
+int __udiv(int v, int b) {
+    if (v >= 0) {
+        return v / b;
+    }
+    int q = (((v >> 1) & 0x7FFFFFFFFFFFFFFF) / b) << 1;
+    int r = v - q * b;
+    if (r >= b) {
+        q++;
+    }
+    return q;
+}
+
+// unsigned a < b
+bool __ult(int a, int b) {
+    return (a ^ (-9223372036854775807 - 1)) < (b ^ (-9223372036854775807 - 1));
+}
+
+// shared by strtol and strtoul: parses text, *end is set to the first unused character.
+// limit = largest magnitude (as unsigned bit pattern); sets __num_over when it does not fit.
+bool __num_over;
+bool __num_neg;
+
+int __parse_number(char* s, char** end, int base, int limitPos, int limitNeg, bool allowNeg) {
+    int i = 0;
+    while (isspace(s[i])) {
+        i++;
+    }
+    bool neg = false;
+    if (s[i] == '-') {
+        neg = true;
+        i++;
+    } else if (s[i] == '+') {
+        i++;
+    }
+    if ((base == 0 || base == 16) && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X') && digitValue(s[i + 2], 16) >= 0) {
+        i = i + 2;
+        base = 16;
+    } else if (base == 0) {
+        if (s[i] == '0') {
+            base = 8;
+        } else {
+            base = 10;
+        }
+    }
+    __num_over = false;
+    __num_neg = neg;
+    if (base < 2 || base > 36) {
+        errno = EINVAL;
+        if (end != null) {
+            *end = s;
+        }
+        return 0;
+    }
+    int limit = limitPos;
+    if (neg) {
+        limit = limitNeg;
+    }
+    int cutoff = __udiv(limit, base);
+    int cutlim = limit - cutoff * base;
+    int acc = 0;
+    int start = i;
+    for (;;) {
+        int d = digitValue(s[i], base);
+        if (d < 0) {
+            break;
+        }
+        if (__ult(cutoff, acc) || (acc == cutoff && d > cutlim)) {
+            __num_over = true;
+        } else {
+            acc = acc * base + d;
+        }
+        i++;
+    }
+    if (i == start) {
+        if (end != null) {
+            *end = s;
+        }
+        __num_neg = false;
+        return 0;
+    }
+    if (end != null) {
+        *end = &s[i];
+    }
+    if (__num_over) {
+        errno = ERANGE;
+    }
+    return acc;
+}
+
+// converts text to a number: leading white space, optional sign, base 2-36 (0 = from the prefix: 0x hex,
+// 0 octal, otherwise decimal). *end (when not null) is set to the first character that was not used.
+// Out of range values give the limit and set errno to ERANGE.
+int strtol(char* s, char** end, int base = 10) {
+    int v = __parse_number(s, end, base, 9223372036854775807, -9223372036854775807 - 1, true);
+    if (__num_over) {
+        if (__num_neg) {
+            return -9223372036854775807 - 1;
+        }
+        return 9223372036854775807;
+    }
+    if (__num_neg) {
+        return -v;
+    }
+    return v;
+}
+
+int strtoll(char* s, char** end, int base = 10) {
+    return strtol(s, end, base);
+}
+
+int strtoimax(char* s, char** end, int base = 10) {
+    return strtol(s, end, base);
+}
+
+// unsigned version: the result is the bit pattern, values above 2^63 come out negative
+int strtoul(char* s, char** end, int base = 10) {
+    int v = __parse_number(s, end, base, -1, -1, true);
+    if (__num_over) {
+        return -1;
+    }
+    if (__num_neg) {
+        return -v;
+    }
+    return v;
+}
+
+int strtoull(char* s, char** end, int base = 10) {
+    return strtoul(s, end, base);
+}
+
+int strtoumax(char* s, char** end, int base = 10) {
+    return strtoul(s, end, base);
+}
+
+int atol(char* s) {
+    return strtol(s, null, 10);
+}
+
+int atoll(char* s) {
+    return strtol(s, null, 10);
+}
+
+// ---- environment ---------------------------------------------------------------------------------------
+// Linux and Android read /proc/self/environ once; Windows asks the system.
+char* __env_buf;
+char** __env_ptrs;
+int __env_count;
+char* __ovl_name[64];
+char* __ovl_val[64];
+int __ovl_count;
+
+void __env_load() {
+    if (__env_ptrs != null) {
+        return;
+    }
+    int cap = 65536;
+    char* buf = alloc(cap + 2);
+    int len = 0;
+    if (__OS != 1) {
+        int fd = __open("/proc/self/environ", 0);
+        if (fd >= 0) {
+            for (;;) {
+                if (len == cap) {
+                    char* nb = alloc(cap * 2 + 2);
+                    for (int k = 0; k < len; k++) {
+                        nb[k] = buf[k];
+                    }
+                    buf = nb;
+                    cap = cap * 2;
+                }
+                int got = __read(fd, &buf[len], cap - len);
+                if (got <= 0) {
+                    break;
+                }
+                len = len + got;
+            }
+            __close(fd);
+        }
+    }
+    int n = 0;
+    for (int k = 0; k < len; k++) {
+        if (buf[k] == 0) {
+            n++;
+        }
+    }
+    if (len > 0 && buf[len - 1] != 0) {
+        n++;
+    }
+    char** ptrs = (char**) alloc((n + 1) * 8);
+    int idx = 0;
+    int startAt = 0;
+    for (int k = 0; k < len; k++) {
+        if (buf[k] == 0) {
+            ptrs[idx] = &buf[startAt];
+            idx++;
+            startAt = k + 1;
+        }
+    }
+    if (startAt < len) {
+        ptrs[idx] = &buf[startAt];
+        idx++;
+    }
+    ptrs[idx] = null;
+    __env_buf = buf;
+    __env_count = idx;
+    __env_ptrs = ptrs;
+}
+
+// the environment as a null-terminated array of "NAME=value" strings (changes made by setenv are included)
+char** environ() {
+    __env_load();
+    char** all = (char**) alloc((__env_count + __ovl_count + 1) * 8);
+    int n = 0;
+    for (int i = 0; i < __env_count; i++) {
+        char* e = __env_ptrs[i];
+        int eq = indexOf(e, '=');
+        bool replaced = false;
+        for (int k = 0; k < __ovl_count; k++) {
+            if (eq >= 0 && strlen(__ovl_name[k]) == eq && startsWith(e, __ovl_name[k])) {
+                replaced = true;
+            }
+        }
+        if (!replaced) {
+            all[n] = e;
+            n++;
+        }
+    }
+    for (int k = 0; k < __ovl_count; k++) {
+        if (__ovl_val[k] != null) {
+            char* line = alloc(strlen(__ovl_name[k]) + strlen(__ovl_val[k]) + 2);
+            strcpy(line, __ovl_name[k]);
+            strcat(line, "=");
+            strcat(line, __ovl_val[k]);
+            all[n] = line;
+            n++;
+        }
+    }
+    all[n] = null;
+    return all;
+}
+
+char* getenv(char* name) {
+    for (int k = __ovl_count - 1; k >= 0; k--) {
+        if (streq(__ovl_name[k], name)) {
+            return __ovl_val[k];
+        }
+    }
+    if (__OS == 1) {
+        char* buf = alloc(32768);
+        int n = (__winapi(12, name, buf, 32767, 0) << 32) >> 32;
+        if (n <= 0) {
+            return null;
+        }
+        return buf;
+    }
+    __env_load();
+    int nl = strlen(name);
+    for (int i = 0; i < __env_count; i++) {
+        char* e = __env_ptrs[i];
+        if (startsWith(e, name) && e[nl] == '=') {
+            return &e[nl + 1];
+        }
+    }
+    return null;
+}
+
+// sets NAME=value; an existing variable is only replaced when overwrite is true. Returns 0, or -1 with errno set
+int setenv(char* name, char* value, bool overwrite = true) {
+    if (name == null || name[0] == 0 || indexOf(name, '=') >= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (!overwrite && getenv(name) != null) {
+        return 0;
+    }
+    if (__OS == 1) {
+        __winapi(36, name, value, 0, 0);                                // SetEnvironmentVariableA
+        return 0;
+    }
+    for (int k = 0; k < __ovl_count; k++) {
+        if (streq(__ovl_name[k], name)) {
+            __ovl_val[k] = strdup(value);
+            return 0;
+        }
+    }
+    if (__ovl_count >= 64) {
+        errno = ENOMEM;
+        return -1;
+    }
+    __ovl_name[__ovl_count] = strdup(name);
+    __ovl_val[__ovl_count] = strdup(value);
+    __ovl_count++;
+    return 0;
+}
+
+// "NAME=value"
+int putenv(char* assignment) {
+    int eq = indexOf(assignment, '=');
+    if (eq <= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    char* name = substr(assignment, 0, eq);
+    return setenv(name, &assignment[eq + 1], true);
+}
+
+int unsetenv(char* name) {
+    if (name == null || name[0] == 0 || indexOf(name, '=') >= 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (__OS == 1) {
+        __winapi(36, name, 0, 0, 0);
+        return 0;
+    }
+    for (int k = 0; k < __ovl_count; k++) {
+        if (streq(__ovl_name[k], name)) {
+            __ovl_val[k] = null;
+            return 0;
+        }
+    }
+    if (__ovl_count >= 64) {
+        errno = ENOMEM;
+        return -1;
+    }
+    __ovl_name[__ovl_count] = strdup(name);
+    __ovl_val[__ovl_count] = null;
+    __ovl_count++;
+    return 0;
+}
+
+// ---- processes -----------------------------------------------------------------------------------------------
+// Runs a command through the shell (/bin/sh -c on Linux, /system/bin/sh on Android, cmd.exe /c on Windows)
+// and waits for it. Returns the exit code of the command (128 + signal number if it was killed),
+// -1 if it could not be started. system(null) returns 1: a shell is available.
+int system(char* command) {
+    if (command == null) {
+        return 1;
+    }
+    int pid = __spawn_shell(command, -1, -1);
+    if (pid < 0) {
+        return -1;
+    }
+    return __wait_pid(pid);
+}
+
+// Windows: starts "cmd.exe /c command". hin / hout (when >= 0) are the handles to use as standard input / output.
+// Returns the process handle, -1 on failure.
+int __win_spawn(char* command, int hin, int hout) {
+    char* line = alloc(strlen(command) + 16);
+    strcpy(line, "cmd.exe /c ");
+    strcat(line, command);
+    char si[104];
+    char pi[24];
+    memset(&si[0], 0, 104);
+    memset(&pi[0], 0, 24);
+    int* siw = (int*) &si[0];
+    siw[0] = 104;                                                      // cb
+    si[60] = 0;
+    si[61] = 1;                                                        // dwFlags = STARTF_USESTDHANDLES (0x100)
+    int* handles = (int*) &si[80];
+    if (hin >= 0) { handles[0] = hin; } else { handles[0] = __winapi(0, -10, 0, 0, 0); }   // GetStdHandle
+    if (hout >= 0) { handles[1] = hout; } else { handles[1] = __winapi(0, -11, 0, 0, 0); }
+    handles[2] = __winapi(0, -12, 0, 0, 0);
+    int ok = (__winapix(30, 0, line, 0, 0, 1, 0, 0, 0, &si[0], &pi[0]) << 32) >> 32;   // CreateProcessA
+    if (ok == 0) {
+        errno = ENOENT;
+        return -1;
+    }
+    int* pih = (int*) &pi[0];
+    __winapi(5, pih[1], 0, 0, 0);                                      // CloseHandle(thread)
+    return pih[0];
+}
+
+// Starts "sh -c command" (Windows: "cmd.exe /c command") in a new process. in_fd / out_fd (when >= 0) become its
+// standard input / output. Returns the process id, -1 with errno set on failure.
+int __spawn_shell(char* command, int in_fd, int out_fd) {
+    if (__OS == 1) {
+        return __win_spawn(command, in_fd, out_fd);
+    }
+    char* shell = "/bin/sh";
+    if (__OS == 2) {
+        // Android: its own shell; where there is none (an Android executable run on a normal Linux) /bin/sh
+        int probe = __open("/system/bin/sh", 0);
+        if (probe >= 0) {
+            __close(probe);
+            shell = "/system/bin/sh";
+        }
+    }
+    char** argv = (char**) alloc(32);
+    argv[0] = "sh";
+    argv[1] = "-c";
+    argv[2] = command;
+    argv[3] = null;
+    char** envp = environ();
+    int pid;
+    if (__ARCH == 1) {
+        pid = __syscall(220, 17, 0, 0, 0, 0, 0);                        // clone(SIGCHLD)
+    } else {
+        pid = __syscall(57, 0, 0, 0, 0, 0, 0);                          // fork
+    }
+    if (pid < 0) {
+        errno = -pid;
+        return -1;
+    }
+    if (pid == 0) {
+        if (in_fd >= 0) {
+            __dup2(in_fd, 0);
+        }
+        if (out_fd >= 0) {
+            __dup2(out_fd, 1);
+        }
+        int nr = 59;
+        if (__ARCH == 1) {
+            nr = 221;
+        }
+        __syscall(nr, shell, argv, envp, 0, 0, 0);                      // execve
+        __exit(127);
+    }
+    return pid;
+}
+
+int __dup2(int old, int nw) {
+    if (__ARCH == 1) {
+        return __syscall(24, old, nw, 0, 0, 0, 0);                      // dup3
+    }
+    return __syscall(33, old, nw, 0, 0, 0, 0);                          // dup2
+}
+
+// waits for a process (a process id, on Windows a process handle) and returns its exit code (128 + signal if it was killed), -1 on failure
+int __wait_pid(int pid) {
+    if (__OS == 1) {
+        __winapi(31, pid, -1, 0, 0);                                    // WaitForSingleObject(INFINITE)
+        char code[8];
+        memset(&code[0], 0, 8);
+        __winapi(32, pid, &code[0], 0, 0);                              // GetExitCodeProcess
+        __winapi(5, pid, 0, 0, 0);                                      // CloseHandle
+        int* code64 = (int*) &code[0];
+        return code64[0] & 0xFFFFFFFF;
+    }
+    char st[8];
+    memset(&st[0], 0, 8);
+    int wnr = 61;
+    if (__ARCH == 1) {
+        wnr = 260;
+    }
+    int r = __syscall(wnr, pid, &st[0], 0, 0, 0, 0);                    // wait4
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    int status = st[0] | (st[1] << 8);
+    if ((status & 127) == 0) {
+        return (status >> 8) & 255;
+    }
+    return 128 + (status & 127);
+}
+
+// ends the program abnormally (exit code 134, as after SIGABRT)
+void abort() {
+    exit(134);
+}
+
+void _Exit(int code) {
+    exit(code);
+}
+
+void quick_exit(int code) {
+    exit(code);
+}
+
+// ---- multibyte characters (UTF-8) ----------------------------------------------------------------------------
+// number of bytes of the character at s (0 for the end of the text, -1 for an invalid sequence)
+int mblen(char* s, int n) {
+    if (s == null || n <= 0) {
+        return 0;
+    }
+    int c = s[0];
+    if (c == 0) {
+        return 0;
+    }
+    int len = 1;
+    if (c >= 0xF0 && c <= 0xF4) {
+        len = 4;
+    } else if (c >= 0xE0) {
+        len = 3;
+    } else if (c >= 0xC2) {
+        len = 2;
+    } else if (c >= 0x80) {
+        return -1;
+    }
+    if (c >= 0xF5 || len > n) {
+        return -1;
+    }
+    for (int i = 1; i < len; i++) {
+        if ((s[i] & 0xC0) != 0x80) {
+            return -1;
+        }
+    }
+    return len;
+}
+
+// decodes one character into *wc; returns the bytes used (0 at the end of the text, -1 if invalid)
+int mbtowc(int* wc, char* s, int n) {
+    int len = mblen(s, n);
+    if (len <= 0) {
+        if (len == 0 && wc != null) {
+            *wc = 0;
+        }
+        return len;
+    }
+    int c = s[0];
+    int v = c;
+    if (len == 2) {
+        v = c & 0x1F;
+    } else if (len == 3) {
+        v = c & 0x0F;
+    } else if (len == 4) {
+        v = c & 0x07;
+    }
+    for (int i = 1; i < len; i++) {
+        v = (v << 6) | (s[i] & 0x3F);
+    }
+    if (wc != null) {
+        *wc = v;
+    }
+    return len;
+}
+
+// encodes the character wc; returns the number of bytes (-1 if it cannot be encoded)
+int wctomb(char* s, int wc) {
+    if (s == null) {
+        return 0;
+    }
+    if (wc < 0 || wc > 0x10FFFF || (wc >= 0xD800 && wc <= 0xDFFF)) {
+        return -1;
+    }
+    if (wc < 0x80) {
+        s[0] = wc;
+        return 1;
+    }
+    if (wc < 0x800) {
+        s[0] = 0xC0 | (wc >> 6);
+        s[1] = 0x80 | (wc & 0x3F);
+        return 2;
+    }
+    if (wc < 0x10000) {
+        s[0] = 0xE0 | (wc >> 12);
+        s[1] = 0x80 | ((wc >> 6) & 0x3F);
+        s[2] = 0x80 | (wc & 0x3F);
+        return 3;
+    }
+    s[0] = 0xF0 | (wc >> 18);
+    s[1] = 0x80 | ((wc >> 12) & 0x3F);
+    s[2] = 0x80 | ((wc >> 6) & 0x3F);
+    s[3] = 0x80 | (wc & 0x3F);
+    return 4;
+}
+
+// converts a UTF-8 text into at most n wide characters (ints); returns how many were stored (-1 if invalid)
+int mbstowcs(int* dst, char* src, int n) {
+    int count = 0;
+    int pos = 0;
+    while (src[pos] != 0) {
+        int w;
+        int len = mbtowc(&w, &src[pos], 4);
+        if (len < 0) {
+            return -1;
+        }
+        if (dst != null) {
+            if (count >= n) {
+                return count;
+            }
+            dst[count] = w;
+        }
+        count++;
+        pos = pos + len;
+    }
+    if (dst != null && count < n) {
+        dst[count] = 0;
+    }
+    return count;
+}
+
+// converts wide characters (0-terminated) into at most n bytes of UTF-8; returns the bytes stored
+int wcstombs(char* dst, int* src, int n) {
+    int count = 0;
+    int pos = 0;
+    char tmp[4];
+    while (src[pos] != 0) {
+        int len = wctomb(&tmp[0], src[pos]);
+        if (len < 0) {
+            return -1;
+        }
+        if (dst != null) {
+            if (count + len > n) {
+                return count;
+            }
+            for (int k = 0; k < len; k++) {
+                dst[count + k] = tmp[k];
+            }
+        }
+        count = count + len;
+        pos++;
+    }
+    if (dst != null && count < n) {
+        dst[count] = 0;
+    }
+    return count;
+}

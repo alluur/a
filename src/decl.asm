@@ -77,6 +77,7 @@ parse_params:
     mov edi, '('
     call expect
     mov dword [ptmp_count], 0
+    mov dword [ptmp_nreq], 0x7FFFFFFF
     cmp qword [tk], ')'
     je .end
 .p:
@@ -109,6 +110,27 @@ parse_params:
     mov [ptmp_nlen+rax*4], ecx
     call next_token
 .noname:
+    ; optional default value:  type name = constant
+    mov r12d, [ptmp_count]
+    mov qword [ptmp_def+r12*8], 0
+    cmp qword [tk], '='
+    jne .nodef
+    call next_token
+    call const_expr
+    cmp edx, 1
+    jne .defok
+    ERR "a default value must be a number, character, bool or null"
+.defok:
+    mov [ptmp_def+r12*8], rax
+    cmp r12d, [ptmp_nreq]
+    jae .defdone
+    mov [ptmp_nreq], r12d
+    jmp .defdone
+.nodef:
+    cmp dword [ptmp_nreq], 0x7FFFFFFF
+    je .defdone
+    ERR "parameters after one with a default value need default values too"
+.defdone:
     inc dword [ptmp_count]
     cmp qword [tk], ','
     jne .end
@@ -182,7 +204,7 @@ func_register:
     mov [rax+SYM_NPAR], ecx
     ; copy the parameter types into the pool
     mov rdx, [ptype_pos]
-    lea rsi, [rdx+rcx]
+    lea rsi, [rdx+rcx*2+1]
     cmp rsi, PTYPE_MAX
     ja err_toobig
     mov [ptype_pos], rsi
@@ -194,9 +216,20 @@ func_register:
     jae .cpd
     mov rdx, [ptmp_type+rsi*8]
     mov [rdi+rsi*8], rdx
+    mov rdx, [ptmp_def+rsi*8]
+    lea r8d, [rsi+rcx]
+    mov [rdi+r8*8], rdx
     inc esi
     jmp .cp
 .cpd:
+    ; pool layout: types[n], default values[n], number of required parameters
+    mov edx, [ptmp_nreq]
+    cmp edx, ecx
+    jbe .nreq
+    mov edx, ecx
+.nreq:
+    lea r8d, [rcx*2]
+    mov [rdi+r8*8], rdx
     pop r15
     pop r14
     pop r13

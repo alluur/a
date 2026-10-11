@@ -1,0 +1,1504 @@
+// =============================================================================
+//  cstdio - C <stdio.h>                                       import cstdio;
+//
+//  Streams (`FILE*`) with the C names: fopen fclose fread fwrite fgetc fputc fgets fputs fseek ftell
+//  rewind feof ferror fflush setvbuf ungetc getline popen pclose tmpfile remove rename ...
+//  and the printf / scanf families: fprintf sprintf snprintf vfprintf vsnprintf dprintf,
+//  scanf fscanf sscanf vsscanf.
+//
+//    stdin  stdout  stderr   the standard streams (they are constants, pass them wherever a FILE* is expected)
+//    printf                   is in the standard library; it prints to stdout like in C
+//
+//  Differences from C that come from the language:
+//    * there are no variable argument lists: the printf family takes up to eight values
+//      (text and pointers are passed as they are), the v... functions take an array of them (an `int*`),
+//      scanf takes up to eight pointers. Values are 64-bit, so %d / %i / %u / %x read and write a whole `int`;
+//      hh, h and l ... modifiers choose 1, 2 or 8 bytes in scanf.
+//    * output to files is buffered (4 KiB) and written out at fclose / fflush / exit; stdout and stderr
+//      are not buffered.
+//    * floating point (see cmath / cfloat): a double is the int that holds its bit pattern. scanf reads %f %lf %e %g into an int
+//      (8 bytes, also without the l); fprintfd / vfprintfd write %f %e %g %a. printf / fprintf / sprintf keep to the integer
+//      conversions (use printfd, sprintfd, snprintfd of cfloat for text on the screen or in buffers).
+// =============================================================================
+import cerrno;
+import cstdlib;
+import cctype;
+import cfloat;
+
+const EOF = -1;
+const SEEK_SET = 0;
+const SEEK_CUR = 1;
+const SEEK_END = 2;
+const BUFSIZ = 4096;
+const FILENAME_MAX = 4096;
+const FOPEN_MAX = 64;
+const TMP_MAX = 238328;
+const L_tmpnam = 260;
+const _IOFBF = 0;
+const _IOLBF = 1;
+const _IONBF = 2;
+
+const stdin = 1;
+const stdout = 2;
+const stderr = 3;
+
+const __FL_READ = 1;
+const __FL_WRITE = 2;
+const __FL_APPEND = 4;
+const __FL_EOF = 8;
+const __FL_ERR = 16;
+const __FL_TEXT = 32;
+
+// The first three fields are read by `exit` (see __wreg in the standard library).
+struct FILE {
+    int fd;
+    char* wbuf;
+    int wlen;
+    int wcap;
+    int flags;
+    int bufmode;
+    char* rbuf;
+    int rpos;
+    int rlen;
+    int unget;          // pushed back character + 1, 0 = none
+    int pid;            // process id of a popen stream
+    char* tmpname;
+    int std;            // 1 stdin, 2 stdout, 3 stderr
+    int slot;           // index in __wreg, -1 = not registered
+}
+
+FILE __sin;
+FILE __sout;
+FILE __serr;
+
+FILE __nofile;
+
+FILE* __fp(FILE* f) {
+    int v = (int) f;
+    if (v == 0) {
+        __nofile.fd = -1;
+        __nofile.slot = -1;
+        __nofile.std = 4;
+        return &__nofile;
+    }
+    if (v == 1) {
+        if (__sin.std == 0) {
+            __sin.std = 1;
+            __sin.fd = 0;
+            __sin.flags = __FL_READ;
+            __sin.bufmode = 2;
+            __sin.slot = -1;
+        }
+        return &__sin;
+    }
+    if (v == 2) {
+        if (__sout.std == 0) {
+            __sout.std = 2;
+            __sout.fd = 1;
+            __sout.flags = __FL_WRITE;
+            __sout.bufmode = 2;
+            __sout.slot = -1;
+        }
+        return &__sout;
+    }
+    if (v == 3) {
+        if (__serr.std == 0) {
+            __serr.std = 3;
+            __serr.fd = 2;
+            __serr.flags = __FL_WRITE;
+            __serr.bufmode = 2;
+            __serr.slot = -1;
+        }
+        return &__serr;
+    }
+    return f;
+}
+
+// ---- low level -----------------------------------------------------------------------------------------------
+int __lseek(int fd, int off, int whence) {
+    if (__OS == 1) {
+        int np = 0;
+        int ok = (__winapi(21, fd, off, &np, whence) << 32) >> 32;        // SetFilePointerEx
+        if (ok == 0) {
+            errno = ESPIPE;
+            return -1;
+        }
+        return np;
+    }
+    int nr = 8;
+    if (__ARCH == 1) {
+        nr = 62;
+    }
+    int r = __syscall(nr, fd, off, whence, 0, 0, 0);
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    return r;
+}
+
+// writes all n bytes straight to the file; false on failure
+bool __raw_write(FILE* f, char* p, int n) {
+    if (n <= 0) {
+        return true;
+    }
+    if (__OS == 1 && (f->flags & __FL_APPEND) != 0 && f->std == 0) {
+        __lseek(f->fd, 0, 2);
+    }
+    int done = 0;
+    while (done < n) {
+        int w = __write(f->fd, &p[done], n - done);
+        if (w <= 0) {
+            f->flags = f->flags | __FL_ERR;
+            if (w < 0) {
+                errno = -w;
+            } else {
+                errno = EIO;
+            }
+            return false;
+        }
+        done = done + w;
+    }
+    return true;
+}
+
+// ---- opening and closing ---------------------------------------------------------------------------------
+FILE* __open_files[64];
+
+void __register(FILE* f) {
+    if (f->slot >= 0) {
+        return;
+    }
+    for (int i = 0; i < 64; i++) {
+        if (__wreg[i] == null) {
+            __wreg[i] = (int*) f;
+            f->slot = i;
+            return;
+        }
+    }
+}
+
+void __unregister(FILE* f) {
+    if (f->slot >= 0) {
+        __wreg[f->slot] = null;
+        f->slot = -1;
+    }
+}
+
+FILE* __new_file(int fd, int flags) {
+    FILE* f = (FILE*) malloc(sizeof(FILE));
+    f->fd = fd;
+    f->flags = flags;
+    f->slot = -1;
+    f->bufmode = 2;
+    if ((flags & __FL_WRITE) != 0) {
+        f->wbuf = malloc(4096);
+        f->wcap = 4096;
+        f->bufmode = 0;
+        __register(f);
+        if (f->slot < 0) {
+            f->bufmode = 2;
+        }
+    }
+    return f;
+}
+
+// opens a file. mode: "r" read, "w" write (create / empty), "a" append, "+" adds the other direction,
+// "x" fails if the file exists (with w), "b" is ignored. Returns null with errno set on failure.
+FILE* fopen(char* path, char* mode) {
+    char m = mode[0];
+    bool plus = indexOf(mode, '+') >= 0;
+    bool excl = indexOf(mode, 'x') >= 0;
+    if (m != 'r' && m != 'w' && m != 'a') {
+        errno = EINVAL;
+        return null;
+    }
+    int flags = 0;
+    if (m == 'r') {
+        flags = __FL_READ;
+        if (plus) { flags = flags | __FL_WRITE; }
+    } else if (m == 'w') {
+        flags = __FL_WRITE;
+        if (plus) { flags = flags | __FL_READ; }
+    } else {
+        flags = __FL_WRITE | __FL_APPEND;
+        if (plus) { flags = flags | __FL_READ; }
+    }
+    int fd;
+    if (__OS == 1) {
+        int access = 0;
+        if ((flags & __FL_READ) != 0) { access = access | 0x80000000; }
+        if ((flags & __FL_APPEND) != 0) {
+            access = access | 4;                                        // FILE_APPEND_DATA
+        } else if ((flags & __FL_WRITE) != 0) {
+            access = access | 0x40000000;
+        }
+        int creation = 3;                                                // OPEN_EXISTING
+        if (m == 'w') {
+            creation = 2;                                                // CREATE_ALWAYS
+            if (excl) { creation = 1; }                                  // CREATE_NEW
+        } else if (m == 'a') {
+            creation = 4;                                                // OPEN_ALWAYS
+        }
+        fd = __winapix(4, path, access, 3, 0, creation, 0x80, 0, 0, 0, 0);   // CreateFileA
+        if (fd == -1) {
+            int attr = (__winapi(25, path, 0, 0, 0) << 32) >> 32;       // GetFileAttributesA
+            if (attr == -1) {
+                errno = ENOENT;
+            } else if (excl && m == 'w') {
+                errno = EEXIST;
+            } else {
+                errno = EACCES;
+            }
+            return null;
+        }
+    } else {
+        int of = 0;
+        if (m == 'r') {
+            of = 0;
+            if (plus) { of = 2; }
+        } else {
+            of = 0x40;                                                   // O_CREAT
+            if (plus) { of = of | 2; } else { of = of | 1; }
+            if (m == 'w') {
+                of = of | 0x200;                                         // O_TRUNC
+                if (excl) { of = of | 0x80; }                            // O_EXCL
+            } else {
+                of = of | 0x400;                                         // O_APPEND
+            }
+        }
+        if (__ARCH == 1) {
+            fd = __syscall(56, -100, path, of, 0x1B6, 0, 0);             // openat
+        } else {
+            fd = __syscall(2, path, of, 0x1B6, 0, 0, 0);                 // open
+        }
+        if (fd < 0) {
+            errno = -fd;
+            return null;
+        }
+    }
+    return __new_file(fd, flags);
+}
+
+// wraps an existing file descriptor / handle (mode as for fopen, without creation flags)
+FILE* fdopen(int fd, char* mode) {
+    int flags = 0;
+    bool plus = indexOf(mode, '+') >= 0;
+    if (mode[0] == 'r') {
+        flags = __FL_READ;
+        if (plus) { flags = flags | __FL_WRITE; }
+    } else {
+        flags = __FL_WRITE;
+        if (mode[0] == 'a') { flags = flags | __FL_APPEND; }
+        if (plus) { flags = flags | __FL_READ; }
+    }
+    return __new_file(fd, flags);
+}
+
+int fileno(FILE* f) {
+    f = __fp(f);
+    return f->fd;
+}
+
+int fflush(FILE* f) {
+    if (f == null) {
+        int rc = 0;
+        for (int i = 0; i < 64; i++) {
+            if (__wreg[i] != null) {
+                if (fflush((FILE*) __wreg[i]) != 0) {
+                    rc = EOF;
+                }
+            }
+        }
+        return rc;
+    }
+    f = __fp(f);
+    if (f->wlen > 0) {
+        int n = f->wlen;
+        f->wlen = 0;
+        if (!__raw_write(f, f->wbuf, n)) {
+            return EOF;
+        }
+    }
+    return 0;
+}
+
+int fclose(FILE* f) {
+    if (f == null) {
+        return EOF;
+    }
+    f = __fp(f);
+    int rc = fflush(f);
+    if (f->std != 0) {
+        return rc;
+    }
+    __unregister(f);
+    if (f->fd >= 0) {
+        __close(f->fd);
+    }
+    if (f->pid > 0) {
+        int code = __wait_pid(f->pid);
+        if (code != 0) {
+            rc = code;
+        }
+    }
+    if (f->tmpname != null) {
+        __remove_file(f->tmpname);
+    }
+    if (f->wbuf != null) { free(f->wbuf); }
+    if (f->rbuf != null) { free(f->rbuf); }
+    f->fd = -1;
+    free((char*) f);
+    return rc;
+}
+
+// reopens a stream on another file (the old one is closed). stdin / stdout / stderr can be redirected as well? No:
+// they keep their handles, so the standard streams cannot be reopened.
+FILE* freopen(char* path, char* mode, FILE* f) {
+    f = __fp(f);
+    if (f->std != 0) {
+        errno = EINVAL;
+        return null;
+    }
+    fclose(f);
+    return fopen(path, mode);
+}
+
+// ---- buffering ---------------------------------------------------------------------------------------------
+// mode: _IOFBF full buffering, _IOLBF line buffering, _IONBF none. The buffer argument is ignored (an internal one is used).
+int setvbuf(FILE* f, char* buf, int mode, int size = 4096) {
+    f = __fp(f);
+    if (mode < 0 || mode > 2) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((f->flags & __FL_WRITE) == 0) {
+        f->bufmode = mode;
+        return 0;
+    }
+    fflush(f);
+    if (mode == 2) {
+        f->bufmode = 2;
+        return 0;
+    }
+    if (f->wbuf == null) {
+        f->wbuf = malloc(4096);
+        f->wcap = 4096;
+    }
+    f->bufmode = mode;
+    __register(f);
+    if (f->slot < 0) {
+        f->bufmode = 2;
+        return -1;
+    }
+    return 0;
+}
+
+void setbuf(FILE* f, char* buf) {
+    if (buf == null) {
+        setvbuf(f, null, 2);
+    } else {
+        setvbuf(f, buf, 0);
+    }
+}
+
+// ---- positioning --------------------------------------------------------------------------------------------
+// forgets read-ahead data so that the OS file position matches the logical one
+void __drop_readahead(FILE* f) {
+    if (f->rlen > f->rpos) {
+        __lseek(f->fd, f->rpos - f->rlen, 1);
+    }
+    f->rpos = 0;
+    f->rlen = 0;
+}
+
+int fseek(FILE* f, int offset, int whence) {
+    f = __fp(f);
+    if (f->std != 0) {
+        errno = ESPIPE;
+        return -1;
+    }
+    if (whence < 0 || whence > 2) {
+        errno = EINVAL;
+        return -1;
+    }
+    fflush(f);
+    if (f->unget != 0) {
+        f->unget = 0;
+        if (whence == 1) { offset = offset - 1; }
+    }
+    int pending = f->rlen - f->rpos;
+    f->rpos = 0;
+    f->rlen = 0;
+    if (whence == 1) {
+        offset = offset - pending;
+    }
+    int r = __lseek(f->fd, offset, whence);
+    if (r < 0) {
+        return -1;
+    }
+    f->flags = f->flags & ~__FL_EOF;
+    return 0;
+}
+
+int ftell(FILE* f) {
+    f = __fp(f);
+    if (f->std != 0) {
+        errno = ESPIPE;
+        return -1;
+    }
+    int pos = __lseek(f->fd, 0, 1);
+    if (pos < 0) {
+        return -1;
+    }
+    pos = pos - (f->rlen - f->rpos) + f->wlen;
+    if (f->unget != 0) {
+        pos = pos - 1;
+    }
+    return pos;
+}
+
+int fseeko(FILE* f, int offset, int whence) {
+    return fseek(f, offset, whence);
+}
+
+int ftello(FILE* f) {
+    return ftell(f);
+}
+
+void rewind(FILE* f) {
+    fseek(f, 0, 0);
+    f = __fp(f);
+    f->flags = f->flags & ~(__FL_EOF | __FL_ERR);
+}
+
+int fgetpos(FILE* f, int* pos) {
+    int p = ftell(f);
+    if (p < 0) {
+        return -1;
+    }
+    *pos = p;
+    return 0;
+}
+
+int fsetpos(FILE* f, int* pos) {
+    return fseek(f, *pos, 0);
+}
+
+int feof(FILE* f) {
+    f = __fp(f);
+    if ((f->flags & __FL_EOF) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+int ferror(FILE* f) {
+    f = __fp(f);
+    if ((f->flags & __FL_ERR) != 0) {
+        return 1;
+    }
+    return 0;
+}
+
+void clearerr(FILE* f) {
+    f = __fp(f);
+    f->flags = f->flags & ~(__FL_EOF | __FL_ERR);
+}
+
+// ---- character input ------------------------------------------------------------------------------------------
+// next byte (0-255) or EOF
+int fgetc(FILE* f) {
+    f = __fp(f);
+    if (f->unget != 0) {
+        int c = f->unget - 1;
+        f->unget = 0;
+        return c;
+    }
+    if ((f->flags & __FL_READ) == 0) {
+        f->flags = f->flags | __FL_ERR;
+        errno = EBADF;
+        return EOF;
+    }
+    if (f->std == 1) {
+        int c = readChar();
+        if (c < 0) {
+            f->flags = f->flags | __FL_EOF;
+            return EOF;
+        }
+        return c;
+    }
+    if (f->wlen > 0) {
+        fflush(f);
+    }
+    if (f->rpos >= f->rlen) {
+        if (f->rbuf == null) {
+            f->rbuf = malloc(4096);
+        }
+        int n = __read(f->fd, f->rbuf, 4096);
+        if (n <= 0) {
+            if (n < 0) {
+                f->flags = f->flags | __FL_ERR;
+                errno = -n;
+            } else {
+                f->flags = f->flags | __FL_EOF;
+            }
+            return EOF;
+        }
+        f->rpos = 0;
+        f->rlen = n;
+    }
+    int c = f->rbuf[f->rpos];
+    f->rpos++;
+    return c;
+}
+
+int getc(FILE* f) {
+    return fgetc(f);
+}
+
+int getchar() {
+    return fgetc(stdin);
+}
+
+// pushes one character back; the next read returns it. Returns c, or EOF if there is no room / c is EOF
+int ungetc(int c, FILE* f) {
+    f = __fp(f);
+    if (c == EOF || f->unget != 0) {
+        return EOF;
+    }
+    f->unget = (c & 255) + 1;
+    f->flags = f->flags & ~__FL_EOF;
+    return c & 255;
+}
+
+// reads a line of at most n-1 characters (the newline is kept) and ends it with a zero. Returns buf, null at the end / on error
+char* fgets(char* buf, int n, FILE* f) {
+    if (n <= 0) {
+        return null;
+    }
+    int i = 0;
+    while (i < n - 1) {
+        int c = fgetc(f);
+        if (c == EOF) {
+            break;
+        }
+        buf[i] = c;
+        i++;
+        if (c == 10) {
+            break;
+        }
+    }
+    buf[i] = 0;
+    if (i == 0) {
+        return null;
+    }
+    return buf;
+}
+
+// reads `count` items of `size` bytes; returns how many complete items were read
+int fread(char* ptr, int size, int count, FILE* f) {
+    if (size <= 0 || count <= 0) {
+        return 0;
+    }
+    int total = size * count;
+    int got = 0;
+    while (got < total) {
+        int c = fgetc(f);
+        if (c == EOF) {
+            break;
+        }
+        ptr[got] = c;
+        got++;
+    }
+    return got / size;
+}
+
+// POSIX getline: reads a whole line (with the newline) into a malloc'ed buffer *line of size *cap
+// (both are updated; start with *line = null, *cap = 0). Returns the length, -1 at the end.
+int getdelim(char** line, int* cap, int delim, FILE* f) {
+    if (*line == null || *cap < 16) {
+        *line = malloc(128);
+        *cap = 128;
+    }
+    int n = 0;
+    for (;;) {
+        int c = fgetc(f);
+        if (c == EOF) {
+            break;
+        }
+        if (n + 2 > *cap) {
+            *line = realloc(*line, *cap * 2);
+            *cap = *cap * 2;
+        }
+        char* b = *line;
+        b[n] = c;
+        n++;
+        if (c == delim) {
+            break;
+        }
+    }
+    if (n == 0) {
+        return -1;
+    }
+    char* b = *line;
+    b[n] = 0;
+    return n;
+}
+
+int getline(char** line, int* cap, FILE* f) {
+    return getdelim(line, cap, 10, f);
+}
+
+// ---- character output -----------------------------------------------------------------------------------------
+// writes n bytes through the stream's buffer; returns false on failure
+bool __put(FILE* f, char* p, int n) {
+    if ((f->flags & __FL_WRITE) == 0) {
+        f->flags = f->flags | __FL_ERR;
+        errno = EBADF;
+        return false;
+    }
+    if (f->rlen > f->rpos || f->unget != 0) {
+        __drop_readahead(f);
+        f->unget = 0;
+    }
+    if (f->bufmode == 2 || f->wbuf == null) {
+        return __raw_write(f, p, n);
+    }
+    bool nl = false;
+    for (int i = 0; i < n; i++) {
+        if (p[i] == 10) {
+            nl = true;
+        }
+    }
+    if (f->wlen + n > f->wcap) {
+        if (!fflush(f) == 0) {
+            return false;
+        }
+        if (n >= f->wcap) {
+            return __raw_write(f, p, n);
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        f->wbuf[f->wlen + i] = p[i];
+    }
+    f->wlen = f->wlen + n;
+    if (f->bufmode == 1 && nl) {
+        return fflush(f) == 0;
+    }
+    return true;
+}
+
+int fputc(int c, FILE* f) {
+    f = __fp(f);
+    char b[1];
+    b[0] = c;
+    if (!__put(f, &b[0], 1)) {
+        return EOF;
+    }
+    return c & 255;
+}
+
+int putc(int c, FILE* f) {
+    return fputc(c, f);
+}
+
+int putchar(int c) {
+    return fputc(c, stdout);
+}
+
+// writes the text without a newline; returns 0, or EOF on failure
+int fputs(char* s, FILE* f) {
+    f = __fp(f);
+    if (!__put(f, s, strlen(s))) {
+        return EOF;
+    }
+    return 0;
+}
+
+// writes the text and a newline to stdout
+int puts(char* s) {
+    FILE* f = __fp(stdout);
+    if (!__put(f, s, strlen(s))) {
+        return EOF;
+    }
+    return fputc(10, f) == EOF ? EOF : 0;
+}
+
+// writes count items of size bytes; returns how many complete items were written
+int fwrite(char* ptr, int size, int count, FILE* f) {
+    if (size <= 0 || count <= 0) {
+        return 0;
+    }
+    f = __fp(f);
+    if (!__put(f, ptr, size * count)) {
+        return 0;
+    }
+    return count;
+}
+
+// ---- formatted output ------------------------------------------------------------------------------------------
+// vfprintf: the values are an array (see vformat in the standard library for the formats)
+int vfprintf(FILE* f, char* fmt, int* args, int n) {
+    char buf[1024];
+    int len = vformat(&buf[0], 1024, fmt, args, n);
+    f = __fp(f);
+    if (len < 1024) {
+        if (!__put(f, &buf[0], len)) {
+            return -1;
+        }
+        return len;
+    }
+    char* big = malloc(len + 1);
+    vformat(big, len + 1, fmt, args, n);
+    bool ok = __put(f, big, len);
+    free(big);
+    if (!ok) {
+        return -1;
+    }
+    return len;
+}
+
+int vprintf(char* fmt, int* args, int n) {
+    return vfprintf(stdout, fmt, args, n);
+}
+
+int fprintf(FILE* f, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int g = 0, int h = 0, int i = 0) {
+    int args[8];
+    args[0] = a;
+    args[1] = b;
+    args[2] = c;
+    args[3] = d;
+    args[4] = e;
+    args[5] = g;
+    args[6] = h;
+    args[7] = i;
+    return vfprintf(f, fmt, &args[0], 8);
+}
+
+// like vfprintf, with %f %e %g %a for doubles
+int vfprintfd(FILE* f, char* fmt, int* args, int n) {
+    int len = vformatd(null, 0, fmt, args, n);
+    char* buf = malloc(len + 1);
+    vformatd(buf, len + 1, fmt, args, n);
+    f = __fp(f);
+    bool ok = __put(f, buf, len);
+    free(buf);
+    if (!ok) {
+        return -1;
+    }
+    return len;
+}
+
+int fprintfd(FILE* f, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int g = 0, int h = 0, int i = 0) {
+    int args[8];
+    args[0] = a;
+    args[1] = b;
+    args[2] = c;
+    args[3] = d;
+    args[4] = e;
+    args[5] = g;
+    args[6] = h;
+    args[7] = i;
+    return vfprintfd(f, fmt, &args[0], 8);
+}
+
+// the buffer must be large enough for the result
+int vsprintf(char* out, char* fmt, int* args, int n) {
+    return vformat(out, 0x7FFFFFFFFFFF, fmt, args, n);
+}
+
+// writes at most size-1 characters and a zero; returns the length the full result has
+int vsnprintf(char* out, int size, char* fmt, int* args, int n) {
+    return vformat(out, size, fmt, args, n);
+}
+
+int sprintf(char* out, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
+    int args[8];
+    args[0] = a;
+    args[1] = b;
+    args[2] = c;
+    args[3] = d;
+    args[4] = e;
+    args[5] = f;
+    args[6] = g;
+    args[7] = h;
+    return vformat(out, 0x7FFFFFFFFFFF, fmt, &args[0], 8);
+}
+
+int snprintf(char* out, int size, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
+    int args[8];
+    args[0] = a;
+    args[1] = b;
+    args[2] = c;
+    args[3] = d;
+    args[4] = e;
+    args[5] = f;
+    args[6] = g;
+    args[7] = h;
+    return vformat(out, size, fmt, &args[0], 8);
+}
+
+// printf to a raw file descriptor
+int dprintf(int fd, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
+    int args[8];
+    args[0] = a;
+    args[1] = b;
+    args[2] = c;
+    args[3] = d;
+    args[4] = e;
+    args[5] = f;
+    args[6] = g;
+    args[7] = h;
+    char buf[1024];
+    int len = vformat(&buf[0], 1024, fmt, &args[0], 8);
+    if (len > 1023) {
+        len = 1023;
+    }
+    __write(fd, &buf[0], len);
+    return len;
+}
+
+// ---- files and processes ------------------------------------------------------------------------------------
+bool __remove_file(char* path) {
+    if (__OS == 1) {
+        return ((__winapi(13, path, 0, 0, 0) << 32) >> 32) != 0;         // DeleteFileA
+    }
+    int r;
+    if (__ARCH == 1) {
+        r = __syscall(35, -100, path, 0, 0, 0, 0);                        // unlinkat
+    } else {
+        r = __syscall(87, path, 0, 0, 0, 0, 0);                           // unlink
+    }
+    if (r < 0) {
+        errno = -r;
+        return false;
+    }
+    return true;
+}
+
+bool __remove_dir(char* path) {
+    if (__OS == 1) {
+        return ((__winapi(23, path, 0, 0, 0) << 32) >> 32) != 0;         // RemoveDirectoryA
+    }
+    int r;
+    if (__ARCH == 1) {
+        r = __syscall(35, -100, path, 0x200, 0, 0, 0);                    // unlinkat(AT_REMOVEDIR)
+    } else {
+        r = __syscall(84, path, 0, 0, 0, 0, 0);                           // rmdir
+    }
+    if (r < 0) {
+        errno = -r;
+        return false;
+    }
+    return true;
+}
+
+// deletes a file or an empty directory; 0 on success, -1 with errno set
+int remove(char* path) {
+    if (__remove_file(path)) {
+        return 0;
+    }
+    if (errno == EISDIR || errno == EPERM || (__OS == 1 && errno == 0)) {
+        if (__remove_dir(path)) {
+            return 0;
+        }
+    }
+    if (__OS == 1 && errno == 0) {
+        errno = ENOENT;
+    }
+    return -1;
+}
+
+// renames or moves a file or directory (an existing destination is replaced); 0 on success, -1 with errno set
+int rename(char* from, char* to) {
+    if (__OS == 1) {
+        if (((__winapi(26, from, to, 1, 0) << 32) >> 32) != 0) {          // MoveFileExA(REPLACE_EXISTING)
+            return 0;
+        }
+        errno = ENOENT;
+        return -1;
+    }
+    int r;
+    if (__ARCH == 1) {
+        r = __syscall(38, -100, from, -100, to, 0, 0);                    // renameat
+    } else {
+        r = __syscall(82, from, to, 0, 0, 0, 0);                          // rename
+    }
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    return 0;
+}
+
+int __tmp_counter;
+
+// makes up a name for a temporary file ("/tmp/tmpXXXXXX", or in %TEMP% on Windows); buf must hold 260 characters.
+// Returns buf (or a static buffer when buf is null).
+char* tmpnam(char* buf) {
+    if (buf == null) {
+        buf = malloc(260);
+    }
+    char* dir = getenv("TMPDIR");
+    if (dir == null && __OS == 1) {
+        dir = getenv("TEMP");
+        if (dir == null) {
+            dir = getenv("TMP");
+        }
+    }
+    if (dir == null || !__is_dir(dir)) {
+        dir = "/tmp";
+        if (!__is_dir(dir)) {
+            dir = "/data/local/tmp";
+            if (!__is_dir(dir)) {
+                dir = ".";
+            }
+        }
+    }
+    __tmp_counter++;
+    int r = (millis() * 7919 + __tmp_counter * 104729 + rand()) & 0xFFFFFF;
+    char* sep = "/";
+    if (__OS == 1) {
+        sep = "\\";
+    }
+    format(buf, 260, "%s%stmp%06x", (int) dir, (int) sep, r, 0);
+    return buf;
+}
+
+// does the directory exist?
+bool __is_dir(char* path) {
+    if (__OS == 1) {
+        int attr = (__winapi(25, path, 0, 0, 0) << 32) >> 32;           // GetFileAttributesA
+        return attr != -1 && (attr & 16) != 0;
+    }
+    int fd = __open(path, 0);
+    if (fd < 0) {
+        return false;
+    }
+    __close(fd);
+    return true;
+}
+
+// an anonymous temporary file opened "w+"; it disappears when it is closed
+FILE* tmpfile() {
+    char name[260];
+    for (int tries = 0; tries < 20; tries++) {
+        tmpnam(&name[0]);
+        FILE* f = fopen(&name[0], "w+x");
+        if (f != null) {
+            if (__OS == 1) {
+                f->tmpname = strdup(name);
+            } else {
+                __remove_file(&name[0]);
+            }
+            return f;
+        }
+    }
+    return null;
+}
+
+// starts a shell command and returns a stream connected to its output ("r") or input ("w")
+FILE* popen(char* command, char* mode) {
+    bool reading = mode[0] == 'r';
+    int rd;
+    int wr;
+    if (__OS == 1) {
+        char sa[24];
+        memset(&sa[0], 0, 24);
+        sa[0] = 24;
+        sa[16] = 1;                                                       // bInheritHandle
+        int hp[2];
+        hp[0] = 0;
+        hp[1] = 0;
+        if (((__winapi(37, &hp[0], &hp[1], &sa[0], 0) << 32) >> 32) == 0) {   // CreatePipe
+            errno = EMFILE;
+            return null;
+        }
+        rd = hp[0];
+        wr = hp[1];
+        if (reading) {
+            __winapi(38, rd, 1, 0, 0);                                    // our end must not be inherited
+        } else {
+            __winapi(38, wr, 1, 0, 0);
+        }
+    } else {
+        char fds[16];
+        memset(&fds[0], 0, 16);
+        int pr;
+        if (__ARCH == 1) {
+            pr = __syscall(59, &fds[0], 0, 0, 0, 0, 0);                   // pipe2
+        } else {
+            pr = __syscall(293, &fds[0], 0, 0, 0, 0, 0);                  // pipe2
+        }
+        if (pr < 0) {
+            errno = -pr;
+            return null;
+        }
+        int* pf = (int*) &fds[0];
+        rd = pf[0] & 0xFFFFFFFF;
+        wr = (pf[0] >> 32) & 0xFFFFFFFF;
+    }
+    int pid;
+    if (reading) {
+        pid = __spawn_shell(command, -1, wr);
+    } else {
+        pid = __spawn_shell(command, rd, -1);
+    }
+    if (pid < 0) {
+        __close(rd);
+        __close(wr);
+        return null;
+    }
+    FILE* f;
+    if (reading) {
+        __close(wr);
+        f = __new_file(rd, __FL_READ);
+    } else {
+        __close(rd);
+        f = __new_file(wr, __FL_WRITE);
+    }
+    f->pid = pid;
+    return f;
+}
+
+// closes a popen stream and returns the exit code of the command
+int pclose(FILE* f) {
+    return fclose(f);
+}
+
+// ---- formatted input ---------------------------------------------------------------------------------------------
+//   sscanf(text, fmt, &a, &b ...)   scanf(fmt, ...)   fscanf(f, fmt, ...)    (up to eight pointers)
+//   vsscanf / vfscanf / vscanf      the pointers are given as an array (an `int*` holding the addresses)
+// Conversions: %d %i %u %x %X %o %b numbers (0x / 0 prefixes with %i), %c characters, %s a word, %[a-z] / %[^,] sets,
+// %p pointer, %n characters used so far, %% a percent sign; * suppresses the assignment, a number is the
+// maximum width, hh / h / l / ll choose a 1, 2 or 8 byte target (plain %d stores a whole 64-bit int).
+// Returns the number of assigned items, EOF (-1) if the input ended before the first one.
+struct __Src {
+    char* s;
+    int pos;
+    FILE* f;
+    int used;
+    int pb[16];         // characters read ahead from a stream (a stack: the last one pushed is read first)
+    int npb;
+}
+
+int __sget(__Src* src) {
+    int c;
+    if (src->npb > 0) {
+        src->npb--;
+        c = src->pb[src->npb];
+    } else if (src->f != null) {
+        c = fgetc(src->f);
+    } else {
+        c = src->s[src->pos];
+        if (c == 0) {
+            c = EOF;
+        } else {
+            src->pos++;
+        }
+    }
+    if (c != EOF) {
+        src->used++;
+    }
+    return c;
+}
+
+void __sunget(__Src* src, int c) {
+    if (c == EOF) {
+        return;
+    }
+    src->used--;
+    if (src->f != null) {
+        if (src->npb < 16) {
+            src->pb[src->npb] = c;
+            src->npb++;
+        }
+    } else {
+        src->pos--;
+    }
+}
+
+void __sstore(int target, int size, int value) {
+    if (size == 1) {
+        char* p = (char*) target;
+        p[0] = value;
+    } else if (size == 2) {
+        char* p = (char*) target;
+        p[0] = value;
+        p[1] = value >> 8;
+    } else {
+        int* p = (int*) target;
+        p[0] = value;
+    }
+}
+
+// is c in the scan set that starts after the '[' at set[0] ? returns the index after the closing ']' in *endp
+bool __inset(char* set, int c, int* endp) {
+    int i = 0;
+    bool neg = false;
+    if (set[i] == '^') {
+        neg = true;
+        i++;
+    }
+    bool found = false;
+    bool first = true;
+    while (set[i] != 0 && (set[i] != ']' || first)) {
+        first = false;
+        if (set[i + 1] == '-' && set[i + 2] != ']' && set[i + 2] != 0) {
+            if (c >= set[i] && c <= set[i + 2]) {
+                found = true;
+            }
+            i = i + 3;
+        } else {
+            if (c == set[i]) {
+                found = true;
+            }
+            i++;
+        }
+    }
+    if (set[i] == ']') {
+        i++;
+    }
+    *endp = i;
+    return found != neg;
+}
+
+int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
+    int assigned = 0;
+    int pi = 0;
+    int i = 0;
+    bool attempted = false;
+    while (fmt[i] != 0) {
+        int fc = fmt[i];
+        if (isspace(fc)) {
+            int c = __sget(src);
+            while (c != EOF && isspace(c)) {
+                c = __sget(src);
+            }
+            __sunget(src, c);
+            i++;
+            continue;
+        }
+        if (fc != '%') {
+            int c = __sget(src);
+            if (c != fc) {
+                __sunget(src, c);
+                if (c == EOF && !attempted && assigned == 0) {
+                    return EOF;
+                }
+                return assigned;
+            }
+            i++;
+            continue;
+        }
+        i++;
+        if (fmt[i] == '%') {
+            int c = __sget(src);
+            while (c != EOF && isspace(c)) {
+                c = __sget(src);
+            }
+            if (c != '%') {
+                __sunget(src, c);
+                return assigned;
+            }
+            i++;
+            continue;
+        }
+        bool suppress = false;
+        if (fmt[i] == '*') {
+            suppress = true;
+            i++;
+        }
+        int width = 0;
+        while (isdigit(fmt[i])) {
+            width = width * 10 + (fmt[i] - '0');
+            i++;
+        }
+        int size = 8;
+        bool again = true;
+        while (again) {
+            int m = fmt[i];
+            if (m == 'h') {
+                if (size == 2) { size = 1; } else { size = 2; }
+            } else if (m == 'l' || m == 'L' || m == 'z' || m == 'j' || m == 't' || m == 'q') {
+                size = 8;
+            } else {
+                again = false;
+            }
+            if (again) { i++; }
+        }
+        int t = fmt[i];
+        if (t == 0) {
+            break;
+        }
+        i++;
+        if (t == 'n') {
+            if (!suppress && pi < nptrs) {
+                __sstore(ptrs[pi], size, src->used);
+                pi++;
+            }
+            continue;
+        }
+        int target = 0;
+        if (!suppress) {
+            if (pi >= nptrs) {
+                return assigned;
+            }
+            target = ptrs[pi];
+        }
+        if (t == 'c') {
+            int w = width;
+            if (w == 0) { w = 1; }
+            char* dst = (char*) target;
+            for (int k = 0; k < w; k++) {
+                int c = __sget(src);
+                if (c == EOF) {
+                    if (k == 0 && !attempted && assigned == 0) {
+                        return EOF;
+                    }
+                    return assigned;
+                }
+                if (!suppress) { dst[k] = c; }
+            }
+            attempted = true;
+            if (!suppress) {
+                assigned++;
+                pi++;
+            }
+            continue;
+        }
+        if (t == 's' || t == '[') {
+            int endset = 0;
+            char* set = &fmt[i];
+            if (t == '[') {
+                __inset(set, 'a', &endset);                            // find the end of the set
+            } else {
+                int c = __sget(src);
+                while (c != EOF && isspace(c)) {
+                    c = __sget(src);
+                }
+                __sunget(src, c);
+            }
+            char* dst = (char*) target;
+            int k = 0;
+            for (;;) {
+                if (width > 0 && k >= width) {
+                    break;
+                }
+                int c = __sget(src);
+                if (c == EOF) {
+                    break;
+                }
+                bool ok;
+                if (t == 's') {
+                    ok = !isspace(c);
+                } else {
+                    int dummy = 0;
+                    ok = __inset(set, c, &dummy);
+                }
+                if (!ok) {
+                    __sunget(src, c);
+                    break;
+                }
+                if (!suppress) { dst[k] = c; }
+                k++;
+            }
+            if (t == '[') {
+                i = i + endset;
+            }
+            if (k == 0) {
+                if (!attempted && assigned == 0 && src->f == null && src->s[src->pos] == 0) {
+                    return EOF;
+                }
+                return assigned;
+            }
+            attempted = true;
+            if (!suppress) {
+                dst[k] = 0;
+                assigned++;
+                pi++;
+            }
+            continue;
+        }
+        if (t == 'f' || t == 'F' || t == 'e' || t == 'E' || t == 'g' || t == 'G' || t == 'a' || t == 'A') {
+            // floating point: collect the longest run of characters that can belong to a number, let strtod decide
+            int maxw = width;
+            if (maxw == 0 || maxw > 300) {
+                maxw = 300;
+            }
+            char tok[304];
+            int tn = 0;
+            int c = __sget(src);
+            while (c != EOF && isspace(c)) {
+                c = __sget(src);
+            }
+            if (c == EOF) {
+                if (!attempted && assigned == 0) {
+                    return EOF;
+                }
+                return assigned;
+            }
+            while (c != EOF && tn < maxw && (isalnum(c) || c == '.' || c == '+' || c == '-' || c == '_')) {
+                if ((c == '+' || c == '-') && tn > 0) {
+                    int prev = tok[tn - 1];
+                    if (prev != 'e' && prev != 'E' && prev != 'p' && prev != 'P') {
+                        break;
+                    }
+                }
+                tok[tn] = c;
+                tn++;
+                c = __sget(src);
+            }
+            __sunget(src, c);
+            tok[tn] = 0;
+            char* endp;
+            int bits = strtod(&tok[0], &endp);
+            int used = (int) endp - (int) &tok[0];
+            if (used == 0) {
+                for (int k = tn - 1; k >= 0; k--) {
+                    __sunget(src, tok[k]);
+                }
+                return assigned;
+            }
+            for (int k = tn - 1; k >= used; k--) {
+                __sunget(src, tok[k]);
+            }
+            attempted = true;
+            if (!suppress) {
+                __sstore(target, 8, bits);
+                assigned++;
+                pi++;
+            }
+            continue;
+        }
+        // numbers
+        int base = 10;
+        if (t == 'x' || t == 'X' || t == 'p') { base = 16; }
+        else if (t == 'o') { base = 8; }
+        else if (t == 'b') { base = 2; }
+        else if (t == 'i') { base = 0; }
+        else if (t != 'd' && t != 'u') {
+            return assigned;
+        }
+        int c = __sget(src);
+        while (c != EOF && isspace(c)) {
+            c = __sget(src);
+        }
+        int used = 0;
+        bool neg = false;
+        if (c == '-' || c == '+') {
+            neg = c == '-';
+            used++;
+            c = __sget(src);
+        }
+        if (c == EOF) {
+            if (!attempted && assigned == 0) {
+                return EOF;
+            }
+            return assigned;
+        }
+        if (c == '0' && (base == 0 || base == 16) && (width == 0 || used + 2 < width)) {
+            int c2 = __sget(src);
+            if (c2 == 'x' || c2 == 'X') {
+                int c3 = __sget(src);
+                if (digitValue(c3, 16) >= 0) {
+                    base = 16;
+                    used = used + 2;
+                    c = c3;
+                } else {
+                    __sunget(src, c3);
+                    __sunget(src, c2);
+                }
+            } else {
+                __sunget(src, c2);
+            }
+        }
+        if (base == 0) {
+            if (c == '0') {
+                base = 8;
+            } else {
+                base = 10;
+            }
+        }
+        int v = 0;
+        int digits = 0;
+        while (c != EOF && digitValue(c, base) >= 0 && (width == 0 || used < width)) {
+            v = v * base + digitValue(c, base);
+            digits++;
+            used++;
+            c = __sget(src);
+        }
+        __sunget(src, c);
+        if (digits == 0) {
+            return assigned;
+        }
+        attempted = true;
+        if (neg) { v = -v; }
+        if (!suppress) {
+            __sstore(target, size, v);
+            assigned++;
+            pi++;
+        }
+    }
+    return assigned;
+}
+
+int vsscanf(char* text, char* fmt, int* ptrs, int n) {
+    __Src src;
+    src.s = text;
+    return __vscan(&src, fmt, ptrs, n);
+}
+
+int vfscanf(FILE* f, char* fmt, int* ptrs, int n) {
+    __Src src;
+    src.f = __fp(f);
+    int r = __vscan(&src, fmt, ptrs, n);
+    if (src.npb > 0) {
+        ungetc(src.pb[src.npb - 1], src.f);  // a stream can take back one character
+    }
+    return r;
+}
+
+int vscanf(char* fmt, int* ptrs, int n) {
+    return vfscanf(stdin, fmt, ptrs, n);
+}
+
+int sscanf(char* text, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
+    int p[8];
+    p[0] = a;
+    p[1] = b;
+    p[2] = c;
+    p[3] = d;
+    p[4] = e;
+    p[5] = f;
+    p[6] = g;
+    p[7] = h;
+    return vsscanf(text, fmt, &p[0], 8);
+}
+
+int fscanf(FILE* fl, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
+    int p[8];
+    p[0] = a;
+    p[1] = b;
+    p[2] = c;
+    p[3] = d;
+    p[4] = e;
+    p[5] = f;
+    p[6] = g;
+    p[7] = h;
+    return vfscanf(fl, fmt, &p[0], 8);
+}
+
+int scanf(char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
+    int p[8];
+    p[0] = a;
+    p[1] = b;
+    p[2] = c;
+    p[3] = d;
+    p[4] = e;
+    p[5] = f;
+    p[6] = g;
+    p[7] = h;
+    return vfscanf(stdin, fmt, &p[0], 8);
+}

@@ -1,0 +1,969 @@
+// =============================================================================
+//  ctime - C <time.h>                                         import ctime;
+//
+//  time clock difftime clock_gettime gettimeofday
+//  struct tm:  gmtime localtime gmtime_r localtime_r mktime timegm
+//  text:       strftime strptime asctime ctime
+//  zones:      tzset (reads the TZ variable, or /etc/localtime on Linux, or UTC); `timezone_name()`
+//
+//  Times are `int` seconds since 1970-01-01 00:00:00 UTC. Functions that take a `time_t*` in C take an
+//  `int*` here:  int t = time(null);  tm* p = localtime(&t);
+//  Local time follows the POSIX rules of the TZ variable ("EET-2EEST,M3.5.0/3,M10.5.0/4", "UTC", "EST5EDT"),
+//  or the rule at the end of /etc/localtime when TZ is not set (Linux/Android). Without either, local time is UTC.
+// =============================================================================
+import cstdlib;
+import cerrno;
+import cctype;
+
+const CLOCKS_PER_SEC = 1000000;
+const CLOCK_REALTIME = 0;
+const CLOCK_MONOTONIC = 1;
+const CLOCK_PROCESS_CPUTIME_ID = 2;
+const TIME_UTC = 1;
+
+struct tm {
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;        // 1-31
+    int tm_mon;         // 0-11
+    int tm_year;        // years since 1900
+    int tm_wday;        // 0 = Sunday
+    int tm_yday;        // 0-365
+    int tm_isdst;
+    int tm_gmtoff;      // seconds east of UTC
+    char* tm_zone;
+}
+
+struct timespec {
+    int tv_sec;
+    int tv_nsec;
+}
+
+struct timeval {
+    int tv_sec;
+    int tv_usec;
+}
+
+tm __gm_result;
+char __asc_buf[40];
+int __clock_base = -1;
+
+// ---- clocks -------------------------------------------------------------------------------------------------------
+// reads a clock: id CLOCK_REALTIME (seconds since 1970), CLOCK_MONOTONIC, or CLOCK_PROCESS_CPUTIME_ID. Returns 0 or -1
+int clock_gettime(int id, timespec* ts) {
+    if (__OS == 1) {
+        if (id == 0) {
+            int ft[1];
+            __winapi(11, &ft[0], 0, 0, 0);
+            int t100 = ft[0] - 116444736000000000;
+            ts->tv_sec = t100 / 10000000;
+            ts->tv_nsec = (t100 % 10000000) * 100;
+            return 0;
+        }
+        int ms = __winapi(9, 0, 0, 0, 0);
+        ts->tv_sec = ms / 1000;
+        ts->tv_nsec = (ms % 1000) * 1000000;
+        return 0;
+    }
+    int nr = 228;
+    if (__ARCH == 1) {
+        nr = 113;
+    }
+    int r = __syscall(nr, id, ts, 0, 0, 0, 0);
+    if (r < 0) {
+        errno = -r;
+        return -1;
+    }
+    return 0;
+}
+
+int timespec_get(timespec* ts, int base) {
+    if (base != 1) {
+        return 0;
+    }
+    clock_gettime(0, ts);
+    return base;
+}
+
+int gettimeofday(timeval* tv) {
+    timespec ts;
+    clock_gettime(0, &ts);
+    tv->tv_sec = ts.tv_sec;
+    tv->tv_usec = ts.tv_nsec / 1000;
+    return 0;
+}
+
+// seconds since 1970; also stored in *t when t is not null
+int time(int* t = null) {
+    timespec ts;
+    clock_gettime(0, &ts);
+    if (t != null) {
+        *t = ts.tv_sec;
+    }
+    return ts.tv_sec;
+}
+
+// processor time used by the program in CLOCKS_PER_SEC (1,000,000) units. On Windows this is the time since the
+// first call.
+int clock() {
+    timespec ts;
+    if (__OS == 1) {
+        clock_gettime(1, &ts);
+        int now = ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+        if (__clock_base < 0) {
+            __clock_base = now;
+        }
+        return now - __clock_base;
+    }
+    clock_gettime(2, &ts);
+    return ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+// a - b in seconds
+int difftime(int a, int b) {
+    return a - b;
+}
+
+// ---- calendar arithmetic -------------------------------------------------------------------------------------------
+// days since 1970-01-01 of a civil date (m = 1-12)
+int __days_from_civil(int y, int m, int d) {
+    if (m <= 2) {
+        y--;
+    }
+    int era = y / 400;
+    if (y < 0 && y % 400 != 0) {
+        era--;
+    }
+    int yoe = y - era * 400;
+    int mp = m - 3;
+    if (m <= 2) {
+        mp = m + 9;
+    }
+    int doy = (153 * mp + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+// fills year / month (1-12) / day from a day number
+void __civil_from_days(int z, int* y, int* m, int* d) {
+    z = z + 719468;
+    int era = z / 146097;
+    if (z < 0 && z % 146097 != 0) {
+        era--;
+    }
+    int doe = z - era * 146097;
+    int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int yy = yoe + era * 400;
+    int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    int mm = mp + 3;
+    if (mp >= 10) {
+        mm = mp - 9;
+    }
+    if (mm <= 2) {
+        yy++;
+    }
+    *m = mm;
+    *y = yy;
+}
+
+bool __leap(int y) {
+    return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+}
+
+int __mdays(int y, int m) {
+    if (m == 2) {
+        if (__leap(y)) {
+            return 29;
+        }
+        return 28;
+    }
+    if (m == 4 || m == 6 || m == 9 || m == 11) {
+        return 30;
+    }
+    return 31;
+}
+
+int __floordiv(int a, int b) {
+    int q = a / b;
+    if (a % b != 0 && ((a < 0) != (b < 0))) {
+        q--;
+    }
+    return q;
+}
+
+// splits seconds since 1970 (as UTC) into out; the zone fields are left to the caller
+void __break_down(int t, tm* out) {
+    int days = __floordiv(t, 86400);
+    int secs = t - days * 86400;
+    int y;
+    int m;
+    int d;
+    __civil_from_days(days, &y, &m, &d);
+    out->tm_year = y - 1900;
+    out->tm_mon = m - 1;
+    out->tm_mday = d;
+    out->tm_hour = secs / 3600;
+    out->tm_min = (secs % 3600) / 60;
+    out->tm_sec = secs % 60;
+    int wd = (days + 4) % 7;
+    if (wd < 0) {
+        wd = wd + 7;
+    }
+    out->tm_wday = wd;
+    out->tm_yday = days - __days_from_civil(y, 1, 1);
+}
+
+// seconds since 1970 for the date fields of p, which are normalized first (month 13 = January of next year, day 0 = last of the
+// previous month, 70 seconds = 1 minute 10 seconds ...). Treats the fields as UTC.
+int timegm(tm* p) {
+    int y = p->tm_year + 1900;
+    int mon = p->tm_mon;
+    y = y + __floordiv(mon, 12);
+    mon = mon - __floordiv(mon, 12) * 12;
+    int days = __days_from_civil(y, mon + 1, 1) + p->tm_mday - 1;
+    int t = days * 86400 + p->tm_hour * 3600 + p->tm_min * 60 + p->tm_sec;
+    __break_down(t, p);
+    return t;
+}
+
+// ---- time zones ---------------------------------------------------------------------------------------------------
+bool __tz_ready;
+char __tz_std[16];
+char __tz_dst[16];
+int __tz_stdoff;        // seconds east of UTC
+int __tz_dstoff;
+bool __tz_hasdst;
+int __tz_r[8];          // start: type, month, week, day, time ; end: same (type 0 = Mm.w.d, 1 = Jn, 2 = n)
+char __tz_text[128];
+
+// parses a zone name at s[i]: letters, or <...>; returns the new index, name copied to out
+int __tz_name(char* s, int i, char* out) {
+    int n = 0;
+    if (s[i] == '<') {
+        i++;
+        while (s[i] != 0 && s[i] != '>' && n < 14) {
+            out[n] = s[i];
+            n++;
+            i++;
+        }
+        if (s[i] == '>') {
+            i++;
+        }
+    } else {
+        while (isalpha(s[i]) && n < 14) {
+            out[n] = s[i];
+            n++;
+            i++;
+        }
+    }
+    out[n] = 0;
+    return i;
+}
+
+// parses [+-]hh[:mm[:ss]] into seconds (as written); index in *ip
+int __tz_hms(char* s, int* ip) {
+    int i = *ip;
+    int sign = 1;
+    if (s[i] == '-') {
+        sign = -1;
+        i++;
+    } else if (s[i] == '+') {
+        i++;
+    }
+    int v[3];
+    v[0] = 0;
+    v[1] = 0;
+    v[2] = 0;
+    for (int k = 0; k < 3; k++) {
+        while (isdigit(s[i])) {
+            v[k] = v[k] * 10 + (s[i] - '0');
+            i++;
+        }
+        if (s[i] == ':' && k < 2) {
+            i++;
+        } else {
+            break;
+        }
+    }
+    *ip = i;
+    return sign * (v[0] * 3600 + v[1] * 60 + v[2]);
+}
+
+// parses a transition rule at s[i] into __tz_r[base ..]
+int __tz_rule(char* s, int i, int base) {
+    __tz_r[base] = 0;
+    __tz_r[base + 1] = 0;
+    __tz_r[base + 2] = 0;
+    __tz_r[base + 3] = 0;
+    if (s[i] == 'M') {
+        i++;
+        __tz_r[base] = 0;
+        int f[3];
+        for (int k = 0; k < 3; k++) {
+            f[k] = 0;
+            while (isdigit(s[i])) {
+                f[k] = f[k] * 10 + (s[i] - '0');
+                i++;
+            }
+            if (s[i] == '.') {
+                i++;
+            }
+        }
+        __tz_r[base + 1] = f[0];
+        __tz_r[base + 2] = f[1];
+        __tz_r[base + 3] = f[2];
+    } else {
+        if (s[i] == 'J') {
+            __tz_r[base] = 1;
+            i++;
+        } else {
+            __tz_r[base] = 2;
+        }
+        int v = 0;
+        while (isdigit(s[i])) {
+            v = v * 10 + (s[i] - '0');
+            i++;
+        }
+        __tz_r[base + 1] = v;
+    }
+    int tm2 = 7200;
+    if (s[i] == '/') {
+        i++;
+        tm2 = __tz_hms(s, &i);
+    }
+    __tz_r[base + 4] = tm2;
+    return i;
+}
+
+void __tz_parse(char* s) {
+    __tz_std[0] = 'U';
+    __tz_std[1] = 'T';
+    __tz_std[2] = 'C';
+    __tz_std[3] = 0;
+    __tz_dst[0] = 0;
+    __tz_stdoff = 0;
+    __tz_dstoff = 0;
+    __tz_hasdst = false;
+    if (s == null || s[0] == 0) {
+        return;
+    }
+    if (s[0] == ':') {
+        s = &s[1];
+    }
+    int i = __tz_name(s, 0, &__tz_std[0]);
+    if (__tz_std[0] == 0) {
+        __tz_std[0] = 'U';
+        __tz_std[1] = 'T';
+        __tz_std[2] = 'C';
+        __tz_std[3] = 0;
+        return;
+    }
+    if (s[i] == 0) {
+        return;
+    }
+    __tz_stdoff = -__tz_hms(s, &i);
+    if (s[i] == 0) {
+        return;
+    }
+    i = __tz_name(s, i, &__tz_dst[0]);
+    if (__tz_dst[0] == 0) {
+        return;
+    }
+    __tz_hasdst = true;
+    __tz_dstoff = __tz_stdoff + 3600;
+    if (s[i] != ',' && s[i] != 0) {
+        __tz_dstoff = -__tz_hms(s, &i);
+    }
+    if (s[i] == ',') {
+        i++;
+        i = __tz_rule(s, i, 0);
+        if (s[i] == ',') {
+            i++;
+            i = __tz_rule(s, i, 5);
+        }
+    } else {
+        // no rule given: the US rule
+        __tz_r[0] = 0; __tz_r[1] = 3; __tz_r[2] = 2; __tz_r[3] = 0; __tz_r[4] = 7200;
+        __tz_r[5] = 0; __tz_r[6] = 11; __tz_r[7] = 1; __tz_r[8] = 0; __tz_r[9] = 7200;
+    }
+}
+
+// local time (as seconds since 1970 interpreted in the zone's local clock) at which the transition `base` happens in year y
+int __tz_trans_local(int y, int base) {
+    int type = __tz_r[base];
+    int days;
+    if (type == 0) {
+        int month = __tz_r[base + 1];
+        int week = __tz_r[base + 2];
+        int wday = __tz_r[base + 3];
+        int first = __days_from_civil(y, month, 1);
+        int fw = (first + 4) % 7;
+        if (fw < 0) {
+            fw = fw + 7;
+        }
+        int d = 1 + ((wday - fw + 7) % 7) + (week - 1) * 7;
+        int dim = __mdays(y, month);
+        while (d > dim) {
+            d = d - 7;
+        }
+        days = first + d - 1;
+    } else if (type == 1) {
+        int n = __tz_r[base + 1];
+        days = __days_from_civil(y, 1, 1) + n - 1;
+        if (__leap(y) && n >= 60) {
+            days++;
+        }
+    } else {
+        days = __days_from_civil(y, 1, 1) + __tz_r[base + 1];
+    }
+    return days * 86400 + __tz_r[base + 4];
+}
+
+// reads /etc/localtime and returns the POSIX rule in its footer (the last line), or null
+char* __tz_from_file() {
+    int fd = __open("/etc/localtime", 0);
+    if (fd < 0) {
+        return null;
+    }
+    int cap = 65536;
+    char* buf = alloc(cap);
+    int len = 0;
+    for (;;) {
+        if (len >= cap - 1) {
+            break;
+        }
+        int got = __read(fd, &buf[len], cap - 1 - len);
+        if (got <= 0) {
+            break;
+        }
+        len = len + got;
+    }
+    __close(fd);
+    if (len < 44 || buf[0] != 'T' || buf[1] != 'Z' || buf[2] != 'i' || buf[3] != 'f') {
+        return null;
+    }
+    // the footer is between the last two newlines of a version 2+ file
+    int e = len - 1;
+    while (e > 0 && buf[e] != 10) {
+        e--;
+    }
+    int b = e - 1;
+    while (b > 0 && buf[b] != 10) {
+        b--;
+    }
+    if (buf[0] == 'T' && buf[4] >= '2' && e > b + 1 && e - b < 120) {
+        for (int k = 0; k < e - b - 1; k++) {
+            __tz_text[k] = buf[b + 1 + k];
+        }
+        __tz_text[e - b - 1] = 0;
+        return &__tz_text[0];
+    }
+    return null;
+}
+
+// (re)reads the time zone from the TZ variable or /etc/localtime
+void tzset() {
+    char* tz = getenv("TZ");
+    if (tz == null && __OS != 1) {
+        tz = __tz_from_file();
+    }
+    __tz_parse(tz);
+    __tz_ready = true;
+}
+
+// is DST in effect at the UTC instant t?
+bool __tz_isdst(int t) {
+    if (!__tz_hasdst) {
+        return false;
+    }
+    int y;
+    int m;
+    int d;
+    __civil_from_days(__floordiv(t + __tz_stdoff, 86400), &y, &m, &d);
+    int start = __tz_trans_local(y, 0) - __tz_stdoff;
+    int end = __tz_trans_local(y, 5) - __tz_dstoff;
+    if (start < end) {
+        return t >= start && t < end;
+    }
+    return !(t >= end && t < start);
+}
+
+// offset in seconds east of UTC at the UTC instant t
+int __tz_offset(int t) {
+    if (!__tz_ready) {
+        tzset();
+    }
+    if (__tz_isdst(t)) {
+        return __tz_dstoff;
+    }
+    return __tz_stdoff;
+}
+
+// abbreviation of the zone in effect at t ("EET", "EEST", "UTC" ...)
+char* __tz_abbr(int t) {
+    if (!__tz_ready) {
+        tzset();
+    }
+    if (__tz_isdst(t)) {
+        return &__tz_dst[0];
+    }
+    return &__tz_std[0];
+}
+
+// the name of the zone that is in effect now
+char* timezone_name() {
+    return __tz_abbr(time(null));
+}
+
+// ---- conversions ---------------------------------------------------------------------------------------------------
+// breaks a time into UTC calendar fields; fills out and returns it
+tm* gmtime_r(int* t, tm* out) {
+    __break_down(*t, out);
+    out->tm_isdst = 0;
+    out->tm_gmtoff = 0;
+    out->tm_zone = "UTC";
+    return out;
+}
+
+tm* localtime_r(int* t, tm* out) {
+    int off = __tz_offset(*t);
+    __break_down(*t + off, out);
+    out->tm_isdst = 0;
+    if (__tz_isdst(*t)) {
+        out->tm_isdst = 1;
+    }
+    out->tm_gmtoff = off;
+    out->tm_zone = __tz_abbr(*t);
+    return out;
+}
+
+// the result of gmtime / localtime is a static record that the next call overwrites
+tm* gmtime(int* t) {
+    return gmtime_r(t, &__gm_result);
+}
+
+tm* localtime(int* t) {
+    return localtime_r(t, &__gm_result);
+}
+
+// seconds since 1970 for local time fields (normalized, and tm_isdst / tm_gmtoff / tm_wday / tm_yday filled in)
+int mktime(tm* p) {
+    int local = timegm(p);
+    if (!__tz_ready) {
+        tzset();
+    }
+    int t0 = local - __tz_stdoff;
+    int t1 = local - __tz_offset(t0);
+    if (__tz_offset(t1) != __tz_offset(t0)) {
+        t1 = local - __tz_offset(t1);
+    }
+    localtime_r(&t1, p);
+    return t1;
+}
+
+// ---- text -------------------------------------------------------------------------------------------------------------
+char* __wday_names[7];
+char* __mon_names[12];
+
+void __names_init() {
+    if (__mon_names[0] != null) {
+        return;
+    }
+    __wday_names[0] = "Sunday";
+    __wday_names[1] = "Monday";
+    __wday_names[2] = "Tuesday";
+    __wday_names[3] = "Wednesday";
+    __wday_names[4] = "Thursday";
+    __wday_names[5] = "Friday";
+    __wday_names[6] = "Saturday";
+    __mon_names[0] = "January";
+    __mon_names[1] = "February";
+    __mon_names[2] = "March";
+    __mon_names[3] = "April";
+    __mon_names[4] = "May";
+    __mon_names[5] = "June";
+    __mon_names[6] = "July";
+    __mon_names[7] = "August";
+    __mon_names[8] = "September";
+    __mon_names[9] = "October";
+    __mon_names[10] = "November";
+    __mon_names[11] = "December";
+}
+
+// number of ISO weeks (52 or 53) in a year
+int __iso_weeks_in_year(int y) {
+    int wd = (__days_from_civil(y, 1, 1) + 4) % 7;
+    if (wd < 0) {
+        wd = wd + 7;
+    }
+    if (wd == 4 || (wd == 3 && __leap(y))) {
+        return 53;
+    }
+    return 52;
+}
+
+// ISO 8601 week number (1-53) and year of a date
+void __iso_week(tm* p, int* week, int* year) {
+    int y = p->tm_year + 1900;
+    int wd = (p->tm_wday + 6) % 7;             // Monday = 0
+    int w = (p->tm_yday - wd + 10) / 7;
+    if (w < 1) {
+        y--;
+        w = __iso_weeks_in_year(y);
+    } else if (w > __iso_weeks_in_year(y)) {
+        w = 1;
+        y++;
+    }
+    *week = w;
+    *year = y;
+}
+
+int __put2(char* out, int max, int pos, int v, int digits, int pad) {
+    char tmp[24];
+    int n = 0;
+    if (v < 0) {
+        v = -v;
+    }
+    if (v == 0) {
+        tmp[n] = '0';
+        n++;
+    }
+    while (v > 0) {
+        tmp[n] = '0' + v % 10;
+        n++;
+        v = v / 10;
+    }
+    while (n < digits) {
+        tmp[n] = pad;
+        n++;
+    }
+    for (int i = n - 1; i >= 0; i--) {
+        if (pos < max - 1) {
+            out[pos] = tmp[i];
+        }
+        pos++;
+    }
+    return pos;
+}
+
+int __puts2(char* out, int max, int pos, char* s) {
+    int i = 0;
+    while (s[i] != 0) {
+        if (pos < max - 1) {
+            out[pos] = s[i];
+        }
+        pos++;
+        i++;
+    }
+    return pos;
+}
+
+// formats p according to fmt (like C):
+//   %a %A day name  %b %h %B month name  %c date and time  %C century  %d day  %D %m/%d/%y  %e day, space padded
+//   %F %Y-%m-%d  %g %G ISO year  %H hour 00-23  %I hour 01-12  %j day of year  %k %l hour, space padded  %m month
+//   %M minute  %n newline  %p AM/PM  %P am/pm  %r %I:%M:%S %p  %R %H:%M  %s seconds since 1970  %S second  %t tab
+//   %T %H:%M:%S  %u weekday 1-7  %U %W %V week numbers  %w weekday 0-6  %x date  %X time  %y %Y year  %z +hhmm  %Z zone  %%
+// Returns the number of characters stored (0 if they do not fit in max).
+int strftime(char* out, int max, char* fmt, tm* p) {
+    __names_init();
+    int pos = 0;
+    int i = 0;
+    while (fmt[i] != 0) {
+        if (fmt[i] != '%') {
+            if (pos < max - 1) {
+                out[pos] = fmt[i];
+            }
+            pos++;
+            i++;
+            continue;
+        }
+        i++;
+        while (fmt[i] == '-' || fmt[i] == '_' || fmt[i] == '0' || fmt[i] == '^' || fmt[i] == '#' || fmt[i] == 'E' || fmt[i] == 'O') {
+            i++;
+        }
+        int c = fmt[i];
+        if (c == 0) {
+            break;
+        }
+        i++;
+        int year = p->tm_year + 1900;
+        int h12 = p->tm_hour % 12;
+        if (h12 == 0) {
+            h12 = 12;
+        }
+        if (c == 'a') {
+            pos = __puts2(out, max, pos, substr(__wday_names[p->tm_wday], 0, 3));
+        } else if (c == 'A') {
+            pos = __puts2(out, max, pos, __wday_names[p->tm_wday]);
+        } else if (c == 'b' || c == 'h') {
+            pos = __puts2(out, max, pos, substr(__mon_names[p->tm_mon], 0, 3));
+        } else if (c == 'B') {
+            pos = __puts2(out, max, pos, __mon_names[p->tm_mon]);
+        } else if (c == 'c') {
+            char tmp[64];
+            strftime(&tmp[0], 64, "%a %b %e %H:%M:%S %Y", p);
+            pos = __puts2(out, max, pos, &tmp[0]);
+        } else if (c == 'C') {
+            pos = __put2(out, max, pos, year / 100, 2, '0');
+        } else if (c == 'd') {
+            pos = __put2(out, max, pos, p->tm_mday, 2, '0');
+        } else if (c == 'D' || c == 'x') {
+            char tmp[16];
+            strftime(&tmp[0], 16, "%m/%d/%y", p);
+            pos = __puts2(out, max, pos, &tmp[0]);
+        } else if (c == 'e') {
+            pos = __put2(out, max, pos, p->tm_mday, 2, ' ');
+        } else if (c == 'F') {
+            pos = __put2(out, max, pos, year, 4, '0');
+            pos = __puts2(out, max, pos, "-");
+            pos = __put2(out, max, pos, p->tm_mon + 1, 2, '0');
+            pos = __puts2(out, max, pos, "-");
+            pos = __put2(out, max, pos, p->tm_mday, 2, '0');
+        } else if (c == 'g') {
+            int w;
+            int y;
+            __iso_week(p, &w, &y);
+            pos = __put2(out, max, pos, y % 100, 2, '0');
+        } else if (c == 'G') {
+            int w;
+            int y;
+            __iso_week(p, &w, &y);
+            pos = __put2(out, max, pos, y, 4, '0');
+        } else if (c == 'H') {
+            pos = __put2(out, max, pos, p->tm_hour, 2, '0');
+        } else if (c == 'I') {
+            pos = __put2(out, max, pos, h12, 2, '0');
+        } else if (c == 'j') {
+            pos = __put2(out, max, pos, p->tm_yday + 1, 3, '0');
+        } else if (c == 'k') {
+            pos = __put2(out, max, pos, p->tm_hour, 2, ' ');
+        } else if (c == 'l') {
+            pos = __put2(out, max, pos, h12, 2, ' ');
+        } else if (c == 'm') {
+            pos = __put2(out, max, pos, p->tm_mon + 1, 2, '0');
+        } else if (c == 'M') {
+            pos = __put2(out, max, pos, p->tm_min, 2, '0');
+        } else if (c == 'n') {
+            pos = __puts2(out, max, pos, "\n");
+        } else if (c == 't') {
+            pos = __puts2(out, max, pos, "\t");
+        } else if (c == 'p') {
+            if (p->tm_hour >= 12) { pos = __puts2(out, max, pos, "PM"); } else { pos = __puts2(out, max, pos, "AM"); }
+        } else if (c == 'P') {
+            if (p->tm_hour >= 12) { pos = __puts2(out, max, pos, "pm"); } else { pos = __puts2(out, max, pos, "am"); }
+        } else if (c == 'r') {
+            char tmp[24];
+            strftime(&tmp[0], 24, "%I:%M:%S %p", p);
+            pos = __puts2(out, max, pos, &tmp[0]);
+        } else if (c == 'R') {
+            pos = __put2(out, max, pos, p->tm_hour, 2, '0');
+            pos = __puts2(out, max, pos, ":");
+            pos = __put2(out, max, pos, p->tm_min, 2, '0');
+        } else if (c == 's') {
+            tm copy = *p;
+            int t = timegm(&copy) - p->tm_gmtoff;
+            char tmp[24];
+            pos = __puts2(out, max, pos, intToStr(t, &tmp[0]));
+        } else if (c == 'S') {
+            pos = __put2(out, max, pos, p->tm_sec, 2, '0');
+        } else if (c == 'T' || c == 'X') {
+            pos = __put2(out, max, pos, p->tm_hour, 2, '0');
+            pos = __puts2(out, max, pos, ":");
+            pos = __put2(out, max, pos, p->tm_min, 2, '0');
+            pos = __puts2(out, max, pos, ":");
+            pos = __put2(out, max, pos, p->tm_sec, 2, '0');
+        } else if (c == 'u') {
+            int u = p->tm_wday;
+            if (u == 0) { u = 7; }
+            pos = __put2(out, max, pos, u, 1, '0');
+        } else if (c == 'U') {
+            pos = __put2(out, max, pos, (p->tm_yday + 7 - p->tm_wday) / 7, 2, '0');
+        } else if (c == 'W') {
+            pos = __put2(out, max, pos, (p->tm_yday + 7 - (p->tm_wday + 6) % 7) / 7, 2, '0');
+        } else if (c == 'V') {
+            int w;
+            int y;
+            __iso_week(p, &w, &y);
+            pos = __put2(out, max, pos, w, 2, '0');
+        } else if (c == 'w') {
+            pos = __put2(out, max, pos, p->tm_wday, 1, '0');
+        } else if (c == 'y') {
+            pos = __put2(out, max, pos, year % 100, 2, '0');
+        } else if (c == 'Y') {
+            pos = __put2(out, max, pos, year, 1, '0');
+        } else if (c == 'z') {
+            int off = p->tm_gmtoff;
+            if (off < 0) {
+                pos = __puts2(out, max, pos, "-");
+                off = -off;
+            } else {
+                pos = __puts2(out, max, pos, "+");
+            }
+            pos = __put2(out, max, pos, off / 3600, 2, '0');
+            pos = __put2(out, max, pos, (off % 3600) / 60, 2, '0');
+        } else if (c == 'Z') {
+            if (p->tm_zone != null) {
+                pos = __puts2(out, max, pos, p->tm_zone);
+            }
+        } else if (c == '%') {
+            pos = __puts2(out, max, pos, "%");
+        } else {
+            if (pos < max - 1) { out[pos] = '%'; }
+            pos++;
+            if (pos < max - 1) { out[pos] = c; }
+            pos++;
+        }
+    }
+    if (pos >= max) {
+        if (max > 0) {
+            out[0] = 0;
+        }
+        return 0;
+    }
+    out[pos] = 0;
+    return pos;
+}
+
+// "Sun Sep 16 01:03:52 1973\n" (in a static buffer)
+char* asctime(tm* p) {
+    strftime(&__asc_buf[0], 40, "%a %b %e %H:%M:%S %Y\n", p);
+    return &__asc_buf[0];
+}
+
+char* ctime(int* t) {
+    return asctime(localtime(t));
+}
+
+// reads a date / time from s according to fmt into p (POSIX strptime). Supports %Y %y %m %d %e %H %M %S %I %p %j
+// %b %B %h %a %A %T %R %D %F %y %z %Z %n %t %% and white space. Returns the address after the used text, null on a mismatch.
+char* strptime(char* s, char* fmt, tm* p) {
+    __names_init();
+    int i = 0;
+    int si = 0;
+    bool pm = false;
+    bool haspm = false;
+    while (fmt[i] != 0) {
+        int c = fmt[i];
+        if (isspace(c)) {
+            while (isspace(s[si])) {
+                si++;
+            }
+            i++;
+            continue;
+        }
+        if (c != '%') {
+            if (s[si] != c) {
+                return null;
+            }
+            si++;
+            i++;
+            continue;
+        }
+        i++;
+        c = fmt[i];
+        i++;
+        if (c == '%') {
+            if (s[si] != '%') { return null; }
+            si++;
+        } else if (c == 'n' || c == 't') {
+            while (isspace(s[si])) { si++; }
+        } else if (c == 'T' || c == 'R' || c == 'D' || c == 'F') {
+            char* sub = "%H:%M:%S";
+            if (c == 'R') { sub = "%H:%M"; }
+            if (c == 'D') { sub = "%m/%d/%y"; }
+            if (c == 'F') { sub = "%Y-%m-%d"; }
+            char* r = strptime(&s[si], sub, p);
+            if (r == null) { return null; }
+            si = si + (int) r - (int) &s[si];
+        } else if (c == 'b' || c == 'B' || c == 'h') {
+            int found = -1;
+            for (int m = 0; m < 12 && found < 0; m++) {
+                char* name = __mon_names[m];
+                int nl = strlen(name);
+                if (strncasecmp_(&s[si], name, nl)) {
+                    found = m;
+                    si = si + nl;
+                } else if (strncasecmp_(&s[si], name, 3)) {
+                    found = m;
+                    si = si + 3;
+                }
+            }
+            if (found < 0) { return null; }
+            p->tm_mon = found;
+        } else if (c == 'a' || c == 'A') {
+            int found = -1;
+            for (int d = 0; d < 7 && found < 0; d++) {
+                char* name = __wday_names[d];
+                int nl = strlen(name);
+                if (strncasecmp_(&s[si], name, nl)) {
+                    found = d;
+                    si = si + nl;
+                } else if (strncasecmp_(&s[si], name, 3)) {
+                    found = d;
+                    si = si + 3;
+                }
+            }
+            if (found < 0) { return null; }
+            p->tm_wday = found;
+        } else if (c == 'p') {
+            if (strncasecmp_(&s[si], "PM", 2)) { pm = true; haspm = true; si = si + 2; }
+            else if (strncasecmp_(&s[si], "AM", 2)) { haspm = true; si = si + 2; }
+            else { return null; }
+        } else if (c == 'z') {
+            int sign = 1;
+            if (s[si] == '+') { si++; }
+            else if (s[si] == '-') { sign = -1; si++; }
+            else if (s[si] == 'Z') { si++; p->tm_gmtoff = 0; continue; }
+            else { return null; }
+            int hh = 0;
+            int mm = 0;
+            int k = 0;
+            while (k < 2 && isdigit(s[si])) { hh = hh * 10 + s[si] - '0'; si++; k++; }
+            if (s[si] == ':') { si++; }
+            k = 0;
+            while (k < 2 && isdigit(s[si])) { mm = mm * 10 + s[si] - '0'; si++; k++; }
+            p->tm_gmtoff = sign * (hh * 3600 + mm * 60);
+        } else if (c == 'Z') {
+            while (isalpha(s[si])) { si++; }
+        } else {
+            int maxd = 2;
+            if (c == 'Y') { maxd = 4; }
+            if (c == 'j') { maxd = 3; }
+            while (s[si] == ' ' && (c == 'e' || c == 'd' || c == 'H' || c == 'I' || c == 'm' || c == 'M' || c == 'S')) { si++; }
+            int v = 0;
+            int k = 0;
+            while (k < maxd && isdigit(s[si])) {
+                v = v * 10 + (s[si] - '0');
+                si++;
+                k++;
+            }
+            if (k == 0) { return null; }
+            if (c == 'Y') { p->tm_year = v - 1900; }
+            else if (c == 'y') { if (v < 69) { p->tm_year = v + 100; } else { p->tm_year = v; } }
+            else if (c == 'm') { p->tm_mon = v - 1; }
+            else if (c == 'd' || c == 'e') { p->tm_mday = v; }
+            else if (c == 'H') { p->tm_hour = v; }
+            else if (c == 'I') { p->tm_hour = v % 12; }
+            else if (c == 'M') { p->tm_min = v; }
+            else if (c == 'S') { p->tm_sec = v; }
+            else if (c == 'j') { p->tm_yday = v - 1; }
+            else { return null; }
+        }
+    }
+    if (haspm && pm) {
+        p->tm_hour = p->tm_hour % 12 + 12;
+    }
+    return &s[si];
+}
+
+bool strncasecmp_(char* a, char* b, int n) {
+    for (int i = 0; i < n; i++) {
+        if (toLower(a[i]) != toLower(b[i]) || b[i] == 0) {
+            return false;
+        }
+    }
+    return true;
+}
