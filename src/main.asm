@@ -537,15 +537,9 @@ emit_prologue:
 .m2:
     cmp dword [target], TGT_WINDOWS
     je .win
-    ; Linux / Android: argc = [rsp], argv = rsp+8
-    EM 0x48, 0x8B, 0x04, 0x24
-    EM 0x48, 0x8D, 0x4C, 0x24, 0x08
-    cmp ebx, 1
-    jb .call
-    EM 0x50
-    cmp ebx, 2
-    jb .call
-    EM 0x51
+    ; Linux / Android: argc and argv come from the initial stack
+    mov edi, ebx
+    CG entry_args
     jmp .call
 .win:
     ; Windows: the standard library parses GetCommandLineA() into argc / argv
@@ -553,16 +547,16 @@ emit_prologue:
     jz .call
     mov rdi, s_win_init
     call emit_call_named
-    EM 0x50
+    CG push_a
     cmp ebx, 2
     jb .call
     mov rdi, s_win_argv
     call emit_call_named
-    EM 0x50
+    CG push_a
 .call:
     mov rdi, r12
     call emit_call_sym
-    EM 0x50
+    CG push_a
     mov rdi, s_exit_name
     call emit_call_named
     ; builtin runtime blobs
@@ -655,49 +649,23 @@ check_undefined:
 ; ---- relocations ---------------------------------------------------------------------------
 ; apply_relocs: [code_vaddr] [data_vaddr] [bss_vaddr] [iat_vaddr] must be set
 apply_relocs:
-    xor ecx, ecx
-.l:
-    cmp ecx, [rel_count]
-    jae .done
-    mov rax, rcx
-    shl rax, 4
-    add rax, rel_buf
-    mov edi, [rax]                  ; position
-    mov esi, [rax+4]                ; kind
-    mov edx, [rax+8]                ; target
-    cmp esi, R_DATA
-    je .data
-    cmp esi, R_BSS
-    je .bss
-    cmp esi, R_IAT
-    je .iat
-    cmp esi, R_DATA64
-    je .d64
-    jmp .n
-.data:
-    mov r8, [data_vaddr]
-    add r8, rdx
-    jmp .rel
-.bss:
-    mov r8, [bss_vaddr]
-    add r8, rdx
-    jmp .rel
-.iat:
-    mov r8, [iat_vaddr]
-    lea r8, [r8+rdx*8]
-.rel:
-    mov r9, [code_vaddr]
-    lea r9, [r9+rdi+4]
-    sub r8, r9
-    mov [code_buf+rdi], r8d
-    jmp .n
-.d64:
-    mov r8, [data_vaddr]
-    add [data_buf+rdi], r8
-.n:
-    inc ecx
-    jmp .l
-.done:
+    cmp dword [arch], ARCH_A64
+    je apply_relocs_a64
+    jmp apply_relocs_x86
+
+; install_backend: edi = architecture; fills the primitive table
+install_backend:
+    mov [arch], edi
+    mov esi, cg_tab_x86
+    mov dword [slot_bytes], 8
+    cmp edi, ARCH_A64
+    jne .copy
+    mov esi, cg_tab_a64
+    mov dword [slot_bytes], 16
+.copy:
+    mov edi, cg_vt
+    mov ecx, CGI_COUNT
+    rep movsq
     ret
 
 ; ---- ELF64 -----------------------------------------------------------------------------------
@@ -1016,6 +984,8 @@ build_idata:
 ; ---- entry -------------------------------------------------------------------------------------
 global _start
 _start:
+    lea rax, [rsp - 6*1024*1024]
+    mov [stack_limit], rax
     mov r14, [rsp]                          ; argc
     lea r15, [rsp+8]                        ; argv
     mov qword [opt_version], s_ver_default
@@ -1141,6 +1111,8 @@ _start:
     call fatal_error
 .have_input:
     call init_tables
+    mov edi, ARCH_X64
+    call install_backend
     ; --- directory of the main file (for lib/ lookups)
     mov rsi, [opt_input]
     mov rdi, maindirbuf
@@ -1337,6 +1309,10 @@ ptmp_nlen:      resd MAXPARAM
 binprec:        resb 256
 
 err_msg:        resq 1
+cg_vt:          resq CGI_COUNT
+arch:           resd 1
+slot_bytes:     resd 1
+stack_limit:    resq 1
 cur_file_name:  resq 1
 arena_pos:      resq 1
 namepool_pos:   resq 1

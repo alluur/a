@@ -19,6 +19,8 @@ section .text
 %include "util.asm"
 %include "lexer.asm"
 %include "symtab.asm"
+%include "cg_x86.asm"
+%include "cg_a64.asm"
 %include "expr.asm"
 %include "stmt.asm"
 %include "decl.asm"

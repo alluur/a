@@ -215,7 +215,7 @@ define_function:
     mov dword [rdi+SYM_PATCH], 0
     mov rsi, [code_pos]
     mov rdi, rax
-    call patch_chain
+    CG patch_chain
     pop rdi
     pop rsi
     pop rax
@@ -232,11 +232,7 @@ compile_function:
     mov r13d, [sym_count]
     mov [cur_func], r12
     call define_function
-    EM 0x55, 0x48, 0x89, 0xE5, 0x48, 0x81, 0xEC
-    mov rax, [code_pos]
-    mov [frame_patch], rax
-    xor edi, edi
-    call emit_d
+    CG prologue
     mov dword [frame_size], 0
     mov qword [ret_chain], 0
     mov dword [loop_sp], 0
@@ -248,7 +244,7 @@ compile_function:
     inc ebx
     mov r14d, 1
     lea eax, [rbx-1]
-    shl eax, 3
+    imul eax, [slot_bytes]
     add eax, 16
     mov [cur_this_off], eax
 .params:
@@ -270,7 +266,7 @@ compile_function:
     mov esi, ebx
     dec esi
     sub esi, edx
-    shl esi, 3
+    imul esi, [slot_bytes]
     add esi, 16
     mov [rax+SYM_VAL], rsi
 .pn:
@@ -278,15 +274,15 @@ compile_function:
     jmp .pl
 .pd:
     call parse_block
-    EM 0x31, 0xC0
+    xor edi, edi
+    CG imm_a
     mov rdi, [ret_chain]
     call patch_here
-    EM 0xC9, 0xC3
-    mov eax, [frame_size]
-    add eax, 15
-    and eax, -16
-    mov rcx, [frame_patch]
-    mov [code_buf+rcx], eax
+    CG epilogue
+    mov edi, [frame_size]
+    add edi, 15
+    and edi, -16
+    CG set_frame
     mov [sym_count], r13d
     mov qword [cur_func], 0
     pop r14

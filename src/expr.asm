@@ -29,9 +29,9 @@ emit_load_type:
     cmp eax, 1
     je .b
     ret
-.q: EM 0x48, 0x8B, 0x00
+.q: CG load8_a
     ret
-.b: EM 0x48, 0x0F, 0xB6, 0x00
+.b: CG load1_a
     ret
 
 ; emit_store_type: rdi = type. Emits  *(type*)rcx = rax  (memcpy for aggregates:
@@ -44,15 +44,12 @@ emit_store_type:
     cmp eax, 1
     je .b
     call type_size
-    push rax
-    EM 0x48, 0x89, 0xC6, 0x48, 0x89, 0xCF, 0x48, 0x89, 0xC8, 0xB9
-    pop rdi
-    call emit_d
-    EM 0xF3, 0xA4
+    mov rdi, rax
+    CG copy_mem
     jmp .out
-.q: EM 0x48, 0x89, 0x01
+.q: CG store8
     jmp .out
-.b: EM 0x88, 0x01
+.b: CG store1
 .out:
     pop rdi
     ret
@@ -78,18 +75,16 @@ scale_rcx:
     call type_pointee_size
     cmp eax, 1
     je .r
-    EM 0x48, 0x69, 0xC9
     mov edi, eax
-    call emit_d
+    CG mul_imm_b
 .r: ret
 
 scale_rax:
     call type_pointee_size
     cmp eax, 1
     je .r
-    EM 0x48, 0x69, 0xC0
     mov edi, eax
-    call emit_d
+    CG mul_imm_a
 .r: ret
 
 ; binop_emit: edi = operator token, rsi = left type, rdx = right type.
@@ -150,7 +145,7 @@ binop_emit:
     call scale_rax
     mov [e_type], r13
 .doadd:
-    EM 0x48, 0x01, 0xC8
+    CG add
     jmp .out
 .sub:
     test r12d, 0xFF00
@@ -161,66 +156,59 @@ binop_emit:
     call scale_rcx
     mov [e_type], r12
 .dosub:
-    EM 0x48, 0x29, 0xC8
+    CG sub
     jmp .out
 .ptrdiff:
-    EM 0x48, 0x29, 0xC8
+    CG sub
     mov rdi, r12
     call type_pointee_size
     cmp eax, 1
     je .out
-    push rax
-    EM 0x48, 0xC7, 0xC1
-    pop rdi
-    call emit_d
-    EM 0x48, 0x99, 0x48, 0xF7, 0xF9
+    mov edi, eax
+    CG imm_b
+    CG div
     jmp .out
 .mul:
-    EM 0x48, 0x0F, 0xAF, 0xC1
+    CG mul
     jmp .out
 .div:
-    EM 0x48, 0x99, 0x48, 0xF7, 0xF9
+    CG div
     jmp .out
 .mod:
-    EM 0x48, 0x99, 0x48, 0xF7, 0xF9, 0x48, 0x89, 0xD0
+    CG mod
     jmp .out
 .and:
-    EM 0x48, 0x21, 0xC8
+    CG and
     jmp .out
 .or:
-    EM 0x48, 0x09, 0xC8
+    CG or
     jmp .out
 .xor:
-    EM 0x48, 0x31, 0xC8
+    CG xor
     jmp .out
 .shl:
-    EM 0x48, 0xD3, 0xE0
+    CG shl
     jmp .out
 .shr:
-    EM 0x48, 0xD3, 0xF8
+    CG sar
     jmp .out
 .eq:
-    mov r8d, 0x94
-    jmp .cmp
+    CG cmp_eq
+    jmp .out
 .ne:
-    mov r8d, 0x95
-    jmp .cmp
+    CG cmp_ne
+    jmp .out
 .lt:
-    mov r8d, 0x9C
-    jmp .cmp
+    CG cmp_lt
+    jmp .out
 .gt:
-    mov r8d, 0x9F
-    jmp .cmp
+    CG cmp_gt
+    jmp .out
 .le:
-    mov r8d, 0x9E
-    jmp .cmp
+    CG cmp_le
+    jmp .out
 .ge:
-    mov r8d, 0x9D
-.cmp:
-    EM 0x48, 0x39, 0xC8, 0x0F
-    mov edi, r8d
-    call emit_b
-    EM 0xC0, 0x0F, 0xB6, 0xC0
+    CG cmp_ge
 .out:
     pop r13
     pop r12
@@ -411,35 +399,10 @@ enum_find:
     ret
 
 ; ---- calls ---------------------------------------------------------------------
-; emit_call_sym: rdi = function symbol. Emits  call rel32  (patch chain if the
+; emit_call_sym: rdi = function symbol. Emits a call (patch chain if the
 ; function is not defined yet)
 emit_call_sym:
-    push rax
-    push rdx
-    EM 0xE8
-    mov rax, [rdi+SYM_VAL]
-    cmp rax, -1
-    je .fwd
-    mov rdx, rax
-    mov rax, [code_pos]
-    add rax, 4
-    sub rdx, rax
-    push rdi
-    mov edi, edx
-    call emit_d
-    pop rdi
-    jmp .out
-.fwd:
-    mov eax, [rdi+SYM_PATCH]
-    mov rdx, [code_pos]
-    mov [rdi+SYM_PATCH], edx
-    push rdi
-    mov edi, eax
-    call emit_d
-    pop rdi
-.out:
-    pop rdx
-    pop rax
+    CG call_sym
     ret
 
 ; gen_call: rdi = function symbol, esi = number of extra stack slots already pushed
@@ -465,7 +428,7 @@ gen_call:
     jne .push
     ERR "structs cannot be passed by value, pass a pointer"
 .push:
-    EM 0x50
+    CG push_a
     inc ebx
     cmp qword [tk], ','
     jne .args_done
@@ -480,21 +443,8 @@ gen_call:
 .ok:
     mov rdi, r12
     call emit_call_sym
-    lea eax, [rbx+r13]
-    test eax, eax
-    jz .noadd
-    cmp eax, 15
-    ja .big
-    EM 0x48, 0x83, 0xC4
-    shl eax, 3
-    mov edi, eax
-    call emit_b
-    jmp .noadd
-.big:
-    EM 0x48, 0x81, 0xC4
-    shl eax, 3
-    mov edi, eax
-    call emit_d
+    lea edi, [rbx+r13]
+    CG drop
 .noadd:
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
@@ -535,7 +485,7 @@ parse_primary:
 
 .num:
     mov rdi, [tk_val]
-    call emit_imm_rax
+    CG imm_a
     mov qword [e_type], TY_INT
     mov qword [e_lval], 0
     call next_token
@@ -547,26 +497,29 @@ parse_primary:
     call data_add_string
     mov edx, eax
     mov esi, R_DATA
-    call emit_lea_rip
+    CG lea_global_a
     mov qword [e_type], TY_CHAR | TY_PTR1
     mov qword [e_lval], 0
     call next_token
     jmp .out
 
 .true:
-    EM 0xB8, 1, 0, 0, 0
+    mov edi, 1
+    CG imm_a
     mov qword [e_type], TY_BOOL
     mov qword [e_lval], 0
     call next_token
     jmp .out
 .false:
-    EM 0x31, 0xC0
+    xor edi, edi
+    CG imm_a
     mov qword [e_type], TY_BOOL
     mov qword [e_lval], 0
     call next_token
     jmp .out
 .null:
-    EM 0x31, 0xC0
+    xor edi, edi
+    CG imm_a
     mov qword [e_type], TY_VOID | TY_PTR1
     mov qword [e_lval], 0
     call next_token
@@ -577,9 +530,8 @@ parse_primary:
     jne .this1
     ERR "'this' used outside of a method"
 .this1:
-    EM 0x48, 0x8B, 0x85
     mov edi, [cur_this_off]
-    call emit_d
+    CG load_local_a
     mov eax, [cur_class]
     shl rax, 16
     or rax, TY_STRUCT | TY_PTR1
@@ -599,7 +551,7 @@ parse_primary:
     mov edi, ')'
     call expect
     mov rdi, rbx
-    call emit_imm_rax
+    CG imm_a
     mov qword [e_type], TY_INT
     mov qword [e_lval], 0
     jmp .out
@@ -628,10 +580,10 @@ parse_primary:
     je .cbool
     jmp .cdone
 .cchar:
-    EM 0x0F, 0xB6, 0xC0
+    CG zext8
     jmp .cdone
 .cbool:
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x95, 0xC0, 0x0F, 0xB6, 0xC0
+    CG tobool
 .cdone:
     mov [e_type], rbx
     mov qword [e_lval], 0
@@ -665,11 +617,12 @@ parse_primary:
 .new_a:
     mov r14, rax
     mov rdi, r13
-    call emit_imm_rax
-    EM 0x50
+    CG imm_a
+    CG push_a
     mov rdi, r14
     call emit_call_sym
-    EM 0x48, 0x83, 0xC4, 0x08
+    mov edi, 1
+    CG drop
     mov edi, r12d
     call struct_find_ctor
     test rax, rax
@@ -679,11 +632,12 @@ parse_primary:
     je .new_c
     ERR "constructor call needs parentheses"
 .new_c:
-    EM 0x50, 0x50
+    CG push_a
+    CG push_a
     mov rdi, r14
     mov esi, 1
     call gen_call
-    EM 0x58
+    CG pop_a
     jmp .new_done
 .new_noctor:
     cmp qword [tk], '('
@@ -748,9 +702,8 @@ parse_primary:
     ERR "a type name cannot be used as a value"
 
 .local:
-    EM 0x48, 0x8D, 0x85
     mov edi, [r12+SYM_VAL]
-    call emit_d
+    CG lea_local_a
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
     mov qword [e_lval], 1
@@ -765,7 +718,7 @@ parse_primary:
     jz .g1
     mov esi, R_BSS
 .g1:
-    call emit_lea_rip
+    CG lea_global_a
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
     mov qword [e_lval], 1
@@ -777,7 +730,7 @@ parse_primary:
     test dword [r12+SYM_FLAGS], F_STRCONST
     jnz .conststr
     mov rdi, [r12+SYM_VAL]
-    call emit_imm_rax
+    CG imm_a
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
     mov qword [e_lval], 0
@@ -785,7 +738,7 @@ parse_primary:
 .conststr:
     mov edx, [r12+SYM_VAL]
     mov esi, R_DATA
-    call emit_lea_rip
+    CG lea_global_a
     mov qword [e_type], TY_CHAR | TY_PTR1
     mov qword [e_lval], 0
     jmp .out
@@ -848,14 +801,12 @@ parse_primary:
 
 .implicit_field:
     mov r12, rax
-    EM 0x48, 0x8B, 0x85
     mov edi, [cur_this_off]
-    call emit_d
+    CG load_local_a
     mov edi, [r12+FD_OFFSET]
     test edi, edi
     jz .if1
-    EM 0x48, 0x05
-    call emit_d
+    CG add_imm_a
 .if1:
     mov rax, [r12+FD_TYPE]
     mov [e_type], rax
@@ -870,10 +821,9 @@ parse_primary:
     je .im1
     ERR "methods can only be called, not used as values"
 .im1:
-    EM 0x48, 0x8B, 0x85
     mov edi, [cur_this_off]
-    call emit_d
-    EM 0x50
+    CG load_local_a
+    CG push_a
     mov rdi, r12
     mov esi, 1
     call gen_call
@@ -923,18 +873,17 @@ parse_postfix:
     mov r12, rax
     mov rbx, [e_type]
     sub rbx, TY_PTR1
-    EM 0x50
+    CG push_a
     call next_token
     call parse_expr
     call to_rvalue
     cmp r12, 1
     je .ix2
-    EM 0x48, 0x69, 0xC0
     mov rdi, r12
-    call emit_d
+    CG mul_imm_a
 .ix2:
-    EM 0x59
-    EM 0x48, 0x01, 0xC8
+    CG pop_b
+    CG add
     mov edi, ']'
     call expect
     mov [e_type], rbx
@@ -988,8 +937,7 @@ parse_postfix:
     mov edi, [r12+FD_OFFSET]
     test edi, edi
     jz .f1
-    EM 0x48, 0x05
-    call emit_d
+    CG add_imm_a
 .f1:
     mov rax, [r12+FD_TYPE]
     mov [e_type], rax
@@ -1019,7 +967,7 @@ parse_postfix:
     je .m3
     ERR "methods can only be called, not used as values"
 .m3:
-    EM 0x50
+    CG push_a
     mov rdi, r12
     mov esi, 1
     call gen_call
@@ -1069,21 +1017,20 @@ emit_incdec_postfix:
     call type_pointee_size
     imul r13, rax
 .step1:
-    EM 0x48, 0x89, 0xC1
+    CG mov_b_a
     mov rdi, rbx
     call emit_load_type
     test r12d, r12d
     jz .nopost
-    EM 0x48, 0x89, 0xC2
+    CG mov_d_a
 .nopost:
-    EM 0x48, 0x05
     mov rdi, r13
-    call emit_d
+    CG add_imm_a
     mov rdi, rbx
     call emit_store_type
     test r12d, r12d
     jz .fin
-    EM 0x48, 0x89, 0xD0
+    CG mov_a_d
 .fin:
     mov [e_type], rbx
     mov qword [e_lval], 0
@@ -1094,6 +1041,7 @@ emit_incdec_postfix:
 
 ; ---- unary ---------------------------------------------------------------------
 parse_unary:
+    STACKCHK
     mov eax, [tk]
     cmp eax, '-'
     je .neg
@@ -1116,7 +1064,7 @@ parse_unary:
     call next_token
     call parse_unary
     call to_rvalue
-    EM 0x48, 0xF7, 0xD8
+    CG neg
     mov qword [e_type], TY_INT
     ret
 .plus:
@@ -1128,14 +1076,14 @@ parse_unary:
     call next_token
     call parse_unary
     call to_rvalue
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x94, 0xC0, 0x0F, 0xB6, 0xC0
+    CG lnot
     mov qword [e_type], TY_BOOL
     ret
 .compl:
     call next_token
     call parse_unary
     call to_rvalue
-    EM 0x48, 0xF7, 0xD0
+    CG not
     mov qword [e_type], TY_INT
     ret
 .deref:
@@ -1207,12 +1155,13 @@ parse_binary:
     mov r13d, ecx
     call to_rvalue
     push qword [e_type]
-    EM 0x50
+    CG push_a
     call next_token
     lea edi, [r13+1]
     call parse_binary
     call to_rvalue
-    EM 0x48, 0x89, 0xC1, 0x58
+    CG mov_b_a
+    CG pop_a
     pop rsi
     mov rdx, [e_type]
     mov edi, r12d
@@ -1233,22 +1182,28 @@ parse_logand:
     call to_rvalue
     push 0
 .l:
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x84
     mov rdi, rsp
-    call chain_slot
+    CG jz_chain
     call next_token
     mov edi, 3
     call parse_binary
     call to_rvalue
     cmp qword [tk], T_ANDAND
     je .l
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x84
     mov rdi, rsp
-    call chain_slot
-    EM 0xB8, 1, 0, 0, 0, 0xEB, 0x02
+    CG jz_chain
+    push 0
+    mov edi, 1
+    CG imm_a
+    mov rdi, rsp
+    CG jmp_chain
+    mov rdi, [rsp+8]
+    call patch_here
+    xor edi, edi
+    CG imm_a
     pop rdi
     call patch_here
-    EM 0x31, 0xC0
+    add rsp, 8
     mov qword [e_type], TY_BOOL
 .out:
     pop rbx
@@ -1262,21 +1217,27 @@ parse_logor:
     call to_rvalue
     push 0
 .l:
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x85
     mov rdi, rsp
-    call chain_slot
+    CG jnz_chain
     call next_token
     call parse_logand
     call to_rvalue
     cmp qword [tk], T_OROR
     je .l
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x85
     mov rdi, rsp
-    call chain_slot
-    EM 0x31, 0xC0, 0xEB, 0x05
+    CG jnz_chain
+    push 0
+    xor edi, edi
+    CG imm_a
+    mov rdi, rsp
+    CG jmp_chain
+    mov rdi, [rsp+8]
+    call patch_here
+    mov edi, 1
+    CG imm_a
     pop rdi
     call patch_here
-    EM 0xB8, 1, 0, 0, 0
+    add rsp, 8
     mov qword [e_type], TY_BOOL
 .out:
     pop rbx
@@ -1290,16 +1251,14 @@ parse_ternary:
     call to_rvalue
     push 0                      ; else chain
     push 0                      ; end chain
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x84
     lea rdi, [rsp+8]
-    call chain_slot
+    CG jz_chain
     call next_token
     call parse_assign
     call to_rvalue
     mov rbx, [e_type]
-    EM 0xE9
     mov rdi, rsp
-    call chain_slot
+    CG jmp_chain
     mov rdi, [rsp+8]
     call patch_here
     mov edi, ':'
@@ -1316,6 +1275,7 @@ parse_ternary:
 
 parse_expr:
 parse_assign:
+    STACKCHK
     push rbx
     push r12
     push r13
@@ -1343,11 +1303,11 @@ parse_assign:
     jnc .p2
     ERR "cannot assign to an array"
 .p2:
-    EM 0x50
+    CG push_a
     call next_token
     call parse_assign
     call to_rvalue
-    EM 0x59
+    CG pop_b
     mov rdi, rbx
     call emit_store_type
     mov [e_type], rbx
@@ -1370,21 +1330,22 @@ parse_assign:
     jnz .c3
     ERR "compound assignment needs a scalar variable"
 .c3:
-    EM 0x50
+    CG push_a
     mov rdi, rbx
     call emit_load_type
-    EM 0x50
+    CG push_a
     call next_token
     call parse_assign
     call to_rvalue
     mov r13, [e_type]
-    EM 0x48, 0x89, 0xC1, 0x58
+    CG mov_b_a
+    CG pop_a
     sub r12d, T_ADDEQ
     movzx edi, byte [compound_map+r12]
     mov rsi, rbx
     mov rdx, r13
     call binop_emit
-    EM 0x59
+    CG pop_b
     mov rdi, rbx
     call emit_store_type
     mov [e_type], rbx

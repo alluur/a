@@ -118,6 +118,9 @@ fatal_error_tok:
     mov edi, errbuf
     jmp fatal_error
 
+err_nested:
+    ERR "source is nested too deeply"
+
 err_toobig:
     ERR "program or compiler limit exceeded (too large)"
 
@@ -311,88 +314,12 @@ add_reloc:
     pop rax
     ret
 
-; emit  lea rax,[rip+disp32]  with a relocation: esi = kind, edx = target
-emit_lea_rip:
-    push rdi
-    EM 0x48, 0x8D, 0x05
-    mov edi, [code_pos]
-    push rdi
-    xor edi, edi
-    call emit_d
-    pop rdi
-    call add_reloc
-    pop rdi
-    ret
-
-; emit_imm_rax: rdi = value -> mov rax, imm
-emit_imm_rax:
-    push rax
-    movsxd rax, edi
-    cmp rax, rdi
-    jne .big
-    EM 0x48, 0xC7, 0xC0
-    call emit_d
-    pop rax
-    ret
-.big:
-    EM 0x48, 0xB8
-    call emit_q
-    pop rax
-    ret
-
-; chain_slot: rdi = address of a chain head variable. Emits a 4 byte link
-; placeholder and makes the head point to it.
-chain_slot:
-    push rax
-    push rdx
-    push rdi
-    mov rdx, rdi
-    mov rax, [code_pos]
-    mov edi, [rdx]
-    call emit_d
-    mov [rdx], rax
-    pop rdi
-    pop rdx
-    pop rax
-    ret
-
-; patch_chain: rdi = chain head value, rsi = target code position
-patch_chain:
-    push rax
-    push rcx
-.l: test rdi, rdi
-    jz .d
-    mov eax, [code_buf+rdi]
-    mov rcx, rsi
-    sub rcx, rdi
-    sub rcx, 4
-    mov [code_buf+rdi], ecx
-    mov rdi, rax
-    jmp .l
-.d: pop rcx
-    pop rax
-    ret
-
 ; patch_here: rdi = chain head value; patches to current code position
 patch_here:
     push rsi
     mov rsi, [code_pos]
-    call patch_chain
+    CG patch_chain
     pop rsi
-    ret
-
-; emit_jmp_back: rdi = target code position; emits jmp rel32
-emit_jmp_back:
-    push rdi
-    push rax
-    mov rax, rdi
-    EM 0xE9
-    mov rdi, rax
-    sub rdi, [code_pos]
-    sub rdi, 4
-    call emit_d
-    pop rax
-    pop rdi
     ret
 
 ; ---- data / bss allocation of the compiled program -------------------------------

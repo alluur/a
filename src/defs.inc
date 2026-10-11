@@ -218,4 +218,94 @@
     __SECT__
 %endmacro
 
+; guard against runaway recursion in the compiler itself (deeply nested source)
+%macro STACKCHK 0
+    cmp rsp, [stack_limit]
+    jb err_nested
+%endmacro
+
+; =============================================================================
+;  code generator backend interface
+;  The parser emits code only through these primitives. Abstract machine:
+;    A = accumulator (rax / x0), B = secondary (rcx / x1), D = temp (rdx / x2),
+;    a downward growing stack of one-slot values (push/pop).
+;  Every primitive preserves all compiler registers (rax..r15) unless stated.
+; =============================================================================
+%macro CGLIST 1
+    %1 push_a              ; push A
+    %1 push_b              ; push B
+    %1 pop_a               ; pop into A
+    %1 pop_b               ; pop into B
+    %1 drop                ; edi = number of stack slots to discard
+    %1 mov_b_a             ; B = A
+    %1 mov_a_b             ; A = B
+    %1 mov_d_a             ; D = A
+    %1 mov_a_d             ; A = D
+    %1 imm_a               ; rdi = value -> A
+    %1 imm_b               ; rdi = value -> B
+    %1 lea_local_a         ; edi = frame offset -> A = &local
+    %1 lea_local_b         ; edi = frame offset -> B = &local
+    %1 load_local_a        ; edi = frame offset -> A = *(qword*)&local
+    %1 store_local_a       ; edi = frame offset -> *(qword*)&local = A
+    %1 zero_local          ; edi = frame offset, esi = size: clears a local (clobbers A)
+    %1 lea_global_a        ; esi = R_DATA/R_BSS, edx = target -> A = address
+    %1 load8_a             ; A = *(qword*)A
+    %1 load1_a             ; A = *(byte*)A (zero extended)
+    %1 store8              ; *(qword*)B = A
+    %1 store1              ; *(byte*)B = A
+    %1 copy_mem            ; edi = size: copy A -> B, result A = B
+    %1 add_imm_a           ; edi = signed 32 bit immediate: A += imm
+    %1 mul_imm_a           ; edi = imm: A *= imm
+    %1 mul_imm_b           ; edi = imm: B *= imm
+    %1 add                 ; A = A + B
+    %1 sub
+    %1 mul
+    %1 div
+    %1 mod
+    %1 and
+    %1 or
+    %1 xor
+    %1 shl
+    %1 sar
+    %1 cmp_eq              ; A = (A == B)
+    %1 cmp_ne
+    %1 cmp_lt
+    %1 cmp_gt
+    %1 cmp_le
+    %1 cmp_ge
+    %1 neg
+    %1 not
+    %1 lnot
+    %1 zext8
+    %1 tobool
+    %1 jz_chain            ; rdi = &chain head: jump if A == 0
+    %1 jnz_chain
+    %1 jmp_chain
+    %1 jmp_back            ; rdi = target code position
+    %1 jnz_back            ; rdi = target: jump if A != 0
+    %1 case_jump           ; edi = frame offset, rsi = value, rdx = target: if local == value jump
+    %1 patch_chain         ; rdi = chain head, rsi = target position
+    %1 call_sym            ; rdi = function symbol
+    %1 prologue            ; function entry; records the frame size patch position
+    %1 epilogue            ; return to the caller
+    %1 set_frame           ; edi = frame size in bytes (multiple of 16)
+    %1 entry_args          ; edi = number of main() parameters (0..2): pushes argc/argv
+%endmacro
+
+%assign CGI_COUNT 0
+%macro CGI_DEF 1
+    %assign CGI_%1 CGI_COUNT
+    %assign CGI_COUNT CGI_COUNT+1
+%endmacro
+CGLIST CGI_DEF
+
+; call a backend primitive
+%macro CG 1
+    call [cg_vt + CGI_%1 * 8]
+%endmacro
+
+; ---- targets / architectures ---------------------------------------------------
+%define ARCH_X64        0
+%define ARCH_A64        1
+
 %endif

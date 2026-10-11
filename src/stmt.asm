@@ -50,6 +50,7 @@ parse_block:
     ret
 
 parse_stmt:
+    STACKCHK
     mov eax, [tk]
     cmp eax, '{'
     je parse_block
@@ -98,9 +99,8 @@ parse_cond_jz:
     call to_rvalue
     mov edi, ')'
     call expect
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x84
     mov rdi, rbx
-    call chain_slot
+    CG jz_chain
     pop rbx
     ret
 
@@ -114,9 +114,8 @@ parse_if:
     jne .noelse
     call next_token
     push 0
-    EM 0xE9
     mov rdi, rsp
-    call chain_slot
+    CG jmp_chain
     mov rdi, [rsp+8]
     call patch_here
     call parse_stmt
@@ -141,7 +140,7 @@ parse_while:
     call parse_cond_jz
     call parse_stmt
     mov rdi, rbx
-    call emit_jmp_back
+    CG jmp_back
     mov rdi, [r12]
     call patch_here
     call loop_pop
@@ -174,11 +173,8 @@ parse_do:
     call expect
     mov edi, ';'
     call expect
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x85
     mov rdi, rbx
-    sub rdi, [code_pos]
-    sub rdi, 4
-    call emit_d
+    CG jnz_back
     mov rdi, [r12]
     call patch_here
     call loop_pop
@@ -218,16 +214,14 @@ parse_for:
     je .nocond
     call parse_expr
     call to_rvalue
-    EM 0x48, 0x85, 0xC0, 0x0F, 0x84
     mov rdi, r12
-    call chain_slot
+    CG jz_chain
 .nocond:
     mov edi, ';'
     call expect
     push 0
-    EM 0xE9
     mov rdi, rsp
-    call chain_slot
+    CG jmp_chain
     mov rax, [code_pos]
     mov [r12+16], rax
     cmp qword [tk], ')'
@@ -237,12 +231,12 @@ parse_for:
     mov edi, ')'
     call expect
     mov rdi, rbx
-    call emit_jmp_back
+    CG jmp_back
     pop rdi
     call patch_here
     call parse_stmt
     mov rdi, [r12+16]
-    call emit_jmp_back
+    CG jmp_back
     mov rdi, [r12]
     call patch_here
     call loop_pop
@@ -260,13 +254,14 @@ parse_return:
     call to_rvalue
     jmp .j
 .void:
-    EM 0x31, 0xC0
+    xor edi, edi
+    CG imm_a
 .j:
     mov edi, ';'
     call expect
-    EM 0xE9
     mov rdi, ret_chain
-    jmp chain_slot
+    CG jmp_chain
+    ret
 
 parse_break:
     call next_token
@@ -280,10 +275,9 @@ parse_break:
     dec eax
     shl rax, 5
     add rax, loop_stack
-    push rax
-    EM 0xE9
-    pop rdi
-    jmp chain_slot
+    mov rdi, rax
+    CG jmp_chain
+    ret
 
 parse_continue:
     call next_token
@@ -304,13 +298,12 @@ parse_continue:
     cmp qword [rdx+16], 0
     je .chain
     mov rdi, [rdx+16]
-    jmp emit_jmp_back
+    CG jmp_back
+    ret
 .chain:
-    push rdx
-    EM 0xE9
-    pop rdi
-    add rdi, 8
-    jmp chain_slot
+    lea rdi, [rdx+8]
+    CG jmp_chain
+    ret
 
 ; ---- switch ------------------------------------------------------------------------
 ; switch (expr) { case C: ... default: ... }
@@ -332,19 +325,17 @@ parse_switch:
     add dword [frame_size], 8
     mov ebx, [frame_size]
     neg rbx
-    EM 0x48, 0x89, 0x85
     mov edi, ebx
-    call emit_d
+    CG store_local_a
     xor edi, edi
     mov esi, 1
     call loop_push
     mov r12, rax
     mov r13d, [case_sp]
     push 0
-    EM 0xE9
     push 0
     mov rdi, rsp
-    call chain_slot
+    CG jmp_chain
     mov edi, '{'
     call expect
     mov r14d, [sym_count]
@@ -393,9 +384,8 @@ parse_switch:
     call next_token
     mov [sym_count], r14d
     ; end of the body falls out of the switch
-    EM 0xE9
-    lea rdi, [r12]
-    call chain_slot
+    mov rdi, r12
+    CG jmp_chain
     ; dispatch code
     pop rdi
     call patch_here
@@ -403,17 +393,10 @@ parse_switch:
 .disp:
     cmp r15d, [case_sp]
     jae .nomore
-    EM 0x48, 0x8B, 0x85
     mov edi, ebx
-    call emit_d
-    EM 0x48, 0x3D
-    mov edi, [case_val+r15*8]
-    call emit_d
-    EM 0x0F, 0x84
-    mov rdi, [case_pos+r15*8]
-    sub rdi, [code_pos]
-    sub rdi, 4
-    call emit_d
+    mov rsi, [case_val+r15*8]
+    mov rdx, [case_pos+r15*8]
+    CG case_jump
     inc r15d
     jmp .disp
 .nomore:
@@ -421,12 +404,11 @@ parse_switch:
     test rax, rax
     jz .nodef
     mov rdi, rax
-    call emit_jmp_back
+    CG jmp_back
     jmp .end
 .nodef:
-    EM 0xE9
-    lea rdi, [r12]
-    call chain_slot
+    mov rdi, r12
+    CG jmp_chain
 .end:
     mov rdi, [r12]
     call patch_here
@@ -506,26 +488,20 @@ parse_local_decl:
     call next_token
     call parse_assign
     call to_rvalue
-    EM 0x48, 0x8D, 0x8D
     mov edi, r14d
-    call emit_d
+    CG lea_local_b
     mov rdi, rbx
     call emit_store_type
     jmp .next
 .zero:
-    EM 0x48, 0xC7, 0x85
     mov edi, r14d
-    call emit_d
-    EM 0, 0, 0, 0
+    mov esi, 8
+    CG zero_local
     jmp .next
 .agg:
-    EM 0x48, 0x8D, 0xBD
     mov edi, r14d
-    call emit_d
-    EM 0x31, 0xC0, 0xB9
-    mov edi, r15d
-    call emit_d
-    EM 0xF3, 0xAA
+    mov esi, r15d
+    CG zero_local
     bt rbx, TF_ARRAY_BIT
     jc .next
     cmp qword [tk], '('
@@ -535,9 +511,8 @@ parse_local_decl:
     call next_token
     call parse_assign
     call to_rvalue
-    EM 0x48, 0x8D, 0x8D
     mov edi, r14d
-    call emit_d
+    CG lea_local_b
     mov rdi, rbx
     call emit_store_type
     jmp .next
@@ -551,10 +526,9 @@ parse_local_decl:
     ERR "this class has no constructor"
 .c1:
     mov r15, rax
-    EM 0x48, 0x8D, 0x85
     mov edi, r14d
-    call emit_d
-    EM 0x50
+    CG lea_local_a
+    CG push_a
     mov rdi, r15
     mov esi, 1
     call gen_call
