@@ -60,6 +60,116 @@ emit_store_type:
     pop rdi
     ret
 
+; ---- peephole support ----------------------------------------------------------------
+; The generator remembers where the most recent "interesting" instruction started and
+; ended (pk_*: address of a local, imm_*: constant in A, ld_*: local loaded, cmp_*: a
+; comparison). A marker is valid only while code_pos still equals its end position, i.e.
+; nothing has been emitted since. Rewinding the code buffer clears every marker.
+
+; rewind_code: rdi = new code position (preserves all registers)
+rewind_code:
+    mov [code_pos], rdi
+    mov qword [pk_end], 0
+    mov qword [imm_end], 0
+    mov qword [ld_end], 0
+    mov qword [cmp_end], 0
+    ret
+
+; gen_imm_a: rdi = value. Emits  A = value  and records it for the optimiser
+gen_imm_a:
+    push rax
+    mov rax, [code_pos]
+    mov [imm_pos], rax
+    mov [imm_val], rdi
+    CG imm_a
+    mov rax, [code_pos]
+    mov [imm_end], rax
+    pop rax
+    ret
+
+; finish_operands: rdi = code position of the "push A" emitted before the right operand,
+; rsi = code position right after it. Right operand is in A, left operand on the stack.
+; Leaves B = right and A = left, using a single instruction when the right operand was
+; just a constant or a plain local variable.
+finish_operands:
+    mov rax, [code_pos]
+    cmp rax, [imm_end]
+    jne .noimm
+    cmp rsi, [imm_pos]
+    jne .noimm
+    mov r8, [imm_val]
+    call rewind_code
+    mov rdi, r8
+    CG imm_b
+    ret
+.noimm:
+    cmp rax, [ld_end]
+    jne .plain
+    cmp rsi, [ld_pos]
+    jne .plain
+    mov r8d, [ld_off]
+    mov r9d, [ld_size]
+    call rewind_code
+    mov edi, r8d
+    cmp r9d, 8
+    jne .b1
+    CG load_local_b
+    ret
+.b1:
+    CG load_local_b1
+    ret
+.plain:
+    CG mov_b_a
+    CG pop_a
+    ret
+
+; cond_jz / cond_jnz: rdi = &chain head. The condition is in A; if it was just computed
+; by a comparison the compare-and-jump is fused.
+cond_jz:
+    push rbx
+    mov rbx, rdi
+    mov rax, [code_pos]
+    cmp rax, [cmp_end]
+    jne .plain
+    mov eax, [cmp_cc]
+    movzx r8d, byte [cc_invert + rax]
+    mov rdi, [cmp_pos]
+    call rewind_code
+    mov edi, r8d
+    mov rsi, rbx
+    CG jcmp_chain
+    pop rbx
+    ret
+.plain:
+    mov rdi, rbx
+    CG jz_chain
+    pop rbx
+    ret
+
+cond_jnz:
+    push rbx
+    mov rbx, rdi
+    mov rax, [code_pos]
+    cmp rax, [cmp_end]
+    jne .plain
+    mov r8d, [cmp_cc]
+    mov rdi, [cmp_pos]
+    call rewind_code
+    mov edi, r8d
+    mov rsi, rbx
+    CG jcmp_chain
+    pop rbx
+    ret
+.plain:
+    mov rdi, rbx
+    CG jnz_chain
+    pop rbx
+    ret
+
+section .rodata
+cc_invert: db CC_NE, CC_EQ, CC_GE, CC_LE, CC_GT, CC_LT
+section .text
+
 ; to_rvalue: turn an lvalue (address in rax) into its value
 to_rvalue:
     cmp qword [e_lval], 0
@@ -68,7 +178,40 @@ to_rvalue:
     mov rdi, [e_type]
     bt rdi, TF_ARRAY_BIT
     jc .arr
+    ; a local variable whose address was just computed: load it directly
+    mov rax, [code_pos]
+    cmp rax, [pk_end]
+    jne .plain
+    call type_ls
+    cmp eax, 8
+    je .f8
+    cmp eax, 1
+    je .f1
+.plain:
+    mov rdi, [e_type]
     jmp emit_load_type
+.f8:
+    mov r8d, [pk_off]
+    mov rdi, [pk_pos]
+    call rewind_code
+    mov [ld_pos], rdi
+    mov edi, r8d
+    CG load_local_a
+    mov dword [ld_size], 8
+    jmp .fdone
+.f1:
+    mov r8d, [pk_off]
+    mov rdi, [pk_pos]
+    call rewind_code
+    mov [ld_pos], rdi
+    mov edi, r8d
+    CG load_local_a1
+    mov dword [ld_size], 1
+.fdone:
+    mov [ld_off], r8d
+    mov rax, [code_pos]
+    mov [ld_end], rax
+    ret
 .arr:
     btr rdi, TF_ARRAY_BIT
     mov [e_type], rdi
@@ -199,22 +342,43 @@ binop_emit:
     CG sar
     jmp .out
 .eq:
+    mov r8d, CC_EQ
+    call .cmark
     CG cmp_eq
-    jmp .out
+    jmp .cdone
 .ne:
+    mov r8d, CC_NE
+    call .cmark
     CG cmp_ne
-    jmp .out
+    jmp .cdone
 .lt:
+    mov r8d, CC_LT
+    call .cmark
     CG cmp_lt
-    jmp .out
+    jmp .cdone
 .gt:
+    mov r8d, CC_GT
+    call .cmark
     CG cmp_gt
-    jmp .out
+    jmp .cdone
 .le:
+    mov r8d, CC_LE
+    call .cmark
     CG cmp_le
-    jmp .out
+    jmp .cdone
 .ge:
+    mov r8d, CC_GE
+    call .cmark
     CG cmp_ge
+.cdone:
+    mov rax, [code_pos]
+    mov [cmp_end], rax
+    jmp .out
+.cmark:
+    mov rax, [code_pos]
+    mov [cmp_pos], rax
+    mov [cmp_cc], r8d
+    ret
 .out:
     pop r13
     pop r12
@@ -502,7 +666,7 @@ parse_primary:
 
 .num:
     mov rdi, [tk_val]
-    CG imm_a
+    call gen_imm_a
     mov qword [e_type], TY_INT
     mov qword [e_lval], 0
     call next_token
@@ -522,21 +686,21 @@ parse_primary:
 
 .true:
     mov edi, 1
-    CG imm_a
+    call gen_imm_a
     mov qword [e_type], TY_BOOL
     mov qword [e_lval], 0
     call next_token
     jmp .out
 .false:
     xor edi, edi
-    CG imm_a
+    call gen_imm_a
     mov qword [e_type], TY_BOOL
     mov qword [e_lval], 0
     call next_token
     jmp .out
 .null:
     xor edi, edi
-    CG imm_a
+    call gen_imm_a
     mov qword [e_type], TY_VOID | TY_PTR1
     mov qword [e_lval], 0
     call next_token
@@ -568,7 +732,7 @@ parse_primary:
     mov edi, ')'
     call expect
     mov rdi, rbx
-    CG imm_a
+    call gen_imm_a
     mov qword [e_type], TY_INT
     mov qword [e_lval], 0
     jmp .out
@@ -719,8 +883,13 @@ parse_primary:
     ERR "a type name cannot be used as a value"
 
 .local:
+    mov rax, [code_pos]
+    mov [pk_pos], rax
     mov edi, [r12+SYM_VAL]
+    mov [pk_off], edi
     CG lea_local_a
+    mov rax, [code_pos]
+    mov [pk_end], rax
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
     mov qword [e_lval], 1
@@ -747,7 +916,7 @@ parse_primary:
     test dword [r12+SYM_FLAGS], F_STRCONST
     jnz .conststr
     mov rdi, [r12+SYM_VAL]
-    CG imm_a
+    call gen_imm_a
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
     mov qword [e_lval], 0
@@ -1011,6 +1180,8 @@ emit_incdec_postfix:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
     mov r12d, edi
     movsxd r13, esi
     cmp qword [e_lval], 0
@@ -1034,6 +1205,36 @@ emit_incdec_postfix:
     call type_pointee_size
     imul r13, rax
 .step1:
+    mov rax, [code_pos]
+    cmp rax, [pk_end]
+    jne .stepg
+    ; local variable: load, modify, store back - no address register needed
+    mov r14d, [pk_off]
+    mov rdi, [pk_pos]
+    call rewind_code
+    mov [pi_pos], rdi
+    mov [pi_off], r14d
+    mov [pi_type], rbx
+    mov [pi_step], r13
+    mov edi, r14d
+    mov rsi, rbx
+    call load_local_typed
+    test r12d, r12d
+    jz .l1
+    CG mov_d_a
+.l1:
+    mov rdi, r13
+    CG add_imm_a
+    mov edi, r14d
+    mov rsi, rbx
+    call store_local_typed
+    test r12d, r12d
+    jz .fin
+    CG mov_a_d
+    mov rax, [code_pos]
+    mov [pi_end], rax
+    jmp .fin
+.stepg:
     CG mov_b_a
     mov rdi, rbx
     call emit_load_type
@@ -1051,9 +1252,31 @@ emit_incdec_postfix:
 .fin:
     mov [e_type], rbx
     mov qword [e_lval], 0
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
+    ret
+
+; discard_result: called after an expression statement. If the whole statement was a
+; postfix ++ / -- of a local variable, the old value is not needed: regenerate it as
+; a plain  load / add / store.
+discard_result:
+    mov rax, [code_pos]
+    cmp rax, [pi_end]
+    jne .ret
+    mov rdi, [pi_pos]
+    call rewind_code
+    mov edi, [pi_off]
+    mov rsi, [pi_type]
+    call load_local_typed
+    mov rdi, [pi_step]
+    CG add_imm_a
+    mov edi, [pi_off]
+    mov rsi, [pi_type]
+    call store_local_typed
+.ret:
     ret
 
 ; ---- unary ---------------------------------------------------------------------
@@ -1081,6 +1304,18 @@ parse_unary:
     call next_token
     call parse_unary
     call to_rvalue
+    mov rax, [code_pos]
+    cmp rax, [imm_end]
+    jne .negreal
+    mov r8, [imm_val]
+    mov rdi, [imm_pos]
+    call rewind_code
+    neg r8
+    mov rdi, r8
+    call gen_imm_a
+    mov qword [e_type], TY_INT
+    ret
+.negreal:
     CG neg
     mov qword [e_type], TY_INT
     ret
@@ -1157,6 +1392,8 @@ parse_binary:
     push rbx
     push r12
     push r13
+    push r14
+    push r15
     mov ebx, edi
     call parse_unary
 .loop:
@@ -1172,19 +1409,24 @@ parse_binary:
     mov r13d, ecx
     call to_rvalue
     push qword [e_type]
+    mov r14, [code_pos]
     CG push_a
+    push qword [code_pos]
     call next_token
     lea edi, [r13+1]
     call parse_binary
     call to_rvalue
-    CG mov_b_a
-    CG pop_a
+    pop rsi
+    mov rdi, r14
+    call finish_operands
     pop rsi
     mov rdx, [e_type]
     mov edi, r12d
     call binop_emit
     jmp .loop
 .done:
+    pop r15
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -1200,7 +1442,7 @@ parse_logand:
     push 0
 .l:
     mov rdi, rsp
-    CG jz_chain
+    call cond_jz
     call next_token
     mov edi, 3
     call parse_binary
@@ -1208,7 +1450,7 @@ parse_logand:
     cmp qword [tk], T_ANDAND
     je .l
     mov rdi, rsp
-    CG jz_chain
+    call cond_jz
     push 0
     mov edi, 1
     CG imm_a
@@ -1235,14 +1477,14 @@ parse_logor:
     push 0
 .l:
     mov rdi, rsp
-    CG jnz_chain
+    call cond_jnz
     call next_token
     call parse_logand
     call to_rvalue
     cmp qword [tk], T_OROR
     je .l
     mov rdi, rsp
-    CG jnz_chain
+    call cond_jnz
     push 0
     xor edi, edi
     CG imm_a
@@ -1269,7 +1511,7 @@ parse_ternary:
     push 0                      ; else chain
     push 0                      ; end chain
     lea rdi, [rsp+8]
-    CG jz_chain
+    call cond_jz
     call next_token
     call parse_assign
     call to_rvalue
@@ -1288,6 +1530,40 @@ parse_ternary:
     mov [e_type], rbx
 .out:
     pop rbx
+    ret
+
+; load_local_typed: edi = frame offset, rsi = type of the variable. A = the variable
+load_local_typed:
+    push rdi
+    mov rdi, rsi
+    call type_ls
+    pop rdi
+    cmp eax, 1
+    je .b
+    CG load_local_a
+    ret
+.b: CG load_local_a1
+    ret
+
+; store_local_typed: edi = frame offset, rsi = type. Stores A into the variable
+; (bool variables are normalised to 0 / 1). A keeps the stored value.
+store_local_typed:
+    push rdi
+    mov rdi, rsi
+    call type_ls
+    mov r9d, eax
+    test esi, 0xFF00
+    jnz .st
+    cmp sil, TY_BOOL
+    jne .st
+    CG tobool
+.st:
+    pop rdi
+    cmp r9d, 1
+    je .b
+    CG store_local_a
+    ret
+.b: CG store_local_a1
     ret
 
 parse_expr:
@@ -1320,6 +1596,28 @@ parse_assign:
     jnc .p2
     ERR "cannot assign to an array"
 .p2:
+    ; fast path: assignment to a plain local scalar, no address needs to be kept
+    mov rax, [code_pos]
+    cmp rax, [pk_end]
+    jne .p3
+    mov rdi, rbx
+    call type_ls
+    test eax, eax
+    jz .p3
+    mov r12d, [pk_off]
+    mov r13d, eax
+    mov rdi, [pk_pos]
+    call rewind_code
+    call next_token
+    call parse_assign
+    call to_rvalue
+    mov edi, r12d
+    mov rsi, rbx
+    call store_local_typed
+    mov [e_type], rbx
+    mov qword [e_lval], 0
+    jmp .ret
+.p3:
     CG push_a
     call next_token
     call parse_assign
@@ -1347,6 +1645,67 @@ parse_assign:
     jnz .c3
     ERR "compound assignment needs a scalar variable"
 .c3:
+    mov rax, [code_pos]
+    cmp rax, [pk_end]
+    jne .cgen
+    ; local scalar: right side first, then load, operate, store - nothing on the stack
+    push r14
+    mov r14d, [pk_off]
+    mov rdi, [pk_pos]
+    call rewind_code
+    call next_token
+    call parse_assign
+    call to_rvalue
+    mov r13, [e_type]
+    mov rax, [code_pos]
+    cmp rax, [imm_end]
+    jne .c3ld
+    mov r8, [imm_val]
+    mov rdi, [imm_pos]
+    call rewind_code
+    mov edi, r14d
+    mov rsi, rbx
+    call load_local_typed
+    mov rdi, r8
+    CG imm_b
+    jmp .c3op
+.c3ld:
+    cmp rax, [ld_end]
+    jne .c3gen
+    mov r8d, [ld_off]
+    mov r9d, [ld_size]
+    mov rdi, [ld_pos]
+    call rewind_code
+    mov edi, r14d
+    mov rsi, rbx
+    call load_local_typed
+    mov edi, r8d
+    cmp r9d, 8
+    jne .c3b1
+    CG load_local_b
+    jmp .c3op
+.c3b1:
+    CG load_local_b1
+    jmp .c3op
+.c3gen:
+    CG mov_b_a
+    mov edi, r14d
+    mov rsi, rbx
+    call load_local_typed
+.c3op:
+    sub r12d, T_ADDEQ
+    movzx edi, byte [compound_map+r12]
+    mov rsi, rbx
+    mov rdx, r13
+    call binop_emit
+    mov edi, r14d
+    mov rsi, rbx
+    call store_local_typed
+    mov [e_type], rbx
+    mov qword [e_lval], 0
+    pop r14
+    jmp .ret
+.cgen:
     CG push_a
     mov rdi, rbx
     call emit_load_type

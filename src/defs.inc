@@ -247,6 +247,10 @@
     %1 lea_local_b         ; edi = frame offset -> B = &local
     %1 load_local_a        ; edi = frame offset -> A = *(qword*)&local
     %1 store_local_a       ; edi = frame offset -> *(qword*)&local = A
+    %1 load_local_a1       ; edi = frame offset -> A = *(byte*)&local (zero extended)
+    %1 load_local_b        ; edi = frame offset -> B = *(qword*)&local
+    %1 load_local_b1       ; edi = frame offset -> B = *(byte*)&local (zero extended)
+    %1 store_local_a1      ; edi = frame offset -> *(byte*)&local = A
     %1 zero_local          ; edi = frame offset, esi = size: clears a local (clobbers A)
     %1 lea_global_a        ; esi = R_DATA/R_BSS, edx = target -> A = address
     %1 load8_a             ; A = *(qword*)A
@@ -281,6 +285,8 @@
     %1 jz_chain            ; rdi = &chain head: jump if A == 0
     %1 jnz_chain
     %1 jmp_chain
+    %1 jcmp_chain          ; edi = condition (CC_*), rdi.. see below: compares A with B and
+                           ;   jumps to the chain at [rsi] when  A cc B  holds
     %1 jmp_back            ; rdi = target code position
     %1 jnz_back            ; rdi = target: jump if A != 0
     %1 case_jump           ; edi = frame offset, rsi = value, rdx = target: if local == value jump
@@ -303,6 +309,14 @@ CGLIST CGI_DEF
 %macro CG 1
     call [cg_vt + CGI_%1 * 8]
 %endmacro
+
+; comparison condition codes used by jcmp_chain
+%define CC_EQ           0
+%define CC_NE           1
+%define CC_LT           2
+%define CC_GT           3
+%define CC_LE           4
+%define CC_GE           5
 
 ; ---- targets / architectures ---------------------------------------------------
 %define ARCH_X64        0

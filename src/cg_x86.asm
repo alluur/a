@@ -123,6 +123,38 @@ x86_lea_global_a:
     pop rdi
     ret
 
+x86_load_local_a1:
+    EM 0x48, 0x0F, 0xB6, 0x85
+    jmp emit_d
+x86_load_local_b:
+    EM 0x48, 0x8B, 0x8D
+    jmp emit_d
+x86_load_local_b1:
+    EM 0x48, 0x0F, 0xB6, 0x8D
+    jmp emit_d
+x86_store_local_a1:
+    EM 0x88, 0x85
+    jmp emit_d
+
+; edi = condition code CC_*, rsi = &chain head: cmp A,B; jump to the chain if A cc B
+x86_jcmp_chain:
+    push rax
+    push rdi
+    push rsi
+    mov eax, edi
+    EM 0x48, 0x39, 0xC8, 0x0F
+    movzx edi, byte [x86_jcc_codes + rax]
+    call emit_b
+    mov rdi, rsi
+    call chain_slot
+    pop rsi
+    pop rdi
+    pop rax
+    ret
+section .rodata
+x86_jcc_codes: db 0x84, 0x85, 0x8C, 0x8F, 0x8E, 0x8D       ; je jne jl jg jle jge
+section .text
+
 x86_load8_a:    EM 0x48, 0x8B, 0x00
                 ret
 x86_load1_a:    EM 0x48, 0x0F, 0xB6, 0x00

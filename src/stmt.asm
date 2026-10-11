@@ -82,6 +82,7 @@ parse_stmt:
     test eax, eax
     jnz parse_local_decl
     call parse_expr
+    call discard_result
     mov edi, ';'
     jmp expect
 .empty:
@@ -100,7 +101,7 @@ parse_cond_jz:
     mov edi, ')'
     call expect
     mov rdi, rbx
-    CG jz_chain
+    call cond_jz
     pop rbx
     ret
 
@@ -215,7 +216,7 @@ parse_for:
     call parse_expr
     call to_rvalue
     mov rdi, r12
-    CG jz_chain
+    call cond_jz
 .nocond:
     mov edi, ';'
     call expect
@@ -227,6 +228,7 @@ parse_for:
     cmp qword [tk], ')'
     je .noinc
     call parse_expr
+    call discard_result
 .noinc:
     mov edi, ')'
     call expect
@@ -495,9 +497,8 @@ parse_local_decl:
     call parse_assign
     call to_rvalue
     mov edi, r14d
-    CG lea_local_b
-    mov rdi, rbx
-    call emit_store_type
+    mov rsi, rbx
+    call store_local_typed
     jmp .next
 .zero:
     mov edi, r14d

@@ -1461,6 +1461,24 @@ ptmp_nlen:      resd MAXPARAM
 binprec:        resb 256
 
 err_msg:        resq 1
+pk_pos:         resq 1
+pk_end:         resq 1
+imm_pos:        resq 1
+imm_end:        resq 1
+imm_val:        resq 1
+ld_pos:         resq 1
+ld_end:         resq 1
+cmp_pos:        resq 1
+cmp_end:        resq 1
+pk_off:         resd 1
+pi_pos:         resq 1
+pi_end:         resq 1
+pi_step:        resq 1
+pi_type:        resq 1
+pi_off:         resd 1
+ld_off:         resd 1
+ld_size:        resd 1
+cmp_cc:         resd 1
 cur_src_base:   resq 1
 tk_start:       resq 1
 cg_vt:          resq CGI_COUNT

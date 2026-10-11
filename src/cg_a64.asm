@@ -271,6 +271,72 @@ a64_store_local_a:
     pop rdi
     ret
 
+; generic "local at frame offset" access: word templates for the near (ldur/stur) and
+; far (address in x16) forms are passed in r8d / r9d
+a64_local_access:
+    push rdi
+    push rsi
+    push rax
+    movsxd rax, edi
+    cmp rax, -256
+    jl .far
+    cmp rax, 255
+    jg .far
+    and eax, 0x1FF
+    shl eax, 12
+    or eax, r8d
+    mov edi, eax
+    call emit_d
+    jmp .out
+.far:
+    mov esi, edi
+    mov edi, 16
+    call a64_addr_local
+    mov edi, r9d
+    call emit_d
+.out:
+    pop rax
+    pop rsi
+    pop rdi
+    ret
+
+a64_load_local_a1:
+    push r8
+    push r9
+    mov r8d, 0x384003A0             ; ldurb w0, [x29, #off]
+    mov r9d, 0x39400200             ; ldrb  w0, [x16]
+    call a64_local_access
+    pop r9
+    pop r8
+    ret
+a64_load_local_b:
+    push r8
+    push r9
+    mov r8d, 0xF84003A1             ; ldur x1, [x29, #off]
+    mov r9d, 0xF9400201             ; ldr  x1, [x16]
+    call a64_local_access
+    pop r9
+    pop r8
+    ret
+a64_load_local_b1:
+    push r8
+    push r9
+    mov r8d, 0x384003A1             ; ldurb w1, [x29, #off]
+    mov r9d, 0x39400201             ; ldrb  w1, [x16]
+    call a64_local_access
+    pop r9
+    pop r8
+    ret
+a64_store_local_a1:
+    push r8
+    push r9
+    mov r8d, 0x380003A0             ; sturb w0, [x29, #off]
+    mov r9d, 0x39000200             ; strb  w0, [x16]
+    call a64_local_access
+    pop r9
+    pop r8
+    ret
+
 ; edi = frame offset, esi = size
 a64_zero_local:
     push rdi
@@ -477,6 +543,28 @@ a64_jnz_chain:
     jmp a64_chain_slot
 a64_jmp_chain:
     jmp a64_chain_slot
+
+; edi = condition code CC_*, rsi = &chain head: cmp A,B; jump to the chain if A cc B.
+; Emitted as  cmp x0,x1 ; b.<not cc> +8 ; b chain   (full branch range)
+a64_jcmp_chain:
+    push rax
+    push rdi
+    push rsi
+    A64 0xEB01001F                  ; cmp x0, x1
+    mov eax, edi
+    movzx edi, byte [a64_inv_cond + rax]
+    or edi, 0x54000040              ; b.<inverse> +8
+    call emit_d
+    mov rdi, rsi
+    call a64_chain_slot
+    pop rsi
+    pop rdi
+    pop rax
+    ret
+section .rodata
+; inverse ARM condition codes for eq ne lt gt le ge  ->  ne eq ge le gt lt
+a64_inv_cond: db 1, 0, 0xA, 0xD, 0xC, 0xB
+section .text
 
 ; rdi = target position
 a64_jmp_back:
