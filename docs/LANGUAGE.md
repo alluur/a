@@ -368,6 +368,11 @@ printf("%-10s|%5d|\n", (int)"total", 1600, 0, 0);       // total     | 1600|
 **Networking** is a separate module: `import net;` (built into the compiler, no files to install). See
 [section 12a](#12a-networking).
 
+**Environment and file system**
+
+`getEnv(argc, argv, "NAME")` (value as a heap string, `null` if unset), `fileExists(path)`, `fileDelete(path)`,
+`makeDir(path)`.
+
 **Process and memory**
 
 `exit(code)`, `alloc(n)` (zeroed heap memory, never freed).
@@ -412,6 +417,42 @@ Limits of this first version: IPv4 and TCP only (no UDP, IPv6, TLS), hosts must 
 `localhost` (no DNS yet), calls block (no timeouts or `select`).
 On Linux and Android the module uses socket system calls; on Windows it calls Winsock
 (`ws2_32.dll`, started automatically) through the built-in `__winapi`.
+
+## 12b. Built-in modules
+
+These modules are written in A and built into the compiler. `import name;` makes them available, they add
+code only to programs that import them, and a file of the same name next to your source takes precedence.
+
+| Module | Contents |
+|---|---|
+| `math` | `gcd lcm pow powMod isqrt isPrime nextPrime factorial fibonacci binomial clamp sign mod floorDiv popcount ilog2 digitSum sum minOf maxOf randRange shuffle` (integers only) |
+| `sort` | `sortInts(a, n)`, `sortStrings(a, n)`, `reverseInts`, `isSorted`, `binarySearch(a, n, key)` |
+| `collections` | classes `IntList`, `StrList`, `StrMap` (string to int), `IntMap` (int to int) |
+| `strings` | class `StringBuilder`; `concat repeat reverse count lastIndexOf replace padLeft padRight isBlank capitalize upper lower split join` |
+| `datetime` | `now() nowMillis() toUnix() dayOfWeek() isLeapYear() daysInMonth() weekdayName() monthName()` and class `DateTime` (UTC) |
+| `encoding` | `base64Encode/Decode`, `hexEncode/Decode`, `urlEncode/Decode` |
+| `hash` | `crc32 adler32 fnv1a djb2 sha256` |
+| `net` | TCP networking, see [12a](#12a-networking) |
+
+```c
+import collections;
+import sort;
+import hash;
+
+int main() {
+    collections.IntList* list = new collections.IntList();
+    list->push(30); list->push(10); list->push(20);
+    sort.sortInts(list->items(), list->size());          // 10 20 30
+    collections.StrMap ages;                              // objects can live on the stack too
+    ages.put("ann", 31);
+    println(hash.sha256("abc", 3));                       // ba7816bf...
+    return ages.get("ann", 0);
+}
+```
+
+Notes: collections never free memory (see section 11), `StrMap` copies its keys, out-of-range
+`IntList.get` returns 0, and iteration over a map goes through its slots
+(`for (int s = 0; s < m.capacity(); s++) if (m.keyAt(s) != null) ...`).
 
 ## 13. Built-in runtime functions
 

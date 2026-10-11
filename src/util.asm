@@ -456,6 +456,7 @@ data_add_string:
     lea rdi, [data_buf+rax]
     mov rcx, rdx
     rep movsb
+    mov byte [rdi], 0
     pop rax
     pop rcx
     pop rdi

@@ -31,6 +31,7 @@
 %define FILE_MAX        256
 %define MAXLOOP         64
 %define MAXPARAM        64
+%define EDGE_MAX        262144
 
 ; ---- targets ------------------------------------------------------------------
 %define TGT_LINUX       0
@@ -129,6 +130,7 @@
 %define F_STRCONST      32
 %define F_BUILTIN       64
 %define F_ENUMVAL       128
+%define F_USED          256     ; reachable from main (dead function elimination)
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
 %define ST_NAME         0       ; qword

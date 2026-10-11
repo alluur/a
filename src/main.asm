@@ -58,11 +58,35 @@ s_err_missing:  db "internal error: standard library function missing:", 0
 s_err_nofile:   db "cannot find the imported file", 0
 s_err_mainpar:  db "main may take at most (int argc, char** argv)", 0
 
-; embedded modules written in A: standard library and networking
-net_src:
-    incbin "lib/net.a"
-    db 0
-net_src_end:
+; embedded modules written in A. EMB "name", "file": makes "import name;" work without any
+; file on disk (a file next to the importing source still wins).
+%macro EMB 2
+    [section .rodata]
+%%nm:   db %1, ".a", 0
+%%lb:   db "<", %1, ">", 0
+%%src:  incbin %2
+        db 0
+%%end:
+    [section .data]
+        dq %%nm, %%lb, %%src, %%end - %%src - 1, 0
+    __SECT__
+%endmacro
+
+section .data
+align 8
+embedded_mods:
+section .text
+EMB "net",         "lib/net.a"
+EMB "math",        "lib/math.a"
+EMB "sort",        "lib/sort.a"
+EMB "collections", "lib/collections.a"
+EMB "strings",     "lib/strings.a"
+EMB "datetime",    "lib/datetime.a"
+EMB "encoding",    "lib/encoding.a"
+EMB "hash",        "lib/hash.a"
+section .data
+        dq 0
+section .rodata
 std_src:
     incbin "lib/std.a"
     db 0
@@ -77,7 +101,7 @@ std_src_end:
 %define IAT_CloseHandle     5
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
-%define IAT_K32             11
+%define IAT_K32             15
 %define IAT_SLOTS           (IAT_K32 + 1 + 9 + 1)   ; kernel32 + null + ws2_32 + null
 
 bn_write:   db "__write", 0
@@ -89,8 +113,6 @@ bn_open:    db "__open", 0
 bn_winapi:  db "__winapi", 0
 s_os_name:  db "__OS", 0
 s_arch_name: db "__ARCH", 0
-s_net_a:    db "net.a", 0
-s_net_name: db "<net>", 0
 bn_close:   db "__close", 0
 s_win_init: db "__win_init_args", 0
 s_win_argv: db "__win_argv_get", 0
@@ -313,8 +335,12 @@ imp_names:
     db "Sleep", 0               ; slot 8
     db "GetTickCount64", 0      ; slot 9
     db "GetFileType", 0         ; slot 10
+    db "GetSystemTimeAsFileTime", 0   ; slot 11
+    db "GetEnvironmentVariableA", 0   ; slot 12
+    db "DeleteFileA", 0         ; slot 13
+    db "CreateDirectoryA", 0    ; slot 14
     db 0
-; WS2_32.DLL imports: slots 12..20 (slot 11 is the null terminator of the kernel32 list)
+; WS2_32.DLL imports: slots 16..24 (slot 15 is the null terminator of the kernel32 list)
 imp_names_ws2:
     db "WSAStartup", 0
     db "socket", 0
@@ -430,15 +456,6 @@ file_try:
 file_include:
     push rbx
     push r12
-    ; the networking module is built into the compiler
-    mov rdi, importbuf
-    mov rsi, s_net_a
-    call cstr_eq
-    test eax, eax
-    jz .notnet
-    mov rax, [net_entry]
-    jmp .found
-.notnet:
     ; 1) next to the importing file
     mov rsi, [cur_file_name]
     mov rdi, candbuf
@@ -471,6 +488,22 @@ file_include:
     call file_try
     test rax, rax
     jnz .found
+    ; modules built into the compiler
+    mov rbx, embedded_mods
+.emb:
+    cmp qword [rbx], 0
+    je .noemb
+    mov rdi, importbuf
+    mov rsi, [rbx]
+    call cstr_eq
+    test eax, eax
+    jz .embnext
+    mov rax, [rbx+32]
+    jmp .found
+.embnext:
+    add rbx, 40
+    jmp .emb
+.noemb:
     ; 2) lib/ in the current directory, 3) installed libraries
     mov rbx, s_libdir1
     call .try_prefix
@@ -800,6 +833,63 @@ emit_call_named:
     mov rdi, rax
     pop rbx
     jmp emit_call_sym
+
+; begin_codegen_pass: resets the output state before a code generating pass
+begin_codegen_pass:
+    mov qword [code_pos], 0
+    mov eax, [rel_base]
+    mov [rel_count], eax
+    mov dword [loop_sp], 0
+    mov dword [case_sp], 0
+    mov dword [edge_count], 0
+    xor edi, edi
+    call rewind_code
+    mov qword [last_label], 0
+    ; every function starts again as "not yet defined"
+    xor edx, edx
+.l:
+    cmp edx, [sym_count]
+    jae .done
+    mov rax, rdx
+    shl rax, 6
+    add rax, symtab
+    cmp dword [rax+SYM_KIND], S_FUNC
+    jne .n
+    mov qword [rax+SYM_VAL], -1
+    mov dword [rax+SYM_PATCH], 0
+.n:
+    inc edx
+    jmp .l
+.done:
+    jmp emit_prologue
+
+; compute_reachable: marks every function reachable from the entry stub as F_USED
+compute_reachable:
+.again:
+    xor r8d, r8d                    ; changed
+    xor ecx, ecx
+.e:
+    cmp ecx, [edge_count]
+    jae .chk
+    mov eax, [edge_from + rcx*4]
+    shl rax, 6
+    add rax, symtab
+    test dword [rax+SYM_FLAGS], F_USED
+    jz .skip
+    mov eax, [edge_to + rcx*4]
+    shl rax, 6
+    add rax, symtab
+    test dword [rax+SYM_FLAGS], F_USED
+    jnz .skip
+    or dword [rax+SYM_FLAGS], F_USED
+    mov r8d, 1
+.skip:
+    inc ecx
+    jmp .e
+.chk:
+    test r8d, r8d
+    jnz .again
+    ret
 
 ; check_undefined: every called function must have been defined
 check_undefined:
@@ -1391,11 +1481,18 @@ _start:
     mov rsi, std_src
     mov rdx, std_src_end - std_src - 1
     call add_embedded_file
-    mov rdi, s_net_name
-    mov rsi, net_src
-    mov rdx, net_src_end - net_src - 1
+    mov rbx, embedded_mods
+.regemb:
+    cmp qword [rbx], 0
+    je .regdone
+    mov rdi, [rbx+8]
+    mov rsi, [rbx+16]
+    mov rdx, [rbx+24]
     call add_embedded_file
-    mov [net_entry], rcx
+    mov [rbx+32], rcx
+    add rbx, 40
+    jmp .regemb
+.regdone:
     mov rdi, [opt_input]
     call file_try
     mov [main_entry], rax
@@ -1408,10 +1505,24 @@ _start:
     call register_builtins
     mov dword [pass], 1
     call compile_all
-    ; --- pass 2
+    ; --- pass 2: compile everything (reports every error) and record the call graph
+    mov eax, [sym_count]
+    mov [sym_base], eax
+    mov eax, [rel_count]
+    mov [rel_base], eax
+    mov rax, [data_pos]
+    mov [data_base], rax
     mov dword [pass], 2
-    mov dword [loop_sp], 0
-    call emit_prologue
+    call begin_codegen_pass
+    call compile_all
+    call compute_reachable
+    ; --- pass 3: the real output, only functions reachable from main
+    mov eax, [sym_base]
+    mov [sym_count], eax
+    mov rax, [data_base]
+    mov [data_pos], rax
+    mov dword [pass], 3
+    call begin_codegen_pass
     call compile_all
     mov qword [cur_file_name], 0
     call check_undefined
@@ -1572,7 +1683,12 @@ ptmp_nlen:      resd MAXPARAM
 binprec:        resb 256
 
 err_msg:        resq 1
-net_entry:      resq 1
+data_base:      resq 1
+sym_base:       resd 1
+rel_base:       resd 1
+edge_count:     resd 1
+edge_from:      resd EDGE_MAX
+edge_to:        resd EDGE_MAX
 main_entry:     resq 1
 pk_pos:         resq 1
 last_label:     resq 1

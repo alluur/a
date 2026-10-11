@@ -225,6 +225,13 @@ define_function:
 ; compile_function: rdi = function symbol, current token '{', ptmp_* holds the
 ; parameters of this declaration (pass 2 only)
 compile_function:
+    ; final pass: functions that nothing calls are not emitted
+    cmp dword [pass], 3
+    jne .go
+    test dword [rdi+SYM_FLAGS], F_USED
+    jnz .go
+    jmp skip_block
+.go:
     push rbx
     push r12
     push r13
@@ -305,8 +312,8 @@ parse_enum:
     je .n1
     ERR "expected an enum name"
 .n1:
-    cmp dword [pass], 2
-    je .skip
+    cmp dword [pass], 1
+    jne .skip
     mov rdi, [tk_ptr]
     mov esi, [tk_len]
     mov edx, S_ENUM
@@ -512,8 +519,8 @@ parse_aggregate:
     cmp qword [tk], '('
     je .method
 ; ---- field
-    cmp dword [pass], 2
-    jne .f1
+    cmp dword [pass], 1
+    je .f1
     call skip_to_semi
     jmp .mloop
 .f1:
@@ -753,8 +760,8 @@ parse_global_vars:
     push r14
     push r15
     mov r12, [agg_gtype]
-    cmp dword [pass], 2
-    jne .again
+    cmp dword [pass], 1
+    je .again
     call skip_to_semi
     jmp .out
 .again:

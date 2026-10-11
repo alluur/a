@@ -29,6 +29,9 @@ syn keyword aStdlib print println printInt printlnInt printChar printBool printH
 syn keyword aStdlib readChar readLine atoi strlen streq strcmp strcpy strcat strdup memcpy memset
 syn keyword aStdlib indexOf startsWith intToStr isDigit isAlpha isUpper isLower isSpace toUpper toLower
 syn keyword aStdlib abs min max srand rand exit alloc fileOpen fileRead fileWrite fileClose readFile writeFile
+syn keyword aStdlib input askInt confirm readAll parseInt format printf printRepeat printColor clearScreen cursorTo isTerminal ansiInit
+syn keyword aStdlib argIndex hasArg argValue millis sleepMs getEnv fileExists fileDelete makeDir endsWith find contains substr trim strUpper strLower streqi hexToStr
+syn keyword aStdConst ANSI_RESET ANSI_BOLD ANSI_RED ANSI_GREEN ANSI_YELLOW ANSI_BLUE ANSI_MAGENTA ANSI_CYAN ANSI_GRAY
 syn keyword aStdConst FILE_READ FILE_WRITE FILE_APPEND
 
 " literals

@@ -14,11 +14,15 @@ linked with `ld`. It uses no libc: it talks to Linux through `syscall` only.
 * There is **no AST and no intermediate representation**. A recursive-descent parser emits machine
   code while it parses. Expression results are left in an accumulator, so the generated code is a
   simple stack machine — small, predictable and easy to debug.
-* The compiler makes **two passes** over the sources:
+* The compiler makes **three passes** over the sources:
   1. *Declarations:* every type, constant, enum, global variable, function signature, class member
      and module is registered. Function bodies are skipped (token-level brace matching).
-  2. *Code:* function bodies are compiled. Everything is known, so functions can be called before
+  2. *Check:* every function body is compiled (so every error is reported, even in code nobody
+     calls) and the call graph is recorded. Everything is known, so functions can be called before
      their definition, and calls to not-yet-emitted functions are patched through chains.
+  3. *Output:* the reachable functions are found from `main` (`compute_reachable`), the code buffer
+     is reset and only those functions are compiled again (dead function elimination). A
+     hello-world is about 4 KB although the standard library has hundreds of functions.
 * Imports are processed in both passes; a file is parsed once per pass.
 
 ## Source files
@@ -195,12 +199,19 @@ When a program differs, the script keeps it as `/tmp/difffuzz_fail_<seed>_<n>.[a
 drops individual lines, until a minimal reproducer remains. Every compiler bug found this way got a
 regression test (`t19_peephole`, `t20_regress_marker`, …).
 
+## Built-in modules
+
+`lib/*.a` other than `std.a` are embedded with the `EMB "name", "lib/name.a"` macro in `main.asm`
+(a table of name, label, source, length, file entry). `import name;` looks for a real file next to the
+importing source first, then at the embedded table, then in `lib/` directories. Adding a module means
+creating the file and one `EMB` line. Modules are only compiled when imported.
+
 ## The `net` module and `__winapi`
 
 `lib/net.a` is embedded in the compiler like `std.a` but only compiled when a program says `import net;`.
 It is plain A code. On Linux / Android it calls `__syscall` with the socket system call numbers of the
 current CPU (`__ARCH` picks x86-64 or ARM64). Windows has no stable syscalls, so the PE image imports
-`WS2_32.DLL` as a second descriptor (IAT slots 12-20, slot 11 is the null terminator of the kernel32
+`WS2_32.DLL` as a second descriptor (IAT slots 16-24, slot 15 is the null terminator of the kernel32
 thunks) and `net.a` reaches it through the generic builtin `__winapi(slot, a1..a4)`, a small blob
 that does `call [IAT + slot*8]` with the Windows x64 convention. Adding another Windows API needs
 only a new import name in `imp_names_ws2` (or a new DLL list) and a slot constant in A code.

@@ -599,6 +599,32 @@ enum_find:
 ; emit_call_sym: rdi = function symbol. Emits a call (patch chain if the
 ; function is not defined yet)
 emit_call_sym:
+    cmp dword [pass], 2
+    jne .go
+    ; pass 2 records the call graph: edge  cur_func -> callee  (no caller = called from the entry stub)
+    push rax
+    push rcx
+    mov rax, [cur_func]
+    test rax, rax
+    jnz .edge
+    or dword [rdi+SYM_FLAGS], F_USED
+    jmp .recorded
+.edge:
+    mov ecx, [edge_count]
+    cmp ecx, EDGE_MAX
+    jae err_toobig
+    sub rax, symtab
+    shr rax, 6
+    mov [edge_from + rcx*4], eax
+    mov rax, rdi
+    sub rax, symtab
+    shr rax, 6
+    mov [edge_to + rcx*4], eax
+    inc dword [edge_count]
+.recorded:
+    pop rcx
+    pop rax
+.go:
     CG call_sym
     ret
 
