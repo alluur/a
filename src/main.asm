@@ -471,6 +471,15 @@ compile_file:
     mov rdi, rsp
     call lex_save
     mov rax, [r12+8]
+    ; skip a UTF-8 byte order mark (Windows editors add it)
+    cmp byte [rax], 0xEF
+    jne .nobom
+    cmp byte [rax+1], 0xBB
+    jne .nobom
+    cmp byte [rax+2], 0xBF
+    jne .nobom
+    add rax, 3
+.nobom:
     mov [src_ptr], rax
     mov [cur_src_base], rax
     add rax, [r12+16]
