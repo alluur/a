@@ -26,7 +26,7 @@ int main() {
 | | |
 |---|---|
 | Language | C-like syntax: variables, constants, functions, structs, **classes** (`public` / `private`), enums, modules, pointers, arrays, `if` / `else if` / `else`, `while`, `do`, `for`, `switch`, logical and arithmetic operators |
-| Compiler | ~8,000 lines of NASM assembly, a single binary of about 50 KB, two passes, direct machine-code generation |
+| Compiler | ~8,400 lines of NASM assembly, a single binary of about 50 KB, two passes, direct machine-code generation, generated code about as fast as `gcc -O0` |
 | Targets | **Linux** x86-64 and ARM64 · **Windows** x86-64 · **Android** ARM64 and x86-64 |
 | Output | static native executables (ELF64 / PE32+), typically 4–10 KB for a small program |
 | Status | version 0.1.0 — complete enough for real programs, see [Limitations](#limitations-and-roadmap) |
@@ -159,6 +159,9 @@ docs/           language reference, targets guide, compiler internals, man page
 make test          # native Linux x86-64
 make test-all      # all targets: Linux, Windows (via Wine), ARM64 & Android (via QEMU)
 ```
+
+A **differential fuzzer** (`tests/fuzz/difffuzz.py`) compares random programs compiled by `ac` with the
+same programs compiled by GCC, on every target (see [`docs/INTERNALS.md`](docs/INTERNALS.md)).
 
 `tests/run.sh` compiles every `tests/t*.a`, runs it and compares stdout and the exit code with the
 `.out` / `.exit` files next to it (`.err` files hold the expected text of a compile error).

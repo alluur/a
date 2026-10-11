@@ -89,6 +89,32 @@ placeholder for the same target (a linked list threaded through the code). `patc
 list and writes the real offsets once the target is known. The same mechanism patches calls to
 functions that are defined later (`SYM_PATCH`).
 
+## The peephole optimiser
+
+The generator is a stack machine, but common shapes are tightened on the fly. The parser records
+*markers* — where the most recent instruction of a kind started and ended — and rewrites the tail
+of the code buffer when a later construct proves the pattern:
+
+| Marker | Rewrite |
+|---|---|
+| `pk_*` (address of a local) | `lea x; load` becomes one `load_local` (`to_rvalue`), `x = e` becomes `store_local`, `x++` / `x += e` operate in place |
+| `imm_*` (constant in A) | `a OP constant` loads the constant straight into B; `-constant` is folded |
+| `ld_*` (local just loaded) | `a OP local` loads the local straight into B (no push / pop) |
+| `cmp_*` (comparison) | compare + `setcc` + test + branch becomes a single compare-and-jump (`jcmp_chain`) |
+| `pi_*` (postfix `i++`) | when the old value is unused (`i++;`), regenerated as load / add / store |
+
+Safety rules — every rewrite must hold *all* of these, otherwise it is skipped:
+
+1. the marker's end position equals `code_pos` (nothing was emitted since);
+2. no jump target was bound at that position (`last_label`; see `tail_is`), because a label at the
+   end means the code before it is only a branch of a bigger construct such as `c ? a : b`;
+3. for operands: the marker's *start* equals the position where the operand began
+   (`imm_pos` / `ld_pos` == the position right after the `push`);
+4. `rewind_code` truncates the code buffer **and clears every marker** — a stale marker whose end
+   happens to coincide with a later position was a real bug once (fuzzer seed 3, AArch64).
+
+The result runs at roughly the speed of `gcc -O0`.
+
 ## Backends
 
 The parser never emits bytes directly. It calls **backend primitives** through a table:
@@ -155,3 +181,16 @@ and `tk_start` of the current token.
 the expected exit code `tNN_name.exit` (default 0), stdin `tNN_name.in`, and `tNN_name.err` holds a
 fragment of the message for tests that must fail to compile (`t9x_err_*`). The same suite is run
 for every target (see [TARGETS.md](TARGETS.md)).
+
+### Differential fuzzing
+
+`tests/fuzz/difffuzz.py [count] [seed] [target]` generates random programs (arithmetic, comparisons,
+`char`/`bool` wrap-around, arrays, globals, calls, `if` / `for` / `while` / `switch`, increments and
+compound assignments) once in A and once in C, builds them with `ac` and `gcc -O0 -fwrapv`, runs both
+and compares the output. `target` can be any `-t` value, so the same random programs validate the x86-64,
+ARM64 (via QEMU) and Windows (via Wine) backends against the same C reference.
+
+When a program differs, the script keeps it as `/tmp/difffuzz_fail_<seed>_<n>.[ac]`.
+`tests/fuzz/reduce.py seed n [target]` drops statements, and `tests/fuzz/ddmin.py file.a file.c [target]`
+drops individual lines, until a minimal reproducer remains. Every compiler bug found this way got a
+regression test (`t19_peephole`, `t20_regress_marker`, …).
