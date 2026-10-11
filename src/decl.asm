@@ -136,6 +136,12 @@ func_register:
     mov r14, rdx
     mov r15d, ecx
     mov ebx, r8d
+    test edx, 0xFF00
+    jnz .retok
+    cmp dl, TY_STRUCT
+    jne .retok
+    ERR "functions cannot return a struct by value, return a pointer"
+.retok:
     cmp r15d, -1
     jne .member
     mov rdi, r12
@@ -473,16 +479,26 @@ parse_aggregate:
     call names_eq
     test eax, eax
     jz .typed
+    ; same name as the class: constructor only when '(' follows
     mov rax, [tk_ptr]
     mov [agg_mname], rax
     mov eax, [tk_len]
     mov [agg_mnlen], eax
-    mov qword [agg_mtype], TY_VOID
-    mov dword [agg_isctor], 1
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
     call next_token
     cmp qword [tk], '('
-    je .method
-    ERR "a member named like its class must be a constructor"
+    je .isctor
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    jmp .typed
+.isctor:
+    add rsp, 128
+    mov qword [agg_mtype], TY_VOID
+    mov dword [agg_isctor], 1
+    jmp .method
 .typed:
     mov dword [agg_isctor], 0
     call parse_type
@@ -683,7 +699,7 @@ parse_import:
     push rbx
     push r12
     call next_token
-    mov rdi, importbuf
+    mov r12, importbuf
     cmp qword [tk], T_STR
     je .str
     cmp qword [tk], T_ID
@@ -696,6 +712,7 @@ parse_import:
     jb .s1
     ERR "import path too long"
 .s1:
+    mov rdi, r12
     rep movsb
     mov byte [rdi], 0
     call next_token
@@ -707,18 +724,20 @@ parse_import:
     jb .i1
     ERR "import path too long"
 .i1:
+    mov rdi, r12
     rep movsb
+    mov r12, rdi
     call next_token
     cmp qword [tk], '.'
     jne .idend
-    mov byte [rdi], '/'
-    inc rdi
+    mov byte [r12], '/'
+    inc r12
     call next_token
     cmp qword [tk], T_ID
     je .id
     ERR "expected a name after '.' in import"
 .idend:
-    mov dword [rdi], 0x0000612E          ; ".a"
+    mov dword [r12], 0x0000612E          ; ".a"
 .go:
     call file_include
     mov edi, ';'

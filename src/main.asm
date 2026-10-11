@@ -47,6 +47,7 @@ s_err_read:     db "cannot read the input file", 0
 s_err_nomain:   db "no 'main' function found", 0
 s_err_write:    db "cannot write the output file", 0
 s_err_undef:    db "undefined function", 0
+s_err_missing:  db "internal error: standard library function missing:", 0
 s_err_nofile:   db "cannot find the imported file", 0
 s_err_mainpar:  db "main may take at most (int argc, char** argv)", 0
 
@@ -70,6 +71,9 @@ bn_write:   db "__write", 0
 bn_read:    db "__read", 0
 bn_exit:    db "__exit", 0
 bn_syscall: db "__syscall", 0
+bn_cmdline: db "__cmdline", 0
+s_win_init: db "__win_init_args", 0
+s_win_argv: db "__win_argv_get", 0
 
 align 8
 builtin_tab:
@@ -77,6 +81,7 @@ builtin_tab:
     dq bn_read,    3, bl_lin_read,    bl_lin_read_end,    bl_win_read,   bl_win_read_end
     dq bn_exit,    1, bl_lin_exit,    bl_lin_exit_end,    bl_win_exit,   bl_win_exit_end
     dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, 0,             0
+    dq bn_cmdline, 0, bl_lin_cmdline, bl_lin_cmdline_end, bl_win_cmdline, bl_win_cmdline_end
     dq 0
 
 ; Linux / Android x86-64 runtime (raw syscalls). Arguments were pushed left to
@@ -115,7 +120,20 @@ bl_lin_syscall:
     ret
 bl_lin_syscall_end:
 
+bl_lin_cmdline:
+    xor eax, eax
+    ret
+bl_lin_cmdline_end:
+
 ; Windows x64 runtime (kernel32 imports through the IAT)
+bl_win_cmdline:
+    mov r12, rsp
+    and rsp, -16
+    sub rsp, 32
+    IATCALL IAT_GetCommandLineA
+    mov rsp, r12
+    ret
+bl_win_cmdline_end:
 bl_win_write:
     mov rdi, [rsp+8]
     mov rsi, [rsp+16]
@@ -530,27 +548,23 @@ emit_prologue:
     EM 0x51
     jmp .call
 .win:
+    ; Windows: the standard library parses GetCommandLineA() into argc / argv
     test ebx, ebx
     jz .call
-    EM 0x31, 0xC0
+    mov rdi, s_win_init
+    call emit_call_named
     EM 0x50
     cmp ebx, 2
     jb .call
+    mov rdi, s_win_argv
+    call emit_call_named
     EM 0x50
 .call:
     mov rdi, r12
     call emit_call_sym
     EM 0x50
     mov rdi, s_exit_name
-    mov esi, 6
-    xor edx, edx
-    call sym_find_global
-    test rax, rax
-    jnz .e1
-    ERR "internal error: __exit missing"
-.e1:
-    mov rdi, rax
-    call emit_call_sym
+    call emit_call_named
     ; builtin runtime blobs
     mov rbx, builtin_tab
 .bl:
@@ -588,6 +602,29 @@ emit_prologue:
     pop r12
     pop rbx
     ret
+
+; emit_call_named: rdi = name of a global (module 0) function -> emits a call to it
+emit_call_named:
+    push rbx
+    mov rbx, rdi
+    call cstrlen
+    mov esi, eax
+    mov rdi, rbx
+    xor edx, edx
+    call sym_find_global
+    test rax, rax
+    jnz .ok
+    mov qword [cur_file_name], 0
+    mov [tk_ptr], rbx
+    mov rdi, rbx
+    call cstrlen
+    mov [tk_len], eax
+    mov edi, s_err_missing
+    call fatal_error_tok
+.ok:
+    mov rdi, rax
+    pop rbx
+    jmp emit_call_sym
 
 ; check_undefined: every called function must have been defined
 check_undefined:
