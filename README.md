@@ -73,8 +73,9 @@ ac -o /tmp/hello hello.a                     # exactly /tmp/hello
 ```
 
 Example programs live in [`examples/`](examples/): `greet`, `calc` (interactive REPL), `wordcount`, `cat`, `todo`,
-`table`, `colors`, `wordfreq`, `clock`, `checksums`, `primes`, `bank`, `modules`, `net_server` / `net_client` and more.
-Built-in modules: `math`, `sort`, `collections`, `strings`, `datetime`, `encoding`, `hash`, `net`.
+`table`, `colors`, `wordfreq`, `clock`, `checksums`, `primes`, `jsonpretty`, `grep`, `bignum`, `dirlist`, `quiz`, `bank`, `modules`, `net_server` / `net_client` and more.
+Built-in modules: `math`, `bigint`, `decimal`, `random`, `sort`, `collections`, `strings`, `regex`, `utf8`, `json`, `csv`,
+`path`, `os`, `datetime`, `encoding`, `hash`, `cli`, `log`, `testing`, `net`.
 
 Details for every platform (adb, Termux, Wine, QEMU) are in [`docs/TARGETS.md`](docs/TARGETS.md).
 

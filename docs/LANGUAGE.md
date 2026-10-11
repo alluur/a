@@ -426,12 +426,24 @@ code only to programs that import them, and a file of the same name next to your
 | Module | Contents |
 |---|---|
 | `math` | `gcd lcm pow powMod isqrt isPrime nextPrime factorial fibonacci binomial clamp sign mod floorDiv popcount ilog2 digitSum sum minOf maxOf randRange shuffle` (integers only) |
+| `bigint` | arbitrary precision integers: class `BigInt`; `fromInt parse add sub mul mulSmall divSmall pow factorial fibonacci cmp negate`; `toString() digits() toInt()` |
+| `decimal` | exact fixed point decimals (money): `parse format mul div rescale percentOf formatMoney` |
+| `random` | class `Random` with its own seed: `next range nextBool chance shuffle pick token`; `clockSeed()` |
 | `sort` | `sortInts(a, n)`, `sortStrings(a, n)`, `reverseInts`, `isSorted`, `binarySearch(a, n, key)` |
-| `collections` | classes `IntList`, `StrList`, `StrMap` (string to int), `IntMap` (int to int) |
+| `collections` | `IntList`, `StrList`, `StrMap` (string to int), `IntMap` (int to int), `IntSet`, `StrSet`, `IntQueue`, `IntHeap` (min-heap), `PriorityQueue` |
 | `strings` | class `StringBuilder`; `concat repeat reverse count lastIndexOf replace padLeft padRight isBlank capitalize upper lower split join` |
+| `regex` | `matches(pattern, text)`, `search(pattern, text, &len)`, `test`, `replaceAll` with `. ^ $ * + ? [a-z] [^x] \d \w \s` (no groups or `\|`) |
+| `utf8` | `length decode encode isValid byteOffset toCodepoints fromCodepoints reverse` |
+| `json` | `parse(text)`, `stringify(v)`, `pretty(v)`, builders `newObject newArray newInt newString newBool newNull`; class `Json` with `get at size keyAt set push asInt asString asBool intOr stringOr boolOr` |
+| `csv` | `parseLine(line, sep, out, max)`, `quote(field, sep)`, `joinLine(fields, n, sep)` |
+| `path` | `join basename dirname extension stem withExtension isAbsolute normalize` |
+| `os` | `getCwd rename fileSize listDir(path, out, max)` (plus `fileExists fileDelete makeDir` in the standard library) |
 | `datetime` | `now() nowMillis() toUnix() dayOfWeek() isLeapYear() daysInMonth() weekdayName() monthName()` and class `DateTime` (UTC) |
 | `encoding` | `base64Encode/Decode`, `hexEncode/Decode`, `urlEncode/Decode` |
 | `hash` | `crc32 adler32 fnv1a djb2 sha256` |
+| `cli` | class `ArgParser`: `addFlag addOption parse flag option optionInt positional positionalCount printHelp` (short, long, `--x=value`, combined `-abc`) |
+| `log` | leveled logging with timestamps and colours: `debug info warn error` (+ `f` variants), `setLevel setFd setTimestamps` |
+| `testing` | `assertEq assertStrEq check summary` for unit tests |
 | `net` | TCP networking, see [12a](#12a-networking) |
 
 ```c

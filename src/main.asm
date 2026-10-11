@@ -84,6 +84,18 @@ EMB "strings",     "lib/strings.a"
 EMB "datetime",    "lib/datetime.a"
 EMB "encoding",    "lib/encoding.a"
 EMB "hash",        "lib/hash.a"
+EMB "os",          "lib/os.a"
+EMB "path",        "lib/path.a"
+EMB "csv",         "lib/csv.a"
+EMB "regex",       "lib/regex.a"
+EMB "utf8",        "lib/utf8.a"
+EMB "random",      "lib/random.a"
+EMB "decimal",     "lib/decimal.a"
+EMB "bigint",      "lib/bigint.a"
+EMB "log",         "lib/log.a"
+EMB "testing",     "lib/testing.a"
+EMB "cli",         "lib/cli.a"
+EMB "json",        "lib/json.a"
 section .data
         dq 0
 section .rodata
@@ -101,7 +113,7 @@ std_src_end:
 %define IAT_CloseHandle     5
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
-%define IAT_K32             15
+%define IAT_K32             21
 %define IAT_SLOTS           (IAT_K32 + 1 + 9 + 1)   ; kernel32 + null + ws2_32 + null
 
 bn_write:   db "__write", 0
@@ -339,8 +351,14 @@ imp_names:
     db "GetEnvironmentVariableA", 0   ; slot 12
     db "DeleteFileA", 0         ; slot 13
     db "CreateDirectoryA", 0    ; slot 14
+    db "MoveFileA", 0           ; slot 15
+    db "GetCurrentDirectoryA", 0 ; slot 16
+    db "GetFileSize", 0         ; slot 17
+    db "FindFirstFileA", 0      ; slot 18
+    db "FindNextFileA", 0       ; slot 19
+    db "FindClose", 0           ; slot 20
     db 0
-; WS2_32.DLL imports: slots 16..24 (slot 15 is the null terminator of the kernel32 list)
+; WS2_32.DLL imports: slots 22..30 (slot 21 is the null terminator of the kernel32 list)
 imp_names_ws2:
     db "WSAStartup", 0
     db "socket", 0
