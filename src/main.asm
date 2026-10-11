@@ -28,7 +28,7 @@ s_ext_win:      db ".exe", 0
 s_ext_android:  db ".bin", 0
 s_std_name:     db "<std>", 0
 s_main:         db "main", 0
-s_exit_name:    db "__exit", 0
+s_exit_name:    db "exit", 0
 s_libdir1:      db "lib/", 0
 s_libdir2:      db "/usr/lib/a/", 0
 s_libdir3:      db "/usr/local/lib/a/", 0
@@ -108,6 +108,8 @@ EMB "cunistd",     "lib/cunistd.a"
 EMB "cmath",       "lib/cmath.a"
 EMB "cfloat",      "lib/cfloat.a"
 EMB "clib",        "lib/clib.a"
+EMB "clocale",     "lib/clocale.a"
+EMB "cwchar",      "lib/cwchar.a"
 section .data
         dq 0
 section .rodata
@@ -140,6 +142,7 @@ bn_setjmp:  db "setjmp", 0
 bn_longjmp: db "longjmp", 0
 s_os_name:  db "__OS", 0
 s_arch_name: db "__ARCH", 0
+s_func_name: db "func", 0
 bn_close:   db "__close", 0
 s_win_init: db "__win_init_args", 0
 s_win_argv: db "__win_argv_get", 0
@@ -741,6 +744,13 @@ register_builtins:
     mov qword [rax+SYM_TYPE], TY_INT
     mov ecx, [arch]
     mov [rax+SYM_VAL], rcx
+    ; the type name "func" (a function pointer)
+    mov rdi, s_func_name
+    mov esi, 4
+    mov edx, S_ENUM
+    call sym_new
+    mov dword [rax+SYM_FLAGS], F_BUILTIN | F_DEFINED | F_FUNCTYPE
+    mov qword [rax+SYM_OWNER], -1
     call builtin_col
     mov r12d, eax
     mov rbx, builtin_tab
@@ -1020,6 +1030,32 @@ check_undefined:
     inc edx
     jmp .l
 .ok:
+    ; functions whose address is used as a value must be defined
+    xor edx, edx
+.r:
+    cmp edx, [rel_count]
+    jae .rdone
+    mov rax, rdx
+    shl rax, 4
+    add rax, rel_buf
+    cmp dword [rax+4], R_CODE
+    jne .rn
+    mov eax, [rax+8]
+    shl rax, 6
+    add rax, symtab
+    cmp qword [rax+SYM_VAL], -1
+    jne .rn
+    mov rcx, [rax+SYM_NAME]
+    mov [tk_ptr], rcx
+    mov ecx, [rax+SYM_NLEN]
+    mov [tk_len], ecx
+    mov qword [cur_file_name], 0
+    mov edi, s_err_undef
+    call fatal_error_tok
+.rn:
+    inc edx
+    jmp .r
+.rdone:
     ret
 
 ; ---- relocations ---------------------------------------------------------------------------

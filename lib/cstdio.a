@@ -60,7 +60,8 @@ struct FILE {
     char* rbuf;
     int rpos;
     int rlen;
-    int unget;          // pushed back character + 1, 0 = none
+    int unget[8];       // pushed back characters (a stack: the last one is read first)
+    int nunget;
     int pid;            // process id of a popen stream
     char* tmpname;
     int std;            // 1 stdin, 2 stdout, 3 stderr
@@ -320,6 +321,11 @@ int fflush(FILE* f) {
             return EOF;
         }
     }
+    if (f->std == 0 && (f->rlen > f->rpos || f->nunget > 0)) {
+        // an input stream: forget what was read ahead or pushed back, the file position becomes the logical one
+        __drop_readahead(f);
+        f->nunget = 0;
+    }
     return 0;
 }
 
@@ -423,9 +429,9 @@ int fseek(FILE* f, int offset, int whence) {
         return -1;
     }
     fflush(f);
-    if (f->unget != 0) {
-        f->unget = 0;
-        if (whence == 1) { offset = offset - 1; }
+    if (f->nunget > 0) {
+        if (whence == 1) { offset = offset - f->nunget; }
+        f->nunget = 0;
     }
     int pending = f->rlen - f->rpos;
     f->rpos = 0;
@@ -451,10 +457,14 @@ int ftell(FILE* f) {
     if (pos < 0) {
         return -1;
     }
-    pos = pos - (f->rlen - f->rpos) + f->wlen;
-    if (f->unget != 0) {
-        pos = pos - 1;
+    if ((f->flags & __FL_APPEND) != 0 && f->wlen > 0) {
+        // buffered output of an append stream goes to the end of the file
+        int end = __lseek(f->fd, 0, 2);
+        __lseek(f->fd, pos, 0);
+        pos = end;
     }
+    pos = pos - (f->rlen - f->rpos) + f->wlen;
+    pos = pos - f->nunget;
     return pos;
 }
 
@@ -510,10 +520,9 @@ void clearerr(FILE* f) {
 // next byte (0-255) or EOF
 int fgetc(FILE* f) {
     f = __fp(f);
-    if (f->unget != 0) {
-        int c = f->unget - 1;
-        f->unget = 0;
-        return c;
+    if (f->nunget > 0) {
+        f->nunget--;
+        return f->unget[f->nunget];
     }
     if ((f->flags & __FL_READ) == 0) {
         f->flags = f->flags | __FL_ERR;
@@ -564,10 +573,11 @@ int getchar() {
 // pushes one character back; the next read returns it. Returns c, or EOF if there is no room / c is EOF
 int ungetc(int c, FILE* f) {
     f = __fp(f);
-    if (c == EOF || f->unget != 0) {
+    if (c == EOF || f->nunget >= 8) {
         return EOF;
     }
-    f->unget = (c & 255) + 1;
+    f->unget[f->nunget] = c & 255;
+    f->nunget++;
     f->flags = f->flags & ~__FL_EOF;
     return c & 255;
 }
@@ -658,9 +668,9 @@ bool __put(FILE* f, char* p, int n) {
         errno = EBADF;
         return false;
     }
-    if (f->rlen > f->rpos || f->unget != 0) {
+    if (f->rlen > f->rpos || f->nunget > 0) {
         __drop_readahead(f);
-        f->unget = 0;
+        f->nunget = 0;
     }
     if (f->bufmode == 2 || f->wbuf == null) {
         return __raw_write(f, p, n);
@@ -1168,7 +1178,6 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
     int assigned = 0;
     int pi = 0;
     int i = 0;
-    bool attempted = false;
     while (fmt[i] != 0) {
         int fc = fmt[i];
         if (isspace(fc)) {
@@ -1184,7 +1193,7 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
             int c = __sget(src);
             if (c != fc) {
                 __sunget(src, c);
-                if (c == EOF && !attempted && assigned == 0) {
+                if (c == EOF && assigned == 0) {
                     return EOF;
                 }
                 return assigned;
@@ -1254,14 +1263,16 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
             for (int k = 0; k < w; k++) {
                 int c = __sget(src);
                 if (c == EOF) {
-                    if (k == 0 && !attempted && assigned == 0) {
-                        return EOF;
+                    if (k == 0) {
+                        if (assigned == 0) {
+                            return EOF;
+                        }
+                        return assigned;
                     }
-                    return assigned;
+                    break;                   // fewer characters than the width: still a success, like the C library
                 }
                 if (!suppress) { dst[k] = c; }
             }
-            attempted = true;
             if (!suppress) {
                 assigned++;
                 pi++;
@@ -1308,12 +1319,11 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
                 i = i + endset;
             }
             if (k == 0) {
-                if (!attempted && assigned == 0 && src->f == null && src->s[src->pos] == 0) {
+                if (assigned == 0 && src->f == null && src->s[src->pos] == 0) {
                     return EOF;
                 }
                 return assigned;
             }
-            attempted = true;
             if (!suppress) {
                 dst[k] = 0;
                 assigned++;
@@ -1334,7 +1344,7 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
                 c = __sget(src);
             }
             if (c == EOF) {
-                if (!attempted && assigned == 0) {
+                if (assigned == 0) {
                     return EOF;
                 }
                 return assigned;
@@ -1364,7 +1374,6 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
             for (int k = tn - 1; k >= used; k--) {
                 __sunget(src, tok[k]);
             }
-            attempted = true;
             if (!suppress) {
                 __sstore(target, 8, bits);
                 assigned++;
@@ -1385,6 +1394,12 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
         while (c != EOF && isspace(c)) {
             c = __sget(src);
         }
+        if (c == EOF) {
+            if (assigned == 0) {
+                return EOF;
+            }
+            return assigned;
+        }
         int used = 0;
         bool neg = false;
         if (c == '-' || c == '+') {
@@ -1393,11 +1408,10 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
             c = __sget(src);
         }
         if (c == EOF) {
-            if (!attempted && assigned == 0) {
-                return EOF;
-            }
-            return assigned;
+            return assigned;                 // a sign and then the end: no number
         }
+        bool zeroX = false;
+        int zxc = 0;
         if (c == '0' && (base == 0 || base == 16) && (width == 0 || used + 2 < width)) {
             int c2 = __sget(src);
             if (c2 == 'x' || c2 == 'X') {
@@ -1407,8 +1421,12 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
                     used = used + 2;
                     c = c3;
                 } else {
-                    __sunget(src, c3);
-                    __sunget(src, c2);
+                    // "0x" without digits: like the C library the number is 0 and the x is used up
+                    base = 16;
+                    used = used + 2;
+                    zeroX = true;
+                    zxc = c3;
+                    c = c3;
                 }
             } else {
                 __sunget(src, c2);
@@ -1423,17 +1441,24 @@ int __vscan(__Src* src, char* fmt, int* ptrs, int nptrs) {
         }
         int v = 0;
         int digits = 0;
-        while (c != EOF && digitValue(c, base) >= 0 && (width == 0 || used < width)) {
-            v = v * base + digitValue(c, base);
-            digits++;
-            used++;
-            c = __sget(src);
+        if (zeroX) {
+            digits = 1;
+        } else {
+            while (c != EOF && digitValue(c, base) >= 0 && (width == 0 || used < width)) {
+                v = v * base + digitValue(c, base);
+                digits++;
+                used++;
+                c = __sget(src);
+            }
         }
-        __sunget(src, c);
+        if (zeroX) {
+            __sunget(src, zxc);
+        } else {
+            __sunget(src, c);
+        }
         if (digits == 0) {
             return assigned;
         }
-        attempted = true;
         if (neg) { v = -v; }
         if (!suppress) {
             __sstore(target, size, v);

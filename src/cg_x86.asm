@@ -380,6 +380,40 @@ x86_call_sym:
     pop rax
     ret
 
+; rdi = function symbol -> A = its address (resolved when the layout is known: R_CODE)
+x86_lea_func_a:
+    push rdi
+    push rsi
+    push rdx
+    sub rdi, symtab
+    shr rdi, 6
+    mov edx, edi
+    EM 0x48, 0x8D, 0x05
+    mov edi, [code_pos]
+    push rdi
+    xor edi, edi
+    call emit_d
+    pop rdi
+    mov esi, R_CODE
+    call add_reloc
+    pop rdx
+    pop rsi
+    pop rdi
+    ret
+
+x86_call_a:
+    EM 0xFF, 0xD0                   ; call rax
+    ret
+
+; edi = n: rax = [rsp + 8*n]
+x86_load_stack_a:
+    push rdi
+    shl edi, 3
+    EM 0x48, 0x8B, 0x84, 0x24       ; mov rax, [rsp + disp32]
+    call emit_d
+    pop rdi
+    ret
+
 ; ---- functions -----------------------------------------------------------------------
 x86_prologue:
     push rax
@@ -458,7 +492,15 @@ apply_relocs_x86:
     je .iat
     cmp esi, R_DATA64
     je .d64
+    cmp esi, R_CODE
+    je .code
     jmp .n
+.code:
+    shl rdx, 6
+    add rdx, symtab
+    mov r8, [rdx+SYM_VAL]
+    add r8, [code_vaddr]
+    jmp .rel
 .data:
     mov r8, [data_vaddr]
     add r8, rdx

@@ -131,6 +131,7 @@
 %define F_BUILTIN       64
 %define F_ENUMVAL       128
 %define F_USED          256     ; reachable from main (dead function elimination)
+%define F_FUNCTYPE      512     ; the predefined type name "func"
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
 %define ST_NAME         0       ; qword
@@ -157,6 +158,7 @@
 %define TY_CHAR         2
 %define TY_BOOL         3
 %define TY_STRUCT       4
+%define TY_FUNC         5       ; function pointer (the type "func")
 %define TY_PTR1         0x100
 %define TF_ARRAY_BIT    32
 
@@ -165,6 +167,7 @@
 %define R_BSS           1       ; rel32 in code -> bss  + target
 %define R_IAT           2       ; rel32 in code -> import slot target
 %define R_DATA64        3       ; abs64 in data -> data + target
+%define R_CODE          4       ; rel32 / adrp pair in code -> code address of function symbol (index) target
 %define R_CODE32        4       ; rel32 in code -> code + target (unused)
 
 ; =============================================================================
@@ -294,6 +297,9 @@
     %1 case_jump           ; edi = frame offset, rsi = value, rdx = target: if local == value jump
     %1 patch_chain         ; rdi = chain head, rsi = target position
     %1 call_sym            ; rdi = function symbol
+    %1 lea_func_a          ; rdi = function symbol -> A = its address
+    %1 call_a              ; call the function whose address is in A
+    %1 load_stack_a        ; edi = n: A = the stack slot n slots above the top
     %1 prologue            ; function entry; records the frame size patch position
     %1 epilogue            ; return to the caller
     %1 set_frame           ; edi = frame size in bytes (multiple of 16)

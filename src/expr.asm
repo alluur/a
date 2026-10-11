@@ -545,6 +545,9 @@ parse_type:
 .enum:
     call check_access
     mov ebx, TY_INT
+    test dword [rax+SYM_FLAGS], F_FUNCTYPE
+    jz .star0
+    mov ebx, TY_FUNC
     jmp .star0
 .struct:
     call check_access
@@ -599,9 +602,21 @@ enum_find:
 ; emit_call_sym: rdi = function symbol. Emits a call (patch chain if the
 ; function is not defined yet)
 emit_call_sym:
+    call record_edge
+    CG call_sym
+    ret
+
+; emit_funcaddr_sym: rdi = function symbol. A = the address of the function (a "func" value)
+emit_funcaddr_sym:
+    call record_edge
+    CG lea_func_a
+    ret
+
+; record_edge: rdi = function symbol that the current function uses.
+; Pass 2 records the call graph: edge  cur_func -> callee  (no caller = called from the entry stub)
+record_edge:
     cmp dword [pass], 2
-    jne .go
-    ; pass 2 records the call graph: edge  cur_func -> callee  (no caller = called from the entry stub)
+    jne .out
     push rax
     push rcx
     mov rax, [cur_func]
@@ -624,8 +639,7 @@ emit_call_sym:
 .recorded:
     pop rcx
     pop rax
-.go:
-    CG call_sym
+.out:
     ret
 
 ; gen_call: rdi = function symbol, esi = number of extra stack slots already pushed
@@ -1012,7 +1026,16 @@ parse_primary:
     call check_access
     cmp qword [tk], '('
     je .func1
-    ERR "function pointers are not supported yet, call the function"
+    ; a function used as a value: its address, type "func"
+    test dword [r12+SYM_FLAGS], F_BUILTIN | F_METHOD
+    jz .funcval
+    ERR "only ordinary functions can be used as values"
+.funcval:
+    mov rdi, r12
+    call emit_funcaddr_sym
+    mov qword [e_type], TY_FUNC
+    mov qword [e_lval], 0
+    jmp .out
 .func1:
     mov rdi, r12
     xor esi, esi
@@ -1118,12 +1141,46 @@ parse_postfix:
     je .postinc
     cmp eax, T_DEC
     je .postdec
+    cmp eax, '('
+    je .callptr
 .out:
     pop r14
     pop r13
     pop r12
     pop rbx
     ret
+
+; call through a function pointer:  fp(a, b)  -  the target is pushed first, then the arguments;
+; the target is fetched back from below the arguments. The result is an int.
+.callptr:
+    cmp qword [e_type], TY_FUNC
+    jne .out
+    call to_rvalue
+    CG push_a
+    call next_token
+    xor ebx, ebx
+    cmp qword [tk], ')'
+    je .cp_done
+.cp_arg:
+    call parse_assign
+    call to_rvalue
+    CG push_a
+    inc ebx
+    cmp qword [tk], ','
+    jne .cp_done
+    call next_token
+    jmp .cp_arg
+.cp_done:
+    mov edi, ')'
+    call expect
+    mov edi, ebx
+    CG load_stack_a
+    CG call_a
+    lea edi, [rbx+1]
+    CG drop
+    mov qword [e_type], TY_INT
+    mov qword [e_lval], 0
+    jmp .loop
 
 .index:
     call to_rvalue
@@ -1445,6 +1502,10 @@ parse_unary:
     call parse_unary
     cmp qword [e_lval], 0
     jne .a1
+    cmp qword [e_type], TY_FUNC
+    jne .a0
+    ret                             ; &function is the function value itself
+.a0:
     ERR "cannot take the address of a value"
 .a1:
     mov rax, [e_type]

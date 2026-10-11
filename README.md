@@ -75,7 +75,9 @@ ac -o /tmp/hello hello.a                     # exactly /tmp/hello
 Example programs live in [`examples/`](examples/): `greet`, `calc` (interactive REPL), `wordcount`, `cat`, `todo`,
 `table`, `colors`, `wordfreq`, `clock`, `checksums`, `primes`, `jsonpretty`, `grep`, `bignum`, `dirlist`, `quiz`, `bank`, `modules`, `net_server` / `net_client` and more.
 Built-in modules: `math`, `bigint`, `decimal`, `random`, `sort`, `collections`, `strings`, `regex`, `utf8`, `json`, `csv`,
-`path`, `os`, `datetime`, `encoding`, `hash`, `cli`, `log`, `testing`, `net`.
+`path`, `os`, `datetime`, `encoding`, `hash`, `cli`, `log`, `testing`, `net`, and **the C standard library** (`import clib;`):
+`ctype errno limits string stdlib stdio time math (correctly rounded libm) unistd signal locale wchar` with the C names,
+see [`docs/CLIB.md`](docs/CLIB.md).
 
 Details for every platform (adb, Termux, Wine, QEMU) are in [`docs/TARGETS.md`](docs/TARGETS.md).
 
@@ -153,6 +155,7 @@ src/            the compiler (NASM assembly)
   main.asm        command line, imports, ELF and PE writers
   util.asm        errors, files, buffers
 lib/std.a       standard library (written in A, embedded into the compiler)
+lib/*.a         built-in modules, among them the C library (cstdio.a, cmath.a ...)
 examples/       example programs
 tests/          regression tests + runner (tests/run.sh)
 docs/           language reference, targets guide, compiler internals, man page
@@ -176,11 +179,13 @@ same programs compiled by GCC, on every target (see [`docs/INTERNALS.md`](docs/I
 
 Version 0.1.0 is deliberately small. Known limitations — all of them are on the roadmap:
 
-* **No floating point** yet (`float` / `double`), no `unsigned` or sized integer types.
-* **No function pointers**, no `union`, `typedef` or preprocessor (modules replace `#include`).
+* **No floating point types** yet (`float` / `double`): the `cmath` module does IEEE 754 arithmetic and all of `<math.h>` in
+  software on doubles held in ints. No `unsigned` or sized integer types.
+* Function pointers are the type `func` (no signature checking); no `union`, `typedef`, variable argument lists or
+  preprocessor (modules replace `#include`, default parameter values replace most `va_list` uses).
 * **Structs are passed and returned by pointer only** (copying with `=` works).
 * **No inheritance / virtual methods** yet; classes are structs with methods.
-* **Memory is never freed:** `new` / `alloc` use a 64 MiB bump allocator.
+* **`new` / `alloc` never free** (a bump allocator); `malloc` / `free` of the C library do.
 * **Light type checking:** pointer types convert freely; this is a systems language in the C
   tradition. Syntax errors, undeclared names, wrong argument counts, private access and similar
   mistakes are reported with the source line.

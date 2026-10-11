@@ -169,10 +169,56 @@ int helper() { return 41; }
   **Structs cannot be passed or returned by value** — pass a pointer (`Point*`).
   The compiler reports an error if you try.
 * Recursion works; the stack is 8 MiB (see [Memory](#11-memory)).
-* There is no overloading and no default argument. A *prototype* (`int f(int a);`) is accepted
-  but never necessary.
+* There is no overloading. A *prototype* (`int f(int a);`) is accepted but never necessary.
 * A function that reaches its end without `return` returns 0. `return;` also returns 0.
 * `private` functions (`private int helper() {...}`) are only visible inside the file that defines them.
+
+### Default parameter values
+
+A parameter can have a default value: a constant expression (a number, character, `true`, `false`, `null`, a `const` name,
+an enum member, simple arithmetic on them) after `=`. Parameters with defaults must be the last ones. A call may leave out
+trailing arguments that have defaults:
+
+```c
+int area(int w, int h = 1, int scale = 100) { return w * h * scale / 100; }
+
+area(5);            // 5 * 1 * 100 / 100
+area(5, 4);         // 20
+area(5, 4, 200);    // 40
+```
+
+This works for functions, methods and constructors (`new Counter()` / `Counter c;` with `Counter(int start = 1)`), and it is
+how the standard library's `printf(fmt, a, b, c, d, e, f, g, h)` accepts one to eight values.
+(Text defaults such as `char* sep = ","` are not possible: the default has to be a number or `null`.)
+
+### Function pointers
+
+`func` is the type of a function pointer. The name of a function (or `&name`) is a `func` value; calling a `func` variable,
+field, array element or parameter calls the function:
+
+```c
+int twice(int x) { return x * 2; }
+int square(int x) { return x * x; }
+
+int apply(func f, int v) { return f(v); }
+
+struct Command { char* name; func run; }
+
+int main() {
+    func f = twice;
+    printlnInt(f(21));                      // 42
+    printlnInt(apply(&square, 9));          // 81
+    func table[2];
+    table[0] = twice;
+    table[1] = square;
+    printlnInt(table[1](7));                // 49
+    return f == twice ? 0 : 1;              // func values can be compared
+}
+```
+
+A `func` carries no signature: the arguments are not checked against the function, and the call returns an `int` (the
+function's result as a 64-bit value). Only ordinary functions have an address (not methods or built-in `__...` functions).
+`qsort`, `bsearch`, `atexit` and `signal` of the C library take `func` arguments.
 
 ## 8. Structs and classes
 
@@ -279,9 +325,11 @@ int main() {
 
 * **Stack:** locals and parameters. 8 MiB (the usual default on Linux and Android, and set explicitly in Windows executables).
 * **Globals:** `data` (initialised) and zero-filled `bss`.
-* **Heap:** `new` and `alloc(n)` take memory from a 64 MiB region, always zeroed. **Memory is never
-  freed** — it lives until the program exits, which is perfect for compilers, tools and short-lived programs.
-  The allocator is a plain bump pointer, so it is also very fast.
+* **Heap:** `new` and `alloc(n)` take memory from a 64 MiB region (and, when that is used up, from further blocks that the
+  operating system provides), always zeroed. **`new` and `alloc` never free** — the memory lives until the program exits,
+  which is perfect for compilers, tools and short-lived programs. The allocator is a plain bump pointer, so it is also very
+  fast. Programs that run for a long time can use `malloc` / `calloc` / `realloc` / `free` from the `cstdlib` module (a
+  real allocator that reuses freed blocks, see [CLIB.md](CLIB.md)).
 * Pointers are plain addresses; there is no bounds checking.
 
 ## 12. Standard library
@@ -314,13 +362,17 @@ Everything in `lib/std.a` is compiled into your program automatically; no import
 
 **Formatted output**
 
-`format(buf, max, fmt, a, b, c, d)` and `printf(fmt, a, b, c, d)` take up to four values (pass `0` for
-unused ones; pass strings as `(int)text`). Specifiers: `%d` number, `%x` hex, `%c` character, `%s` string,
-`%%`; widths pad with spaces (`%5d`, left aligned `%-8s`) or zeros (`%05d`).
+`format(buf, max, fmt, a, b, ...)` and `printf(fmt, a, b, ...)` take up to eight values (leave out the unused ones;
+text is passed as it is). `vformat(buf, max, fmt, values, count)` takes the values as an array and returns the length the
+complete text has. The formats are those of C: flags `- 0 + space #`, width and precision (also `*`), `h hh l ll z` length
+modifiers, and the conversions `d i u x X o b c s p %` (`%b` is binary). Every value is 64 bits wide; `%u` and `%x` show
+negative numbers as unsigned 64-bit values.
 
 ```c
-printf("%-10s|%5d|\n", (int)"total", 1600, 0, 0);       // total     | 1600|
+printf("%-10s|%5d|%#08x\n", "total", 1600, 255);       // total     | 1600|0x0000ff
 ```
+
+Floating point conversions (`%f %e %g %a`) are in `printfd` of the `cfloat` module.
 
 `printRepeat(ch, n)` writes a character `n` times.
 
@@ -444,6 +496,7 @@ code only to programs that import them, and a file of the same name next to your
 | `cli` | class `ArgParser`: `addFlag addOption parse flag option optionInt positional positionalCount printHelp` (short, long, `--x=value`, combined `-abc`) |
 | `log` | leveled logging with timestamps and colours: `debug info warn error` (+ `f` variants), `setLevel setFd setTimestamps` |
 | `testing` | `assertEq assertStrEq check summary` for unit tests |
+| `clib` (and `cctype climits cerrno cassert cstring cstdlib cstdio ctime cunistd cmath cfloat clocale cwchar`) | the C standard library, see [12c](#12c-the-c-library) and [CLIB.md](CLIB.md) |
 | `net` | TCP networking, see [12a](#12a-networking) |
 
 ```c
@@ -466,6 +519,32 @@ Notes: collections never free memory (see section 11), `StrMap` copies its keys,
 `IntList.get` returns 0, and iteration over a map goes through its slots
 (`for (int s = 0; s < m.capacity(); s++) if (m.keyAt(s) != null) ...`).
 
+## 12c. The C library
+
+`import clib;` provides the C standard library with its C names and behaviour (`<ctype.h> <errno.h> <limits.h> <locale.h>
+<math.h> <setjmp.h> <signal.h> <stdio.h> <stdlib.h> <string.h> <time.h> <wchar.h>` and parts of `<unistd.h>`,
+`<sys/stat.h>`, `<dirent.h>`): `malloc free`, `fopen fgets fprintf sscanf popen`, `strtol getenv system qsort`,
+`strstr strtok memmove`, `time localtime strftime mktime`, `stat opendir getopt`, and all of `<math.h>` — `sqrt sin cos pow exp
+log erf tgamma ...` with **correctly rounded** results — and more. The modules (`cstring`, `cstdio`, `cmath` ...) can also be
+imported one at a time. A has no floating point types, so a `double` is an `int` holding the IEEE 754 bit pattern and the
+operations are functions (`dadd`, `dmul`, `sqrt`), printed with `printfd("%.3f", x)`. Everything is documented in
+[CLIB.md](CLIB.md), including the places where A differs from C.
+
+```c
+import clib;
+
+int main() {
+    int x = sqrt(dlit("2"));                       // 1.4142135623730951
+    printfd("%.17g %s\n", x, strerror(ENOENT));
+    FILE* f = fopen("data.txt", "r");
+    if (f == null) { perror("data.txt"); return 1; }
+    char line[100];
+    while (fgets(line, 100, f) != null) { fputs(line, stdout); }
+    fclose(f);
+    return 0;
+}
+```
+
 ## 13. Built-in runtime functions
 
 These are provided by the compiler for the target platform; the standard library is built on them.
@@ -478,7 +557,9 @@ They are plain functions with a leading `__`.
 | `__open(path, mode)` / `__close(h)` | files; `mode` is 0 read, 1 write, 2 append |
 | `__exit(code)` | terminate the process |
 | `__syscall(nr, a1, …, a6)` | raw system call (Linux and Android only; numbers differ between x86-64 and ARM64) |
-| `__winapi(slot, a1, a2, a3, a4)` | call an imported Windows function by import-table slot (returns -1 elsewhere); used by `net` |
+| `__winapi(slot, a1, a2, a3, a4)` | call an imported Windows function by import-table slot (returns -1 elsewhere); used by `net` and the C library |
+| `__winapix(slot, a1, …, a10)` | the same with up to ten arguments |
+| `setjmp(buf)` / `longjmp(buf, value)` | non-local jump: `buf` is an array of 4 ints (`int env[4];`); `setjmp` returns 0, `longjmp` makes it return again with `value` (1 if 0). The frame that called `setjmp` must still be active |
 | `__OS`, `__ARCH` | predefined constants: OS 0 Linux, 1 Windows, 2 Android; architecture 0 x86-64, 1 ARM64 |
 | `__cmdline()` | the Windows command line (used to build `argv`; returns `null` elsewhere) |
 
@@ -503,9 +584,10 @@ The process exit code is 1; on success it is 0.
 
 * Classes with methods, constructors and `public` / `private`; modules instead of `#include`.
 * `int` is 64-bit; `char` is unsigned; `bool` is a real type.
-* All variables start zeroed; `new` returns zeroed memory; there is no `free`.
+* All variables start zeroed; `new` returns zeroed memory; `new` has no `free` (`malloc` / `free` come with `cstdlib`).
 * Functions may be used before their definition without prototypes.
 * `const NAME = value;` declares a compile-time constant.
-* No floating point, `unsigned`, `typedef`, `union`, function pointers, bit-fields or preprocessor — yet.
+* No floating point *types* (the `cmath` module computes with doubles held in ints), no `unsigned`, `typedef`, `union`, bit-fields,
+  variable argument lists or preprocessor — yet. Function pointers exist as the type `func`; parameters can have default values.
 * Struct values cannot be function arguments or results.
 * `switch` labels must be constant expressions (like C), and `case` values must fit in 32 bits.

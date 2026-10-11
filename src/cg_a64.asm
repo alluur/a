@@ -660,6 +660,42 @@ a64_call_sym:
     pop rax
     ret
 
+; rdi = function symbol -> A = its address (adrp + add, resolved when the layout is known: R_CODE)
+a64_lea_func_a:
+    push rdi
+    push rsi
+    push rdx
+    sub rdi, symtab
+    shr rdi, 6
+    mov edx, edi
+    mov edi, [code_pos]
+    mov esi, R_CODE
+    call add_reloc
+    A64 0x90000000                  ; adrp x0, #0
+    A64 0x91000000                  ; add  x0, x0, #0
+    pop rdx
+    pop rsi
+    pop rdi
+    ret
+
+a64_call_a:
+    A64 0xD63F0000                  ; blr x0
+    ret
+
+; edi = n: x0 = [sp + 16*n]
+a64_load_stack_a:
+    push rdi
+    shl edi, 1
+    cmp edi, 4095
+    jbe .ok
+    ERR "too many arguments in a call"
+.ok:
+    shl edi, 10
+    or edi, 0xF94003E0              ; ldr x0, [sp, #imm]
+    call emit_d
+    pop rdi
+    ret
+
 ; ---- functions ---------------------------------------------------------------------------------------
 a64_prologue:
     A64 0xA9BF7BFD                  ; stp x29, x30, [sp, #-16]!
@@ -737,7 +773,15 @@ apply_relocs_a64:
     je .bss
     cmp esi, R_DATA64
     je .d64
+    cmp esi, R_CODE
+    je .code
     jmp .n
+.code:
+    shl rdx, 6
+    add rdx, symtab
+    mov r8, [rdx+SYM_VAL]
+    add r8, [code_vaddr]
+    jmp .adrp
 .data:
     mov r8, [data_vaddr]
     add r8, rdx

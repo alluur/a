@@ -38,7 +38,11 @@ An ARM64 file can be tried on an x86-64 machine with QEMU user mode emulation
 ## Windows
 
 PE32+ console executables importing only `kernel32.dll` (`GetStdHandle`, `ReadFile`, `WriteFile`,
-`CreateFileA`, `CloseHandle`, `ExitProcess`, `GetCommandLineA`) and `ws2_32.dll` (Winsock, for the `net` module). Other kernel32 functions (`Sleep`, `GetTickCount64`, file and directory calls, environment) are reached through the `__winapi` built-in. The image is linked at
+`CreateFileA`, `CloseHandle`, `ExitProcess`, `GetCommandLineA` and about 40 more for time, files, directories, processes,
+pipes, memory, environment) and `ws2_32.dll` (Winsock, for the `net` module). The other functions are reached through the
+`__winapi` / `__winapix` built-ins by import-table slot. The C library (`import clib;`) runs on Windows too: `system`,
+`popen`, `fopen`, `stat`, `opendir`, `getenv` ... are implemented with these imports. Not available: `fork`, `kill`, `link`,
+`symlink` and signals (they fail with `ENOSYS`). The image is linked at
 `0x140000000` without ASLR; it reserves an 8 MiB stack and probes the stack for large frames the
 way `__chkstk` does. Command line arguments are parsed with the standard Windows rules, so
 `argv` works as expected.

@@ -7,6 +7,7 @@
 //    open read write close lseek dup dup2 pipe isatty
 //    sleep usleep fork waitpid execv execvp kill raise _exit       (fork, kill ... : Linux and Android only)
 //    opendir readdir closedir (DIR, Dirent)         getopt (optarg optind opterr optopt)
+//    mkstemp mkdtemp  fnmatch  signal alarm pause (signals: Linux and Android)
 //  File descriptors are the plain numbers of the operating system (handles on Windows).
 //  Failing calls return -1 (or null) and set errno (see cerrno).
 // =============================================================================
@@ -896,4 +897,331 @@ int getopt(int argc, char** argv, char* optstring) {
         __optpos = 0;
     }
     return c;
+}
+
+// ---- temporary files and directories ---------------------------------------------------------------------------------
+// fills the six X at the end of the template with random letters; false if the template does not end in XXXXXX
+bool __fill_template(char* tmpl) {
+    int n = strlen(tmpl);
+    if (n < 6 || !streq(&tmpl[n - 6], "XXXXXX")) {
+        errno = EINVAL;
+        return false;
+    }
+    char* letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (int i = 0; i < 6; i++) {
+        tmpl[n - 6 + i] = letters[(rand() ^ millis() ^ getpid() * 7919) % 62];
+    }
+    return true;
+}
+
+// creates and opens a new file whose name is the template with its XXXXXX replaced; returns the descriptor, -1 on failure
+int mkstemp(char* tmpl) {
+    for (int tries = 0; tries < 100; tries++) {
+        if (!__fill_template(tmpl)) {
+            return -1;
+        }
+        int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 384);
+        if (fd >= 0 || errno != EEXIST) {
+            return fd;
+        }
+    }
+    return -1;
+}
+
+// creates a new directory from the template; returns the template, null on failure
+char* mkdtemp(char* tmpl) {
+    for (int tries = 0; tries < 100; tries++) {
+        if (!__fill_template(tmpl)) {
+            return null;
+        }
+        if (mkdir(tmpl, 448) == 0) {
+            return tmpl;
+        }
+        if (errno != EEXIST) {
+            return null;
+        }
+    }
+    return null;
+}
+
+// ---- fnmatch -----------------------------------------------------------------------------------------------------------
+const FNM_PATHNAME = 1;
+const FNM_NOESCAPE = 2;
+const FNM_PERIOD = 4;
+const FNM_CASEFOLD = 16;
+const FNM_NOMATCH = 1;
+
+int __fn_lower(int c, int flags) {
+    if ((flags & FNM_CASEFOLD) != 0 && c >= 'A' && c <= 'Z') {
+        return c + 32;
+    }
+    return c;
+}
+
+// matches a bracket expression at p[0] == '[' against c; *next gets the index after it. Returns 1 matched, 0 not, -1 no bracket expression
+int __fn_bracket(char* p, int c, int flags, int* next) {
+    int i = 1;
+    bool neg = false;
+    if (p[i] == '!' || p[i] == '^') {
+        neg = true;
+        i++;
+    }
+    bool found = false;
+    bool first = true;
+    c = __fn_lower(c, flags);
+    while (p[i] != 0 && (p[i] != ']' || first)) {
+        first = false;
+        int lo = p[i];
+        if (lo == 92 && (flags & FNM_NOESCAPE) == 0 && p[i + 1] != 0) {
+            i++;
+            lo = p[i];
+        }
+        int hi = lo;
+        if (p[i + 1] == '-' && p[i + 2] != ']' && p[i + 2] != 0) {
+            hi = p[i + 2];
+            i = i + 2;
+        }
+        i++;
+        if (c >= __fn_lower(lo, flags) && c <= __fn_lower(hi, flags)) {
+            found = true;
+        }
+    }
+    if (p[i] != ']') {
+        return -1;
+    }
+    *next = i + 1;
+    if (found != neg) {
+        return 1;
+    }
+    return 0;
+}
+
+bool __fn_match(char* p, char* s, int flags, bool atStart) {
+    for (;;) {
+        int pc = p[0];
+        if (pc == 0) {
+            return s[0] == 0;
+        }
+        bool leadingDot = (flags & FNM_PERIOD) != 0 && s[0] == '.' && (atStart || ((flags & FNM_PATHNAME) != 0 && s[-1] == '/'));
+        if (pc == '*') {
+            while (p[0] == '*') {
+                p++;
+            }
+            if (leadingDot) {
+                return false;
+            }
+            if (p[0] == 0) {
+                if ((flags & FNM_PATHNAME) != 0) {
+                    return indexOf(s, '/') < 0;
+                }
+                return true;
+            }
+            for (int i = 0; ; i++) {
+                if (__fn_match(p, &s[i], flags, false)) {
+                    return true;
+                }
+                if (s[i] == 0 || (s[i] == '/' && (flags & FNM_PATHNAME) != 0)) {
+                    return false;
+                }
+            }
+        }
+        if (s[0] == 0) {
+            return false;
+        }
+        if (pc == '?') {
+            if (leadingDot || (s[0] == '/' && (flags & FNM_PATHNAME) != 0)) {
+                return false;
+            }
+            p++;
+            s++;
+            atStart = false;
+            continue;
+        }
+        if (pc == '[') {
+            int next = 0;
+            int r = __fn_bracket(p, s[0], flags, &next);
+            if (r >= 0) {
+                if (r == 0 || leadingDot || (s[0] == '/' && (flags & FNM_PATHNAME) != 0)) {
+                    return false;
+                }
+                p = &p[next];
+                s++;
+                atStart = false;
+                continue;
+            }
+        }
+        if (pc == 92 && (flags & FNM_NOESCAPE) == 0 && p[1] != 0) {
+            p++;
+            pc = p[0];
+        }
+        if (__fn_lower(pc, flags) != __fn_lower(s[0], flags)) {
+            return false;
+        }
+        p++;
+        s++;
+        atStart = false;
+    }
+    return false;
+}
+
+// shell style wildcard matching:  * ? [abc] [a-z] [!x]  with backslash escapes. Returns 0 when the name matches, FNM_NOMATCH otherwise.
+// flags: FNM_PATHNAME (wildcards do not match '/'), FNM_PERIOD (a leading '.' needs an explicit '.'), FNM_NOESCAPE, FNM_CASEFOLD.
+int fnmatch(char* pattern, char* name, int flags = 0) {
+    if (__fn_match(pattern, name, flags, true)) {
+        return 0;
+    }
+    return FNM_NOMATCH;
+}
+
+// ---- signals (Linux and Android) -------------------------------------------------------------------------------------------
+const SIG_DFL = 0;
+const SIG_IGN = 1;
+const SIG_ERR = -1;
+
+char* __sig_page;
+func __sig_handlers[65];
+
+// an executable page with one small thunk per signal that calls the A function with its argument on the stack
+// (the kernel calls handlers with the C calling convention of the platform), and the x86-64 signal return code
+char* __sig_thunks() {
+    if (__sig_page != null) {
+        return __sig_page;
+    }
+    int nr = 9;
+    if (__ARCH == 1) {
+        nr = 222;
+    }
+    int p = __syscall(nr, 0, 4096, 7, 0x22, -1, 0);                   // mmap(RWX, anonymous)
+    if (p < 0 && p > -4096) {
+        errno = -p;
+        return null;
+    }
+    __sig_page = (char*) p;
+    if (__ARCH == 0) {
+        // restorer at offset 0: mov eax, 15 ; syscall   (rt_sigreturn)
+        char* r = __sig_page;
+        r[0] = 0xB8; r[1] = 15; r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 0x0F; r[6] = 0x05;
+    }
+    return __sig_page;
+}
+
+void __put32(char* p, int off, int v) {
+    p[off] = v;
+    p[off + 1] = v >> 8;
+    p[off + 2] = v >> 16;
+    p[off + 3] = v >> 24;
+}
+
+// code of the thunk of signal `sig` at offset 64 + 48*sig; returns its address
+char* __sig_thunk_for(int sig, func handler) {
+    char* page = __sig_thunks();
+    if (page == null) {
+        return null;
+    }
+    char* t = &page[64 + 48 * sig];
+    int* lit = (int*) &t[32];
+    lit[0] = (int) handler;
+    if (__ARCH == 0) {
+        // push rdi ; mov rax, [rip+24] (the literal at +32) ; call rax ; add rsp, 8 ; ret
+        t[0] = 0x57;
+        t[1] = 0x48; t[2] = 0x8B; t[3] = 0x05; t[4] = 24; t[5] = 0; t[6] = 0; t[7] = 0;
+        t[8] = 0xFF; t[9] = 0xD0;
+        t[10] = 0x48; t[11] = 0x83; t[12] = 0xC4; t[13] = 0x08;
+        t[14] = 0xC3;
+    } else {
+        __put32(t, 0, 0xA9BF7BFD);          // stp x29, x30, [sp, #-16]!
+        __put32(t, 4, 0xF81F0FE0);          // str x0, [sp, #-16]!
+        __put32(t, 8, 0x580000D0);          // ldr x16, #24  (the literal at +32)
+        __put32(t, 12, 0xD63F0200);         // blr x16
+        __put32(t, 16, 0x910043FF);         // add sp, sp, #16
+        __put32(t, 20, 0xA8C17BFD);         // ldp x29, x30, [sp], #16
+        __put32(t, 24, 0xD65F03C0);         // ret
+    }
+    return t;
+}
+
+// installs a signal handler: a function void handler(int sig), or SIG_DFL (the default action) or SIG_IGN (ignore the signal).
+// Returns the previous handler, or SIG_ERR (with errno set) on failure. Signals are available on Linux and Android only.
+func signal(int sig, func handler) {
+    if (__OS == 1 || sig < 1 || sig > 64) {
+        errno = ENOSYS;
+        if (__OS != 1) {
+            errno = EINVAL;
+        }
+        return (func) SIG_ERR;
+    }
+    int h = (int) handler;
+    char* thunk = null;
+    if (h != SIG_DFL && h != SIG_IGN) {
+        thunk = __sig_thunk_for(sig, handler);
+        if (thunk == null) {
+            return (func) SIG_ERR;
+        }
+        h = (int) thunk;
+    }
+    int act[4];
+    int old[4];
+    act[0] = h;
+    act[1] = 0x10000000;                         // SA_RESTART
+    act[2] = 0;
+    act[3] = 0;
+    if (__ARCH == 0 && thunk != null) {
+        act[1] = act[1] | 0x04000000;            // SA_RESTORER
+        act[2] = (int) __sig_page;
+    }
+    int nr = 13;
+    if (__ARCH == 1) {
+        nr = 134;
+    }
+    int r = __syscall(nr, sig, &act[0], &old[0], 8, 0, 0);       // rt_sigaction
+    if (r < 0) {
+        errno = -r;
+        return (func) SIG_ERR;
+    }
+    int prev = old[0];
+    if (__sig_page != null && prev == (int) &__sig_page[64 + 48 * sig]) {
+        int* lit = (int*) &__sig_page[64 + 48 * sig + 32];
+        return (func) lit[0];
+    }
+    return (func) prev;
+}
+
+// delivers a SIGALRM to the program after the given number of seconds (0 cancels); returns the seconds that were left
+int alarm(int seconds) {
+    if (__OS == 1) {
+        errno = ENOSYS;
+        return 0;
+    }
+    int itv[4];
+    int old[4];
+    itv[0] = 0;
+    itv[1] = 0;
+    itv[2] = seconds;
+    itv[3] = 0;
+    int nr = 38;
+    if (__ARCH == 1) {
+        nr = 103;
+    }
+    __syscall(nr, 0, &itv[0], &old[0], 0, 0, 0);               // setitimer(ITIMER_REAL)
+    int left = old[2];
+    if (old[3] > 0) {
+        left++;
+    }
+    return left;
+}
+
+// waits until a signal arrives; returns -1 with errno EINTR
+int pause() {
+    if (__OS == 1) {
+        errno = ENOSYS;
+        return -1;
+    }
+    int mask = 0;
+    int nr = 130;
+    if (__ARCH == 1) {
+        nr = 133;
+    }
+    __syscall(nr, &mask, 8, 0, 0, 0, 0);                        // rt_sigsuspend with an empty mask
+    errno = EINTR;
+    return -1;
 }
