@@ -282,6 +282,11 @@ x86_jnz_back:
 x86_case_jump:
     push rdi
     push rax
+    movsxd rax, esi
+    cmp rax, rsi
+    je .fits
+    ERR "case value does not fit in 32 bits"
+.fits:
     EM 0x48, 0x8B, 0x85
     call emit_d
     EM 0x48, 0x3D
