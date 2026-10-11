@@ -200,7 +200,7 @@ regression test (`t19_peephole`, `t20_regress_marker`, …).
 `lib/net.a` is embedded in the compiler like `std.a` but only compiled when a program says `import net;`.
 It is plain A code. On Linux / Android it calls `__syscall` with the socket system call numbers of the
 current CPU (`__ARCH` picks x86-64 or ARM64). Windows has no stable syscalls, so the PE image imports
-`WS2_32.DLL` as a second descriptor (IAT slots 8-16, slot 7 is the null terminator of the kernel32
+`WS2_32.DLL` as a second descriptor (IAT slots 12-20, slot 11 is the null terminator of the kernel32
 thunks) and `net.a` reaches it through the generic builtin `__winapi(slot, a1..a4)`, a small blob
 that does `call [IAT + slot*8]` with the Windows x64 convention. Adding another Windows API needs
 only a new import name in `imp_names_ws2` (or a new DLL list) and a slot constant in A code.

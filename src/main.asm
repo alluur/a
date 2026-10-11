@@ -77,7 +77,8 @@ std_src_end:
 %define IAT_CloseHandle     5
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
-%define IAT_SLOTS           18      ; kernel32 (7) + null + ws2_32 (9) + null
+%define IAT_K32             11
+%define IAT_SLOTS           (IAT_K32 + 1 + 9 + 1)   ; kernel32 + null + ws2_32 + null
 
 bn_write:   db "__write", 0
 bn_read:    db "__read", 0
@@ -308,8 +309,12 @@ imp_names:
     db "CreateFileA", 0
     db "CloseHandle", 0
     db "GetCommandLineA", 0
+    db "SetConsoleMode", 0      ; slot 7
+    db "Sleep", 0               ; slot 8
+    db "GetTickCount64", 0      ; slot 9
+    db "GetFileType", 0         ; slot 10
     db 0
-; WS2_32.DLL imports: slots 8..16 (slot 7 is the null terminator of the kernel32 list)
+; WS2_32.DLL imports: slots 12..20 (slot 11 is the null terminator of the kernel32 list)
 imp_names_ws2:
     db "WSAStartup", 0
     db "socket", 0
@@ -1178,11 +1183,11 @@ build_idata:
     lea rax, [rbx + PE_IDATA_IAT]
     mov [idata_buf + 16], eax
     ; descriptor 1: WS2_32 (its thunks start after the 8 kernel32 slots)
-    lea rax, [rbx + PE_IDATA_ILT + 8*8]
+    lea rax, [rbx + PE_IDATA_ILT + (IAT_K32+1)*8]
     mov [idata_buf + 20], eax
     lea rax, [rbx + r13]
     mov [idata_buf + 32], eax
-    lea rax, [rbx + PE_IDATA_IAT + 8*8]
+    lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1)*8]
     mov [idata_buf + 36], eax
     mov rax, r12
     pop r14

@@ -72,6 +72,9 @@ ac -t windows -v 7 -r release hello.a        # hello-7-release.exe
 ac -o /tmp/hello hello.a                     # exactly /tmp/hello
 ```
 
+Example programs live in [`examples/`](examples/): `greet`, `calc` (interactive REPL), `wordcount`, `cat`, `todo`,
+`table`, `colors`, `bank`, `modules`, `net_server` / `net_client` and more.
+
 Details for every platform (adb, Termux, Wine, QEMU) are in [`docs/TARGETS.md`](docs/TARGETS.md).
 
 ---

@@ -299,20 +299,56 @@ Everything in `lib/std.a` is compiled into your program automatically; no import
 | `printHex(int n)` | lowercase hexadecimal |
 | `eprint(s)` / `eprintln(s)` | same for standard error |
 
-**Input**
+**Input** (standard input is buffered)
 
 | Function | Description |
 |---|---|
-| `int readChar()` | next byte of standard input, `-1` at the end |
-| `int readLine(char* buf, int max)` | reads a line without the newline, returns its length, `-1` at the end |
-| `int atoi(char* s)` | parses a (signed) decimal number |
+| `int readChar()` | next byte, `-1` at the end of the input |
+| `int readLine(char* buf, int max)` | a line without `\n` / `\r\n`; returns its length, `-1` at the end |
+| `char* input(char* prompt)` | prints the prompt, returns the typed line as a heap string (`null` at the end) |
+| `int askInt(char* prompt)` | asks until a whole number is typed |
+| `bool confirm(char* prompt)` | yes / no question (`y` or `Y` = yes) |
+| `char* readAll()` | the rest of standard input |
+| `bool parseInt(char* s, int* out)` | strict number parsing (`false` if the text is not a number) |
+| `int atoi(char* s)` | lenient number parsing |
+
+**Formatted output**
+
+`format(buf, max, fmt, a, b, c, d)` and `printf(fmt, a, b, c, d)` take up to four values (pass `0` for
+unused ones; pass strings as `(int)text`). Specifiers: `%d` number, `%x` hex, `%c` character, `%s` string,
+`%%`; widths pad with spaces (`%5d`, left aligned `%-8s`) or zeros (`%05d`).
+
+```c
+printf("%-10s|%5d|\n", (int)"total", 1600, 0, 0);       // total     | 1600|
+```
+
+`printRepeat(ch, n)` writes a character `n` times.
+
+**Terminal**
+
+| Function | Description |
+|---|---|
+| `printColor(ANSI_RED, "text")` | coloured text, plain when output is not a terminal. Colours: `ANSI_RED`, `ANSI_GREEN`, `ANSI_YELLOW`, `ANSI_BLUE`, `ANSI_MAGENTA`, `ANSI_CYAN`, `ANSI_GRAY`, `ANSI_BOLD`, `ANSI_RESET` |
+| `clearScreen()`, `cursorTo(row, col)` | ANSI screen control |
+| `isTerminal(fd)` | `true` if 0 / 1 / 2 is a terminal rather than a file or pipe |
+| `ansiInit()` | enables escape codes on the Windows console (called automatically by the above) |
+
+**Command line arguments** (`int main(int argc, char** argv)`)
+
+`hasArg(argc, argv, "-v")`, `argIndex(argc, argv, flag)` (index or -1), `argValue(argc, argv, "-o", fallback)`
+(the argument after the flag).
+
+**Time**
+
+`millis()` milliseconds counter (use differences), `sleepMs(ms)`.
 
 **Strings and characters**
 
 `strlen`, `streq(a, b)`, `strcmp(a, b)`, `strcpy(dst, src)`, `strcat(dst, src)`, `strdup(s)`,
 `memcpy(dst, src, n)`, `memset(dst, value, n)`, `indexOf(s, c)`, `startsWith(s, prefix)`,
 `intToStr(n, buf)`, `isDigit(c)`, `isAlpha(c)`, `isUpper(c)`, `isLower(c)`, `isSpace(c)`,
-`toUpper(c)`, `toLower(c)`.
+`toUpper(c)`, `toLower(c)`, `endsWith(s, suffix)`, `find(s, sub)`, `contains(s, sub)`,
+`substr(s, start, len)`, `trim(s)`, `strUpper(s)`, `strLower(s)`, `streqi(a, b)`, `hexToStr(n, buf)`.
 
 **Math and random numbers**
 
