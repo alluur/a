@@ -659,6 +659,9 @@ gen_call:
     push r12
     push r13
     push r14
+    push r15
+    mov r15d, [force_direct]            ; super.method(): no virtual dispatch
+    mov dword [force_direct], 0
     mov r12, rdi
     mov r13d, esi
     xor ebx, ebx
@@ -781,14 +784,42 @@ gen_call:
     inc ebx
     mov r14d, 1
 .noretst:
+    test dword [r12+SYM_FLAGS], F_VIRTUAL
+    jz .direct
+    test r15d, r15d
+    jnz .direct
+    ; virtual method: this -> vtable -> slot -> call
+    mov edi, ebx
+    CG load_stack_a
+    mov eax, [r12+SYM_OWNER]
+    mov edi, [st_vptr + rax*4]
+    dec edi
+    jz .novo
+    CG add_imm_a
+.novo:
+    CG load8_a
+    mov rdx, r12
+    sub rdx, symtab
+    shr rdx, 6
+    mov edi, [sym_vslot + rdx*4]
+    shl edi, 3
+    jz .nosl
+    CG add_imm_a
+.nosl:
+    CG load8_a
+    CG call_a
+    jmp .called
+.direct:
     mov rdi, r12
     call emit_call_sym
+.called:
     lea edi, [rbx+r13]
     CG drop
 .noadd:
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
     mov qword [e_lval], r14                  ; a struct result is an address (the temporary)
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -834,6 +865,8 @@ parse_primary:
     je .sizeof
     cmp eax, K_NEW
     je .new
+    cmp eax, K_SUPER
+    je .super
     ERR "expected an expression"
 
 .num:
@@ -891,6 +924,76 @@ parse_primary:
     mov [e_type], rax
     mov qword [e_lval], 0
     call next_token
+    jmp .out
+
+; ---- super(args) calls the constructor of the base class, super.method(args) a base class method
+.super:
+    cmp dword [cur_class], -1
+    jne .sup1
+    ERR "'super' used outside of a method"
+.sup1:
+    mov eax, [cur_class]
+    mov eax, [st_base + rax*4]
+    test eax, eax
+    jnz .sup2
+    ERR "'super' used in a class that has no base class"
+.sup2:
+    lea r13d, [rax-1]
+    call next_token
+    cmp qword [tk], '('
+    je .supctor
+    cmp qword [tk], '.'
+    je .supmeth
+    ERR "'super' must be followed by '(' or '.'"
+.supctor:
+    mov edi, r13d
+    call struct_find_ctor
+    test rax, rax
+    jnz .supc1
+    ERR "the base class has no constructor"
+.supc1:
+    mov r12, rax
+    mov edi, [cur_this_off]
+    CG load_local_a
+    CG push_a
+    mov rdi, r12
+    mov esi, 1
+    call gen_call
+    jmp .out
+.supmeth:
+    call next_token
+    cmp qword [tk], T_ID
+    je .supm1
+    ERR "expected a method name after 'super.'"
+.supm1:
+    mov edi, r13d
+    mov rsi, [tk_ptr]
+    mov edx, [tk_len]
+    call struct_find_method
+    test rax, rax
+    jnz .supm2
+    mov edi, msg_nomember
+    call fatal_error_tok
+.supm2:
+    mov r12, rax
+    call method_vis_ok
+    test eax, eax
+    jnz .supm3
+    mov edi, msg_privmember
+    call fatal_error_tok
+.supm3:
+    call next_token
+    cmp qword [tk], '('
+    je .supm4
+    ERR "methods can only be called, not used as values"
+.supm4:
+    mov edi, [cur_this_off]
+    CG load_local_a
+    CG push_a
+    mov dword [force_direct], 1
+    mov rdi, r12
+    mov esi, 1
+    call gen_call
     jmp .out
 
 .sizeof:
@@ -976,6 +1079,8 @@ parse_primary:
     call emit_call_sym
     mov edi, 1
     CG drop
+    mov edi, r12d
+    call emit_vptr_init
     mov edi, r12d
     call struct_find_ctor
     test rax, rax
@@ -1232,6 +1337,14 @@ parse_primary:
 
 .implicit_field:
     mov r12, rax
+    mov eax, [r12+FD_VIS]
+    mov edx, [r12+FD_OWNER]
+    call member_ok
+    test eax, eax
+    jnz .ifok
+    mov edi, msg_privmember
+    call fatal_error_tok
+.ifok:
     mov edi, [cur_this_off]
     CG load_local_a
     mov edi, [r12+FD_OFFSET]
@@ -1247,6 +1360,12 @@ parse_primary:
 
 .implicit_method:
     mov r12, rax
+    call method_vis_ok
+    test eax, eax
+    jnz .imok
+    mov edi, msg_privmember
+    call fatal_error_tok
+.imok:
     call next_token
     cmp qword [tk], '('
     je .im1
@@ -1392,10 +1511,11 @@ parse_postfix:
     test rax, rax
     jz .trymethod
     mov r12, rax
-    cmp dword [r12+FD_VIS], 0
-    je .fok
-    cmp ebx, [cur_class]
-    je .fok
+    mov eax, [r12+FD_VIS]
+    mov edx, [r12+FD_OWNER]
+    call member_ok
+    test eax, eax
+    jnz .fok
     mov edi, msg_privmember
     call fatal_error_tok
 .fok:
@@ -1420,10 +1540,9 @@ parse_postfix:
     call fatal_error_tok
 .m1:
     mov r12, rax
-    test dword [r12+SYM_FLAGS], F_PRIVATE
-    jz .m2
-    cmp ebx, [cur_class]
-    je .m2
+    call method_vis_ok
+    test eax, eax
+    jnz .m2
     mov edi, msg_privmember
     call fatal_error_tok
 .m2:

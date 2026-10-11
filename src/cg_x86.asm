@@ -494,6 +494,15 @@ apply_relocs_x86:
     je .d64
     cmp esi, R_CODE
     je .code
+    cmp esi, R_CODE64
+    je .c64
+    jmp .n
+.c64:
+    shl rdx, 6
+    add rdx, symtab
+    mov r8, [rdx+SYM_VAL]
+    add r8, [code_vaddr]
+    add [data_buf+rdi], r8
     jmp .n
 .code:
     shl rdx, 6

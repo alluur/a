@@ -981,6 +981,20 @@ begin_codegen_pass:
 
 ; compute_reachable: marks every function reachable from the entry stub as F_USED
 compute_reachable:
+    ; virtual methods are reachable through the vtables
+    xor ecx, ecx
+.vroot:
+    cmp ecx, [sym_count]
+    jae .again
+    mov rax, rcx
+    shl rax, 6
+    add rax, symtab
+    test dword [rax+SYM_FLAGS], F_VIRTUAL
+    jz .vnext
+    or dword [rax+SYM_FLAGS], F_USED
+.vnext:
+    inc ecx
+    jmp .vroot
 .again:
     xor r8d, r8d                    ; changed
     xor ecx, ecx
@@ -1040,7 +1054,10 @@ check_undefined:
     shl rax, 4
     add rax, rel_buf
     cmp dword [rax+4], R_CODE
+    je .rchk
+    cmp dword [rax+4], R_CODE64
     jne .rn
+.rchk:
     mov eax, [rax+8]
     shl rax, 6
     add rax, symtab
@@ -1886,6 +1903,15 @@ ptmp_variadic:  resd 1
 cur_va_cnt:     resd 1
 agg_vis:        resd 1
 agg_union:      resd 1
+agg_virtual:    resd 1
+force_direct:   resd 1
+agg_base:       resd 1
+st_base:        resd STRUCT_MAX         ; index of the base class + 1 (0 = none)
+st_vptr:        resd STRUCT_MAX         ; offset of the vtable pointer in the object + 1 (0 = none)
+st_vcount:      resd STRUCT_MAX         ; number of virtual methods
+st_vt:          resd STRUCT_MAX         ; offset of the vtable in the data section + 1
+vt_method:      resd STRUCT_MAX * VT_MAX ; per class: symbol index of the method in each vtable slot
+sym_vslot:      resd SYM_MAX            ; per virtual method symbol: its vtable slot
 agg_mnlen:      resd 1
 agg_isctor:     resd 1
 src_ptr:        resq 1

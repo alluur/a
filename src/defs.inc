@@ -24,6 +24,7 @@
 %define SYM_MAX         65536
 %define FIELD_MAX       32768
 %define STRUCT_MAX      4096
+%define VT_MAX          64      ; virtual methods per class
 %define PTYPE_MAX       131072
 %define ARENA_MAX       (32*1024*1024)
 %define OUT_MAX         (32*1024*1024)
@@ -98,6 +99,9 @@
 %define K_TYPEDEF       189
 %define K_UNION         190
 %define K_STATIC        191
+%define K_VIRTUAL       192
+%define K_SUPER         193
+%define K_PROTECTED     194
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1
@@ -137,6 +141,8 @@
 %define F_USED          256     ; reachable from main (dead function elimination)
 %define F_FUNCTYPE      512     ; the predefined type name "func"
 %define F_VARIADIC      1024    ; the parameter list ends with ...
+%define F_VIRTUAL       4096    ; a method that is called through the vtable of the object
+%define F_PROTECTED     8192
 %define F_BYREF         2048    ; a struct parameter: the slot holds the address of the caller's copy
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
@@ -155,6 +161,7 @@
 %define FD_VIS          12      ; dword 1 = private
 %define FD_TYPE         16      ; qword
 %define FD_OFFSET       24      ; dword
+%define FD_OWNER        28      ; dword  struct index of the class that declared the field
 %define FD_SIZEOF       32
 
 ; ---- types -------------------------------------------------------------------
@@ -173,6 +180,7 @@
 %define R_BSS           1       ; rel32 in code -> bss  + target
 %define R_IAT           2       ; rel32 in code -> import slot target
 %define R_DATA64        3       ; abs64 in data -> data + target
+%define R_CODE64        5       ; abs64 in data -> code address of function symbol (index) target (vtables)
 %define R_CODE          4       ; rel32 / adrp pair in code -> code address of function symbol (index) target
 %define R_CODE32        4       ; rel32 in code -> code + target (unused)
 

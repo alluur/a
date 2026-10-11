@@ -8,7 +8,7 @@ syn keyword aRepeat      while do for
 syn keyword aStatement   break continue return
 syn keyword aStructure   struct class enum
 syn keyword aStorage     const static typedef union
-syn keyword aAccess      public private
+syn keyword aAccess      public private protected virtual super
 syn keyword aModule      module import
 syn keyword aType        int long char byte bool void func
 syn keyword aOperatorKw  new sizeof

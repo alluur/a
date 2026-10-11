@@ -64,6 +64,15 @@ bits 16..31  struct index (for kind 4)
 bit   32     "array" flag (an array lvalue; it decays to a pointer when used as a value)
 ```
 
+Inheritance: a derived class copies the field entries of its base class into its own field list (so lookup
+needs no chain walk) and starts its layout after the base size. `st_base`, `st_vptr`, `st_vcount`, `st_vt` and
+`vt_method` (symtab-side arrays indexed by struct) hold the base class, the vtable pointer offset, the number of
+slots, the vtable's data offset and the method symbol of every slot. The vtable is an array of code addresses in
+the data section, filled by `R_CODE64` relocations; virtual methods are roots of the dead-function elimination.
+`gen_call` dispatches a call of an `F_VIRTUAL` method through `this -> vptr -> slot` (`load_stack_a`, `call_a`)
+unless it comes from `super.`; objects get their vtable pointer from `emit_vptr_init` (new, locals) or a
+`R_DATA64` relocation (globals).
+
 Enums are `int`. Sizes: pointers 8, `int` 8, `char`/`bool` 1, structs from the struct table.
 
 ## Expression code generation

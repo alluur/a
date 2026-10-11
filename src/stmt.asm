@@ -527,6 +527,16 @@ parse_local_decl:
     CG zero_local
     bt rbx, TF_ARRAY_BIT
     jc .next
+    mov rdi, rbx
+    call type_vptr
+    test eax, eax
+    jz .novp
+    mov edi, r14d
+    CG lea_local_a
+    mov edi, ebx
+    shr edi, 16
+    call emit_vptr_init
+.novp:
     cmp qword [tk], '('
     je .ctor
     cmp qword [tk], '='

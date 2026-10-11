@@ -185,13 +185,13 @@ func_register:
     test ebx, F_CTOR
     jz .m2
     mov edi, r15d
-    call struct_find_ctor
+    call struct_find_ctor_here
     jmp .m3
 .m2:
     mov edi, r15d
     mov rsi, r12
     mov edx, r13d
-    call struct_find_method
+    call struct_find_method_here
 .m3:
     test rax, rax
     jnz .have
@@ -543,6 +543,35 @@ parse_aggregate:
 .named:
     mov r15d, r14d                  ; default member visibility: classes private
     call next_token
+    cmp qword [tk], ':'
+    jne .nobase
+    ; class D : B  - single inheritance, the base class must be complete
+    call next_token
+    call parse_type
+    movzx ecx, al
+    cmp ecx, TY_STRUCT
+    jne .badbase
+    test eax, 0xFF00
+    jnz .badbase
+    shr rax, 16
+    and eax, 0xFFFF
+    mov r12d, eax
+    cmp r12d, ebx
+    je .badbase
+    mov rax, r12
+    shl rax, 5
+    add rax, struct_tab
+    cmp dword [rax+ST_SIZE], 0
+    jne .base_ok
+    ERR "the base class must be defined before the derived class"
+.badbase:
+    ERR "expected the name of a class after ':'"
+.base_ok:
+    cmp dword [pass], 1
+    jne .nobase
+    lea eax, [r12+1]
+    mov [st_base + rbx*4], eax
+.nobase:
     cmp qword [tk], ';'
     jne .body
     jmp next_token_ret
@@ -550,6 +579,14 @@ parse_aggregate:
     mov edi, '{'
     call expect
     mov [cur_class], ebx
+    cmp dword [pass], 1
+    jne .mloop
+    mov eax, [st_base + rbx*4]
+    test eax, eax
+    jz .mloop
+    lea esi, [rax-1]
+    mov edi, ebx
+    call inherit_base
 .mloop:
     cmp qword [tk], '}'
     je .mend
@@ -564,8 +601,13 @@ parse_aggregate:
     jmp .mod
 .m1:
     cmp qword [tk], K_PRIVATE
-    jne .nomod
+    jne .m1b
     mov dword [agg_vis], 1
+    jmp .mod
+.m1b:
+    cmp qword [tk], K_PROTECTED
+    jne .nomod
+    mov dword [agg_vis], 2
 .mod:
     call next_token
     cmp qword [tk], ':'
@@ -575,6 +617,12 @@ parse_aggregate:
     mov r15d, eax
     jmp .mloop
 .nomod:
+    mov dword [agg_virtual], 0
+    cmp qword [tk], K_VIRTUAL
+    jne .nv
+    mov dword [agg_virtual], 1
+    call next_token
+.nv:
     ; constructor?  (identifier equal to the class name)
     cmp qword [tk], T_ID
     jne .typed
@@ -686,6 +734,7 @@ parse_aggregate:
     mov [rdi+FD_NLEN], edx
     mov edx, [agg_vis]
     mov [rdi+FD_VIS], edx
+    mov [rdi+FD_OWNER], ebx
     mov [rdi+FD_TYPE], r13
     mov [rdi+FD_OFFSET], ecx
     inc dword [rax+ST_NFIELDS]
@@ -706,7 +755,12 @@ parse_aggregate:
     mov r8d, F_METHOD
     cmp dword [agg_vis], 0
     je .mf1
+    cmp dword [agg_vis], 2
+    je .mfp
     or r8d, F_PRIVATE
+    jmp .mf1
+.mfp:
+    or r8d, F_PROTECTED
 .mf1:
     cmp dword [agg_isctor], 0
     je .mf2
@@ -718,6 +772,10 @@ parse_aggregate:
     mov ecx, ebx
     call func_register
     mov r13, rax
+    cmp dword [pass], 1
+    jne .nov
+    call register_virtual
+.nov:
     cmp qword [tk], ';'
     jne .mb
     call next_token
@@ -760,6 +818,29 @@ parse_aggregate:
     mov ecx, 8
 .sz:
     mov [rax+ST_SIZE], ecx
+    ; the vtable of a class with virtual methods: one code address per slot, filled in by the linker
+    mov r12d, [st_vcount + rbx*4]
+    test r12d, r12d
+    jz .semi
+    lea rdi, [r12*8]
+    mov esi, 8
+    call data_alloc
+    lea ecx, [rax+1]
+    mov [st_vt + rbx*4], ecx
+    mov r13d, eax
+    xor r14d, r14d
+.vt:
+    cmp r14d, r12d
+    jae .semi
+    mov rax, rbx
+    shl rax, 6
+    add rax, r14
+    mov edx, [vt_method + rax*4]
+    lea edi, [r13 + r14*8]
+    mov esi, R_CODE64
+    call add_reloc
+    inc r14d
+    jmp .vt
 .semi:
     cmp qword [tk], ';'
     jne .out
@@ -774,6 +855,111 @@ parse_aggregate:
 next_token_ret:
     call next_token
     jmp parse_aggregate.out
+
+; inherit_base: edi = derived struct index, esi = base struct index. The derived class starts with a
+; copy of the fields (and the vtable layout) of its base, so the base part lives at offset 0.
+inherit_base:
+    push rbx
+    push r12
+    mov r8d, edi
+    mov r9d, esi
+    mov rax, r8
+    shl rax, 5
+    add rax, struct_tab
+    mov r10, rax                        ; derived entry
+    mov rax, r9
+    shl rax, 5
+    add rax, struct_tab                 ; base entry
+    mov ecx, [rax+ST_NFIELDS]
+    mov [r10+ST_NFIELDS], ecx
+    mov edx, [rax+ST_SIZE]
+    mov [r10+ST_SIZE], edx
+    mov esi, [rax+ST_FIRST]
+    mov edi, [field_count]
+    mov [r10+ST_FIRST], edi
+    ; copy the field entries
+    lea edx, [rdi+rcx]
+    cmp edx, FIELD_MAX
+    jae err_toobig
+    mov [field_count], edx
+    mov rdx, rsi
+    shl rdx, 5
+    add rdx, field_tab
+    shl rdi, 5
+    add rdi, field_tab
+    mov rsi, rdx
+    shl ecx, 5
+    rep movsb
+    ; vtable layout
+    mov eax, [st_vptr + r9*4]
+    mov [st_vptr + r8*4], eax
+    mov ecx, [st_vcount + r9*4]
+    mov [st_vcount + r8*4], ecx
+    mov rsi, r9
+    shl rsi, 6
+    lea rsi, [vt_method + rsi*4]
+    mov rdi, r8
+    shl rdi, 6
+    lea rdi, [vt_method + rdi*4]
+    rep movsd
+    pop r12
+    pop rbx
+    ret
+
+; register_virtual: r13 = method symbol just registered, ebx = class (pass 1). A method with the name of a
+; virtual method of a base class overrides it; otherwise 'virtual' gives it a new vtable slot.
+register_virtual:
+    test dword [r13+SYM_FLAGS], F_CTOR | F_VIRTUAL
+    jnz .ret
+    mov eax, [st_base + rbx*4]
+    test eax, eax
+    jz .own
+    lea edi, [rax-1]
+    mov rsi, [agg_mname]
+    mov edx, [agg_mnlen]
+    call struct_find_method
+    test rax, rax
+    jz .own
+    test dword [rax+SYM_FLAGS], F_VIRTUAL
+    jz .own
+    sub rax, symtab
+    shr rax, 6
+    mov ecx, [sym_vslot + rax*4]       ; override: same slot
+    jmp .set
+.own:
+    cmp dword [agg_virtual], 0
+    je .ret
+    mov ecx, [st_vcount + rbx*4]
+    cmp ecx, VT_MAX
+    jb .room
+    ERR "too many virtual methods in one class"
+.room:
+    inc dword [st_vcount + rbx*4]
+    cmp dword [st_vptr + rbx*4], 0
+    jne .set
+    ; the first virtual method of the hierarchy: reserve room for the vtable pointer
+    mov rax, rbx
+    shl rax, 5
+    add rax, struct_tab
+    mov edx, [rax+ST_SIZE]
+    add edx, 7
+    and edx, -8
+    lea esi, [rdx+1]
+    mov [st_vptr + rbx*4], esi
+    add edx, 8
+    mov [rax+ST_SIZE], edx
+.set:
+    or dword [r13+SYM_FLAGS], F_VIRTUAL
+    mov rax, r13
+    sub rax, symtab
+    shr rax, 6
+    mov [sym_vslot + rax*4], ecx
+    mov rdx, rbx
+    shl rdx, 6
+    add rdx, rcx
+    mov [vt_method + rdx*4], eax
+.ret:
+    ret
 
 ; ---- module / import -------------------------------------------------------------------------
 parse_module:
@@ -910,6 +1096,32 @@ parse_global_vars:
 .big:
     cmp qword [tk], '='
     je .init
+    ; an object with virtual methods lives in the data section so that its vtable pointer can be set
+    mov rdi, rbx
+    call type_vptr
+    test eax, eax
+    jz .plainbss
+    dec eax
+    mov r13d, eax                       ; offset of the pointer inside the object
+    mov rdi, r15
+    mov esi, 8
+    call data_alloc
+    mov r9, rax
+    mov rdx, rbx
+    shr edx, 16
+    mov edx, [st_vt + rdx*4]
+    dec edx
+    lea rcx, [r9 + r13]
+    mov [data_buf + rcx], rdx
+    mov edi, ecx
+    mov esi, R_DATA64
+    xor edx, edx
+    push r9
+    call add_reloc
+    pop r13
+    xor edx, edx
+    jmp .reg
+.plainbss:
     ; zero initialised -> bss
     mov rdi, r15
     mov esi, 8

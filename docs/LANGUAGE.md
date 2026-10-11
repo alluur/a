@@ -351,7 +351,42 @@ private:
 * **Access control** is checked at compile time. Using a private member from outside the class is an
   error: `error: member is private to its class 'balance'`.
 * Structs can be copied with `=` and initialisers (`Point q = p;`), and compared field by field by hand.
-  There is no inheritance and no virtual dispatch yet.
+
+### Inheritance and virtual methods
+
+A class can extend one base class: `class Dog : Animal { ... }`. The base class must be defined first.
+
+```c
+class Animal {
+    protected int legs;                       // visible in Animal and in classes derived from it
+    public Animal(int l) { legs = l; }
+    public virtual int speak() { return 1; }  // called through the object's real class
+    public int describe() { return speak() * 1000 + legs; }
+}
+class Dog : Animal {
+    public Dog() { super(4); }                // run the base class constructor
+    public int speak() { return 2; }          // overrides Animal.speak (already virtual)
+}
+class Puppy : Dog {
+    public int speak() { return super.speak() + 10; }   // call the base class version directly
+}
+Animal* a = new Puppy();
+printlnInt(a->describe());                    // 12004: speak() resolves to Puppy.speak
+```
+
+* The derived object starts with the fields of the base class, so a `Dog*` can be used wherever an
+  `Animal*` is expected (pointer types convert freely in A).
+* `virtual` gives a method a slot in the class's vtable. A method with the same name as a virtual method of
+  a base class overrides it, with or without the keyword. The signature is not compared.
+* `protected` members can be used by the class itself and by derived classes. `private` members stay
+  private to the class that declares them, even from derived classes.
+* `super(args);` calls the base class constructor (put it first in your constructor). A class without a
+  constructor of its own uses the base class constructor. `super.name(args)` calls a base class method
+  without virtual dispatch.
+* Objects of a class with virtual methods get their vtable pointer when they are created with `new`,
+  declared as a local, or declared as a global. Copying an object copies the pointer as well (no
+  slicing protection, no destructors, no multiple inheritance, no abstract classes).
+* A virtual method must have a body, otherwise the program fails to link with `undefined function`.
 
 ## 9. Enums
 

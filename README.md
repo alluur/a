@@ -184,7 +184,7 @@ Version 0.1.0 is deliberately small. Known limitations — all of them are on th
 * Function pointers are the type `func` (no signature checking); no bit-fields or preprocessor (modules replace `#include`).
   `typedef`, `union`, `static` locals, structs by value, default parameter values and `...` with `va_arg` exist.
 
-* **No inheritance / virtual methods** yet; classes are structs with methods.
+* **Single inheritance only:** `class D : B`, `virtual`, `super`, `protected`; no multiple inheritance, abstract classes or destructors.
 * **`new` / `alloc` never free** (a bump allocator); `malloc` / `free` of the C library do.
 * **Light type checking:** pointer types convert freely; this is a systems language in the C
   tradition. Syntax errors, undeclared names, wrong argument counts, private access and similar

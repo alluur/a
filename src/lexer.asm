@@ -39,6 +39,9 @@ kw_table:
     KW "typedef",  K_TYPEDEF
     KW "union",    K_UNION
     KW "static",   K_STATIC
+    KW "virtual",  K_VIRTUAL
+    KW "super",    K_SUPER
+    KW "protected", K_PROTECTED
     db 0
 
 ops3:
