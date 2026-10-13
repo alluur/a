@@ -14,7 +14,7 @@ Contents
 7. [Functions](#7-functions)
 8. [Structs and classes](#8-structs-and-classes)
 9. [Enums](#9-enums)
-10. [Modules and imports](#10-modules-and-imports)
+10. [Modules and imports](#10-modules-and-imports) (including `a_module` / `a_import`)
 11. [Memory](#11-memory)
 12. [Standard library](#12-standard-library)
 13. [Built-in runtime functions](#13-built-in-runtime-functions)
@@ -435,6 +435,42 @@ int main() {
 * `private` makes a top-level declaration (function, global, constant, class, enum) visible only inside its own file;
   everything else is `public`. `public` may be written explicitly.
 * Different modules can use the same names without conflict (`math.square` and an own `square`).
+
+### Module files: `a_module` and `a_import`
+
+The clearest way to write a reusable module is a **module file** with the extension `.am`. The module
+name and its content are written in one block:
+
+```c
+// file shapes.am
+a_module shapes
+{
+    const SIDES = 4;
+    public int area(int w, int h) { return w * h; }
+    private int secret() { return 42; }          // only visible inside shapes.am
+    public class Box { public int w; public int h; public Box(int a, int b) { w = a; h = b; } }
+}
+```
+
+Both `.a` and `.am` files can import a module file with `a_import`:
+
+```c
+a_import('shapes.am');                            // use it as shapes.area(...)
+a_import('shapes.am', 'area, Box');               // also use area and Box without the prefix
+a_import('shapes.am', '*');                       // ... or every public member
+```
+
+* The first argument is the file name. It is looked up like `import "file"`: next to the importing file,
+  then `lib/`, `/usr/lib/a/` and `/usr/local/lib/a/`. Single quotes (`'...'`) and double quotes both work
+  inside `a_import( ... )`.
+* The optional second argument lists the members to bring into the importing file's own namespace, separated
+  by commas or blanks. A name that is not a public member of the file is a compile error
+  (`the module has no public member called 'secret'`), and so is a name that is already declared.
+  The members can still be reached as `shapes.area`.
+* A module file can itself contain `a_import` lines (before or inside the block). A file is compiled
+  once, however many files import it. Several files can contribute to the same module name.
+* `a_module` blocks cannot be nested. The older forms `module name;` and `import name;` keep working; the
+  standard library still uses them.
 
 ## 11. Memory
 

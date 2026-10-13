@@ -65,7 +65,7 @@ sym_lookup:
     jne .pa
     mov rax, r10
     pop rbx
-    ret
+    jmp alias_resolve
 .pb0:
     cmp dword [cur_module], 0
     je .none
@@ -92,7 +92,7 @@ sym_lookup:
     jne .pb
     mov rax, r10
     pop rbx
-    ret
+    jmp alias_resolve
 .none:
     xor eax, eax
     pop rbx
@@ -125,10 +125,19 @@ sym_find_global:
     repe cmpsb
     jne .l
     mov rax, r10
-    ret
+    jmp alias_resolve
 .none:
     xor eax, eax
     ret
+
+; alias_resolve: rax = symbol -> the real symbol if it is a name imported with a_import(file, 'names')
+alias_resolve:
+    cmp dword [rax+SYM_KIND], S_ALIAS
+    jne .r
+    mov eax, [rax+SYM_VAL]
+    shl rax, 6
+    add rax, symtab
+.r: ret
 
 ; check_access: rax = symbol. Errors if it is private to another file.
 check_access:

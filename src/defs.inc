@@ -102,6 +102,8 @@
 %define K_VIRTUAL       192
 %define K_SUPER         193
 %define K_PROTECTED     194
+%define K_AMODULE       195     ; a_module NAME { ... }
+%define K_AIMPORT       196     ; a_import('file.am');
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1
@@ -112,6 +114,7 @@
 %define S_ENUM          6
 %define S_MODULE        7
 %define S_TYPEDEF       8
+%define S_ALIAS         9       ; a name imported with a_import(file, 'names'): SYM_VAL = index of the real symbol
 
 ; ---- symbol entry layout (64 bytes) ------------------------------------------
 %define SYM_NAME        0       ; qword  pointer to name

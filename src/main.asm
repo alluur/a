@@ -694,12 +694,19 @@ compile_file:
     mov eax, [r12+24]
     mov [cur_file_id], eax
     mov dword [cur_module], 0
+    mov eax, [in_amodule]               ; the imported file starts outside of any a_module block
+    mov [rsp+112], eax
+    mov dword [in_amodule], 0
     call next_token
     call parse_items
     mov rsi, rsp
     call lex_restore
+    mov eax, [rsp+112]
+    mov [in_amodule], eax
     add rsp, 128
 .skip:
+    mov eax, [r12+24]
+    mov [last_file_id], eax
     pop r12
     pop rbx
     ret
@@ -1904,6 +1911,11 @@ cur_va_cnt:     resd 1
 agg_vis:        resd 1
 agg_union:      resd 1
 agg_virtual:    resd 1
+in_amodule:     resd 1
+sq_string:      resd 1
+str_term:       resd 1
+last_file_id:   resd 1
+selbuf:         resb 1024
 force_direct:   resd 1
 agg_base:       resd 1
 st_base:        resd STRUCT_MAX         ; index of the base class + 1 (0 = none)

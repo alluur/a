@@ -42,6 +42,8 @@ kw_table:
     KW "virtual",  K_VIRTUAL
     KW "super",    K_SUPER
     KW "protected", K_PROTECTED
+    KW "a_module", K_AMODULE
+    KW "a_import", K_AIMPORT
     db 0
 
 ops3:
@@ -407,6 +409,11 @@ next_token:
 
 ; ---- character literal
 .char:
+    cmp dword [sq_string], 0
+    je .char0
+    mov byte [str_term], 0x27           ; inside a_import( ... ) 'text' is a string
+    jmp .string_go
+.char0:
     inc rsi
     movzx eax, byte [rsi]
     test al, al
@@ -428,6 +435,8 @@ next_token:
 
 ; ---- string literal
 .string:
+    mov byte [str_term], '"'
+.string_go:
     inc rsi
     mov rdi, strbuf
 .s1:
@@ -436,7 +445,7 @@ next_token:
     jz .s_err
     cmp al, 10
     je .s_err
-    cmp al, '"'
+    cmp al, [str_term]
     je .s_end
     inc rsi
     cmp al, '\'

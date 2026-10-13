@@ -969,6 +969,17 @@ parse_module:
     je .n1
     ERR "expected a module name"
 .n1:
+    call module_enter
+    call next_token
+    mov edi, ';'
+    call expect
+    pop rbx
+    ret
+
+; module_enter: the current token is the module name. Finds or creates the module and makes it the
+; current one -> eax = the module that was current before
+module_enter:
+    push rbx
     mov rdi, [tk_ptr]
     mov esi, [tk_len]
     xor edx, edx
@@ -992,10 +1003,271 @@ parse_module:
     mov [rax+SYM_VAL], rcx
 .have:
     mov ecx, [rax+SYM_VAL]
+    mov eax, [cur_module]
     mov [cur_module], ecx
+    pop rbx
+    ret
+
+; a_module NAME { declarations }
+parse_amodule:
+    push rbx
+    cmp dword [in_amodule], 0
+    je .ok0
+    ERR "a_module blocks cannot be nested"
+.ok0:
     call next_token
+    cmp qword [tk], T_ID
+    je .n1
+    ERR "expected a module name after 'a_module'"
+.n1:
+    call module_enter
+    mov ebx, eax
+    call next_token
+    mov edi, '{'
+    call expect
+    mov dword [in_amodule], 1
+    call parse_items
+    mov dword [in_amodule], 0
+    cmp qword [tk], '}'
+    je .close
+    ERR "expected '}' at the end of the a_module block"
+.close:
+    mov [cur_module], ebx
+    call next_token
+    pop rbx
+    ret
+
+; a_import('file.am');   a_import('file.am', 'name1, name2');   a_import('file.am', '*');
+; The names in the second string are also made available without the module prefix.
+parse_aimport:
+    push rbx
+    sub rsp, 1024                       ; the name list lives on the stack: nested imports reuse the buffers
+    mov dword [sq_string], 1
+    call next_token
+    mov edi, '('
+    call expect
+    cmp qword [tk], T_STR
+    je .s1
+    ERR "a_import needs the file name of the module as a string, for example a_import('math.am');"
+.s1:
+    mov rsi, [tk_ptr]
+    mov ecx, [tk_len]
+    cmp ecx, 500
+    jb .s2
+    ERR "import path too long"
+.s2:
+    mov rdi, importbuf
+    rep movsb
+    mov byte [rdi], 0
+    mov byte [rsp], 0
+    call next_token
+    cmp qword [tk], ','
+    jne .noargs
+    call next_token
+    cmp qword [tk], T_STR
+    je .n1
+    ERR "the second argument of a_import is a string with the names to import"
+.n1:
+    mov rsi, [tk_ptr]
+    mov ecx, [tk_len]
+    cmp ecx, 1000
+    jb .n2
+    ERR "import name list too long"
+.n2:
+    mov rdi, rsp
+    rep movsb
+    mov byte [rdi], 0
+    call next_token
+.noargs:
+    mov dword [sq_string], 0
+    mov edi, ')'
+    call expect
+    call file_include
+    cmp dword [pass], 1
+    jne .semi
+    cmp byte [rsp], 0
+    je .semi
+    mov rdi, rsp
+    call import_names
+.semi:
     mov edi, ';'
     call expect
+    add rsp, 1024
+    pop rbx
+    ret
+
+CSTR msg_noimport, "the module has no public member called"
+
+; import_names: makes the names listed in selbuf (separated by commas / blanks) of the file that was
+; just imported (last_file_id) usable without the module prefix. '*' = every public member.
+import_names:
+    push rbx
+    push r12
+    push r13
+    mov rbx, rdi
+.next:
+    movzx eax, byte [rbx]
+    test al, al
+    jz .done
+    cmp al, ' '
+    jbe .sep
+    cmp al, ','
+    je .sep
+    cmp al, ';'
+    je .sep
+    mov r12, rbx
+.scan:
+    movzx eax, byte [rbx]
+    test al, al
+    jz .got
+    cmp al, ' '
+    jbe .got
+    cmp al, ','
+    je .got
+    cmp al, ';'
+    je .got
+    inc rbx
+    jmp .scan
+.got:
+    mov r13, rbx
+    sub r13, r12
+    cmp r13d, 1
+    jne .one
+    cmp byte [r12], '*'
+    jne .one
+    call import_all
+    jmp .next
+.one:
+    mov rdi, r12
+    mov esi, r13d
+    call import_find
+    test rax, rax
+    jnz .have
+    mov [tk_ptr], r12
+    mov [tk_len], r13d
+    mov edi, msg_noimport
+    call fatal_error_tok
+.have:
+    mov rdi, rax
+    xor esi, esi
+    call import_alias
+    jmp .next
+.sep:
+    inc rbx
+    jmp .next
+.done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; import_find: rdi = name, esi = length -> rax = public symbol of that name declared in the imported file (or 0)
+import_find:
+    mov r8, rdi
+    mov r9d, esi
+    mov eax, [sym_count]
+.l:
+    test eax, eax
+    jz .none
+    dec eax
+    mov r10, rax
+    shl r10, 6
+    add r10, symtab
+    cmp [r10+SYM_NLEN], r9d
+    jne .l
+    mov edx, [last_file_id]
+    cmp [r10+SYM_FILE], edx
+    jne .l
+    call import_ok
+    test ecx, ecx
+    jz .l
+    mov rdi, [r10+SYM_NAME]
+    mov rsi, r8
+    mov ecx, r9d
+    repe cmpsb
+    jne .l
+    mov rax, r10
+    ret
+.none:
+    xor eax, eax
+    ret
+
+; import_ok: r10 = symbol -> ecx = 1 if it can be imported by name (a public global, constant, function, type)
+import_ok:
+    xor ecx, ecx
+    mov edx, [r10+SYM_KIND]
+    cmp edx, S_GLOBAL
+    jb .no
+    cmp edx, S_TYPEDEF
+    ja .no
+    cmp edx, S_MODULE
+    je .no
+    test dword [r10+SYM_FLAGS], F_METHOD | F_PRIVATE | F_BUILTIN
+    jnz .no
+    mov ecx, 1
+.no:
+    ret
+
+; import_alias: rdi = symbol, esi = 1 to skip names that already exist (for '*')
+import_alias:
+    push rbx
+    push r12
+    mov rbx, rdi
+    mov r12d, esi
+    mov rdi, [rbx+SYM_NAME]
+    mov esi, [rbx+SYM_NLEN]
+    mov edx, [cur_module]
+    call sym_find_global
+    test rax, rax
+    jz .make
+    test r12d, r12d
+    jnz .out
+    mov rax, [rbx+SYM_NAME]
+    mov [tk_ptr], rax
+    mov eax, [rbx+SYM_NLEN]
+    mov [tk_len], eax
+    mov edi, msg_redef
+    call fatal_error_tok
+.make:
+    mov rdi, [rbx+SYM_NAME]
+    mov esi, [rbx+SYM_NLEN]
+    mov edx, S_ALIAS
+    call sym_new
+    mov rcx, rbx
+    sub rcx, symtab
+    shr rcx, 6
+    mov [rax+SYM_VAL], rcx
+.out:
+    pop r12
+    pop rbx
+    ret
+
+; import_all: aliases every public member of the imported file
+import_all:
+    push rbx
+    push r12
+    xor ebx, ebx
+    mov r12d, [sym_count]
+.l:
+    cmp ebx, r12d
+    jae .done
+    mov r10, rbx
+    shl r10, 6
+    add r10, symtab
+    mov edx, [last_file_id]
+    cmp [r10+SYM_FILE], edx
+    jne .n
+    call import_ok
+    test ecx, ecx
+    jz .n
+    mov rdi, r10
+    mov esi, 1
+    call import_alias
+.n:
+    inc ebx
+    jmp .l
+.done:
+    pop r12
     pop rbx
     ret
 
@@ -1206,6 +1478,11 @@ parse_items:
 .loop:
     cmp qword [tk], T_EOF
     je .done
+    cmp dword [in_amodule], 0
+    je .toplvl
+    cmp qword [tk], '}'
+    je .done
+.toplvl:
     xor ebx, ebx
     cmp qword [tk], K_PUBLIC
     jne .v1
@@ -1229,6 +1506,10 @@ parse_items:
     je .import
     cmp eax, K_MODULE
     je .module
+    cmp eax, K_AMODULE
+    je .amodule
+    cmp eax, K_AIMPORT
+    je .aimport
     cmp eax, K_STRUCT
     je .aggr
     cmp eax, K_CLASS
@@ -1253,6 +1534,12 @@ parse_items:
     jmp .loop
 .module:
     call parse_module
+    jmp .loop
+.amodule:
+    call parse_amodule
+    jmp .loop
+.aimport:
+    call parse_aimport
     jmp .loop
 .aggr:
     mov edi, ebx

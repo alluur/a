@@ -250,3 +250,13 @@ current CPU (`__ARCH` picks x86-64 or ARM64). Windows has no stable syscalls, so
 thunks) and `net.a` reaches it through the generic builtin `__winapi(slot, a1..a4)`, a small blob
 that does `call [IAT + slot*8]` with the Windows x64 convention. Adding another Windows API needs
 only a new import name in `imp_names_ws2` (or a new DLL list) and a slot constant in A code.
+
+## Module files (`a_module` / `a_import`)
+
+`a_module NAME { ... }` is `module_enter` (shared with `module NAME;`) plus a recursive `parse_items` that stops
+at `}` (`in_amodule`; `compile_file` clears it for imported files). `a_import(file [, names])` copies the file
+name into `importbuf`, uses the normal `file_include` and then, in pass 1, `import_names` creates an `S_ALIAS`
+symbol (`SYM_VAL` = index of the real symbol) in the importing module for each listed public member of the file
+that was just compiled (`last_file_id`). `sym_lookup` and `sym_find_global` resolve aliases through
+`alias_resolve`. Inside `a_import( ... )` the lexer reads `'text'` as a string (`sq_string`). The name list is
+kept on the stack because nested imports reuse `importbuf`.
