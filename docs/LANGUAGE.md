@@ -615,11 +615,63 @@ int main() {
 | `net.close(h)` | close a socket |
 | `net.httpGet(host, port, path)` | tiny HTTP/1.0 client, returns the body (plain HTTP only) |
 | `net.parseIp(text)` | `"1.2.3.4"` to a number, `-1` if invalid |
+| `net.resolve(host)` | an address, `"localhost"` or a **host name** to an IPv4 address, `-1` if unknown. `connect` calls it, so `net.connect("example.org", 80)` works |
+| `net.setTimeout(h, ms)` | time limit for receiving and sending on a socket (`0` = wait forever); a timed out `recv` returns a negative number |
+| `net.localPort(h)` | the port a socket is bound to |
+| `net.udpSocket()` / `net.udpBind(port)` | a UDP socket / one bound to a port (`0` = pick a free one) |
+| `net.sendTo(h, ip, port, buf, n)` | send one datagram |
+| `net.recvFrom(h, buf, max, &ip, &port)` | receive one datagram and learn who sent it (`ip`, `port` may be `null`) |
+| `net.dnsBuildQuery(name, id, buf)` / `net.dnsParseReply(buf, n, id)` | the DNS packets themselves |
+| `net.setDns("8.8.8.8", 53)` | use this DNS server instead of the system's |
 
-Limits of this first version: IPv4 and TCP only (no UDP, IPv6, TLS), hosts must be IP addresses or
-`localhost` (no DNS yet), calls block (no timeouts or `select`).
+Host names are resolved like this: on **Windows** by the system (`gethostbyname`); on **Linux and Android** from
+`/etc/hosts`, then by a DNS query over UDP to the servers in `/etc/resolv.conf` (then `8.8.8.8` and `1.1.1.1`).
+Limits: IPv4 only, no IPv6 and no TLS; calls block (use `setTimeout`, there is no `select`).
 On Linux and Android the module uses socket system calls; on Windows it calls Winsock
 (`ws2_32.dll`, started automatically) through the built-in `__winapi`.
+
+### `http` - HTTP client and server
+
+`import http;` builds HTTP/1.1 on top of `net` (plain `http://`, no TLS).
+
+```c
+import http;
+import net;
+
+void hello(http.Request* q, int client) {              // the handler of http.serve
+    char name[64];
+    if (http.queryValue(q, "name", name, 64)) {
+        char text[128];
+        format(text, 128, "hello %s", name);
+        http.respond(client, 200, "text/plain", text);
+    } else {
+        http.respond(client, 404, "text/plain", "who?");
+    }
+}
+
+int main() {
+    // client
+    http.Response* r = http.get("http://example.org/index.html");     // follows redirects
+    if (r == null) { println(http.error()); return 1; }
+    printlnInt(r->status);  println(r->body);  println(r->header("Content-Type"));
+    http.post("http://localhost:8080/items", "{\"id\":1}", "application/json");
+
+    // server: answers 100 requests on port 8080 (0 = forever)
+    http.serve(8080, hello, 100);
+    return 0;
+}
+```
+
+| Function | Description |
+|---|---|
+| `http.get(url)`, `http.post(url, body, contentType)`, `http.request(method, url, extraHeaders, body, bodyLen)` | one request, returns an `http.Response*` (`status`, `headers`, `body`, `bodyLen`, `header(name)`) or `null`; `http.error()` tells why |
+| `http.parseUrl(url, u)` | splits a URL into an `http.Url` (`scheme host port path`) |
+| `http.sendRequest(h, ...)`, `http.readResponse(h)` | the two halves of a request on a connection you made yourself. Bodies with `Content-Length`, `chunked` and "until closed" are all understood |
+| `http.readRequest(h, q)` | server side: reads a request into an `http.Request` (`method path query version headers body bodyLen header(name)`) |
+| `http.queryValue(q, "name", buf, max)` | a URL decoded query parameter |
+| `http.respond(h, status, contentType, body)`, `http.respondBytes(...)` | send a response |
+| `http.serve(port, handler, count)` | accept loop that calls `handler(request, client)` |
+| `http.statusText(code)`, `http.headerOf(raw, name, buf, max)` | helpers |
 
 ## 12b. Built-in modules
 
@@ -648,7 +700,9 @@ code only to programs that import them, and a file of the same name next to your
 | `log` | leveled logging with timestamps and colours: `debug info warn error` (+ `f` variants), `setLevel setFd setTimestamps` |
 | `testing` | `assertEq assertStrEq check summary` for unit tests |
 | `clib` (and `cctype climits cerrno cassert cstring cstdlib cstdio ctime cunistd cmath cfloat ccomplex clocale cwchar`) | the C standard library, see [12c](#12c-the-c-library) and [CLIB.md](CLIB.md) |
-| `net` | TCP networking, see [12a](#12a-networking) |
+| `net` | TCP / UDP networking and DNS, see [12a](#12a-networking) |
+| `http` | HTTP/1.1 client and server, see [12a](#12a-networking) |
+| `fixed`, `nn`, `codec` | fixed-point numbers, neural networks, text / binary / image converters, see [12d](#12d-fixed-point-numbers-neural-networks-and-converters) |
 
 ```c
 import collections;
@@ -669,6 +723,74 @@ int main() {
 Notes: collections never free memory (see section 11), `StrMap` copies its keys, out-of-range
 `IntList.get` returns 0, and iteration over a map goes through its slots
 (`for (int s = 0; s < m.capacity(); s++) if (m.keyAt(s) != null) ...`).
+
+## 12d. Fixed-point numbers, neural networks and converters
+
+A has no `float` type, so the AI modules run on **fixed-point numbers**: an `int` that holds the value times
+2<sup>20</sup> (`fixed.ONE` is 1.0, resolution about 0.000001, products must stay below ±2048). They are
+integer-only, so every platform and CPU computes exactly the same numbers.
+
+```c
+import fixed;
+int a = fixed.fromText("2.5");   int b = fixed.fromInt(3);
+fixed.putln(fixed.mul(a, b), 3);                              // 7.500
+```
+
+`fixed`: `ONE FB HALF LN2 PI E`; `fromInt toInt ratio fromParts fromText toText put putln`; `mul div abs min max clamp sign floor round
+sqrt exp log pow sin cos sigmoid tanh relu`; random numbers `seed next rand randRange gauss`.
+
+### `nn` - neural networks
+
+`import nn;` - all vectors and matrices are plain `int` arrays of fixed-point numbers.
+
+| Class | Kind |
+|---|---|
+| `nn.Perceptron(n)` | one neuron with a step output: `train fit predict` |
+| `nn.Network(count, sizes, hiddenAct, outAct)` | multi-layer feed-forward network (MLP) with back-propagation and momentum. Activations `ACT_LINEAR ACT_SIGMOID ACT_TANH ACT_RELU ACT_LEAKY ACT_SOFTMAX`, loss `LOSS_MSE` / `LOSS_CE`. `forward predict train trainEpoch fit evaluate accuracy save load parameters` |
+| `nn.Autoencoder(inputs, hidden, code)` | squeezes data into a short code: `fit train encode decode reconstruct` |
+| `nn.Hopfield(n)` | associative memory for ±1 patterns: `store recall energy` |
+| `nn.SOM(w, h, dim)` | self-organizing (Kohonen) map: `fit train bmu quantizationError` |
+| `nn.Elman(in, hidden, out)` | simple recurrent network: `step run trainSequence resetState` (back-propagation through time) |
+| `nn.LSTM(in, hidden, out)` | long short-term memory network with the same methods as `Elman` |
+| `nn.ConvNet(w, h, filters, ksize, classes)` | convolution → relu → 2x2 max-pool → dense softmax: `forward predict train fit accuracy` |
+
+Helpers: `nn.vec(n)`, `nn.argmax`, `nn.softmax`, `nn.mseLoss`, `nn.ceLoss`.
+
+```c
+import nn;
+import fixed;
+
+int main() {
+    int ONE = fixed.ONE;
+    int sizes[3]; sizes[0] = 2; sizes[1] = 4; sizes[2] = 1;
+    nn.Network* net = new nn.Network(3, sizes, nn.ACT_TANH, nn.ACT_SIGMOID);
+    int x[8] = ...;                                   // XOR: four samples of two numbers
+    net->fit(x, targets, 4, 3000, fixed.fromText("0.5"), 0);
+    int* y = net->forward(&x[2]);                     // y[0] is about 1.0
+}
+```
+
+### `codec` - text, binary and image converters
+
+`import codec;` converts between text, binary and pictures, and produces the vectors the networks want.
+
+| Group | Functions |
+|---|---|
+| text ↔ binary | `textToBinary(text, sep)` `"Hi"` → `"01001000 01101001"`, `binaryToText`, `bytesToBinary`, `binaryToBytes`, `intToBinary`, `binaryToInt`, `bytesToBits`, `bitsToBytes` |
+| image ↔ binary | `imageToBinary(img, threshold)` (rows of `0`/`1`, `1` = dark), `binaryToImage(text)`, `imageToBits`, `bitsToImage`, `imageToBytes`, `bytesToImage`, `packBits`, `unpackBits` |
+| text ↔ image | `textToImage(text, scale)` draws text with a built-in 5x7 font; `imageToText(img, scale)` reads it back (scale `0` = detect; noisy pictures are fine); `imageToTextWith(img, scale, recogniser)` lets **your network** recognise each character |
+| for networks | `textToVector`, `vectorToText`, `bitsToVector`, `vectorToBits`, `bitsToSigns`, `signsToBits` (Hopfield), `oneHot`, `fromOneHot`, `imageToVector`, `vectorToImage`, `glyphVector`, `glyphChar`, `fontSet(chars, x, t)` (training data for a character recogniser) |
+| files | `writePgm readPgm writePbm readPbm writeBmp readBmp` (BMP reads 1, 8, 24 and 32 bit) |
+| display | `toAscii(img, step)` |
+
+A `codec.Image` has `w`, `h` and one byte per pixel in `px` (0 = black); methods `get set fill copy crop scaleUp resize invert threshold`.
+
+```c
+codec.Image* page = codec.textToImage("CAFE 2024", 3);        // text -> picture
+println(codec.imageToText(page, 3));                          // picture -> text
+// let a trained network read it: int recognise(int* glyph) { return alphabet[net->predict(glyph)]; }
+println(codec.imageToTextWith(page, 3, recognise));
+```
 
 ## 12c. The C library
 

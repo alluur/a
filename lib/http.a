@@ -1,0 +1,573 @@
+// =============================================================================
+//  http - HTTP/1.1 client and server on top of net            import http;
+//
+//  Client (plain http:// only, no TLS):
+//    http.Response* r = http.get("http://example.org/index.html");     // follows up to 5 redirects
+//    http.Response* r = http.post(url, body, "application/json");
+//    http.Response* r = http.request("PUT", url, "X-Key: 1\r\n", body, bodyLen);
+//    r->status, r->body, r->bodyLen, r->headers, r->header("Content-Type")
+//    char* http.error()                          reason of the last failure (the call returned null)
+//
+//  Server:
+//    int s = net.listen(8080, 8);
+//    int c = net.accept(s);
+//    http.Request* q = new http.Request();
+//    if (http.readRequest(c, q)) { http.respond(c, 200, "text/plain", "hello"); }
+//    net.close(c);
+//    http.serve(8080, handler, n)                handler(http.Request* q, int client) answers n requests
+//
+//  Pieces: http.parseUrl, http.sendRequest / http.readResponse (client halves), http.statusText,
+//  http.queryValue(q, "name", buf, max), http.headerOf(rawHeaders, "Name", buf, max).
+// =============================================================================
+import net;
+import encoding;
+module http;
+
+private char lastError[128];
+
+public char* error() {
+    return &lastError[0];
+}
+
+private void fail(char* why) {
+    strcpy(&lastError[0], why);
+}
+
+// ---- URLs -----------------------------------------------------------------------------------------------------------
+public class Url {
+    public char scheme[16];
+    public char host[256];
+    public int port;
+    public char path[2048];
+}
+
+// splits "http://host:port/path?query". Returns false if the text is not an absolute http(s) URL
+public bool parseUrl(char* url, Url* u) {
+    int i = 0;
+    int k = 0;
+    while (url[i] != 0 && url[i] != ':' && k < 15) {
+        u->scheme[k] = toLower(url[i]);
+        k++;
+        i++;
+    }
+    u->scheme[k] = 0;
+    if (url[i] != ':' || url[i + 1] != '/' || url[i + 2] != '/') {
+        return false;
+    }
+    i = i + 3;
+    u->port = 80;
+    if (streq(&u->scheme[0], "https")) {
+        u->port = 443;
+    } else if (!streq(&u->scheme[0], "http")) {
+        return false;
+    }
+    k = 0;
+    while (url[i] != 0 && url[i] != '/' && url[i] != ':' && url[i] != '?' && k < 255) {
+        u->host[k] = url[i];
+        k++;
+        i++;
+    }
+    u->host[k] = 0;
+    if (k == 0) {
+        return false;
+    }
+    if (url[i] == ':') {
+        i++;
+        int p = 0;
+        while (isDigit(url[i])) {
+            p = p * 10 + (url[i] - '0');
+            i++;
+        }
+        u->port = p;
+    }
+    k = 0;
+    if (url[i] != '/') {
+        u->path[0] = '/';
+        k = 1;
+    }
+    while (url[i] != 0 && k < 2047) {
+        u->path[k] = url[i];
+        k++;
+        i++;
+    }
+    u->path[k] = 0;
+    return true;
+}
+
+public char* statusText(int code) {
+    if (code == 200) return "OK";
+    if (code == 201) return "Created";
+    if (code == 202) return "Accepted";
+    if (code == 204) return "No Content";
+    if (code == 301) return "Moved Permanently";
+    if (code == 302) return "Found";
+    if (code == 303) return "See Other";
+    if (code == 304) return "Not Modified";
+    if (code == 307) return "Temporary Redirect";
+    if (code == 308) return "Permanent Redirect";
+    if (code == 400) return "Bad Request";
+    if (code == 401) return "Unauthorized";
+    if (code == 403) return "Forbidden";
+    if (code == 404) return "Not Found";
+    if (code == 405) return "Method Not Allowed";
+    if (code == 408) return "Request Timeout";
+    if (code == 409) return "Conflict";
+    if (code == 413) return "Payload Too Large";
+    if (code == 418) return "I'm a teapot";
+    if (code == 429) return "Too Many Requests";
+    if (code == 500) return "Internal Server Error";
+    if (code == 501) return "Not Implemented";
+    if (code == 502) return "Bad Gateway";
+    if (code == 503) return "Service Unavailable";
+    return "Unknown";
+}
+
+// ---- headers -----------------------------------------------------------------------------------------------------
+private bool sameNameAt(char* s, char* name) {
+    int i = 0;
+    while (name[i] != 0) {
+        if (toLower(s[i]) != toLower(name[i])) {
+            return false;
+        }
+        i++;
+    }
+    return s[i] == ':';
+}
+
+// finds the header `name` (case does not matter) in raw header text ("A: b\r\nC: d\r\n") and copies its
+// value to out. Returns false if there is no such header
+public bool headerOf(char* raw, char* name, char* out, int max) {
+    int i = 0;
+    while (raw[i] != 0) {
+        if (sameNameAt(&raw[i], name)) {
+            int j = i + strlen(name) + 1;
+            while (raw[j] == ' ' || raw[j] == 9) {
+                j++;
+            }
+            int k = 0;
+            while (raw[j] != 0 && raw[j] != 13 && raw[j] != 10 && k < max - 1) {
+                out[k] = raw[j];
+                k++;
+                j++;
+            }
+            out[k] = 0;
+            return true;
+        }
+        while (raw[i] != 0 && raw[i] != 10) {
+            i++;
+        }
+        if (raw[i] == 10) {
+            i++;
+        }
+    }
+    return false;
+}
+
+// ---- reading helpers -----------------------------------------------------------------------------------------
+// a growing buffer
+private class Buf {
+    public char* data;
+    public int len;
+    public int cap;
+    public Buf() { cap = 4096; data = alloc(cap + 1); len = 0; }
+    public void add(char* p, int n) {
+        if (len + n > cap) {
+            int nc = cap * 2;
+            while (nc < len + n) {
+                nc = nc * 2;
+            }
+            char* nd = alloc(nc + 1);
+            memcpy(nd, data, len);
+            data = nd;
+            cap = nc;
+        }
+        memcpy(&data[len], p, n);
+        len = len + n;
+        data[len] = 0;
+    }
+}
+
+private int hexVal(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// reads exactly n bytes, returns the number actually read
+private int recvAll(int h, char* buf, int n) {
+    int got = 0;
+    while (got < n) {
+        int r = net.recv(h, &buf[got], n - got);
+        if (r <= 0) {
+            break;
+        }
+        got = got + r;
+    }
+    return got;
+}
+
+// reads the header block (up to the empty line) as raw text "A: b\r\nC: d\r\n" without the first line;
+// the first line goes to first (max bytes). Returns the raw headers or null
+private char* readHead(int h, char* first, int max) {
+    if (net.recvLine(h, first, max) < 0) {
+        return null;
+    }
+    Buf* b = new Buf();
+    char line[4096];
+    for (;;) {
+        int n = net.recvLine(h, &line[0], 4096);
+        if (n < 0) {
+            return null;
+        }
+        if (n == 0) {
+            break;
+        }
+        b->add(&line[0], n);
+        b->add("\r\n", 2);
+    }
+    return b->data;
+}
+
+// ---- client ---------------------------------------------------------------------------------------------------------
+public class Response {
+    public int status;
+    public char* headers;
+    public char* body;
+    public int bodyLen;
+    public char* header(char* name) {
+        char tmp[1024];
+        if (headerOf(headers, name, &tmp[0], 1024)) {
+            return strdup(&tmp[0]);
+        }
+        return null;
+    }
+}
+
+// sends "METHOD path HTTP/1.1" with Host, Connection: close, Content-Length (when body != null) and your own
+// header lines (each ending in \r\n, or "")
+public bool sendRequest(int h, char* method, char* host, char* path, char* extra, char* body, int bodyLen) {
+    net.sendText(h, method);
+    net.sendText(h, " ");
+    net.sendText(h, path);
+    net.sendText(h, " HTTP/1.1\r\nHost: ");
+    net.sendText(h, host);
+    net.sendText(h, "\r\nConnection: close\r\nUser-Agent: A-http/1.0\r\n");
+    if (extra != null) {
+        net.sendText(h, extra);
+    }
+    if (body != null) {
+        char num[32];
+        intToStr(bodyLen, &num[0]);
+        net.sendText(h, "Content-Length: ");
+        net.sendText(h, &num[0]);
+        net.sendText(h, "\r\n");
+    }
+    net.sendText(h, "\r\n");
+    if (body != null && bodyLen > 0) {
+        return net.send(h, body, bodyLen) == bodyLen;
+    }
+    return true;
+}
+
+// reads a whole response: status line, headers and the body (Content-Length, chunked or until the connection closes)
+public Response* readResponse(int h) {
+    char first[256];
+    char* raw = readHead(h, &first[0], 256);
+    if (raw == null) {
+        fail("connection closed before the response");
+        return null;
+    }
+    if (!startsWith(&first[0], "HTTP/")) {
+        fail("not an HTTP response");
+        return null;
+    }
+    Response* r = new Response();
+    int sp = indexOf(&first[0], ' ');
+    if (sp < 0) {
+        fail("bad status line");
+        return null;
+    }
+    r->status = atoi(&first[sp + 1]);
+    r->headers = raw;
+    char val[256];
+    Buf* body = new Buf();
+    if (headerOf(raw, "Transfer-Encoding", &val[0], 256) && contains(&val[0], "chunked")) {
+        for (;;) {
+            char line[64];
+            if (net.recvLine(h, &line[0], 64) < 0) {
+                break;
+            }
+            int size = 0;
+            int i = 0;
+            while (hexVal(line[i]) >= 0) {
+                size = size * 16 + hexVal(line[i]);
+                i++;
+            }
+            if (size == 0) {
+                // trailer lines up to the empty line
+                char t[256];
+                while (net.recvLine(h, &t[0], 256) > 0) { }
+                break;
+            }
+            char* piece = alloc(size + 1);
+            int got = recvAll(h, piece, size);
+            body->add(piece, got);
+            net.recvLine(h, &line[0], 64);                  // the CRLF after the chunk
+            if (got < size) {
+                break;
+            }
+        }
+    } else if (headerOf(raw, "Content-Length", &val[0], 256)) {
+        int n = atoi(&val[0]);
+        if (n > 0) {
+            char* piece = alloc(n + 1);
+            int got = recvAll(h, piece, n);
+            body->add(piece, got);
+        }
+    } else {
+        char buf[4096];
+        for (;;) {
+            int got = net.recv(h, &buf[0], 4096);
+            if (got <= 0) {
+                break;
+            }
+            body->add(&buf[0], got);
+        }
+    }
+    r->body = body->data;
+    r->bodyLen = body->len;
+    return r;
+}
+
+// one request on a fresh connection
+public Response* request(char* method, char* url, char* extra, char* body, int bodyLen) {
+    Url* u = new Url();
+    if (!parseUrl(url, u)) {
+        fail("not an http:// URL");
+        return null;
+    }
+    if (streq(&u->scheme[0], "https")) {
+        fail("https is not supported (no TLS)");
+        return null;
+    }
+    int h = net.connect(&u->host[0], u->port);
+    if (h < 0) {
+        fail("cannot connect");
+        return null;
+    }
+    net.setTimeout(h, 15000);
+    if (!sendRequest(h, method, &u->host[0], &u->path[0], extra, body, bodyLen)) {
+        net.close(h);
+        fail("sending the request failed");
+        return null;
+    }
+    Response* r = readResponse(h);
+    net.close(h);
+    return r;
+}
+
+// GET, following up to 5 redirects to http:// locations
+public Response* get(char* url) {
+    char* cur = strdup(url);
+    for (int hop = 0; hop < 6; hop++) {
+        Response* r = request("GET", cur, null, null, 0);
+        if (r == null) {
+            return null;
+        }
+        if (r->status == 301 || r->status == 302 || r->status == 303 || r->status == 307 || r->status == 308) {
+            char loc[2048];
+            if (!headerOf(r->headers, "Location", &loc[0], 2048)) {
+                return r;
+            }
+            if (startsWith(&loc[0], "http://")) {
+                cur = strdup(&loc[0]);
+            } else if (loc[0] == '/') {
+                Url* u = new Url();
+                parseUrl(cur, u);
+                char* nu = alloc(4400);
+                format(nu, 4400, "http://%s:%d%s", &u->host[0], u->port, &loc[0]);
+                cur = nu;
+            } else {
+                return r;
+            }
+        } else {
+            return r;
+        }
+    }
+    fail("too many redirects");
+    return null;
+}
+
+public Response* post(char* url, char* body, char* contentType) {
+    char* extra = alloc(256);
+    format(extra, 256, "Content-Type: %s\r\n", contentType);
+    return request("POST", url, extra, body, strlen(body));
+}
+
+// ---- server ---------------------------------------------------------------------------------------------------------
+public class Request {
+    public char method[16];
+    public char path[1024];          // without the query
+    public char query[1024];         // after the ? (still URL encoded)
+    public char version[16];
+    public char* headers;            // raw header lines
+    public char* body;
+    public int bodyLen;
+    public char* header(char* name) {
+        char tmp[1024];
+        if (headerOf(headers, name, &tmp[0], 1024)) {
+            return strdup(&tmp[0]);
+        }
+        return null;
+    }
+}
+
+// reads one request from a connection that net.accept returned. Returns false if the client sent nothing useful
+public bool readRequest(int h, Request* q) {
+    char first[2200];
+    char* raw = readHead(h, &first[0], 2200);
+    if (raw == null) {
+        return false;
+    }
+    // METHOD SP target SP version
+    int i = 0;
+    int k = 0;
+    while (first[i] != ' ' && first[i] != 0 && k < 15) {
+        q->method[k] = first[i];
+        k++;
+        i++;
+    }
+    q->method[k] = 0;
+    if (first[i] != ' ') {
+        return false;
+    }
+    i++;
+    k = 0;
+    while (first[i] != ' ' && first[i] != 0 && first[i] != '?' && k < 1023) {
+        q->path[k] = first[i];
+        k++;
+        i++;
+    }
+    q->path[k] = 0;
+    q->query[0] = 0;
+    if (first[i] == '?') {
+        i++;
+        k = 0;
+        while (first[i] != ' ' && first[i] != 0 && k < 1023) {
+            q->query[k] = first[i];
+            k++;
+            i++;
+        }
+        q->query[k] = 0;
+    }
+    while (first[i] != 0 && first[i] != ' ') {
+        i++;
+    }
+    if (first[i] == ' ') {
+        i++;
+    }
+    strcpy(&q->version[0], "HTTP/1.1");
+    if (startsWith(&first[i], "HTTP/")) {
+        k = 0;
+        while (first[i] != 0 && k < 15) {
+            q->version[k] = first[i];
+            k++;
+            i++;
+        }
+        q->version[k] = 0;
+    }
+    q->headers = raw;
+    q->bodyLen = 0;
+    q->body = "";
+    char val[64];
+    if (headerOf(raw, "Content-Length", &val[0], 64)) {
+        int n = atoi(&val[0]);
+        if (n > 0) {
+            if (n > 64 * 1024 * 1024) {
+                return false;
+            }
+            char* b = alloc(n + 1);
+            q->bodyLen = recvAll(h, b, n);
+            q->body = b;
+        }
+    }
+    return true;
+}
+
+// the value of a query parameter ("a=1&b=two"), URL decoded, into out. Returns false if it is not there
+public bool queryValue(Request* q, char* name, char* out, int max) {
+    int nl = strlen(name);
+    int i = 0;
+    while (q->query[i] != 0) {
+        if (startsWith(&q->query[i], name) && q->query[i + nl] == '=') {
+            int j = i + nl + 1;
+            int e = j;
+            while (q->query[e] != 0 && q->query[e] != '&') {
+                e++;
+            }
+            char* raw = alloc(e - j + 1);
+            memcpy(raw, &q->query[j], e - j);
+            raw[e - j] = 0;
+            char* dec = encoding.urlDecode(raw);
+            int k = 0;
+            while (dec[k] != 0 && k < max - 1) {
+                out[k] = dec[k];
+                k++;
+            }
+            out[k] = 0;
+            return true;
+        }
+        while (q->query[i] != 0 && q->query[i] != '&') {
+            i++;
+        }
+        if (q->query[i] == '&') {
+            i++;
+        }
+    }
+    return false;
+}
+
+// sends a complete response and nothing else (the connection is for you to close)
+public bool respondBytes(int h, int status, char* contentType, char* body, int n) {
+    char head[512];
+    format(&head[0], 512, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\nServer: A-http/1.0\r\n\r\n",
+           status, statusText(status), contentType, n);
+    if (!net.sendText(h, &head[0])) {
+        return false;
+    }
+    if (n > 0) {
+        return net.send(h, body, n) == n;
+    }
+    return true;
+}
+
+public bool respond(int h, int status, char* contentType, char* body) {
+    return respondBytes(h, status, contentType, body, strlen(body));
+}
+
+// answers `count` requests on a port (count <= 0: forever). The handler is called as handler(request, client)
+// and has to send the response with respond()
+public void serve(int port, func handler, int count) {
+    int s = net.listen(port, 16);
+    if (s < 0) {
+        return;
+    }
+    int served = 0;
+    while (count <= 0 || served < count) {
+        int c = net.accept(s);
+        if (c < 0) {
+            break;
+        }
+        net.setTimeout(c, 15000);
+        Request* q = new Request();
+        if (readRequest(c, q)) {
+            handler(q, c);
+        } else {
+            respond(c, 400, "text/plain", "bad request");
+        }
+        net.close(c);
+        served++;
+    }
+    net.close(s);
+}

@@ -1,0 +1,1112 @@
+// =============================================================================
+//  nn - neural networks in fixed-point arithmetic                  import nn;
+//
+//  All real numbers are fixed-point ints (see the fixed module: 1.0 = fixed.ONE). Vectors, images and
+//  matrices are plain int arrays, so the output of the codec module can be fed in directly.
+//
+//  Network kinds
+//    nn.Perceptron      one neuron with a step output (linear classification)
+//    nn.Network         multi-layer feed-forward network (MLP), back-propagation with momentum,
+//                       sigmoid / tanh / relu / leaky relu / linear / softmax layers, MSE or cross-entropy loss
+//    nn.Autoencoder     MLP that learns to squeeze data into a short code and rebuild it
+//    nn.Hopfield        associative memory that restores noisy patterns
+//    nn.SOM             self-organizing (Kohonen) map: clusters data on a 2D grid
+//    nn.Elman           simple recurrent network for sequences, back-propagation through time
+//    nn.ConvNet         small convolutional network: conv -> relu -> max-pool -> dense softmax
+//
+//  Example (XOR):
+//     int sizes[3]; sizes[0] = 2; sizes[1] = 4; sizes[2] = 1;
+//     nn.Network* net = new nn.Network(3, sizes, nn.ACT_TANH, nn.ACT_SIGMOID);
+//     net->fit(inputs, targets, 4, 3000, fixed.fromText("0.5"));
+//     int* y = net->forward(x);                 // y[0] is a fixed-point number
+// =============================================================================
+import fixed;
+module nn;
+a_import('fixed.a', 'mul, div, exp, log, sqrt, sigmoid, tanh, ONE, FB, HALF');
+
+public const ACT_LINEAR = 0;
+public const ACT_SIGMOID = 1;
+public const ACT_TANH = 2;
+public const ACT_RELU = 3;
+public const ACT_LEAKY = 4;
+public const ACT_SOFTMAX = 5;
+public const LOSS_MSE = 0;
+public const LOSS_CE = 1;
+
+// ---- helpers ------------------------------------------------------------------------------------------------------------
+// a zeroed vector of n fixed-point numbers
+public int* vec(int n) {
+    return alloc((n + 1) * 8);
+}
+
+private int actFn(int kind, int x) {
+    if (kind == ACT_SIGMOID) return sigmoid(x);
+    if (kind == ACT_TANH) return tanh(x);
+    if (kind == ACT_RELU) { if (x < 0) return 0; return x; }
+    if (kind == ACT_LEAKY) { if (x < 0) return x / 16; return x; }
+    return x;
+}
+
+// derivative of the activation, computed from its OUTPUT y
+private int actDeriv(int kind, int y) {
+    if (kind == ACT_SIGMOID) return mul(y, ONE - y);
+    if (kind == ACT_TANH) return ONE - mul(y, y);
+    if (kind == ACT_RELU) { if (y > 0) return ONE; return 0; }
+    if (kind == ACT_LEAKY) { if (y > 0) return ONE; return ONE / 16; }
+    return ONE;
+}
+
+// index of the largest of n numbers
+public int argmax(int* v, int n) {
+    int best = 0;
+    for (int i = 1; i < n; i++) {
+        if (v[i] > v[best]) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+// softmax of n numbers in place
+public void softmax(int* v, int n) {
+    int m = v[0];
+    for (int i = 1; i < n; i++) {
+        if (v[i] > m) m = v[i];
+    }
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        v[i] = exp(v[i] - m);
+        sum = sum + v[i];
+    }
+    if (sum == 0) sum = 1;
+    for (int i = 0; i < n; i++) {
+        v[i] = div(v[i], sum);
+    }
+}
+
+// sum of squared differences / 2 between two vectors
+public int mseLoss(int* y, int* t, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+        int d = y[i] - t[i];
+        s = s + mul(d, d) / 2;
+    }
+    return s;
+}
+
+// cross-entropy -sum(t ln y)
+public int ceLoss(int* y, int* t, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+        if (t[i] > 0) {
+            int yy = y[i];
+            if (yy < 1) yy = 1;
+            s = s - mul(t[i], log(yy));
+        }
+    }
+    return s;
+}
+
+// a random permutation of 0 .. n-1
+private void shuffled(int* order, int n) {
+    for (int i = 0; i < n; i++) order[i] = i;
+    for (int i = n - 1; i > 0; i--) {
+        int j = fixed.next() % (i + 1);
+        int t = order[i];
+        order[i] = order[j];
+        order[j] = t;
+    }
+}
+
+private int clip(int x, int lim) {
+    if (x > lim) return lim;
+    if (x < -lim) return -lim;
+    return x;
+}
+
+// temporary vectors for one training step: take() hands out zeroed room, reset() makes it all reusable
+// (the heap of A never frees, so the networks keep one of these instead of allocating per step)
+private class Scratch {
+    public int* buf;
+    public int cap;
+    public int pos;
+    public Scratch() { cap = 4096; buf = alloc(cap * 8 + 8); }
+    public void reset() { pos = 0; }
+    public int* take(int n) {
+        if (pos + n > cap) {
+            cap = cap * 2;
+            if (cap < n + 1024) cap = n + 1024;
+            buf = alloc(cap * 8 + 8);
+            pos = 0;
+        }
+        int* p = &buf[pos];
+        for (int i = 0; i < n; i++) p[i] = 0;
+        pos = pos + n;
+        return p;
+    }
+}
+
+// ===========================================================================================================================
+//  Perceptron
+// ===========================================================================================================================
+public class Perceptron {
+    public int n;
+    public int* w;              // n weights followed by the bias
+    public Perceptron(int inputs) {
+        n = inputs;
+        w = vec(inputs + 1);
+    }
+    // the weighted sum (before the step)
+    public int sum(int* x) {
+        int s = w[n];
+        for (int i = 0; i < n; i++) {
+            s = s + mul(w[i], x[i]);
+        }
+        return s;
+    }
+    // 1 if the sum is positive, otherwise 0
+    public int predict(int* x) {
+        if (sum(x) > 0) return 1;
+        return 0;
+    }
+    // one learning step with the perceptron rule; returns true if the sample was already right
+    public bool train(int* x, int target, int rate) {
+        int err = target - predict(x);
+        if (err == 0) return true;
+        for (int i = 0; i < n; i++) {
+            w[i] = w[i] + err * mul(rate, x[i]);
+        }
+        w[n] = w[n] + err * rate;
+        return false;
+    }
+    // epochs over count samples (x is count * n numbers, t holds 0 / 1). Returns the epochs used (stops
+    // when a whole epoch had no mistakes)
+    public int fit(int* x, int* t, int count, int epochs, int rate) {
+        for (int e = 1; e <= epochs; e++) {
+            int wrong = 0;
+            for (int s = 0; s < count; s++) {
+                if (!train(&x[s * n], t[s], rate)) wrong++;
+            }
+            if (wrong == 0) return e;
+        }
+        return epochs;
+    }
+}
+
+// ===========================================================================================================================
+//  Network: multi-layer perceptron
+// ===========================================================================================================================
+public class Network {
+    public int nl;                  // weight layers
+    public int* sizes;              // nl + 1 layer sizes
+    public int* acts;               // activation per weight layer (index 1 .. nl)
+    public int* wOff;
+    public int* bOff;
+    public int* aOff;
+    public int* W;
+    public int* B;
+    public int* VW;
+    public int* VB;
+    public int* A;                  // activations of every layer (layer 0 = the input)
+    public int* D;                  // deltas
+    public int loss;
+    public int momentum;
+    public int nW;
+    public int nB;
+    public int nA;
+
+    // sz = layer sizes (count entries, input first), hidden / out = activation kinds
+    public Network(int count, int* sz, int hidden, int out) {
+        nl = count - 1;
+        sizes = alloc((count + 1) * 8);
+        acts = alloc((count + 1) * 8);
+        wOff = alloc((count + 1) * 8);
+        bOff = alloc((count + 1) * 8);
+        aOff = alloc((count + 1) * 8);
+        nW = 0; nB = 0; nA = 0;
+        for (int l = 0; l < count; l++) {
+            sizes[l] = sz[l];
+            aOff[l] = nA;
+            nA = nA + sz[l];
+            if (l > 0) {
+                wOff[l] = nW;
+                bOff[l] = nB;
+                nW = nW + sz[l] * sz[l - 1];
+                nB = nB + sz[l];
+                acts[l] = hidden;
+            }
+        }
+        acts[nl] = out;
+        W = vec(nW); B = vec(nB); VW = vec(nW); VB = vec(nB);
+        A = vec(nA); D = vec(nA);
+        loss = LOSS_MSE;
+        if (out == ACT_SOFTMAX) loss = LOSS_CE;
+        momentum = fixed.fromText("0.5");
+        randomize();
+    }
+
+    // new random weights (Xavier style)
+    public void randomize() {
+        for (int l = 1; l <= nl; l++) {
+            int scale = sqrt(div(2 * ONE, fixed.fromInt(sizes[l - 1] + sizes[l])));
+            for (int k = 0; k < sizes[l] * sizes[l - 1]; k++) {
+                W[wOff[l] + k] = mul(fixed.gauss(), scale);
+            }
+        }
+        for (int k = 0; k < nW; k++) VW[k] = 0;
+        for (int k = 0; k < nB; k++) { B[k] = 0; VB[k] = 0; }
+        // a small positive bias keeps relu units from starting dead
+        for (int l = 1; l < nl; l++) {
+            if (acts[l] == ACT_RELU || acts[l] == ACT_LEAKY) {
+                for (int j = 0; j < sizes[l]; j++) B[bOff[l] + j] = ONE / 10;
+            }
+        }
+    }
+
+    public int inputSize() { return sizes[0]; }
+    public int outputSize() { return sizes[nl]; }
+    public int parameters() { return nW + nB; }
+
+    // runs layers l0 + 1 .. nl on the activations that are already in layer l0
+    public void forwardFrom(int l0) {
+        for (int l = l0 + 1; l <= nl; l++) {
+            int in = sizes[l - 1];
+            int out = sizes[l];
+            int ao = aOff[l];
+            int ap = aOff[l - 1];
+            for (int j = 0; j < out; j++) {
+                int s = 0;
+                int base = wOff[l] + j * in;
+                for (int i = 0; i < in; i++) {
+                    s = s + W[base + i] * A[ap + i];
+                }
+                A[ao + j] = (s >> FB) + B[bOff[l] + j];
+            }
+            if (acts[l] == ACT_SOFTMAX) {
+                softmax(&A[ao], out);
+            } else {
+                for (int j = 0; j < out; j++) {
+                    A[ao + j] = actFn(acts[l], A[ao + j]);
+                }
+            }
+        }
+    }
+
+    // runs the network, returns a pointer to the output layer (valid until the next call)
+    public int* forward(int* x) {
+        for (int i = 0; i < sizes[0]; i++) A[i] = x[i];
+        forwardFrom(0);
+        return &A[aOff[nl]];
+    }
+
+    // the index of the strongest output
+    public int predict(int* x) {
+        int* y = forward(x);
+        return argmax(y, sizes[nl]);
+    }
+
+    public int sampleLoss(int* t) {
+        int* y = &A[aOff[nl]];
+        if (loss == LOSS_CE) return ceLoss(y, t, sizes[nl]);
+        return mseLoss(y, t, sizes[nl]);
+    }
+
+    // loss of one sample without learning
+    public int evaluate(int* x, int* t) {
+        forward(x);
+        return sampleLoss(t);
+    }
+
+    // one learning step on one sample, returns its loss before the step
+    public int train(int* x, int* t, int rate) {
+        forward(x);
+        int l0 = sampleLoss(t);
+        int no = sizes[nl];
+        // output deltas
+        int ao = aOff[nl];
+        for (int j = 0; j < no; j++) {
+            int y = A[ao + j];
+            int d = y - t[j];
+            if (acts[nl] != ACT_SOFTMAX && !(loss == LOSS_CE && acts[nl] == ACT_SIGMOID)) {
+                d = mul(d, actDeriv(acts[nl], y));
+            }
+            D[ao + j] = d;
+        }
+        // hidden deltas
+        for (int l = nl - 1; l >= 1; l--) {
+            int out = sizes[l];
+            int nxt = sizes[l + 1];
+            for (int i = 0; i < out; i++) {
+                int s = 0;
+                for (int j = 0; j < nxt; j++) {
+                    s = s + W[wOff[l + 1] + j * out + i] * D[aOff[l + 1] + j];
+                }
+                D[aOff[l] + i] = mul(s >> FB, actDeriv(acts[l], A[aOff[l] + i]));
+            }
+        }
+        // weight updates (with momentum)
+        for (int l = 1; l <= nl; l++) {
+            int in = sizes[l - 1];
+            int out = sizes[l];
+            for (int j = 0; j < out; j++) {
+                int dj = D[aOff[l] + j];
+                int base = wOff[l] + j * in;
+                for (int i = 0; i < in; i++) {
+                    int g = mul(dj, A[aOff[l - 1] + i]);
+                    int v = mul(momentum, VW[base + i]) - mul(rate, g);
+                    VW[base + i] = v;
+                    W[base + i] = W[base + i] + v;
+                }
+                int vb = mul(momentum, VB[bOff[l] + j]) - mul(rate, dj);
+                VB[bOff[l] + j] = vb;
+                B[bOff[l] + j] = B[bOff[l] + j] + vb;
+            }
+        }
+        return l0;
+    }
+
+    // one pass over count samples in random order; returns the mean loss
+    public int trainEpoch(int* x, int* t, int count, int rate) {
+        int* order = alloc((count + 1) * 8);
+        shuffled(order, count);
+        int total = 0;
+        int ni = sizes[0];
+        int no = sizes[nl];
+        for (int k = 0; k < count; k++) {
+            int s = order[k];
+            total = total + train(&x[s * ni], &t[s * no], rate);
+        }
+        return total / count;
+    }
+
+    // epochs of training; stops early when the mean loss falls below `stopBelow` (0 = never).
+    // Returns the final mean loss
+    public int fit(int* x, int* t, int count, int epochs, int rate, int stopBelow) {
+        int l = 0;
+        for (int e = 0; e < epochs; e++) {
+            l = trainEpoch(x, t, count, rate);
+            if (stopBelow > 0 && l < stopBelow) break;
+        }
+        return l;
+    }
+
+    // percentage (0 .. 100) of samples whose strongest output is the strongest target
+    public int accuracy(int* x, int* t, int count) {
+        int ni = sizes[0];
+        int no = sizes[nl];
+        int ok = 0;
+        for (int s = 0; s < count; s++) {
+            if (predict(&x[s * ni]) == argmax(&t[s * no], no)) ok++;
+        }
+        return ok * 100 / count;
+    }
+
+    // saves the layer sizes, activations and weights; returns false if the file cannot be written
+    public bool save(char* path) {
+        int h = fileOpen(path, FILE_WRITE);
+        if (h < 0) return false;
+        int hdr[2];
+        hdr[0] = 0x314E4E41;                // "ANN1"
+        hdr[1] = nl;
+        fileWrite(h, &hdr[0], 16);
+        fileWrite(h, sizes, (nl + 1) * 8);
+        fileWrite(h, acts, (nl + 1) * 8);
+        fileWrite(h, W, nW * 8);
+        fileWrite(h, B, nB * 8);
+        fileClose(h);
+        return true;
+    }
+
+    // loads weights saved by a network of the same shape. Returns false on a mismatch
+    public bool load(char* path) {
+        int h = fileOpen(path, FILE_READ);
+        if (h < 0) return false;
+        int hdr[2];
+        if (fileRead(h, &hdr[0], 16) != 16 || hdr[0] != 0x314E4E41 || hdr[1] != nl) {
+            fileClose(h);
+            return false;
+        }
+        int* sz = vec(nl + 1);
+        fileRead(h, sz, (nl + 1) * 8);
+        for (int l = 0; l <= nl; l++) {
+            if (sz[l] != sizes[l]) {
+                fileClose(h);
+                return false;
+            }
+        }
+        fileRead(h, acts, (nl + 1) * 8);
+        readAll(h, W, nW * 8);
+        readAll(h, B, nB * 8);
+        fileClose(h);
+        return true;
+    }
+
+    private void readAll(int h, int* dst, int bytes) {
+        char* p = dst;
+        int got = 0;
+        while (got < bytes) {
+            int r = fileRead(h, &p[got], bytes - got);
+            if (r <= 0) break;
+            got = got + r;
+        }
+    }
+}
+
+// ===========================================================================================================================
+//  Autoencoder
+// ===========================================================================================================================
+public class Autoencoder {
+    public Network* net;
+    public int codeLayer;
+    public int inputs;
+    public int codeSize;
+
+    // inputs -> hidden -> code -> hidden -> inputs (hidden = 0: no hidden layer)
+    public Autoencoder(int nIn, int hidden, int code) {
+        inputs = nIn;
+        codeSize = code;
+        int sz[5];
+        if (hidden > 0) {
+            sz[0] = nIn; sz[1] = hidden; sz[2] = code; sz[3] = hidden; sz[4] = nIn;
+            net = new Network(5, sz, ACT_TANH, ACT_SIGMOID);
+            codeLayer = 2;
+        } else {
+            sz[0] = nIn; sz[1] = code; sz[2] = nIn;
+            net = new Network(3, sz, ACT_TANH, ACT_SIGMOID);
+            codeLayer = 1;
+        }
+    }
+    // one learning step to rebuild x from itself, returns the loss
+    public int train(int* x, int rate) {
+        return net->train(x, x, rate);
+    }
+    public int fit(int* x, int count, int epochs, int rate) {
+        return net->fit(x, x, count, epochs, rate, 0);
+    }
+    // the code of x (a pointer into the network, valid until the next call)
+    public int* encode(int* x) {
+        net->forward(x);
+        return &net->A[net->aOff[codeLayer]];
+    }
+    // rebuilds data from a code
+    public int* decode(int* code) {
+        int off = net->aOff[codeLayer];
+        for (int i = 0; i < codeSize; i++) net->A[off + i] = code[i];
+        net->forwardFrom(codeLayer);
+        return &net->A[net->aOff[net->nl]];
+    }
+    // x passed through code and back
+    public int* reconstruct(int* x) {
+        return net->forward(x);
+    }
+    public int loss(int* x) {
+        return net->evaluate(x, x);
+    }
+}
+
+// ===========================================================================================================================
+//  Hopfield network: patterns of +1 / -1
+// ===========================================================================================================================
+public class Hopfield {
+    public int n;
+    public int* w;                  // n * n integer weights
+    public int stored;
+    public Hopfield(int size) {
+        n = size;
+        w = alloc(size * size * 8 + 8);
+    }
+    // learns a pattern of n values, each +1 or -1 (Hebb rule)
+    public void store(int* p) {
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                if (i != j) {
+                    w[i * n + j] = w[i * n + j] + p[i] * p[j];
+                }
+            }
+        }
+        stored++;
+    }
+    // total energy of a state (lower = more stable)
+    public int energy(int* s) {
+        int e = 0;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                e = e - w[i * n + j] * s[i] * s[j];
+            }
+        }
+        return e / 2;
+    }
+    // updates the state in place, one neuron at a time, until nothing changes (or maxSweeps).
+    // Returns the number of sweeps that were needed
+    public int recall(int* s, int maxSweeps) {
+        for (int sweep = 1; sweep <= maxSweeps; sweep++) {
+            bool changed = false;
+            for (int i = 0; i < n; i++) {
+                int a = 0;
+                for (int j = 0; j < n; j++) {
+                    a = a + w[i * n + j] * s[j];
+                }
+                int v = s[i];
+                if (a > 0) v = 1;
+                if (a < 0) v = -1;
+                if (v != s[i]) {
+                    s[i] = v;
+                    changed = true;
+                }
+            }
+            if (!changed) return sweep;
+        }
+        return maxSweeps;
+    }
+}
+
+// ===========================================================================================================================
+//  Self-organizing map
+// ===========================================================================================================================
+public class SOM {
+    public int gw;                  // grid width
+    public int gh;                  // grid height
+    public int dim;                 // length of the data vectors
+    public int* w;                  // gw * gh * dim weights
+
+    public SOM(int width, int height, int dimension) {
+        gw = width;
+        gh = height;
+        dim = dimension;
+        w = vec(width * height * dimension);
+        for (int k = 0; k < width * height * dimension; k++) {
+            w[k] = fixed.rand();
+        }
+    }
+
+    // squared distance between the data vector x and the unit u
+    public int distance(int* x, int u) {
+        int d = 0;
+        for (int i = 0; i < dim; i++) {
+            int e = x[i] - w[u * dim + i];
+            d = d + mul(e, e);
+        }
+        return d;
+    }
+
+    // the best matching unit (index y * width + x)
+    public int bmu(int* x) {
+        int best = 0;
+        int bd = distance(x, 0);
+        for (int u = 1; u < gw * gh; u++) {
+            int d = distance(x, u);
+            if (d < bd) {
+                bd = d;
+                best = u;
+            }
+        }
+        return best;
+    }
+
+    // one training step; rate and radius (in grid cells) are fixed-point numbers
+    public void train(int* x, int rate, int radius) {
+        int b = bmu(x);
+        int bx = b % gw;
+        int by = b / gw;
+        int two = 2 * mul(radius, radius);
+        if (two < 1) two = 1;
+        for (int u = 0; u < gw * gh; u++) {
+            int dx = u % gw - bx;
+            int dy = u / gw - by;
+            int d2 = fixed.fromInt(dx * dx + dy * dy);
+            int h = exp(-div(d2, two));
+            if (h < 2000) continue;
+            int f = mul(rate, h);
+            for (int i = 0; i < dim; i++) {
+                w[u * dim + i] = w[u * dim + i] + mul(f, x[i] - w[u * dim + i]);
+            }
+        }
+    }
+
+    // trains for epochs with a rate and neighbourhood radius that shrink linearly to a small value
+    public void fit(int* data, int count, int epochs, int rate0, int radius0) {
+        int* order = alloc((count + 1) * 8);
+        int total = epochs * count;
+        int step = 0;
+        for (int e = 0; e < epochs; e++) {
+            shuffled(order, count);
+            for (int k = 0; k < count; k++) {
+                int frac = ONE - ratio(step, total);
+                int rate = mul(rate0, frac);
+                if (rate < 1000) rate = 1000;
+                int radius = mul(radius0, frac);
+                if (radius < HALF) radius = HALF;
+                train(&data[order[k] * dim], rate, radius);
+                step++;
+            }
+        }
+    }
+
+    // mean distance of the data to their best matching units
+    public int quantizationError(int* data, int count) {
+        int s = 0;
+        for (int k = 0; k < count; k++) {
+            int* x = &data[k * dim];
+            s = s + sqrt(distance(x, bmu(x)));
+        }
+        return s / count;
+    }
+}
+
+private int ratio(int a, int b) {
+    return (a << FB) / b;
+}
+
+// ===========================================================================================================================
+//  Elman recurrent network
+// ===========================================================================================================================
+public class Elman {
+    public int nin;
+    public int nhid;
+    public int nout;
+    public int* Wxh;                // nhid * nin
+    public int* Whh;                // nhid * nhid
+    public int* Why;                // nout * nhid
+    public int* bh;
+    public int* by;
+    public int* h;                  // the current hidden state
+    public bool softmaxOut;         // true: softmax output and cross-entropy, false: linear output and MSE
+    public int clipLimit;
+    private Scratch* scr;
+
+    public Elman(int inputs, int hidden, int outputs) {
+        nin = inputs; nhid = hidden; nout = outputs;
+        Wxh = vec(hidden * inputs);
+        Whh = vec(hidden * hidden);
+        Why = vec(outputs * hidden);
+        bh = vec(hidden);
+        by = vec(outputs);
+        h = vec(hidden);
+        clipLimit = 5 * ONE;
+        scr = new Scratch();
+        int s1 = sqrt(div(ONE, fixed.fromInt(inputs + hidden)));
+        for (int k = 0; k < hidden * inputs; k++) Wxh[k] = mul(fixed.gauss(), s1);
+        for (int k = 0; k < hidden * hidden; k++) Whh[k] = mul(fixed.gauss(), s1);
+        int s2 = sqrt(div(ONE, fixed.fromInt(hidden)));
+        for (int k = 0; k < outputs * hidden; k++) Why[k] = mul(fixed.gauss(), s2);
+    }
+
+    public void resetState() {
+        for (int i = 0; i < nhid; i++) h[i] = 0;
+    }
+
+    // one time step: consumes x, updates the hidden state, writes the output to y (nout numbers)
+    public void step(int* x, int* y) {
+        scr->reset();
+        int* nh = scr->take(nhid);
+        for (int j = 0; j < nhid; j++) {
+            int s = 0;
+            for (int i = 0; i < nin; i++) s = s + Wxh[j * nin + i] * x[i];
+            for (int i = 0; i < nhid; i++) s = s + Whh[j * nhid + i] * h[i];
+            nh[j] = tanh((s >> FB) + bh[j]);
+        }
+        for (int j = 0; j < nhid; j++) h[j] = nh[j];
+        for (int k = 0; k < nout; k++) {
+            int s = 0;
+            for (int j = 0; j < nhid; j++) s = s + Why[k * nhid + j] * h[j];
+            y[k] = (s >> FB) + by[k];
+        }
+        if (softmaxOut) softmax(y, nout);
+    }
+
+    // runs a whole sequence of T steps (xs = T * nin numbers) from a zero state, outputs into ys (T * nout)
+    public void run(int* xs, int T, int* ys) {
+        resetState();
+        for (int t = 0; t < T; t++) step(&xs[t * nin], &ys[t * nout]);
+    }
+
+    // one training step on a whole sequence (back-propagation through time). xs = T * nin numbers,
+    // ts = T * nout targets. Returns the mean loss per step before the update
+    public int trainSequence(int* xs, int* ts, int T, int rate) {
+        scr->reset();
+        int* hs = scr->take((T + 1) * nhid);          // hs[t+1] = state after step t, hs[0] = zero
+        int* ys = scr->take(T * nout);
+        for (int t = 0; t < T; t++) {
+            for (int j = 0; j < nhid; j++) {
+                int s = 0;
+                for (int i = 0; i < nin; i++) s = s + Wxh[j * nin + i] * xs[t * nin + i];
+                for (int i = 0; i < nhid; i++) s = s + Whh[j * nhid + i] * hs[t * nhid + i];
+                hs[(t + 1) * nhid + j] = tanh((s >> FB) + bh[j]);
+            }
+            for (int k = 0; k < nout; k++) {
+                int s = 0;
+                for (int j = 0; j < nhid; j++) s = s + Why[k * nhid + j] * hs[(t + 1) * nhid + j];
+                ys[t * nout + k] = (s >> FB) + by[k];
+            }
+            if (softmaxOut) softmax(&ys[t * nout], nout);
+        }
+        int total = 0;
+        for (int t = 0; t < T; t++) {
+            if (softmaxOut) total = total + ceLoss(&ys[t * nout], &ts[t * nout], nout);
+            else total = total + mseLoss(&ys[t * nout], &ts[t * nout], nout);
+        }
+        // gradients
+        int* gWxh = scr->take(nhid * nin);
+        int* gWhh = scr->take(nhid * nhid);
+        int* gWhy = scr->take(nout * nhid);
+        int* gbh = scr->take(nhid);
+        int* gby = scr->take(nout);
+        int* dh = scr->take(nhid);                    // gradient flowing back through time
+        int* dz = scr->take(nhid);
+        for (int t = T - 1; t >= 0; t--) {
+            for (int k = 0; k < nout; k++) {
+                int dy = ys[t * nout + k] - ts[t * nout + k];
+                gby[k] = gby[k] + dy;
+                for (int j = 0; j < nhid; j++) {
+                    gWhy[k * nhid + j] = gWhy[k * nhid + j] + mul(dy, hs[(t + 1) * nhid + j]);
+                    dh[j] = dh[j] + mul(Why[k * nhid + j], dy);
+                }
+            }
+            for (int j = 0; j < nhid; j++) {
+                int hj = hs[(t + 1) * nhid + j];
+                dz[j] = mul(dh[j], ONE - mul(hj, hj));
+                gbh[j] = gbh[j] + dz[j];
+                for (int i = 0; i < nin; i++) {
+                    gWxh[j * nin + i] = gWxh[j * nin + i] + mul(dz[j], xs[t * nin + i]);
+                }
+                for (int i = 0; i < nhid; i++) {
+                    gWhh[j * nhid + i] = gWhh[j * nhid + i] + mul(dz[j], hs[t * nhid + i]);
+                }
+            }
+            // gradient for the previous hidden state
+            for (int i = 0; i < nhid; i++) {
+                int s = 0;
+                for (int j = 0; j < nhid; j++) s = s + Whh[j * nhid + i] * dz[j];
+                dh[i] = s >> FB;
+            }
+        }
+        for (int k = 0; k < nhid * nin; k++) Wxh[k] = Wxh[k] - mul(rate, clip(gWxh[k], clipLimit));
+        for (int k = 0; k < nhid * nhid; k++) Whh[k] = Whh[k] - mul(rate, clip(gWhh[k], clipLimit));
+        for (int k = 0; k < nout * nhid; k++) Why[k] = Why[k] - mul(rate, clip(gWhy[k], clipLimit));
+        for (int k = 0; k < nhid; k++) bh[k] = bh[k] - mul(rate, clip(gbh[k], clipLimit));
+        for (int k = 0; k < nout; k++) by[k] = by[k] - mul(rate, clip(gby[k], clipLimit));
+        return total / T;
+    }
+}
+
+// ===========================================================================================================================
+//  Convolutional network (one input channel)
+// ===========================================================================================================================
+public class ConvNet {
+    public int iw;
+    public int ih;
+    public int nf;                  // filters
+    public int ks;                  // filter size
+    public int classes;
+    public int cw;                  // conv output size
+    public int ch;
+    public int pw;                  // pooled size
+    public int ph;
+    public int feat;                // nf * pw * ph
+    public int* K;                  // nf * ks * ks
+    public int* kb;                 // nf
+    public int* Wd;                 // classes * feat
+    public int* bd;                 // classes
+    public int* conv;               // after relu: nf * cw * ch
+    public int* pool;               // nf * pw * ph
+    public int* arg;                // index into conv of every pooled value
+    public int* out;                // classes
+    private Scratch* scr;
+
+    public ConvNet(int width, int height, int filters, int ksize, int nclasses) {
+        iw = width; ih = height; nf = filters; ks = ksize; classes = nclasses;
+        cw = width - ksize + 1;
+        ch = height - ksize + 1;
+        pw = cw / 2;
+        ph = ch / 2;
+        feat = nf * pw * ph;
+        K = vec(nf * ks * ks);
+        kb = vec(nf);
+        Wd = vec(classes * feat);
+        bd = vec(classes);
+        conv = vec(nf * cw * ch);
+        pool = vec(feat);
+        arg = vec(feat);
+        out = vec(classes);
+        scr = new Scratch();
+        int s1 = sqrt(div(2 * ONE, fixed.fromInt(ks * ks)));
+        for (int k = 0; k < nf * ks * ks; k++) K[k] = mul(fixed.gauss(), s1);
+        int s2 = sqrt(div(ONE, fixed.fromInt(feat)));
+        for (int k = 0; k < classes * feat; k++) Wd[k] = mul(fixed.gauss(), s2);
+    }
+
+    // class probabilities of an image (iw * ih numbers, usually 0 .. 1.0); pointer valid until the next call
+    public int* forward(int* img) {
+        for (int f = 0; f < nf; f++) {
+            for (int y = 0; y < ch; y++) {
+                for (int x = 0; x < cw; x++) {
+                    int s = 0;
+                    for (int v = 0; v < ks; v++) {
+                        for (int u = 0; u < ks; u++) {
+                            s = s + K[(f * ks + v) * ks + u] * img[(y + v) * iw + x + u];
+                        }
+                    }
+                    int a = (s >> FB) + kb[f];
+                    if (a < 0) a = 0;
+                    conv[(f * ch + y) * cw + x] = a;
+                }
+            }
+        }
+        // 2x2 max pooling
+        for (int f = 0; f < nf; f++) {
+            for (int y = 0; y < ph; y++) {
+                for (int x = 0; x < pw; x++) {
+                    int best = (f * ch + 2 * y) * cw + 2 * x;
+                    for (int dy = 0; dy < 2; dy++) {
+                        for (int dx = 0; dx < 2; dx++) {
+                            int idx = (f * ch + 2 * y + dy) * cw + 2 * x + dx;
+                            if (conv[idx] > conv[best]) best = idx;
+                        }
+                    }
+                    int p = (f * ph + y) * pw + x;
+                    pool[p] = conv[best];
+                    arg[p] = best;
+                }
+            }
+        }
+        for (int c = 0; c < classes; c++) {
+            int s = 0;
+            for (int i = 0; i < feat; i++) s = s + Wd[c * feat + i] * pool[i];
+            out[c] = (s >> FB) + bd[c];
+        }
+        softmax(out, classes);
+        return out;
+    }
+
+    public int predict(int* img) {
+        return argmax(forward(img), classes);
+    }
+
+    // one learning step with cross-entropy loss; label = the class number. Returns the loss before the step
+    public int train(int* img, int label, int rate) {
+        scr->reset();
+        forward(img);
+        int lossv = out[label];
+        if (lossv < 1) lossv = 1;
+        lossv = -log(lossv);
+        int* dpool = scr->take(feat);
+        for (int c = 0; c < classes; c++) {
+            int d = out[c];
+            if (c == label) d = d - ONE;
+            for (int i = 0; i < feat; i++) {
+                dpool[i] = dpool[i] + mul(Wd[c * feat + i], d);
+                Wd[c * feat + i] = Wd[c * feat + i] - mul(rate, mul(d, pool[i]));
+            }
+            bd[c] = bd[c] - mul(rate, d);
+        }
+        // route the gradient to the winners of the pooling (relu: nothing flows where the output was 0)
+        int* dconv = scr->take(nf * cw * ch);
+        for (int p = 0; p < feat; p++) {
+            if (pool[p] > 0) dconv[arg[p]] = dconv[arg[p]] + dpool[p];
+        }
+        for (int f = 0; f < nf; f++) {
+            int gb = 0;
+            for (int y = 0; y < ch; y++) {
+                for (int x = 0; x < cw; x++) {
+                    int d = dconv[(f * ch + y) * cw + x];
+                    if (d == 0) continue;
+                    gb = gb + d;
+                    for (int v = 0; v < ks; v++) {
+                        for (int u = 0; u < ks; u++) {
+                            int k = (f * ks + v) * ks + u;
+                            K[k] = K[k] - mul(rate, mul(d, img[(y + v) * iw + x + u]));
+                        }
+                    }
+                }
+            }
+            kb[f] = kb[f] - mul(rate, gb);
+        }
+        return lossv;
+    }
+
+    public int fit(int* imgs, int* labels, int count, int epochs, int rate) {
+        int* order = alloc((count + 1) * 8);
+        int l = 0;
+        for (int e = 0; e < epochs; e++) {
+            shuffled(order, count);
+            int total = 0;
+            for (int k = 0; k < count; k++) {
+                int s = order[k];
+                total = total + train(&imgs[s * iw * ih], labels[s], rate);
+            }
+            l = total / count;
+        }
+        return l;
+    }
+
+    public int accuracy(int* imgs, int* labels, int count) {
+        int ok = 0;
+        for (int s = 0; s < count; s++) {
+            if (predict(&imgs[s * iw * ih]) == labels[s]) ok++;
+        }
+        return ok * 100 / count;
+    }
+}
+
+// ===========================================================================================================================
+//  LSTM: long short-term memory network (one layer + output layer)
+// ===========================================================================================================================
+public class LSTM {
+    public int nin;
+    public int nhid;
+    public int nout;
+    public int nz;                  // nin + nhid
+    public int* W;                  // 4 gates (input, forget, output, candidate) * nhid rows of nz weights
+    public int* b;                  // 4 * nhid
+    public int* Wy;                 // nout * nhid
+    public int* by;                 // nout
+    public int* h;                  // current hidden state
+    public int* c;                  // current cell state
+    public bool softmaxOut;
+    public int clipLimit;
+    private Scratch* scr;
+
+    public LSTM(int inputs, int hidden, int outputs) {
+        nin = inputs; nhid = hidden; nout = outputs;
+        nz = inputs + hidden;
+        W = vec(4 * hidden * nz);
+        b = vec(4 * hidden);
+        Wy = vec(outputs * hidden);
+        by = vec(outputs);
+        h = vec(hidden);
+        c = vec(hidden);
+        clipLimit = 5 * ONE;
+        scr = new Scratch();
+        int s1 = sqrt(div(ONE, fixed.fromInt(nz)));
+        for (int k = 0; k < 4 * hidden * nz; k++) W[k] = mul(fixed.gauss(), s1);
+        for (int j = 0; j < hidden; j++) b[hidden + j] = ONE;           // forget gate starts open
+        int s2 = sqrt(div(ONE, fixed.fromInt(hidden)));
+        for (int k = 0; k < outputs * hidden; k++) Wy[k] = mul(fixed.gauss(), s2);
+    }
+
+    public void resetState() {
+        for (int j = 0; j < nhid; j++) { h[j] = 0; c[j] = 0; }
+    }
+
+    // gate pre-activation k (0 i, 1 f, 2 o, 3 g) of unit j for input x and previous state hp
+    private int gate(int k, int j, int* x, int* hp) {
+        int row = (k * nhid + j) * nz;
+        int s = 0;
+        for (int i = 0; i < nin; i++) s = s + W[row + i] * x[i];
+        for (int i = 0; i < nhid; i++) s = s + W[row + nin + i] * hp[i];
+        return (s >> FB) + b[k * nhid + j];
+    }
+
+    // one time step: consumes x, updates h and c, writes the output to y (nout numbers)
+    public void step(int* x, int* y) {
+        scr->reset();
+        int* nh = scr->take(nhid);
+        int* nc = scr->take(nhid);
+        for (int j = 0; j < nhid; j++) {
+            int gi = sigmoid(gate(0, j, x, h));
+            int gf = sigmoid(gate(1, j, x, h));
+            int go = sigmoid(gate(2, j, x, h));
+            int gg = tanh(gate(3, j, x, h));
+            nc[j] = mul(gf, c[j]) + mul(gi, gg);
+            nh[j] = mul(go, tanh(nc[j]));
+        }
+        for (int j = 0; j < nhid; j++) { h[j] = nh[j]; c[j] = nc[j]; }
+        for (int k = 0; k < nout; k++) {
+            int s = 0;
+            for (int j = 0; j < nhid; j++) s = s + Wy[k * nhid + j] * h[j];
+            y[k] = (s >> FB) + by[k];
+        }
+        if (softmaxOut) softmax(y, nout);
+    }
+
+    public void run(int* xs, int T, int* ys) {
+        resetState();
+        for (int t = 0; t < T; t++) step(&xs[t * nin], &ys[t * nout]);
+    }
+
+    // one training step on a whole sequence, back-propagation through time; returns the mean loss per step
+    public int trainSequence(int* xs, int* ts, int T, int rate) {
+        scr->reset();
+        int H = nhid;
+        // per step: gates i f o g, cell c, hidden h, tanh(c)
+        int* gi = scr->take(T * H); int* gf = scr->take(T * H); int* go = scr->take(T * H); int* gg = scr->take(T * H);
+        int* cs = scr->take((T + 1) * H);          // cs[t + 1] = cell after step t
+        int* hs = scr->take((T + 1) * H);
+        int* tc = scr->take(T * H);
+        int* ys = scr->take(T * nout);
+        for (int t = 0; t < T; t++) {
+            int* x = &xs[t * nin];
+            int* hp = &hs[t * H];
+            for (int j = 0; j < H; j++) {
+                gi[t * H + j] = sigmoid(gate(0, j, x, hp));
+                gf[t * H + j] = sigmoid(gate(1, j, x, hp));
+                go[t * H + j] = sigmoid(gate(2, j, x, hp));
+                gg[t * H + j] = tanh(gate(3, j, x, hp));
+                cs[(t + 1) * H + j] = mul(gf[t * H + j], cs[t * H + j]) + mul(gi[t * H + j], gg[t * H + j]);
+                tc[t * H + j] = tanh(cs[(t + 1) * H + j]);
+                hs[(t + 1) * H + j] = mul(go[t * H + j], tc[t * H + j]);
+            }
+            for (int k = 0; k < nout; k++) {
+                int s = 0;
+                for (int j = 0; j < H; j++) s = s + Wy[k * H + j] * hs[(t + 1) * H + j];
+                ys[t * nout + k] = (s >> FB) + by[k];
+            }
+            if (softmaxOut) softmax(&ys[t * nout], nout);
+        }
+        int total = 0;
+        for (int t = 0; t < T; t++) {
+            if (softmaxOut) total = total + ceLoss(&ys[t * nout], &ts[t * nout], nout);
+            else total = total + mseLoss(&ys[t * nout], &ts[t * nout], nout);
+        }
+        int* gW = scr->take(4 * H * nz);
+        int* gb = scr->take(4 * H);
+        int* gWy = scr->take(nout * H);
+        int* gby = scr->take(nout);
+        int* dh = scr->take(H);                    // gradient on h of the step being processed
+        int* dc = scr->take(H);                    // gradient flowing back on the cell
+        int* da = scr->take(4 * H);
+        int* dhp = scr->take(H);
+        for (int t = T - 1; t >= 0; t--) {
+            for (int k = 0; k < nout; k++) {
+                int dy = ys[t * nout + k] - ts[t * nout + k];
+                gby[k] = gby[k] + dy;
+                for (int j = 0; j < H; j++) {
+                    gWy[k * H + j] = gWy[k * H + j] + mul(dy, hs[(t + 1) * H + j]);
+                    dh[j] = dh[j] + mul(Wy[k * H + j], dy);
+                }
+            }
+            for (int j = 0; j < H; j++) {
+                int o = go[t * H + j];
+                int i = gi[t * H + j];
+                int f = gf[t * H + j];
+                int g = gg[t * H + j];
+                int tcv = tc[t * H + j];
+                int dcj = dc[j] + mul(mul(dh[j], o), ONE - mul(tcv, tcv));
+                da[2 * H + j] = mul(mul(dh[j], tcv), mul(o, ONE - o));                  // output gate
+                da[j] = mul(mul(dcj, g), mul(i, ONE - i));                              // input gate
+                da[H + j] = mul(mul(dcj, cs[t * H + j]), mul(f, ONE - f));              // forget gate
+                da[3 * H + j] = mul(mul(dcj, i), ONE - mul(g, g));                      // candidate
+                dc[j] = mul(dcj, f);                                                     // to the previous cell
+            }
+            for (int j = 0; j < H; j++) dhp[j] = 0;
+            for (int k = 0; k < 4; k++) {
+                for (int j = 0; j < H; j++) {
+                    int a = da[k * H + j];
+                    int row = (k * H + j) * nz;
+                    gb[k * H + j] = gb[k * H + j] + a;
+                    for (int i = 0; i < nin; i++) gW[row + i] = gW[row + i] + mul(a, xs[t * nin + i]);
+                    for (int i = 0; i < H; i++) {
+                        gW[row + nin + i] = gW[row + nin + i] + mul(a, hs[t * H + i]);
+                        dhp[i] = dhp[i] + mul(W[row + nin + i], a);
+                    }
+                }
+            }
+            for (int j = 0; j < H; j++) dh[j] = dhp[j];
+        }
+        for (int k = 0; k < 4 * H * nz; k++) W[k] = W[k] - mul(rate, clip(gW[k], clipLimit));
+        for (int k = 0; k < 4 * H; k++) b[k] = b[k] - mul(rate, clip(gb[k], clipLimit));
+        for (int k = 0; k < nout * H; k++) Wy[k] = Wy[k] - mul(rate, clip(gWy[k], clipLimit));
+        for (int k = 0; k < nout; k++) by[k] = by[k] - mul(rate, clip(gby[k], clipLimit));
+        return total / T;
+    }
+}

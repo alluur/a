@@ -1,0 +1,919 @@
+// =============================================================================
+//  codec - converters between text, binary and images, ready for neural networks      import codec;
+//
+//  text <-> binary    codec.textToBinary("Hi", " ")        -> "01001000 01101001"
+//                     codec.binaryToText("0100100001101001") -> "Hi"
+//                     codec.bytesToBinary / binaryToBytes / intToBinary / binaryToInt
+//  image <-> binary   codec.imageToBinary(img, 128)        -> rows of 0 / 1 (1 = dark pixel), one row per line
+//                     codec.binaryToImage(rows)            -> codec.Image
+//                     imageToBits / bitsToImage / packBits / unpackBits / imageToBytes / bytesToImage
+//  text  <-> image    codec.textToImage("Hello", 2)        -> codec.Image (5x7 pixel font, scaled by 2)
+//                     codec.imageToText(img, 0)            -> "Hello" (reads that font back; scale 0 = detect)
+//                     codec.imageToTextWith(img, 2, recognizer)   with your own recogniser (a neural network)
+//  for the nn module  textToVector / vectorToText, bitsToVector / vectorToBits, oneHot / fromOneHot,
+//                     bitsToSigns / signsToBits (+1 / -1 for nn.Hopfield)
+//                     imageToVector / vectorToImage (fixed-point numbers 0 .. fixed.ONE, see the fixed module),
+//                     glyphVector / glyphChar / fontSet (the 5x8 character bitmaps as network inputs)
+//  files              writePgm / readPgm, writePbm / readPbm, writeBmp / readBmp
+//  display            toAscii(img, step)
+//
+//  An image is a codec.Image: width w, height h, one byte per pixel (0 = black, 255 = white) in px.
+// =============================================================================
+import fixed;
+module codec;
+a_import('fixed.a', 'ONE, mul, div');
+
+// ---- the font: 95 characters (32 .. 126), 5 columns of 8 bits each (bit 0 = top row) ----------------------------------
+private const FONTHEX = "000000000000005F00000007000700147F147F14242A7F2A12231308646236495620500008070300001C2241000041221C002A1C7F1C2A08083E080800807030000808080808000060600020100804023E5149453E00427F400072494949462141494D331814127F1027454545393C4A49493141211109073649494936464949291E0000140000004034000000081422411414141414004122140802015909063E415D594E7C1211127C7F494949363E414141227F4141413E7F494949417F090909013E414151737F0808087F00417F41002040413F017F081422417F404040407F021C027F7F0408107F3E4141413E7F090909063E4151215E7F09192946264949493203017F01033F4040403F1F2040201F3F4038403F631408146303047804036159494D43007F4141410204081020004141417F04020102044040404040000307080020545478407F284444383844444428384444287F385454541800087E090218A4A49C787F0804047800447D40002040403D007F1028440000417F40007C047804787C080404783844444438FC1824241818242418FC7C08040408485454542404043F44243C4040207C1C2040201C3C4030403C44281028444C9090907C4464544C440008364100000077000000413608000201020402";
+public const GLYPH_W = 5;
+public const GLYPH_H = 8;
+public const ADVANCE = 6;           // columns per character, including one blank column
+public const LINE_HEIGHT = 9;       // rows per text line, including one blank row
+
+private char fontBytes[475];
+private bool fontReady;
+
+private int hexNibble(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    return c - 'A' + 10;
+}
+
+private void initFont() {
+    if (fontReady) return;
+    for (int i = 0; i < 475; i++) {
+        fontBytes[i] = hexNibble(FONTHEX[i * 2]) * 16 + hexNibble(FONTHEX[i * 2 + 1]);
+    }
+    fontReady = true;
+}
+
+// 1 if the pixel (x 0..4, y 0..7) of the character is set
+public int glyphBit(int ch, int x, int y) {
+    initFont();
+    if (ch < 32 || ch > 126) ch = '?';
+    return (fontBytes[(ch - 32) * 5 + x] >> y) & 1;
+}
+
+// ===========================================================================================================================
+//  Text <-> binary
+// ===========================================================================================================================
+// "01001000 01101001": 8 binary digits per byte, `sep` between the bytes ("" or " ")
+public char* bytesToBinary(char* data, int n, char* sep) {
+    int sl = strlen(sep);
+    char* out = alloc(n * (8 + sl) + 1);
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+        if (i > 0) {
+            for (int k = 0; k < sl; k++) { out[o] = sep[k]; o++; }
+        }
+        for (int b = 7; b >= 0; b--) {
+            out[o] = '0' + ((data[i] >> b) & 1);
+            o++;
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+public char* textToBinary(char* text, char* sep) {
+    return bytesToBinary(text, strlen(text), sep);
+}
+
+// reads the digits 0 and 1 of a text (everything else is ignored) into bytes, 8 digits per byte, most significant
+// first. A last incomplete group is dropped. Returns the number of bytes
+public int binaryToBytes(char* bin, char* out) {
+    int n = 0;
+    int bits = 0;
+    int cur = 0;
+    for (int i = 0; bin[i] != 0; i++) {
+        if (bin[i] == '0' || bin[i] == '1') {
+            cur = (cur << 1) | (bin[i] - '0');
+            bits++;
+            if (bits == 8) {
+                out[n] = cur;
+                n++;
+                bits = 0;
+                cur = 0;
+            }
+        }
+    }
+    return n;
+}
+
+public char* binaryToText(char* bin) {
+    char* out = alloc(strlen(bin) / 8 + 2);
+    int n = binaryToBytes(bin, out);
+    out[n] = 0;
+    return out;
+}
+
+// the lowest `width` bits of n as digits
+public char* intToBinary(int n, int width) {
+    char* out = alloc(width + 1);
+    for (int i = 0; i < width; i++) {
+        out[i] = '0' + ((n >> (width - 1 - i)) & 1);
+    }
+    out[width] = 0;
+    return out;
+}
+
+public int binaryToInt(char* bin) {
+    int v = 0;
+    for (int i = 0; bin[i] != 0; i++) {
+        if (bin[i] == '0' || bin[i] == '1') v = (v << 1) | (bin[i] - '0');
+    }
+    return v;
+}
+
+// bits[i] (one byte per bit, 0 / 1) from n bytes, most significant bit first. bits needs 8 * n bytes
+public void bytesToBits(char* data, int n, char* bits) {
+    for (int i = 0; i < n; i++) {
+        for (int b = 0; b < 8; b++) {
+            bits[i * 8 + b] = (data[i] >> (7 - b)) & 1;
+        }
+    }
+}
+
+// the opposite: nbits bits become (nbits + 7) / 8 bytes (the last byte is padded with zero bits)
+public int bitsToBytes(char* bits, int nbits, char* data) {
+    int n = (nbits + 7) / 8;
+    for (int i = 0; i < n; i++) data[i] = 0;
+    for (int i = 0; i < nbits; i++) {
+        if (bits[i] != 0) data[i / 8] = data[i / 8] | (0x80 >> (i % 8));
+    }
+    return n;
+}
+
+public void packBits(char* bits, int nbits, char* out) {
+    bitsToBytes(bits, nbits, out);
+}
+
+public void unpackBits(char* data, int nbits, char* bits) {
+    for (int i = 0; i < nbits; i++) {
+        bits[i] = (data[i / 8] >> (7 - i % 8)) & 1;
+    }
+}
+
+// ===========================================================================================================================
+//  Images
+// ===========================================================================================================================
+public class Image {
+    public int w;
+    public int h;
+    public char* px;
+
+    // a white image
+    public Image(int width, int height) {
+        w = width;
+        h = height;
+        px = alloc(width * height + 1);
+        for (int i = 0; i < width * height; i++) px[i] = 255;
+    }
+    // the pixel at x, y (255 outside of the image)
+    public int get(int x, int y) {
+        if (x < 0 || y < 0 || x >= w || y >= h) return 255;
+        return px[y * w + x];
+    }
+    public void set(int x, int y, int v) {
+        if (x < 0 || y < 0 || x >= w || y >= h) return;
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        px[y * w + x] = v;
+    }
+    public void fill(int v) {
+        for (int i = 0; i < w * h; i++) px[i] = v;
+    }
+    public Image* copy() {
+        Image* c = new Image(w, h);
+        memcpy(c->px, px, w * h);
+        return c;
+    }
+    public Image* crop(int x0, int y0, int cw, int ch) {
+        Image* c = new Image(cw, ch);
+        for (int y = 0; y < ch; y++) {
+            for (int x = 0; x < cw; x++) c->px[y * cw + x] = get(x0 + x, y0 + y);
+        }
+        return c;
+    }
+    // every pixel k times bigger (nearest neighbour)
+    public Image* scaleUp(int k) {
+        Image* c = new Image(w * k, h * k);
+        for (int y = 0; y < h * k; y++) {
+            for (int x = 0; x < w * k; x++) c->px[y * c->w + x] = px[(y / k) * w + x / k];
+        }
+        return c;
+    }
+    // any size: the mean of the source area behind every new pixel
+    public Image* resize(int nw, int nh) {
+        Image* c = new Image(nw, nh);
+        for (int y = 0; y < nh; y++) {
+            int y0 = y * h / nh;
+            int y1 = (y + 1) * h / nh;
+            if (y1 <= y0) y1 = y0 + 1;
+            for (int x = 0; x < nw; x++) {
+                int x0 = x * w / nw;
+                int x1 = (x + 1) * w / nw;
+                if (x1 <= x0) x1 = x0 + 1;
+                int sum = 0;
+                int cnt = 0;
+                for (int yy = y0; yy < y1; yy++) {
+                    for (int xx = x0; xx < x1; xx++) {
+                        sum = sum + get(xx, yy);
+                        cnt++;
+                    }
+                }
+                c->px[y * nw + x] = sum / cnt;
+            }
+        }
+        return c;
+    }
+    public void invert() {
+        for (int i = 0; i < w * h; i++) px[i] = 255 - px[i];
+    }
+    // every pixel becomes 0 (darker than t) or 255
+    public void threshold(int t) {
+        for (int i = 0; i < w * h; i++) {
+            if (px[i] < t) px[i] = 0; else px[i] = 255;
+        }
+    }
+}
+
+// ---- image <-> binary ------------------------------------------------------------------------------------------------
+// one byte per pixel, 1 for a dark pixel (value < threshold) and 0 otherwise; needs w * h bytes
+public void imageToBits(Image* img, int threshold, char* bits) {
+    for (int i = 0; i < img->w * img->h; i++) {
+        if (img->px[i] < threshold) bits[i] = 1; else bits[i] = 0;
+    }
+}
+
+// a black and white image from w * h bits (1 = black)
+public Image* bitsToImage(char* bits, int w, int h) {
+    Image* img = new Image(w, h);
+    for (int i = 0; i < w * h; i++) {
+        if (bits[i] != 0) img->px[i] = 0; else img->px[i] = 255;
+    }
+    return img;
+}
+
+// "0110\n1001\n...": the image as text, one line per row, 1 = dark pixel
+public char* imageToBinary(Image* img, int threshold) {
+    char* out = alloc(img->h * (img->w + 1) + 1);
+    int o = 0;
+    for (int y = 0; y < img->h; y++) {
+        for (int x = 0; x < img->w; x++) {
+            if (img->px[y * img->w + x] < threshold) out[o] = '1'; else out[o] = '0';
+            o++;
+        }
+        out[o] = 10;
+        o++;
+    }
+    out[o] = 0;
+    return out;
+}
+
+// the reverse. Lines are rows; '1' or '#' is a dark pixel, every other character is white
+public Image* binaryToImage(char* text) {
+    int w = 0;
+    int h = 0;
+    int cur = 0;
+    for (int i = 0; ; i++) {
+        if (text[i] == 0 || text[i] == 10) {
+            if (cur > 0) {
+                if (cur > w) w = cur;
+                h++;
+            }
+            cur = 0;
+            if (text[i] == 0) break;
+        } else if (text[i] != 13) {
+            cur++;
+        }
+    }
+    Image* img = new Image(w, h);
+    int x = 0;
+    int y = 0;
+    for (int i = 0; ; i++) {
+        char c = text[i];
+        if (c == 0 || c == 10) {
+            if (x > 0) y++;
+            x = 0;
+            if (c == 0) break;
+        } else if (c != 13) {
+            if (c == '1' || c == '#') img->px[y * w + x] = 0;
+            x++;
+        }
+    }
+    return img;
+}
+
+// the raw pixel bytes (w * h)
+public void imageToBytes(Image* img, char* out) {
+    memcpy(out, img->px, img->w * img->h);
+}
+
+public Image* bytesToImage(char* data, int w, int h) {
+    Image* img = new Image(w, h);
+    memcpy(img->px, data, w * h);
+    return img;
+}
+
+// ---- for neural networks -----------------------------------------------------------------------------------------------------
+// pixels as fixed-point numbers: 0 .. ONE. invert = true makes dark pixels the large values ("ink")
+public void imageToVector(Image* img, int* vec, bool invert) {
+    for (int i = 0; i < img->w * img->h; i++) {
+        int v = img->px[i];
+        if (invert) v = 255 - v;
+        vec[i] = (v * ONE) / 255;
+    }
+}
+
+public Image* vectorToImage(int* vec, int w, int h, bool invert) {
+    Image* img = new Image(w, h);
+    for (int i = 0; i < w * h; i++) {
+        int v = (vec[i] * 255 + ONE / 2) / ONE;
+        if (v < 0) v = 0;
+        if (v > 255) v = 255;
+        if (invert) v = 255 - v;
+        img->px[i] = v;
+    }
+    return img;
+}
+
+// bits (0 / 1 bytes) as fixed-point: 0 and ONE, or -ONE and ONE when bipolar (the values a Hopfield network wants)
+public void bitsToVector(char* bits, int n, int* vec, bool bipolar) {
+    for (int i = 0; i < n; i++) {
+        if (bits[i] != 0) vec[i] = ONE;
+        else if (bipolar) vec[i] = -ONE;
+        else vec[i] = 0;
+    }
+}
+
+// the reverse: a value above the middle is a 1
+public void vectorToBits(int* vec, int n, char* bits, bool bipolar) {
+    int mid = ONE / 2;
+    if (bipolar) mid = 0;
+    for (int i = 0; i < n; i++) {
+        if (vec[i] > mid) bits[i] = 1; else bits[i] = 0;
+    }
+}
+
+// bits (0 / 1 bytes) as the plain integers -1 and +1 that a Hopfield network stores, and back
+public void bitsToSigns(char* bits, int n, int* signs) {
+    for (int i = 0; i < n; i++) {
+        if (bits[i] != 0) signs[i] = 1; else signs[i] = -1;
+    }
+}
+
+public void signsToBits(int* signs, int n, char* bits) {
+    for (int i = 0; i < n; i++) {
+        if (signs[i] > 0) bits[i] = 1; else bits[i] = 0;
+    }
+}
+
+// a text as maxChars * 8 bits (padded with zero characters), vec needs maxChars * 8 numbers
+public void textToVector(char* text, int* vec, int maxChars, bool bipolar) {
+    char* bits = alloc(maxChars * 8 + 1);
+    int n = strlen(text);
+    if (n > maxChars) n = maxChars;
+    bytesToBits(text, n, bits);
+    bitsToVector(bits, maxChars * 8, vec, bipolar);
+}
+
+// the reverse, up to maxChars characters (stops at the first zero character). buf needs maxChars + 1 bytes
+public char* vectorToText(int* vec, int maxChars, char* buf, bool bipolar) {
+    char* bits = alloc(maxChars * 8 + 1);
+    vectorToBits(vec, maxChars * 8, bits, bipolar);
+    int n = bitsToBytes(bits, maxChars * 8, buf);
+    buf[n] = 0;
+    return buf;
+}
+
+// a vector with ONE at index `code` and zeros elsewhere (n numbers)
+public void oneHot(int code, int* vec, int n) {
+    for (int i = 0; i < n; i++) vec[i] = 0;
+    if (code >= 0 && code < n) vec[code] = ONE;
+}
+
+public int fromOneHot(int* vec, int n) {
+    int best = 0;
+    for (int i = 1; i < n; i++) {
+        if (vec[i] > vec[best]) best = i;
+    }
+    return best;
+}
+
+// ---- ASCII art ---------------------------------------------------------------------------------------------------------------
+// every step-th pixel as a character: '#' for black ... ' ' for white
+public char* toAscii(Image* img, int step) {
+    if (step < 1) step = 1;
+    char* ramp = "@%#*+=-:. ";
+    int cols = (img->w + step - 1) / step;
+    int rows = (img->h + step - 1) / step;
+    char* out = alloc(rows * (cols + 1) + 1);
+    int o = 0;
+    for (int y = 0; y < img->h; y = y + step) {
+        for (int x = 0; x < img->w; x = x + step) {
+            out[o] = ramp[img->px[y * img->w + x] * 9 / 255];
+            o++;
+        }
+        out[o] = 10;
+        o++;
+    }
+    out[o] = 0;
+    return out;
+}
+
+// ===========================================================================================================================
+//  Text <-> image
+// ===========================================================================================================================
+// draws text with the built-in 5x7 font (black on white); every font pixel becomes scale x scale pixels.
+// '\n' starts a new line
+public Image* textToImage(char* text, int scale) {
+    if (scale < 1) scale = 1;
+    int cols = 0;
+    int lines = 1;
+    int cur = 0;
+    for (int i = 0; text[i] != 0; i++) {
+        if (text[i] == 10) {
+            lines++;
+            cur = 0;
+        } else {
+            cur++;
+            if (cur > cols) cols = cur;
+        }
+    }
+    if (cols == 0) cols = 1;
+    Image* img = new Image((cols * ADVANCE + 1) * scale, (lines * LINE_HEIGHT + 1) * scale);
+    int line = 0;
+    int col = 0;
+    for (int i = 0; text[i] != 0; i++) {
+        int c = text[i];
+        if (c == 10) {
+            line++;
+            col = 0;
+            continue;
+        }
+        if (c == 9) c = ' ';
+        for (int gx = 0; gx < GLYPH_W; gx++) {
+            for (int gy = 0; gy < GLYPH_H; gy++) {
+                if (glyphBit(c, gx, gy) != 0) {
+                    int px0 = (1 + col * ADVANCE + gx) * scale;
+                    int py0 = (1 + line * LINE_HEIGHT + gy) * scale;
+                    for (int dy = 0; dy < scale; dy++) {
+                        for (int dx = 0; dx < scale; dx++) img->px[(py0 + dy) * img->w + px0 + dx] = 0;
+                    }
+                }
+            }
+        }
+        col++;
+    }
+    return img;
+}
+
+// the glyph of a character as 40 numbers (row by row, 0 or ONE)
+public void glyphVector(int ch, int* vec) {
+    for (int y = 0; y < GLYPH_H; y++) {
+        for (int x = 0; x < GLYPH_W; x++) {
+            vec[y * GLYPH_W + x] = glyphBit(ch, x, y) * ONE;
+        }
+    }
+}
+
+// the character whose glyph is closest to a 40 number vector (noise is fine)
+public int glyphChar(int* vec) {
+    int best = ' ';
+    int bd = 0x7FFFFFFFFFFF;
+    for (int c = 32; c < 127; c++) {
+        int d = 0;
+        for (int y = 0; y < GLYPH_H; y++) {
+            for (int x = 0; x < GLYPH_W; x++) {
+                int e = vec[y * GLYPH_W + x] - glyphBit(c, x, y) * ONE;
+                d = d + mul(e, e);
+            }
+        }
+        if (d < bd) {
+            bd = d;
+            best = c;
+        }
+    }
+    return best;
+}
+
+// training data for a character recogniser: for every character of `chars` the glyph vector (40 numbers)
+// in x and the one-hot class (strlen(chars) numbers) in t
+public void fontSet(char* chars, int* x, int* t) {
+    int n = strlen(chars);
+    for (int i = 0; i < n; i++) {
+        glyphVector(chars[i], &x[i * 40]);
+        oneHot(i, &t[i * n], n);
+    }
+}
+
+// ---- reading text from an image -----------------------------------------------------------------------------------------------
+// the dark/light cells of an image drawn at `scale`: grid[gy * gw + gx] = 1 for a dark cell
+private int detectScale(Image* img) {
+    int best = 0;
+    for (int y = 0; y < img->h; y++) {
+        int run = 0;
+        for (int x = 0; x <= img->w; x++) {
+            if (x < img->w && img->px[y * img->w + x] < 128) {
+                run++;
+            } else {
+                if (run > 0 && (best == 0 || run < best)) best = run;
+                run = 0;
+            }
+        }
+    }
+    for (int x = 0; x < img->w; x++) {
+        int run = 0;
+        for (int y = 0; y <= img->h; y++) {
+            if (y < img->h && img->px[y * img->w + x] < 128) {
+                run++;
+            } else {
+                if (run > 0 && (best == 0 || run < best)) best = run;
+                run = 0;
+            }
+        }
+    }
+    return best;
+}
+
+// the nearest character to the 5x8 cells at (cx, cy) of a grid, and its distance in *dist
+private int matchCell(char* grid, int gw, int gh, int cx, int cy, int* dist) {
+    int best = ' ';
+    int bd = 100;
+    for (int c = 32; c < 127; c++) {
+        int d = 0;
+        for (int y = 0; y < GLYPH_H && d < bd; y++) {
+            for (int x = 0; x < GLYPH_W; x++) {
+                int gx = cx + x;
+                int gy = cy + y;
+                int v = 0;
+                if (gx < gw && gy < gh) v = grid[gy * gw + gx];
+                if (v != glyphBit(c, x, y)) d++;
+            }
+        }
+        if (d < bd) {
+            bd = d;
+            best = c;
+        }
+        if (d == 0) break;
+    }
+    *dist = bd;
+    return best;
+}
+
+// is any cell of the 5x8 block set?
+private bool cellInk(char* grid, int gw, int gh, int cx, int cy) {
+    for (int y = 0; y < GLYPH_H; y++) {
+        for (int x = 0; x < GLYPH_W; x++) {
+            if (cx + x < gw && cy + y < gh && grid[(cy + y) * gw + cx + x] != 0) return true;
+        }
+    }
+    return false;
+}
+
+// decodes the grid with the text origin at (ox, oy). out (may be null) gets the text; returns the total distance
+private int decodeGrid(char* grid, int gw, int gh, int ox, int oy, char* out, func rec) {
+    int total = 0;
+    int o = 0;
+    int nl = (gh - oy) / LINE_HEIGHT;
+    int nc = (gw - ox) / ADVANCE;
+    for (int l = 0; l < nl; l++) {
+        int lineStart = o;
+        for (int c = 0; c < nc; c++) {
+            int cx = ox + c * ADVANCE;
+            int cy = oy + l * LINE_HEIGHT;
+            int ch = ' ';
+            if (cellInk(grid, gw, gh, cx, cy)) {
+                int d = 0;
+                ch = matchCell(grid, gw, gh, cx, cy, &d);
+                total = total + d;
+                if (out != null && rec != null) {
+                    int* vec = alloc(41 * 8);
+                    for (int y = 0; y < GLYPH_H; y++) {
+                        for (int x = 0; x < GLYPH_W; x++) {
+                            int v = 0;
+                            if (cx + x < gw && cy + y < gh) v = grid[(cy + y) * gw + cx + x];
+                            vec[y * GLYPH_W + x] = v * ONE;
+                        }
+                    }
+                    ch = rec(vec);
+                }
+            }
+            if (out != null) {
+                out[o] = ch;
+                o++;
+            }
+        }
+        if (out != null) {
+            while (o > lineStart && out[o - 1] == ' ') o--;
+            out[o] = 10;
+            o++;
+        }
+    }
+    if (out != null) {
+        while (o > 0 && out[o - 1] == 10) o--;
+        out[o] = 0;
+    } else {
+        // dark cells that no character block covers count as errors (so that a wrong origin cannot win by
+        // reading nothing)
+        for (int y = 0; y < gh; y++) {
+            for (int x = 0; x < gw; x++) {
+                if (grid[y * gw + x] == 0) continue;
+                bool covered = x >= ox && y >= oy && (x - ox) % ADVANCE < GLYPH_W && (y - oy) % LINE_HEIGHT < GLYPH_H
+                    && (x - ox) / ADVANCE < nc && (y - oy) / LINE_HEIGHT < nl;
+                if (!covered) total++;
+            }
+        }
+    }
+    return total;
+}
+
+// reads text drawn with the built-in font: an image made by textToImage (or anything like it, also scanned and
+// noisy). scale = size of one font pixel, 0 = find out. rec is called for every glyph (a vector of 40 fixed-point
+// numbers, see glyphVector) and returns the character code; null uses the nearest glyph of the font
+public char* imageToTextWith(Image* img, int scale, func rec) {
+    if (scale <= 0) scale = detectScale(img);
+    if (scale <= 0) return "";
+    int gw = img->w / scale;
+    int gh = img->h / scale;
+    char* grid = alloc(gw * gh + 1);
+    for (int gy = 0; gy < gh; gy++) {
+        for (int gx = 0; gx < gw; gx++) {
+            // majority of the pixels of the cell
+            int dark = 0;
+            for (int dy = 0; dy < scale; dy++) {
+                for (int dx = 0; dx < scale; dx++) {
+                    if (img->px[(gy * scale + dy) * img->w + gx * scale + dx] < 128) dark++;
+                }
+            }
+            if (dark * 2 > scale * scale) grid[gy * gw + gx] = 1;
+        }
+    }
+    // the origin of the text grid (the margin is one cell for images from textToImage)
+    int bx = 1;
+    int by = 1;
+    int bestd = 0x7FFFFFFF;
+    for (int oy = 0; oy < 3; oy++) {
+        for (int ox = 0; ox < 3; ox++) {
+            int d = decodeGrid(grid, gw, gh, ox, oy, null, null);
+            if (d < bestd) {
+                bestd = d;
+                bx = ox;
+                by = oy;
+            }
+        }
+    }
+    char* out = alloc(((gw - bx) / ADVANCE + 1) * ((gh - by) / LINE_HEIGHT + 1) + 8);
+    decodeGrid(grid, gw, gh, bx, by, out, rec);
+    return out;
+}
+
+public char* imageToText(Image* img, int scale) {
+    return imageToTextWith(img, scale, null);
+}
+
+// ===========================================================================================================================
+//  Files: PGM / PBM / BMP
+// ===========================================================================================================================
+// reads a whole file, *n = its size; null if it cannot be opened
+private char* readBytes(char* path, int* n) {
+    int h = fileOpen(path, FILE_READ);
+    if (h < 0) return null;
+    int cap = 65536;
+    char* buf = alloc(cap + 1);
+    int len = 0;
+    for (;;) {
+        if (len == cap) {
+            char* nb = alloc(cap * 2 + 1);
+            memcpy(nb, buf, len);
+            buf = nb;
+            cap = cap * 2;
+        }
+        int r = fileRead(h, &buf[len], cap - len);
+        if (r <= 0) break;
+        len = len + r;
+    }
+    fileClose(h);
+    *n = len;
+    return buf;
+}
+
+private bool writeBytes(char* path, char* data, int n) {
+    int h = fileOpen(path, FILE_WRITE);
+    if (h < 0) return false;
+    int done = 0;
+    while (done < n) {
+        int r = fileWrite(h, &data[done], n - done);
+        if (r <= 0) break;
+        done = done + r;
+    }
+    fileClose(h);
+    return done == n;
+}
+
+// reads the next number of a PNM header / ASCII body, skipping blanks and # comments. -1 at the end
+private int pnmNumber(char* d, int n, int* pos) {
+    int p = *pos;
+    for (;;) {
+        while (p < n && (d[p] == ' ' || d[p] == 10 || d[p] == 13 || d[p] == 9)) p++;
+        if (p < n && d[p] == '#') {
+            while (p < n && d[p] != 10) p++;
+        } else {
+            break;
+        }
+    }
+    if (p >= n || !isDigit(d[p])) {
+        *pos = p;
+        return -1;
+    }
+    int v = 0;
+    while (p < n && isDigit(d[p])) {
+        v = v * 10 + (d[p] - '0');
+        p++;
+    }
+    *pos = p;
+    return v;
+}
+
+public bool writePgm(Image* img, char* path) {
+    char head[48];
+    format(&head[0], 48, "P5\n%d %d\n255\n", img->w, img->h);
+    int hl = strlen(&head[0]);
+    char* all = alloc(hl + img->w * img->h + 1);
+    memcpy(all, &head[0], hl);
+    memcpy(&all[hl], img->px, img->w * img->h);
+    return writeBytes(path, all, hl + img->w * img->h);
+}
+
+// P2 (text) and P5 (binary) grey images; null if the file is missing or damaged
+public Image* readPgm(char* path) {
+    int n = 0;
+    char* d = readBytes(path, &n);
+    if (d == null || n < 3 || d[0] != 'P' || (d[1] != '2' && d[1] != '5')) return null;
+    int pos = 2;
+    int w = pnmNumber(d, n, &pos);
+    int h = pnmNumber(d, n, &pos);
+    int maxv = pnmNumber(d, n, &pos);
+    if (w <= 0 || h <= 0 || maxv <= 0 || w * h > 100000000) return null;
+    Image* img = new Image(w, h);
+    if (d[1] == '5') {
+        pos++;                                       // the single blank after maxval
+        if (pos + w * h > n) return null;
+        for (int i = 0; i < w * h; i++) img->px[i] = d[pos + i] * 255 / maxv;
+    } else {
+        for (int i = 0; i < w * h; i++) {
+            int v = pnmNumber(d, n, &pos);
+            if (v < 0) return null;
+            img->px[i] = v * 255 / maxv;
+        }
+    }
+    return img;
+}
+
+// text P1 (binary = false) or packed P4 (binary = true) black and white image; pixels darker than threshold are black
+public bool writePbm(Image* img, char* path, int threshold, bool binary) {
+    char head[48];
+    char tag = '1';
+    if (binary) tag = '4';
+    format(&head[0], 48, "P%c\n%d %d\n", tag, img->w, img->h);
+    int hl = strlen(&head[0]);
+    int rowBytes = (img->w + 7) / 8;
+    int cap = hl + img->h * (img->w + 1) + img->h * rowBytes + 8;
+    char* all = alloc(cap);
+    memcpy(all, &head[0], hl);
+    int o = hl;
+    for (int y = 0; y < img->h; y++) {
+        if (binary) {
+            for (int b = 0; b < rowBytes; b++) {
+                int v = 0;
+                for (int k = 0; k < 8; k++) {
+                    int x = b * 8 + k;
+                    if (x < img->w && img->px[y * img->w + x] < threshold) v = v | (0x80 >> k);
+                }
+                all[o] = v;
+                o++;
+            }
+        } else {
+            for (int x = 0; x < img->w; x++) {
+                if (img->px[y * img->w + x] < threshold) all[o] = '1'; else all[o] = '0';
+                o++;
+            }
+            all[o] = 10;
+            o++;
+        }
+    }
+    return writeBytes(path, all, o);
+}
+
+public Image* readPbm(char* path) {
+    int n = 0;
+    char* d = readBytes(path, &n);
+    if (d == null || n < 3 || d[0] != 'P' || (d[1] != '1' && d[1] != '4')) return null;
+    int pos = 2;
+    int w = pnmNumber(d, n, &pos);
+    int h = pnmNumber(d, n, &pos);
+    if (w <= 0 || h <= 0 || w * h > 100000000) return null;
+    Image* img = new Image(w, h);
+    if (d[1] == '4') {
+        pos++;
+        int rowBytes = (w + 7) / 8;
+        if (pos + rowBytes * h > n) return null;
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                if ((d[pos + y * rowBytes + x / 8] >> (7 - x % 8)) & 1) img->px[y * w + x] = 0;
+            }
+        }
+    } else {
+        // P1: digits, possibly without blanks between them
+        int i = 0;
+        while (pos < n && i < w * h) {
+            char c = d[pos];
+            pos++;
+            if (c == '#') {
+                while (pos < n && d[pos] != 10) pos++;
+            } else if (c == '0' || c == '1') {
+                if (c == '1') img->px[i] = 0;
+                i++;
+            }
+        }
+        if (i < w * h) return null;
+    }
+    return img;
+}
+
+private void put16(char* b, int o, int v) { b[o] = v & 255; b[o + 1] = (v >> 8) & 255; }
+private void put32(char* b, int o, int v) { put16(b, o, v & 0xFFFF); put16(b, o + 2, (v >> 16) & 0xFFFF); }
+private int get16(char* b, int o) { return b[o] | (b[o + 1] << 8); }
+private int get32(char* b, int o) { return get16(b, o) | (get16(b, o + 2) << 16); }
+
+// 8 bit grey BMP with a grey palette
+public bool writeBmp(Image* img, char* path) {
+    int rowBytes = (img->w + 3) / 4 * 4;
+    int dataOff = 14 + 40 + 1024;
+    int size = dataOff + rowBytes * img->h;
+    char* b = alloc(size + 1);
+    b[0] = 'B'; b[1] = 'M';
+    put32(b, 2, size);
+    put32(b, 10, dataOff);
+    put32(b, 14, 40);
+    put32(b, 18, img->w);
+    put32(b, 22, img->h);
+    put16(b, 26, 1);
+    put16(b, 28, 8);
+    put32(b, 34, rowBytes * img->h);
+    put32(b, 46, 256);
+    for (int i = 0; i < 256; i++) {
+        b[54 + i * 4] = i; b[55 + i * 4] = i; b[56 + i * 4] = i;
+    }
+    for (int y = 0; y < img->h; y++) {
+        for (int x = 0; x < img->w; x++) {
+            b[dataOff + (img->h - 1 - y) * rowBytes + x] = img->px[y * img->w + x];
+        }
+    }
+    return writeBytes(path, b, size);
+}
+
+// uncompressed BMP with 1, 8, 24 or 32 bits per pixel, converted to grey
+public Image* readBmp(char* path) {
+    int n = 0;
+    char* b = readBytes(path, &n);
+    if (b == null || n < 54 || b[0] != 'B' || b[1] != 'M') return null;
+    int dataOff = get32(b, 10);
+    int hdr = get32(b, 14);
+    int w = get32(b, 18);
+    int h = get32(b, 22);
+    if (h >= 0x80000000) h = h - 0x100000000;       // negative height: top-down
+    if (w >= 0x80000000) return null;
+    bool topDown = false;
+    if (h < 0) { h = -h; topDown = true; }
+    int bpp = get16(b, 28);
+    int comp = get32(b, 30);
+    if (comp != 0 || w <= 0 || h <= 0 || w * h > 100000000) return null;
+    if (bpp != 1 && bpp != 8 && bpp != 24 && bpp != 32) return null;
+    int rowBytes = (w * bpp + 31) / 32 * 4;
+    if (dataOff + rowBytes * h > n) return null;
+    int palOff = 14 + hdr;
+    Image* img = new Image(w, h);
+    for (int y = 0; y < h; y++) {
+        int sy = h - 1 - y;
+        if (topDown) sy = y;
+        int row = dataOff + sy * rowBytes;
+        for (int x = 0; x < w; x++) {
+            int g = 0;
+            if (bpp == 8) {
+                int idx = b[row + x];
+                int p = palOff + idx * 4;
+                g = (b[p + 2] * 30 + b[p + 1] * 59 + b[p] * 11) / 100;
+            } else if (bpp == 1) {
+                int idx = (b[row + x / 8] >> (7 - x % 8)) & 1;
+                int p = palOff + idx * 4;
+                g = (b[p + 2] * 30 + b[p + 1] * 59 + b[p] * 11) / 100;
+            } else {
+                int p = row + x * (bpp / 8);
+                g = (b[p + 2] * 30 + b[p + 1] * 59 + b[p] * 11) / 100;
+            }
+            img->px[y * w + x] = g;
+        }
+    }
+    return img;
+}

@@ -77,6 +77,10 @@ align 8
 embedded_mods:
 section .text
 EMB "net",         "lib/net.a"
+EMB "http",        "lib/http.a"
+EMB "fixed",       "lib/fixed.a"
+EMB "nn",          "lib/nn.a"
+EMB "codec",       "lib/codec.a"
 EMB "math",        "lib/math.a"
 EMB "sort",        "lib/sort.a"
 EMB "collections", "lib/collections.a"
@@ -129,7 +133,7 @@ std_src_end:
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
 %define IAT_K32             39
-%define IAT_SLOTS           (IAT_K32 + 1 + 9 + 1)   ; kernel32 + null + ws2_32 + null
+%define IAT_SLOTS           (IAT_K32 + 1 + 14 + 1)   ; kernel32 + null + ws2_32 + null
 
 bn_write:   db "__write", 0
 bn_read:    db "__read", 0
@@ -449,7 +453,7 @@ imp_names:
     db "CreatePipe", 0          ; slot 37
     db "SetHandleInformation", 0 ; slot 38
     db 0
-; WS2_32.DLL imports: slots 40..48 (slot 39 is the null terminator of the kernel32 list)
+; WS2_32.DLL imports: slots 40..53 (slot 39 is the null terminator of the kernel32 list)
 imp_names_ws2:
     db "WSAStartup", 0
     db "socket", 0
@@ -460,6 +464,11 @@ imp_names_ws2:
     db "send", 0
     db "recv", 0
     db "closesocket", 0
+    db "sendto", 0              ; slot 49
+    db "recvfrom", 0            ; slot 50
+    db "setsockopt", 0          ; slot 51
+    db "gethostbyname", 0       ; slot 52
+    db "getsockname", 0         ; slot 53
     db 0
 s_kernel32: db "KERNEL32.DLL", 0
 s_ws2_32:   db "WS2_32.DLL", 0

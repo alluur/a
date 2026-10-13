@@ -6,7 +6,8 @@
 //    * Windows: Winsock (ws2_32.dll) through the compiler's __winapi built-in
 //
 //  Handles are plain ints. Functions return a negative number on error.
-//  Host names must be IPv4 addresses ("192.168.1.10") or "localhost" - there is no DNS yet.
+//  Host names can be IPv4 addresses ("192.168.1.10"), "localhost" or real names ("example.org"): names are
+//  resolved by resolve() (the system resolver on Windows, /etc/hosts and a DNS query over UDP on Linux/Android).
 //
 //    int  net.connect(host, port)          connect to a server
 //    int  net.listen(port, backlog)        listen on all interfaces
@@ -19,6 +20,15 @@
 //    void net.close(h)
 //    char* net.httpGet(host, port, path)   very small HTTP/1.0 client, returns the body
 //    int  net.parseIp(text)                "1.2.3.4" -> 0x01020304, -1 if invalid
+//    int  net.resolve(host)                host name or address -> IPv4 address, -1 if unknown
+//    void net.setTimeout(h, ms)            receive / send time limit of a socket (0 = none)
+//    int  net.localPort(h)                 the port a socket is bound to
+//    int  net.udpSocket()                  UDP datagram socket
+//    int  net.udpBind(port)                UDP socket bound to a port (0 = pick a free one)
+//    int  net.sendTo(h, ip, port, buf, n)  one datagram
+//    int  net.recvFrom(h, buf, max, int* ip, int* port)   one datagram, -1 on error / timeout
+//    int  net.dnsBuildQuery(name, id, buf) / net.dnsParseReply(buf, n, id)   the DNS packets themselves
+//    void net.setDns(ip, port)             use this DNS server instead of the system's
 // =============================================================================
 module net;
 
@@ -36,6 +46,12 @@ const WS_ACCEPT = 45;
 const WS_SEND = 46;
 const WS_RECV = 47;
 const WS_CLOSE = 48;
+const WS_SENDTO = 49;
+const WS_RECVFROM = 50;
+const WS_SETSOCKOPT = 51;
+const WS_GETHOSTBYNAME = 52;
+const WS_GETSOCKNAME = 53;
+const SOCK_DGRAM = 2;
 
 private bool started;
 private char wsadata[512];
@@ -115,16 +131,20 @@ private void fillAddr(char* sa, int ip, int port) {
     sa[7] = ip & 255;
 }
 
-private int newSocket() {
+private int newSock(int type, int proto) {
     init();
     if (windows()) {
-        int s = __winapi(WS_SOCKET, AF_INET, SOCK_STREAM, 6, 0);
+        int s = __winapi(WS_SOCKET, AF_INET, type, proto, 0);
         if (s == -1) {
             return -1;
         }
         return s;
     }
-    return __syscall(nr(41, 198), AF_INET, SOCK_STREAM, 0, 0, 0, 0);
+    return __syscall(nr(41, 198), AF_INET, type, 0, 0, 0, 0);
+}
+
+private int newSocket() {
+    return newSock(SOCK_STREAM, 6);
 }
 
 public void close(int h) {
@@ -137,7 +157,7 @@ public void close(int h) {
 
 // connects to host:port, returns a handle or a negative number
 public int connect(char* host, int port) {
-    int ip = parseIp(host);
+    int ip = resolve(host);
     if (ip < 0) {
         return -1;
     }
@@ -300,4 +320,366 @@ public char* httpGet(char* host, int port, char* path) {
         }
     }
     return start;
+}
+
+
+// ---- sockets: time limits, port, UDP ---------------------------------------------------------------------------------------
+// receive and send time limit in milliseconds (0 = wait forever)
+public void setTimeout(int h, int ms) {
+    if (windows()) {
+        int v = ms;
+        __winapix(WS_SETSOCKOPT, h, 0xFFFF, 0x1006, &v, 4, 0, 0, 0, 0, 0);   // SO_RCVTIMEO (a DWORD in ms)
+        __winapix(WS_SETSOCKOPT, h, 0xFFFF, 0x1005, &v, 4, 0, 0, 0, 0, 0);
+        return;
+    }
+    int tv[2];
+    tv[0] = ms / 1000;
+    tv[1] = (ms % 1000) * 1000;
+    __syscall(nr(54, 208), h, 1, 20, &tv[0], 16, 0);               // SOL_SOCKET, SO_RCVTIMEO
+    __syscall(nr(54, 208), h, 1, 21, &tv[0], 16, 0);               // SO_SNDTIMEO
+}
+
+// the local port of a socket (useful after udpBind(0) / listen on port 0), -1 on error
+public int localPort(int h) {
+    char sa[16];
+    int len = 16;
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_GETSOCKNAME, h, &sa[0], &len, 0));
+    } else {
+        r = __syscall(nr(51, 204), h, &sa[0], &len, 0, 0, 0);
+    }
+    if (r < 0) {
+        return -1;
+    }
+    return sa[2] * 256 + sa[3];
+}
+
+public int udpSocket() {
+    return newSock(SOCK_DGRAM, 17);
+}
+
+// a UDP socket that receives on every interface at the port (0 = a free port, see localPort)
+public int udpBind(int port) {
+    int s = udpSocket();
+    if (s < 0) {
+        return s;
+    }
+    char sa[16];
+    fillAddr(&sa[0], 0, port);
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_BIND, s, &sa[0], 16, 0));
+    } else {
+        r = __syscall(nr(49, 200), s, &sa[0], 16, 0, 0, 0);
+    }
+    if (r < 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+// sends one datagram to ip:port ("1.2.3.4" parsed by parseIp / resolve). Returns the bytes sent or -1
+public int sendTo(int h, int ip, int port, char* buf, int n) {
+    char sa[16];
+    fillAddr(&sa[0], ip, port);
+    if (windows()) {
+        return i32(__winapix(WS_SENDTO, h, buf, n, 0, &sa[0], 16, 0, 0, 0, 0));
+    }
+    return __syscall(nr(44, 206), h, buf, n, 0, &sa[0], 16);
+}
+
+// receives one datagram (max bytes at most); the sender's address goes to *ip and *port (either can be null).
+// Returns its length or -1 on error / time out
+public int recvFrom(int h, char* buf, int max, int* ip, int* port) {
+    char sa[16];
+    int len = 16;
+    int r;
+    if (windows()) {
+        r = i32(__winapix(WS_RECVFROM, h, buf, max, 0, &sa[0], &len, 0, 0, 0, 0));
+    } else {
+        r = __syscall(nr(45, 207), h, buf, max, 0, &sa[0], &len);
+    }
+    if (r < 0) {
+        return -1;
+    }
+    if (ip != null) {
+        *ip = (sa[4] << 24) | (sa[5] << 16) | (sa[6] << 8) | sa[7];
+    }
+    if (port != null) {
+        *port = sa[2] * 256 + sa[3];
+    }
+    return r;
+}
+
+// ---- DNS ------------------------------------------------------------------------------------------------------------------------
+private int dnsServerIp;
+private int dnsServerPort = 53;
+private int dnsNextId = 4711;
+
+// uses this DNS server ("8.8.8.8", 53) for names instead of the servers of the system
+public void setDns(char* ip, int port) {
+    dnsServerIp = parseIp(ip);
+    dnsServerPort = port;
+}
+
+// builds a DNS query for the A record of a name. Returns the packet length, -1 if the name is not valid
+public int dnsBuildQuery(char* name, int id, char* buf) {
+    for (int i = 0; i < 12; i++) {
+        buf[i] = 0;
+    }
+    buf[0] = (id >> 8) & 255;
+    buf[1] = id & 255;
+    buf[2] = 1;                                // recursion desired
+    buf[5] = 1;                                // one question
+    int pos = 12;
+    int labelAt = pos;
+    pos++;
+    int len = 0;
+    int i = 0;
+    for (;;) {
+        char c = name[i];
+        if (c == '.' || c == 0) {
+            if (len == 0 || len > 63) {
+                return -1;
+            }
+            buf[labelAt] = len;
+            if (c == 0) {
+                break;
+            }
+            labelAt = pos;
+            pos++;
+            len = 0;
+        } else {
+            if (pos > 500) {
+                return -1;
+            }
+            buf[pos] = c;
+            pos++;
+            len++;
+        }
+        i++;
+    }
+    buf[pos] = 0;
+    buf[pos + 1] = 0;
+    buf[pos + 2] = 1;                          // type A
+    buf[pos + 3] = 0;
+    buf[pos + 4] = 1;                          // class IN
+    return pos + 5;
+}
+
+// skips a (possibly compressed) name at pos, returns the position after it or -1
+private int dnsSkipName(char* b, int n, int pos) {
+    while (pos < n) {
+        int l = b[pos];
+        if (l == 0) {
+            return pos + 1;
+        }
+        if ((l & 0xC0) == 0xC0) {
+            return pos + 2;
+        }
+        pos = pos + l + 1;
+    }
+    return -1;
+}
+
+// finds the first A record of a reply. Returns the address (host order) or -1
+public int dnsParseReply(char* b, int n, int id) {
+    if (n < 12) {
+        return -1;
+    }
+    if (b[0] * 256 + b[1] != id) {
+        return -1;
+    }
+    if ((b[2] & 0x80) == 0 || (b[3] & 15) != 0) {
+        return -1;
+    }
+    int qd = b[4] * 256 + b[5];
+    int an = b[6] * 256 + b[7];
+    int pos = 12;
+    for (int i = 0; i < qd; i++) {
+        pos = dnsSkipName(b, n, pos);
+        if (pos < 0) {
+            return -1;
+        }
+        pos = pos + 4;
+    }
+    for (int i = 0; i < an; i++) {
+        pos = dnsSkipName(b, n, pos);
+        if (pos < 0 || pos + 10 > n) {
+            return -1;
+        }
+        int type = b[pos] * 256 + b[pos + 1];
+        int cls = b[pos + 2] * 256 + b[pos + 3];
+        int rd = b[pos + 8] * 256 + b[pos + 9];
+        pos = pos + 10;
+        if (pos + rd > n) {
+            return -1;
+        }
+        if (type == 1 && cls == 1 && rd == 4) {
+            return (b[pos] << 24) | (b[pos + 1] << 16) | (b[pos + 2] << 8) | b[pos + 3];
+        }
+        pos = pos + rd;
+    }
+    return -1;
+}
+
+// asks one DNS server, returns the address or -1
+private int dnsAsk(int server, int port, char* name) {
+    int s = udpSocket();
+    if (s < 0) {
+        return -1;
+    }
+    setTimeout(s, 2000);
+    char q[600];
+    dnsNextId = (dnsNextId * 75 + 74) & 0xFFFF;
+    int id = dnsNextId;
+    int n = dnsBuildQuery(name, id, &q[0]);
+    if (n < 0) {
+        close(s);
+        return -1;
+    }
+    int ip = -1;
+    for (int attempt = 0; attempt < 2 && ip < 0; attempt++) {
+        if (sendTo(s, server, port, &q[0], n) == n) {
+            char r[600];
+            int got = recvFrom(s, &r[0], 600, null, null);
+            if (got > 0) {
+                ip = dnsParseReply(&r[0], got, id);
+            }
+        }
+    }
+    close(s);
+    return ip;
+}
+
+// looks a name up in /etc/hosts (Linux / Android)
+private int hostsLookup(char* name) {
+    char* text = readFile("/etc/hosts");
+    if (text == null) {
+        return -1;
+    }
+    int i = 0;
+    while (text[i] != 0) {
+        // one line: address, then names, '#' starts a comment
+        int ls = i;
+        while (text[i] != 0 && text[i] != 10) {
+            i++;
+        }
+        int le = i;
+        if (text[i] == 10) {
+            i++;
+        }
+        int j = ls;
+        while (j < le && (text[j] == ' ' || text[j] == 9)) {
+            j++;
+        }
+        if (j >= le || text[j] == '#') {
+            continue;
+        }
+        char addr[64];
+        int k = 0;
+        while (j < le && text[j] != ' ' && text[j] != 9 && k < 63) {
+            addr[k] = text[j];
+            k++;
+            j++;
+        }
+        addr[k] = 0;
+        int ip = parseIp(&addr[0]);
+        if (ip < 0) {
+            continue;
+        }
+        while (j < le && text[j] != '#') {
+            while (j < le && (text[j] == ' ' || text[j] == 9)) {
+                j++;
+            }
+            char nm[256];
+            k = 0;
+            while (j < le && text[j] != ' ' && text[j] != 9 && text[j] != '#' && k < 255) {
+                nm[k] = text[j];
+                k++;
+                j++;
+            }
+            nm[k] = 0;
+            if (k > 0 && streq(&nm[0], name)) {
+                return ip;
+            }
+        }
+    }
+    return -1;
+}
+
+// the host name or address as an IPv4 address (host order), -1 if it cannot be found
+public int resolve(char* host) {
+    int ip = parseIp(host);
+    if (ip >= 0) {
+        return ip;
+    }
+    if (windows()) {
+        init();
+        int p = __winapi(WS_GETHOSTBYNAME, host, 0, 0, 0);
+        if (p == 0) {
+            return -1;
+        }
+        char* ent = p;
+        int* lp = &ent[24];                            // h_addr_list
+        int lst = *lp;
+        if (lst == 0) {
+            return -1;
+        }
+        int* ep = lst;
+        int a0 = *ep;
+        if (a0 == 0) {
+            return -1;
+        }
+        char* b = a0;
+        return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
+    }
+    ip = hostsLookup(host);
+    if (ip >= 0) {
+        return ip;
+    }
+    if (dnsServerIp != 0) {
+        return dnsAsk(dnsServerIp, dnsServerPort, host);
+    }
+    // the name servers of the system (resolv.conf), then two public ones
+    char* conf = readFile("/etc/resolv.conf");
+    if (conf != null) {
+        int i = 0;
+        while (conf[i] != 0) {
+            if (startsWith(&conf[i], "nameserver")) {
+                int j = i + 10;
+                while (conf[j] == ' ' || conf[j] == 9) {
+                    j++;
+                }
+                char a[64];
+                int k = 0;
+                while (conf[j] != 0 && conf[j] != 10 && conf[j] != ' ' && k < 63) {
+                    a[k] = conf[j];
+                    k++;
+                    j++;
+                }
+                a[k] = 0;
+                int srv = parseIp(&a[0]);
+                if (srv >= 0) {
+                    ip = dnsAsk(srv, 53, host);
+                    if (ip >= 0) {
+                        return ip;
+                    }
+                }
+            }
+            while (conf[i] != 0 && conf[i] != 10) {
+                i++;
+            }
+            if (conf[i] == 10) {
+                i++;
+            }
+        }
+    }
+    ip = dnsAsk(0x08080808, 53, host);
+    if (ip >= 0) {
+        return ip;
+    }
+    return dnsAsk(0x01010101, 53, host);
 }
