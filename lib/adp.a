@@ -1,0 +1,259 @@
+// =============================================================================
+//  adp - the A Display Protocol, shared by the display server (wsrv) and the client library (gui)    import adp;
+//
+//  A client connects to the display server over TCP (default 127.0.0.1:7000, set by the environment variable
+//  ADISPLAY: "N" for port 7000+N, "host:port", or ":N"). Every message is
+//
+//      int32 payload length   int32 opcode   payload
+//
+//  All numbers are little endian 32 bit signed integers; text and pixels follow the integers as raw bytes.
+//  Pixels are 4 bytes each: blue, green, red, alpha.
+//
+//  Requests (client -> server)
+//    Q_HELLO    version, name...                       introduce yourself  (answered with E_WELCOME)
+//    Q_CREATE   id, x, y, w, h, flags, title...         create a window; id is chosen by the client; x = y = -1: the server places it
+//    Q_DESTROY  id
+//    Q_TITLE    id, title...
+//    Q_MOVE     id, x, y                                 position of the client area
+//    Q_RESIZE   id, w, h                                 new size of the client area (the contents are lost, present again)
+//    Q_PRESENT  id, x, y, w, h, pixels...                new pixels for a rectangle of the window (the first one shows the window)
+//    Q_VISIBLE  id, visible
+//    Q_RAISE    id
+//    Q_CLIPSET  text...         Q_CLIPGET     the clipboard of the display (one text)
+//    Q_CURSOR   id, shape                                CURSOR_ARROW / CURSOR_TEXT / CURSOR_HAND while the pointer is over the window
+//    Q_PING     value                                     answered with E_PONG
+//    Q_FOCUS    id
+//  Events (server -> client)
+//    E_WELCOME  version, client number, screen width, screen height
+//    E_EXPOSE   id, x, y, w, h                           parts of the window have to be drawn again
+//    E_MOUSE    id, kind, button, x, y, modifiers        kind M_MOVE / M_DOWN / M_UP / M_SCROLL (button = +1 up, -1 down); x, y in the window
+//    E_KEY      id, down, key, unicode, modifiers
+//    E_FOCUS    id, gained
+//    E_CLOSE    id                                        the user pressed the close button
+//    E_RESIZE   id, w, h                                  the user resized the window
+//    E_CROSS    id, inside                                the pointer entered / left the window
+//    E_CLIP     text...                                   answer to Q_CLIPGET
+//    E_PONG     value
+// =============================================================================
+import cstdlib;
+module adp;
+
+public const VERSION = 1;
+public const DEFAULT_PORT = 7000;
+
+public const Q_HELLO = 1;
+public const Q_CREATE = 2;
+public const Q_DESTROY = 3;
+public const Q_TITLE = 4;
+public const Q_MOVE = 5;
+public const Q_RESIZE = 6;
+public const Q_PRESENT = 7;
+public const Q_VISIBLE = 8;
+public const Q_RAISE = 9;
+public const Q_CLIPSET = 10;
+public const Q_CLIPGET = 11;
+public const Q_CURSOR = 12;
+public const Q_PING = 13;
+public const Q_FOCUS = 14;
+
+public const E_WELCOME = 101;
+public const E_EXPOSE = 103;
+public const E_MOUSE = 104;
+public const E_KEY = 105;
+public const E_FOCUS = 106;
+public const E_CLOSE = 107;
+public const E_RESIZE = 108;
+public const E_CROSS = 109;
+public const E_CLIP = 110;
+public const E_PONG = 111;
+
+// window flags
+public const F_NODECOR = 1;        // no title bar or border
+public const F_BELOW = 2;          // stays below every other window (desktop background)
+public const F_ABOVE = 4;          // stays above the others (panels, menus)
+public const F_NOFOCUS = 8;        // never takes the keyboard focus
+public const F_FIXED = 16;         // the user cannot resize it
+
+public const M_MOVE = 0;
+public const M_DOWN = 1;
+public const M_UP = 2;
+public const M_SCROLL = 3;
+
+public const BUTTON_LEFT = 1;
+public const BUTTON_MIDDLE = 2;
+public const BUTTON_RIGHT = 3;
+
+public const MOD_SHIFT = 1;
+public const MOD_CTRL = 2;
+public const MOD_ALT = 4;
+public const MOD_META = 8;
+
+public const CURSOR_ARROW = 0;
+public const CURSOR_TEXT = 1;
+public const CURSOR_HAND = 2;
+
+// key codes: printable keys use their (lower case) character code, the others these numbers
+public const KEY_BACKSPACE = 8;
+public const KEY_TAB = 9;
+public const KEY_ENTER = 13;
+public const KEY_ESCAPE = 27;
+public const KEY_SPACE = 32;
+public const KEY_DELETE = 127;
+public const KEY_LEFT = 300;
+public const KEY_RIGHT = 301;
+public const KEY_UP = 302;
+public const KEY_DOWN = 303;
+public const KEY_HOME = 304;
+public const KEY_END = 305;
+public const KEY_PGUP = 306;
+public const KEY_PGDN = 307;
+public const KEY_INSERT = 308;
+public const KEY_F1 = 320;         // F1 .. F12 = 320 .. 331
+public const KEY_SHIFT = 340;
+public const KEY_CTRL = 341;
+public const KEY_ALT = 342;
+public const KEY_META = 343;
+public const KEY_CAPS = 344;
+
+public void put32(char* b, int at, int v) {
+    b[at] = v & 255;
+    b[at + 1] = (v >> 8) & 255;
+    b[at + 2] = (v >> 16) & 255;
+    b[at + 3] = (v >> 24) & 255;
+}
+
+// a signed 32 bit number
+public int get32(char* b, int at) {
+    int v = b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24);
+    if (v >= 0x80000000) {
+        v = v - 0x100000000;
+    }
+    return v;
+}
+
+// a growable byte buffer: the receive buffer of a connection, or a message that is being built
+public class Bytes {
+    public char* data;
+    public int len;
+    public int cap;
+
+    public Bytes() {
+        cap = 4096;
+        data = malloc(cap);
+        len = 0;
+    }
+
+    public void clear() {
+        len = 0;
+    }
+
+    public void reserve(int extra) {
+        if (len + extra + 16 > cap) {
+            int ncap = cap * 2;
+            while (len + extra + 16 > ncap) {
+                ncap = ncap * 2;
+            }
+            data = realloc(data, ncap);
+            cap = ncap;
+        }
+    }
+
+    public void add32(int v) {
+        reserve(4);
+        put32(data, len, v);
+        len = len + 4;
+    }
+
+    public void addBytes(char* p, int n) {
+        reserve(n);
+        memcpy(&data[len], p, n);
+        len = len + n;
+    }
+
+    public void addText(char* s) {
+        addBytes(s, strlen(s));
+    }
+
+    // removes the first n bytes
+    public void consume(int n) {
+        if (n >= len) {
+            len = 0;
+            return;
+        }
+        memcpy(data, &data[n], len - n);
+        len = len - n;
+    }
+
+    // a message starts with the header (payload length, opcode)
+    public void begin(int op) {
+        len = 0;
+        add32(0);
+        add32(op);
+    }
+
+    // fills in the payload length
+    public int finish() {
+        put32(data, 0, len - 8);
+        return len;
+    }
+}
+
+// the size of the first complete message in a buffer (header + payload), 0 if it is not complete yet, -1 if it is invalid
+public int messageSize(Bytes* b) {
+    if (b->len < 8) {
+        return 0;
+    }
+    int n = get32(b->data, 0);
+    if (n < 0 || n > 64 * 1024 * 1024) {
+        return -1;
+    }
+    if (b->len < 8 + n) {
+        return 0;
+    }
+    return 8 + n;
+}
+
+// the port for the ADISPLAY setting: "3" -> 7003, ":3" -> 7003, "host:7010" -> 7010
+public int portOf(char* spec) {
+    if (spec == null || spec[0] == 0) {
+        return DEFAULT_PORT;
+    }
+    int colon = -1;
+    for (int i = 0; spec[i] != 0; i++) {
+        if (spec[i] == ':') {
+            colon = i;
+        }
+    }
+    char* num = spec;
+    if (colon >= 0) {
+        num = &spec[colon + 1];
+    }
+    if (num[0] == 0) {
+        return DEFAULT_PORT;
+    }
+    int v = atoi(num);
+    if (v < 100) {
+        return DEFAULT_PORT + v;
+    }
+    return v;
+}
+
+// the host part of the setting ("127.0.0.1" when there is none)
+public char* hostOf(char* spec) {
+    if (spec == null) {
+        return "127.0.0.1";
+    }
+    int colon = -1;
+    for (int i = 0; spec[i] != 0; i++) {
+        if (spec[i] == ':') {
+            colon = i;
+        }
+    }
+    if (colon <= 0) {
+        return "127.0.0.1";
+    }
+    char* h = malloc(colon + 1);
+    memcpy(h, spec, colon);
+    h[colon] = 0;
+    return h;
+}

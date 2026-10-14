@@ -1,0 +1,691 @@
+// =============================================================================
+//  gfx - 2D software graphics                                        import gfx;
+//
+//  A Surface is a rectangle of pixels in memory. A pixel is an int 0xAARRGGBB (alpha, red, green, blue). Every drawing
+//  function clips to the surface and to the clip rectangle, so it is safe to draw outside of it.
+//
+//    gfx.Surface* s = new gfx.Surface(320, 200);
+//    s->clear(gfx.rgb(30, 30, 40));
+//    s->fill(10, 10, 100, 40, gfx.rgb(200, 80, 60));
+//    s->text(gfx.sans(), 16, 20, "Hello, world", gfx.WHITE);
+//    s->savePPM("out.ppm");
+//
+//  Colours      rgb(r,g,b)  argb(a,r,g,b)  alpha red green blue  withAlpha(c,a)  mix(c1,c2,t)  lighten darken
+//  Drawing      clear put get blend fill rect hline vline line circle fillCircle roundRect fillRoundRect
+//               gradientV shadow
+//  Images       blit (copy) blitBlend (alpha compositing) pack unpack savePPM saveBMP checksum
+//  Text         text(font, x, y, utf8, colour)  textWidth(font, s)  font->height  font->ascent
+//               Fonts: gfx.sans() gfx.sansBold() gfx.mono() (13 pixel antialiased DejaVu fonts, Latin-1)
+//  Drawing with a translucent colour (alpha < 255) blends it with what is already there.
+// =============================================================================
+import gfxfont;
+import cstdlib;
+module gfx;
+
+public const BLACK = 0xFF000000;
+public const WHITE = 0xFFFFFFFF;
+public const RED = 0xFFE03030;
+public const GREEN = 0xFF30B050;
+public const BLUE = 0xFF3070E0;
+public const YELLOW = 0xFFF0D030;
+public const GRAY = 0xFF808080;
+
+public int rgb(int r, int g, int b) {
+    return 0xFF000000 | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+}
+
+public int argb(int a, int r, int g, int b) {
+    return ((a & 255) << 24) | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255);
+}
+
+public int alpha(int c) { return (c >> 24) & 255; }
+public int red(int c) { return (c >> 16) & 255; }
+public int green(int c) { return (c >> 8) & 255; }
+public int blue(int c) { return c & 255; }
+
+public int withAlpha(int c, int a) {
+    return (c & 0xFFFFFF) | ((a & 255) << 24);
+}
+
+// t = 0 gives a, t = 255 gives b
+public int mix(int a, int b, int t) {
+    int it = 255 - t;
+    int r = (red(a) * it + red(b) * t + 127) / 255;
+    int g = (green(a) * it + green(b) * t + 127) / 255;
+    int bl = (blue(a) * it + blue(b) * t + 127) / 255;
+    return rgb(r, g, bl);
+}
+
+public int lighten(int c, int amount) { return mix(c, WHITE, amount); }
+public int darken(int c, int amount) { return mix(c, BLACK, amount); }
+
+// c laid over the destination pixel d with an extra coverage 0..255; the result is opaque
+private int over(int d, int c, int cover) {
+    int a = (((c >> 24) & 255) * cover + 127) / 255;
+    if (a >= 255) {
+        return c | 0xFF000000;
+    }
+    if (a <= 0) {
+        return d;
+    }
+    int ia = 255 - a;
+    int r = (((c >> 16) & 255) * a + ((d >> 16) & 255) * ia + 127) / 255;
+    int g = (((c >> 8) & 255) * a + ((d >> 8) & 255) * ia + 127) / 255;
+    int b = ((c & 255) * a + (d & 255) * ia + 127) / 255;
+    return 0xFF000000 | (r << 16) | (g << 8) | b;
+}
+
+public int isqrt(int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    int x = n;
+    int y = (x + 1) / 2;
+    while (y < x) {
+        x = y;
+        y = (x + n / x) / 2;
+    }
+    return x;
+}
+
+private int hexVal(int c) {
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    return c - 'a' + 10;
+}
+
+// =============================================================================
+//  fonts
+// =============================================================================
+public class Font {
+    public int ascent;
+    public int height;
+    private char* data;
+    private int* offs;
+
+    // hex is the text form made by docs/gen_font.py
+    public Font(char* hex) {
+        int n = strlen(hex) / 2;
+        data = malloc(n + 16);
+        for (int i = 0; i < n; i++) {
+            data[i] = hexVal(hex[i * 2]) * 16 + hexVal(hex[i * 2 + 1]);
+        }
+        ascent = data[0];
+        height = data[1];
+        offs = (int*) malloc(224 * 8);
+        int p = 2;
+        for (int i = 0; i < 224; i++) {
+            offs[i] = p;
+            int w = data[p + 3];
+            int h = data[p + 4];
+            p = p + 5 + (w * h + 1) / 2;
+        }
+    }
+
+    // offset of the glyph of a code (codes outside Latin-1 are shown as '?')
+    public int slot(int code) {
+        if (code < 32 || code > 255) {
+            code = '?';
+        }
+        return offs[code - 32];
+    }
+
+    public int advance(int code) {
+        return data[slot(code)];
+    }
+
+    public int byteAt(int i) {
+        return data[i];
+    }
+}
+
+// how far a rounded rectangle of height rh with corner radius r is cut in at one of its rows
+private int cornerInset(int r, int row, int rh) {
+    if (r <= 0) {
+        return 0;
+    }
+    if (row < r) {
+        int d = r - row;
+        return r - isqrt(r * r - d * d);
+    }
+    if (row >= rh - r) {
+        int d = row - (rh - r - 1);
+        return r - isqrt(r * r - d * d);
+    }
+    return 0;
+}
+
+// the next code point of a UTF-8 string (characters above Latin-1 become '?'); pos is advanced
+public int nextCode(char* s, int* pos) {
+    int i = *pos;
+    int c = s[i];
+    if (c == 0) {
+        return 0;
+    }
+    i++;
+    if (c >= 0xC0 && c < 0xE0 && (s[i] & 0xC0) == 0x80) {
+        c = ((c & 31) << 6) | (s[i] & 63);
+        i++;
+    } else if (c >= 0xE0) {
+        int extra = (c >= 0xF0) ? 3 : 2;
+        while (extra > 0 && (s[i] & 0xC0) == 0x80) {
+            i++;
+            extra--;
+        }
+        c = '?';
+    }
+    *pos = i;
+    return c;
+}
+
+public int textWidth(Font* f, char* s) {
+    int pos = 0;
+    int w = 0;
+    for (;;) {
+        int c = nextCode(s, &pos);
+        if (c == 0) {
+            break;
+        }
+        w = w + f->advance(c);
+    }
+    return w;
+}
+
+Font* theSans;
+Font* theBold;
+Font* theMono;
+
+public Font* sans() {
+    if (theSans == null) {
+        theSans = new Font(gfxfont.sans());
+    }
+    return theSans;
+}
+
+public Font* sansBold() {
+    if (theBold == null) {
+        theBold = new Font(gfxfont.sansBold());
+    }
+    return theBold;
+}
+
+public Font* mono() {
+    if (theMono == null) {
+        theMono = new Font(gfxfont.mono());
+    }
+    return theMono;
+}
+
+// =============================================================================
+//  surfaces
+// =============================================================================
+public class Surface {
+    public int w;
+    public int h;
+    public int* px;
+    public int clipX0;
+    public int clipY0;
+    public int clipX1;
+    public int clipY1;
+
+    public Surface(int width, int height) {
+        if (width < 1) { width = 1; }
+        if (height < 1) { height = 1; }
+        w = width;
+        h = height;
+        px = (int*) calloc(width * height, 8);
+        clipX0 = 0;
+        clipY0 = 0;
+        clipX1 = width;
+        clipY1 = height;
+    }
+
+    // gives the pixel memory back (the Surface itself stays valid but empty)
+    public void release() {
+        if (px != null) {
+            free((char*) px);
+        }
+        px = null;
+        w = 0;
+        h = 0;
+        clipX0 = 0;
+        clipY0 = 0;
+        clipX1 = 0;
+        clipY1 = 0;
+    }
+
+    // a new size; the old contents are dropped (the new surface is black and transparent)
+    public void resize(int width, int height) {
+        if (width < 1) { width = 1; }
+        if (height < 1) { height = 1; }
+        if (px != null) {
+            free((char*) px);
+        }
+        w = width;
+        h = height;
+        px = (int*) calloc(width * height, 8);
+        clipX0 = 0;
+        clipY0 = 0;
+        clipX1 = width;
+        clipY1 = height;
+    }
+
+    public void setClip(int x, int y, int cw, int ch) {
+        int x1 = x + cw;
+        int y1 = y + ch;
+        if (x < 0) { x = 0; }
+        if (y < 0) { y = 0; }
+        if (x1 > w) { x1 = w; }
+        if (y1 > h) { y1 = h; }
+        clipX0 = x;
+        clipY0 = y;
+        clipX1 = x1;
+        clipY1 = y1;
+    }
+
+    public void resetClip() {
+        clipX0 = 0;
+        clipY0 = 0;
+        clipX1 = w;
+        clipY1 = h;
+    }
+
+    public bool inside(int x, int y) {
+        return x >= clipX0 && x < clipX1 && y >= clipY0 && y < clipY1;
+    }
+
+    public int get(int x, int y) {
+        if (x < 0 || y < 0 || x >= w || y >= h) {
+            return 0;
+        }
+        return px[y * w + x];
+    }
+
+    // stores the colour (no blending)
+    public void put(int x, int y, int c) {
+        if (x >= clipX0 && x < clipX1 && y >= clipY0 && y < clipY1) {
+            px[y * w + x] = c;
+        }
+    }
+
+    // c laid over the pixel; cover (0..255) scales the alpha of c
+    public void blend(int x, int y, int c, int cover) {
+        if (x >= clipX0 && x < clipX1 && y >= clipY0 && y < clipY1) {
+            int i = y * w + x;
+            px[i] = over(px[i], c, cover);
+        }
+    }
+
+    public void clear(int c) {
+        int n = w * h;
+        for (int i = 0; i < n; i++) {
+            px[i] = c;
+        }
+    }
+
+    public void fill(int x, int y, int rw, int rh, int c) {
+        int x0 = x;
+        int y0 = y;
+        int x1 = x + rw;
+        int y1 = y + rh;
+        if (x0 < clipX0) { x0 = clipX0; }
+        if (y0 < clipY0) { y0 = clipY0; }
+        if (x1 > clipX1) { x1 = clipX1; }
+        if (y1 > clipY1) { y1 = clipY1; }
+        if (x0 >= x1 || y0 >= y1) {
+            return;
+        }
+        bool opaque = ((c >> 24) & 255) == 255;
+        for (int yy = y0; yy < y1; yy++) {
+            int i = yy * w + x0;
+            for (int xx = x0; xx < x1; xx++) {
+                if (opaque) {
+                    px[i] = c;
+                } else {
+                    px[i] = over(px[i], c, 255);
+                }
+                i++;
+            }
+        }
+    }
+
+    public void hline(int x, int y, int len, int c) {
+        fill(x, y, len, 1, c);
+    }
+
+    public void vline(int x, int y, int len, int c) {
+        fill(x, y, 1, len, c);
+    }
+
+    // outline of a rectangle
+    public void rect(int x, int y, int rw, int rh, int c) {
+        if (rw <= 0 || rh <= 0) {
+            return;
+        }
+        fill(x, y, rw, 1, c);
+        fill(x, y + rh - 1, rw, 1, c);
+        fill(x, y + 1, 1, rh - 2, c);
+        fill(x + rw - 1, y + 1, 1, rh - 2, c);
+    }
+
+    // a line (Bresenham)
+    public void line(int x0, int y0, int x1, int y1, int c) {
+        int dx = x1 - x0;
+        if (dx < 0) { dx = -dx; }
+        int dy = y1 - y0;
+        if (dy < 0) { dy = -dy; }
+        int sx = (x0 < x1) ? 1 : -1;
+        int sy = (y0 < y1) ? 1 : -1;
+        int err = dx - dy;
+        for (;;) {
+            blend(x0, y0, c, 255);
+            if (x0 == x1 && y0 == y1) {
+                break;
+            }
+            int e2 = err * 2;
+            if (e2 > -dy) {
+                err = err - dy;
+                x0 = x0 + sx;
+            }
+            if (e2 < dx) {
+                err = err + dx;
+                y0 = y0 + sy;
+            }
+        }
+    }
+
+    public void fillCircle(int cx, int cy, int r, int c) {
+        for (int dy = -r; dy <= r; dy++) {
+            int dx = isqrt(r * r - dy * dy);
+            fill(cx - dx, cy + dy, dx * 2 + 1, 1, c);
+        }
+    }
+
+    public void circle(int cx, int cy, int r, int c) {
+        int x = r;
+        int y = 0;
+        int err = 1 - r;
+        while (x >= y) {
+            blend(cx + x, cy + y, c, 255);
+            blend(cx - x, cy + y, c, 255);
+            blend(cx + x, cy - y, c, 255);
+            blend(cx - x, cy - y, c, 255);
+            blend(cx + y, cy + x, c, 255);
+            blend(cx - y, cy + x, c, 255);
+            blend(cx + y, cy - x, c, 255);
+            blend(cx - y, cy - x, c, 255);
+            y++;
+            if (err < 0) {
+                err = err + 2 * y + 1;
+            } else {
+                x--;
+                err = err + 2 * (y - x) + 1;
+            }
+        }
+    }
+
+    public void fillRoundRect(int x, int y, int rw, int rh, int r, int c) {
+        if (r * 2 > rw) { r = rw / 2; }
+        if (r * 2 > rh) { r = rh / 2; }
+        for (int row = 0; row < rh; row++) {
+            int inset = cornerInset(r, row, rh);
+            fill(x + inset, y + row, rw - inset * 2, 1, c);
+        }
+    }
+
+    // outline of a rounded rectangle (1 pixel wide)
+    public void roundRect(int x, int y, int rw, int rh, int r, int c) {
+        if (r * 2 > rw) { r = rw / 2; }
+        if (r * 2 > rh) { r = rh / 2; }
+        int ri = (r > 0) ? r - 1 : 0;
+        for (int row = 0; row < rh; row++) {
+            int io = cornerInset(r, row, rh);
+            if (row == 0 || row == rh - 1) {
+                fill(x + io, y + row, rw - io * 2, 1, c);
+            } else {
+                int ii = 1 + cornerInset(ri, row - 1, rh - 2);
+                if (ii < io + 1) { ii = io + 1; }
+                fill(x + io, y + row, ii - io, 1, c);
+                fill(x + rw - ii, y + row, ii - io, 1, c);
+            }
+        }
+    }
+
+    // a vertical colour gradient from c1 (top) to c2 (bottom)
+    public void gradientV(int x, int y, int rw, int rh, int c1, int c2) {
+        for (int row = 0; row < rh; row++) {
+            int t = (rh <= 1) ? 0 : (row * 255) / (rh - 1);
+            fill(x, y + row, rw, 1, mix(c1, c2, t));
+        }
+    }
+
+    // a soft dark halo around a rectangle (window shadows): the darkness fades over spread pixels
+    public void shadow(int x, int y, int rw, int rh, int spread, int maxAlpha) {
+        for (int i = 0; i < spread; i++) {
+            int a = maxAlpha * (spread - i) / (spread * spread) ;
+            int c = argb(a, 0, 0, 0);
+            int g = spread - i;
+            rect(x - g, y - g, rw + g * 2, rh + g * 2, c);
+        }
+    }
+
+    // copies a rectangle of src (opaque copy, no blending)
+    public void blit(Surface* src, int sx, int sy, int bw, int bh, int dx, int dy) {
+        if (sx < 0) { dx = dx - sx; bw = bw + sx; sx = 0; }
+        if (sy < 0) { dy = dy - sy; bh = bh + sy; sy = 0; }
+        if (sx + bw > src->w) { bw = src->w - sx; }
+        if (sy + bh > src->h) { bh = src->h - sy; }
+        if (dx < clipX0) { sx = sx + (clipX0 - dx); bw = bw - (clipX0 - dx); dx = clipX0; }
+        if (dy < clipY0) { sy = sy + (clipY0 - dy); bh = bh - (clipY0 - dy); dy = clipY0; }
+        if (dx + bw > clipX1) { bw = clipX1 - dx; }
+        if (dy + bh > clipY1) { bh = clipY1 - dy; }
+        if (bw <= 0 || bh <= 0) {
+            return;
+        }
+        for (int row = 0; row < bh; row++) {
+            int si = (sy + row) * src->w + sx;
+            int di = (dy + row) * w + dx;
+            for (int col = 0; col < bw; col++) {
+                px[di] = src->px[si];
+                di++;
+                si++;
+            }
+        }
+    }
+
+    // like blit, but the source alpha is composited over the destination (opacity 0..255 scales it)
+    public void blitBlend(Surface* src, int sx, int sy, int bw, int bh, int dx, int dy, int opacity) {
+        if (sx < 0) { dx = dx - sx; bw = bw + sx; sx = 0; }
+        if (sy < 0) { dy = dy - sy; bh = bh + sy; sy = 0; }
+        if (sx + bw > src->w) { bw = src->w - sx; }
+        if (sy + bh > src->h) { bh = src->h - sy; }
+        if (dx < clipX0) { sx = sx + (clipX0 - dx); bw = bw - (clipX0 - dx); dx = clipX0; }
+        if (dy < clipY0) { sy = sy + (clipY0 - dy); bh = bh - (clipY0 - dy); dy = clipY0; }
+        if (dx + bw > clipX1) { bw = clipX1 - dx; }
+        if (dy + bh > clipY1) { bh = clipY1 - dy; }
+        if (bw <= 0 || bh <= 0) {
+            return;
+        }
+        for (int row = 0; row < bh; row++) {
+            int si = (sy + row) * src->w + sx;
+            int di = (dy + row) * w + dx;
+            for (int col = 0; col < bw; col++) {
+                px[di] = over(px[di], src->px[si], opacity);
+                di++;
+                si++;
+            }
+        }
+    }
+
+    // draws UTF-8 text, y is the top of the line; returns the x position after the text
+    public int text(Font* f, int x, int y, char* s, int color) {
+        int pos = 0;
+        int baseline = y + f->ascent;
+        for (;;) {
+            int code = nextCode(s, &pos);
+            if (code == 0) {
+                break;
+            }
+            int p = f->slot(code);
+            int lb = f->byteAt(p + 1);
+            if (lb > 127) {
+                lb = lb - 256;
+            }
+            int top = f->byteAt(p + 2);
+            if (top > 127) {
+                top = top - 256;
+            }
+            int gw = f->byteAt(p + 3);
+            int gh = f->byteAt(p + 4);
+            int gx = x + lb;
+            int gy = baseline - top;
+            int q = p + 5;
+            int i = 0;
+            for (int row = 0; row < gh; row++) {
+                for (int col = 0; col < gw; col++) {
+                    int bv = f->byteAt(q + (i >> 1));
+                    int cov = (i & 1) ? (bv & 15) : (bv >> 4);
+                    i++;
+                    if (cov != 0) {
+                        blend(gx + col, gy + row, color, cov * 17);
+                    }
+                }
+            }
+            x = x + f->byteAt(p);
+        }
+        return x;
+    }
+
+    // text centred in a rectangle
+    public void textCentered(Font* f, int x, int y, int rw, int rh, char* s, int color) {
+        int tw = textWidth(f, s);
+        text(f, x + (rw - tw) / 2, y + (rh - f->height) / 2, s, color);
+    }
+
+    // ---- pixel transfer (4 bytes per pixel: blue, green, red, alpha) -------------------------------------------------------
+    // writes the rectangle (clipped to the surface) to out; returns the number of bytes
+    public int pack(int x, int y, int bw, int bh, char* out) {
+        int n = 0;
+        for (int row = 0; row < bh; row++) {
+            for (int col = 0; col < bw; col++) {
+                int c = get(x + col, y + row);
+                out[n] = c & 255;
+                out[n + 1] = (c >> 8) & 255;
+                out[n + 2] = (c >> 16) & 255;
+                out[n + 3] = (c >> 24) & 255;
+                n = n + 4;
+            }
+        }
+        return n;
+    }
+
+    // stores bw * bh pixels given as bytes (blue, green, red, alpha) at x, y
+    public void unpack(int x, int y, int bw, int bh, char* in) {
+        int n = 0;
+        for (int row = 0; row < bh; row++) {
+            for (int col = 0; col < bw; col++) {
+                int c = in[n] | (in[n + 1] << 8) | (in[n + 2] << 16) | (in[n + 3] << 24);
+                if (x + col >= 0 && x + col < w && y + row >= 0 && y + row < h) {
+                    px[(y + row) * w + x + col] = c;
+                }
+                n = n + 4;
+            }
+        }
+    }
+
+    // a number that depends on every pixel (for tests: the same picture gives the same number everywhere)
+    public int checksum() {
+        int hsh = 0x811C9DC5;
+        int n = w * h;
+        for (int i = 0; i < n; i++) {
+            hsh = ((hsh ^ (px[i] & 0xFFFFFFFF)) * 16777619) & 0xFFFFFFFF;
+        }
+        return hsh;
+    }
+
+    // writes a binary PPM (P6) image
+    public bool savePPM(char* path) {
+        int f = fileOpen(path, 1);
+        if (f < 0) {
+            return false;
+        }
+        char head[40];
+        int n = format(&head[0], 40, "P6\n%d %d\n255\n", w, h);
+        fileWrite(f, &head[0], n);
+        char* row = malloc(w * 3 + 4);
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int c = px[y * w + x];
+                row[x * 3] = (c >> 16) & 255;
+                row[x * 3 + 1] = (c >> 8) & 255;
+                row[x * 3 + 2] = c & 255;
+            }
+            fileWrite(f, row, w * 3);
+        }
+        free(row);
+        fileClose(f);
+        return true;
+    }
+
+    // writes a 24 bit BMP image
+    public bool saveBMP(char* path) {
+        int f = fileOpen(path, 1);
+        if (f < 0) {
+            return false;
+        }
+        int stride = (w * 3 + 3) & ~3;
+        int size = 54 + stride * h;
+        char head[54];
+        memset(&head[0], 0, 54);
+        head[0] = 'B';
+        head[1] = 'M';
+        put32(&head[0], 2, size);
+        put32(&head[0], 10, 54);
+        put32(&head[0], 14, 40);
+        put32(&head[0], 18, w);
+        put32(&head[0], 22, h);
+        head[26] = 1;
+        head[28] = 24;
+        put32(&head[0], 34, stride * h);
+        fileWrite(f, &head[0], 54);
+        char* row = malloc(stride + 4);
+        for (int y = h - 1; y >= 0; y--) {
+            memset(row, 0, stride);
+            for (int x = 0; x < w; x++) {
+                int c = px[y * w + x];
+                row[x * 3] = c & 255;
+                row[x * 3 + 1] = (c >> 8) & 255;
+                row[x * 3 + 2] = (c >> 16) & 255;
+            }
+            fileWrite(f, row, stride);
+        }
+        free(row);
+        fileClose(f);
+        return true;
+    }
+}
+
+private void put32(char* b, int at, int v) {
+    b[at] = v & 255;
+    b[at + 1] = (v >> 8) & 255;
+    b[at + 2] = (v >> 16) & 255;
+    b[at + 3] = (v >> 24) & 255;
+}
+
+// a rectangle helper used by the display server and the toolkit
+public class Rect {
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+    public Rect(int rx, int ry, int rw, int rh) {
+        x = rx;
+        y = ry;
+        w = rw;
+        h = rh;
+    }
+    public bool contains(int px, int py) {
+        return px >= x && px < x + w && py >= y && py < y + h;
+    }
+}

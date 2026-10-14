@@ -1,0 +1,1830 @@
+// =============================================================================
+//  gui - graphical programs: a connection to a display server, windows and widgets          import gui;
+//
+//    gui.Display* d = gui.connect(null);                     // uses ADISPLAY (default 127.0.0.1:7000)
+//    gui.Window* w = d->createWindow("Hello", 300, 160, 0);
+//    gui.Box* col = gui.vbox(10, 12);                        // vertical box: spacing 10, padding 12
+//    col->add(new gui.Label("Press the button"));
+//    gui.Button* b = new gui.Button("Click me");
+//    b->onClick = clicked;                                    // int clicked(int widget) { ... return 0; }
+//    col->add(b);
+//    w->setRoot(col);
+//    d->run();                                                // until every window is closed
+//
+//  Widgets      Label  Button  CheckBox  TextBox  ListBox  Slider  ProgressBar  ImageView  Separator  Spacer  Box (layout)
+//  Layout       a Box lays its children out in a row or column. A child with flex > 0 takes its share of the free space,
+//               the others get their preferred size. Children are stretched across the box.
+//  Callbacks    are plain functions  int f(int widget);  the widget comes as an int (cast it: (gui.Button*) widget);
+//               every widget has a userData field for your own use.
+//  Own drawing  derive from gui.Widget and override paint(), onMouse(), onKey(); or draw into window->surf and call
+//               window->invalidateAll().
+//  Timers       d->after(ms, f, arg) calls  int f(int arg)  once.
+//  Events are handled by d->run() (or d->pump(ms) if you have a loop of your own). Windows are repainted after every
+//  event that changed something.
+// =============================================================================
+import net;
+import gfx;
+import adp;
+import cstdlib;
+module gui;
+
+// ---- colours of the standard theme ------------------------------------------------------------------------------------------
+public int cBack = 0xFFEEEEF2;
+public int cText = 0xFF202428;
+public int cTextDim = 0xFF80848C;
+public int cAccent = 0xFF3C78D8;
+public int cAccentText = 0xFFFFFFFF;
+public int cField = 0xFFFFFFFF;
+public int cBorder = 0xFF9CA0AA;
+public int cButton = 0xFFE4E6EC;
+public int cButtonHot = 0xFFD6DAE6;
+public int cButtonDown = 0xFFBCC4DC;
+public int cSelect = 0xFF9CC0F0;
+
+// a function that is called while the library waits for the server (a program that runs the display server in the
+// same process sets it to a function that calls server->step(0))
+public func idleHook;
+
+class Window;
+class Widget;
+class Display;
+
+// =============================================================================
+//  widgets
+// =============================================================================
+public class Widget {
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+    public int flex;                // share of the free space in a Box (0 = preferred size)
+    public int userData;
+    public bool visible;
+    public bool enabled;
+    public bool focusable;
+    public Widget* parent;
+    public Window* win;
+    public Widget** kids;
+    public int nkids;
+    public int capKids;
+
+    public Widget() {
+        visible = true;
+        enabled = true;
+        w = 10;
+        h = 10;
+    }
+
+    public void add(Widget* k) {
+        if (capKids == 0) {
+            capKids = 8;
+            kids = (Widget**) calloc(capKids, 8);
+        } else if (nkids == capKids) {
+            capKids = capKids * 2;
+            kids = (Widget**) realloc((char*) kids, capKids * 8);
+        }
+        kids[nkids] = k;
+        nkids++;
+        k->parent = this;
+        k->attach(win);
+        relayout();
+    }
+
+    public void removeAll() {
+        for (int i = 0; i < nkids; i++) {
+            kids[i]->attach(null);
+            kids[i]->parent = null;
+        }
+        nkids = 0;
+        relayout();
+    }
+
+    // tells the widget and its children which window they belong to
+    public void attach(Window* wn) {
+        win = wn;
+        for (int i = 0; i < nkids; i++) {
+            kids[i]->attach(wn);
+        }
+    }
+
+    public virtual int prefW() { return w; }
+    public virtual int prefH() { return h; }
+    public virtual void layout() {
+        for (int i = 0; i < nkids; i++) {
+            kids[i]->layout();
+        }
+    }
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+    }
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        return false;
+    }
+    public virtual bool onKey(int down, int key, int uni, int mods) {
+        return false;
+    }
+    public virtual void onFocus(bool gained) {
+    }
+    public virtual void onHover(bool inside) {
+    }
+
+    public int absX() {
+        int v = x;
+        Widget* p = parent;
+        while (p != null) {
+            v = v + p->x;
+            p = p->parent;
+        }
+        return v;
+    }
+
+    public int absY() {
+        int v = y;
+        Widget* p = parent;
+        while (p != null) {
+            v = v + p->y;
+            p = p->parent;
+        }
+        return v;
+    }
+
+    // the deepest visible widget at (px, py) given relative to this widget, null if none
+    public Widget* hit(int px, int py) {
+        if (!visible || px < 0 || py < 0 || px >= w || py >= h) {
+            return null;
+        }
+        for (int i = nkids - 1; i >= 0; i--) {
+            Widget* k = kids[i];
+            Widget* r = k->hit(px - k->x, py - k->y);
+            if (r != null) {
+                return r;
+            }
+        }
+        return this;
+    }
+
+    public void paintTree(gfx.Surface* s, int ox, int oy) {
+        if (!visible) {
+            return;
+        }
+        int c0 = s->clipX0;
+        int c1 = s->clipY0;
+        int c2 = s->clipX1;
+        int c3 = s->clipY1;
+        int nx0 = (ox > c0) ? ox : c0;
+        int ny0 = (oy > c1) ? oy : c1;
+        int nx1 = (ox + w < c2) ? ox + w : c2;
+        int ny1 = (oy + h < c3) ? oy + h : c3;
+        if (nx0 < nx1 && ny0 < ny1) {
+            s->clipX0 = nx0;
+            s->clipY0 = ny0;
+            s->clipX1 = nx1;
+            s->clipY1 = ny1;
+            paint(s, ox, oy);
+            for (int i = 0; i < nkids; i++) {
+                kids[i]->paintTree(s, ox + kids[i]->x, oy + kids[i]->y);
+            }
+        }
+        s->clipX0 = c0;
+        s->clipY0 = c1;
+        s->clipX1 = c2;
+        s->clipY1 = c3;
+    }
+
+    public void invalidate() {
+        if (win != null) {
+            win->invalidate(absX(), absY(), w, h);
+        }
+    }
+
+    // the widget (or a child of it) changed size: arrange everything again
+    public void relayout() {
+        if (win != null) {
+            win->needLayout = true;
+        }
+    }
+
+    public void setVisible(bool v) {
+        visible = v;
+        relayout();
+        if (win != null) {
+            win->invalidateAll();
+        }
+    }
+
+    public void setEnabled(bool v) {
+        enabled = v;
+        invalidate();
+    }
+
+    public void focusMe() {
+        if (win != null) {
+            win->setFocus(this);
+        }
+    }
+}
+
+// ---- a row or a column of widgets ---------------------------------------------------------------------------------------------------
+public class Box : Widget {
+    public bool vertical;
+    public int spacing;
+    public int padding;
+    public int background;          // 0 = transparent
+    public int border;              // 0 = none
+
+    public Box(bool vert, int space, int pad) {
+        super();
+        vertical = vert;
+        spacing = space;
+        padding = pad;
+    }
+
+    public virtual int prefW() {
+        int total = 0;
+        int count = 0;
+        for (int i = 0; i < nkids; i++) {
+            if (!kids[i]->visible) { continue; }
+            int pw = kids[i]->prefW();
+            if (vertical) {
+                if (pw > total) { total = pw; }
+            } else {
+                total = total + pw;
+            }
+            count++;
+        }
+        if (!vertical && count > 1) {
+            total = total + spacing * (count - 1);
+        }
+        return total + padding * 2;
+    }
+
+    public virtual int prefH() {
+        int total = 0;
+        int count = 0;
+        for (int i = 0; i < nkids; i++) {
+            if (!kids[i]->visible) { continue; }
+            int ph = kids[i]->prefH();
+            if (!vertical) {
+                if (ph > total) { total = ph; }
+            } else {
+                total = total + ph;
+            }
+            count++;
+        }
+        if (vertical && count > 1) {
+            total = total + spacing * (count - 1);
+        }
+        return total + padding * 2;
+    }
+
+    public virtual void layout() {
+        int count = 0;
+        int fixedSum = 0;
+        int flexSum = 0;
+        for (int i = 0; i < nkids; i++) {
+            Widget* k = kids[i];
+            if (!k->visible) { continue; }
+            count++;
+            if (k->flex > 0) {
+                flexSum = flexSum + k->flex;
+            } else {
+                fixedSum = fixedSum + (vertical ? k->prefH() : k->prefW());
+            }
+        }
+        int mainSize = (vertical ? h : w) - padding * 2;
+        int free = mainSize - fixedSum - ((count > 1) ? spacing * (count - 1) : 0);
+        if (free < 0) { free = 0; }
+        int cross = (vertical ? w : h) - padding * 2;
+        int pos = padding;
+        int flexLeft = flexSum;
+        int freeLeft = free;
+        for (int i = 0; i < nkids; i++) {
+            Widget* k = kids[i];
+            if (!k->visible) { continue; }
+            int size;
+            if (k->flex > 0) {
+                size = freeLeft * k->flex / flexLeft;
+                freeLeft = freeLeft - size;
+                flexLeft = flexLeft - k->flex;
+            } else {
+                size = vertical ? k->prefH() : k->prefW();
+            }
+            if (vertical) {
+                k->x = padding;
+                k->y = pos;
+                k->w = cross;
+                k->h = size;
+            } else {
+                k->x = pos;
+                k->y = padding;
+                k->w = size;
+                k->h = cross;
+            }
+            pos = pos + size + spacing;
+            k->layout();
+        }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        if (background != 0) {
+            s->fill(ox, oy, w, h, background);
+        }
+        if (border != 0) {
+            s->rect(ox, oy, w, h, border);
+        }
+    }
+}
+
+public Box* vbox(int spacing, int padding) {
+    return new Box(true, spacing, padding);
+}
+
+public Box* hbox(int spacing, int padding) {
+    return new Box(false, spacing, padding);
+}
+
+// ---- Label ---------------------------------------------------------------------------------------------------------------------------
+public class Label : Widget {
+    public char* text;
+    public int color;
+    public int align;               // 0 left, 1 centre, 2 right
+    public gfx.Font* font;
+
+    public Label(char* t) {
+        super();
+        text = strdup(t);
+        color = cText;
+        font = gfx.sans();
+    }
+
+    public void setText(char* t) {
+        text = strdup(t);
+        relayout();
+        invalidate();
+    }
+
+    public virtual int prefW() { return gfx.textWidth(font, text) + 2; }
+    public virtual int prefH() { return font->height + 4; }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        int tw = gfx.textWidth(font, text);
+        int tx = ox + 1;
+        if (align == 1) { tx = ox + (w - tw) / 2; }
+        if (align == 2) { tx = ox + w - tw - 1; }
+        s->text(font, tx, oy + (h - font->height) / 2, text, enabled ? color : cTextDim);
+    }
+}
+
+// ---- Button ------------------------------------------------------------------------------------------------------------------------------
+public class Button : Widget {
+    public char* text;
+    public func onClick;
+    public bool primary;            // drawn in the accent colour
+    private bool down;
+    private bool hot;
+
+    public Button(char* t) {
+        super();
+        text = strdup(t);
+        focusable = true;
+    }
+
+    public void setText(char* t) {
+        text = strdup(t);
+        relayout();
+        invalidate();
+    }
+
+    public virtual int prefW() { return gfx.textWidth(gfx.sans(), text) + 28; }
+    public virtual int prefH() { return 28; }
+
+    public void click() {
+        if (enabled && onClick != null) {
+            onClick(this);
+        }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        int base = primary ? cAccent : cButton;
+        int c = base;
+        if (!enabled) {
+            c = gfx.mix(base, cBack, 140);
+        } else if (down) {
+            c = primary ? gfx.darken(cAccent, 50) : cButtonDown;
+        } else if (hot) {
+            c = primary ? gfx.lighten(cAccent, 40) : cButtonHot;
+        }
+        s->fillRoundRect(ox, oy, w, h, 5, c);
+        s->roundRect(ox, oy, w, h, 5, (win != null && win->focusWidget == this) ? cAccent : cBorder);
+        int tc = primary ? cAccentText : cText;
+        if (!enabled) { tc = cTextDim; }
+        s->textCentered(gfx.sans(), ox, oy + (down ? 1 : 0), w, h, text, tc);
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (!enabled) {
+            return true;
+        }
+        if (kind == adp.M_DOWN && button == 1) {
+            down = true;
+            invalidate();
+            return true;
+        }
+        if (kind == adp.M_UP && button == 1) {
+            bool was = down;
+            down = false;
+            invalidate();
+            if (was && mx >= 0 && my >= 0 && mx < w && my < h) {
+                click();
+            }
+            return true;
+        }
+        return true;
+    }
+
+    public virtual void onHover(bool inside) {
+        hot = inside;
+        if (!inside) { down = false; }
+        invalidate();
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn != 0 && (key == adp.KEY_ENTER || key == adp.KEY_SPACE)) {
+            click();
+            return true;
+        }
+        return false;
+    }
+
+    public virtual void onFocus(bool gained) {
+        invalidate();
+    }
+}
+
+// ---- CheckBox ----------------------------------------------------------------------------------------------------------------------------
+public class CheckBox : Widget {
+    public char* text;
+    public bool checked;
+    public func onChange;
+
+    public CheckBox(char* t) {
+        super();
+        text = strdup(t);
+        focusable = true;
+    }
+
+    public virtual int prefW() { return gfx.textWidth(gfx.sans(), text) + 26; }
+    public virtual int prefH() { return 22; }
+
+    public void setChecked(bool v) {
+        checked = v;
+        invalidate();
+        if (onChange != null) {
+            onChange(this);
+        }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        int by = oy + (h - 16) / 2;
+        s->fillRoundRect(ox + 1, by, 16, 16, 3, cField);
+        s->roundRect(ox + 1, by, 16, 16, 3, (win != null && win->focusWidget == this) ? cAccent : cBorder);
+        if (checked) {
+            int ink = enabled ? cAccent : cTextDim;
+            s->line(ox + 4, by + 8, ox + 7, by + 11, ink);
+            s->line(ox + 5, by + 8, ox + 8, by + 11, ink);
+            s->line(ox + 7, by + 11, ox + 13, by + 4, ink);
+            s->line(ox + 8, by + 11, ox + 14, by + 4, ink);
+        }
+        s->text(gfx.sans(), ox + 24, oy + (h - gfx.sans()->height) / 2, text, enabled ? cText : cTextDim);
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (enabled && kind == adp.M_UP && button == 1 && mx >= 0 && my >= 0 && mx < w && my < h) {
+            setChecked(!checked);
+        }
+        return true;
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn != 0 && key == adp.KEY_SPACE) {
+            setChecked(!checked);
+            return true;
+        }
+        return false;
+    }
+
+    public virtual void onFocus(bool gained) {
+        invalidate();
+    }
+}
+
+// ---- TextBox ---------------------------------------------------------------------------------------------------------------------------------
+public class TextBox : Widget {
+    public func onEnter;
+    public func onChange;
+    public bool password;
+    public char* placeholder;
+    private char* buf;
+    private int cap;
+    private int len;
+    private int cur;
+    private int anchor;             // the other end of the selection (== cur: nothing selected)
+    private int scroll;             // pixels the text is shifted left
+    private bool caretOn;
+    private bool dragging;
+
+    public TextBox() {
+        super();
+        focusable = true;
+        cap = 256;
+        buf = malloc(cap);
+        buf[0] = 0;
+        placeholder = "";
+        w = 160;
+        h = 26;
+    }
+
+    public virtual int prefW() { return 160; }
+    public virtual int prefH() { return 26; }
+
+    public char* text() { return buf; }
+
+    public void setText(char* t) {
+        len = 0;
+        buf[0] = 0;
+        insertText(t);
+        anchor = cur;
+        invalidate();
+    }
+
+    public void selectAll() {
+        anchor = 0;
+        cur = len;
+        invalidate();
+    }
+
+    private void grow(int extra) {
+        if (len + extra + 8 > cap) {
+            while (len + extra + 8 > cap) {
+                cap = cap * 2;
+            }
+            buf = realloc(buf, cap);
+        }
+    }
+
+    private bool hasSelection() { return anchor != cur; }
+
+    private void deleteSelection() {
+        if (!hasSelection()) {
+            return;
+        }
+        int a = (anchor < cur) ? anchor : cur;
+        int b = (anchor < cur) ? cur : anchor;
+        memcpy(&buf[a], &buf[b], len - b + 1);
+        len = len - (b - a);
+        cur = a;
+        anchor = a;
+    }
+
+    private void insertText(char* t) {
+        deleteSelection();
+        int n = strlen(t);
+        grow(n);
+        memcpy(&buf[cur + n], &buf[cur], len - cur + 1);
+        memcpy(&buf[cur], t, n);
+        len = len + n;
+        cur = cur + n;
+        anchor = cur;
+    }
+
+    // inserts a character (code point; encoded as UTF-8)
+    private void insertChar(int c) {
+        char tmp[8];
+        if (c < 128) {
+            tmp[0] = c;
+            tmp[1] = 0;
+        } else if (c < 2048) {
+            tmp[0] = 0xC0 | (c >> 6);
+            tmp[1] = 0x80 | (c & 63);
+            tmp[2] = 0;
+        } else {
+            tmp[0] = '?';
+            tmp[1] = 0;
+        }
+        insertText(&tmp[0]);
+    }
+
+    // the byte position of the character before / after a position (UTF-8 aware)
+    private int prevPos(int p) {
+        if (p <= 0) { return 0; }
+        p--;
+        while (p > 0 && (buf[p] & 0xC0) == 0x80) { p--; }
+        return p;
+    }
+
+    private int nextPos(int p) {
+        if (p >= len) { return len; }
+        p++;
+        while (p < len && (buf[p] & 0xC0) == 0x80) { p++; }
+        return p;
+    }
+
+    private int widthTo(int p) {
+        char save = buf[p];
+        buf[p] = 0;
+        int tw;
+        if (password) {
+            tw = 0;
+            int q = 0;
+            while (q < p) {
+                tw = tw + gfx.sans()->advance('*');
+                q = nextPos(q);
+            }
+        } else {
+            tw = gfx.textWidth(gfx.sans(), buf);
+        }
+        buf[p] = save;
+        return tw;
+    }
+
+    private int posAt(int px) {
+        int best = 0;
+        int p = 0;
+        while (p <= len) {
+            int wd = widthTo(p);
+            if (wd - scroll > px) {
+                break;
+            }
+            best = p;
+            if (p == len) { break; }
+            p = nextPos(p);
+        }
+        return best;
+    }
+
+    private void changed() {
+        invalidate();
+        if (onChange != null) {
+            onChange(this);
+        }
+    }
+
+    private void keepCaretVisible() {
+        int cx = widthTo(cur);
+        int room = w - 12;
+        if (cx - scroll > room) { scroll = cx - room; }
+        if (cx - scroll < 0) { scroll = cx; }
+        if (scroll < 0) { scroll = 0; }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        bool focused = (win != null && win->focusWidget == this);
+        s->fillRoundRect(ox, oy, w, h, 4, enabled ? cField : cBack);
+        s->roundRect(ox, oy, w, h, 4, focused ? cAccent : cBorder);
+        int c0 = s->clipX0;
+        int c2 = s->clipX1;
+        int ix = ox + 5;
+        if (ix > s->clipX0) { s->clipX0 = ix; }
+        if (ox + w - 5 < s->clipX1) { s->clipX1 = ox + w - 5; }
+        gfx.Font* f = gfx.sans();
+        int ty = oy + (h - f->height) / 2;
+        if (len == 0 && !focused) {
+            s->text(f, ix, ty, placeholder, cTextDim);
+        } else {
+            if (hasSelection()) {
+                int a = (anchor < cur) ? anchor : cur;
+                int b = (anchor < cur) ? cur : anchor;
+                int sx0 = ix + widthTo(a) - scroll;
+                int sx1 = ix + widthTo(b) - scroll;
+                s->fill(sx0, ty - 1, sx1 - sx0, f->height + 2, cSelect);
+            }
+            if (password) {
+                int px = ix - scroll;
+                int q = 0;
+                while (q < len) {
+                    px = s->text(f, px, ty, "*", cText);
+                    q = nextPos(q);
+                }
+            } else {
+                s->text(f, ix - scroll, ty, buf, cText);
+            }
+            if (focused && caretOn) {
+                int cx = ix + widthTo(cur) - scroll;
+                s->fill(cx, ty, 1, f->height, cText);
+            }
+        }
+        s->clipX0 = c0;
+        s->clipX1 = c2;
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (!enabled) {
+            return true;
+        }
+        if (kind == adp.M_DOWN && button == 1) {
+            cur = posAt(mx - 5);
+            if ((mods & adp.MOD_SHIFT) == 0) {
+                anchor = cur;
+            }
+            dragging = true;
+            caretOn = true;
+            invalidate();
+        } else if (kind == adp.M_MOVE && dragging) {
+            cur = posAt(mx - 5);
+            keepCaretVisible();
+            invalidate();
+        } else if (kind == adp.M_UP) {
+            dragging = false;
+        }
+        return true;
+    }
+
+    public virtual void onFocus(bool gained) {
+        caretOn = gained;
+        if (gained && win != null) {
+            win->display->after(500, blink, (int) this);
+        }
+        invalidate();
+    }
+
+    public void toggleCaret() {
+        if (win != null && win->focusWidget == this) {
+            caretOn = !caretOn;
+            invalidate();
+            win->display->after(500, blink, (int) this);
+        }
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn == 0 || !enabled) {
+            return false;
+        }
+        bool shift = (mods & adp.MOD_SHIFT) != 0;
+        bool ctrl = (mods & adp.MOD_CTRL) != 0;
+        caretOn = true;
+        if (ctrl) {
+            if (key == 'a') {
+                selectAll();
+                return true;
+            }
+            if ((key == 'c' || key == 'x') && hasSelection()) {
+                int a = (anchor < cur) ? anchor : cur;
+                int b = (anchor < cur) ? cur : anchor;
+                char saved = buf[b];
+                buf[b] = 0;
+                win->display->setClipboard(&buf[a]);
+                buf[b] = saved;
+                if (key == 'x') {
+                    deleteSelection();
+                    changed();
+                }
+                return true;
+            }
+            if (key == 'v') {
+                win->display->requestPaste(this);
+                return true;
+            }
+            return false;
+        }
+        if (key == adp.KEY_LEFT) {
+            cur = prevPos(cur);
+            if (!shift) { anchor = cur; }
+        } else if (key == adp.KEY_RIGHT) {
+            cur = nextPos(cur);
+            if (!shift) { anchor = cur; }
+        } else if (key == adp.KEY_HOME) {
+            cur = 0;
+            if (!shift) { anchor = cur; }
+        } else if (key == adp.KEY_END) {
+            cur = len;
+            if (!shift) { anchor = cur; }
+        } else if (key == adp.KEY_BACKSPACE) {
+            if (hasSelection()) {
+                deleteSelection();
+            } else if (cur > 0) {
+                anchor = prevPos(cur);
+                deleteSelection();
+            }
+            changed();
+        } else if (key == adp.KEY_DELETE) {
+            if (hasSelection()) {
+                deleteSelection();
+            } else if (cur < len) {
+                anchor = nextPos(cur);
+                deleteSelection();
+            }
+            changed();
+        } else if (key == adp.KEY_ENTER) {
+            if (onEnter != null) {
+                onEnter(this);
+            }
+            return true;
+        } else if (uni >= 32 && uni != 127 && uni < 0x10000) {
+            insertChar(uni);
+            changed();
+        } else {
+            return false;
+        }
+        keepCaretVisible();
+        invalidate();
+        return true;
+    }
+
+    // text that arrives from the clipboard
+    public void paste(char* t) {
+        // only the first line
+        char* line = strdup(t);
+        for (int i = 0; line[i] != 0; i++) {
+            if (line[i] == 10 || line[i] == 13) {
+                line[i] = 0;
+                break;
+            }
+        }
+        insertText(line);
+        changed();
+        keepCaretVisible();
+    }
+}
+
+int blink(int self) {
+    TextBox* t = (TextBox*) self;
+    t->toggleCaret();
+    return 0;
+}
+
+// ---- ProgressBar and Slider -----------------------------------------------------------------------------------------------------
+public class ProgressBar : Widget {
+    public int value;               // 0 .. 100
+
+    public ProgressBar() { super(); h = 16; w = 120; }
+    public virtual int prefW() { return 120; }
+    public virtual int prefH() { return 16; }
+
+    public void setValue(int v) {
+        if (v < 0) { v = 0; }
+        if (v > 100) { v = 100; }
+        value = v;
+        invalidate();
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        s->fillRoundRect(ox, oy, w, h, 4, cField);
+        int fw = (w - 2) * value / 100;
+        if (fw > 0) {
+            s->fillRoundRect(ox + 1, oy + 1, fw, h - 2, 3, cAccent);
+        }
+        s->roundRect(ox, oy, w, h, 4, cBorder);
+    }
+}
+
+public class Slider : Widget {
+    public int min;
+    public int max;
+    public int value;
+    public func onChange;
+    private bool dragging;
+
+    public Slider(int lo, int hi) {
+        super();
+        min = lo;
+        max = hi;
+        value = lo;
+        focusable = true;
+        h = 22;
+        w = 140;
+    }
+
+    public virtual int prefW() { return 140; }
+    public virtual int prefH() { return 22; }
+
+    public void setValue(int v) {
+        if (v < min) { v = min; }
+        if (v > max) { v = max; }
+        if (v != value) {
+            value = v;
+            invalidate();
+            if (onChange != null) {
+                onChange(this);
+            }
+        }
+    }
+
+    private int knobX() {
+        if (max <= min) { return 8; }
+        return 8 + (w - 16) * (value - min) / (max - min);
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        int ty = oy + h / 2 - 2;
+        s->fillRoundRect(ox + 4, ty, w - 8, 4, 2, cBorder);
+        int kx = knobX();
+        s->fillRoundRect(ox + 4, ty, kx - 4, 4, 2, cAccent);
+        s->fillCircle(ox + kx, oy + h / 2, 7, cField);
+        s->circle(ox + kx, oy + h / 2, 7, (win != null && win->focusWidget == this) ? cAccent : cBorder);
+    }
+
+    private void setFromX(int mx) {
+        if (w <= 16) { return; }
+        int v = min + ((mx - 8) * (max - min) + (w - 16) / 2) / (w - 16);
+        setValue(v);
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (!enabled) { return true; }
+        if (kind == adp.M_DOWN && button == 1) {
+            dragging = true;
+            setFromX(mx);
+        } else if (kind == adp.M_MOVE && dragging) {
+            setFromX(mx);
+        } else if (kind == adp.M_UP) {
+            dragging = false;
+        }
+        return true;
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn == 0) { return false; }
+        int step = (max - min) / 20;
+        if (step < 1) { step = 1; }
+        if (key == adp.KEY_LEFT) { setValue(value - step); return true; }
+        if (key == adp.KEY_RIGHT) { setValue(value + step); return true; }
+        return false;
+    }
+
+    public virtual void onFocus(bool gained) {
+        invalidate();
+    }
+}
+
+// ---- ListBox -------------------------------------------------------------------------------------------------------------------------
+public class ListBox : Widget {
+    public int selected;            // -1 = none
+    public func onSelect;
+    public func onActivate;         // double click or Enter
+    private char** items;
+    private int count;
+    private int cap;
+    private int top;                // first visible row
+    private int lastClick;
+
+    public ListBox() {
+        super();
+        focusable = true;
+        selected = -1;
+        w = 160;
+        h = 120;
+        cap = 16;
+        items = (char**) calloc(cap, 8);
+    }
+
+    public virtual int prefW() { return 160; }
+    public virtual int prefH() { return 120; }
+    public int size() { return count; }
+
+    public void clear() {
+        count = 0;
+        selected = -1;
+        top = 0;
+        invalidate();
+    }
+
+    public void addItem(char* t) {
+        if (count == cap) {
+            cap = cap * 2;
+            items = (char**) realloc((char*) items, cap * 8);
+        }
+        items[count] = strdup(t);
+        count++;
+        invalidate();
+    }
+
+    public char* item(int i) {
+        if (i < 0 || i >= count) {
+            return "";
+        }
+        return items[i];
+    }
+
+    private int rowH() { return gfx.sans()->height + 6; }
+    private int rows() { return (h - 2) / rowH(); }
+
+    private void clampTop() {
+        int r = rows();
+        if (top > count - r) { top = count - r; }
+        if (top < 0) { top = 0; }
+    }
+
+    public void select(int i) {
+        if (i < -1 || i >= count) {
+            return;
+        }
+        selected = i;
+        int r = rows();
+        if (i >= 0 && i < top) { top = i; }
+        if (i >= top + r) { top = i - r + 1; }
+        clampTop();
+        invalidate();
+        if (onSelect != null) {
+            onSelect(this);
+        }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        s->fill(ox, oy, w, h, cField);
+        gfx.Font* f = gfx.sans();
+        int rh = rowH();
+        int r = rows();
+        for (int i = 0; i < r + 1 && top + i < count; i++) {
+            int ry = oy + 1 + i * rh;
+            int idx = top + i;
+            if (idx == selected) {
+                bool focused = (win != null && win->focusWidget == this);
+                s->fill(ox + 1, ry, w - 2, rh, focused ? cAccent : cSelect);
+                s->text(f, ox + 6, ry + (rh - f->height) / 2, items[idx], focused ? cAccentText : cText);
+            } else {
+                s->text(f, ox + 6, ry + (rh - f->height) / 2, items[idx], cText);
+            }
+        }
+        if (count > r && r > 0) {
+            int trackH = h - 2;
+            int thumbH = trackH * r / count;
+            if (thumbH < 12) { thumbH = 12; }
+            int thumbY = (trackH - thumbH) * top / (count - r);
+            s->fillRoundRect(ox + w - 8, oy + 1 + thumbY, 6, thumbH, 3, cBorder);
+        }
+        s->rect(ox, oy, w, h, (win != null && win->focusWidget == this) ? cAccent : cBorder);
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (kind == adp.M_DOWN && button == 1) {
+            int i = top + (my - 1) / rowH();
+            if (i >= 0 && i < count) {
+                select(i);
+                int now = millis();
+                if (now - lastClick < 400 && onActivate != null) {
+                    onActivate(this);
+                }
+                lastClick = now;
+            }
+        } else if (kind == adp.M_SCROLL) {
+            top = top - button * 3;
+            clampTop();
+            invalidate();
+        }
+        return true;
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn == 0) { return false; }
+        if (key == adp.KEY_DOWN) {
+            select((selected < count - 1) ? selected + 1 : selected);
+            return true;
+        }
+        if (key == adp.KEY_UP) {
+            select((selected > 0) ? selected - 1 : selected);
+            return true;
+        }
+        if (key == adp.KEY_PGDN) { select((selected + rows() < count) ? selected + rows() : count - 1); return true; }
+        if (key == adp.KEY_PGUP) { select((selected - rows() > 0) ? selected - rows() : 0); return true; }
+        if (key == adp.KEY_HOME && count > 0) { select(0); return true; }
+        if (key == adp.KEY_END && count > 0) { select(count - 1); return true; }
+        if (key == adp.KEY_ENTER && selected >= 0 && onActivate != null) {
+            onActivate(this);
+            return true;
+        }
+        return false;
+    }
+
+    public virtual void onFocus(bool gained) {
+        invalidate();
+    }
+}
+
+// ---- ImageView, Separator, Spacer ----------------------------------------------------------------------------------------------------
+public class ImageView : Widget {
+    public gfx.Surface* image;
+
+    public ImageView(gfx.Surface* img) {
+        super();
+        image = img;
+        w = img->w;
+        h = img->h;
+    }
+
+    public virtual int prefW() { return image->w; }
+    public virtual int prefH() { return image->h; }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        s->blitBlend(image, 0, 0, image->w, image->h, ox, oy, 255);
+    }
+}
+
+public class Separator : Widget {
+    public Separator() { super(); h = 3; w = 3; }
+    public virtual int prefW() { return 3; }
+    public virtual int prefH() { return 3; }
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        if (w > h) {
+            s->hline(ox, oy + h / 2, w, cBorder);
+        } else {
+            s->vline(ox + w / 2, oy, h, cBorder);
+        }
+    }
+}
+
+public class Spacer : Widget {
+    public Spacer(int size) { super(); w = size; h = size; flex = 0; }
+    public virtual int prefW() { return w; }
+    public virtual int prefH() { return h; }
+}
+
+// =============================================================================
+//  windows
+// =============================================================================
+public class Window {
+    public int id;
+    public Display* display;
+    public char* title;
+    public int w;
+    public int h;
+    public int flags;
+    public gfx.Surface* surf;
+    public Widget* root;
+    public Widget* focusWidget;
+    public Widget* defaultButton;
+    public func onClose;            // return 0 to let the window close (the default when not set)
+    public func onKey;              // keys no widget wanted:  int f(int window, int key, int uni)
+    public func onResize;           // after the window got another size
+    public func onMouseRaw;         // every mouse event before the widgets:  int f(int window)  (see lastMouse*)
+    public int userData;
+    public int lastMouseX;
+    public int lastMouseY;
+    public int lastMouseKind;
+    public int lastMouseButton;
+    public bool needLayout;
+    public bool closed;
+    public bool focused;
+    private Widget* hoverWidget;
+    private Widget* captureWidget;
+    private bool dirty;
+    private int dx0;
+    private int dy0;
+    private int dx1;
+    private int dy1;
+
+    public void setRoot(Widget* r) {
+        root = r;
+        r->attach(this);
+        r->x = 0;
+        r->y = 0;
+        r->w = w;
+        r->h = h;
+        needLayout = true;
+        invalidateAll();
+    }
+
+    // resizes the window to the preferred size of the content
+    public void fit() {
+        if (root == null) {
+            return;
+        }
+        resize(root->prefW(), root->prefH());
+    }
+
+    public void invalidate(int x, int y, int rw, int rh) {
+        int x1 = x + rw;
+        int y1 = y + rh;
+        if (x < 0) { x = 0; }
+        if (y < 0) { y = 0; }
+        if (x1 > w) { x1 = w; }
+        if (y1 > h) { y1 = h; }
+        if (x >= x1 || y >= y1) {
+            return;
+        }
+        if (!dirty) {
+            dx0 = x; dy0 = y; dx1 = x1; dy1 = y1;
+            dirty = true;
+        } else {
+            if (x < dx0) { dx0 = x; }
+            if (y < dy0) { dy0 = y; }
+            if (x1 > dx1) { dx1 = x1; }
+            if (y1 > dy1) { dy1 = y1; }
+        }
+    }
+
+    public void invalidateAll() {
+        invalidate(0, 0, w, h);
+    }
+
+    public void setFocus(Widget* wd) {
+        if (wd == focusWidget) {
+            return;
+        }
+        Widget* old = focusWidget;
+        focusWidget = wd;
+        if (old != null) {
+            old->onFocus(false);
+            old->invalidate();
+        }
+        if (wd != null) {
+            wd->onFocus(true);
+            wd->invalidate();
+        }
+    }
+
+    // the next (or previous) widget that can take the focus, in tree order
+    private void collect(Widget* wd, Widget** list, int* n) {
+        if (!wd->visible || !wd->enabled) {
+            return;
+        }
+        if (wd->focusable && *n < 64) {
+            list[*n] = wd;
+            *n = *n + 1;
+        }
+        for (int i = 0; i < wd->nkids; i++) {
+            collect(wd->kids[i], list, n);
+        }
+    }
+
+    public void focusNext(int dir) {
+        if (root == null) {
+            return;
+        }
+        Widget* list[64];
+        int n = 0;
+        collect(root, &list[0], &n);
+        if (n == 0) {
+            return;
+        }
+        int at = -1;
+        for (int i = 0; i < n; i++) {
+            if (list[i] == focusWidget) {
+                at = i;
+            }
+        }
+        int next = (at < 0) ? ((dir > 0) ? 0 : n - 1) : (at + dir + n) % n;
+        setFocus(list[next]);
+    }
+
+    // ---- painting and presenting ---------------------------------------------------------------------------------------------
+    public void update() {
+        if (closed) {
+            return;
+        }
+        if (needLayout && root != null) {
+            needLayout = false;
+            root->w = w;
+            root->h = h;
+            root->layout();
+            invalidateAll();
+        }
+        if (!dirty) {
+            return;
+        }
+        dirty = false;
+        surf->setClip(dx0, dy0, dx1 - dx0, dy1 - dy0);
+        surf->fill(0, 0, w, h, cBack);
+        if (root != null) {
+            root->paintTree(surf, 0, 0);
+        }
+        surf->resetClip();
+        display->sendPresent(this, dx0, dy0, dx1 - dx0, dy1 - dy0);
+    }
+
+    // ---- requests to the server ----------------------------------------------------------------------------------------------
+    public void setTitle(char* t) {
+        title = strdup(t);
+        display->sendText(adp.Q_TITLE, id, title);
+    }
+
+    public void move(int x, int y) {
+        display->send3(adp.Q_MOVE, id, x, y);
+    }
+
+    // asks for another size of the client area
+    public void resize(int nw, int nh) {
+        if (nw < 1) { nw = 1; }
+        if (nh < 1) { nh = 1; }
+        w = nw;
+        h = nh;
+        surf->resize(nw, nh);
+        display->send3(adp.Q_RESIZE, id, nw, nh);
+        if (root != null) {
+            root->w = nw;
+            root->h = nh;
+        }
+        needLayout = true;
+        invalidateAll();
+    }
+
+    public void show() { display->send3(adp.Q_VISIBLE, id, 1, 0); }
+    public void hide() { display->send3(adp.Q_VISIBLE, id, 0, 0); }
+    public void raise() { display->send3(adp.Q_RAISE, id, 0, 0); }
+    public void focusWindow() { display->send3(adp.Q_FOCUS, id, 0, 0); }
+    public void setCursor(int shape) { display->send3(adp.Q_CURSOR, id, shape, 0); }
+
+    public void close() {
+        if (closed) {
+            return;
+        }
+        closed = true;
+        display->send3(adp.Q_DESTROY, id, 0, 0);
+        display->windowClosed(this);
+    }
+
+    // ---- events from the server ----------------------------------------------------------------------------------------------
+    public void handleMouse(int kind, int button, int mx, int my, int mods) {
+        lastMouseX = mx;
+        lastMouseY = my;
+        lastMouseKind = kind;
+        lastMouseButton = button;
+        if (onMouseRaw != null) {
+            onMouseRaw(this);
+        }
+        if (root == null) {
+            return;
+        }
+        Widget* target = captureWidget;
+        if (target == null) {
+            target = root->hit(mx, my);
+        }
+        if (kind == adp.M_MOVE || kind == adp.M_DOWN) {
+            Widget* under = root->hit(mx, my);
+            if (under != hoverWidget) {
+                if (hoverWidget != null) {
+                    hoverWidget->onHover(false);
+                }
+                hoverWidget = under;
+                if (under != null) {
+                    under->onHover(true);
+                }
+            }
+        }
+        if (target == null) {
+            return;
+        }
+        if (kind == adp.M_DOWN) {
+            if (captureWidget == null) {
+                captureWidget = target;
+            }
+            Widget* f = target;
+            while (f != null && !f->focusable) {
+                f = f->parent;
+            }
+            if (f != null) {
+                setFocus(f);
+            }
+        }
+        target->onMouse(kind, button, mx - target->absX(), my - target->absY(), mods);
+        if (kind == adp.M_UP) {
+            captureWidget = null;
+        }
+    }
+
+    public void handleLeave() {
+        if (hoverWidget != null) {
+            hoverWidget->onHover(false);
+            hoverWidget = null;
+        }
+    }
+
+    public void handleKey(int down, int key, int uni, int mods) {
+        bool done = false;
+        if (focusWidget != null && focusWidget->enabled) {
+            done = focusWidget->onKey(down, key, uni, mods);
+        }
+        if (!done && down != 0) {
+            if (key == adp.KEY_TAB) {
+                focusNext(((mods & adp.MOD_SHIFT) != 0) ? -1 : 1);
+                done = true;
+            } else if (key == adp.KEY_ENTER && defaultButton != null && defaultButton->enabled) {
+                Button* b = (Button*) defaultButton;
+                b->click();
+                done = true;
+            }
+        }
+        if (!done && down != 0 && onKey != null) {
+            onKey(this, key, uni);
+        }
+    }
+
+    public void handleResize(int nw, int nh) {
+        resize(nw, nh);
+        if (onResize != null) {
+            onResize(this);
+        }
+    }
+}
+
+// =============================================================================
+//  the connection
+// =============================================================================
+public class Display {
+    public int fd;
+    public int clientNum;
+    public int screenW;
+    public int screenH;
+    public bool connected;
+    public bool quit;
+    public char* clipText;
+    private adp.Bytes* in;
+    private adp.Bytes* outq;
+    private adp.Bytes* msg;
+    private Window** windows;
+    private int nwin;
+    private int nextId;
+    private int* timerDue;
+    private int* timerArg;
+    private func* timerFn;
+    private int* timerId;
+    private int nextTimer;
+    private TextBox* pasteTarget;
+    private bool welcomed;
+
+    public Display(int handle) {
+        fd = handle;
+        connected = true;
+        in = new adp.Bytes();
+        outq = new adp.Bytes();
+        msg = new adp.Bytes();
+        windows = (Window**) calloc(64, 8);
+        timerDue = (int*) calloc(32, 8);
+        timerArg = (int*) calloc(32, 8);
+        timerFn = (func*) calloc(32, 8);
+        timerId = (int*) calloc(32, 8);
+        nextId = 1;
+        nextTimer = 1;
+        clipText = "";
+    }
+
+    // ---- output: messages are queued and sent as the socket takes them -----------------------------------------------------------------
+    private void queue() {
+        msg->finish();
+        outq->addBytes(msg->data, msg->len);
+        flushOut();
+    }
+
+    // sends what the socket accepts right now; returns true when everything is out
+    public bool flushOut() {
+        int sent = 0;
+        while (sent < outq->len && connected) {
+            if (!net.waitWritable(fd, 0)) {
+                break;
+            }
+            int n = outq->len - sent;
+            if (n > 16384) { n = 16384; }
+            if (net.send(fd, &outq->data[sent], n) < 0) {
+                connected = false;
+                break;
+            }
+            sent = sent + n;
+        }
+        if (sent > 0) {
+            outq->consume(sent);
+        }
+        return outq->len == 0;
+    }
+
+    // waits until everything has been sent
+    public void sync() {
+        while (connected && !flushOut()) {
+            if (idleHook != null) {
+                idleHook(0);
+            }
+            net.waitWritable(fd, 50);
+        }
+    }
+
+    public void send3(int op, int id, int a, int b) {
+        msg->begin(op);
+        msg->add32(id);
+        msg->add32(a);
+        msg->add32(b);
+        queue();
+    }
+
+    public void sendText(int op, int id, char* text) {
+        msg->begin(op);
+        msg->add32(id);
+        msg->addText(text);
+        queue();
+    }
+
+    public void sendPresent(Window* w, int x, int y, int rw, int rh) {
+        msg->begin(adp.Q_PRESENT);
+        msg->add32(w->id);
+        msg->add32(x);
+        msg->add32(y);
+        msg->add32(rw);
+        msg->add32(rh);
+        msg->reserve(rw * rh * 4);
+        int n = w->surf->pack(x, y, rw, rh, &msg->data[msg->len]);
+        msg->len = msg->len + n;
+        queue();
+    }
+
+    public void setClipboard(char* t) {
+        clipText = strdup(t);
+        msg->begin(adp.Q_CLIPSET);
+        msg->addText(t);
+        queue();
+    }
+
+    public void requestPaste(TextBox* t) {
+        pasteTarget = t;
+        msg->begin(adp.Q_CLIPGET);
+        queue();
+    }
+
+    // ---- windows ---------------------------------------------------------------------------------------------------------------------
+    public Window* createWindow(char* title, int w, int h, int flags) {
+        return createWindowAt(title, -1, -1, w, h, flags);
+    }
+
+    public Window* createWindowAt(char* title, int x, int y, int w, int h, int flags) {
+        if (nwin >= 63) {
+            return null;
+        }
+        Window* win = new Window();
+        win->id = nextId;
+        nextId++;
+        win->display = this;
+        win->title = strdup(title);
+        win->w = w;
+        win->h = h;
+        win->flags = flags;
+        win->surf = new gfx.Surface(w, h);
+        win->surf->clear(cBack);
+        windows[nwin] = win;
+        nwin++;
+        msg->begin(adp.Q_CREATE);
+        msg->add32(win->id);
+        msg->add32(x);
+        msg->add32(y);
+        msg->add32(w);
+        msg->add32(h);
+        msg->add32(flags);
+        msg->addText(title);
+        queue();
+        win->invalidateAll();
+        return win;
+    }
+
+    public void windowClosed(Window* w) {
+        for (int i = 0; i < nwin; i++) {
+            if (windows[i] == w) {
+                for (int j = i; j < nwin - 1; j++) {
+                    windows[j] = windows[j + 1];
+                }
+                nwin--;
+                break;
+            }
+        }
+        if (nwin == 0) {
+            quit = true;
+        }
+    }
+
+    public int windowCount() { return nwin; }
+
+    private Window* find(int id) {
+        for (int i = 0; i < nwin; i++) {
+            if (windows[i]->id == id) {
+                return windows[i];
+            }
+        }
+        return null;
+    }
+
+    // ---- timers ----------------------------------------------------------------------------------------------------------------------
+    // calls f(arg) once after ms milliseconds; returns a number for cancel()
+    public int after(int ms, func f, int arg) {
+        for (int i = 0; i < 32; i++) {
+            if (timerFn[i] == null) {
+                timerDue[i] = millis() + ms;
+                timerArg[i] = arg;
+                timerFn[i] = f;
+                timerId[i] = nextTimer;
+                nextTimer++;
+                return timerId[i];
+            }
+        }
+        return -1;
+    }
+
+    public void cancel(int id) {
+        for (int i = 0; i < 32; i++) {
+            if (timerFn[i] != null && timerId[i] == id) {
+                timerFn[i] = null;
+            }
+        }
+    }
+
+    private int nextDue(int now, int limit) {
+        int wait = limit;
+        for (int i = 0; i < 32; i++) {
+            if (timerFn[i] != null) {
+                int d = timerDue[i] - now;
+                if (d < 0) { d = 0; }
+                if (d < wait) { wait = d; }
+            }
+        }
+        return wait;
+    }
+
+    private void runTimers() {
+        int now = millis();
+        for (int i = 0; i < 32; i++) {
+            if (timerFn[i] != null && timerDue[i] - now <= 0) {
+                func f = timerFn[i];
+                int a = timerArg[i];
+                timerFn[i] = null;
+                f(a);
+            }
+        }
+    }
+
+    // ---- events ----------------------------------------------------------------------------------------------------------------------
+    private void handle(int op, char* p, int len) {
+        if (op == adp.E_WELCOME && len >= 16) {
+            clientNum = adp.get32(p, 4);
+            screenW = adp.get32(p, 8);
+            screenH = adp.get32(p, 12);
+            welcomed = true;
+            return;
+        }
+        if (op == adp.E_CLIP) {
+            char* t = malloc(len + 1);
+            memcpy(t, p, len);
+            t[len] = 0;
+            clipText = t;
+            if (pasteTarget != null) {
+                TextBox* tb = pasteTarget;
+                pasteTarget = null;
+                tb->paste(t);
+            }
+            return;
+        }
+        if (len < 4) {
+            return;
+        }
+        Window* w = find(adp.get32(p, 0));
+        if (w == null) {
+            return;
+        }
+        if (op == adp.E_MOUSE && len >= 24) {
+            w->handleMouse(adp.get32(p, 4), adp.get32(p, 8), adp.get32(p, 12), adp.get32(p, 16), adp.get32(p, 20));
+        } else if (op == adp.E_KEY && len >= 20) {
+            w->handleKey(adp.get32(p, 4), adp.get32(p, 8), adp.get32(p, 12), adp.get32(p, 16));
+        } else if (op == adp.E_FOCUS && len >= 8) {
+            w->focused = adp.get32(p, 4) != 0;
+            if (w->focusWidget != null) {
+                w->focusWidget->onFocus(w->focused);
+            }
+        } else if (op == adp.E_CLOSE) {
+            if (w->onClose == null || w->onClose(w) == 0) {
+                w->close();
+            }
+        } else if (op == adp.E_RESIZE && len >= 12) {
+            w->handleResize(adp.get32(p, 4), adp.get32(p, 8));
+        } else if (op == adp.E_EXPOSE) {
+            w->invalidateAll();
+        } else if (op == adp.E_CROSS && len >= 8) {
+            if (adp.get32(p, 4) == 0) {
+                w->handleLeave();
+            }
+        }
+    }
+
+    private void readInput() {
+        in->reserve(65536);
+        int n = net.recv(fd, &in->data[in->len], 65536);
+        if (n <= 0) {
+            connected = false;
+            return;
+        }
+        in->len = in->len + n;
+        for (;;) {
+            int size = adp.messageSize(in);
+            if (size < 0) {
+                connected = false;
+                return;
+            }
+            if (size == 0) {
+                break;
+            }
+            handle(adp.get32(in->data, 4), &in->data[8], size - 8);
+            in->consume(size);
+        }
+    }
+
+    // repaints the windows that changed
+    public void update() {
+        for (int i = 0; i < nwin; i++) {
+            windows[i]->update();
+        }
+    }
+
+    // processes events for up to ms milliseconds (returns earlier when there was something to do)
+    public void pump(int ms) {
+        update();
+        flushOut();
+        if (!connected) {
+            quit = true;
+            return;
+        }
+        int wait = nextDue(millis(), ms);
+        int h[1];
+        int ev[1];
+        int rev[1];
+        h[0] = fd;
+        ev[0] = net.READABLE;
+        rev[0] = 0;
+        int r = net.poll(&h[0], &ev[0], &rev[0], 1, wait);
+        if (r > 0 && (rev[0] & (net.READABLE | net.HUNGUP | net.FAILED)) != 0) {
+            readInput();
+        }
+        runTimers();
+        update();
+        flushOut();
+        if (!connected) {
+            quit = true;
+        }
+    }
+
+    // the main loop: until the last window is closed, the connection ends or quit is set
+    public void run() {
+        while (!quit && connected) {
+            pump(50);
+        }
+        sync();
+    }
+
+    public void disconnect() {
+        sync();
+        connected = false;
+        net.close(fd);
+    }
+
+    // waits for the greeting of the server
+    public bool hello(char* name) {
+        msg->begin(adp.Q_HELLO);
+        msg->add32(adp.VERSION);
+        msg->addText(name);
+        queue();
+        for (int i = 0; i < 60 && !welcomed && connected; i++) {
+            if (idleHook != null) {
+                idleHook(0);
+            }
+            pump(idleHook != null ? 0 : 50);
+        }
+        return welcomed;
+    }
+}
+
+// connects to the display server named by spec (null: the ADISPLAY environment variable, or 127.0.0.1:7000)
+public Display* connectAs(char* spec, char* name) {
+    char* s = spec;
+    if (s == null) {
+        s = getenv("ADISPLAY");
+    }
+    int port = adp.portOf(s);
+    char* host = adp.hostOf(s);
+    net.init();
+    int h = net.connect(host, port);
+    if (h < 0) {
+        return null;
+    }
+    net.setNoDelay(h, true);
+    Display* d = new Display(h);
+    if (!d->hello(name)) {
+        net.close(h);
+        return null;
+    }
+    return d;
+}
+
+public Display* connect(char* spec) {
+    return connectAs(spec, "gui");
+}
+
+// a small window with a message and an OK button; returns it (it closes itself)
+int okClicked(int self) {
+    Widget* b = (Widget*) self;
+    b->win->close();
+    return 0;
+}
+
+public Window* messageBox(Display* d, char* title, char* text) {
+    Window* w = d->createWindow(title, 280, 110, adp.F_FIXED);
+    Box* col = vbox(12, 14);
+    col->add(new Label(text));
+    Button* ok = new Button("OK");
+    ok->primary = true;
+    ok->onClick = okClicked;
+    col->add(ok);
+    w->setRoot(col);
+    w->defaultButton = ok;
+    w->fit();
+    w->setFocus(ok);
+    return w;
+}

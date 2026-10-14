@@ -185,6 +185,11 @@ EMB "clib",        "lib/clib.a"
 EMB "clocale",     "lib/clocale.a"
 EMB "cwchar",      "lib/cwchar.a"
 EMB "ccomplex",    "lib/ccomplex.a"
+EMB "gfxfont",      "lib/gfxfont.a"
+EMB "gfx",          "lib/gfx.a"
+EMB "adp",          "lib/adp.a"
+EMB "wsrv",         "lib/wsrv.a"
+EMB "gui",          "lib/gui.a"
 section .data
         dq 0
 section .rodata

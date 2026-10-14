@@ -529,6 +529,29 @@ parse_aggregate:
 .n1b:
     cmp dword [pass], 1
     jne .p2
+    ; "class X;" declares a class that is defined later: the definition completes that entry
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, [cur_module]
+    call sym_find_global
+    test rax, rax
+    jz .newstruct
+    cmp dword [rax+SYM_KIND], S_STRUCT
+    jne .newstruct
+    mov rcx, [rax+SYM_VAL]
+    mov rdx, rcx
+    shl rdx, 5
+    add rdx, struct_tab
+    cmp dword [rdx+ST_SIZE], 0
+    jne .newstruct
+    cmp dword [rdx+ST_NFIELDS], 0
+    jne .newstruct
+    mov rbx, rcx
+    mov ecx, [field_count]
+    mov [rdx+ST_FIRST], ecx
+    mov [rdx+ST_ISCLASS], r14d
+    jmp .named
+.newstruct:
     mov eax, [struct_count]
     cmp eax, STRUCT_MAX
     jae err_toobig

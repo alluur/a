@@ -1,0 +1,1247 @@
+// =============================================================================
+//  wsrv - the display server                                          import wsrv;
+//
+//  A display server owns the screen: it composites the windows of its clients, draws their title bars, moves, resizes
+//  and focuses them, and routes keyboard and mouse input to them. Clients are programs that speak the display protocol
+//  (see adp) - normally through the gui library. Where the pixels go and where the input comes from is the job of a
+//  Backend:
+//
+//    wsrv.Headless   no output, input is injected by the program (tests, automation)      this module
+//    wvnc.Vnc        a VNC (RFB) server: view and control the display with any VNC viewer  import wvnc;
+//    wfb.Framebuffer the Linux framebuffer /dev/fb0 with evdev keyboard and mouse           import wfb;
+//
+//    wsrv.Headless* hb = new wsrv.Headless(800, 600);
+//    wsrv.Server* srv = new wsrv.Server(hb, 7000);        // the display "ADISPLAY=0"
+//    while (true) { srv->step(20); }                       // or srv->run();
+//
+//  Several backends can be used at once (srv->addBackend(b)), for example the framebuffer and VNC.
+//  step(ms) does everything that is due: accept clients, read their requests, read the input, draw what changed.
+// =============================================================================
+import net;
+import gfx;
+import adp;
+import cstdlib;
+module wsrv;
+
+// ---- input events delivered by the backends ---------------------------------------------------------------------------------------------
+public const IE_MOVE = 1;          // the pointer is at x, y (screen coordinates)
+public const IE_DOWN = 2;          // a button went down (button 1, 2, 3)
+public const IE_UP = 3;
+public const IE_SCROLL = 4;        // button = +1 (up) or -1 (down)
+public const IE_KEYDOWN = 5;       // key = adp.KEY_*, uni = the character it types (0 for none)
+public const IE_KEYUP = 6;
+
+public class InputEvent {
+    public int kind;
+    public int x;
+    public int y;
+    public int button;
+    public int key;
+    public int uni;
+    public int mods;
+}
+
+// The base of all backends. A backend that has file descriptors to wait for lists them in pollFds, and is told in service
+// when one of them is ready.
+public class Backend {
+    public int w;
+    public int h;
+
+    public virtual void present(gfx.Surface* screen, int x, int y, int rw, int rh) {
+    }
+
+    // fills handles[] / events[] (net.READABLE) and returns how many there are
+    public virtual int pollFds(int* handles, int* events, int max) {
+        return 0;
+    }
+
+    public virtual void service(int* handles, int* revents, int n) {
+    }
+
+    // the next input event, 0 if there is none
+    public virtual int nextEvent(InputEvent* ev) {
+        return 0;
+    }
+
+    public virtual void shutdown() {
+    }
+}
+
+// A backend without output. Input is made with push / moveTo / click / typeText.
+public class Headless : Backend {
+    public int frames;
+    public int damageX;
+    public int damageY;
+    public int damageW;
+    public int damageH;
+    private int* qk;
+    private int* qx;
+    private int* qy;
+    private int* qb;
+    private int* qkey;
+    private int* qu;
+    private int head;
+    private int tail;
+
+    public Headless(int width, int height) {
+        w = width;
+        h = height;
+        qk = (int*) calloc(1024, 8);
+        qx = (int*) calloc(1024, 8);
+        qy = (int*) calloc(1024, 8);
+        qb = (int*) calloc(1024, 8);
+        qkey = (int*) calloc(1024, 8);
+        qu = (int*) calloc(1024, 8);
+        head = 0;
+        tail = 0;
+    }
+
+    public void push(int kind, int x, int y, int button, int key, int uni) {
+        int next = (tail + 1) & 1023;
+        if (next == head) {
+            return;
+        }
+        qk[tail] = kind;
+        qx[tail] = x;
+        qy[tail] = y;
+        qb[tail] = button;
+        qkey[tail] = key;
+        qu[tail] = uni;
+        tail = next;
+    }
+
+    public void moveTo(int x, int y) { push(IE_MOVE, x, y, 0, 0, 0); }
+    public void buttonDown(int b) { push(IE_DOWN, 0, 0, b, 0, 0); }
+    public void buttonUp(int b) { push(IE_UP, 0, 0, b, 0, 0); }
+    public void scroll(int delta) { push(IE_SCROLL, 0, 0, delta, 0, 0); }
+
+    public void click(int x, int y) {
+        moveTo(x, y);
+        buttonDown(1);
+        buttonUp(1);
+    }
+
+    public void keyDown(int key, int uni) { push(IE_KEYDOWN, 0, 0, 0, key, uni); }
+    public void keyUp(int key, int uni) { push(IE_KEYUP, 0, 0, 0, key, uni); }
+
+    public void tap(int key, int uni) {
+        keyDown(key, uni);
+        keyUp(key, uni);
+    }
+
+    // types a text: one key press for every character (ASCII)
+    public void typeText(char* s) {
+        for (int i = 0; s[i] != 0; i++) {
+            int c = s[i];
+            int key = c;
+            if (c >= 'A' && c <= 'Z') {
+                key = c + 32;
+            }
+            if (c >= 'A' && c <= 'Z') {
+                keyDown(adp.KEY_SHIFT, 0);
+            }
+            tap(key, c);
+            if (c >= 'A' && c <= 'Z') {
+                keyUp(adp.KEY_SHIFT, 0);
+            }
+        }
+    }
+
+    public virtual void present(gfx.Surface* screen, int x, int y, int rw, int rh) {
+        frames++;
+        damageX = x;
+        damageY = y;
+        damageW = rw;
+        damageH = rh;
+    }
+
+    public virtual int nextEvent(InputEvent* ev) {
+        if (head == tail) {
+            return 0;
+        }
+        ev->kind = qk[head];
+        ev->x = qx[head];
+        ev->y = qy[head];
+        ev->button = qb[head];
+        ev->key = qkey[head];
+        ev->uni = qu[head];
+        ev->mods = 0;
+        head = (head + 1) & 1023;
+        return 1;
+    }
+}
+
+// ---- windows and clients -----------------------------------------------------------------------------------------------------------
+const BW = 2;                      // window border
+const TH = 26;                     // title bar height
+const PART_NONE = 0;
+const PART_CLIENT = 1;
+const PART_TITLE = 2;
+const PART_CLOSE = 3;
+const PART_GRIP = 4;
+const PART_BORDER = 5;
+
+public class Client {
+    public int fd;
+    public int num;
+    public bool dead;
+    public char* name;
+    public adp.Bytes* in;
+
+    public Client(int h, int n) {
+        fd = h;
+        num = n;
+        dead = false;
+        name = "?";
+        in = new adp.Bytes();
+    }
+}
+
+public class Win {
+    public int id;
+    public int cid;
+    public Client* owner;
+    public int x;                  // top left of the client area
+    public int y;
+    public int w;                  // size of the client area
+    public int h;
+    public int flags;
+    public char* title;
+    public bool mapped;            // it has shown pixels
+    public bool visible;
+    public int cursor;
+    public gfx.Surface* buf;
+
+    public bool decorated() { return (flags & adp.F_NODECOR) == 0; }
+    public int fx() { return decorated() ? x - BW : x; }
+    public int fy() { return decorated() ? y - TH : y; }
+    public int fw() { return decorated() ? w + BW * 2 : w; }
+    public int fh() { return decorated() ? h + TH + BW : h; }
+}
+
+private char* arrowSprite[17] = {
+    "X          ",
+    "XX         ",
+    "X.X        ",
+    "X..X       ",
+    "X...X      ",
+    "X....X     ",
+    "X.....X    ",
+    "X......X   ",
+    "X.......X  ",
+    "X........X ",
+    "X.....XXXXX",
+    "X..X..X    ",
+    "X.X X..X   ",
+    "XX  X..X   ",
+    "X    X..X  ",
+    "     X..X  ",
+    "      XX   "
+};
+
+public class Server {
+    public gfx.Surface* screen;
+    public bool ok;
+    public bool allowScreenshots;
+    public bool allowInject;
+    public bool quit;
+    public int bgTop;
+    public int bgBottom;
+    public int framesDrawn;
+    public int cursorX;
+    public int cursorY;
+    public Win* focus;
+    public char* clipboard;
+
+    private Backend** backends;
+    private int nbackends;
+    private Win** stack;
+    private int nstack;
+    private Client** clients;
+    private int nclients;
+    private int listenFd;
+    private int nextClientNum;
+    private int nextWinId;
+    private int cascade;
+    private bool hasDamage;
+    private int dx0;
+    private int dy0;
+    private int dx1;
+    private int dy1;
+    private int buttons;
+    private int mods;
+    private Win* grab;
+    private Win* hover;
+    private int hoverPart;
+    private int dragMode;          // 0 none, 1 moving, 2 resizing
+    private Win* dragWin;
+    private int dragX;
+    private int dragY;
+    private int dragW;
+    private int dragH;
+    private int shapeNow;
+    private adp.Bytes* msg;
+    private int* pfd;
+    private int* pev;
+    private int* prev;
+
+    public Server(Backend* b, int port) {
+        screen = new gfx.Surface(b->w, b->h);
+        backends = (Backend**) calloc(4, 8);
+        backends[0] = b;
+        nbackends = 1;
+        stack = (Win**) calloc(256, 8);
+        clients = (Client**) calloc(64, 8);
+        pfd = (int*) calloc(128, 8);
+        pev = (int*) calloc(128, 8);
+        prev = (int*) calloc(128, 8);
+        msg = new adp.Bytes();
+        nextWinId = 1;
+        nextClientNum = 1;
+        bgTop = gfx.rgb(52, 84, 126);
+        bgBottom = gfx.rgb(20, 30, 56);
+        cursorX = b->w / 2;
+        cursorY = b->h / 2;
+        clipboard = "";
+        net.init();
+        listenFd = net.listenOn("127.0.0.1", port, 16);
+        ok = listenFd >= 0;
+        addDamage(0, 0, screen->w, screen->h);
+    }
+
+    public void addBackend(Backend* b) {
+        if (nbackends < 4) {
+            backends[nbackends] = b;
+            nbackends++;
+        }
+        addDamage(0, 0, screen->w, screen->h);
+    }
+
+    public void setBackground(int top, int bottom) {
+        bgTop = top;
+        bgBottom = bottom;
+        addDamage(0, 0, screen->w, screen->h);
+    }
+
+    // ---- damage and drawing ------------------------------------------------------------------------------------------------------
+    public void addDamage(int x, int y, int w, int h) {
+        int x1 = x + w;
+        int y1 = y + h;
+        if (x < 0) { x = 0; }
+        if (y < 0) { y = 0; }
+        if (x1 > screen->w) { x1 = screen->w; }
+        if (y1 > screen->h) { y1 = screen->h; }
+        if (x >= x1 || y >= y1) {
+            return;
+        }
+        if (!hasDamage) {
+            dx0 = x;
+            dy0 = y;
+            dx1 = x1;
+            dy1 = y1;
+            hasDamage = true;
+            return;
+        }
+        if (x < dx0) { dx0 = x; }
+        if (y < dy0) { dy0 = y; }
+        if (x1 > dx1) { dx1 = x1; }
+        if (y1 > dy1) { dy1 = y1; }
+    }
+
+    private void damageWin(Win* w) {
+        addDamage(w->fx() - 10, w->fy() - 10, w->fw() + 20, w->fh() + 20);
+    }
+
+    private void drawBackground(int x, int y, int w, int h) {
+        int sh = screen->h;
+        for (int row = y; row < y + h; row++) {
+            int t = (sh <= 1) ? 0 : (row * 255) / (sh - 1);
+            screen->fill(x, row, w, 1, gfx.mix(bgTop, bgBottom, t));
+        }
+    }
+
+    private void drawWindow(Win* w) {
+        bool focused = (w == focus);
+        if (w->decorated()) {
+            int fx = w->fx();
+            int fy = w->fy();
+            int fw = w->fw();
+            int fh = w->fh();
+            screen->shadow(fx, fy, fw, fh, 7, 90);
+            int border = focused ? gfx.rgb(52, 92, 186) : gfx.rgb(88, 90, 98);
+            screen->fill(fx, fy, fw, fh, border);
+            int c1 = focused ? gfx.rgb(82, 124, 214) : gfx.rgb(118, 120, 130);
+            int c2 = focused ? gfx.rgb(48, 84, 172) : gfx.rgb(90, 92, 100);
+            screen->gradientV(fx + 1, fy + 1, fw - 2, TH - 1, c1, c2);
+            // the title, kept clear of the close button
+            int sx0 = screen->clipX0;
+            int sy0 = screen->clipY0;
+            int sx1 = screen->clipX1;
+            int sy1 = screen->clipY1;
+            int tx0 = fx + 6;
+            int tw = fw - 12 - 24;
+            int ax0 = (tx0 > sx0) ? tx0 : sx0;
+            int ax1 = (tx0 + tw < sx1) ? tx0 + tw : sx1;
+            screen->clipX0 = ax0;
+            screen->clipX1 = ax1;
+            gfx.Font* f = gfx.sansBold();
+            screen->text(f, tx0, fy + (TH - f->height) / 2, w->title, gfx.WHITE);
+            screen->clipX0 = sx0;
+            screen->clipX1 = sx1;
+            // the close button
+            int cx = fx + fw - BW - 20;
+            int cy = fy + 5;
+            bool hot = (hover == w && hoverPart == PART_CLOSE);
+            screen->fillRoundRect(cx, cy, 16, 16, 4, hot ? gfx.rgb(222, 70, 60) : gfx.argb(70, 255, 255, 255));
+            screen->line(cx + 4, cy + 4, cx + 11, cy + 11, gfx.WHITE);
+            screen->line(cx + 11, cy + 4, cx + 4, cy + 11, gfx.WHITE);
+            screen->line(cx + 5, cy + 4, cx + 11, cy + 10, gfx.WHITE);
+            screen->line(cx + 10, cy + 4, cx + 4, cy + 10, gfx.WHITE);
+            // the client area
+            screen->fill(w->x, w->y, w->w, w->h, gfx.rgb(238, 238, 242));
+        }
+        if (w->buf != null) {
+            int bw = w->buf->w;
+            int bh = w->buf->h;
+            if (bw > w->w) { bw = w->w; }
+            if (bh > w->h) { bh = w->h; }
+            screen->blit(w->buf, 0, 0, bw, bh, w->x, w->y);
+        }
+        if (w->decorated() && (w->flags & adp.F_FIXED) == 0) {
+            int gx = w->x + w->w - 1;
+            int gy = w->y + w->h - 1;
+            int gc = gfx.argb(150, 90, 90, 100);
+            screen->line(gx - 10, gy, gx, gy - 10, gc);
+            screen->line(gx - 6, gy, gx, gy - 6, gc);
+            screen->line(gx - 2, gy, gx, gy - 2, gc);
+        }
+    }
+
+    private void drawCursor() {
+        int x = cursorX;
+        int y = cursorY;
+        if (shapeNow == adp.CURSOR_TEXT) {
+            int ink = gfx.BLACK;
+            screen->fill(x - 3, y - 8, 7, 1, gfx.WHITE);
+            screen->fill(x - 3, y + 8, 7, 1, gfx.WHITE);
+            screen->fill(x - 1, y - 7, 3, 15, gfx.WHITE);
+            screen->fill(x - 2, y - 8, 5, 1, ink);
+            screen->fill(x - 2, y + 8, 5, 1, ink);
+            screen->fill(x, y - 7, 1, 15, ink);
+            return;
+        }
+        int fill = (shapeNow == adp.CURSOR_HAND) ? gfx.rgb(255, 214, 90) : gfx.WHITE;
+        for (int row = 0; row < 17; row++) {
+            char* r = arrowSprite[row];
+            for (int col = 0; col < 11; col++) {
+                int c = r[col];
+                if (c == 'X') {
+                    screen->put(x + col, y + row, gfx.BLACK);
+                } else if (c == '.') {
+                    screen->put(x + col, y + row, fill);
+                }
+            }
+        }
+    }
+
+    // draws the screen contents of a rectangle (windows bottom to top, then the pointer)
+    private void repaint(int x, int y, int w, int h) {
+        screen->setClip(x, y, w, h);
+        drawBackground(screen->clipX0, screen->clipY0, screen->clipX1 - screen->clipX0, screen->clipY1 - screen->clipY0);
+        for (int i = 0; i < nstack; i++) {
+            Win* win = stack[i];
+            if (!win->visible || !win->mapped) {
+                continue;
+            }
+            int fx0 = win->fx() - 8;
+            int fy0 = win->fy() - 8;
+            int fx1 = fx0 + win->fw() + 16;
+            int fy1 = fy0 + win->fh() + 16;
+            if (fx1 <= screen->clipX0 || fx0 >= screen->clipX1 || fy1 <= screen->clipY0 || fy0 >= screen->clipY1) {
+                continue;
+            }
+            drawWindow(win);
+        }
+        drawCursor();
+        screen->resetClip();
+    }
+
+    // draws what changed and hands it to the backends
+    public void flush() {
+        if (!hasDamage) {
+            return;
+        }
+        hasDamage = false;
+        int x = dx0;
+        int y = dy0;
+        int w = dx1 - dx0;
+        int h = dy1 - dy0;
+        repaint(x, y, w, h);
+        framesDrawn++;
+        for (int i = 0; i < nbackends; i++) {
+            backends[i]->present(screen, x, y, w, h);
+        }
+    }
+
+    // ---- the window stack ----------------------------------------------------------------------------------------------------------
+    private int layerOf(Win* w) {
+        if ((w->flags & adp.F_BELOW) != 0) {
+            return 0;
+        }
+        if ((w->flags & adp.F_ABOVE) != 0) {
+            return 2;
+        }
+        return 1;
+    }
+
+    private int indexOf(Win* w) {
+        for (int i = 0; i < nstack; i++) {
+            if (stack[i] == w) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private void unstack(Win* w) {
+        int i = indexOf(w);
+        if (i < 0) {
+            return;
+        }
+        for (int j = i; j < nstack - 1; j++) {
+            stack[j] = stack[j + 1];
+        }
+        nstack--;
+    }
+
+    // puts the window on top of its layer
+    private void restack(Win* w) {
+        unstack(w);
+        int layer = layerOf(w);
+        int at = 0;
+        for (int i = 0; i < nstack; i++) {
+            if (layerOf(stack[i]) <= layer) {
+                at = i + 1;
+            }
+        }
+        for (int j = nstack; j > at; j--) {
+            stack[j] = stack[j - 1];
+        }
+        stack[at] = w;
+        nstack++;
+    }
+
+    public void raise(Win* w) {
+        if (stack[nstack - 1] == w) {
+            return;
+        }
+        restack(w);
+        damageWin(w);
+    }
+
+    // finds the window under a screen position and which part of it
+    private Win* findWin(int px, int py, int* part) {
+        for (int i = nstack - 1; i >= 0; i--) {
+            Win* w = stack[i];
+            if (!w->visible || !w->mapped) {
+                continue;
+            }
+            int fx = w->fx();
+            int fy = w->fy();
+            if (px < fx || py < fy || px >= fx + w->fw() || py >= fy + w->fh()) {
+                continue;
+            }
+            int p = PART_CLIENT;
+            if (w->decorated()) {
+                if (px >= w->x && px < w->x + w->w && py >= w->y && py < w->y + w->h) {
+                    p = PART_CLIENT;
+                    if ((w->flags & adp.F_FIXED) == 0 && px >= w->x + w->w - 14 && py >= w->y + w->h - 14) {
+                        p = PART_GRIP;
+                    }
+                } else if (py < w->y) {
+                    p = PART_TITLE;
+                    if (px >= fx + w->fw() - BW - 22 && px < fx + w->fw() - BW - 2 && py >= fy + 3 && py < fy + 23) {
+                        p = PART_CLOSE;
+                    }
+                } else {
+                    p = PART_BORDER;
+                }
+            }
+            *part = p;
+            return w;
+        }
+        *part = PART_NONE;
+        return null;
+    }
+
+    // ---- sending to clients --------------------------------------------------------------------------------------------------------
+    private void sendMsg(Client* c) {
+        if (c->dead) {
+            return;
+        }
+        msg->finish();
+        if (net.send(c->fd, msg->data, msg->len) < 0) {
+            c->dead = true;
+        }
+    }
+
+    private void sendWin2(Win* w, int op, int a) {
+        msg->begin(op);
+        msg->add32(w->cid);
+        msg->add32(a);
+        sendMsg(w->owner);
+    }
+
+    private void sendFocus(Win* w, int gained) {
+        sendWin2(w, adp.E_FOCUS, gained);
+    }
+
+    private void sendResize(Win* w) {
+        msg->begin(adp.E_RESIZE);
+        msg->add32(w->cid);
+        msg->add32(w->w);
+        msg->add32(w->h);
+        sendMsg(w->owner);
+    }
+
+    private void sendMouse(Win* w, int kind, int button, int mods2) {
+        msg->begin(adp.E_MOUSE);
+        msg->add32(w->cid);
+        msg->add32(kind);
+        msg->add32(button);
+        msg->add32(cursorX - w->x);
+        msg->add32(cursorY - w->y);
+        msg->add32(mods2);
+        sendMsg(w->owner);
+    }
+
+    // ---- focus ---------------------------------------------------------------------------------------------------------------------
+    public void setFocus(Win* w) {
+        if (w == focus) {
+            return;
+        }
+        Win* old = focus;
+        focus = w;
+        if (old != null) {
+            sendFocus(old, 0);
+            damageWin(old);
+        }
+        if (w != null) {
+            sendFocus(w, 1);
+            damageWin(w);
+        }
+    }
+
+    // the window that should get the focus when the current one goes away
+    private Win* topFocusable() {
+        for (int i = nstack - 1; i >= 0; i--) {
+            Win* w = stack[i];
+            if (w->visible && w->mapped && (w->flags & (adp.F_NOFOCUS | adp.F_BELOW)) == 0) {
+                return w;
+            }
+        }
+        return null;
+    }
+
+    // ---- windows -------------------------------------------------------------------------------------------------------------------
+    private Win* findClientWin(Client* c, int cid) {
+        for (int i = 0; i < nstack; i++) {
+            if (stack[i]->owner == c && stack[i]->cid == cid) {
+                return stack[i];
+            }
+        }
+        return null;
+    }
+
+    private void destroyWin(Win* w) {
+        damageWin(w);
+        if (focus == w) {
+            focus = null;
+        }
+        if (grab == w) {
+            grab = null;
+        }
+        if (hover == w) {
+            hover = null;
+        }
+        if (dragWin == w) {
+            dragWin = null;
+            dragMode = 0;
+        }
+        unstack(w);
+        if (w->buf != null) {
+            w->buf->release();
+        }
+        if (focus == null) {
+            setFocus(topFocusable());
+        }
+    }
+
+    private void createWin(Client* c, int cid, int x, int y, int w, int h, int flags, char* title) {
+        if (nstack >= 255 || findClientWin(c, cid) != null) {
+            return;
+        }
+        if (w < 1) { w = 1; }
+        if (h < 1) { h = 1; }
+        if (w > 8192) { w = 8192; }
+        if (h > 8192) { h = 8192; }
+        Win* win = new Win();
+        win->id = nextWinId;
+        nextWinId++;
+        win->cid = cid;
+        win->owner = c;
+        win->w = w;
+        win->h = h;
+        win->flags = flags;
+        win->title = title;
+        win->visible = true;
+        win->mapped = false;
+        win->cursor = adp.CURSOR_ARROW;
+        win->buf = new gfx.Surface(w, h);
+        if (x == -1 && y == -1) {
+            x = 40 + (cascade % 8) * 28;
+            y = TH + 24 + (cascade % 8) * 28;
+            cascade++;
+            if ((flags & adp.F_NODECOR) != 0) {
+                x = 0;
+                y = 0;
+            }
+        }
+        win->x = x;
+        win->y = y;
+        restack(win);
+    }
+
+    private void moveWin(Win* w, int x, int y) {
+        damageWin(w);
+        w->x = x;
+        w->y = y;
+        damageWin(w);
+    }
+
+    // ---- requests of the clients -------------------------------------------------------------------------------------------------
+    private char* textOf(char* payload, int from, int len) {
+        int n = len - from;
+        if (n < 0) {
+            n = 0;
+        }
+        char* s = malloc(n + 1);
+        memcpy(s, &payload[from], n);
+        s[n] = 0;
+        return s;
+    }
+
+    private void handleRequest(Client* c, int op, char* p, int len) {
+        if (op == adp.Q_HELLO) {
+            if (len >= 4) {
+                c->name = textOf(p, 4, len);
+            }
+            msg->begin(adp.E_WELCOME);
+            msg->add32(adp.VERSION);
+            msg->add32(c->num);
+            msg->add32(screen->w);
+            msg->add32(screen->h);
+            sendMsg(c);
+            return;
+        }
+        if (op == adp.Q_CREATE && len >= 24) {
+            createWin(c, adp.get32(p, 0), adp.get32(p, 4), adp.get32(p, 8), adp.get32(p, 12), adp.get32(p, 16), adp.get32(p, 20), textOf(p, 24, len));
+            return;
+        }
+        if (op == adp.Q_PING && len >= 4) {
+            msg->begin(adp.E_PONG);
+            msg->add32(adp.get32(p, 0));
+            sendMsg(c);
+            return;
+        }
+        if (op == adp.Q_CLIPSET) {
+            clipboard = textOf(p, 0, len);
+            return;
+        }
+        if (op == adp.Q_CLIPGET) {
+            msg->begin(adp.E_CLIP);
+            msg->addText(clipboard);
+            sendMsg(c);
+            return;
+        }
+        if (op == 15 && allowScreenshots) {
+            msg->begin(112);
+            msg->add32(screen->w);
+            msg->add32(screen->h);
+            msg->reserve(screen->w * screen->h * 4);
+            int n = screen->pack(0, 0, screen->w, screen->h, &msg->data[msg->len]);
+            msg->len = msg->len + n;
+            sendMsg(c);
+            return;
+        }
+        if (op == 16 && allowInject && len >= 24) {
+            InputEvent ev;
+            ev.kind = adp.get32(p, 0);
+            ev.x = adp.get32(p, 4);
+            ev.y = adp.get32(p, 8);
+            ev.button = adp.get32(p, 12);
+            ev.key = adp.get32(p, 16);
+            ev.uni = adp.get32(p, 20);
+            ev.mods = 0;
+            handleInput(&ev);
+            return;
+        }
+        if (len < 4) {
+            return;
+        }
+        Win* w = findClientWin(c, adp.get32(p, 0));
+        if (w == null) {
+            return;
+        }
+        if (op == adp.Q_DESTROY) {
+            destroyWin(w);
+        } else if (op == adp.Q_TITLE) {
+            w->title = textOf(p, 4, len);
+            damageWin(w);
+        } else if (op == adp.Q_MOVE && len >= 12) {
+            moveWin(w, adp.get32(p, 4), adp.get32(p, 8));
+        } else if (op == adp.Q_RESIZE && len >= 12) {
+            int nw = adp.get32(p, 4);
+            int nh = adp.get32(p, 8);
+            if (nw < 1) { nw = 1; }
+            if (nh < 1) { nh = 1; }
+            if (nw > 8192) { nw = 8192; }
+            if (nh > 8192) { nh = 8192; }
+            damageWin(w);
+            w->w = nw;
+            w->h = nh;
+            w->buf->resize(nw, nh);
+            damageWin(w);
+        } else if (op == adp.Q_PRESENT && len >= 20) {
+            int rx = adp.get32(p, 4);
+            int ry = adp.get32(p, 8);
+            int rw = adp.get32(p, 12);
+            int rh = adp.get32(p, 16);
+            if (rw < 0 || rh < 0 || len != 20 + rw * rh * 4) {
+                return;
+            }
+            w->buf->unpack(rx, ry, rw, rh, &p[20]);
+            bool first = !w->mapped;
+            w->mapped = true;
+            if (first) {
+                // a new window comes to the front and takes the focus
+                if (layerOf(w) == 1) {
+                    restack(w);
+                }
+                damageWin(w);
+                if ((w->flags & (adp.F_NOFOCUS | adp.F_BELOW)) == 0) {
+                    setFocus(w);
+                }
+            } else {
+                addDamage(w->x + rx, w->y + ry, rw, rh);
+            }
+        } else if (op == adp.Q_VISIBLE && len >= 8) {
+            w->visible = adp.get32(p, 4) != 0;
+            damageWin(w);
+            if (!w->visible && focus == w) {
+                setFocus(topFocusable());
+            }
+        } else if (op == adp.Q_RAISE) {
+            raise(w);
+        } else if (op == adp.Q_FOCUS) {
+            raise(w);
+            setFocus(w);
+        } else if (op == adp.Q_CURSOR && len >= 8) {
+            w->cursor = adp.get32(p, 4);
+        }
+    }
+
+    // ---- input ---------------------------------------------------------------------------------------------------------------------
+    private void setShape(int shape) {
+        if (shape != shapeNow) {
+            addDamage(cursorX - 12, cursorY - 12, 40, 40);
+            shapeNow = shape;
+            addDamage(cursorX - 12, cursorY - 12, 40, 40);
+        }
+    }
+
+    private void closeRequest(Win* w) {
+        sendWin2(w, adp.E_CLOSE, 0);
+    }
+
+    private void cycleFocus() {
+        // the focusable window that is lowest in the stack comes to the front
+        for (int i = 0; i < nstack; i++) {
+            Win* w = stack[i];
+            if (w->visible && w->mapped && (w->flags & (adp.F_NOFOCUS | adp.F_BELOW | adp.F_ABOVE)) == 0 && w != focus) {
+                raise(w);
+                setFocus(w);
+                return;
+            }
+        }
+    }
+
+    private void handleMove() {
+        if (dragMode == 1 && dragWin != null) {
+            int nx = cursorX - dragX;
+            int ny = cursorY - dragY;
+            if (ny < TH) { ny = TH; }
+            if (ny > screen->h - 8) { ny = screen->h - 8; }
+            moveWin(dragWin, nx, ny);
+            return;
+        }
+        if (dragMode == 2 && dragWin != null) {
+            int nw = dragW + (cursorX - dragX);
+            int nh = dragH + (cursorY - dragY);
+            if (nw < 80) { nw = 80; }
+            if (nh < 40) { nh = 40; }
+            if (nw != dragWin->w || nh != dragWin->h) {
+                damageWin(dragWin);
+                dragWin->w = nw;
+                dragWin->h = nh;
+                damageWin(dragWin);
+                sendResize(dragWin);
+            }
+            return;
+        }
+        int part = 0;
+        Win* under = findWin(cursorX, cursorY, &part);
+        if (under != hover || (under != null && part != hoverPart)) {
+            if (hover != null && hover != under) {
+                msg->begin(adp.E_CROSS);
+                msg->add32(hover->cid);
+                msg->add32(0);
+                sendMsg(hover->owner);
+            }
+            if (under != null && under != hover) {
+                msg->begin(adp.E_CROSS);
+                msg->add32(under->cid);
+                msg->add32(1);
+                sendMsg(under->owner);
+            }
+            if (hover != null) {
+                damageWin(hover);
+            }
+            if (under != null) {
+                damageWin(under);
+            }
+            hover = under;
+            hoverPart = part;
+        }
+        int shape = adp.CURSOR_ARROW;
+        if (under != null && part == PART_CLIENT) {
+            shape = under->cursor;
+        }
+        setShape(shape);
+        Win* target = (grab != null) ? grab : under;
+        if (target != null && (grab != null || part == PART_CLIENT)) {
+            sendMouse(target, adp.M_MOVE, 0, mods);
+        }
+    }
+
+    private void handleButton(InputEvent* ev, bool down) {
+        int b = ev->button;
+        if (down) {
+            buttons = buttons | (1 << b);
+            int part = 0;
+            Win* under = findWin(cursorX, cursorY, &part);
+            if (under != null) {
+                if ((under->flags & (adp.F_BELOW | adp.F_ABOVE)) == 0 || (under->flags & adp.F_ABOVE) != 0) {
+                    if ((under->flags & adp.F_BELOW) == 0) {
+                        raise(under);
+                    }
+                }
+                if ((under->flags & (adp.F_NOFOCUS | adp.F_BELOW)) == 0) {
+                    setFocus(under);
+                }
+                if (b == 1 && part == PART_TITLE) {
+                    dragMode = 1;
+                    dragWin = under;
+                    dragX = cursorX - under->x;
+                    dragY = cursorY - under->y;
+                    return;
+                }
+                if (b == 1 && part == PART_GRIP) {
+                    dragMode = 2;
+                    dragWin = under;
+                    dragX = cursorX;
+                    dragY = cursorY;
+                    dragW = under->w;
+                    dragH = under->h;
+                    return;
+                }
+                if (b == 1 && part == PART_CLOSE) {
+                    grab = under;
+                    dragMode = 3;
+                    return;
+                }
+                if (part == PART_CLIENT) {
+                    grab = under;
+                    sendMouse(under, adp.M_DOWN, b, mods);
+                }
+            } else {
+                setFocus(null);
+            }
+        } else {
+            buttons = buttons & ~(1 << b);
+            if (dragMode == 1 || dragMode == 2) {
+                dragMode = 0;
+                dragWin = null;
+                return;
+            }
+            if (dragMode == 3) {
+                dragMode = 0;
+                int part = 0;
+                Win* under = findWin(cursorX, cursorY, &part);
+                if (under != null && under == grab && part == PART_CLOSE) {
+                    closeRequest(under);
+                }
+                grab = null;
+                return;
+            }
+            if (grab != null) {
+                sendMouse(grab, adp.M_UP, b, mods);
+            }
+            if (buttons == 0) {
+                grab = null;
+            }
+        }
+    }
+
+    // the pointer or the keyboard did something
+    public void handleInput(InputEvent* ev) {
+        int k = ev->kind;
+        if (k == IE_MOVE) {
+            addDamage(cursorX - 12, cursorY - 12, 40, 40);
+            cursorX = ev->x;
+            cursorY = ev->y;
+            if (cursorX < 0) { cursorX = 0; }
+            if (cursorY < 0) { cursorY = 0; }
+            if (cursorX >= screen->w) { cursorX = screen->w - 1; }
+            if (cursorY >= screen->h) { cursorY = screen->h - 1; }
+            addDamage(cursorX - 12, cursorY - 12, 40, 40);
+            handleMove();
+        } else if (k == IE_DOWN) {
+            handleButton(ev, true);
+        } else if (k == IE_UP) {
+            handleButton(ev, false);
+        } else if (k == IE_SCROLL) {
+            int part = 0;
+            Win* under = findWin(cursorX, cursorY, &part);
+            Win* target = (grab != null) ? grab : under;
+            if (target != null && (grab != null || part == PART_CLIENT)) {
+                sendMouse(target, adp.M_SCROLL, ev->button, mods);
+            }
+        } else if (k == IE_KEYDOWN || k == IE_KEYUP) {
+            bool down = (k == IE_KEYDOWN);
+            int key = ev->key;
+            int bit = 0;
+            if (key == adp.KEY_SHIFT) { bit = adp.MOD_SHIFT; }
+            if (key == adp.KEY_CTRL) { bit = adp.MOD_CTRL; }
+            if (key == adp.KEY_ALT) { bit = adp.MOD_ALT; }
+            if (key == adp.KEY_META) { bit = adp.MOD_META; }
+            if (bit != 0) {
+                if (down) { mods = mods | bit; } else { mods = mods & ~bit; }
+            }
+            if (down && (mods & adp.MOD_ALT) != 0) {
+                if (key == adp.KEY_TAB) {
+                    cycleFocus();
+                    return;
+                }
+                if (key == adp.KEY_F1 + 3 && focus != null) {
+                    closeRequest(focus);
+                    return;
+                }
+            }
+            if (focus != null) {
+                msg->begin(adp.E_KEY);
+                msg->add32(focus->cid);
+                msg->add32(down ? 1 : 0);
+                msg->add32(key);
+                msg->add32(ev->uni);
+                msg->add32(mods);
+                sendMsg(focus->owner);
+            }
+        }
+    }
+
+    // ---- clients -------------------------------------------------------------------------------------------------------------------
+    public int clientCount() { return nclients; }
+    public int windowCount() { return nstack; }
+
+    public Win* windowAt(int i) {
+        if (i < 0 || i >= nstack) {
+            return null;
+        }
+        return stack[i];
+    }
+
+    // the window of a client by the number the client gave it
+    public Win* findWindow(int clientNum, int cid) {
+        for (int i = 0; i < nstack; i++) {
+            if (stack[i]->owner->num == clientNum && stack[i]->cid == cid) {
+                return stack[i];
+            }
+        }
+        return null;
+    }
+
+    public Client* clientAt(int i) {
+        if (i < 0 || i >= nclients) {
+            return null;
+        }
+        return clients[i];
+    }
+
+    private void dropClient(int i) {
+        Client* c = clients[i];
+        // its windows go with it
+        bool again = true;
+        while (again) {
+            again = false;
+            for (int j = 0; j < nstack; j++) {
+                if (stack[j]->owner == c) {
+                    destroyWin(stack[j]);
+                    again = true;
+                    break;
+                }
+            }
+        }
+        net.close(c->fd);
+        for (int j = i; j < nclients - 1; j++) {
+            clients[j] = clients[j + 1];
+        }
+        nclients--;
+    }
+
+    // disconnects every client except the one with this number (0 = all of them)
+    public void disconnectAllExcept(int keepNum) {
+        int i = 0;
+        while (i < nclients) {
+            if (clients[i]->num != keepNum) {
+                dropClient(i);
+            } else {
+                i++;
+            }
+        }
+    }
+
+    private void readClient(Client* c) {
+        c->in->reserve(65536);
+        int n = net.recv(c->fd, &c->in->data[c->in->len], 65536);
+        if (n <= 0) {
+            c->dead = true;
+            return;
+        }
+        c->in->len = c->in->len + n;
+        for (;;) {
+            int size = adp.messageSize(c->in);
+            if (size < 0) {
+                c->dead = true;
+                return;
+            }
+            if (size == 0) {
+                break;
+            }
+            handleRequest(c, adp.get32(c->in->data, 4), &c->in->data[8], size - 8);
+            c->in->consume(size);
+            if (c->dead) {
+                return;
+            }
+        }
+    }
+
+    // ---- the main loop -----------------------------------------------------------------------------------------------------------
+    // waits up to ms milliseconds for something to do and does it
+    public void step(int ms) {
+        if (flushPending()) {
+            ms = 0;
+        }
+        int n = 0;
+        if (listenFd >= 0) {
+            pfd[n] = listenFd;
+            pev[n] = net.READABLE;
+            n++;
+        }
+        int firstClient = n;
+        for (int i = 0; i < nclients && n < 100; i++) {
+            pfd[n] = clients[i]->fd;
+            pev[n] = net.READABLE;
+            n++;
+        }
+        int firstBackend = n;
+        for (int i = 0; i < nbackends; i++) {
+            n = n + backends[i]->pollFds(&pfd[n], &pev[n], 120 - n);
+        }
+        int r = 0;
+        if (n > 0) {
+            r = net.poll(pfd, pev, prev, n, ms);
+        } else if (ms > 0) {
+            sleepMs(ms);
+        }
+        if (r > 0) {
+            if (listenFd >= 0) {
+                if ((prev[0] & net.READABLE) != 0 && nclients < 60) {
+                    int h = net.accept(listenFd);
+                    if (h >= 0) {
+                        net.setTimeout(h, 1000);
+                        net.setNoDelay(h, true);
+                        clients[nclients] = new Client(h, nextClientNum);
+                        nextClientNum++;
+                        nclients++;
+                    }
+                }
+            }
+            for (int i = 0; i < nclients && firstClient + i < firstBackend; i++) {
+                if ((prev[firstClient + i] & (net.READABLE | net.HUNGUP | net.FAILED)) != 0) {
+                    readClient(clients[i]);
+                }
+            }
+            for (int i = 0; i < nbackends; i++) {
+                // every backend gets the whole result list; it looks at its own descriptors
+                backends[i]->service(&pfd[firstBackend], &prev[firstBackend], n - firstBackend);
+            }
+        } else {
+            for (int i = 0; i < nbackends; i++) {
+                backends[i]->service(&pfd[firstBackend], &prev[firstBackend], 0);
+            }
+        }
+        InputEvent ev;
+        for (int i = 0; i < nbackends; i++) {
+            while (backends[i]->nextEvent(&ev) != 0) {
+                handleInput(&ev);
+            }
+        }
+        int i = 0;
+        while (i < nclients) {
+            if (clients[i]->dead) {
+                dropClient(i);
+            } else {
+                i++;
+            }
+        }
+        flush();
+    }
+
+    private bool flushPending() {
+        return hasDamage;
+    }
+
+    public void run() {
+        while (!quit) {
+            step(20);
+        }
+    }
+
+    public void stop() {
+        quit = true;
+    }
+
+    public void close() {
+        for (int i = 0; i < nbackends; i++) {
+            backends[i]->shutdown();
+        }
+        while (nclients > 0) {
+            dropClient(0);
+        }
+        if (listenFd >= 0) {
+            net.close(listenFd);
+            listenFd = -1;
+        }
+    }
+}
