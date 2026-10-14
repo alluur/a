@@ -309,3 +309,16 @@ the library symbol table, creates hidden function symbols for `R_CODE` / `R_CODE
 (`R_DATA64` words are rebased in place) to `rel_buf`. After that the usual `check_undefined` and `build_elf` / `build_pe` run.
 
 Tests: `tests/link.sh` (every directory of `tests/link` is a multi-file program).
+
+## The graphics stack (`lib/gfx.a`, `adp`, `wsrv`, `gui`, `wvnc`, `wfb`, `dm`)
+
+All of it is ordinary A code in embedded modules (see docs/GUI.md for the user view). Notes for the compiler side:
+
+* The modules rely on `class X;` forward declarations (completed by the real definition in pass 1, `parse_aggregate`), on
+  `super();` in derived constructors (base constructors are not run implicitly), on classes derived across modules with
+  virtual methods (`wsrv.Backend` -> `wvnc.Vnc`), and on `func` fields called with an argument for the widget callbacks.
+* `net.poll` uses a static buffer (a server polls many times a second; the bump allocator never frees).
+* The fonts are 4-bit coverage bitmaps in hex strings (`lib/gfxfont.a`, made by `docs/gen_font.py`, below the 64 KB string
+  limit of the lexer) decoded at first use.
+* `tests/t111_gui_server.a` runs a display server and its clients in one process (`gui.idleHook`); rendering checksums are
+  compared between all targets. `tests/gui.sh` runs real processes with a VNC client (`tests/gui/rfbclient.py`).

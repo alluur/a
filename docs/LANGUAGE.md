@@ -1016,6 +1016,28 @@ println(codec.imageToText(page, 3));                          // picture -> text
 println(codec.imageToTextWith(page, 3, recognise));
 ```
 
+## 12g. Graphics, windows and a display server
+
+`gfx` (software 2D graphics with antialiased fonts), `gui` (client library and widgets), `wsrv` (display server), `wvnc` /
+`wfb` (VNC and Linux framebuffer backends), `adp` (the protocol) and `dm` + `syscrypt` (display manager and `$6$` password
+hashes) make a complete graphical stack in A. See [GUI.md](GUI.md).
+
+```c
+import gui;
+int clicked(int self) { println("clicked"); return 0; }
+int main() {
+    gui.Display* d = gui.connect(null);              // ADISPLAY=0 -> 127.0.0.1:7000
+    gui.Window* w = d->createWindow("Hello", 280, 120, 0);
+    gui.Box* col = gui.vbox(10, 14);
+    gui.Button* b = new gui.Button("Click me");
+    b->onClick = clicked;
+    col->add(b);
+    w->setRoot(col);
+    d->run();
+    return 0;
+}
+```
+
 ## 12f. The processor: `cpu` and `thread`
 
 `import cpu;` is built on `asm` blocks and works the same on x86-64, ARM64, RISC-V 64 and LoongArch64:
