@@ -24,6 +24,7 @@ section .text
 %include "cg_rv64.asm"
 %include "cg_la64.asm"
 %include "expr.asm"
+%include "float.asm"
 %include "stmt.asm"
 %include "decl.asm"
 %include "main.asm"

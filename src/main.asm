@@ -74,6 +74,7 @@ s_ext_linux:    db ".elf", 0
 s_ext_win:      db ".exe", 0
 s_ext_android:  db ".bin", 0
 s_std_name:     db "<std>", 0
+s_dfloat_name:  db "dfloat.a", 0
 s_main:         db "main", 0
 s_exit_name:    db "exit", 0
 s_libdir1:      db "lib/", 0
@@ -135,6 +136,8 @@ EMB "websocket",   "lib/websocket.a"
 EMB "netutil",     "lib/netutil.a"
 EMB "rawnet",      "lib/rawnet.a"
 EMB "cpu",         "lib/cpu.a"
+EMB "dfloat",      "lib/dfloat.a"
+EMB "dmath",       "lib/dmath.a"
 EMB "thread",      "lib/thread.a"
 EMB "fixed",       "lib/fixed.a"
 EMB "nn",          "lib/nn.a"
@@ -782,12 +785,17 @@ compile_file:
     mov eax, [in_amodule]               ; the imported file starts outside of any a_module block
     mov [rsp+112], eax
     mov dword [in_amodule], 0
+    mov eax, [block_depth]
+    mov [rsp+116], eax
+    mov dword [block_depth], 0
     call next_token
     call parse_items
     mov rsi, rsp
     call lex_restore
     mov eax, [rsp+112]
     mov [in_amodule], eax
+    mov eax, [rsp+116]
+    mov [block_depth], eax
     add rsp, 128
 .skip:
     mov eax, [r12+24]
@@ -804,7 +812,16 @@ compile_all:
     mov rdi, file_table
     call compile_file
     mov rdi, [main_entry]
-    jmp compile_file
+    call compile_file
+    ; the soft-float runtime (cmath + cfloat + printDouble ...) when the program mentions double or a floating literal
+    cmp dword [need_float], 0
+    je .nofloat
+    mov dword [cur_module], 0
+    mov dword [cur_class], -1
+    mov rdi, [float_entry]
+    call compile_file
+.nofloat:
+    ret
 
 ; ---- builtins ------------------------------------------------------------------------------
 ; builtin_col -> eax = byte offset of the (start, end) columns for the current target
@@ -1751,6 +1768,22 @@ _start:
     add rbx, 40
     jmp .regemb
 .regdone:
+    ; the entry of the embedded float runtime
+    mov rbx, embedded_mods
+.findfl:
+    cmp qword [rbx], 0
+    je .regdone2
+    mov rdi, [rbx]
+    mov rsi, s_dfloat_name
+    call cstr_eq
+    test eax, eax
+    jnz .foundfl
+    add rbx, 40
+    jmp .findfl
+.foundfl:
+    mov rax, [rbx+32]
+    mov [float_entry], rax
+.regdone2:
     mov rdi, [opt_input]
     call file_try
     mov [main_entry], rax
@@ -2019,6 +2052,18 @@ agg_vis:        resd 1
 agg_union:      resd 1
 agg_virtual:    resd 1
 in_amodule:     resd 1
+need_float:     resd 1
+float_entry:    resq 1
+lf_tmp:         resq 1
+lf_dlen:        resq 1
+lf_alen:        resq 1
+lf_blen:        resq 1
+lf_ex:          resd 1
+alignb 16
+lf_bnD:         resd 512
+lf_bnA:         resd 1024
+lf_bnB:         resd 1024
+block_depth:    resd 1
 sq_string:      resd 1
 str_term:       resd 1
 last_file_id:   resd 1

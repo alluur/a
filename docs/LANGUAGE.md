@@ -300,6 +300,31 @@ int next() {
 A `static` local is zero-initialized (or set from its constant initializer once, before the program starts), is visible only
 in its block and may be an array (`static int table[16];`).
 
+### `static if`, `::` and floating point
+
+`static if (constant) { ... } else { ... }` is decided while compiling: the branch that is not chosen is parsed but never
+compiled, so it may name things that do not exist on the current target. It works at file level (around declarations), inside
+classes and inside function bodies. Use it with `__ARCH` (0 x64, 1 arm64, 2 riscv64, 3 loongarch64) and `__OS`
+(0 Linux, 1 Windows, 2 Android) or with your own `const` values.
+
+`::name` refers to the global `name` even when a module or local declaration shadows it (`::sqrt(x)` inside module `dmath`).
+
+`double` (and `float`, which is an alias of `double`) is an IEEE 754 binary64 number. The compiler converts between `int` and
+`double` automatically (an `int` operand of a mixed expression becomes a `double`; assigning a `double` to an `int` needs a cast
+`(int) d`, which truncates toward zero). Supported: `+ - * /`, unary `-`, the six comparisons, `!` and truth tests
+(`if (d)` is true when `d != 0`), `+= -= *= /=`, `?:`, struct fields, arrays, globals, parameters and return values.
+Literals like `1.5`, `2e-3` and `1_000.25` are rounded exactly (to nearest, ties to even, like a C compiler).
+
+`__bits(d)` returns the 64 raw bits of a double as an `int`; `__dbl(i)` does the reverse.
+
+Arithmetic uses a built-in software implementation (`dfloat`, loaded only when a program uses doubles), so results are bit
+for bit identical on every target. Helpers: `printDouble`, `printlnDouble`, `doubleToText`, `doubleToFixed(d, n)`,
+`doubleToSci(d, n)`, `parseDouble(text)`, `isNaN`, `isInf`, `isFinite`. The `dmath` module has `sqrt cbrt pow exp exp2 expm1 log
+log2 log10 log1p hypot sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh floor ceil round trunc fabs fmod fmin
+fmax copysign nan` and the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`.
+
+Not available yet: `++`/`--` on doubles.
+
 ### Inline assembly
 
 `asm` puts machine code of your choice into a function. The program lists the code for every CPU it should run on;

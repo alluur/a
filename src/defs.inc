@@ -45,6 +45,7 @@
 %define T_ID            1
 %define T_NUM           2
 %define T_STR           3
+%define T_FLT           4       ; floating point literal, tk_val = the IEEE bits
 %define T_EQ            128     ; ==
 %define T_NE            129     ; !=
 %define T_LE            130     ; <=
@@ -66,6 +67,7 @@
 %define T_XOREQ         146
 %define T_SHLEQ         147
 %define T_SHREQ         148
+%define T_SCOPE         149     ; ::
 ; keywords
 %define K_INT           160
 %define K_CHAR          161
@@ -104,7 +106,8 @@
 %define K_PROTECTED     194
 %define K_AMODULE       195     ; a_module NAME { ... }
 %define K_AIMPORT       196     ; a_import('file.am');
-%define K_ASM           197     ; asm(a, b, c) { x64: ...; arm64: ...; }
+%define K_ASM           197
+%define K_DOUBLE        198     ; double, float     ; asm(a, b, c) { x64: ...; arm64: ...; }
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1
@@ -175,6 +178,7 @@
 %define TY_CHAR         2
 %define TY_BOOL         3
 %define TY_STRUCT       4
+%define TY_DOUBLE       6       ; double (and float): an IEEE 754 binary64 held in the 64-bit slot, arithmetic by soft-float calls
 %define TY_FUNC         5       ; function pointer (the type "func")
 %define TY_PTR1         0x100
 %define TF_ARRAY_BIT    32

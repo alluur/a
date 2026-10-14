@@ -1026,7 +1026,9 @@ parse_amodule:
     mov edi, '{'
     call expect
     mov dword [in_amodule], 1
+    inc dword [block_depth]
     call parse_items
+    dec dword [block_depth]
     mov dword [in_amodule], 0
     cmp qword [tk], '}'
     je .close
@@ -1408,7 +1410,14 @@ parse_global_vars:
     ERR "array initializers are not supported, assign the elements in code"
 .i0:
     call next_token
+    cmp rbx, TY_DOUBLE
+    jne .i0int
+    call const_double
+    xor edx, edx
+    jmp .i0got
+.i0int:
     call const_expr
+.i0got:
     push rax
     push rdx
     mov rdi, 8
@@ -1478,7 +1487,7 @@ parse_items:
 .loop:
     cmp qword [tk], T_EOF
     je .done
-    cmp dword [in_amodule], 0
+    cmp dword [block_depth], 0
     je .toplvl
     cmp qword [tk], '}'
     je .done
@@ -1499,6 +1508,10 @@ parse_items:
     jne .vdone
     mov ebx, 1                          ; static = private to the file
     call next_token
+    cmp qword [tk], K_IF
+    jne .vdone
+    call parse_static_if_items          ; static if (condition) { declarations } else { ... }
+    jmp .loop
 .vdone:
     mov [agg_vis], ebx
     mov eax, [tk]
@@ -1642,5 +1655,124 @@ parse_items:
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+
+; ---- compile time conditions --------------------------------------------------------------------------------------
+; static if (constant) { declarations } [else { declarations } | else static if (...) { ... }]
+; Only the chosen branch is compiled; the other one is skipped. The current token is 'if'.
+parse_static_if_items:
+    push rbx
+    call next_token
+    mov edi, '('
+    call expect
+    call const_expr
+    test rax, rax
+    setnz bl
+    movzx ebx, bl
+    mov edi, ')'
+    call expect
+    cmp qword [tk], '{'
+    je .blk
+    ERR "expected '{' after static if (...)"
+.blk:
+    test ebx, ebx
+    jz .skip_then
+    call parse_item_block
+    jmp .after_then
+.skip_then:
+    call skip_block
+.after_then:
+    cmp qword [tk], K_ELSE
+    jne .done
+    call next_token
+    cmp qword [tk], K_STATIC
+    je .else_static
+    cmp qword [tk], '{'
+    je .else_block
+    ERR "expected '{' or 'static if' after else"
+.else_block:
+    test ebx, ebx
+    jnz .skip_else
+    call parse_item_block
+    jmp .done
+.skip_else:
+    call skip_block
+    jmp .done
+.else_static:
+    call next_token
+    cmp qword [tk], K_IF
+    je .nested
+    ERR "expected 'if' after 'else static'"
+.nested:
+    test ebx, ebx
+    jnz .skip_nested
+    call parse_static_if_items
+    jmp .done
+.skip_nested:
+    call skip_static_if
+.done:
+    pop rbx
+    ret
+
+; '{' declarations '}'
+parse_item_block:
+    mov edi, '{'
+    call expect
+    inc dword [block_depth]
+    call parse_items
+    dec dword [block_depth]
+    cmp qword [tk], '}'
+    je .ok
+    ERR "expected '}' at the end of the static if block"
+.ok:
+    jmp next_token
+
+; skips   if ( ... ) { ... } [else { ... } | else static if ...]    (current token 'if')
+skip_static_if:
+    push rbx
+    call next_token
+    mov edi, '('
+    call expect
+    xor ebx, ebx                        ; parenthesis depth
+.p:
+    cmp qword [tk], T_EOF
+    jne .p1
+    ERR "unexpected end of file in static if (...)"
+.p1:
+    cmp qword [tk], '('
+    jne .p2
+    inc ebx
+.p2:
+    cmp qword [tk], ')'
+    jne .p3
+    test ebx, ebx
+    jz .pend
+    dec ebx
+.p3:
+    call next_token
+    jmp .p
+.pend:
+    call next_token
+    cmp qword [tk], '{'
+    je .b
+    ERR "expected '{' after static if (...)"
+.b:
+    call skip_block
+    cmp qword [tk], K_ELSE
+    jne .out
+    call next_token
+    cmp qword [tk], K_STATIC
+    je .es
+    cmp qword [tk], '{'
+    jne .out
+    call skip_block
+    jmp .out
+.es:
+    call next_token
+    cmp qword [tk], K_IF
+    jne .out
+    call skip_static_if
+.out:
     pop rbx
     ret

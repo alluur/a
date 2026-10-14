@@ -75,7 +75,7 @@ parse_stmt:
     cmp eax, K_TYPEDEF
     je parse_typedef
     cmp eax, K_STATIC
-    je parse_static_local
+    je parse_static_stmt
     cmp eax, ';'
     je .empty
     cmp eax, K_PUBLIC
@@ -263,6 +263,9 @@ parse_return:
     mov rax, [cur_func]
     test rax, rax
     jz .j
+    mov rdi, [rax+SYM_TYPE]
+    call coerce_to                      ; int <-> double
+    mov rax, [cur_func]
     cmp qword [rax+SYM_TYPE], TY_BOOL
     jne .notbool
     CG tobool
@@ -514,6 +517,8 @@ parse_local_decl:
     call next_token
     call parse_assign
     call to_rvalue
+    mov rdi, rbx
+    call coerce_to
     mov edi, r14d
     mov rsi, rbx
     call store_local_typed
@@ -605,7 +610,21 @@ parse_const_decl:
     call next_token
     mov edi, '='
     call expect
+    cmp rbx, TY_DOUBLE
+    je .dconst
+    cmp rbx, TY_INT
+    jne .iconst
+    call peek_is_flt
+    test eax, eax
+    jz .iconst
+    mov rbx, TY_DOUBLE
+.dconst:
+    call const_double
+    xor edx, edx
+    jmp .chave
+.iconst:
     call const_expr
+.chave:
     push rax
     push rdx
     mov edi, ';'
@@ -659,13 +678,17 @@ parse_typedef:
     ret
 
 ; static Type name [= constant] [, name ...];   a local variable that keeps its value between calls
+; static if (constant) { statements } else { ... }   or   static TYPE name ...;
+parse_static_stmt:
+    call next_token
+    cmp qword [tk], K_IF
+    je parse_static_if_stmt
 parse_static_local:
     push rbx
     push r12
     push r13
     push r14
     push r15
-    call next_token
     call parse_type
     mov r12, rax                        ; element type
     cmp qword [tk], T_ID
@@ -772,4 +795,59 @@ parse_asm_stmt:
     jne .out
     jmp next_token
 .out:
+    ret
+
+; static if (constant) { statements } [else { statements } | else static if (...) { ... }]   (current token 'if')
+parse_static_if_stmt:
+    push rbx
+    call next_token
+    mov edi, '('
+    call expect
+    call const_expr
+    test rax, rax
+    setnz bl
+    movzx ebx, bl
+    mov edi, ')'
+    call expect
+    cmp qword [tk], '{'
+    je .blk
+    ERR "expected '{' after static if (...)"
+.blk:
+    test ebx, ebx
+    jz .skip_then
+    call parse_block
+    jmp .after_then
+.skip_then:
+    call skip_block
+.after_then:
+    cmp qword [tk], K_ELSE
+    jne .done
+    call next_token
+    cmp qword [tk], K_STATIC
+    je .else_static
+    cmp qword [tk], '{'
+    je .else_block
+    ERR "expected '{' or 'static if' after else"
+.else_block:
+    test ebx, ebx
+    jnz .skip_else
+    call parse_block
+    jmp .done
+.skip_else:
+    call skip_block
+    jmp .done
+.else_static:
+    call next_token
+    cmp qword [tk], K_IF
+    je .nested
+    ERR "expected 'if' after 'else static'"
+.nested:
+    test ebx, ebx
+    jnz .skip_nested
+    call parse_static_if_stmt
+    jmp .done
+.skip_nested:
+    call skip_static_if
+.done:
+    pop rbx
     ret

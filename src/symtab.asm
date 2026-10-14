@@ -409,6 +409,8 @@ type_size:
     movzx eax, dil
     cmp eax, TY_INT
     je .eight
+    cmp eax, TY_DOUBLE
+    je .eight
     cmp eax, TY_FUNC
     je .eight
     cmp eax, TY_STRUCT

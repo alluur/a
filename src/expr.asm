@@ -151,6 +151,10 @@ finish_operands:
 cond_jz:
     push rbx
     mov rbx, rdi
+    cmp qword [e_type], TY_DOUBLE
+    jne .nd
+    call truth_value
+.nd:
     mov rdi, [cmp_end]
     call tail_is
     test eax, eax
@@ -173,6 +177,10 @@ cond_jz:
 cond_jnz:
     push rbx
     mov rbx, rdi
+    cmp qword [e_type], TY_DOUBLE
+    jne .nd
+    call truth_value
+.nd:
     mov rdi, [cmp_end]
     call tail_is
     test eax, eax
@@ -426,6 +434,8 @@ is_type_start_impl:
     mov eax, [tk]
     cmp eax, K_INT
     je .yes
+    cmp eax, K_DOUBLE
+    je .yes
     cmp eax, K_CHAR
     je .yes
     cmp eax, K_BOOL
@@ -495,6 +505,8 @@ parse_type:
     mov eax, [tk]
     cmp eax, K_INT
     je .int
+    cmp eax, K_DOUBLE
+    je .double
     cmp eax, K_CHAR
     je .char
     cmp eax, K_BOOL
@@ -538,6 +550,9 @@ parse_type:
     jmp fatal_error
 .int:
     mov ebx, TY_INT
+    jmp .star0
+.double:
+    mov ebx, TY_DOUBLE
     jmp .star0
 .char:
     mov ebx, TY_CHAR
@@ -672,6 +687,15 @@ gen_call:
 .arg:
     call parse_assign
     call to_rvalue
+    ; int <-> double conversion to the declared parameter type
+    mov rax, [r12+SYM_EXTRA]
+    test rax, rax
+    jz .argcv
+    cmp ebx, [r12+SYM_NPAR]
+    jae .argcv
+    mov rdi, [rax+rbx*8]
+    call coerce_to
+.argcv:
     mov rax, [e_type]
     test eax, 0xFF00
     jnz .push
@@ -869,7 +893,39 @@ parse_primary:
     je .super
     cmp eax, K_ASM
     je .asm
+    cmp eax, T_FLT
+    je .flt
+    cmp eax, T_SCOPE
+    je .scope
     ERR "expected an expression"
+
+.flt:
+    mov rdi, [tk_val]
+    call gen_imm_a
+    mov qword [e_type], TY_DOUBLE
+    mov qword [e_lval], 0
+    call next_token
+    jmp .out
+
+; ::name  -  a name of the global namespace even inside a module that has the same name
+.scope:
+    call next_token
+    cmp qword [tk], T_ID
+    je .sc1
+    ERR "expected a name after '::'"
+.sc1:
+    mov rdi, [tk_ptr]
+    mov esi, [tk_len]
+    xor edx, edx
+    call sym_find_global
+    test rax, rax
+    jnz .sc2
+    mov edi, msg_undeclared
+    call fatal_error_tok
+.sc2:
+    mov r12, rax
+    call next_token
+    jmp .dispatch
 
 .num:
     mov rdi, [tk_val]
@@ -1140,6 +1196,10 @@ parse_primary:
     call expect
     call parse_unary
     call to_rvalue
+    cmp rbx, TY_DOUBLE
+    je .cconv
+    cmp qword [e_type], TY_DOUBLE
+    je .cconv
     test ebx, 0xFF00
     jnz .cdone
     cmp bl, TY_CHAR
@@ -1152,6 +1212,10 @@ parse_primary:
     jmp .cdone
 .cbool:
     CG tobool
+    jmp .cdone
+.cconv:
+    mov rdi, rbx
+    call coerce_to                      ; int <-> double
 .cdone:
     mov [e_type], rbx
     mov qword [e_lval], 0
@@ -1221,6 +1285,30 @@ parse_primary:
     mov qword [e_lval], 0
     jmp .out
 
+; ---- __bits(x): the 64 bits of a value as an int (a double's IEEE bits);  __dbl(i): an int's bits taken as a double
+.bitsfn:
+    call next_token
+    mov edi, '('
+    call expect
+    call parse_assign
+    call to_rvalue
+    mov edi, ')'
+    call expect
+    mov qword [e_type], TY_INT
+    mov qword [e_lval], 0
+    jmp .out
+.dblfn:
+    call next_token
+    mov edi, '('
+    call expect
+    call parse_assign
+    call to_rvalue
+    mov edi, ')'
+    call expect
+    mov qword [e_type], TY_DOUBLE
+    mov qword [e_lval], 0
+    jmp .out
+
 ; ---- va_arg(i) and va_count(): the extra arguments of a function declared with ...
 .vaarg:
     call va_check
@@ -1269,6 +1357,20 @@ parse_primary:
     cmp word [r13+4], 'rg'
     je .vaarg
 .nova1:
+    cmp r14d, 6
+    jne .nobits
+    cmp dword [r13], '__bi'
+    jne .nobits
+    cmp word [r13+4], 'ts'
+    je .bitsfn
+.nobits:
+    cmp r14d, 5
+    jne .nodbl
+    cmp dword [r13], '__db'
+    jne .nodbl
+    cmp byte [r13+4], 'l'
+    je .dblfn
+.nodbl:
     cmp r14d, 8
     jne .nova2
     cmp dword [r13], 'va_c'
@@ -1573,6 +1675,8 @@ parse_postfix:
     call next_token
     call parse_expr
     call to_rvalue
+    mov edi, TY_INT
+    call coerce_to                      ; a double index is truncated
     cmp r12, 1
     je .ix2
     mov rdi, r12
@@ -1818,6 +1922,8 @@ parse_unary:
     call parse_unary
     call to_rvalue
     pop rax
+    cmp qword [e_type], TY_DOUBLE
+    je .negdbl
     cmp rax, [imm_pos]
     jne .negreal
     mov rdi, [imm_end]
@@ -1836,6 +1942,27 @@ parse_unary:
     CG neg
     mov qword [e_type], TY_INT
     ret
+.negdbl:
+    cmp rax, [imm_pos]
+    jne .negdbl_rt
+    mov rdi, [imm_end]
+    call tail_is
+    test eax, eax
+    jz .negdbl_rt
+    mov r8, [imm_val]
+    mov rdi, [imm_pos]
+    call rewind_code
+    mov rcx, 0x8000000000000000
+    xor r8, rcx
+    mov rdi, r8
+    call gen_imm_a
+    mov qword [e_type], TY_DOUBLE
+    ret
+.negdbl_rt:
+    mov rdi, fn_dneg
+    call call_rt1
+    mov qword [e_type], TY_DOUBLE
+    ret
 .plus:
     call next_token
     call parse_unary
@@ -1845,6 +1972,7 @@ parse_unary:
     call next_token
     call parse_unary
     call to_rvalue
+    call truth_value
     CG lnot
     mov qword [e_type], TY_BOOL
     ret
@@ -1937,6 +2065,12 @@ parse_binary:
     lea edi, [r13+1]
     call parse_binary
     call to_rvalue
+    ; a double on either side: the soft-float routines take over (left value is on the stack, right one in A)
+    mov rax, [rsp+8]
+    cmp rax, TY_DOUBLE
+    je .dbl
+    cmp qword [e_type], TY_DOUBLE
+    je .dbl
     pop rsi
     mov rdi, r14
     call finish_operands
@@ -1944,6 +2078,13 @@ parse_binary:
     mov rdx, [e_type]
     mov edi, r12d
     call binop_emit
+    jmp .loop
+.dbl:
+    pop rcx
+    pop rsi
+    mov rdx, [e_type]
+    mov edi, r12d
+    call float_binop
     jmp .loop
 .done:
     pop r15
@@ -2045,6 +2186,18 @@ parse_ternary:
     call expect
     call parse_ternary
     call to_rvalue
+    mov rax, [e_type]
+    cmp rax, rbx
+    je .same
+    cmp rbx, TY_DOUBLE
+    je .conv2
+    cmp rax, TY_DOUBLE
+    jne .same
+    ERR "the two results of ?: are an int and a double: cast one of them"
+.conv2:
+    mov rdi, rbx
+    call coerce_to
+.same:
     pop rdi
     call patch_here
     add rsp, 8
@@ -2133,6 +2286,8 @@ parse_assign:
     call next_token
     call parse_assign
     call to_rvalue
+    mov rdi, rbx
+    call coerce_to
     mov edi, r12d
     mov rsi, rbx
     call store_local_typed
@@ -2144,6 +2299,8 @@ parse_assign:
     call next_token
     call parse_assign
     call to_rvalue
+    mov rdi, rbx
+    call coerce_to
     CG pop_b
     mov rdi, rbx
     call emit_store_type
@@ -2161,6 +2318,8 @@ parse_assign:
     jnc .c2
     ERR "cannot assign to an array"
 .c2:
+    cmp rbx, TY_DOUBLE
+    je .cdbl
     mov rdi, rbx
     call type_ls
     test eax, eax
@@ -2225,6 +2384,10 @@ parse_assign:
     mov rsi, rbx
     call load_local_typed
 .c3op:
+    cmp r13, TY_DOUBLE
+    jne .c3op1
+    ERR "an int variable cannot be updated with a double operator (write i = i + d; with a cast)"
+.c3op1:
     sub r12d, T_ADDEQ
     movzx edi, byte [compound_map+r12]
     mov rsi, rbx
@@ -2247,6 +2410,10 @@ parse_assign:
     call parse_assign
     call to_rvalue
     mov r13, [e_type]
+    cmp r13, TY_DOUBLE
+    jne .cgen1
+    ERR "an int variable cannot be updated with a double operator (write i = i + d; with a cast)"
+.cgen1:
     CG mov_b_a
     CG pop_a
     sub r12d, T_ADDEQ
@@ -2254,6 +2421,28 @@ parse_assign:
     mov rsi, rbx
     mov rdx, r13
     call binop_emit
+    CG pop_b
+    mov rdi, rbx
+    call emit_store_type
+    mov [e_type], rbx
+    mov qword [e_lval], 0
+    jmp .ret
+
+; compound assignment on a double:  x += e  x -= e  x *= e  x /= e
+.cdbl:
+    CG push_a                           ; the address
+    mov rdi, rbx
+    call emit_load_type
+    CG push_a                           ; the old value is the left operand
+    call next_token
+    call parse_assign
+    call to_rvalue
+    mov r13, [e_type]
+    sub r12d, T_ADDEQ
+    movzx edi, byte [compound_map+r12]
+    mov rsi, rbx
+    mov rdx, r13
+    call float_binop
     CG pop_b
     mov rdi, rbx
     call emit_store_type
@@ -2662,3 +2851,71 @@ asm_cpu_names:
     dq a_la, ARCH_LA64
     dq 0
 section .text
+
+; const_double: a constant for a double: [-] floating literal, or an integer constant expression (converted) -> rax = IEEE bits
+const_double:
+    push rbx
+    xor ebx, ebx
+    cmp qword [tk], '-'
+    jne .nn
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    cmp qword [tk], T_FLT
+    jne .notflt
+    add rsp, 128
+    mov ebx, 1
+    jmp .lit
+.notflt:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    jmp .intconst
+.nn:
+    cmp qword [tk], T_FLT
+    jne .intconst
+.lit:
+    mov rax, [tk_val]
+    test ebx, ebx
+    jz .lit2
+    mov rcx, 0x8000000000000000
+    xor rax, rcx
+.lit2:
+    push rax
+    call next_token
+    pop rax
+    pop rbx
+    ret
+.intconst:
+    call const_expr
+    cvtsi2sd xmm0, rax
+    movq rax, xmm0
+    pop rbx
+    ret
+
+; peek_is_flt -> eax = 1 if the current token is a floating literal or a '-' in front of one
+peek_is_flt:
+    xor eax, eax
+    cmp qword [tk], T_FLT
+    jne .m
+    mov eax, 1
+    ret
+.m: cmp qword [tk], '-'
+    jne .no
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor eax, eax
+    cmp qword [tk], T_FLT
+    sete al
+    push rax
+    mov rsi, rsp
+    add rsi, 8
+    call lex_restore
+    pop rax
+    add rsp, 128
+    ret
+.no:
+    ret
