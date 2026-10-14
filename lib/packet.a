@@ -1,0 +1,545 @@
+// =============================================================================
+//  packet - build and read network packets                         import packet;
+//
+//  Ethernet frames, ARP, IPv4, ICMP, UDP and TCP, with all the checksums, plus a tcpdump style one-line
+//  description, a hex dump and the pcap file format (Wireshark / tcpdump). Packets are plain byte buffers
+//  (char*); the build functions return the number of bytes they wrote, the parse functions fill a class
+//  and return false if the bytes are too short or not of that kind.
+//
+//    char frame[64];
+//    char mine[6]; netaddr.macParse("02:00:00:00:00:01", mine);
+//    int n = packet.arpRequestFrame(mine, ip, targetIp, frame);     // "who has targetIp?" as a broadcast frame
+//    println(packet.describe(frame, n));                            // ARP who-has 10.0.0.2 tell 10.0.0.1
+//
+//  Layers (every build function writes the layer *and* what you give it as payload):
+//    packet.ethBuild   packet.arpBuild   packet.ipBuild   packet.icmpEcho   packet.udpBuild   packet.tcpBuild
+//    packet.ethParse   packet.arpParse   packet.ipParse   packet.icmpParse   packet.udpParse   packet.tcpParse
+// =============================================================================
+import netaddr;
+module packet;
+
+public const ETH_IPV4 = 0x0800;
+public const ETH_ARP = 0x0806;
+public const ETH_VLAN = 0x8100;
+public const ETH_IPV6 = 0x86DD;
+public const ARP_REQUEST = 1;
+public const ARP_REPLY = 2;
+public const PROTO_ICMP = 1;
+public const PROTO_TCP = 6;
+public const PROTO_UDP = 17;
+public const ICMP_ECHO_REPLY = 0;
+public const ICMP_UNREACHABLE = 3;
+public const ICMP_ECHO = 8;
+public const ICMP_TIME_EXCEEDED = 11;
+public const TCP_FIN = 1;
+public const TCP_SYN = 2;
+public const TCP_RST = 4;
+public const TCP_PSH = 8;
+public const TCP_ACK = 16;
+public const TCP_URG = 32;
+
+// ---- big endian access -----------------------------------------------------------------------------------------------------
+public int be16(char* b, int o) { return b[o] * 256 + b[o + 1]; }
+public int be32(char* b, int o) { return (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]; }
+public void put16(char* b, int o, int v) { b[o] = (v >> 8) & 255; b[o + 1] = v & 255; }
+public void put32(char* b, int o, int v) {
+    b[o] = (v >> 24) & 255; b[o + 1] = (v >> 16) & 255; b[o + 2] = (v >> 8) & 255; b[o + 3] = v & 255;
+}
+
+// ---- Ethernet -----------------------------------------------------------------------------------------------------------------
+public class Eth {
+    public char dst[6];
+    public char src[6];
+    public int type;               // ETH_IPV4, ETH_ARP ... (the type behind a VLAN tag)
+    public int vlan;               // VLAN id, -1 if the frame has no tag
+    public int offset;             // where the payload starts in the frame
+}
+
+// dst + src + type + payload. Returns the frame length
+public int ethBuild(char* dst, char* src, int type, char* payload, int n, char* out) {
+    memcpy(&out[0], dst, 6);
+    memcpy(&out[6], src, 6);
+    put16(out, 12, type);
+    if (n > 0) memcpy(&out[14], payload, n);
+    return 14 + n;
+}
+
+public bool ethParse(char* f, int n, Eth* e) {
+    if (n < 14) return false;
+    memcpy(&e->dst[0], &f[0], 6);
+    memcpy(&e->src[0], &f[6], 6);
+    e->type = be16(f, 12);
+    e->vlan = -1;
+    e->offset = 14;
+    if (e->type == ETH_VLAN) {
+        if (n < 18) return false;
+        e->vlan = be16(f, 14) & 0x0FFF;
+        e->type = be16(f, 16);
+        e->offset = 18;
+    }
+    return true;
+}
+
+// ---- ARP (IPv4 over Ethernet) -----------------------------------------------------------------------------------------------
+public class Arp {
+    public int op;                 // ARP_REQUEST or ARP_REPLY
+    public char senderMac[6];
+    public int senderIp;
+    public char targetMac[6];
+    public int targetIp;
+}
+
+// the 28 byte ARP packet. Returns 28
+public int arpBuild(int op, char* senderMac, int senderIp, char* targetMac, int targetIp, char* out) {
+    put16(out, 0, 1);                  // hardware type: Ethernet
+    put16(out, 2, ETH_IPV4);           // protocol type
+    out[4] = 6;
+    out[5] = 4;
+    put16(out, 6, op);
+    memcpy(&out[8], senderMac, 6);
+    put32(out, 14, senderIp);
+    memcpy(&out[18], targetMac, 6);
+    put32(out, 24, targetIp);
+    return 28;
+}
+
+public bool arpParse(char* p, int n, Arp* a) {
+    if (n < 28 || be16(p, 0) != 1 || be16(p, 2) != ETH_IPV4 || p[4] != 6 || p[5] != 4) return false;
+    a->op = be16(p, 6);
+    memcpy(&a->senderMac[0], &p[8], 6);
+    a->senderIp = be32(p, 14);
+    memcpy(&a->targetMac[0], &p[18], 6);
+    a->targetIp = be32(p, 24);
+    return true;
+}
+
+// a complete broadcast frame asking "who has targetIp? tell senderIp". Returns 42
+public int arpRequestFrame(char* senderMac, int senderIp, int targetIp, char* out) {
+    char bcast[6];
+    char zero[6];
+    for (int i = 0; i < 6; i++) { bcast[i] = 255; zero[i] = 0; }
+    char arp[28];
+    arpBuild(ARP_REQUEST, senderMac, senderIp, zero, targetIp, arp);
+    return ethBuild(bcast, senderMac, ETH_ARP, arp, 28, out);
+}
+
+// the frame an owner of targetIp answers with: "targetIp is at ownerMac"
+public int arpReplyFrame(char* ownerMac, int ownerIp, char* askerMac, int askerIp, char* out) {
+    char arp[28];
+    arpBuild(ARP_REPLY, ownerMac, ownerIp, askerMac, askerIp, arp);
+    return ethBuild(askerMac, ownerMac, ETH_ARP, arp, 28, out);
+}
+
+// ---- IPv4 ---------------------------------------------------------------------------------------------------------------------
+public class Ip {
+    public int version;
+    public int headerLen;          // bytes
+    public int tos;
+    public int totalLen;
+    public int id;
+    public int flags;              // bit 1 = don't fragment, bit 0 = more fragments (of the 3 flag bits: 2, 1, 0 -> DF = 2, MF = 1)
+    public int fragOffset;         // in 8 byte units
+    public int ttl;
+    public int proto;
+    public int checksum;
+    public bool checksumOk;
+    public int src;
+    public int dst;
+    public int offset;             // where the payload starts in the buffer
+}
+
+// a 20 byte IPv4 header (no options, don't fragment) followed by the payload. Returns the packet length
+public int ipBuild(int src, int dst, int proto, int ttl, int id, char* payload, int n, char* out) {
+    out[0] = 0x45;
+    out[1] = 0;
+    put16(out, 2, 20 + n);
+    put16(out, 4, id);
+    put16(out, 6, 0x4000);
+    out[8] = ttl;
+    out[9] = proto;
+    put16(out, 10, 0);
+    put32(out, 12, src);
+    put32(out, 16, dst);
+    put16(out, 10, netaddr.checksum(out, 20));
+    if (n > 0) memcpy(&out[20], payload, n);
+    return 20 + n;
+}
+
+public bool ipParse(char* p, int n, Ip* h) {
+    if (n < 20) return false;
+    h->version = p[0] >> 4;
+    h->headerLen = (p[0] & 15) * 4;
+    if (h->version != 4 || h->headerLen < 20 || h->headerLen > n) return false;
+    h->tos = p[1];
+    h->totalLen = be16(p, 2);
+    h->id = be16(p, 4);
+    h->flags = be16(p, 6) >> 13;
+    h->fragOffset = be16(p, 6) & 0x1FFF;
+    h->ttl = p[8];
+    h->proto = p[9];
+    h->checksum = be16(p, 10);
+    h->checksumOk = netaddr.checksum(p, h->headerLen) == 0;
+    h->src = be32(p, 12);
+    h->dst = be32(p, 16);
+    h->offset = h->headerLen;
+    return true;
+}
+
+// ---- ICMP -----------------------------------------------------------------------------------------------------------------------
+public class Icmp {
+    public int type;
+    public int code;
+    public int id;                 // echo request / reply
+    public int seq;
+    public bool checksumOk;
+    public int offset;             // start of the data (after the 8 byte header)
+}
+
+// an echo request (type ICMP_ECHO) or reply (ICMP_ECHO_REPLY) with data. Returns the length
+public int icmpEcho(int type, int id, int seq, char* data, int n, char* out) {
+    out[0] = type;
+    out[1] = 0;
+    put16(out, 2, 0);
+    put16(out, 4, id);
+    put16(out, 6, seq);
+    if (n > 0) memcpy(&out[8], data, n);
+    put16(out, 2, netaddr.checksum(out, 8 + n));
+    return 8 + n;
+}
+
+public bool icmpParse(char* p, int n, Icmp* m) {
+    if (n < 8) return false;
+    m->type = p[0];
+    m->code = p[1];
+    m->id = be16(p, 4);
+    m->seq = be16(p, 6);
+    m->checksumOk = netaddr.checksum(p, n) == 0;
+    m->offset = 8;
+    return true;
+}
+
+// ---- UDP ------------------------------------------------------------------------------------------------------------------------
+public class Udp {
+    public int srcPort;
+    public int dstPort;
+    public int length;             // header + data
+    public int checksum;
+    public int offset;
+}
+
+// checksum over the pseudo header (addresses, protocol, length) and the segment
+private int transportChecksum(int src, int dst, int proto, char* seg, int n) {
+    char ph[12];
+    put32(ph, 0, src);
+    put32(ph, 4, dst);
+    ph[8] = 0;
+    ph[9] = proto;
+    put16(ph, 10, n);
+    int sum = netaddr.checksumAdd(ph, 12, 0);
+    sum = netaddr.checksumAdd(seg, n, sum);
+    return netaddr.checksumFinish(sum);
+}
+
+// a UDP datagram with its checksum. Returns the length
+public int udpBuild(int srcIp, int dstIp, int srcPort, int dstPort, char* payload, int n, char* out) {
+    put16(out, 0, srcPort);
+    put16(out, 2, dstPort);
+    put16(out, 4, 8 + n);
+    put16(out, 6, 0);
+    if (n > 0) memcpy(&out[8], payload, n);
+    int c = transportChecksum(srcIp, dstIp, PROTO_UDP, out, 8 + n);
+    if (c == 0) c = 0xFFFF;
+    put16(out, 6, c);
+    return 8 + n;
+}
+
+public bool udpParse(char* p, int n, Udp* u) {
+    if (n < 8) return false;
+    u->srcPort = be16(p, 0);
+    u->dstPort = be16(p, 2);
+    u->length = be16(p, 4);
+    u->checksum = be16(p, 6);
+    u->offset = 8;
+    return true;
+}
+
+// does the checksum of a received UDP datagram match? (a zero checksum means "not used" and passes)
+public bool udpChecksumOk(int srcIp, int dstIp, char* p, int n) {
+    if (n < 8) return false;
+    if (be16(p, 6) == 0) return true;
+    return transportChecksum(srcIp, dstIp, PROTO_UDP, p, n) == 0;
+}
+
+// ---- TCP ------------------------------------------------------------------------------------------------------------------------
+public class Tcp {
+    public int srcPort;
+    public int dstPort;
+    public int seq;
+    public int ack;
+    public int headerLen;
+    public int flags;              // TCP_SYN | TCP_ACK ...
+    public int window;
+    public int checksum;
+    public int mss;                // from the MSS option, 0 if absent
+    public int offset;
+}
+
+// a TCP segment (flags: TCP_SYN, TCP_ACK ...). mss > 0 adds the maximum segment size option (use it on SYN).
+// Returns the length
+public int tcpBuild(int srcIp, int dstIp, int srcPort, int dstPort, int seq, int ack, int flags, int window,
+                    int mss, char* payload, int n, char* out) {
+    int hl = 20;
+    if (mss > 0) hl = 24;
+    put16(out, 0, srcPort);
+    put16(out, 2, dstPort);
+    put32(out, 4, seq);
+    put32(out, 8, ack);
+    out[12] = (hl / 4) << 4;
+    out[13] = flags;
+    put16(out, 14, window);
+    put16(out, 16, 0);
+    put16(out, 18, 0);
+    if (mss > 0) {
+        out[20] = 2;
+        out[21] = 4;
+        put16(out, 22, mss);
+    }
+    if (n > 0) memcpy(&out[hl], payload, n);
+    put16(out, 16, transportChecksum(srcIp, dstIp, PROTO_TCP, out, hl + n));
+    return hl + n;
+}
+
+public bool tcpParse(char* p, int n, Tcp* t) {
+    if (n < 20) return false;
+    t->srcPort = be16(p, 0);
+    t->dstPort = be16(p, 2);
+    t->seq = be32(p, 4);
+    t->ack = be32(p, 8);
+    t->headerLen = (p[12] >> 4) * 4;
+    if (t->headerLen < 20 || t->headerLen > n) return false;
+    t->flags = p[13];
+    t->window = be16(p, 14);
+    t->checksum = be16(p, 16);
+    t->mss = 0;
+    int i = 20;
+    while (i < t->headerLen) {
+        int kind = p[i];
+        if (kind == 0) break;
+        if (kind == 1) { i++; continue; }
+        if (i + 1 >= t->headerLen) break;
+        int len = p[i + 1];
+        if (len < 2) break;
+        if (kind == 2 && len == 4) t->mss = be16(p, i + 2);
+        i = i + len;
+    }
+    t->offset = t->headerLen;
+    return true;
+}
+
+public bool tcpChecksumOk(int srcIp, int dstIp, char* p, int n) {
+    return transportChecksum(srcIp, dstIp, PROTO_TCP, p, n) == 0;
+}
+
+// ---- describing packets ------------------------------------------------------------------------------------------------------------
+private char* flagText(int f) {
+    char* out = alloc(16);
+    int o = 0;
+    if ((f & TCP_SYN) != 0) { out[o] = 'S'; o++; }
+    if ((f & TCP_FIN) != 0) { out[o] = 'F'; o++; }
+    if ((f & TCP_RST) != 0) { out[o] = 'R'; o++; }
+    if ((f & TCP_PSH) != 0) { out[o] = 'P'; o++; }
+    if ((f & TCP_URG) != 0) { out[o] = 'U'; o++; }
+    if ((f & TCP_ACK) != 0) { out[o] = '.'; o++; }
+    if (o == 0) { out[0] = '-'; }
+    return out;
+}
+
+// a one-line summary of an Ethernet frame in the style of tcpdump
+public char* describe(char* frame, int n) {
+    char* out = alloc(300);
+    Eth* e = new Eth();
+    if (!ethParse(frame, n, e)) {
+        strcpy(out, "short frame");
+        return out;
+    }
+    char* body = &frame[e->offset];
+    int bn = n - e->offset;
+    if (e->type == ETH_ARP) {
+        Arp* a = new Arp();
+        if (!arpParse(body, bn, a)) {
+            strcpy(out, "ARP (malformed)");
+            return out;
+        }
+        if (a->op == ARP_REQUEST) {
+            format(out, 300, "ARP who-has %s tell %s", netaddr.ipToText(a->targetIp), netaddr.ipToText(a->senderIp));
+        } else {
+            format(out, 300, "ARP reply %s is-at %s", netaddr.ipToText(a->senderIp), netaddr.macToText(&a->senderMac[0]));
+        }
+        return out;
+    }
+    if (e->type != ETH_IPV4) {
+        format(out, 300, "%s > %s ethertype 0x%04x, length %d", netaddr.macToText(&e->src[0]), netaddr.macToText(&e->dst[0]), e->type, n);
+        return out;
+    }
+    Ip* ip = new Ip();
+    if (!ipParse(body, bn, ip)) {
+        strcpy(out, "IP (malformed)");
+        return out;
+    }
+    char* seg = &body[ip->offset];
+    int sn = ip->totalLen - ip->headerLen;
+    if (sn > bn - ip->offset) sn = bn - ip->offset;
+    if (ip->proto == PROTO_TCP) {
+        Tcp* t = new Tcp();
+        if (tcpParse(seg, sn, t)) {
+            format(out, 300, "IP %s.%d > %s.%d: TCP [%s] seq %d ack %d length %d", netaddr.ipToText(ip->src), t->srcPort,
+                   netaddr.ipToText(ip->dst), t->dstPort, flagText(t->flags), t->seq, t->ack, sn - t->headerLen);
+            return out;
+        }
+    } else if (ip->proto == PROTO_UDP) {
+        Udp* u = new Udp();
+        if (udpParse(seg, sn, u)) {
+            format(out, 300, "IP %s.%d > %s.%d: UDP length %d", netaddr.ipToText(ip->src), u->srcPort,
+                   netaddr.ipToText(ip->dst), u->dstPort, sn - 8);
+            return out;
+        }
+    } else if (ip->proto == PROTO_ICMP) {
+        Icmp* m = new Icmp();
+        if (icmpParse(seg, sn, m)) {
+            char* what = "ICMP";
+            if (m->type == ICMP_ECHO) what = "ICMP echo request";
+            else if (m->type == ICMP_ECHO_REPLY) what = "ICMP echo reply";
+            else if (m->type == ICMP_UNREACHABLE) what = "ICMP destination unreachable";
+            else if (m->type == ICMP_TIME_EXCEEDED) what = "ICMP time exceeded";
+            format(out, 300, "IP %s > %s: %s, id %d, seq %d, length %d", netaddr.ipToText(ip->src), netaddr.ipToText(ip->dst),
+                   what, m->id, m->seq, sn - 8);
+            return out;
+        }
+    }
+    format(out, 300, "IP %s > %s: proto %d, length %d", netaddr.ipToText(ip->src), netaddr.ipToText(ip->dst), ip->proto, sn);
+    return out;
+}
+
+// "0000  48 65 6c 6c 6f ...  Hello" lines, 16 bytes each
+public char* hexdump(char* data, int n) {
+    int lines = (n + 15) / 16;
+    char* out = alloc(lines * 80 + 8);
+    int o = 0;
+    for (int l = 0; l < lines; l++) {
+        char tmp[16];
+        format(&tmp[0], 16, "%04x  ", l * 16);
+        for (int k = 0; tmp[k] != 0; k++) { out[o] = tmp[k]; o++; }
+        for (int i = 0; i < 16; i++) {
+            if (l * 16 + i < n) {
+                format(&tmp[0], 16, "%02x ", data[l * 16 + i]);
+                for (int k = 0; tmp[k] != 0; k++) { out[o] = tmp[k]; o++; }
+            } else {
+                out[o] = ' '; out[o + 1] = ' '; out[o + 2] = ' ';
+                o = o + 3;
+            }
+        }
+        out[o] = ' ';
+        o++;
+        for (int i = 0; i < 16 && l * 16 + i < n; i++) {
+            int c = data[l * 16 + i];
+            if (c >= 32 && c < 127) out[o] = c; else out[o] = '.';
+            o++;
+        }
+        out[o] = 10;
+        o++;
+    }
+    out[o] = 0;
+    return out;
+}
+
+// ---- pcap files ---------------------------------------------------------------------------------------------------------------------
+// libpcap capture files (readable by Wireshark and tcpdump), Ethernet link type
+public class PcapWriter {
+    private int fd;
+    public int packets;
+    public PcapWriter(char* path) {
+        fd = fileOpen(path, FILE_WRITE);
+        if (fd >= 0) {
+            char h[24];
+            for (int i = 0; i < 24; i++) h[i] = 0;
+            h[0] = 0xD4; h[1] = 0xC3; h[2] = 0xB2; h[3] = 0xA1;          // magic, little endian
+            h[4] = 2; h[6] = 4;                                            // version 2.4
+            h[16] = 0xFF; h[17] = 0xFF;                                    // snap length 65535
+            h[20] = 1;                                                     // LINKTYPE_ETHERNET
+            fileWrite(fd, h, 24);
+        }
+    }
+    public bool ok() { return fd >= 0; }
+    // adds a frame with a time stamp
+    public bool write(char* frame, int n, int sec, int usec) {
+        if (fd < 0) return false;
+        char h[16];
+        put32le(h, 0, sec);
+        put32le(h, 4, usec);
+        put32le(h, 8, n);
+        put32le(h, 12, n);
+        fileWrite(fd, h, 16);
+        fileWrite(fd, frame, n);
+        packets++;
+        return true;
+    }
+    public void close() {
+        if (fd >= 0) fileClose(fd);
+        fd = -1;
+    }
+}
+
+private void put32le(char* b, int o, int v) {
+    b[o] = v & 255; b[o + 1] = (v >> 8) & 255; b[o + 2] = (v >> 16) & 255; b[o + 3] = (v >> 24) & 255;
+}
+
+private int get32le(char* b, int o) {
+    return b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24);
+}
+
+public class PcapReader {
+    private int fd;
+    public int sec;
+    public int usec;
+    public PcapReader(char* path) {
+        fd = fileOpen(path, FILE_READ);
+        if (fd >= 0) {
+            char h[24];
+            if (readFully(fd, h, 24) != 24 || get32le(h, 0) != 0xA1B2C3D4) {
+                fileClose(fd);
+                fd = -1;
+            }
+        }
+    }
+    public bool ok() { return fd >= 0; }
+    // reads the next frame into buf (at most max bytes). Returns its length, -1 at the end of the file
+    public int next(char* buf, int max) {
+        if (fd < 0) return -1;
+        char h[16];
+        if (readFully(fd, h, 16) != 16) return -1;
+        sec = get32le(h, 0);
+        usec = get32le(h, 4);
+        int caplen = get32le(h, 8);
+        int take = caplen;
+        if (take > max) take = max;
+        if (readFully(fd, buf, take) != take) return -1;
+        // skip what does not fit
+        char skip[1];
+        for (int i = take; i < caplen; i++) readFully(fd, skip, 1);
+        return take;
+    }
+    public void close() {
+        if (fd >= 0) fileClose(fd);
+        fd = -1;
+    }
+}
+
+private int readFully(int fd, char* buf, int n) {
+    int got = 0;
+    while (got < n) {
+        int r = fileRead(fd, &buf[got], n - got);
+        if (r <= 0) break;
+        got = got + r;
+    }
+    return got;
+}

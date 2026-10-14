@@ -39,7 +39,7 @@ An ARM64 file can be tried on an x86-64 machine with QEMU user mode emulation
 
 PE32+ console executables importing only `kernel32.dll` (`GetStdHandle`, `ReadFile`, `WriteFile`,
 `CreateFileA`, `CloseHandle`, `ExitProcess`, `GetCommandLineA` and about 40 more for time, files, directories, processes,
-pipes, memory, environment) and `ws2_32.dll` (Winsock, for the `net` and `http` modules: sockets, UDP, time limits, host name lookup). The other functions are reached through the
+pipes, memory, environment) and `ws2_32.dll` (Winsock, for the `net` family of modules: sockets, UDP, time limits, polling, host name lookup) and `iphlpapi.dll` (adapter, ARP, route and connection tables, ICMP echo). The other functions are reached through the
 `__winapi` / `__winapix` built-ins by import-table slot. The C library (`import clib;`) runs on Windows too: `system`,
 `popen`, `fopen`, `stat`, `opendir`, `getenv` ... are implemented with these imports. Not available: `fork`, `kill`, `link`,
 `symlink` and signals (they fail with `ENOSYS`). The image is linked at

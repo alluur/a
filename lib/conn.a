@@ -1,0 +1,232 @@
+// =============================================================================
+//  conn - buffered connections, listeners and a poller                   import conn;
+//
+//  conn.Connection wraps a TCP socket with a read buffer (lines, exact byte counts) and a write buffer;
+//  conn.Listener accepts connections; conn.Poller waits for many connections at once so one program
+//  can serve many clients without threads.
+//
+//    conn.Connection* c = conn.open("example.org", 80, 5000);        // host, port, time limit in ms
+//    c->writeLine("GET / HTTP/1.0");  c->writeLine("");  c->flush();
+//    char line[256];
+//    while (c->readLine(line, 256) >= 0) println(line);
+//    c->close();
+//
+//    conn.Listener* l = new conn.Listener(8080);
+//    conn.Poller* p = new conn.Poller();
+//    p->add(l->handle(), 0);
+//    ... p->wait(1000) tells which entries are readable (see the echo server example)
+// =============================================================================
+import net;
+module conn;
+
+public class Connection {
+    private int h;
+    private char* inbuf;
+    private int inPos;
+    private int inLen;
+    private char* outbuf;
+    private int outLen;
+    public int bytesIn;
+    public int bytesOut;
+
+    public Connection(int handle) {
+        h = handle;
+        inbuf = alloc(4096);
+        outbuf = alloc(4096);
+    }
+    public int handle() { return h; }
+    public bool isOpen() { return h >= 0; }
+    public void setTimeout(int ms) { net.setTimeout(h, ms); }
+    public bool peer(int* ip, int* port) { return net.peer(h, ip, port); }
+    public int localPort() { return net.localPort(h); }
+    // bytes that are already received and waiting in the buffer
+    public int buffered() { return inLen - inPos; }
+    // true if a read would not block (data waiting in the buffer or in the socket)
+    public bool readable(int ms) {
+        if (inLen > inPos) return true;
+        return net.waitReadable(h, ms);
+    }
+
+    private bool fill() {
+        if (h < 0) return false;
+        inPos = 0;
+        inLen = 0;
+        int r = net.recv(h, inbuf, 4096);
+        if (r <= 0) return false;
+        inLen = r;
+        bytesIn = bytesIn + r;
+        return true;
+    }
+
+    // one byte, -1 at the end of the connection (or on a time out)
+    public int readByte() {
+        if (inPos >= inLen && !fill()) return -1;
+        int c = inbuf[inPos];
+        inPos++;
+        return c;
+    }
+
+    // some bytes (at most max): whatever is available, waits only if nothing is. Returns the count, 0 at the end
+    public int read(char* out, int max) {
+        if (inPos >= inLen && !fill()) return 0;
+        int n = inLen - inPos;
+        if (n > max) n = max;
+        memcpy(out, &inbuf[inPos], n);
+        inPos = inPos + n;
+        return n;
+    }
+
+    // exactly n bytes (fewer only if the connection ends). Returns how many were read
+    public int readExact(char* out, int n) {
+        int got = 0;
+        while (got < n) {
+            int r = read(&out[got], n - got);
+            if (r <= 0) break;
+            got = got + r;
+        }
+        return got;
+    }
+
+    // a line without the "\r\n" or "\n". Returns its length, -1 at the end of the connection. Long lines are cut at max - 1
+    public int readLine(char* out, int max) {
+        int n = 0;
+        for (;;) {
+            int c = readByte();
+            if (c < 0) {
+                if (n == 0) return -1;
+                break;
+            }
+            if (c == 10) break;
+            if (c != 13 && n < max - 1) {
+                out[n] = c;
+                n++;
+            }
+        }
+        out[n] = 0;
+        return n;
+    }
+
+    // writes into the send buffer (sent when it is full, on flush() and on close())
+    public bool write(char* data, int n) {
+        if (h < 0) return false;
+        if (n >= 4096) {
+            if (!flush()) return false;
+            bytesOut = bytesOut + n;
+            return net.send(h, data, n) == n;
+        }
+        if (outLen + n > 4096 && !flush()) return false;
+        memcpy(&outbuf[outLen], data, n);
+        outLen = outLen + n;
+        return true;
+    }
+    public bool writeText(char* text) { return write(text, strlen(text)); }
+    // the text and "\r\n"
+    public bool writeLine(char* text) { return writeText(text) && write("\r\n", 2); }
+
+    public bool flush() {
+        if (outLen == 0) return true;
+        int n = outLen;
+        outLen = 0;
+        bytesOut = bytesOut + n;
+        return net.send(h, outbuf, n) == n;
+    }
+
+    public void close() {
+        if (h >= 0) {
+            flush();
+            net.close(h);
+            h = -1;
+        }
+    }
+}
+
+// connects (name or address, port) with a time limit; null on failure
+public Connection* open(char* host, int port, int timeoutMs) {
+    int h = net.connectTimeout(host, port, timeoutMs);
+    if (h < 0) return null;
+    Connection* c = new Connection(h);
+    c->setTimeout(timeoutMs * 3);
+    return c;
+}
+
+// tries several times with a pause between the tries
+public Connection* openRetry(char* host, int port, int timeoutMs, int tries, int pauseMs) {
+    for (int i = 0; i < tries; i++) {
+        Connection* c = open(host, port, timeoutMs);
+        if (c != null) return c;
+        if (i + 1 < tries) sleepMs(pauseMs);
+    }
+    return null;
+}
+
+public class Listener {
+    private int h;
+    public Listener(int port) {
+        h = net.listen(port, 64);
+    }
+    public bool ok() { return h >= 0; }
+    public int handle() { return h; }
+    public int port() { return net.localPort(h); }
+    // waits for a client (ms < 0: forever); null on time out or error
+    public Connection* accept(int ms) {
+        if (h < 0) return null;
+        if (ms >= 0 && !net.waitReadable(h, ms)) return null;
+        int c = net.accept(h);
+        if (c < 0) return null;
+        return new Connection(c);
+    }
+    public void close() {
+        if (h >= 0) net.close(h);
+        h = -1;
+    }
+}
+
+// waits for several sockets at once. add() puts a handle with a tag of your choice in the set,
+// wait(ms) returns how many are ready, readyHandle(i) / readyTag(i) tell which
+public class Poller {
+    private int handles[128];
+    private int tags[128];
+    private int events[128];
+    private int revents[128];
+    private int n;
+    private int ready[128];
+    private int readyN;
+
+    public int count() { return n; }
+
+    public bool add(int handle, int tag) {
+        if (n >= 128) return false;
+        handles[n] = handle;
+        tags[n] = tag;
+        events[n] = net.READABLE;
+        n++;
+        return true;
+    }
+    public void remove(int handle) {
+        for (int i = 0; i < n; i++) {
+            if (handles[i] == handle) {
+                n--;
+                handles[i] = handles[n];
+                tags[i] = tags[n];
+                events[i] = events[n];
+                return;
+            }
+        }
+    }
+    // returns the number of sockets that are readable (or hung up / failed); ms < 0 waits forever
+    public int wait(int ms) {
+        readyN = 0;
+        if (n == 0) return 0;
+        int r = net.poll(&handles[0], &events[0], &revents[0], n, ms);
+        if (r <= 0) return r;
+        for (int i = 0; i < n; i++) {
+            if (revents[i] != 0) {
+                ready[readyN] = i;
+                readyN++;
+            }
+        }
+        return readyN;
+    }
+    public int readyHandle(int i) { return handles[ready[i]]; }
+    public int readyTag(int i) { return tags[ready[i]]; }
+}

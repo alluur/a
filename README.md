@@ -75,7 +75,7 @@ ac -o /tmp/hello hello.a                     # exactly /tmp/hello
 Example programs live in [`examples/`](examples/): `greet`, `calc` (interactive REPL), `wordcount`, `cat`, `todo`,
 `table`, `colors`, `wordfreq`, `clock`, `checksums`, `primes`, `jsonpretty`, `grep`, `bignum`, `dirlist`, `quiz`, `bank`, `modules`, `net_server` / `net_client` and more.
 Built-in modules: `math`, `bigint`, `decimal`, `random`, `sort`, `collections`, `strings`, `regex`, `utf8`, `json`, `csv`,
-`path`, `os`, `datetime`, `encoding`, `hash`, `cli`, `log`, `testing`, `net` (TCP, UDP, DNS), `http`, `fixed`, `nn` (perceptron, MLP, autoencoder, Hopfield, SOM, Elman, LSTM, CNN), `codec` (text / binary / image converters), and **the C standard library** (`import clib;`):
+`path`, `os`, `datetime`, `encoding`, `hash`, `cli`, `log`, `testing`, `net` (TCP, UDP, DNS, poll), `http`, `netaddr`, `packet` (ARP / IP / ICMP / UDP / TCP / pcap), `netif` (interfaces, ARP table, routes, sockets), `dns`, `conn`, `websocket`, `netutil` (ping, Wake-on-LAN, NTP), `rawnet`, `fixed`, `nn` (perceptron, MLP, autoencoder, Hopfield, SOM, Elman, LSTM, CNN), `codec` (text / binary / image converters), and **the C standard library** (`import clib;`):
 `ctype errno limits string stdlib stdio time math (correctly rounded libm) complex unistd signal locale wchar` with the C names,
 see [`docs/CLIB.md`](docs/CLIB.md).
 

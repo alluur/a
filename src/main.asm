@@ -78,6 +78,14 @@ embedded_mods:
 section .text
 EMB "net",         "lib/net.a"
 EMB "http",        "lib/http.a"
+EMB "netaddr",     "lib/netaddr.a"
+EMB "packet",      "lib/packet.a"
+EMB "netif",       "lib/netif.a"
+EMB "dns",         "lib/dns.a"
+EMB "conn",        "lib/conn.a"
+EMB "websocket",   "lib/websocket.a"
+EMB "netutil",     "lib/netutil.a"
+EMB "rawnet",      "lib/rawnet.a"
 EMB "fixed",       "lib/fixed.a"
 EMB "nn",          "lib/nn.a"
 EMB "codec",       "lib/codec.a"
@@ -133,7 +141,7 @@ std_src_end:
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
 %define IAT_K32             39
-%define IAT_SLOTS           (IAT_K32 + 1 + 14 + 1)   ; kernel32 + null + ws2_32 + null
+%define IAT_SLOTS           (IAT_K32 + 1 + 20 + 1 + 8 + 1)   ; kernel32 + null + ws2_32 + null
 
 bn_write:   db "__write", 0
 bn_read:    db "__read", 0
@@ -453,7 +461,7 @@ imp_names:
     db "CreatePipe", 0          ; slot 37
     db "SetHandleInformation", 0 ; slot 38
     db 0
-; WS2_32.DLL imports: slots 40..53 (slot 39 is the null terminator of the kernel32 list)
+; WS2_32.DLL imports: slots 40..59 (slot 39 is the null terminator of the kernel32 list)
 imp_names_ws2:
     db "WSAStartup", 0
     db "socket", 0
@@ -469,7 +477,25 @@ imp_names_ws2:
     db "setsockopt", 0          ; slot 51
     db "gethostbyname", 0       ; slot 52
     db "getsockname", 0         ; slot 53
+    db "shutdown", 0            ; slot 54
+    db "getpeername", 0         ; slot 55
+    db "WSAPoll", 0             ; slot 56
+    db "ioctlsocket", 0         ; slot 57
+    db "getsockopt", 0          ; slot 58
+    db "gethostname", 0         ; slot 59
     db 0
+; IPHLPAPI.DLL imports: slots 61..68 (slot 60 is the null terminator of the ws2_32 list)
+imp_names_iph:
+    db "GetAdaptersInfo", 0     ; slot 61
+    db "GetIpNetTable", 0       ; slot 62
+    db "GetIpForwardTable", 0   ; slot 63
+    db "GetTcpTable", 0         ; slot 64
+    db "IcmpCreateFile", 0      ; slot 65
+    db "IcmpSendEcho", 0        ; slot 66
+    db "IcmpCloseHandle", 0     ; slot 67
+    db "GetUdpTable", 0         ; slot 68
+    db 0
+s_iphlpapi: db "IPHLPAPI.DLL", 0
 s_kernel32: db "KERNEL32.DLL", 0
 s_ws2_32:   db "WS2_32.DLL", 0
 
@@ -1213,8 +1239,8 @@ build_elf:
 
 ; ---- PE32+ (Windows x64) -----------------------------------------------------------------
 %define PE_BASE 0x140000000
-%define PE_IDATA_ILT 60
-%define PE_IDATA_IAT (60 + IAT_SLOTS*8)
+%define PE_IDATA_ILT 80
+%define PE_IDATA_IAT (80 + IAT_SLOTS*8)
 %define PE_IDATA_NAMES (PE_IDATA_IAT + IAT_SLOTS*8)
 
 ; align_up: rax = value, rcx = alignment (power of two) -> rax
@@ -1417,6 +1443,7 @@ build_idata:
     push r12
     push r13
     push r14
+    push r15
     mov rbx, [pe_idata_rva]
     mov r12d, PE_IDATA_NAMES
     xor r13d, r13d
@@ -1424,6 +1451,9 @@ build_idata:
     call idata_list
     inc r13d                                ; null slot ends the kernel32 thunk array
     mov rsi, imp_names_ws2
+    call idata_list
+    inc r13d                                ; null slot ends the ws2_32 thunk array
+    mov rsi, imp_names_iph
     call idata_list
     ; DLL name strings
     lea rdi, [idata_buf + r12]
@@ -1438,8 +1468,15 @@ build_idata:
     call cstr_copy
     lea rax, [r12 + 11]
     mov r12, rax
+    lea rdi, [idata_buf + r12]
+    mov r15, rdi
+    mov rsi, s_iphlpapi
+    call cstr_copy
+    lea rax, [r12 + 13]
+    mov r12, rax
     sub r14, idata_buf
     sub r13, idata_buf
+    sub r15, idata_buf
     ; descriptor 0: KERNEL32
     lea rax, [rbx + PE_IDATA_ILT]
     mov [idata_buf], eax
@@ -1454,7 +1491,15 @@ build_idata:
     mov [idata_buf + 32], eax
     lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1)*8]
     mov [idata_buf + 36], eax
+    ; descriptor 2: IPHLPAPI
+    lea rax, [rbx + PE_IDATA_ILT + (IAT_K32+1+20+1)*8]
+    mov [idata_buf + 40], eax
+    lea rax, [rbx + r15]
+    mov [idata_buf + 52], eax
+    lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1+20+1)*8]
+    mov [idata_buf + 56], eax
     mov rax, r12
+    pop r15
     pop r14
     pop r13
     pop r12
@@ -1842,7 +1887,7 @@ field_tab:      resb FIELD_MAX * 32
 ptype_pool:     resq PTYPE_MAX
 file_table:     resb FILE_MAX * 64
 outbuf:         resb OUT_MAX
-idata_buf:      resb 4096
+idata_buf:      resb 8192
 strbuf:         resb 65536
 errbuf:         resb 512
 importbuf:      resb 1024

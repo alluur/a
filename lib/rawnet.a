@@ -1,0 +1,120 @@
+// =============================================================================
+//  rawnet - raw Ethernet frames: send, receive, capture, ARP queries        import rawnet;
+//
+//  Needs Linux or Android and the permission to open packet sockets (root or CAP_NET_RAW); on Windows
+//  and without the permission open() returns -1. The frame builders and parsers are in the packet module.
+//
+//    int h = rawnet.open("eth0");
+//    char mac[6];
+//    if (rawnet.arping("eth0", netaddr.ipParse("192.168.1.1"), 1000, mac)) println(netaddr.macToText(mac));
+//    rawnet.capture("eth0", "dump.pcap", 100, 10000);          // 100 frames or 10 seconds, readable with Wireshark
+// =============================================================================
+import net;
+import netaddr;
+import netif;
+import packet;
+module rawnet;
+
+private bool windows() { return __OS == 1; }
+private int nr(int x64, int a64) { if (__ARCH == 1) return a64; return x64; }
+
+// opens a packet socket that sees every frame of an interface ("eth0", "wlan0", "lo"); "" = all interfaces.
+// Returns a handle, -1 if that is not possible here
+public int open(char* ifname) {
+    if (windows()) return -1;
+    int s = __syscall(nr(41, 198), 17, 3, 0x0300, 0, 0, 0);        // AF_PACKET, SOCK_RAW, htons(ETH_P_ALL)
+    if (s < 0) return -1;
+    if (ifname[0] != 0) {
+        netif.Iface* f = netif.findInterface(ifname);
+        if (f == null || f->index == 0) {
+            __syscall(nr(3, 57), s, 0, 0, 0, 0, 0);
+            return -1;
+        }
+        char sll[20];
+        for (int i = 0; i < 20; i++) sll[i] = 0;
+        sll[0] = 17;                                               // AF_PACKET
+        sll[2] = 3; sll[3] = 0;                                    // ETH_P_ALL, network order (0x0003 -> 00 03)
+        sll[2] = 0; sll[3] = 3;
+        sll[4] = f->index & 255; sll[5] = (f->index >> 8) & 255;
+        sll[6] = (f->index >> 16) & 255; sll[7] = (f->index >> 24) & 255;
+        if (__syscall(nr(49, 200), s, &sll[0], 20, 0, 0, 0) < 0) {
+            __syscall(nr(3, 57), s, 0, 0, 0, 0, 0);
+            return -1;
+        }
+    }
+    return s;
+}
+
+public void close(int h) {
+    __syscall(nr(3, 57), h, 0, 0, 0, 0, 0);
+}
+
+// sends one complete Ethernet frame. Returns the bytes sent or -1
+public int send(int h, char* frame, int n) {
+    return __syscall(nr(44, 206), h, frame, n, 0, 0, 0);
+}
+
+// receives one frame (waits ms; ms < 0 forever). Returns its length, 0 on time out, -1 on error
+public int recv(int h, char* buf, int max, int ms) {
+    if (ms >= 0 && !net.waitReadable(h, ms)) return 0;
+    return __syscall(nr(45, 207), h, buf, max, 0, 0, 0);
+}
+
+// asks "who has ip?" on the interface and waits for the answer: the MAC address of the owner goes to mac
+public bool arping(char* ifname, int ip, int timeoutMs, char* mac) {
+    netif.Iface* f = netif.findInterface(ifname);
+    if (f == null || f->ip == 0) return false;
+    int h = open(ifname);
+    if (h < 0) return false;
+    char frame[64];
+    int n = packet.arpRequestFrame(&f->mac[0], f->ip, ip, &frame[0]);
+    if (send(h, &frame[0], n) != n) {
+        close(h);
+        return false;
+    }
+    int start = millis();
+    bool found = false;
+    while (!found) {
+        int left = timeoutMs - (millis() - start);
+        if (left <= 0) break;
+        char buf[1600];
+        int got = recv(h, &buf[0], 1600, left);
+        if (got <= 0) break;
+        packet.Eth* e = new packet.Eth();
+        if (!packet.ethParse(&buf[0], got, e) || e->type != packet.ETH_ARP) continue;
+        packet.Arp* a = new packet.Arp();
+        if (packet.arpParse(&buf[e->offset], got - e->offset, a) && a->op == packet.ARP_REPLY && a->senderIp == ip) {
+            for (int i = 0; i < 6; i++) mac[i] = a->senderMac[i];
+            found = true;
+        }
+    }
+    close(h);
+    return found;
+}
+
+// writes up to count frames (or what arrives within ms milliseconds) to a pcap file. Returns the number of frames, -1 if
+// capturing is not possible
+public int capture(char* ifname, char* path, int count, int ms) {
+    int h = open(ifname);
+    if (h < 0) return -1;
+    packet.PcapWriter* w = new packet.PcapWriter(path);
+    if (!w->ok()) {
+        close(h);
+        return -1;
+    }
+    int start = millis();
+    int got = 0;
+    while (got < count) {
+        int left = ms - (millis() - start);
+        if (left <= 0) break;
+        char buf[2000];
+        int n = recv(h, &buf[0], 2000, left);
+        if (n <= 0) break;
+        int now = (millis() - start);
+        w->write(&buf[0], n, now / 1000, (now % 1000) * 1000);
+        got++;
+    }
+    w->close();
+    close(h);
+    return got;
+}

@@ -1,0 +1,341 @@
+// =============================================================================
+//  dns - DNS client with record types                                 import dns;
+//
+//    int n = dns.query("example.org", dns.MX);          // asks the name server, returns the number of answers
+//    for (int i = 0; i < n; i++) {
+//        dns.Record* r = dns.recordAt(i);
+//        println(dns.recordText(r));                     // 10 mail.example.org
+//    }
+//    dns.reverse(ip)                                    // PTR: the name of an address
+//    dns.lookupA("example.org")                         // the first IPv4 address (or -1)
+//
+//  Types: A NS CNAME SOA PTR MX TXT AAAA SRV. The servers are the ones of the system (see netif.dnsServers)
+//  unless dns.setServer(ip, port) is used. Answers are cached in the module until the next query.
+//  The packet functions (buildQuery, parseReply, buildReply) work without a network, and
+//  startQuery / finishQuery are the two halves of query for programs that serve DNS themselves.
+// =============================================================================
+import net;
+import netaddr;
+import netif;
+module dns;
+
+public const A = 1;
+public const NS = 2;
+public const CNAME = 5;
+public const SOA = 6;
+public const PTR = 12;
+public const MX = 15;
+public const TXT = 16;
+public const AAAA = 28;
+public const SRV = 33;
+
+public class Record {
+    public int type;
+    public int ttl;
+    public char name[256];
+    public int ip;                 // A
+    public char ip6[16];           // AAAA
+    public char target[256];       // NS, CNAME, PTR, MX exchange, SRV target, SOA primary server
+    public char text[512];         // TXT
+    public int pref;               // MX preference, SRV priority
+    public int weight;             // SRV
+    public int port;               // SRV
+    public int serial;             // SOA
+}
+
+private Record* records[64];
+private int recordN;
+private int lastRcodeValue;
+private int serverIp;
+private int serverPort = 53;
+private int nextId = 9137;
+
+// uses this server for all queries instead of the servers of the system
+public void setServer(int ip, int port) {
+    serverIp = ip;
+    serverPort = port;
+}
+
+public int rcode() { return lastRcodeValue; }
+public int recordCount() { return recordN; }
+public Record* recordAt(int i) {
+    if (i < 0 || i >= recordN) return null;
+    return records[i];
+}
+
+private int be16(char* b, int o) { return b[o] * 256 + b[o + 1]; }
+private int be32(char* b, int o) { return (b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]; }
+
+// ---- packets ------------------------------------------------------------------------------------------------------------------------
+// a query for a name and record type. Returns the packet length, -1 for a bad name
+public int buildQuery(char* name, int type, int id, char* buf) {
+    for (int i = 0; i < 12; i++) buf[i] = 0;
+    buf[0] = (id >> 8) & 255;
+    buf[1] = id & 255;
+    buf[2] = 1;                                // recursion desired
+    buf[5] = 1;
+    int pos = 12;
+    int labelAt = pos;
+    pos++;
+    int len = 0;
+    int i = 0;
+    for (;;) {
+        char c = name[i];
+        if (c == '.' || c == 0) {
+            if (len == 0 && !(c == 0 && i == 0) && !(c == 0 && name[i - 1] == '.')) return -1;
+            if (len > 63) return -1;
+            buf[labelAt] = len;
+            if (c == 0) break;
+            labelAt = pos;
+            pos++;
+            len = 0;
+        } else {
+            if (pos > 500) return -1;
+            buf[pos] = c;
+            pos++;
+            len++;
+        }
+        i++;
+    }
+    buf[pos] = 0;
+    buf[pos + 1] = type >> 8;
+    buf[pos + 2] = type & 255;
+    buf[pos + 3] = 0;
+    buf[pos + 4] = 1;                          // class IN
+    return pos + 5;
+}
+
+// reads a (compressed) name at pos into out as "www.example.org". Returns the position after the name in the packet, -1 if bad
+public int readName(char* b, int n, int pos, char* out, int max) {
+    int o = 0;
+    int next = -1;
+    int jumps = 0;
+    for (;;) {
+        if (pos >= n) return -1;
+        int l = b[pos];
+        if (l == 0) {
+            pos++;
+            break;
+        }
+        if ((l & 0xC0) == 0xC0) {
+            if (pos + 1 >= n) return -1;
+            if (next < 0) next = pos + 2;
+            pos = ((l & 0x3F) << 8) | b[pos + 1];
+            jumps++;
+            if (jumps > 20) return -1;
+            continue;
+        }
+        if (pos + 1 + l > n) return -1;
+        if (o > 0 && o < max - 1) { out[o] = '.'; o++; }
+        for (int k = 0; k < l; k++) {
+            if (o < max - 1) { out[o] = b[pos + 1 + k]; o++; }
+        }
+        pos = pos + 1 + l;
+    }
+    out[o] = 0;
+    if (next < 0) next = pos;
+    return next;
+}
+
+// reads the answers of a reply (the id must match). Returns the number of records, -1 if the packet is not
+// the reply to that query; rcode() is the response code (0 = no error, 3 = the name does not exist)
+public int parseReply(char* b, int n, int id) {
+    recordN = 0;
+    if (n < 12 || be16(b, 0) != id || (b[2] & 0x80) == 0) return -1;
+    lastRcodeValue = b[3] & 15;
+    int qd = be16(b, 4);
+    int an = be16(b, 6);
+    int pos = 12;
+    char skip[256];
+    for (int i = 0; i < qd; i++) {
+        pos = readName(b, n, pos, &skip[0], 256);
+        if (pos < 0) return -1;
+        pos = pos + 4;
+    }
+    for (int i = 0; i < an && recordN < 64; i++) {
+        Record* r = new Record();
+        pos = readName(b, n, pos, &r->name[0], 256);
+        if (pos < 0 || pos + 10 > n) return -1;
+        r->type = be16(b, pos);
+        r->ttl = be32(b, pos + 4) & 0xFFFFFFFF;
+        int rd = be16(b, pos + 8);
+        pos = pos + 10;
+        if (pos + rd > n) return -1;
+        if (r->type == A && rd == 4) {
+            r->ip = be32(b, pos);
+        } else if (r->type == AAAA && rd == 16) {
+            for (int k = 0; k < 16; k++) r->ip6[k] = b[pos + k];
+        } else if (r->type == NS || r->type == CNAME || r->type == PTR) {
+            readName(b, n, pos, &r->target[0], 256);
+        } else if (r->type == MX && rd >= 3) {
+            r->pref = be16(b, pos);
+            readName(b, n, pos + 2, &r->target[0], 256);
+        } else if (r->type == TXT) {
+            int t = pos;
+            int o = 0;
+            while (t < pos + rd) {
+                int l = b[t];
+                t++;
+                for (int k = 0; k < l && t + k < pos + rd && o < 511; k++) { r->text[o] = b[t + k]; o++; }
+                t = t + l;
+            }
+            r->text[o] = 0;
+        } else if (r->type == SRV && rd >= 7) {
+            r->pref = be16(b, pos);
+            r->weight = be16(b, pos + 2);
+            r->port = be16(b, pos + 4);
+            readName(b, n, pos + 6, &r->target[0], 256);
+        } else if (r->type == SOA) {
+            int p2 = readName(b, n, pos, &r->target[0], 256);
+            if (p2 > 0) {
+                char rname[256];
+                p2 = readName(b, n, p2, &rname[0], 256);
+                if (p2 > 0 && p2 + 4 <= n) r->serial = be32(b, p2) & 0xFFFFFFFF;
+            }
+        }
+        records[recordN] = r;
+        recordN++;
+        pos = pos + rd;
+    }
+    return recordN;
+}
+
+// a minimal reply to a query packet: the question again and, for an A question, one answer with the address
+// (ip = 0 answers with "no such name"). For programs that act as a DNS server. Returns the length
+public int buildReply(char* q, int qn, int ip, char* out) {
+    memcpy(out, q, qn);
+    out[2] = 0x81;                                 // response, recursion desired
+    out[3] = 0x80;                                 // recursion available
+    if (ip == 0) {
+        out[3] = 0x83;                             // NXDOMAIN
+        return qn;
+    }
+    out[6] = 0;
+    out[7] = 1;
+    int p = qn;
+    out[p] = 0xC0; out[p + 1] = 12;                // name: pointer to the question
+    out[p + 2] = 0; out[p + 3] = 1;                // type A
+    out[p + 4] = 0; out[p + 5] = 1;                // class IN
+    out[p + 6] = 0; out[p + 7] = 0; out[p + 8] = 0; out[p + 9] = 60;      // ttl 60
+    out[p + 10] = 0; out[p + 11] = 4;
+    out[p + 12] = (ip >> 24) & 255; out[p + 13] = (ip >> 16) & 255; out[p + 14] = (ip >> 8) & 255; out[p + 15] = ip & 255;
+    return p + 16;
+}
+
+// ---- asking ----------------------------------------------------------------------------------------------------------------------
+public class Pending {
+    public int socket;
+    public int id;
+    public int type;
+}
+
+// sends a query to a server and returns the state needed by finishQuery (null if it could not be sent)
+public Pending* startQuery(int server, int port, char* name, int type) {
+    int s = net.udpSocket();
+    if (s < 0) return null;
+    nextId = (nextId * 75 + 74) & 0xFFFF;
+    char q[600];
+    int n = buildQuery(name, type, nextId, &q[0]);
+    if (n < 0 || net.sendTo(s, server, port, &q[0], n) != n) {
+        net.close(s);
+        return null;
+    }
+    Pending* p = new Pending();
+    p->socket = s;
+    p->id = nextId;
+    p->type = type;
+    return p;
+}
+
+// waits up to ms for the reply and reads it (see parseReply); closes the socket. Returns the record count or -1
+public int finishQuery(Pending* p, int ms) {
+    net.setTimeout(p->socket, ms);
+    char buf[1500];
+    int got = net.recvFrom(p->socket, &buf[0], 1500, null, null);
+    net.close(p->socket);
+    if (got <= 0) return -1;
+    return parseReply(&buf[0], got, p->id);
+}
+
+// asks the servers (one after the other) for the records of a name. Returns the number of answers, -1 if nobody answered.
+// "No such name" gives 0 and rcode() 3
+public int query(char* name, int type) {
+    int servers[8];
+    int count = 0;
+    if (serverIp != 0) {
+        servers[0] = serverIp;
+        count = 1;
+    } else {
+        count = netif.dnsServers(&servers[0], 6);
+        servers[count] = 0x08080808;
+        count++;
+        servers[count] = 0x01010101;
+        count++;
+    }
+    for (int i = 0; i < count; i++) {
+        int port = 53;
+        if (serverIp != 0) port = serverPort;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            Pending* p = startQuery(servers[i], port, name, type);
+            if (p == null) break;
+            int r = finishQuery(p, 2000);
+            if (r >= 0) return r;
+        }
+    }
+    return -1;
+}
+
+// ---- conveniences -----------------------------------------------------------------------------------------------------------------
+// the first IPv4 address of a name (-1 if there is none)
+public int lookupA(char* name) {
+    int ip = net.parseIp(name);
+    if (ip >= 0) return ip;
+    int n = query(name, A);
+    for (int i = 0; i < n; i++) {
+        if (records[i]->type == A) return records[i]->ip;
+    }
+    return -1;
+}
+
+// the name of an address (PTR record) or null
+public char* reverse(int ip) {
+    int n = query(netaddr.reverseName(ip), PTR);
+    for (int i = 0; i < n; i++) {
+        if (records[i]->type == PTR) return strdup(&records[i]->target[0]);
+    }
+    return null;
+}
+
+public char* typeName(int type) {
+    if (type == A) return "A";
+    if (type == NS) return "NS";
+    if (type == CNAME) return "CNAME";
+    if (type == SOA) return "SOA";
+    if (type == PTR) return "PTR";
+    if (type == MX) return "MX";
+    if (type == TXT) return "TXT";
+    if (type == AAAA) return "AAAA";
+    if (type == SRV) return "SRV";
+    return "?";
+}
+
+// "93.184.216.34", "10 mail.example.org", "\"v=spf1 ...\"" ...: the data of a record as text
+public char* recordText(Record* r) {
+    char* out = alloc(800);
+    if (r->type == A) {
+        format(out, 800, "%s", netaddr.ipToText(r->ip));
+    } else if (r->type == AAAA) {
+        format(out, 800, "%s", netaddr.ip6ToText(&r->ip6[0]));
+    } else if (r->type == MX) {
+        format(out, 800, "%d %s", r->pref, &r->target[0]);
+    } else if (r->type == SRV) {
+        format(out, 800, "%d %d %d %s", r->pref, r->weight, r->port, &r->target[0]);
+    } else if (r->type == TXT) {
+        format(out, 800, "\"%s\"", &r->text[0]);
+    } else if (r->type == SOA) {
+        format(out, 800, "%s serial %d", &r->target[0], r->serial);
+    } else {
+        format(out, 800, "%s", &r->target[0]);
+    }
+    return out;
+}

@@ -1,0 +1,320 @@
+// =============================================================================
+//  websocket - WebSocket client and server (RFC 6455)               import websocket;
+//
+//    websocket.WebSocket* ws = websocket.connect("ws://localhost:8080/chat");
+//    ws->sendText("hello");
+//    char buf[1024]; int op;
+//    int n = ws->receive(buf, 1024, &op);        // n < 0: the connection was closed
+//    ws->close(1000);
+//
+//  Server side: take a conn.Connection from a conn.Listener and call websocket.accept(c); it reads the
+//  HTTP upgrade request, answers it and returns the WebSocket. Pings are answered automatically, fragmented
+//  messages are put together. Plain ws:// only (no TLS). Text frames are not checked for UTF-8.
+//
+//  The frame functions (buildFrame, parseHeader, unmask, acceptKey) work on byte buffers.
+// =============================================================================
+import net;
+import conn;
+import hash;
+import encoding;
+import http;
+module websocket;
+
+public const OP_CONT = 0;
+public const OP_TEXT = 1;
+public const OP_BINARY = 2;
+public const OP_CLOSE = 8;
+public const OP_PING = 9;
+public const OP_PONG = 10;
+
+// the Sec-WebSocket-Accept value for a Sec-WebSocket-Key (a new heap string)
+public char* acceptKey(char* clientKey) {
+    char joined[100];
+    format(&joined[0], 100, "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", clientKey);
+    char digest[20];
+    hash.sha1Raw(&joined[0], strlen(&joined[0]), &digest[0]);
+    return encoding.base64Encode(&digest[0], 20);
+}
+
+// ---- frames -------------------------------------------------------------------------------------------------------------------------
+public class Frame {
+    public int opcode;
+    public bool fin;
+    public bool masked;
+    public int length;             // payload length
+    public int headerLen;          // bytes before the payload
+    public int maskKey;
+}
+
+// xor n bytes with the 4 byte mask key (the same call masks and unmasks)
+public void unmask(char* data, int n, int key) {
+    for (int i = 0; i < n; i++) {
+        data[i] = data[i] ^ ((key >> (24 - 8 * (i % 4))) & 255);
+    }
+}
+
+// writes a frame (opcode, FIN bit, optional masking with maskKey as a client must) into out. Returns its length
+public int buildFrame(int opcode, bool fin, bool mask, int maskKey, char* payload, int n, char* out) {
+    int o = 0;
+    out[o] = opcode;
+    if (fin) out[o] = out[o] | 0x80;
+    o++;
+    int m = 0;
+    if (mask) m = 0x80;
+    if (n < 126) {
+        out[o] = m | n;
+        o++;
+    } else if (n < 65536) {
+        out[o] = m | 126;
+        out[o + 1] = (n >> 8) & 255;
+        out[o + 2] = n & 255;
+        o = o + 3;
+    } else {
+        out[o] = m | 127;
+        for (int i = 0; i < 8; i++) out[o + 1 + i] = (n >> (56 - 8 * i)) & 255;
+        o = o + 9;
+    }
+    if (mask) {
+        out[o] = (maskKey >> 24) & 255; out[o + 1] = (maskKey >> 16) & 255;
+        out[o + 2] = (maskKey >> 8) & 255; out[o + 3] = maskKey & 255;
+        o = o + 4;
+    }
+    memcpy(&out[o], payload, n);
+    if (mask) unmask(&out[o], n, maskKey);
+    return o + n;
+}
+
+// reads the frame header from the first n bytes of buf. Returns the header length, 0 if more bytes are needed,
+// -1 if it is not a valid header
+public int parseHeader(char* buf, int n, Frame* f) {
+    if (n < 2) return 0;
+    f->fin = (buf[0] & 0x80) != 0;
+    if ((buf[0] & 0x70) != 0) return -1;
+    f->opcode = buf[0] & 15;
+    f->masked = (buf[1] & 0x80) != 0;
+    int len = buf[1] & 0x7F;
+    int o = 2;
+    if (len == 126) {
+        if (n < 4) return 0;
+        len = buf[2] * 256 + buf[3];
+        o = 4;
+    } else if (len == 127) {
+        if (n < 10) return 0;
+        len = 0;
+        for (int i = 0; i < 8; i++) len = (len << 8) | buf[2 + i];
+        if (len < 0) return -1;
+        o = 10;
+    }
+    f->maskKey = 0;
+    if (f->masked) {
+        if (n < o + 4) return 0;
+        f->maskKey = (buf[o] << 24) | (buf[o + 1] << 16) | (buf[o + 2] << 8) | buf[o + 3];
+        o = o + 4;
+    }
+    f->length = len;
+    f->headerLen = o;
+    return o;
+}
+
+// ---- a connection -------------------------------------------------------------------------------------------------------------------
+public class WebSocket {
+    public conn.Connection* c;
+    public bool isClient;
+    public bool closed;
+    public int closeCode;
+
+    public WebSocket(conn.Connection* connection, bool client) {
+        c = connection;
+        isClient = client;
+        closeCode = 0;
+    }
+
+    private bool sendFrame(int opcode, char* data, int n) {
+        if (closed) return false;
+        char* out = alloc(n + 20);
+        int key = 0;
+        if (isClient) key = ((rand() & 0xFFFF) << 16) | (rand() & 0xFFFF);
+        int len = buildFrame(opcode, true, isClient, key, data, n, out);
+        bool ok = c->write(out, len) && c->flush();
+        return ok;
+    }
+
+    public bool sendText(char* text) { return sendFrame(OP_TEXT, text, strlen(text)); }
+    public bool sendBinary(char* data, int n) { return sendFrame(OP_BINARY, data, n); }
+    public bool ping() { return sendFrame(OP_PING, "", 0); }
+
+    // starts the closing handshake (code 1000 = normal)
+    public void close(int code) {
+        if (!closed) {
+            char p[2];
+            p[0] = (code >> 8) & 255;
+            p[1] = code & 255;
+            sendFrame(OP_CLOSE, p, 2);
+            closed = true;
+            // finish politely: say that nothing more follows and read what the other side still sends, so the
+            // close frame is not lost to a connection reset
+            net.shutdown(c->handle(), 1);
+            c->setTimeout(200);
+            char junk[256];
+            while (c->read(&junk[0], 256) > 0) { }
+        }
+        c->close();
+    }
+
+    // Reads one message into buf (at most max bytes, a longer message is cut). *opcode is OP_TEXT or OP_BINARY.
+    // Returns the length, or -1 when the connection was closed (closeCode tells why, 0 = it just ended)
+    public int receive(char* buf, int max, int* opcode) {
+        int total = 0;
+        int msgOp = 0;
+        for (;;) {
+            char head[16];
+            int have = 0;
+            Frame* f = new Frame();
+            int hl = 0;
+            while (hl == 0) {
+                int b = c->readByte();
+                if (b < 0) {
+                    closed = true;
+                    return -1;
+                }
+                head[have] = b;
+                have++;
+                hl = parseHeader(&head[0], have, f);
+                if (hl < 0 || have >= 14) {
+                    if (hl <= 0) {
+                        close(1002);
+                        return -1;
+                    }
+                }
+            }
+            char* payload = alloc(f->length + 1);
+            if (c->readExact(payload, f->length) != f->length) {
+                closed = true;
+                return -1;
+            }
+            if (f->masked) unmask(payload, f->length, f->maskKey);
+            if (f->opcode == OP_PING) {
+                sendFrame(OP_PONG, payload, f->length);
+                continue;
+            }
+            if (f->opcode == OP_PONG) {
+                continue;
+            }
+            if (f->opcode == OP_CLOSE) {
+                if (f->length >= 2) closeCode = payload[0] * 256 + payload[1];
+                if (!closed) {
+                    sendFrame(OP_CLOSE, payload, f->length);
+                    closed = true;
+                }
+                c->close();
+                return -1;
+            }
+            if (f->opcode != OP_CONT) msgOp = f->opcode;
+            int take = f->length;
+            if (total + take > max) take = max - total;
+            if (take > 0) {
+                memcpy(&buf[total], payload, take);
+                total = total + take;
+            }
+            if (f->fin) {
+                if (total < max) buf[total] = 0;
+                *opcode = msgOp;
+                return total;
+            }
+        }
+        return -1;
+    }
+}
+
+// ---- handshakes ---------------------------------------------------------------------------------------------------------------------
+private char* readHeaders(conn.Connection* c, char* first, int max) {
+    if (c->readLine(first, max) < 0) return null;
+    char* raw = alloc(8192);
+    int o = 0;
+    char line[1024];
+    for (;;) {
+        int n = c->readLine(&line[0], 1024);
+        if (n < 0) return null;
+        if (n == 0) break;
+        if (o + n + 2 < 8190) {
+            memcpy(&raw[o], &line[0], n);
+            o = o + n;
+            raw[o] = 13; raw[o + 1] = 10;
+            o = o + 2;
+        }
+    }
+    raw[o] = 0;
+    return raw;
+}
+
+// client, first half: sends the upgrade request; key (at least 32 bytes) receives the Sec-WebSocket-Key
+public bool clientSend(conn.Connection* c, char* host, int port, char* path, char* key) {
+    char raw[16];
+    for (int i = 0; i < 16; i++) raw[i] = rand() & 255;
+    char* k = encoding.base64Encode(&raw[0], 16);
+    strcpy(key, k);
+    char req[1400];
+    format(&req[0], 1400, "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+           path, host, port, k);
+    return c->writeText(&req[0]) && c->flush();
+}
+
+// client, second half: reads the answer and checks it. Returns the WebSocket or null
+public WebSocket* clientFinish(conn.Connection* c, char* key) {
+    char first[256];
+    char* raw = readHeaders(c, &first[0], 256);
+    if (raw == null || !startsWith(&first[0], "HTTP/1.1 101")) return null;
+    char got[128];
+    if (!http.headerOf(raw, "Sec-WebSocket-Accept", &got[0], 128)) return null;
+    if (!streq(&got[0], acceptKey(key))) return null;
+    return new WebSocket(c, true);
+}
+
+// connects to ws://host[:port]/path. Returns null if the connection or the handshake fails
+public WebSocket* connect(char* url) {
+    char* httpUrl = alloc(strlen(url) + 8);
+    if (startsWith(url, "ws://")) {
+        strcpy(httpUrl, "http://");
+        strcat(httpUrl, &url[5]);
+    } else {
+        return null;
+    }
+    http.Url* u = new http.Url();
+    if (!http.parseUrl(httpUrl, u)) return null;
+    conn.Connection* c = conn.open(&u->host[0], u->port, 5000);
+    if (c == null) return null;
+    char key[40];
+    if (!clientSend(c, &u->host[0], u->port, &u->path[0], &key[0])) return null;
+    WebSocket* ws = clientFinish(c, &key[0]);
+    if (ws == null) c->close();
+    return ws;
+}
+
+// server: reads the upgrade request from a new connection and answers it. Returns the WebSocket or null
+// (a plain HTTP request gets "400 Bad Request"). path (may be null) receives the requested path
+public WebSocket* accept(conn.Connection* c, char* path, int pathMax) {
+    char first[1100];
+    char* raw = readHeaders(c, &first[0], 1100);
+    if (raw == null) return null;
+    char key[128];
+    char up[64];
+    if (!startsWith(&first[0], "GET ") || !http.headerOf(raw, "Sec-WebSocket-Key", &key[0], 128)
+        || !http.headerOf(raw, "Upgrade", &up[0], 64) || !contains(&up[0], "ebsocket")) {
+        c->writeText("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        c->flush();
+        c->close();
+        return null;
+    }
+    if (path != null) {
+        int i = 4;
+        int k = 0;
+        while (first[i] != ' ' && first[i] != 0 && k < pathMax - 1) { path[k] = first[i]; k++; i++; }
+        path[k] = 0;
+    }
+    char resp[400];
+    format(&resp[0], 400, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
+           acceptKey(&key[0]));
+    c->writeText(&resp[0]);
+    c->flush();
+    return new WebSocket(c, false);
+}

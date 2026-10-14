@@ -251,6 +251,13 @@ thunks) and `net.a` reaches it through the generic builtin `__winapi(slot, a1..a
 that does `call [IAT + slot*8]` with the Windows x64 convention. Adding another Windows API needs
 only a new import name in `imp_names_ws2` (or a new DLL list) and a slot constant in A code.
 
+## Windows imports
+
+The PE import table has three DLLs: `KERNEL32.DLL` (slots 0..38), `WS2_32.DLL` (slots 40..59: sockets, UDP, `WSAPoll`, name lookup)
+and `IPHLPAPI.DLL` (slots 61..68: adapter, ARP, route, TCP and UDP tables, ICMP echo). The slots are the first argument of
+`__winapi` / `__winapix`; the null terminators between the lists occupy slots 39 and 60. `build_idata` writes the three
+descriptors, so a new function only needs a name in `imp_names*` and a slot constant in the A code.
+
 ## Module files (`a_module` / `a_import`)
 
 `a_module NAME { ... }` is `module_enter` (shared with `module NAME;`) plus a recursive `parse_items` that stops

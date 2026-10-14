@@ -623,6 +623,12 @@ int main() {
 | `net.recvFrom(h, buf, max, &ip, &port)` | receive one datagram and learn who sent it (`ip`, `port` may be `null`) |
 | `net.dnsBuildQuery(name, id, buf)` / `net.dnsParseReply(buf, n, id)` | the DNS packets themselves |
 | `net.setDns("8.8.8.8", 53)` | use this DNS server instead of the system's |
+| `net.poll(handles, events, revents, n, ms)` | wait for several sockets at once (`net.READABLE`, `net.WRITABLE`; results also `net.FAILED`, `net.HUNGUP`); returns how many are ready, `0` on time out. `net.waitReadable(h, ms)` / `net.waitWritable(h, ms)` for one socket |
+| `net.connectTimeout(host, port, ms)` | connect with a time limit |
+| `net.shutdown(h, how)` | `0` stop reading, `1` stop writing (the peer sees the end of the data), `2` both |
+| `net.peer(h, &ip, &port)` / `net.localIp(h)` / `net.localPort(h)` | the addresses of a connection |
+| `net.setNoDelay` / `setKeepAlive` / `setBroadcast` / `setReuse(h, on)` | socket options; `net.joinMulticast(h, group)` joins a multicast group |
+| `net.hostName()` | the name of this computer |
 
 Host names are resolved like this: on **Windows** by the system (`gethostbyname`); on **Linux and Android** from
 `/etc/hosts`, then by a DNS query over UDP to the servers in `/etc/resolv.conf` (then `8.8.8.8` and `1.1.1.1`).
@@ -702,6 +708,7 @@ code only to programs that import them, and a file of the same name next to your
 | `clib` (and `cctype climits cerrno cassert cstring cstdlib cstdio ctime cunistd cmath cfloat ccomplex clocale cwchar`) | the C standard library, see [12c](#12c-the-c-library) and [CLIB.md](CLIB.md) |
 | `net` | TCP / UDP networking and DNS, see [12a](#12a-networking) |
 | `http` | HTTP/1.1 client and server, see [12a](#12a-networking) |
+| `netaddr`, `packet`, `netif`, `dns`, `conn`, `websocket`, `netutil`, `rawnet` | addresses, packets (ARP, IP, ICMP, UDP, TCP, pcap), interfaces / ARP table / routes / connections, DNS records, buffered connections and a poller, WebSocket, ping / Wake-on-LAN / NTP, raw frames: see [12e](#12e-the-networking-modules) |
 | `fixed`, `nn`, `codec` | fixed-point numbers, neural networks, text / binary / image converters, see [12d](#12d-fixed-point-numbers-neural-networks-and-converters) |
 
 ```c
@@ -791,6 +798,41 @@ println(codec.imageToText(page, 3));                          // picture -> text
 // let a trained network read it: int recognise(int* glyph) { return alphabet[net->predict(glyph)]; }
 println(codec.imageToTextWith(page, 3, recognise));
 ```
+
+## 12e. The networking modules
+
+The modules below are layered on `net` and work on Linux, Android and Windows (where a feature needs the
+operating system it says so). The packet-level modules (`netaddr`, `packet`) are pure computation and work everywhere.
+
+| Module | What it is |
+|---|---|
+| `netaddr` | addresses and numbers: `htons htonl ntohs ntohl`; IPv4 `ipFromBytes ipParse ipToText isPrivate isLoopback isMulticast isLinkLocal ipClass reverseName`; subnets `maskFromPrefix prefixFromMask network broadcast hostCount firstHost lastHost inSubnet parseCidr` (`"192.168.1.77/26"`); MAC `macParse macToText macIsBroadcast macIsMulticast macRandom`; IPv6 `ip6Parse ip6ToText` (with `::`), `ip6IsLoopback ip6FromV4 ip6ToV4`; `serviceName(443)` = `"https"`, `servicePort("ssh")`, `isHostname`, `checksum` (RFC 1071) |
+| `packet` | build and read packets with correct checksums: `ethBuild/ethParse` (VLAN tags too), ARP `arpBuild arpParse arpRequestFrame arpReplyFrame`, IPv4 `ipBuild ipParse`, ICMP `icmpEcho icmpParse`, UDP `udpBuild udpParse udpChecksumOk`, TCP `tcpBuild tcpParse tcpChecksumOk` (flags `TCP_SYN TCP_ACK ...`, MSS option); `describe(frame, n)` prints one line like tcpdump, `hexdump`; `PcapWriter` / `PcapReader` for `.pcap` files that Wireshark opens |
+| `netif` | what the system knows (ifconfig, `arp -a`, route, netstat): `interfaceCount/interfaceAt/findInterface/localAddress` (name, `ip`, `mask`, `mac`, `mtu`, up/loopback, byte counters), `arpCount/arpAt/arpLookup`, `routeCount/routeAt/defaultGateway`, `connectionCount/connectionAt/stateName` (open TCP and UDP sockets), `dnsServers`; the text parsers `parseNetDev parseArp parseRoutes parseSockets`. Linux and Android read `/proc` and ask the kernel; Windows uses `iphlpapi.dll` |
+| `dns` | DNS with record types `A NS CNAME SOA PTR MX TXT AAAA SRV`: `query(name, type)` then `recordAt(i)`, `recordText`, `lookupA`, `reverse(ip)`, `setServer`; packet functions `buildQuery parseReply buildReply`, and `startQuery` / `finishQuery` for programs that run a DNS server themselves |
+| `conn` | buffered connections: `conn.open(host, port, ms)` gives a `Connection` with `readLine readExact read readByte write writeLine flush close peer`; `Listener(port)` with `accept(ms)`; `Poller` (`add wait readyTag`) serves many clients in one thread (see `examples/chat_server.a`) |
+| `http` | HTTP client and server (section 12a) plus `basicAuth`, `postForm`, `download`, `mimeType`, `serveFile`, `serveStatic(port, dir, count)` |
+| `websocket` | RFC 6455: `connect("ws://host:port/path")`, `accept(connection, path, max)`, then `sendText sendBinary ping receive close`; pings are answered, fragments joined, large frames work; the frame functions `buildFrame parseHeader unmask acceptKey` |
+| `netutil` | `ping(host, ms)` (ICMP: -1 no answer, -2 not allowed), `tcpPing`, `portOpen`, `wakeOnLan("aa:bb:..")`, `ntpTime(server)` |
+| `rawnet` | raw Ethernet frames (Linux and Android, needs root / CAP_NET_RAW): `open("eth0") send recv`, `arping(interface, ip, ms, mac)`, `capture(interface, "dump.pcap", count, ms)` |
+
+```c
+import netif;  import netaddr;  import conn;  import websocket;
+
+char mac[6];
+if (netif.arpLookup(netaddr.ipParse("192.168.1.1"), mac)) println(netaddr.macToText(mac));    // the system's ARP cache
+
+conn.Connection* c = conn.open("example.org", 80, 5000);
+c->writeLine("GET / HTTP/1.0"); c->writeLine(""); c->flush();
+char line[256];
+while (c->readLine(line, 256) >= 0) println(line);
+
+websocket.WebSocket* ws = websocket.connect("ws://localhost:8081/");
+ws->sendText("hello");
+```
+
+Limits: IPv4 only for sockets (IPv6 addresses can be parsed and printed), no TLS, no TCP implementation of your own
+(`packet` builds the segments; `rawnet` can send them on Linux).
 
 ## 12c. The C library
 

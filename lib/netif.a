@@ -1,0 +1,702 @@
+// =============================================================================
+//  netif - network interfaces, ARP table, routes, open connections            import netif;
+//
+//  What the operating system knows about the network, like ifconfig / ip, arp -a, route and netstat.
+//  Linux and Android read /proc and /sys and ask the kernel (ioctl); Windows uses iphlpapi.dll.
+//
+//    for (int i = 0; i < netif.interfaceCount(); i++) {
+//        netif.Iface* f = netif.interfaceAt(i);
+//        println(f->name);  println(netaddr.ipToText(f->ip));  println(netaddr.macToText(&f->mac[0]));
+//    }
+//    char mac[6];
+//    if (netif.arpLookup(netaddr.ipParse("192.168.1.1"), mac)) println(netaddr.macToText(mac));
+//    printlnInt(netif.defaultGateway());
+//
+//  Interfaces   interfaceCount interfaceAt findInterface localAddress
+//  ARP table    arpCount arpAt arpLookup
+//  Routes       routeCount routeAt defaultGateway
+//  Connections  connectionCount connectionAt stateName (open TCP and UDP sockets, "netstat")
+//  DNS          dnsServers
+//  Text parsers (also useful on their own)   parseNetDev parseArp parseRoutes parseSockets
+// =============================================================================
+import net;
+import netaddr;
+module netif;
+
+public const FLAG_UP = 1;
+public const FLAG_LOOPBACK = 8;
+public const FLAG_BROADCAST = 2;
+
+public class Iface {
+    public char name[48];
+    public char description[132];
+    public char mac[6];
+    public int ip;                  // IPv4 address, 0 if none
+    public int mask;
+    public int broadcast;
+    public int gateway;             // Windows only
+    public int mtu;
+    public int flags;
+    public int index;
+    public int rxBytes;
+    public int txBytes;
+    public int rxPackets;
+    public int txPackets;
+    public bool isUp() { return (flags & FLAG_UP) != 0; }
+    public bool isLoopback() { return (flags & FLAG_LOOPBACK) != 0; }
+}
+
+public class ArpEntry {
+    public int ip;
+    public char mac[6];
+    public int flags;               // Linux: 2 = complete
+    public bool complete;
+    public char device[32];
+}
+
+public class Route {
+    public int dest;
+    public int mask;
+    public int gateway;
+    public int metric;
+    public int flags;
+    public char device[32];
+}
+
+public class Socket {
+    public char proto[8];           // "tcp" or "udp"
+    public int localIp;
+    public int localPort;
+    public int remoteIp;
+    public int remotePort;
+    public int state;               // 1 established, 10 listen ... see stateName
+    public int uid;
+}
+
+private Iface* ifaces[64];
+private int ifaceN;
+private ArpEntry* arps[256];
+private int arpN;
+private Route* routes[128];
+private int routeN;
+private Socket* socks[512];
+private int sockN;
+
+private bool windows() { return __OS == 1; }
+private int nr(int x64, int a64) { if (__ARCH == 1) return a64; return x64; }
+private int i32(int x) { return (x << 32) >> 32; }
+
+// ---- small text helpers ---------------------------------------------------------------------------------------------------------
+private int hexv(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+private int parseHex(char* s, int n) {
+    int v = 0;
+    for (int i = 0; i < n && hexv(s[i]) >= 0; i++) v = v * 16 + hexv(s[i]);
+    return v;
+}
+
+// the next blank separated word of a line starting at *pos (stops at the end of the line); false if there is none
+private bool word(char* line, int* pos, char* out, int max) {
+    int p = *pos;
+    while (line[p] == ' ' || line[p] == 9) p++;
+    if (line[p] == 0 || line[p] == 10) {
+        *pos = p;
+        return false;
+    }
+    int k = 0;
+    while (line[p] != 0 && line[p] != 10 && line[p] != ' ' && line[p] != 9) {
+        if (k < max - 1) {
+            out[k] = line[p];
+            k++;
+        }
+        p++;
+    }
+    out[k] = 0;
+    *pos = p;
+    return true;
+}
+
+private int decimal(char* s) {
+    int v = 0;
+    for (int i = 0; isDigit(s[i]); i++) v = v * 10 + (s[i] - '0');
+    return v;
+}
+
+// a kernel hex address (little endian, as printed in /proc/net/route and /proc/net/tcp) as a host order number
+private int kernelIp(char* s) {
+    int v = parseHex(s, 8);
+    return ((v & 255) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 255);
+}
+
+private char* readText(char* path) {
+    return readFile(path);
+}
+
+// the text of a one line file without the line break, or null
+private char* readLine1(char* path) {
+    char* t = readFile(path);
+    if (t == null) return null;
+    int n = strlen(t);
+    while (n > 0 && (t[n - 1] == 10 || t[n - 1] == 13)) {
+        t[n - 1] = 0;
+        n--;
+    }
+    return t;
+}
+
+private void copyText(char* dst, char* src, int max) {
+    int i = 0;
+    while (src[i] != 0 && i < max - 1) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = 0;
+}
+
+// ---- interfaces -----------------------------------------------------------------------------------------------------------------
+public int interfaceCount() {
+    refreshInterfaces();
+    return ifaceN;
+}
+
+public Iface* interfaceAt(int i) {
+    if (i < 0 || i >= ifaceN) return null;
+    return ifaces[i];
+}
+
+public Iface* findInterface(char* name) {
+    refreshInterfaces();
+    for (int i = 0; i < ifaceN; i++) {
+        if (streq(&ifaces[i]->name[0], name)) return ifaces[i];
+    }
+    return null;
+}
+
+// the IPv4 address of the first interface that is up, has an address and is not the loopback (0 if none)
+public int localAddress() {
+    refreshInterfaces();
+    for (int i = 0; i < ifaceN; i++) {
+        Iface* f = ifaces[i];
+        if (f->isUp() && !f->isLoopback() && f->ip != 0) return f->ip;
+    }
+    return 0;
+}
+
+private Iface* addIface(char* name) {
+    if (ifaceN >= 64) return null;
+    Iface* f = new Iface();
+    copyText(&f->name[0], name, 48);
+    ifaces[ifaceN] = f;
+    ifaceN++;
+    return f;
+}
+
+// the statistics lines of /proc/net/dev: "  eth0: rxbytes rxpackets ... txbytes txpackets ..."
+public int parseNetDev(char* text) {
+    ifaceN = 0;
+    int i = 0;
+    int lineNo = 0;
+    while (text[i] != 0) {
+        int ls = i;
+        while (text[i] != 0 && text[i] != 10) i++;
+        if (lineNo >= 2) {
+            int colon = ls;
+            while (colon < i && text[colon] != ':') colon++;
+            if (colon < i) {
+                int s = ls;
+                while (text[s] == ' ') s++;
+                char name[48];
+                int k = 0;
+                while (s < colon && k < 47) { name[k] = text[s]; k++; s++; }
+                name[k] = 0;
+                Iface* f = addIface(&name[0]);
+                if (f != null) {
+                    // 16 numbers: rx bytes, packets, errs, drop, fifo, frame, compressed, multicast, tx bytes, packets ...
+                    int vals[16];
+                    int n = 0;
+                    int p = colon + 1;
+                    while (n < 16) {
+                        while (text[p] == ' ') p++;
+                        if (text[p] == 0 || text[p] == 10) break;
+                        int v = 0;
+                        while (isDigit(text[p])) { v = v * 10 + (text[p] - '0'); p++; }
+                        vals[n] = v;
+                        n++;
+                    }
+                    if (n >= 10) {
+                        f->rxBytes = vals[0]; f->rxPackets = vals[1];
+                        f->txBytes = vals[8]; f->txPackets = vals[9];
+                    }
+                }
+            }
+        }
+        lineNo++;
+        if (text[i] == 10) i++;
+    }
+    return ifaceN;
+}
+
+private int sysPath(char* name, char* file, char* out) {
+    format(out, 200, "/sys/class/net/%s/%s", name, file);
+    return 0;
+}
+
+private void linuxInterfaces() {
+    char* dev = readText("/proc/net/dev");
+    if (dev != null) {
+        parseNetDev(dev);
+    }
+    // SIOCGIFCONF lists the interfaces that have an IPv4 address (the only way on some Android versions)
+    int s = __syscall(nr(41, 198), 2, 2, 0, 0, 0, 0);
+    if (s < 0) return;
+    char* buf = alloc(40 * 32 + 16);
+    int conf[2];
+    conf[0] = 40 * 32;
+    conf[1] = buf;
+    if (__syscall(nr(16, 29), s, 0x8912, &conf[0], 0, 0, 0) >= 0) {
+        int count = (conf[0] & 0xFFFFFFFF) / 40;
+        for (int k = 0; k < count; k++) {
+            char* ent = &buf[k * 40];
+            char name[48];
+            copyText(&name[0], ent, 16);
+            Iface* f = findLoaded(&name[0]);
+            if (f == null) f = addIface(&name[0]);
+            if (f != null) f->ip = (ent[20] << 24) | (ent[21] << 16) | (ent[22] << 8) | ent[23];
+        }
+    }
+    for (int i = 0; i < ifaceN; i++) {
+        Iface* f = ifaces[i];
+        char ifr[40];
+        for (int k = 0; k < 40; k++) ifr[k] = 0;
+        copyText(&ifr[0], &f->name[0], 16);
+        if (f->ip != 0) {
+            if (__syscall(nr(16, 29), s, 0x891B, &ifr[0], 0, 0, 0) >= 0) {          // SIOCGIFNETMASK
+                f->mask = (ifr[20] << 24) | (ifr[21] << 16) | (ifr[22] << 8) | ifr[23];
+            }
+            for (int k = 16; k < 40; k++) ifr[k] = 0;
+            if (__syscall(nr(16, 29), s, 0x8919, &ifr[0], 0, 0, 0) >= 0) {          // SIOCGIFBRDADDR
+                f->broadcast = (ifr[20] << 24) | (ifr[21] << 16) | (ifr[22] << 8) | ifr[23];
+            }
+        }
+        for (int k = 16; k < 40; k++) ifr[k] = 0;
+        if (__syscall(nr(16, 29), s, 0x8927, &ifr[0], 0, 0, 0) >= 0) {              // SIOCGIFHWADDR
+            for (int k = 0; k < 6; k++) f->mac[k] = ifr[18 + k];
+        }
+        for (int k = 16; k < 40; k++) ifr[k] = 0;
+        if (__syscall(nr(16, 29), s, 0x8921, &ifr[0], 0, 0, 0) >= 0) {              // SIOCGIFMTU
+            f->mtu = (ifr[16] | (ifr[17] << 8) | (ifr[18] << 16) | (ifr[19] << 24));
+        }
+        for (int k = 16; k < 40; k++) ifr[k] = 0;
+        if (__syscall(nr(16, 29), s, 0x8913, &ifr[0], 0, 0, 0) >= 0) {              // SIOCGIFFLAGS
+            int fl = ifr[16] | (ifr[17] << 8);
+            f->flags = 0;
+            if ((fl & 1) != 0) f->flags = f->flags | FLAG_UP;
+            if ((fl & 2) != 0) f->flags = f->flags | FLAG_BROADCAST;
+            if ((fl & 8) != 0) f->flags = f->flags | FLAG_LOOPBACK;
+            // up means UP and RUNNING for a real interface; keep UP only
+        }
+        for (int k = 16; k < 40; k++) ifr[k] = 0;
+        if (__syscall(nr(16, 29), s, 0x8933, &ifr[0], 0, 0, 0) >= 0) {              // SIOCGIFINDEX
+            f->index = ifr[16] | (ifr[17] << 8) | (ifr[18] << 16);
+        }
+    }
+    __syscall(nr(3, 57), s, 0, 0, 0, 0, 0);
+}
+
+private Iface* findLoaded(char* name) {
+    for (int i = 0; i < ifaceN; i++) {
+        if (streq(&ifaces[i]->name[0], name)) return ifaces[i];
+    }
+    return null;
+}
+
+private void windowsInterfaces() {
+    ifaceN = 0;
+    int size = 0;
+    int r = i32(__winapi(61, 0, &size, 0, 0));                 // GetAdaptersInfo: asks for the size
+    if (r != 111 || size <= 0) return;
+    char* buf = alloc(size + 16);
+    r = i32(__winapi(61, buf, &size, 0, 0));
+    if (r != 0) return;
+    char* a = buf;
+    while (a != null) {
+        char desc[132];
+        copyText(&desc[0], &a[272], 132);
+        Iface* f = addIface(&desc[0]);
+        if (f == null) break;
+        copyText(&f->description[0], &a[272], 132);
+        int alen = a[404] | (a[405] << 8);
+        for (int k = 0; k < 6 && k < alen; k++) f->mac[k] = a[408 + k];
+        f->index = a[416] | (a[417] << 8);
+        char ipText[20];
+        copyText(&ipText[0], &a[440 + 8], 16);
+        int ip = net.parseIp(&ipText[0]);
+        if (ip > 0) f->ip = ip;
+        copyText(&ipText[0], &a[440 + 24], 16);
+        int mask = net.parseIp(&ipText[0]);
+        if (mask > 0) f->mask = mask;
+        copyText(&ipText[0], &a[488 + 8], 16);
+        int gw = net.parseIp(&ipText[0]);
+        if (gw > 0) f->gateway = gw;
+        f->flags = FLAG_UP | FLAG_BROADCAST;
+        f->mtu = 1500;
+        // next adapter
+        int nx = 0;
+        int* np = a;
+        nx = *np;
+        if (nx == 0) break;
+        a = nx;
+    }
+}
+
+private void refreshInterfaces() {
+    ifaceN = 0;
+    if (windows()) {
+        windowsInterfaces();
+    } else {
+        linuxInterfaces();
+    }
+}
+
+// ---- ARP table ------------------------------------------------------------------------------------------------------------------
+public int arpCount() {
+    refreshArp();
+    return arpN;
+}
+
+public ArpEntry* arpAt(int i) {
+    if (i < 0 || i >= arpN) return null;
+    return arps[i];
+}
+
+// the MAC address the system has cached for an IPv4 address; false if there is no complete entry
+public bool arpLookup(int ip, char* mac) {
+    refreshArp();
+    for (int i = 0; i < arpN; i++) {
+        if (arps[i]->ip == ip && arps[i]->complete) {
+            for (int k = 0; k < 6; k++) mac[k] = arps[i]->mac[k];
+            return true;
+        }
+    }
+    return false;
+}
+
+// text in the format of /proc/net/arp:
+//   IP address       HW type     Flags       HW address            Mask     Device
+//   192.168.1.1      0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0
+// replaces the table with its lines and returns how many entries there are
+public int parseArp(char* text) {
+    arpN = 0;
+    int i = 0;
+    int lineNo = 0;
+    while (text[i] != 0) {
+        int ls = i;
+        while (text[i] != 0 && text[i] != 10) i++;
+        char line[256];
+        int n = i - ls;
+        if (n > 255) n = 255;
+        memcpy(&line[0], &text[ls], n);
+        line[n] = 0;
+        if (text[i] == 10) i++;
+        lineNo++;
+        if (lineNo == 1) continue;
+        int p = 0;
+        char w[64];
+        if (!word(&line[0], &p, &w[0], 64)) continue;
+        int ip = net.parseIp(&w[0]);
+        if (ip < 0 || arpN >= 256) continue;
+        ArpEntry* e = new ArpEntry();
+        e->ip = ip;
+        word(&line[0], &p, &w[0], 64);                                  // hardware type
+        word(&line[0], &p, &w[0], 64);                                  // flags
+        e->flags = parseHex(&w[2], 8);
+        e->complete = (e->flags & 2) != 0;
+        word(&line[0], &p, &w[0], 64);                                  // hardware address
+        netaddr.macParse(&w[0], &e->mac[0]);
+        word(&line[0], &p, &w[0], 64);                                  // mask
+        word(&line[0], &p, &w[0], 64);                                  // device
+        copyText(&e->device[0], &w[0], 32);
+        arps[arpN] = e;
+        arpN++;
+    }
+    return arpN;
+}
+
+private void refreshArp() {
+    if (windows()) {
+        arpN = 0;
+        int size = 0;
+        int r = i32(__winapi(62, 0, &size, 0, 0));              // GetIpNetTable
+        if (r != 122 || size <= 0) return;                        // ERROR_INSUFFICIENT_BUFFER
+        char* buf = alloc(size + 16);
+        r = i32(__winapi(62, buf, &size, 0, 0));
+        if (r != 0) return;
+        int count = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+        for (int k = 0; k < count && k < 256; k++) {
+            char* row = &buf[4 + k * 24];
+            int type = row[20];                                   // 2 invalid, 3 dynamic, 4 static
+            if (type != 3 && type != 4) continue;
+            ArpEntry* e = new ArpEntry();
+            e->ip = (row[16] << 24) | (row[17] << 16) | (row[18] << 8) | row[19];
+            for (int m = 0; m < 6; m++) e->mac[m] = row[8 + m];
+            e->complete = type == 3 || type == 4;
+            e->flags = type;
+            arps[arpN] = e;
+            arpN++;
+        }
+        return;
+    }
+    char* t = readText("/proc/net/arp");
+    if (t == null) {
+        arpN = 0;
+        return;
+    }
+    parseArp(t);
+}
+
+// ---- routes ---------------------------------------------------------------------------------------------------------------------
+public int routeCount() {
+    refreshRoutes();
+    return routeN;
+}
+
+public Route* routeAt(int i) {
+    if (i < 0 || i >= routeN) return null;
+    return routes[i];
+}
+
+// the gateway of the default route (0.0.0.0/0), 0 if there is none
+public int defaultGateway() {
+    refreshRoutes();
+    int best = 0;
+    int bestMetric = 0x7FFFFFFF;
+    for (int i = 0; i < routeN; i++) {
+        if (routes[i]->dest == 0 && routes[i]->mask == 0 && routes[i]->metric < bestMetric) {
+            best = routes[i]->gateway;
+            bestMetric = routes[i]->metric;
+        }
+    }
+    return best;
+}
+
+// text in the format of /proc/net/route (addresses are little endian hex)
+public int parseRoutes(char* text) {
+    routeN = 0;
+    int i = 0;
+    int lineNo = 0;
+    while (text[i] != 0) {
+        int ls = i;
+        while (text[i] != 0 && text[i] != 10) i++;
+        char line[256];
+        int n = i - ls;
+        if (n > 255) n = 255;
+        memcpy(&line[0], &text[ls], n);
+        line[n] = 0;
+        if (text[i] == 10) i++;
+        lineNo++;
+        if (lineNo == 1) continue;
+        int p = 0;
+        char dev[32]; char dst[16]; char gw[16]; char fl[16]; char skip[16]; char metric[16]; char mask[16];
+        if (!word(&line[0], &p, &dev[0], 32)) continue;
+        if (!word(&line[0], &p, &dst[0], 16)) continue;
+        word(&line[0], &p, &gw[0], 16);
+        word(&line[0], &p, &fl[0], 16);
+        word(&line[0], &p, &skip[0], 16);
+        word(&line[0], &p, &skip[0], 16);
+        word(&line[0], &p, &metric[0], 16);
+        word(&line[0], &p, &mask[0], 16);
+        if (routeN >= 128) continue;
+        Route* r = new Route();
+        copyText(&r->device[0], &dev[0], 32);
+        r->dest = kernelIp(&dst[0]);
+        r->gateway = kernelIp(&gw[0]);
+        r->flags = parseHex(&fl[0], 8);
+        r->metric = decimal(&metric[0]);
+        r->mask = kernelIp(&mask[0]);
+        routes[routeN] = r;
+        routeN++;
+    }
+    return routeN;
+}
+
+private void refreshRoutes() {
+    if (windows()) {
+        routeN = 0;
+        int size = 0;
+        int r = i32(__winapi(63, 0, &size, 0, 0));              // GetIpForwardTable
+        if (r != 122 || size <= 0) return;
+        char* buf = alloc(size + 16);
+        r = i32(__winapi(63, buf, &size, 0, 0));
+        if (r != 0) return;
+        int count = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+        for (int k = 0; k < count && k < 128; k++) {
+            char* row = &buf[4 + k * 56];
+            Route* rt = new Route();
+            rt->dest = (row[0] << 24) | (row[1] << 16) | (row[2] << 8) | row[3];
+            rt->mask = (row[4] << 24) | (row[5] << 16) | (row[6] << 8) | row[7];
+            rt->gateway = (row[12] << 24) | (row[13] << 16) | (row[14] << 8) | row[15];
+            rt->metric = row[36] | (row[37] << 8) | (row[38] << 16);
+            routes[routeN] = rt;
+            routeN++;
+        }
+        return;
+    }
+    char* t = readText("/proc/net/route");
+    if (t == null) {
+        routeN = 0;
+        return;
+    }
+    parseRoutes(t);
+}
+
+// ---- open connections -----------------------------------------------------------------------------------------------------------
+public int connectionCount() {
+    refreshSockets();
+    return sockN;
+}
+
+public Socket* connectionAt(int i) {
+    if (i < 0 || i >= sockN) return null;
+    return socks[i];
+}
+
+public char* stateName(int state) {
+    if (state == 1) return "ESTABLISHED";
+    if (state == 2) return "SYN_SENT";
+    if (state == 3) return "SYN_RECV";
+    if (state == 4) return "FIN_WAIT1";
+    if (state == 5) return "FIN_WAIT2";
+    if (state == 6) return "TIME_WAIT";
+    if (state == 7) return "CLOSE";
+    if (state == 8) return "CLOSE_WAIT";
+    if (state == 9) return "LAST_ACK";
+    if (state == 10) return "LISTEN";
+    if (state == 11) return "CLOSING";
+    return "UNKNOWN";
+}
+
+// text in the format of /proc/net/tcp or /proc/net/udp; the sockets are appended to the list (replace = true starts a new one)
+public int parseSockets(char* text, char* proto, bool replace) {
+    if (replace) sockN = 0;
+    int i = 0;
+    int lineNo = 0;
+    while (text[i] != 0) {
+        int ls = i;
+        while (text[i] != 0 && text[i] != 10) i++;
+        char line[300];
+        int n = i - ls;
+        if (n > 299) n = 299;
+        memcpy(&line[0], &text[ls], n);
+        line[n] = 0;
+        if (text[i] == 10) i++;
+        lineNo++;
+        if (lineNo == 1) continue;
+        int p = 0;
+        char idx[16]; char loc[32]; char rem[32]; char st[8]; char skip[48]; char uid[16];
+        if (!word(&line[0], &p, &idx[0], 16)) continue;
+        word(&line[0], &p, &loc[0], 32);
+        word(&line[0], &p, &rem[0], 32);
+        word(&line[0], &p, &st[0], 8);
+        word(&line[0], &p, &skip[0], 48);                          // tx_queue:rx_queue
+        word(&line[0], &p, &skip[0], 48);                          // tr:tm->when
+        word(&line[0], &p, &skip[0], 48);                          // retrnsmt
+        word(&line[0], &p, &uid[0], 16);
+        if (sockN >= 512) continue;
+        Socket* s = new Socket();
+        copyText(&s->proto[0], proto, 8);
+        s->localIp = kernelIp(&loc[0]);
+        s->localPort = parseHex(&loc[9], 4);
+        s->remoteIp = kernelIp(&rem[0]);
+        s->remotePort = parseHex(&rem[9], 4);
+        s->state = parseHex(&st[0], 2);
+        s->uid = decimal(&uid[0]);
+        socks[sockN] = s;
+        sockN++;
+    }
+    return sockN;
+}
+
+private void refreshSockets() {
+    sockN = 0;
+    if (windows()) {
+        int size = 0;
+        int r = i32(__winapi(64, 0, &size, 0, 0));              // GetTcpTable
+        if (r == 122 && size > 0) {
+            char* buf = alloc(size + 16);
+            r = i32(__winapi(64, buf, &size, 0, 0));
+            if (r == 0) {
+                int count = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+                for (int k = 0; k < count && k < 512; k++) {
+                    char* row = &buf[4 + k * 20];
+                    Socket* s = new Socket();
+                    strcpy(&s->proto[0], "tcp");
+                    int st = row[0];
+                    // MIB states: 1 closed 2 listen 3 syn_sent 4 syn_rcvd 5 established 6 fin_wait1 7 fin_wait2 8 close_wait 9 closing 10 last_ack 11 time_wait
+                    if (st == 2) s->state = 10; else if (st == 3) s->state = 2; else if (st == 4) s->state = 3;
+                    else if (st == 5) s->state = 1; else if (st == 6) s->state = 4; else if (st == 7) s->state = 5;
+                    else if (st == 8) s->state = 8; else if (st == 9) s->state = 11; else if (st == 10) s->state = 9;
+                    else if (st == 11) s->state = 6; else s->state = 7;
+                    s->localIp = (row[4] << 24) | (row[5] << 16) | (row[6] << 8) | row[7];
+                    s->localPort = row[8] * 256 + row[9];
+                    s->remoteIp = (row[12] << 24) | (row[13] << 16) | (row[14] << 8) | row[15];
+                    s->remotePort = row[16] * 256 + row[17];
+                    socks[sockN] = s;
+                    sockN++;
+                }
+            }
+        }
+        size = 0;
+        r = i32(__winapi(68, 0, &size, 0, 0));                  // GetUdpTable
+        if (r == 122 && size > 0) {
+            char* buf = alloc(size + 16);
+            r = i32(__winapi(68, buf, &size, 0, 0));
+            if (r == 0) {
+                int count = buf[0] | (buf[1] << 8) | (buf[2] << 16);
+                for (int k = 0; k < count && sockN < 512; k++) {
+                    char* row = &buf[4 + k * 8];
+                    Socket* s = new Socket();
+                    strcpy(&s->proto[0], "udp");
+                    s->localIp = (row[0] << 24) | (row[1] << 16) | (row[2] << 8) | row[3];
+                    s->localPort = row[4] * 256 + row[5];
+                    s->state = 7;
+                    socks[sockN] = s;
+                    sockN++;
+                }
+            }
+        }
+        return;
+    }
+    char* t = readText("/proc/net/tcp");
+    if (t != null) parseSockets(t, "tcp", false);
+    t = readText("/proc/net/udp");
+    if (t != null) parseSockets(t, "udp", false);
+}
+
+// ---- DNS servers of the system ---------------------------------------------------------------------------------------------------
+// the name servers from /etc/resolv.conf (Linux / Android); returns how many were stored in out[] (max entries)
+public int dnsServers(int* out, int max) {
+    char* conf = readFile("/etc/resolv.conf");
+    if (conf == null) return 0;
+    int n = 0;
+    int i = 0;
+    while (conf[i] != 0 && n < max) {
+        if (startsWith(&conf[i], "nameserver")) {
+            int j = i + 10;
+            while (conf[j] == ' ' || conf[j] == 9) j++;
+            char a[64];
+            int k = 0;
+            while (conf[j] != 0 && conf[j] != 10 && conf[j] != ' ' && k < 63) { a[k] = conf[j]; k++; j++; }
+            a[k] = 0;
+            int ip = net.parseIp(&a[0]);
+            if (ip >= 0) { out[n] = ip; n++; }
+        }
+        while (conf[i] != 0 && conf[i] != 10) i++;
+        if (conf[i] == 10) i++;
+    }
+    return n;
+}

@@ -16,6 +16,10 @@
 //    net.close(c);
 //    http.serve(8080, handler, n)                handler(http.Request* q, int client) answers n requests
 //
+//  More: http.download(url, path), http.postForm(url, "a=1&b=2"), http.basicAuth(user, password) (a header line for
+//  `extra`), http.mimeType(path), http.serveFile(client, rootDir, request) and http.serveStatic(port, dir, count)
+//  (a small web server for a directory).
+//
 //  Pieces: http.parseUrl, http.sendRequest / http.readResponse (client halves), http.statusText,
 //  http.queryValue(q, "name", buf, max), http.headerOf(rawHeaders, "Name", buf, max).
 // =============================================================================
@@ -570,4 +574,135 @@ public void serve(int port, func handler, int count) {
         served++;
     }
     net.close(s);
+}
+
+
+// ---- more client helpers ----------------------------------------------------------------------------------------------------------
+// "Authorization: Basic ...\r\n" for the extra headers of request()
+public char* basicAuth(char* user, char* password) {
+    char cred[200];
+    format(&cred[0], 200, "%s:%s", user, password);
+    char* b = encoding.base64Encode(&cred[0], strlen(&cred[0]));
+    char* out = alloc(strlen(b) + 40);
+    format(out, strlen(b) + 40, "Authorization: Basic %s\r\n", b);
+    return out;
+}
+
+// POST of form fields ("name=Ada&age=36", already URL encoded)
+public Response* postForm(char* url, char* fields) {
+    return post(url, fields, "application/x-www-form-urlencoded");
+}
+
+// GET and save the body in a file. Returns the HTTP status (200 = saved), -1 if the request or writing failed
+public int download(char* url, char* path) {
+    Response* r = get(url);
+    if (r == null) return -1;
+    if (r->status != 200) return r->status;
+    int h = fileOpen(path, FILE_WRITE);
+    if (h < 0) {
+        fail("cannot write the file");
+        return -1;
+    }
+    int done = 0;
+    while (done < r->bodyLen) {
+        int n = fileWrite(h, &r->body[done], r->bodyLen - done);
+        if (n <= 0) break;
+        done = done + n;
+    }
+    fileClose(h);
+    if (done != r->bodyLen) {
+        fail("writing the file failed");
+        return -1;
+    }
+    return 200;
+}
+
+// ---- a web server for files -----------------------------------------------------------------------------------------------------------
+public char* mimeType(char* path) {
+    int n = strlen(path);
+    int dot = n;
+    while (dot > 0 && path[dot - 1] != '.' && path[dot - 1] != '/') dot--;
+    if (dot == 0 || path[dot - 1] != '.') return "application/octet-stream";
+    char low[16];
+    int k = 0;
+    while (path[dot + k] != 0 && k < 15) {
+        low[k] = toLower(path[dot + k]);
+        k++;
+    }
+    low[k] = 0;
+    char* e = &low[0];
+    if (streq(e, "html") || streq(e, "htm")) return "text/html";
+    if (streq(e, "txt") || streq(e, "md")) return "text/plain";
+    if (streq(e, "css")) return "text/css";
+    if (streq(e, "js")) return "text/javascript";
+    if (streq(e, "json")) return "application/json";
+    if (streq(e, "xml")) return "application/xml";
+    if (streq(e, "csv")) return "text/csv";
+    if (streq(e, "png")) return "image/png";
+    if (streq(e, "jpg") || streq(e, "jpeg")) return "image/jpeg";
+    if (streq(e, "gif")) return "image/gif";
+    if (streq(e, "svg")) return "image/svg+xml";
+    if (streq(e, "pdf")) return "application/pdf";
+    if (streq(e, "wasm")) return "application/wasm";
+    return "application/octet-stream";
+}
+
+// answers a GET or HEAD request with a file below `root` (index.html for a directory). Paths that try to leave the
+// directory ("..", backslashes) get 403, missing files 404, other methods 405
+public void serveFile(int client, char* root, Request* q) {
+    bool head = streq(&q->method[0], "HEAD");
+    if (!streq(&q->method[0], "GET") && !head) {
+        respond(client, 405, "text/plain", "method not allowed");
+        return;
+    }
+    char* p = &q->path[0];
+    if (p[0] != '/') {
+        respond(client, 400, "text/plain", "bad request");
+        return;
+    }
+    char* clean = encoding.urlDecode(p);
+    for (int i = 0; clean[i] != 0; i++) {
+        if (clean[i] == '\\' || clean[i] == 0 || (clean[i] == '.' && clean[i + 1] == '.' && (i == 0 || clean[i - 1] == '/')
+            && (clean[i + 2] == '/' || clean[i + 2] == 0))) {
+            respond(client, 403, "text/plain", "forbidden");
+            return;
+        }
+    }
+    char* path = alloc(strlen(root) + strlen(clean) + 16);
+    format(path, strlen(root) + strlen(clean) + 16, "%s%s", root, clean);
+    if (path[strlen(path) - 1] == '/') {
+        strcat(path, "index.html");
+    }
+    int h = fileOpen(path, FILE_READ);
+    if (h < 0) {
+        respond(client, 404, "text/plain", "not found");
+        return;
+    }
+    Buf* body = new Buf();
+    char chunk[4096];
+    for (;;) {
+        int n = fileRead(h, &chunk[0], 4096);
+        if (n <= 0) break;
+        body->add(&chunk[0], n);
+    }
+    fileClose(h);
+    if (head) {
+        char hdr[300];
+        format(&hdr[0], 300, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", mimeType(path), body->len);
+        net.sendText(client, &hdr[0]);
+        return;
+    }
+    respondBytes(client, 200, mimeType(path), body->data, body->len);
+}
+
+private char* staticRoot;
+
+private void staticHandler(Request* q, int client) {
+    serveFile(client, staticRoot, q);
+}
+
+// serves the files of a directory on a port for `count` requests (count <= 0: forever)
+public void serveStatic(int port, char* dir, int count) {
+    staticRoot = strdup(dir);
+    serve(port, staticHandler, count);
 }

@@ -1,0 +1,407 @@
+// =============================================================================
+//  netaddr - network addresses and numbers                          import netaddr;
+//
+//  IPv4 addresses are ints in host order (192.168.1.10 = 0xC0A8010A), MAC addresses are 6 bytes and
+//  IPv6 addresses are 16 bytes in network order. Text results are new heap strings.
+//
+//    byte order      htons htonl ntohs ntohl swap16 swap32
+//    IPv4            ipToText ipFromBytes ipParse isPrivate isLoopback isMulticast isLinkLocal ipClass reverseName
+//    subnets (CIDR)  maskFromPrefix prefixFromMask network broadcast hostCount firstHost lastHost inSubnet parseCidr
+//    MAC             macParse macToText macIsBroadcast macIsMulticast macRandom
+//    IPv6            ip6Parse ip6ToText ip6IsLoopback ip6IsLinkLocal ip6IsMulticast ip6FromV4 ip6ToV4
+//    other           serviceName servicePort isHostname checksum (the Internet checksum of RFC 1071)
+// =============================================================================
+import net;
+module netaddr;
+
+// ---- byte order -------------------------------------------------------------------------------------------------------------
+public int swap16(int v) { return ((v & 0xFF) << 8) | ((v >> 8) & 0xFF); }
+public int swap32(int v) {
+    return ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF);
+}
+// host order <-> network order (this machine is little endian)
+public int htons(int v) { return swap16(v); }
+public int ntohs(int v) { return swap16(v); }
+public int htonl(int v) { return swap32(v); }
+public int ntohl(int v) { return swap32(v); }
+
+// ---- IPv4 --------------------------------------------------------------------------------------------------------------------
+public int ipFromBytes(int a, int b, int c, int d) {
+    return ((a & 255) << 24) | ((b & 255) << 16) | ((c & 255) << 8) | (d & 255);
+}
+
+// "10.0.0.1" -> number, -1 if the text is not an address
+public int ipParse(char* text) {
+    return net.parseIp(text);
+}
+
+public char* ipToText(int ip) {
+    char* out = alloc(20);
+    format(out, 20, "%d.%d.%d.%d", (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+    return out;
+}
+
+// 10/8, 172.16/12, 192.168/16
+public bool isPrivate(int ip) {
+    int a = (ip >> 24) & 255;
+    int b = (ip >> 16) & 255;
+    return a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168);
+}
+public bool isLoopback(int ip) { return ((ip >> 24) & 255) == 127; }
+public bool isMulticast(int ip) { return ((ip >> 28) & 15) == 14; }
+public bool isLinkLocal(int ip) { return ((ip >> 16) & 0xFFFF) == 0xA9FE; }
+
+// 'A' .. 'E' (the old address classes)
+public int ipClass(int ip) {
+    int a = (ip >> 24) & 255;
+    if (a < 128) return 'A';
+    if (a < 192) return 'B';
+    if (a < 224) return 'C';
+    if (a < 240) return 'D';
+    return 'E';
+}
+
+// "4.3.2.1.in-addr.arpa" for a reverse (PTR) lookup of 1.2.3.4
+public char* reverseName(int ip) {
+    char* out = alloc(40);
+    format(out, 40, "%d.%d.%d.%d.in-addr.arpa", ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, (ip >> 24) & 255);
+    return out;
+}
+
+// ---- subnets --------------------------------------------------------------------------------------------------------------------
+public int maskFromPrefix(int bits) {
+    if (bits <= 0) return 0;
+    if (bits >= 32) return 0xFFFFFFFF;
+    return (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF;
+}
+
+// 255.255.255.0 -> 24, -1 if the mask has holes
+public int prefixFromMask(int mask) {
+    mask = mask & 0xFFFFFFFF;
+    int bits = 0;
+    while (bits < 32 && ((mask >> (31 - bits)) & 1) == 1) bits++;
+    if (mask != maskFromPrefix(bits)) return -1;
+    return bits;
+}
+
+public int network(int ip, int bits) { return ip & maskFromPrefix(bits); }
+public int broadcast(int ip, int bits) { return (ip & maskFromPrefix(bits)) | (~maskFromPrefix(bits) & 0xFFFFFFFF); }
+
+// usable host addresses of a subnet (the network and broadcast addresses are not counted, /31 and /32 count as 2 and 1)
+public int hostCount(int bits) {
+    if (bits >= 32) return 1;
+    if (bits == 31) return 2;
+    return (1 << (32 - bits)) - 2;
+}
+public int firstHost(int ip, int bits) {
+    if (bits >= 31) return network(ip, bits);
+    return network(ip, bits) + 1;
+}
+public int lastHost(int ip, int bits) {
+    if (bits >= 31) return broadcast(ip, bits);
+    return broadcast(ip, bits) - 1;
+}
+
+public bool inSubnet(int ip, int netIp, int bits) {
+    return network(ip, bits) == network(netIp, bits);
+}
+
+// "192.168.1.0/24" -> *ip and *bits. Returns false for bad text
+public bool parseCidr(char* text, int* ip, int* bits) {
+    int slash = indexOf(text, '/');
+    if (slash < 0) return false;
+    char* addr = alloc(slash + 1);
+    memcpy(addr, text, slash);
+    int a = ipParse(addr);
+    if (a < 0) return false;
+    int n = 0;
+    int i = slash + 1;
+    if (!isDigit(text[i])) return false;
+    while (isDigit(text[i])) {
+        n = n * 10 + (text[i] - '0');
+        i++;
+    }
+    if (text[i] != 0 || n > 32) return false;
+    *ip = a;
+    *bits = n;
+    return true;
+}
+
+// ---- MAC addresses ----------------------------------------------------------------------------------------------------------------
+private int hexv(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// "aa:bb:cc:dd:ee:ff" (or with - or without separators) into 6 bytes. Returns false for bad text
+public bool macParse(char* text, char* out) {
+    int n = 0;
+    int i = 0;
+    while (text[i] != 0 && n < 6) {
+        int hi = hexv(text[i]);
+        int lo = hexv(text[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[n] = hi * 16 + lo;
+        n++;
+        i = i + 2;
+        if (text[i] == ':' || text[i] == '-') i++;
+    }
+    return n == 6 && text[i] == 0;
+}
+
+public char* macToText(char* mac) {
+    char* out = alloc(20);
+    format(out, 20, "%02x:%02x:%02x:%02x:%02x:%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return out;
+}
+
+public bool macIsBroadcast(char* mac) {
+    for (int i = 0; i < 6; i++) {
+        if (mac[i] != 255) return false;
+    }
+    return true;
+}
+public bool macIsMulticast(char* mac) { return (mac[0] & 1) == 1; }
+
+// a random locally administered unicast MAC address
+public void macRandom(char* out) {
+    for (int i = 0; i < 6; i++) out[i] = rand() & 255;
+    out[0] = (out[0] & 0xFE) | 2;
+}
+
+// ---- IPv6 ------------------------------------------------------------------------------------------------------------------------
+// "2001:db8::1", "::1", "fe80::1", "::ffff:1.2.3.4" into 16 bytes. Returns false for bad text
+public bool ip6Parse(char* text, char* out) {
+    for (int i = 0; i < 16; i++) out[i] = 0;
+    int groups[8];
+    int head = 0;                       // groups before ::
+    int tail = 0;                       // groups after ::
+    bool gap = false;
+    int tailv[8];
+    int i = 0;
+    if (text[0] == ':' && text[1] == ':') {
+        gap = true;
+        i = 2;
+    } else if (text[0] == ':') {
+        return false;
+    }
+    while (text[i] != 0) {
+        // a trailing IPv4 part
+        int dots = 0;
+        for (int k = i; text[k] != 0 && text[k] != ':'; k++) {
+            if (text[k] == '.') dots++;
+        }
+        if (dots == 3) {
+            int v4 = ipParse(&text[i]);
+            if (v4 < 0) return false;
+            int hi = (v4 >> 16) & 0xFFFF;
+            int lo = v4 & 0xFFFF;
+            if (gap) { if (tail + 2 > 8) return false; tailv[tail] = hi; tailv[tail + 1] = lo; tail = tail + 2; }
+            else { if (head + 2 > 8) return false; groups[head] = hi; groups[head + 1] = lo; head = head + 2; }
+            break;
+        }
+        int v = 0;
+        int digits = 0;
+        while (hexv(text[i]) >= 0) {
+            v = v * 16 + hexv(text[i]);
+            digits++;
+            i++;
+            if (digits > 4) return false;
+        }
+        if (digits == 0) return false;
+        if (gap) { if (tail >= 8) return false; tailv[tail] = v; tail++; }
+        else { if (head >= 8) return false; groups[head] = v; head++; }
+        if (text[i] == ':') {
+            i++;
+            if (text[i] == ':') {
+                if (gap) return false;
+                gap = true;
+                i++;
+            } else if (text[i] == 0) {
+                return false;
+            }
+        } else if (text[i] != 0) {
+            return false;
+        }
+    }
+    if (!gap && head != 8) return false;
+    if (gap && head + tail > 7) return false;
+    for (int k = 0; k < head; k++) {
+        out[k * 2] = groups[k] >> 8;
+        out[k * 2 + 1] = groups[k] & 255;
+    }
+    for (int k = 0; k < tail; k++) {
+        int pos = 8 - tail + k;
+        out[pos * 2] = tailv[k] >> 8;
+        out[pos * 2 + 1] = tailv[k] & 255;
+    }
+    return true;
+}
+
+// the shortest text form (lower case, the longest run of zero groups becomes ::)
+public char* ip6ToText(char* b) {
+    int g[8];
+    for (int i = 0; i < 8; i++) g[i] = b[i * 2] * 256 + b[i * 2 + 1];
+    int bestStart = -1;
+    int bestLen = 0;
+    int i = 0;
+    while (i < 8) {
+        if (g[i] == 0) {
+            int j = i;
+            while (j < 8 && g[j] == 0) j++;
+            if (j - i > bestLen && j - i >= 2) {
+                bestStart = i;
+                bestLen = j - i;
+            }
+            i = j;
+        } else {
+            i++;
+        }
+    }
+    char* out = alloc(48);
+    int o = 0;
+    i = 0;
+    while (i < 8) {
+        if (i == bestStart) {
+            out[o] = ':';
+            out[o + 1] = ':';
+            o = o + 2;
+            i = i + bestLen;
+            continue;
+        }
+        if (o > 0 && out[o - 1] != ':') {
+            out[o] = ':';
+            o++;
+        }
+        char tmp[8];
+        format(&tmp[0], 8, "%x", g[i]);
+        for (int k = 0; tmp[k] != 0; k++) {
+            out[o] = tmp[k];
+            o++;
+        }
+        i++;
+    }
+    out[o] = 0;
+    return out;
+}
+
+public bool ip6IsLoopback(char* b) {
+    for (int i = 0; i < 15; i++) {
+        if (b[i] != 0) return false;
+    }
+    return b[15] == 1;
+}
+public bool ip6IsLinkLocal(char* b) { return b[0] == 0xFE && (b[1] & 0xC0) == 0x80; }
+public bool ip6IsMulticast(char* b) { return b[0] == 0xFF; }
+
+// IPv4 -> the IPv6 form ::ffff:a.b.c.d, and back (false if it is not such an address)
+public void ip6FromV4(int ip, char* out) {
+    for (int i = 0; i < 16; i++) out[i] = 0;
+    out[10] = 255;
+    out[11] = 255;
+    out[12] = (ip >> 24) & 255;
+    out[13] = (ip >> 16) & 255;
+    out[14] = (ip >> 8) & 255;
+    out[15] = ip & 255;
+}
+
+public bool ip6ToV4(char* b, int* ip) {
+    for (int i = 0; i < 10; i++) {
+        if (b[i] != 0) return false;
+    }
+    if (b[10] != 255 || b[11] != 255) return false;
+    *ip = (b[12] << 24) | (b[13] << 16) | (b[14] << 8) | b[15];
+    return true;
+}
+
+// ---- services, host names, checksum ---------------------------------------------------------------------------------------------
+// well-known ports: "port:name" pairs
+private const SERVICES = " 7 echo 13 daytime 20 ftp-data 21 ftp 22 ssh 23 telnet 25 smtp 37 time 43 whois 53 dns 67 dhcp 68 dhcp-client 69 tftp 79 finger 80 http 88 kerberos 110 pop3 119 nntp 123 ntp 137 netbios-ns 143 imap 161 snmp 179 bgp 389 ldap 443 https 445 smb 465 smtps 514 syslog 587 submission 636 ldaps 993 imaps 995 pop3s 1433 mssql 1883 mqtt 3306 mysql 3389 rdp 5432 postgres 5672 amqp 6379 redis 8080 http-alt 27017 mongodb ";
+
+// the name of a well-known port ("http" for 80) or null
+public char* serviceName(int port) {
+    int i = 0;
+    while (SERVICES[i] != 0) {
+        while (SERVICES[i] == ' ') i++;
+        if (SERVICES[i] == 0) break;
+        int p = 0;
+        while (isDigit(SERVICES[i])) {
+            p = p * 10 + (SERVICES[i] - '0');
+            i++;
+        }
+        i++;
+        int start = i;
+        while (SERVICES[i] != ' ' && SERVICES[i] != 0) i++;
+        if (p == port) {
+            char* name = alloc(i - start + 1);
+            memcpy(name, &SERVICES[start], i - start);
+            return name;
+        }
+    }
+    return null;
+}
+
+// the port of a well-known service name ("https" -> 443), -1 if unknown
+public int servicePort(char* name) {
+    int i = 0;
+    while (SERVICES[i] != 0) {
+        while (SERVICES[i] == ' ') i++;
+        if (SERVICES[i] == 0) break;
+        int p = 0;
+        while (isDigit(SERVICES[i])) {
+            p = p * 10 + (SERVICES[i] - '0');
+            i++;
+        }
+        i++;
+        int start = i;
+        while (SERVICES[i] != ' ' && SERVICES[i] != 0) i++;
+        int len = i - start;
+        if (len == strlen(name) && startsWith(&SERVICES[start], name)) return p;
+    }
+    return -1;
+}
+
+// a syntactically valid host name: labels of letters, digits and '-' separated by dots
+public bool isHostname(char* s) {
+    int n = strlen(s);
+    if (n == 0 || n > 253) return false;
+    int label = 0;
+    for (int i = 0; i <= n; i++) {
+        char c = s[i];
+        if (c == '.' || c == 0) {
+            if (label == 0 || label > 63) return false;
+            if (s[i - 1] == '-' || s[i - label] == '-') return false;
+            label = 0;
+        } else if (isAlpha(c) || isDigit(c) || c == '-') {
+            label++;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the Internet checksum (RFC 1071) of n bytes: used by IP, ICMP, UDP and TCP. Result is a 16 bit number;
+// seed lets you continue over several pieces (pass the previous sum, before complementing, via checksumAdd)
+public int checksumAdd(char* data, int n, int sum) {
+    for (int i = 0; i + 1 < n; i = i + 2) {
+        sum = sum + data[i] * 256 + data[i + 1];
+    }
+    if (n % 2 == 1) {
+        sum = sum + data[n - 1] * 256;
+    }
+    return sum;
+}
+
+public int checksumFinish(int sum) {
+    while ((sum >> 16) != 0) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    return (~sum) & 0xFFFF;
+}
+
+public int checksum(char* data, int n) {
+    return checksumFinish(checksumAdd(data, n, 0));
+}

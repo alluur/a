@@ -1,0 +1,187 @@
+// =============================================================================
+//  netutil - everyday network tools                                    import netutil;
+//
+//    netutil.ping("192.168.1.1", 1000)        round trip time in ms, -1 = no answer, -2 = not allowed to ping here
+//    netutil.tcpPing("example.org", 443, 2000) time to open a TCP connection in ms, -1 = failed
+//    netutil.portOpen("localhost", 22, 500)   is something listening?
+//    netutil.wakeOnLan("aa:bb:cc:dd:ee:ff")   magic packet to the broadcast address (UDP port 9)
+//    netutil.ntpTime("pool.ntp.org")          Unix time (seconds) from an NTP server, -1 on failure
+//
+//  ping uses ICMP: on Linux and Android an unprivileged ICMP socket (or a raw one when you are allowed to open it),
+//  on Windows the system's IcmpSendEcho.
+// =============================================================================
+import net;
+import netaddr;
+import packet;
+module netutil;
+
+private bool windows() { return __OS == 1; }
+private int nr(int x64, int a64) { if (__ARCH == 1) return a64; return x64; }
+private int i32(int x) { return (x << 32) >> 32; }
+
+// ---- ping ---------------------------------------------------------------------------------------------------------------------------
+private int pingSeq = 1;
+
+// round trip time in milliseconds
+public int ping(char* host, int timeoutMs) {
+    int ip = net.resolve(host);
+    if (ip < 0) return -1;
+    if (windows()) {
+        int h = __winapi(65, 0, 0, 0, 0);                         // IcmpCreateFile
+        if (h == 0 || h == -1) return -2;
+        char* reply = alloc(300);
+        char data[32];
+        for (int i = 0; i < 32; i++) data[i] = 'a' + i % 23;
+        // the address is passed in network byte order
+        int addr = ((ip & 255) << 24) | (((ip >> 8) & 255) << 16) | (((ip >> 16) & 255) << 8) | ((ip >> 24) & 255);
+        int r = i32(__winapix(66, h, addr, &data[0], 32, 0, reply, 300, timeoutMs, 0, 0));      // IcmpSendEcho
+        __winapi(67, h, 0, 0, 0);                                                                 // IcmpCloseHandle
+        if (r <= 0) return -1;
+        int status = reply[4] | (reply[5] << 8) | (reply[6] << 16);
+        if (status != 0) return -1;
+        return reply[8] | (reply[9] << 8) | (reply[10] << 16);
+    }
+    bool raw = false;
+    int s = __syscall(nr(41, 198), 2, 2, 1, 0, 0, 0);             // AF_INET, SOCK_DGRAM, IPPROTO_ICMP
+    if (s < 0) {
+        s = __syscall(nr(41, 198), 2, 3, 1, 0, 0, 0);             // SOCK_RAW
+        if (s < 0) return -2;
+        raw = true;
+    }
+    net.setTimeout(s, timeoutMs);
+    pingSeq++;
+    int id = 0x4A21;
+    char data[32];
+    for (int i = 0; i < 32; i++) data[i] = 'a' + i % 23;
+    char msg[64];
+    int n = packet.icmpEcho(packet.ICMP_ECHO, id, pingSeq, &data[0], 32, &msg[0]);
+    int start = millis();
+    int sent = net.sendTo(s, ip, 0, &msg[0], n);
+    if (sent < 0) {
+        net.close(s);
+        return -2;
+    }
+    int result = -1;
+    for (;;) {
+        char buf[300];
+        int from;
+        int got = net.recvFrom(s, &buf[0], 300, &from, null);
+        if (got <= 0) break;
+        int off = 0;
+        if (raw) {
+            off = (buf[0] & 15) * 4;
+        }
+        // an echo reply from the address we pinged (the kernel changes the id of unprivileged sockets)
+        if (got > off + 7 && buf[off] == packet.ICMP_ECHO_REPLY && from == ip) {
+            if (raw && packet.be16(&buf[0], off + 4) != id) continue;
+            result = millis() - start;
+            break;
+        }
+        if (millis() - start > timeoutMs) break;
+    }
+    net.close(s);
+    return result;
+}
+
+// ---- TCP --------------------------------------------------------------------------------------------------------------------------------
+// milliseconds needed to connect, -1 if it failed or took longer than the time limit
+public int tcpPing(char* host, int port, int timeoutMs) {
+    int start = millis();
+    int h = net.connectTimeout(host, port, timeoutMs);
+    if (h < 0) return -1;
+    int t = millis() - start;
+    net.close(h);
+    return t;
+}
+
+public bool portOpen(char* host, int port, int timeoutMs) {
+    return tcpPing(host, port, timeoutMs) >= 0;
+}
+
+// ---- Wake-on-LAN ------------------------------------------------------------------------------------------------------------------------
+// the 102 byte magic packet: six bytes of 255 and the MAC address sixteen times. Returns 102, 0 for a bad address
+public int wolPacket(char* macText, char* out) {
+    char mac[6];
+    if (!netaddr.macParse(macText, &mac[0])) return 0;
+    for (int i = 0; i < 6; i++) out[i] = 255;
+    for (int k = 0; k < 16; k++) {
+        for (int i = 0; i < 6; i++) out[6 + k * 6 + i] = mac[i];
+    }
+    return 102;
+}
+
+// sends the magic packet to an address and port (the usual: 255.255.255.255 port 9)
+public bool wakeOnLanTo(char* macText, int ip, int port) {
+    char pkt[110];
+    int n = wolPacket(macText, &pkt[0]);
+    if (n == 0) return false;
+    int s = net.udpSocket();
+    if (s < 0) return false;
+    net.setBroadcast(s, true);
+    int sent = net.sendTo(s, ip, port, &pkt[0], n);
+    net.close(s);
+    return sent == n;
+}
+
+public bool wakeOnLan(char* macText) {
+    return wakeOnLanTo(macText, 0xFFFFFFFF, 9);
+}
+
+// ---- NTP --------------------------------------------------------------------------------------------------------------------------------
+// the 48 byte SNTP request (version 4, client mode)
+public int ntpBuildRequest(char* out) {
+    for (int i = 0; i < 48; i++) out[i] = 0;
+    out[0] = 0x23;
+    return 48;
+}
+
+// the Unix time in seconds from a reply (the transmit timestamp), -1 if it is not a usable reply
+public int ntpParse(char* b, int n) {
+    if (n < 48) return -1;
+    int mode = b[0] & 7;
+    int stratum = b[1];
+    if (mode != 4 || stratum == 0) return -1;
+    int secs = (b[40] << 24) | (b[41] << 16) | (b[42] << 8) | b[43];
+    if (secs == 0) return -1;
+    return secs - 2208988800;
+}
+
+public class NtpPending {
+    public int socket;
+}
+
+// sends a request to a server (ip, port 123 normally); finish with ntpFinish
+public NtpPending* ntpStart(int ip, int port) {
+    int s = net.udpSocket();
+    if (s < 0) return null;
+    char req[48];
+    ntpBuildRequest(&req[0]);
+    if (net.sendTo(s, ip, port, &req[0], 48) != 48) {
+        net.close(s);
+        return null;
+    }
+    NtpPending* p = new NtpPending();
+    p->socket = s;
+    return p;
+}
+
+public int ntpFinish(NtpPending* p, int ms) {
+    net.setTimeout(p->socket, ms);
+    char buf[100];
+    int got = net.recvFrom(p->socket, &buf[0], 100, null, null);
+    net.close(p->socket);
+    if (got <= 0) return -1;
+    return ntpParse(&buf[0], got);
+}
+
+public int ntpTime(char* server) {
+    int ip = net.resolve(server);
+    if (ip < 0) return -1;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        NtpPending* p = ntpStart(ip, 123);
+        if (p == null) return -1;
+        int t = ntpFinish(p, 2000);
+        if (t >= 0) return t;
+    }
+    return -1;
+}

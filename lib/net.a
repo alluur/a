@@ -29,6 +29,14 @@
 //    int  net.recvFrom(h, buf, max, int* ip, int* port)   one datagram, -1 on error / timeout
 //    int  net.dnsBuildQuery(name, id, buf) / net.dnsParseReply(buf, n, id)   the DNS packets themselves
 //    void net.setDns(ip, port)             use this DNS server instead of the system's
+//    int  net.poll(handles, events, revents, n, ms)   wait for several sockets at once (READABLE / WRITABLE)
+//    bool net.waitReadable(h, ms) / waitWritable(h, ms)
+//    int  net.connectTimeout(host, port, ms)          connect with a time limit
+//    void net.shutdown(h, how)             0 = stop reading, 1 = stop writing, 2 = both
+//    bool net.peer(h, &ip, &port)          address of the other side of a connection
+//    void net.setNoDelay / setKeepAlive / setBroadcast / setReuse (h, on)    socket options
+//    bool net.joinMulticast(h, group)      receive datagrams sent to a multicast group
+//    char* net.hostName()                  name of this computer
 // =============================================================================
 module net;
 
@@ -52,6 +60,18 @@ const WS_SETSOCKOPT = 51;
 const WS_GETHOSTBYNAME = 52;
 const WS_GETSOCKNAME = 53;
 const SOCK_DGRAM = 2;
+const WS_SHUTDOWN = 54;
+const WS_GETPEERNAME = 55;
+const WS_WSAPOLL = 56;
+const WS_IOCTLSOCKET = 57;
+const WS_GETSOCKOPT = 58;
+const WS_GETHOSTNAME = 59;
+
+// poll() events (the same numbers on every system, translated for Windows)
+public const READABLE = 1;
+public const WRITABLE = 4;
+public const FAILED = 8;
+public const HUNGUP = 16;
 
 private bool started;
 private char wsadata[512];
@@ -682,4 +702,264 @@ public int resolve(char* host) {
         return ip;
     }
     return dnsAsk(0x01010101, 53, host);
+}
+
+
+// ---- waiting for many sockets, connection details, options ------------------------------------------------------------------
+// Waits until one of the n sockets in handles[] is ready for what events[] asks (READABLE, WRITABLE, or both added).
+// revents[] receives what happened (READABLE / WRITABLE / FAILED / HUNGUP). ms < 0 waits forever.
+// Returns the number of ready sockets, 0 on time out, negative on error.
+public int poll(int* handles, int* events, int* revents, int n, int ms) {
+    if (n <= 0) {
+        return 0;
+    }
+    init();
+    int stride = 8;
+    if (windows()) {
+        stride = 16;
+    }
+    char* fds = alloc(n * stride + 16);
+    for (int i = 0; i < n; i++) {
+        char* f = &fds[i * stride];
+        int ev = 0;
+        if (windows()) {
+            f[0] = handles[i] & 255;
+            f[1] = (handles[i] >> 8) & 255;
+            f[2] = (handles[i] >> 16) & 255;
+            f[3] = (handles[i] >> 24) & 255;
+            if ((events[i] & READABLE) != 0) ev = ev | 0x100;           // POLLRDNORM
+            if ((events[i] & WRITABLE) != 0) ev = ev | 0x10;            // POLLWRNORM
+            f[8] = ev & 255;
+            f[9] = (ev >> 8) & 255;
+        } else {
+            f[0] = handles[i] & 255;
+            f[1] = (handles[i] >> 8) & 255;
+            f[2] = (handles[i] >> 16) & 255;
+            f[3] = (handles[i] >> 24) & 255;
+            if ((events[i] & READABLE) != 0) ev = ev | 1;
+            if ((events[i] & WRITABLE) != 0) ev = ev | 4;
+            f[4] = ev & 255;
+            f[5] = (ev >> 8) & 255;
+        }
+    }
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_WSAPOLL, fds, n, ms, 0));
+    } else {
+        int ts[2];
+        int* tp = null;
+        if (ms >= 0) {
+            ts[0] = ms / 1000;
+            ts[1] = (ms % 1000) * 1000000;
+            tp = &ts[0];
+        }
+        r = __syscall(nr(271, 73), fds, n, tp, 0, 0, 0);          // ppoll
+    }
+    if (r < 0) {
+        return -1;
+    }
+    for (int i = 0; i < n; i++) {
+        char* f = &fds[i * stride];
+        int re;
+        int out = 0;
+        if (windows()) {
+            re = f[10] | (f[11] << 8);
+            if ((re & 0x300) != 0) out = out | READABLE;                // POLLRDNORM | POLLRDBAND
+            if ((re & 0x30) != 0) out = out | WRITABLE;
+            if ((re & 1) != 0) out = out | FAILED;                      // POLLERR
+            if ((re & 2) != 0) out = out | HUNGUP;                      // POLLHUP
+        } else {
+            re = f[6] | (f[7] << 8);
+            if ((re & 1) != 0) out = out | READABLE;
+            if ((re & 4) != 0) out = out | WRITABLE;
+            if ((re & 8) != 0) out = out | FAILED;
+            if ((re & 16) != 0) out = out | HUNGUP;
+        }
+        revents[i] = out;
+    }
+    return r;
+}
+
+// true if the socket has data (or a pending connection / a closed peer) within ms milliseconds
+public bool waitReadable(int h, int ms) {
+    int hh[1]; int ev[1]; int re[1];
+    hh[0] = h; ev[0] = READABLE;
+    return poll(&hh[0], &ev[0], &re[0], 1, ms) > 0;
+}
+
+public bool waitWritable(int h, int ms) {
+    int hh[1]; int ev[1]; int re[1];
+    hh[0] = h; ev[0] = WRITABLE;
+    return poll(&hh[0], &ev[0], &re[0], 1, ms) > 0;
+}
+
+// how = 0: no more reading, 1: no more writing (the other side sees the end of the data), 2: both
+public void shutdown(int h, int how) {
+    if (windows()) {
+        __winapi(WS_SHUTDOWN, h, how, 0, 0);
+    } else {
+        __syscall(nr(48, 210), h, how, 0, 0, 0, 0);
+    }
+}
+
+// the address and port of the other side of a connected socket
+public bool peer(int h, int* ip, int* port) {
+    char sa[16];
+    int len = 16;
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_GETPEERNAME, h, &sa[0], &len, 0));
+    } else {
+        r = __syscall(nr(52, 205), h, &sa[0], &len, 0, 0, 0);
+    }
+    if (r < 0) {
+        return false;
+    }
+    if (ip != null) {
+        *ip = (sa[4] << 24) | (sa[5] << 16) | (sa[6] << 8) | sa[7];
+    }
+    if (port != null) {
+        *port = sa[2] * 256 + sa[3];
+    }
+    return true;
+}
+
+// the local address of a connected socket (the interface the connection uses)
+public int localIp(int h) {
+    char sa[16];
+    int len = 16;
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_GETSOCKNAME, h, &sa[0], &len, 0));
+    } else {
+        r = __syscall(nr(51, 204), h, &sa[0], &len, 0, 0, 0);
+    }
+    if (r < 0) {
+        return -1;
+    }
+    return (sa[4] << 24) | (sa[5] << 16) | (sa[6] << 8) | sa[7];
+}
+
+private bool setOpt(int h, int levelLinux, int levelWin, int optLinux, int optWin, int value) {
+    int v = value;
+    int r;
+    if (windows()) {
+        r = i32(__winapix(WS_SETSOCKOPT, h, levelWin, optWin, &v, 4, 0, 0, 0, 0, 0));
+    } else {
+        r = __syscall(nr(54, 208), h, levelLinux, optLinux, &v, 4, 0);
+    }
+    return r >= 0;
+}
+
+public bool setNoDelay(int h, bool on) {                  // TCP_NODELAY: send small packets at once
+    return setOpt(h, 6, 6, 1, 1, on ? 1 : 0);
+}
+
+public bool setKeepAlive(int h, bool on) {
+    return setOpt(h, 1, 0xFFFF, 9, 8, on ? 1 : 0);
+}
+
+public bool setBroadcast(int h, bool on) {                // UDP: allow sending to 255.255.255.255
+    return setOpt(h, 1, 0xFFFF, 6, 0x20, on ? 1 : 0);
+}
+
+public bool setReuse(int h, bool on) {                    // SO_REUSEADDR
+    return setOpt(h, 1, 0xFFFF, 2, 4, on ? 1 : 0);
+}
+
+// receive datagrams that are sent to a multicast group address (224.0.0.0 .. 239.255.255.255) on any interface
+public bool joinMulticast(int h, int group) {
+    char mreq[8];
+    mreq[0] = (group >> 24) & 255;
+    mreq[1] = (group >> 16) & 255;
+    mreq[2] = (group >> 8) & 255;
+    mreq[3] = group & 255;
+    mreq[4] = 0; mreq[5] = 0; mreq[6] = 0; mreq[7] = 0;
+    int r;
+    if (windows()) {
+        r = i32(__winapix(WS_SETSOCKOPT, h, 0, 12, &mreq[0], 8, 0, 0, 0, 0, 0));
+    } else {
+        r = __syscall(nr(54, 208), h, 0, 35, &mreq[0], 8, 0);
+    }
+    return r >= 0;
+}
+
+// the name of this computer
+public char* hostName() {
+    char* buf = alloc(260);
+    if (windows()) {
+        init();
+        __winapi(WS_GETHOSTNAME, buf, 255, 0, 0);
+        return buf;
+    }
+    char* u = alloc(400);                                      // struct utsname: 6 fields of 65 bytes
+    __syscall(nr(63, 160), u, 0, 0, 0, 0, 0);
+    for (int i = 0; i < 64; i++) {
+        buf[i] = u[65 + i];
+    }
+    return buf;
+}
+
+private void setBlocking(int s, bool blocking) {
+    if (windows()) {
+        int mode = 0;
+        if (!blocking) {
+            mode = 1;
+        }
+        __winapi(WS_IOCTLSOCKET, s, 0x8004667E, &mode, 0);            // FIONBIO
+        return;
+    }
+    int flags = __syscall(nr(72, 25), s, 3, 0, 0, 0, 0);              // F_GETFL
+    if (blocking) {
+        flags = flags & ~0x800;
+    } else {
+        flags = flags | 0x800;                                        // O_NONBLOCK
+    }
+    __syscall(nr(72, 25), s, 4, flags, 0, 0, 0);                      // F_SETFL
+}
+
+// like connect, but gives up after ms milliseconds (-1 on failure or time out)
+public int connectTimeout(char* host, int port, int ms) {
+    int ip = resolve(host);
+    if (ip < 0) {
+        return -1;
+    }
+    int s = newSocket();
+    if (s < 0) {
+        return s;
+    }
+    setBlocking(s, false);
+    char sa[16];
+    fillAddr(&sa[0], ip, port);
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_CONNECT, s, &sa[0], 16, 0));
+    } else {
+        r = __syscall(nr(42, 203), s, &sa[0], 16, 0, 0, 0);
+    }
+    if (r < 0) {
+        // in progress? (Linux: -115 EINPROGRESS, Windows: -1 with WSAEWOULDBLOCK)
+        if (!windows() && r != -115) {
+            close(s);
+            return -1;
+        }
+        if (!waitWritable(s, ms)) {
+            close(s);
+            return -1;
+        }
+        int err = 0;
+        int len = 4;
+        if (windows()) {
+            __winapix(WS_GETSOCKOPT, s, 0xFFFF, 0x1007, &err, &len, 0, 0, 0, 0, 0);     // SO_ERROR
+        } else {
+            __syscall(nr(55, 209), s, 1, 4, &err, &len, 0);
+        }
+        err = err & 0xFFFFFFFF;
+        if (err != 0) {
+            close(s);
+            return -1;
+        }
+    }
+    setBlocking(s, true);
+    return s;
 }
