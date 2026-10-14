@@ -33,7 +33,7 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t119`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t120`, `tests/gui.sh`.
 
 ## Quick start
 
@@ -168,6 +168,17 @@ col->add(bar);                                             // the bar goes at th
   arrow although there are no children yet: add them in `tree->onExpand`, the node is `tree->expandedNode`). Click the
   arrow or press Right/Left/Enter to open and close, Up/Down/Home/End/PageUp/PageDown to move, `selected`, `onSelect`,
   `onActivate`. `examples/gui/afiles.a` (a file browser: a tree of folders, a table of files, a splitter) uses all three.
+* **Toolbar and icons**: `tb = new guix.Toolbar(); tb->addButton(guix.ICON_SAVE, "Save", f); tb->addSeparator();`. An
+  `IconButton` is flat, has a tooltip and can be a toggle (`toggle = true`, `checked`). There are 27 icons
+  (`ICON_NEW OPEN SAVE CUT COPY PASTE UNDO REDO PLUS MINUS CLOSE CHECK LEFT RIGHT UP DOWN REFRESH SEARCH HOME SETTINGS TRASH
+  PLAY PAUSE STOP STAR INFO WARNING`); `guix.drawIcon(surface, icon, x, y, colour)` draws one (16 x 16) anywhere.
+* **StatusBar**: `addSection(width)` (0 stretches) and `setText(section, text)`. **TextBlock**: text that wraps at the width
+  of the widget (`\n` starts a paragraph, `align`, `wrapWidth`). **Calendar**: `year month day`, `onChange`, click a day,
+  the arrows or the wheel change the month, arrow keys move by day and week, PageUp/PageDown by month; `guix.chooseDate(d,
+  title, year, month, day, f)` is a dialog (the result is `year * 10000 + month * 100 + day`, 0 when cancelled).
+* **Notifications**: `guix.notify(d, "Title", "text", kind, ms)` shows a card in the top right corner (kind 0 information,
+  1 warning, 2 error); it closes after `ms` or on a click, up to six at a time.
+* **Busy bar**: `progressBar->start()` / `stop()` animate a `gui.ProgressBar` for work of unknown length.
 * **Tooltips**: `widget->tooltip = "text";` (a field of every widget) shows the text when the pointer rests on it.
 
 **Dialogs** open a window, and when the user is done they call your function `int f(int result)` and close:
@@ -218,6 +229,15 @@ PNG: every colour type and bit depth (not interlaced), palettes with transparenc
 compression; the decoder contains its own inflate. `gimg.decode(bytes, n)` and `gimg.encodePng(surface, &n)` work in memory.
 `examples/gui/aview.a` is an image viewer (open, save as PNG, zoom, fit to the window).
 
+## A taskbar and minimizing
+
+Windows have a minimize button next to maximize. The display server can list the normal windows of all clients and control
+them (`adp.Q_LISTWIN` / `Q_WINCMD`); in `gui` that is `d->requestWindowList()` (the answer calls `d->onWinList`, the data is in
+`d->winList[i]->gid / state / title`, `nWinList`) and `d->windowCommand(gid, adp.WC_ACTIVATE | WC_MINIMIZE | WC_CLOSE |
+WC_MAXIMIZE)`. `examples/gui/apanel.a` is a taskbar made of it: a button for every window (click: show or minimize),
+launchers (`apanel Terminal=aterm Files=afiles`) and a clock. Panels, wallpapers, undecorated and no-focus windows are not
+listed.
+
 ## A terminal: `gterm` and `aterm`
 
 ```c
@@ -260,7 +280,7 @@ srv->addBackend(otherBackend);                        // several outputs at once
 srv->run();                                           // or: while (...) { srv->step(20); }
 ```
 
-* **Window manager**: title bars with close and maximize buttons (a double click on the title also maximizes; windows
+* **Window manager**: title bars with close, maximize and minimize buttons (a double click on the title also maximizes; windows
   with `F_FIXED` do not maximize; `srv->toggleMaximize(win)`), move by dragging the title, resize with the grip at the bottom right,
   focus follows the click, windows come to the front; `Alt+Tab` switches, `Alt+F4` asks the window to close. The
   window decides (`E_CLOSE`), the server never kills a program.

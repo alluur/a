@@ -345,3 +345,6 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   by another program (PNG of every kind, BMP, PPM) as hex and compares pixel hashes. Maximized windows (`wsrv.Win.maximized`) keep
   their old rectangle and get an `E_RESIZE`; dragging and the resize grip are off while maximized. `tests/t119_gui_table.a`:
   maximize, TableView, TreeView.
+* Minimizing: `Win.minimized` and `Win.shown()` (visible, mapped, not minimized) replace the old visibility tests in the server;
+  `listed()` decides which windows a taskbar sees. The window list is pulled (a taskbar polls every 400 ms), the server never
+  pushes it. Notifications are undecorated `F_ABOVE | F_NOFOCUS` windows in six slots. `tests/t120_gui_extras.a` covers all of it.

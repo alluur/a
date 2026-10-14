@@ -176,6 +176,7 @@ const PART_CLOSE = 3;
 const PART_GRIP = 4;
 const PART_BORDER = 5;
 const PART_MAX = 6;
+const PART_MIN = 7;
 
 public class Client {
     public int fd;
@@ -207,12 +208,14 @@ public class Win {
     public bool visible;
     public int cursor;
     public bool maximized;
+    public bool minimized;
     public int restoreX;
     public int restoreY;
     public int restoreW;
     public int restoreH;
     public gfx.Surface* buf;
 
+    public bool shown() { return visible && mapped && !minimized; }
     public bool decorated() { return (flags & adp.F_NODECOR) == 0; }
     public bool canMaximize() { return decorated() && (flags & adp.F_FIXED) == 0; }
     public int fx() { return decorated() ? x - BW : x; }
@@ -381,7 +384,7 @@ public class Server {
             int sx1 = screen->clipX1;
             int sy1 = screen->clipY1;
             int tx0 = fx + 6;
-            int tw = fw - 12 - 24 - (w->canMaximize() ? 24 : 0);
+            int tw = fw - 12 - 24 - (w->canMaximize() ? 48 : 0);
             int ax0 = (tx0 > sx0) ? tx0 : sx0;
             int ax1 = (tx0 + tw < sx1) ? tx0 + tw : sx1;
             screen->clipX0 = ax0;
@@ -403,6 +406,11 @@ public class Server {
                 int mx = cx - 22;
                 bool mhot = (hover == w && hoverPart == PART_MAX);
                 screen->fillRoundRect(mx, cy, 16, 16, 4, mhot ? gfx.argb(130, 255, 255, 255) : gfx.argb(70, 255, 255, 255));
+                int ix = mx - 22;
+                bool ihot = (hover == w && hoverPart == PART_MIN);
+                screen->fillRoundRect(ix, cy, 16, 16, 4, ihot ? gfx.argb(130, 255, 255, 255) : gfx.argb(70, 255, 255, 255));
+                screen->hline(ix + 4, cy + 11, 8, gfx.WHITE);
+                screen->hline(ix + 4, cy + 12, 8, gfx.WHITE);
                 if (w->maximized) {
                     screen->rect(mx + 5, cy + 3, 7, 7, gfx.WHITE);
                     screen->rect(mx + 3, cy + 6, 7, 7, gfx.WHITE);
@@ -487,7 +495,7 @@ public class Server {
         drawBackground(screen->clipX0, screen->clipY0, screen->clipX1 - screen->clipX0, screen->clipY1 - screen->clipY0);
         for (int i = 0; i < nstack; i++) {
             Win* win = stack[i];
-            if (!win->visible || !win->mapped) {
+            if (!win->shown()) {
                 continue;
             }
             int fx0 = win->fx() - 8;
@@ -597,7 +605,7 @@ public class Server {
         Win* lk = lockWindow();
         for (int i = nstack - 1; i >= 0; i--) {
             Win* w = stack[i];
-            if (!w->visible || !w->mapped) {
+            if (!w->shown()) {
                 continue;
             }
             if (lk != null && w != lk) {
@@ -621,6 +629,8 @@ public class Server {
                         p = PART_CLOSE;
                     } else if (w->canMaximize() && px >= fx + w->fw() - BW - 42 && px < fx + w->fw() - BW - 22 && py >= fy + 3 && py < fy + 23) {
                         p = PART_MAX;
+                    } else if (w->canMaximize() && px >= fx + w->fw() - BW - 64 && px < fx + w->fw() - BW - 44 && py >= fy + 3 && py < fy + 23) {
+                        p = PART_MIN;
                     }
                 } else {
                     p = PART_BORDER;
@@ -703,7 +713,7 @@ public class Server {
         }
         for (int i = nstack - 1; i >= 0; i--) {
             Win* w = stack[i];
-            if (w->visible && w->mapped && (w->flags & (adp.F_NOFOCUS | adp.F_BELOW)) == 0) {
+            if (w->shown() && (w->flags & (adp.F_NOFOCUS | adp.F_BELOW)) == 0) {
                 return w;
             }
         }
@@ -839,6 +849,42 @@ public class Server {
             sendMsg(c);
             return;
         }
+        if (op == adp.Q_LISTWIN) {
+            int count = 0;
+            for (int i = 0; i < nstack; i++) {
+                if (listed(stack[i])) { count++; }
+            }
+            msg->begin(adp.E_WINLIST);
+            msg->add32(count);
+            for (int i = 0; i < nstack; i++) {
+                Win* lw = stack[i];
+                if (!listed(lw)) {
+                    continue;
+                }
+                int st = 0;
+                if (lw->minimized) { st = st | adp.WS_MINIMIZED; }
+                if (lw == focus) { st = st | adp.WS_FOCUSED; }
+                if (lw->maximized) { st = st | adp.WS_MAXIMIZED; }
+                msg->add32(lw->id);
+                msg->add32(st);
+                msg->add32(lw->owner->num);
+                msg->add32(strlen(lw->title));
+                msg->addText(lw->title);
+            }
+            sendMsg(c);
+            return;
+        }
+        if (op == adp.Q_WINCMD && len >= 8) {
+            Win* tw = findGlobal(adp.get32(p, 0));
+            if (tw != null && listed(tw)) {
+                int cmd = adp.get32(p, 4);
+                if (cmd == adp.WC_ACTIVATE) { activate(tw); }
+                else if (cmd == adp.WC_MINIMIZE) { minimize(tw); }
+                else if (cmd == adp.WC_CLOSE) { closeRequest(tw); }
+                else if (cmd == adp.WC_MAXIMIZE) { toggleMaximize(tw); }
+            }
+            return;
+        }
         if (op == 15 && allowScreenshots) {
             msg->begin(112);
             msg->add32(screen->w);
@@ -969,6 +1015,44 @@ public class Server {
         sendResize(w);
     }
 
+    public void minimize(Win* w) {
+        if (w->minimized) {
+            return;
+        }
+        damageWin(w);
+        w->minimized = true;
+        if (grab == w) { grab = null; }
+        if (hover == w) { hover = null; }
+        if (focus == w) {
+            focus = null;
+            sendFocus(w, 0);
+            setFocus(topFocusable());
+        }
+    }
+
+    // brings a window back (if it was minimized), to the front, with the focus
+    public void activate(Win* w) {
+        if (w->minimized) {
+            w->minimized = false;
+        }
+        damageWin(w);
+        raise(w);
+        setFocus(w);
+    }
+
+    private bool listed(Win* w) {
+        return w->mapped && w->visible && (w->flags & (adp.F_BELOW | adp.F_ABOVE | adp.F_NODECOR | adp.F_LOCK | adp.F_NOFOCUS)) == 0;
+    }
+
+    private Win* findGlobal(int gid) {
+        for (int i = 0; i < nstack; i++) {
+            if (stack[i]->id == gid) {
+                return stack[i];
+            }
+        }
+        return null;
+    }
+
     private int lastTitleAt;
     private Win* lastTitleWin;
 
@@ -980,7 +1064,7 @@ public class Server {
         // the focusable window that is lowest in the stack comes to the front
         for (int i = 0; i < nstack; i++) {
             Win* w = stack[i];
-            if (w->visible && w->mapped && (w->flags & (adp.F_NOFOCUS | adp.F_BELOW | adp.F_ABOVE)) == 0 && w != focus) {
+            if (w->shown() && (w->flags & (adp.F_NOFOCUS | adp.F_BELOW | adp.F_ABOVE)) == 0 && w != focus) {
                 raise(w);
                 setFocus(w);
                 return;
@@ -1098,6 +1182,11 @@ public class Server {
                     dragMode = 4;
                     return;
                 }
+                if (b == 1 && part == PART_MIN) {
+                    grab = under;
+                    dragMode = 5;
+                    return;
+                }
                 if (part == PART_CLIENT) {
                     grab = under;
                     sendMouse(under, adp.M_DOWN, b, mods);
@@ -1110,6 +1199,16 @@ public class Server {
             if (dragMode == 1 || dragMode == 2) {
                 dragMode = 0;
                 dragWin = null;
+                return;
+            }
+            if (dragMode == 5) {
+                dragMode = 0;
+                int part = 0;
+                Win* under = findWin(cursorX, cursorY, &part);
+                if (under != null && under == grab && part == PART_MIN) {
+                    minimize(under);
+                }
+                grab = null;
                 return;
             }
             if (dragMode == 4) {

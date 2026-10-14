@@ -114,6 +114,37 @@ try:
         fail("typing with actl changed nothing")
     print("actl input ok")
 
+    # apanel: a taskbar at the bottom of the screen, with a button for every window; clicking the focused window's button minimizes it
+    start("apanel")
+    time.sleep(1.0)
+    c.grab()
+    panel_color = c.pixel(400, 595)
+    if abs(panel_color[0] - 226) > 3 or abs(panel_color[2] - 236) > 3:
+        fail("the taskbar was not found at the bottom: %s" % (panel_color,))
+    print("taskbar ok")
+    start("calc")
+    time.sleep(1.0)
+    c.grab()
+    # the button of the newest (focused) window is blue: click it and the window goes away (the screen changes)
+    btn = None
+    for x in range(0, 700, 4):
+        p = c.pixel(x, 582)
+        if abs(p[0] - 60) < 8 and abs(p[1] - 120) < 8 and abs(p[2] - 216) < 8:
+            btn = x
+            break
+    if btn is None:
+        fail("the task button of the focused window was not found")
+    before = bytes(c.fb)
+    c.click(btn + 10, 582)
+    time.sleep(0.8)
+    c.grab()
+    if bytes(c.fb) == before:
+        fail("clicking the task button changed nothing")
+    c.click(btn + 10, 582)
+    time.sleep(0.8)
+    c.grab()
+    print("task button ok")
+
     # aterm: a shell on a pseudo terminal. Keys typed through VNC reach the shell, and when it ends the window and the program go away
     term = start("aterm")
     time.sleep(1.2)
