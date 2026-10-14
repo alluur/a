@@ -325,6 +325,21 @@ fmax copysign nan` and the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`.
 
 Not available yet: `++`/`--` on doubles.
 
+### Initializer lists
+
+Arrays and structs (locals, globals and `static` locals) can be filled with a `{...}` list. Values that are left out are 0,
+a trailing comma is allowed, lists nest, and a `char` array can be filled from a string:
+
+    int primes[6] = {2, 3, 5, 7, 11};            // the last element is 0
+    Point p = {3, 4};
+    Line l = {{1, 2}, {3, 4}, "ab"};              // nested structs, a char array field
+    char name[16] = "Aytict";
+    char* words[3] = {"alpha", "beta", "gamma"};
+    double w[2] = {1.5, 2};                       // ints are converted
+
+Too many values (`int a[2] = {1, 2, 3};`) or a string longer than the array is a compile error. Global and `static` lists
+must be made of constants; local lists may use any expression.
+
 ### Inline assembly
 
 `asm` puts machine code of your choice into a function. The program lists the code for every CPU it should run on;

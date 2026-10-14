@@ -480,6 +480,7 @@ parse_local_decl:
     ERR "array size must be positive"
 .a1:
     mov r15, rax
+    mov [init_count], rax
     mov edi, ']'
     call expect
     mov rdi, r12
@@ -533,7 +534,16 @@ parse_local_decl:
     mov esi, r15d
     CG zero_local
     bt rbx, TF_ARRAY_BIT
-    jc .next
+    jnc .notarr
+    cmp qword [tk], '='
+    jne .next
+    call next_token
+    mov rdi, rbx
+    mov rsi, r14
+    mov rdx, [init_count]
+    call init_elem
+    jmp .next
+.notarr:
     mov rdi, rbx
     call type_vptr
     test eax, eax
@@ -549,6 +559,14 @@ parse_local_decl:
     cmp qword [tk], '='
     jne .next
     call next_token
+    cmp qword [tk], '{'
+    jne .nolist
+    mov rdi, rbx
+    mov rsi, r14
+    xor edx, edx
+    call init_local_list
+    jmp .next
+.nolist:
     call parse_assign
     call to_rvalue
     mov edi, r14d
@@ -737,11 +755,25 @@ parse_static_local:
     mov edx, F_BSS
     jmp .reg
 .init:
+    call next_token
+    cmp qword [tk], '{'
+    je .glist
     bt rbx, TF_ARRAY_BIT
     jnc .i0
-    ERR "array initializers are not supported, assign the elements in code"
+.glist:
+    mov rdi, r15
+    mov esi, 8
+    call data_alloc
+    mov r13, rax
+    mov dword [init_mode], 1
+    mov rdi, rbx
+    mov rsi, r13
+    mov rdx, r14
+    call init_elem
+    mov dword [init_mode], 0
+    xor edx, edx
+    jmp .reg
 .i0:
-    call next_token
     call const_expr
     push rax
     push rdx
@@ -849,5 +881,226 @@ parse_static_if_stmt:
 .skip_nested:
     call skip_static_if
 .done:
+    pop rbx
+    ret
+
+; ---- initializer lists ---------------------------------------------------------------------------------------------------
+; init_elem: rdi = type of the object, rsi = frame offset of its first byte, rdx = element count (arrays).
+; Initializes one object from the current tokens: a {...} list, a string for a char array, or an ordinary expression.
+; The object has been zeroed before, so values that are left out stay 0.
+init_elem:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    cmp qword [tk], '{'
+    jne .nobrace
+    mov rdi, rbx
+    mov rsi, r12
+    mov rdx, r13
+    call init_local_list
+    jmp .out
+.nobrace:
+    bt rbx, TF_ARRAY_BIT
+    jnc .value
+    cmp qword [tk], T_STR
+    je .str
+    ERR "an array is initialized with a {...} list (or a string for a char array)"
+.str:
+    mov rax, rbx
+    btr rax, TF_ARRAY_BIT
+    sub rax, TY_PTR1
+    cmp rax, TY_CHAR
+    je .s1
+    ERR "only a char array can be initialized with a string"
+.s1:
+    mov rcx, [tk_len]
+    cmp rcx, r13
+    jbe .s2
+    ERR "the string is longer than the array"
+.s2:
+    xor r14d, r14d
+.sl:
+    cmp r14, [tk_len]
+    jae .sdone
+    mov rax, [tk_ptr]
+    cmp dword [init_mode], 0
+    je .sl_code
+    movzx eax, byte [rax + r14]
+    lea rcx, [r12 + r14]
+    mov [data_buf + rcx], al
+    inc r14
+    jmp .sl
+.sl_code:
+    movzx edi, byte [rax + r14]
+    call gen_imm_a
+    lea edi, [r12 + r14]
+    CG lea_local_b
+    CG store1
+    inc r14
+    jmp .sl
+.sdone:
+    call next_token
+    jmp .out
+.value:
+    cmp dword [init_mode], 0
+    jne .dvalue
+    call parse_assign
+    call to_rvalue
+    mov rdi, rbx
+    call coerce_to
+    mov edi, r12d
+    CG lea_local_b
+    mov rdi, rbx
+    call emit_store_type
+    jmp .out
+.dvalue:
+    cmp rbx, TY_DOUBLE
+    jne .dint
+    call const_double
+    xor edx, edx
+    jmp .dgot
+.dint:
+    call const_expr
+.dgot:
+    push rax
+    push rdx
+    mov rdi, rbx
+    call type_ls
+    pop rdx
+    pop rcx
+    cmp eax, 8
+    je .dq
+    cmp eax, 1
+    je .db
+    ERR "a struct value cannot be used here, use a {...} list"
+.db:
+    mov [data_buf + r12], cl
+    jmp .out
+.dq:
+    mov [data_buf + r12], rcx
+    test edx, edx
+    jz .out
+    mov edi, r12d
+    mov esi, R_DATA64
+    xor edx, edx
+    call add_reloc
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; init_local_list: rdi = type (struct or array), rsi = frame offset, rdx = element count (arrays). Current token: '{'
+init_local_list:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    mov rbx, rdi
+    mov r12, rsi
+    mov r14, rdx
+    call next_token
+    bt rbx, TF_ARRAY_BIT
+    jc .array
+    test ebx, 0xFF00
+    jnz .bad
+    cmp bl, TY_STRUCT
+    je .struct
+.bad:
+    ERR "this type cannot be initialized with a {...} list"
+.struct:
+    mov edi, ebx
+    shr edi, 16
+    and edi, 0xFFFF
+    call struct_ptr
+    mov r15, rax
+    mov r14d, [r15+ST_NFIELDS]
+    mov eax, [r15+ST_FIRST]
+    shl rax, 5
+    add rax, field_tab
+    mov r13, rax
+.sloop:
+    cmp qword [tk], '}'
+    je .close
+    test r14d, r14d
+    jnz .s1
+    ERR "too many values in the initializer list"
+.s1:
+    mov rdi, [r13+FD_TYPE]
+    mov esi, [r13+FD_OFFSET]
+    add rsi, r12
+    xor edx, edx
+    bt rdi, TF_ARRAY_BIT
+    jnc .s2
+    cmp r14d, 1
+    jbe .last
+    mov ecx, [r13+FD_SIZEOF+FD_OFFSET]
+    jmp .bnd
+.last:
+    mov ecx, [r15+ST_SIZE]
+.bnd:
+    sub ecx, [r13+FD_OFFSET]
+    push rcx
+    push rdi
+    push rsi
+    btr rdi, TF_ARRAY_BIT
+    sub rdi, TY_PTR1
+    call type_size
+    mov r8, rax
+    pop rsi
+    pop rdi
+    pop rax
+    xor edx, edx
+    div r8
+    mov rdx, rax
+.s2:
+    call init_elem
+    add r13, FD_SIZEOF
+    dec r14d
+    cmp qword [tk], ','
+    jne .close
+    call next_token
+    jmp .sloop
+.array:
+    mov r15, rbx
+    btr r15, TF_ARRAY_BIT
+    sub r15, TY_PTR1
+    mov rdi, r15
+    call type_size
+    mov r13, rax
+    xor ebp, ebp
+.aloop:
+    cmp qword [tk], '}'
+    je .close
+    cmp rbp, r14
+    jb .a1
+    ERR "too many values in the initializer list"
+.a1:
+    mov rsi, rbp
+    imul rsi, r13
+    add rsi, r12
+    mov rdi, r15
+    xor edx, edx
+    call init_elem
+    inc rbp
+    cmp qword [tk], ','
+    jne .close
+    call next_token
+    jmp .aloop
+.close:
+    mov edi, '}'
+    call expect
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret

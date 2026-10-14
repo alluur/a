@@ -2059,6 +2059,8 @@ lf_dlen:        resq 1
 lf_alen:        resq 1
 lf_blen:        resq 1
 lf_ex:          resd 1
+init_count:     resq 1
+init_mode:      resd 1
 alignb 16
 lf_bnD:         resd 512
 lf_bnA:         resd 1024

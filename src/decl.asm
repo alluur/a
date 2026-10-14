@@ -1405,11 +1405,25 @@ parse_global_vars:
     mov edx, F_BSS
     jmp .reg
 .init:
+    call next_token
+    cmp qword [tk], '{'
+    je .glist
     bt rbx, TF_ARRAY_BIT
     jnc .i0
-    ERR "array initializers are not supported, assign the elements in code"
+.glist:
+    mov rdi, r15
+    mov esi, 8
+    call data_alloc
+    mov r13, rax
+    mov dword [init_mode], 1
+    mov rdi, rbx
+    mov rsi, r13
+    mov rdx, r14
+    call init_elem
+    mov dword [init_mode], 0
+    xor edx, edx
+    jmp .reg
 .i0:
-    call next_token
     cmp rbx, TY_DOUBLE
     jne .i0int
     call const_double
