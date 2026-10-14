@@ -1,0 +1,1337 @@
+// =============================================================================
+//  gterm - a terminal emulator widget (Linux and Android)                                            import gterm;
+//
+//    gterm.Terminal* t = new gterm.Terminal();
+//    t->flex = 1;
+//    col->add(t);
+//    window->setRoot(col);
+//    t->start(display, null);           // runs $SHELL (or /bin/sh); start(display, "ls -l") runs a command
+//
+//  The widget understands the usual ANSI/xterm escape sequences (colours with 16, 256 and 24-bit values, cursor movement,
+//  erasing, scroll regions, the alternate screen used by full-screen programs, UTF-8, box-drawing characters, bracketed
+//  paste, window title), keeps 2000 lines of history (mouse wheel, Shift+PageUp/PageDown), selects text with the mouse
+//  (copy goes to the clipboard, middle click or Ctrl+Shift+V pastes) and resizes the pseudo terminal with the widget.
+//  feed(text) writes text to the screen as if the program had printed it (used for tests and for a terminal without a
+//  program). onExit(terminal) is called when the program has ended (exitStatus holds its status).
+// =============================================================================
+import gui;
+import gfx;
+import adp;
+import cstdlib;
+import cunistd;
+module gterm;
+
+const SCROLLBACK = 2000;
+const FLAG_BOLD = 1;
+const FLAG_UNDERLINE = 2;
+const FLAG_REVERSE = 4;
+const FLAG_DIM = 8;
+const FLAG_ITALIC = 16;
+
+public int defaultFg = 0xFFD8DCE0;
+public int defaultBg = 0xFF14181C;
+public int selectionBg = 0xFF3C5A8C;
+
+int ansi[16] = { 0x000000, 0xCD3131, 0x0DBC79, 0xE5E510, 0x2472C8, 0xBC3FBC, 0x11A8CD, 0xE5E5E5,
+                 0x666666, 0xF14C4C, 0x23D18B, 0xF5F543, 0x3B8EEA, 0xD670D6, 0x29B8DB, 0xFFFFFF };
+
+// the colour of entry n of the 256 colour palette (0xRRGGBB)
+public int paletteColor(int n) {
+    if (n < 16) {
+        return ansi[n];
+    }
+    if (n < 232) {
+        int v = n - 16;
+        int r = v / 36;
+        int g = (v / 6) % 6;
+        int b = v % 6;
+        r = (r == 0) ? 0 : 55 + r * 40;
+        g = (g == 0) ? 0 : 55 + g * 40;
+        b = (b == 0) ? 0 : 55 + b * 40;
+        return (r << 16) | (g << 8) | b;
+    }
+    int gray = 8 + (n - 232) * 10;
+    return (gray << 16) | (gray << 8) | gray;
+}
+
+// ---- a row of cells: two ints per cell ----------------------------------------------------------------------------------------------
+//   first:  code point | flags << 24            second:  foreground (bit 24 = set, 24 bits colour) | background << 25 (the same)
+class Line {
+    public int* c;
+    public int n;
+
+    public Line(int cols) {
+        n = cols;
+        c = (int*) malloc(cols * 16);
+        for (int i = 0; i < cols; i++) {
+            c[i * 2] = 32;
+            c[i * 2 + 1] = 0;
+        }
+    }
+
+    public void clear(int from, int to, int blank2) {
+        if (to > n) { to = n; }
+        for (int i = from; i < to; i++) {
+            c[i * 2] = 32;
+            c[i * 2 + 1] = blank2;
+        }
+    }
+}
+
+// the box-drawing pieces of a character: bit 0 up, 1 down, 2 left, 3 right (0 = not a box character)
+int boxBits(int cp) {
+    if (cp == 0x2500 || cp == 0x2501 || cp == 0x2550 || cp == 0x254C || cp == 0x254D || cp == 0x2504 || cp == 0x2505 || cp == 0x2508 || cp == 0x2509) { return 12; }
+    if (cp == 0x2502 || cp == 0x2503 || cp == 0x2551 || cp == 0x254E || cp == 0x254F || cp == 0x2506 || cp == 0x2507 || cp == 0x250A || cp == 0x250B) { return 3; }
+    if ((cp >= 0x250C && cp <= 0x250F) || cp == 0x2554 || cp == 0x2552 || cp == 0x2553 || cp == 0x256D) { return 10; }
+    if ((cp >= 0x2510 && cp <= 0x2513) || cp == 0x2557 || cp == 0x2555 || cp == 0x2556 || cp == 0x256E) { return 6; }
+    if ((cp >= 0x2514 && cp <= 0x2517) || cp == 0x255A || cp == 0x2558 || cp == 0x2559 || cp == 0x2570) { return 9; }
+    if ((cp >= 0x2518 && cp <= 0x251B) || cp == 0x255D || cp == 0x255B || cp == 0x255C || cp == 0x256F) { return 5; }
+    if ((cp >= 0x251C && cp <= 0x2523) || cp == 0x2560 || cp == 0x255E || cp == 0x255F) { return 11; }
+    if ((cp >= 0x2524 && cp <= 0x252B) || cp == 0x2563 || cp == 0x2561 || cp == 0x2562) { return 7; }
+    if ((cp >= 0x252C && cp <= 0x2533) || cp == 0x2566 || cp == 0x2564 || cp == 0x2565) { return 14; }
+    if ((cp >= 0x2534 && cp <= 0x253B) || cp == 0x2569 || cp == 0x2567 || cp == 0x2568) { return 13; }
+    if ((cp >= 0x253C && cp <= 0x254B) || cp == 0x256C || cp == 0x256A || cp == 0x256B) { return 15; }
+    if (cp == 0x2574 || cp == 0x2578) { return 4; }
+    if (cp == 0x2575 || cp == 0x2579) { return 1; }
+    if (cp == 0x2576 || cp == 0x257A) { return 8; }
+    if (cp == 0x2577 || cp == 0x257B) { return 2; }
+    return 0;
+}
+
+// encodes a code point as UTF-8 into out (at least 5 bytes); returns the length
+int encodeUtf8(int cp, char* out) {
+    if (cp < 0x80) {
+        out[0] = cp;
+        out[1] = 0;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = 0xC0 | (cp >> 6);
+        out[1] = 0x80 | (cp & 63);
+        out[2] = 0;
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = 0xE0 | (cp >> 12);
+        out[1] = 0x80 | ((cp >> 6) & 63);
+        out[2] = 0x80 | (cp & 63);
+        out[3] = 0;
+        return 3;
+    }
+    out[0] = 0xF0 | (cp >> 18);
+    out[1] = 0x80 | ((cp >> 12) & 63);
+    out[2] = 0x80 | ((cp >> 6) & 63);
+    out[3] = 0x80 | (cp & 63);
+    out[4] = 0;
+    return 4;
+}
+
+// ---- system calls for the pseudo terminal -----------------------------------------------------------------------------------------------
+int sysIoctl(int fd, int req, char* arg) {
+    return __syscall(__ARCH == 0 ? 16 : 29, fd, req, (int) arg, 0, 0, 0);
+}
+
+int sysSetsid() {
+    return __syscall(__ARCH == 0 ? 112 : 157, 0, 0, 0, 0, 0, 0);
+}
+
+int ptyReadable(int arg);
+
+public class Terminal : gui.Widget {
+    public func onExit;             // int f(int terminal)
+    public func onTitle;            // int f(int terminal): title holds the text (when not set, the window title is changed)
+    public char* title;
+    public int exitStatus;
+    public bool running;
+    public int cols;
+    public int rows;
+    public int cursorRow;
+    public int cursorCol;
+    public bool showCursor;
+    public bool autoTitle;
+    public int pid;
+    public int master;
+
+    private gui.Display* display;
+    private Line** grid;
+    private Line** mainGrid;
+    private Line** altGrid;
+    private bool altActive;
+    private Line** sb;
+    private int sbStart;
+    private int sbCount;
+    private int viewOff;
+    private int cw;
+    private int chh;
+    private int top;                // scroll region
+    private int bottom;
+    private bool wrapPending;
+    private bool autoWrap;
+    private bool appCursor;
+    private bool bracketed;
+    private int curFlags;
+    private int curFg;
+    private int curBg;
+    private int savedRow;
+    private int savedCol;
+    private int savedFlags;
+    private int savedFg;
+    private int savedBg;
+    private int state;
+    private int params[16];
+    private int nparams;
+    private bool privMode;
+    private int utfLeft;
+    private int utfCode;
+    private char* osc;
+    private int oscLen;
+    private bool focused;
+    private int selA;               // selection: absolute cell positions (line * cols + col); -1 = none
+    private int selB;
+    private bool selecting;
+    private char* tabs;
+
+    public Terminal() {
+        super();
+        focusable = true;
+        showCursor = true;
+        autoWrap = true;
+        autoTitle = true;
+        title = "";
+        selA = -1;
+        selB = -1;
+        master = -1;
+        osc = malloc(520);
+        gfx.Font* f = gfx.mono();
+        cw = f->advance('M');
+        chh = f->height + 1;
+        w = cw * 80;
+        h = chh * 24;
+        flex = 1;
+        sb = (Line**) calloc(SCROLLBACK, 8);
+        resizeGrid(80, 24);
+    }
+
+    public virtual int prefW() { return cw * 80 + 6; }
+    public virtual int prefH() { return chh * 24 + 6; }
+    public int cellW() { return cw; }
+    public int cellH() { return chh; }
+
+    // ---- the grid ------------------------------------------------------------------------------------------------------------------------
+    private Line** newGrid(int nc, int nr) {
+        Line** g = (Line**) calloc(nr, 8);
+        for (int i = 0; i < nr; i++) {
+            g[i] = new Line(nc);
+        }
+        return g;
+    }
+
+    // new size in cells; the contents stay where they are (lines that fall off the top go to the history)
+    public void resizeGrid(int nc, int nr) {
+        if (nc < 2) { nc = 2; }
+        if (nr < 1) { nr = 1; }
+        if (grid == null) {
+            mainGrid = newGrid(nc, nr);
+            altGrid = newGrid(nc, nr);
+            grid = mainGrid;
+            cols = nc;
+            rows = nr;
+            top = 0;
+            bottom = nr - 1;
+            tabs = malloc(nc + 1);
+            for (int i = 0; i <= nc; i++) { tabs[i] = (i % 8 == 0 && i > 0) ? 1 : 0; }
+            return;
+        }
+        if (nc == cols && nr == rows) {
+            return;
+        }
+        Line** g = newGrid(nc, nr);
+        Line** old = mainGrid;
+        // lines that no longer fit above the cursor go to the history
+        int drop = 0;
+        if (nr < rows && !altActive) {
+            drop = cursorRow - nr + 1;
+            if (drop < 0) { drop = 0; }
+            for (int i = 0; i < drop; i++) {
+                pushHistory(old[i]);
+            }
+        }
+        for (int i = 0; i < nr; i++) {
+            int srcRow = i + drop;
+            if (srcRow < rows) {
+                Line* src = old[srcRow];
+                Line* dst = g[i];
+                int n = (src->n < nc) ? src->n : nc;
+                for (int k = 0; k < n * 2; k++) { dst->c[k] = src->c[k]; }
+            }
+        }
+        mainGrid = g;
+        altGrid = newGrid(nc, nr);
+        grid = altActive ? altGrid : mainGrid;
+        cursorRow = cursorRow - drop;
+        if (cursorRow >= nr) { cursorRow = nr - 1; }
+        if (cursorRow < 0) { cursorRow = 0; }
+        if (cursorCol >= nc) { cursorCol = nc - 1; }
+        cols = nc;
+        rows = nr;
+        top = 0;
+        bottom = nr - 1;
+        wrapPending = false;
+        tabs = malloc(nc + 1);
+        for (int i = 0; i <= nc; i++) { tabs[i] = (i % 8 == 0 && i > 0) ? 1 : 0; }
+        selA = -1;
+        selB = -1;
+        if (viewOff > sbCount) { viewOff = sbCount; }
+    }
+
+    private void pushHistory(Line* ln) {
+        if (sbCount == SCROLLBACK) {
+            sb[sbStart] = ln;
+            sbStart = (sbStart + 1) % SCROLLBACK;
+        } else {
+            sb[(sbStart + sbCount) % SCROLLBACK] = ln;
+            sbCount++;
+        }
+        if (viewOff > 0) {
+            viewOff++;
+            if (viewOff > sbCount) { viewOff = sbCount; }
+        }
+        if (selA >= 0) {
+            // the selection moves up with the text
+            selA = selA - cols;
+            selB = selB - cols;
+            if (selA < 0 && selB < 0) {
+                selA = -1;
+                selB = -1;
+            }
+        }
+    }
+
+    // the line at an absolute number (0 = oldest line of the history)
+    private Line* lineAt(int a) {
+        if (a < 0) {
+            return null;
+        }
+        if (a < sbCount) {
+            return sb[(sbStart + a) % SCROLLBACK];
+        }
+        a = a - sbCount;
+        if (a >= rows) {
+            return null;
+        }
+        return grid[a];
+    }
+
+    private int blank2() {
+        return (curBg != 0) ? (curBg << 25) : 0;
+    }
+
+    // moves the lines of the scroll region up by n (the first one leaves for the history when the region is the whole screen)
+    private void scrollUp(int n) {
+        for (int k = 0; k < n; k++) {
+            Line* gone = grid[top];
+            if (top == 0 && !altActive) {
+                pushHistory(gone);
+                gone = new Line(cols);
+            } else {
+                gone->clear(0, cols, 0);
+            }
+            for (int i = top; i < bottom; i++) {
+                grid[i] = grid[i + 1];
+            }
+            gone->clear(0, cols, blank2());
+            grid[bottom] = gone;
+        }
+        invalidate();
+    }
+
+    private void scrollDown(int n) {
+        for (int k = 0; k < n; k++) {
+            Line* gone = grid[bottom];
+            for (int i = bottom; i > top; i--) {
+                grid[i] = grid[i - 1];
+            }
+            gone->clear(0, cols, blank2());
+            grid[top] = gone;
+        }
+        invalidate();
+    }
+
+    private void lineFeed() {
+        if (cursorRow == bottom) {
+            scrollUp(1);
+        } else if (cursorRow < rows - 1) {
+            cursorRow++;
+        }
+    }
+
+    private void reverseIndex() {
+        if (cursorRow == top) {
+            scrollDown(1);
+        } else if (cursorRow > 0) {
+            cursorRow--;
+        }
+    }
+
+    // writes one character at the cursor
+    private void put(int cp) {
+        if (wrapPending) {
+            wrapPending = false;
+            if (autoWrap) {
+                cursorCol = 0;
+                lineFeed();
+            }
+        }
+        Line* ln = grid[cursorRow];
+        ln->c[cursorCol * 2] = cp | (curFlags << 24);
+        ln->c[cursorCol * 2 + 1] = curFg | (curBg << 25);
+        if (cursorCol >= cols - 1) {
+            wrapPending = true;
+        } else {
+            cursorCol++;
+        }
+    }
+
+    private void clampCursor() {
+        if (cursorRow < 0) { cursorRow = 0; }
+        if (cursorRow >= rows) { cursorRow = rows - 1; }
+        if (cursorCol < 0) { cursorCol = 0; }
+        if (cursorCol >= cols) { cursorCol = cols - 1; }
+        wrapPending = false;
+    }
+
+    private void eraseLine(int row, int from, int to) {
+        grid[row]->clear(from, to, blank2());
+    }
+
+    private void eraseDisplay(int mode) {
+        if (mode == 0) {
+            eraseLine(cursorRow, cursorCol, cols);
+            for (int r = cursorRow + 1; r < rows; r++) { eraseLine(r, 0, cols); }
+        } else if (mode == 1) {
+            for (int r = 0; r < cursorRow; r++) { eraseLine(r, 0, cols); }
+            eraseLine(cursorRow, 0, cursorCol + 1);
+        } else if (mode == 2) {
+            for (int r = 0; r < rows; r++) { eraseLine(r, 0, cols); }
+        } else if (mode == 3) {
+            sbCount = 0;
+            viewOff = 0;
+        }
+    }
+
+    // ---- sending to the program ----------------------------------------------------------------------------------------------------------
+    public void send(char* s) {
+        sendBytes(s, strlen(s));
+    }
+
+    // without a program (master < 0) what would be sent is collected instead; takeSent() returns it and starts again
+    private char* sentBuf;
+    private int sentLen;
+
+    public char* takeSent() {
+        if (sentBuf == null) {
+            return "";
+        }
+        sentBuf[sentLen] = 0;
+        char* r = strdup(sentBuf);
+        sentLen = 0;
+        return r;
+    }
+
+    public void sendBytes(char* s, int n) {
+        if (master < 0) {
+            if (sentBuf == null) {
+                sentBuf = malloc(4096);
+            }
+            for (int i = 0; i < n && sentLen < 4000; i++) {
+                sentBuf[sentLen] = s[i];
+                sentLen++;
+            }
+            return;
+        }
+        int done = 0;
+        while (done < n) {
+            int k = write(master, &s[done], n - done);
+            if (k <= 0) {
+                break;
+            }
+            done = done + k;
+        }
+    }
+
+    // ---- the escape sequence parser ----------------------------------------------------------------------------------------------------
+    private int pdef(int i, int d) {
+        if (i >= nparams || params[i] <= 0) {
+            return d;
+        }
+        return params[i];
+    }
+
+    private int pget(int i) {
+        if (i >= nparams) {
+            return 0;
+        }
+        return params[i];
+    }
+
+    private int colorOf(int rgb) {
+        return 0x1000000 | (rgb & 0xFFFFFF);
+    }
+
+    private void sgr() {
+        if (nparams == 0) {
+            nparams = 1;
+            params[0] = 0;
+        }
+        for (int i = 0; i < nparams; i++) {
+            int p = params[i];
+            if (p == 0) { curFlags = 0; curFg = 0; curBg = 0; }
+            else if (p == 1) { curFlags = curFlags | FLAG_BOLD; }
+            else if (p == 2) { curFlags = curFlags | FLAG_DIM; }
+            else if (p == 3) { curFlags = curFlags | FLAG_ITALIC; }
+            else if (p == 4) { curFlags = curFlags | FLAG_UNDERLINE; }
+            else if (p == 7) { curFlags = curFlags | FLAG_REVERSE; }
+            else if (p == 22) { curFlags = curFlags & ~(FLAG_BOLD | FLAG_DIM); }
+            else if (p == 23) { curFlags = curFlags & ~FLAG_ITALIC; }
+            else if (p == 24) { curFlags = curFlags & ~FLAG_UNDERLINE; }
+            else if (p == 27) { curFlags = curFlags & ~FLAG_REVERSE; }
+            else if (p >= 30 && p <= 37) { curFg = colorOf(ansi[p - 30]); }
+            else if (p == 39) { curFg = 0; }
+            else if (p >= 40 && p <= 47) { curBg = colorOf(ansi[p - 40]); }
+            else if (p == 49) { curBg = 0; }
+            else if (p >= 90 && p <= 97) { curFg = colorOf(ansi[p - 90 + 8]); }
+            else if (p >= 100 && p <= 107) { curBg = colorOf(ansi[p - 100 + 8]); }
+            else if (p == 38 || p == 48) {
+                int color = 0;
+                bool ok = false;
+                if (i + 2 < nparams && params[i + 1] == 5) {
+                    color = colorOf(paletteColor(params[i + 2] & 255));
+                    ok = true;
+                    i = i + 2;
+                } else if (i + 4 < nparams && params[i + 1] == 2) {
+                    color = colorOf((params[i + 2] << 16) | (params[i + 3] << 8) | params[i + 4]);
+                    ok = true;
+                    i = i + 4;
+                }
+                if (ok) {
+                    if (p == 38) { curFg = color; } else { curBg = color; }
+                }
+            }
+        }
+    }
+
+    private void setMode(bool on) {
+        for (int i = 0; i < nparams; i++) {
+            int p = params[i];
+            if (!privMode) {
+                continue;
+            }
+            if (p == 1) { appCursor = on; }
+            else if (p == 7) { autoWrap = on; }
+            else if (p == 25) { showCursor = on; }
+            else if (p == 2004) { bracketed = on; }
+            else if (p == 47 || p == 1047 || p == 1049) { switchScreen(on, p == 1049); }
+        }
+    }
+
+    private void switchScreen(bool alt, bool saveCursor) {
+        if (alt == altActive) {
+            return;
+        }
+        if (alt) {
+            if (saveCursor) {
+                savedRow = cursorRow; savedCol = cursorCol;
+            }
+            altActive = true;
+            grid = altGrid;
+            for (int r = 0; r < rows; r++) { grid[r]->clear(0, cols, 0); }
+            top = 0;
+            bottom = rows - 1;
+        } else {
+            altActive = false;
+            grid = mainGrid;
+            top = 0;
+            bottom = rows - 1;
+            if (saveCursor) {
+                cursorRow = savedRow; cursorCol = savedCol;
+                clampCursor();
+            }
+        }
+        viewOff = 0;
+        invalidate();
+    }
+
+    private void csi(int final) {
+        int n = pdef(0, 1);
+        if (final == 'A') { cursorRow = cursorRow - n; if (cursorRow < top && cursorRow + n >= top) { cursorRow = top; } clampCursor(); }
+        else if (final == 'B' || final == 'e') { cursorRow = cursorRow + n; if (cursorRow > bottom && cursorRow - n <= bottom) { cursorRow = bottom; } clampCursor(); }
+        else if (final == 'C' || final == 'a') { cursorCol = cursorCol + n; clampCursor(); }
+        else if (final == 'D') { cursorCol = cursorCol - n; clampCursor(); }
+        else if (final == 'E') { cursorRow = cursorRow + n; cursorCol = 0; clampCursor(); }
+        else if (final == 'F') { cursorRow = cursorRow - n; cursorCol = 0; clampCursor(); }
+        else if (final == 'G' || final == '`') { cursorCol = n - 1; clampCursor(); }
+        else if (final == 'd') { cursorRow = n - 1; clampCursor(); }
+        else if (final == 'H' || final == 'f') { cursorRow = pdef(0, 1) - 1; cursorCol = pdef(1, 1) - 1; clampCursor(); }
+        else if (final == 'J') { eraseDisplay(pget(0)); }
+        else if (final == 'K') {
+            int m = pget(0);
+            if (m == 0) { eraseLine(cursorRow, cursorCol, cols); }
+            else if (m == 1) { eraseLine(cursorRow, 0, cursorCol + 1); }
+            else if (m == 2) { eraseLine(cursorRow, 0, cols); }
+        }
+        else if (final == 'L') {
+            if (cursorRow >= top && cursorRow <= bottom) {
+                int save = top;
+                top = cursorRow;
+                scrollDown(n);
+                top = save;
+            }
+        }
+        else if (final == 'M') {
+            if (cursorRow >= top && cursorRow <= bottom) {
+                int save = top;
+                top = cursorRow;
+                bool alt = altActive;
+                altActive = true;           // deleted lines do not go to the history
+                scrollUp(n);
+                altActive = alt;
+                top = save;
+            }
+        }
+        else if (final == 'P') {
+            Line* ln = grid[cursorRow];
+            if (n > cols - cursorCol) { n = cols - cursorCol; }
+            for (int i = cursorCol; i < cols - n; i++) { ln->c[i * 2] = ln->c[(i + n) * 2]; ln->c[i * 2 + 1] = ln->c[(i + n) * 2 + 1]; }
+            ln->clear(cols - n, cols, blank2());
+        }
+        else if (final == '@') {
+            Line* ln = grid[cursorRow];
+            if (n > cols - cursorCol) { n = cols - cursorCol; }
+            for (int i = cols - 1; i >= cursorCol + n; i--) { ln->c[i * 2] = ln->c[(i - n) * 2]; ln->c[i * 2 + 1] = ln->c[(i - n) * 2 + 1]; }
+            ln->clear(cursorCol, cursorCol + n, blank2());
+        }
+        else if (final == 'X') { eraseLine(cursorRow, cursorCol, cursorCol + n); }
+        else if (final == 'S') { scrollUp(n); }
+        else if (final == 'T') { scrollDown(n); }
+        else if (final == 'm') { sgr(); }
+        else if (final == 'h') { setMode(true); }
+        else if (final == 'l') { setMode(false); }
+        else if (final == 'r') {
+            int t = pdef(0, 1) - 1;
+            int b = pdef(1, rows) - 1;
+            if (t < 0) { t = 0; }
+            if (b >= rows) { b = rows - 1; }
+            if (t < b) {
+                top = t;
+                bottom = b;
+                cursorRow = 0;
+                cursorCol = 0;
+                wrapPending = false;
+            }
+        }
+        else if (final == 's') { savedRow = cursorRow; savedCol = cursorCol; savedFlags = curFlags; savedFg = curFg; savedBg = curBg; }
+        else if (final == 'u') { cursorRow = savedRow; cursorCol = savedCol; clampCursor(); }
+        else if (final == 'n') {
+            if (pget(0) == 6) {
+                char reply[32];
+                format(&reply[0], 32, "\x1b[%d;%dR", cursorRow + 1, cursorCol + 1);
+                send(&reply[0]);
+            } else if (pget(0) == 5) {
+                send("\x1b[0n");
+            }
+        }
+        else if (final == 'c') {
+            if (!privMode) {
+                send("\x1b[?1;2c");
+            }
+        }
+        invalidate();
+    }
+
+    private void oscDone() {
+        osc[oscLen] = 0;
+        int code = 0;
+        int i = 0;
+        while (i < oscLen && osc[i] >= '0' && osc[i] <= '9') {
+            code = code * 10 + osc[i] - '0';
+            i++;
+        }
+        if (i < oscLen && osc[i] == ';' && (code == 0 || code == 2)) {
+            title = strdup(&osc[i + 1]);
+            if (onTitle != null) {
+                onTitle(this);
+            } else if (autoTitle && win != null) {
+                win->setTitle(title);
+            }
+        }
+    }
+
+    private void escFinal(int c) {
+        if (c == '7') { savedRow = cursorRow; savedCol = cursorCol; savedFlags = curFlags; savedFg = curFg; savedBg = curBg; }
+        else if (c == '8') { cursorRow = savedRow; cursorCol = savedCol; clampCursor(); }
+        else if (c == 'D') { lineFeed(); }
+        else if (c == 'E') { cursorCol = 0; lineFeed(); }
+        else if (c == 'M') { reverseIndex(); }
+        else if (c == 'c') { fullReset(); }
+        invalidate();
+    }
+
+    public void fullReset() {
+        switchScreen(false, false);
+        for (int r = 0; r < rows; r++) { grid[r]->clear(0, cols, 0); }
+        cursorRow = 0;
+        cursorCol = 0;
+        curFlags = 0;
+        curFg = 0;
+        curBg = 0;
+        top = 0;
+        bottom = rows - 1;
+        autoWrap = true;
+        appCursor = false;
+        bracketed = false;
+        showCursor = true;
+        wrapPending = false;
+    }
+
+    // one byte of output from the program
+    private void feedByte(int b) {
+        if (state == 0) {
+            if (utfLeft > 0) {
+                if ((b & 0xC0) == 0x80) {
+                    utfCode = (utfCode << 6) | (b & 63);
+                    utfLeft--;
+                    if (utfLeft == 0) {
+                        put(utfCode);
+                    }
+                    return;
+                }
+                utfLeft = 0;
+            }
+            if (b >= 0x20 && b < 0x7F) { put(b); return; }
+            if (b >= 0xC2 && b < 0xE0) { utfLeft = 1; utfCode = b & 31; return; }
+            if (b >= 0xE0 && b < 0xF0) { utfLeft = 2; utfCode = b & 15; return; }
+            if (b >= 0xF0 && b < 0xF5) { utfLeft = 3; utfCode = b & 7; return; }
+            if (b == 27) { state = 1; return; }
+            if (b == 13) { cursorCol = 0; wrapPending = false; return; }
+            if (b == 10 || b == 11 || b == 12) { lineFeed(); wrapPending = false; return; }
+            if (b == 8) { if (cursorCol > 0) { cursorCol--; } wrapPending = false; return; }
+            if (b == 9) {
+                int c = cursorCol + 1;
+                while (c < cols - 1 && tabs[c] == 0) { c++; }
+                cursorCol = (c >= cols) ? cols - 1 : c;
+                wrapPending = false;
+                return;
+            }
+            if (b == 7) { return; }
+            return;
+        }
+        if (state == 1) {
+            if (b == '[') { state = 2; nparams = 0; privMode = false; params[0] = 0; return; }
+            if (b == ']') { state = 3; oscLen = 0; return; }
+            if (b == '(' || b == ')' || b == '*' || b == '+' || b == '#' || b == '%') { state = 4; return; }
+            if (b == 'P' || b == '_' || b == '^' || b == 'X') { state = 6; return; }
+            state = 0;
+            escFinal(b);
+            return;
+        }
+        if (state == 2) {
+            if (b >= '0' && b <= '9') {
+                if (nparams == 0) { nparams = 1; params[0] = 0; }
+                if (nparams <= 16) { params[nparams - 1] = params[nparams - 1] * 10 + b - '0'; }
+                return;
+            }
+            if (b == ';' || b == ':') {
+                if (nparams == 0) { nparams = 1; params[0] = 0; }
+                if (nparams < 16) { params[nparams] = 0; nparams++; }
+                return;
+            }
+            if (b == '?' || b == '>' || b == '=' || b == '<') { privMode = (b == '?'); return; }
+            if (b >= 0x20 && b <= 0x2F) { return; }
+            state = 0;
+            if (b >= 0x40 && b <= 0x7E) {
+                csi(b);
+            }
+            return;
+        }
+        if (state == 3) {
+            if (b == 7) { state = 0; oscDone(); return; }
+            if (b == 27) { state = 5; return; }
+            if (oscLen < 512) { osc[oscLen] = b; oscLen++; }
+            return;
+        }
+        if (state == 5) {
+            state = 0;
+            if (b == '\\') { oscDone(); }
+            return;
+        }
+        if (state == 4) {
+            state = 0;
+            return;
+        }
+        if (state == 6) {
+            if (b == 7) { state = 0; }
+            if (b == 27) { state = 5; }
+            return;
+        }
+    }
+
+    // writes text to the screen as if the program had printed it
+    public void feed(char* s) {
+        feedBytes(s, strlen(s));
+    }
+
+    public void feedBytes(char* s, int n) {
+        for (int i = 0; i < n; i++) {
+            feedByte(s[i] & 255);
+        }
+        invalidate();
+    }
+
+    // the text of a row of the visible screen (without trailing spaces), as UTF-8
+    public char* lineText(int row) {
+        Line* ln = (row >= 0 && row < rows) ? grid[row] : null;
+        return textOfLine(ln, 0, cols);
+    }
+
+    private char* textOfLine(Line* ln, int from, int to) {
+        if (ln == null) {
+            return "";
+        }
+        if (to > ln->n) { to = ln->n; }
+        int last = to - 1;
+        while (last >= from && (ln->c[last * 2] & 0xFFFFFF) == 32) {
+            last--;
+        }
+        char* out = malloc((last - from + 2) * 4 + 1);
+        int n = 0;
+        for (int i = from; i <= last; i++) {
+            n = n + encodeUtf8(ln->c[i * 2] & 0xFFFFFF, &out[n]);
+        }
+        out[n] = 0;
+        return out;
+    }
+
+    // ---- drawing ---------------------------------------------------------------------------------------------------------------------------
+    private bool isSelected(int absLine, int c) {
+        if (selA < 0) {
+            return false;
+        }
+        int p = absLine * cols + c;
+        int lo = (selA < selB) ? selA : selB;
+        int hi = (selA < selB) ? selB : selA;
+        return p >= lo && p <= hi;
+    }
+
+    private void drawBox(gfx.Surface* s, int x, int y, int bits, int color) {
+        int mx = x + cw / 2;
+        int my = y + chh / 2;
+        if ((bits & 1) != 0) { s->vline(mx, y, my - y + 1, color); }
+        if ((bits & 2) != 0) { s->vline(mx, my, y + chh - my, color); }
+        if ((bits & 4) != 0) { s->hline(x, my, mx - x + 1, color); }
+        if ((bits & 8) != 0) { s->hline(mx, my, x + cw - mx, color); }
+    }
+
+    private void drawCell(gfx.Surface* s, gfx.Font* f, int x, int y, int cp, int fg, int bg, bool bold) {
+        if (cp > 255) {
+            int bits = boxBits(cp);
+            if (bits != 0) {
+                drawBox(s, x, y, bits, fg);
+                if (bold) { drawBox(s, x + 1, y, bits & 12, fg); }
+                return;
+            }
+            if (cp == 0x2588) { s->fill(x, y, cw, chh, fg); return; }
+            if (cp == 0x2580) { s->fill(x, y, cw, chh / 2, fg); return; }
+            if (cp == 0x2584) { s->fill(x, y + chh / 2, cw, chh - chh / 2, fg); return; }
+            if (cp == 0x258C) { s->fill(x, y, cw / 2, chh, fg); return; }
+            if (cp == 0x2590) { s->fill(x + cw / 2, y, cw - cw / 2, chh, fg); return; }
+            if (cp >= 0x2591 && cp <= 0x2593) { s->fill(x, y, cw, chh, gfx.mix(bg, fg, (cp - 0x2590) * 64 - 1)); return; }
+            if (cp == 0x2022 || cp == 0x25CF) { s->fillCircle(x + cw / 2, y + chh / 2, 2, fg); return; }
+            cp = '?';
+        }
+        char buf[8];
+        encodeUtf8(cp, &buf[0]);
+        s->text(f, x, y, &buf[0], fg);
+        if (bold) {
+            s->text(f, x + 1, y, &buf[0], fg);
+        }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        gfx.Font* f = gfx.mono();
+        s->fill(ox, oy, w, h, defaultBg);
+        int pad = 3;
+        int firstAbs = sbCount - viewOff;
+        for (int r = 0; r < rows; r++) {
+            int y = oy + pad + r * chh;
+            if (y >= s->clipY1 || y + chh <= s->clipY0) {
+                continue;
+            }
+            Line* ln = lineAt(firstAbs + r);
+            if (ln == null) {
+                continue;
+            }
+            int n = (ln->n < cols) ? ln->n : cols;
+            for (int c = 0; c < n; c++) {
+                int a = ln->c[c * 2];
+                int b = ln->c[c * 2 + 1];
+                int cp = a & 0xFFFFFF;
+                int flags = (a >> 24) & 255;
+                int fg = b & 0x1FFFFFF;
+                int bg = (b >> 25) & 0x1FFFFFF;
+                int fgc = (fg != 0) ? (0xFF000000 | (fg & 0xFFFFFF)) : defaultFg;
+                int bgc = (bg != 0) ? (0xFF000000 | (bg & 0xFFFFFF)) : defaultBg;
+                if ((flags & FLAG_REVERSE) != 0) {
+                    int t = fgc;
+                    fgc = bgc;
+                    bgc = t;
+                }
+                if (isSelected(firstAbs + r, c)) {
+                    bgc = selectionBg;
+                }
+                if ((flags & FLAG_DIM) != 0) {
+                    fgc = gfx.mix(fgc, bgc, 110);
+                }
+                int x = ox + pad + c * cw;
+                if (bgc != defaultBg) {
+                    s->fill(x, y, cw, chh, bgc);
+                }
+                if (cp != 32) {
+                    drawCell(s, f, x, y, cp, fgc, bgc, (flags & FLAG_BOLD) != 0);
+                }
+                if ((flags & FLAG_UNDERLINE) != 0) {
+                    s->hline(x, y + chh - 1, cw, fgc);
+                }
+            }
+        }
+        if (viewOff == 0 && showCursor) {
+            int x = ox + pad + cursorCol * cw;
+            int y = oy + pad + cursorRow * chh;
+            if (focused) {
+                s->fill(x, y, cw, chh, defaultFg);
+                Line* ln = grid[cursorRow];
+                int cp = ln->c[cursorCol * 2] & 0xFFFFFF;
+                if (cp != 32) {
+                    drawCell(s, f, x, y, cp, defaultBg, defaultFg, false);
+                }
+            } else {
+                s->rect(x, y, cw, chh, defaultFg);
+            }
+        }
+        if (viewOff > 0) {
+            // a mark at the right edge shows that the view is in the history
+            int bar = h * rows / (sbCount + rows);
+            int pos = (h - bar) * (sbCount - viewOff) / sbCount;
+            s->fill(ox + w - 4, oy + pos, 3, bar, 0x80FFFFFF);
+        }
+    }
+
+    public virtual void layout() {
+        int pad = 3;
+        int nc = (w - pad * 2) / cw;
+        int nr = (h - pad * 2) / chh;
+        if (nc < 2 || nr < 1) {
+            return;
+        }
+        if (nc != cols || nr != rows) {
+            resizeGrid(nc, nr);
+            setWindowSize();
+        }
+    }
+
+    private void setWindowSize() {
+        if (master < 0) {
+            return;
+        }
+        char ws[8];
+        ws[0] = rows & 255;
+        ws[1] = (rows >> 8) & 255;
+        ws[2] = cols & 255;
+        ws[3] = (cols >> 8) & 255;
+        ws[4] = 0; ws[5] = 0; ws[6] = 0; ws[7] = 0;
+        sysIoctl(master, 0x5414, &ws[0]);                  // TIOCSWINSZ
+    }
+
+    public virtual bool wantsScroll() { return true; }
+
+    public virtual void onFocus(bool gained) {
+        focused = gained;
+        invalidate();
+    }
+
+    // ---- keyboard --------------------------------------------------------------------------------------------------------------------------
+    private int csiKey(char* out, int letter, int mods) {
+        int m = 1;
+        if ((mods & adp.MOD_SHIFT) != 0) { m = m + 1; }
+        if ((mods & adp.MOD_ALT) != 0) { m = m + 2; }
+        if ((mods & adp.MOD_CTRL) != 0) { m = m + 4; }
+        if (m == 1) {
+            out[0] = 27;
+            out[1] = appCursor ? 'O' : '[';
+            out[2] = letter;
+            return 3;
+        }
+        return format(out, 16, "\x1b[1;%d%c", m, letter);
+    }
+
+    private int tildeKey(char* out, int number, int mods) {
+        int m = 1;
+        if ((mods & adp.MOD_SHIFT) != 0) { m = m + 1; }
+        if ((mods & adp.MOD_ALT) != 0) { m = m + 2; }
+        if ((mods & adp.MOD_CTRL) != 0) { m = m + 4; }
+        if (m == 1) {
+            return format(out, 16, "\x1b[%d~", number);
+        }
+        return format(out, 16, "\x1b[%d;%d~", number, m);
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (key >= adp.KEY_SHIFT && key <= adp.KEY_CAPS) {
+            return true;
+        }
+        if (dn == 0) {
+            return true;
+        }
+        bool ctrl = (mods & adp.MOD_CTRL) != 0;
+        bool alt = (mods & adp.MOD_ALT) != 0;
+        bool shift = (mods & adp.MOD_SHIFT) != 0;
+        if (ctrl && shift && key == 'c') { copy(); return true; }
+        if (ctrl && shift && key == 'v') { paste(); return true; }
+        if (shift && key == adp.KEY_PGUP) { scrollView(rows - 1); return true; }
+        if (shift && key == adp.KEY_PGDN) { scrollView(1 - rows); return true; }
+        char out[24];
+        int n = 0;
+        if (key == adp.KEY_UP) { n = csiKey(&out[0], 'A', mods); }
+        else if (key == adp.KEY_DOWN) { n = csiKey(&out[0], 'B', mods); }
+        else if (key == adp.KEY_RIGHT) { n = csiKey(&out[0], 'C', mods); }
+        else if (key == adp.KEY_LEFT) { n = csiKey(&out[0], 'D', mods); }
+        else if (key == adp.KEY_HOME) { n = csiKey(&out[0], 'H', mods); }
+        else if (key == adp.KEY_END) { n = csiKey(&out[0], 'F', mods); }
+        else if (key == adp.KEY_PGUP) { n = tildeKey(&out[0], 5, mods); }
+        else if (key == adp.KEY_PGDN) { n = tildeKey(&out[0], 6, mods); }
+        else if (key == adp.KEY_INSERT) { n = tildeKey(&out[0], 2, mods); }
+        else if (key == adp.KEY_DELETE) { n = tildeKey(&out[0], 3, mods); }
+        else if (key >= adp.KEY_F1 && key <= adp.KEY_F1 + 3) {
+            out[0] = 27; out[1] = 'O'; out[2] = 'P' + (key - adp.KEY_F1); n = 3;
+        }
+        else if (key >= adp.KEY_F1 + 4 && key <= adp.KEY_F1 + 11) {
+            int codes[8] = { 15, 17, 18, 19, 20, 21, 23, 24 };
+            n = tildeKey(&out[0], codes[key - adp.KEY_F1 - 4], mods);
+        }
+        else if (key == adp.KEY_ENTER) { out[0] = 13; n = 1; }
+        else if (key == adp.KEY_BACKSPACE) { out[0] = 127; n = 1; }
+        else if (key == adp.KEY_TAB) {
+            if (shift) { out[0] = 27; out[1] = '['; out[2] = 'Z'; n = 3; } else { out[0] = 9; n = 1; }
+        }
+        else if (key == adp.KEY_ESCAPE) { out[0] = 27; n = 1; }
+        else if (ctrl && key >= 'a' && key <= 'z') { out[0] = key - 96; n = 1; }
+        else if (ctrl && key == '[') { out[0] = 27; n = 1; }
+        else if (ctrl && key == '\\') { out[0] = 28; n = 1; }
+        else if (ctrl && key == ']') { out[0] = 29; n = 1; }
+        else if (ctrl && (key == '6' || key == '^')) { out[0] = 30; n = 1; }
+        else if (ctrl && (key == '-' || key == '_' || key == '/')) { out[0] = 31; n = 1; }
+        else if (ctrl && (key == ' ' || key == '2' || key == '@')) { out[0] = 0; n = 1; }
+        else if (uni >= 32 && uni != 127) {
+            if (alt) {
+                out[0] = 27;
+                n = 1 + encodeUtf8(uni, &out[1]);
+            } else {
+                n = encodeUtf8(uni, &out[0]);
+            }
+        }
+        if (n > 0) {
+            if (alt && out[0] != 27) {
+                // Alt+Enter, Alt+Backspace ...: an Esc before it
+                char tmp[24];
+                tmp[0] = 27;
+                memcpy(&tmp[1], &out[0], n);
+                sendBytes(&tmp[0], n + 1);
+            } else {
+                sendBytes(&out[0], n);
+            }
+            viewOff = 0;
+            selA = -1;
+            selB = -1;
+            invalidate();
+            return true;
+        }
+        return false;
+    }
+
+    // ---- mouse, selection, clipboard, history -----------------------------------------------------------------------------------------------
+    private int cellAbs(int mx, int my) {
+        int pad = 3;
+        int c = (mx - pad) / cw;
+        int r = (my - pad) / chh;
+        if (c < 0) { c = 0; }
+        if (c >= cols) { c = cols - 1; }
+        if (r < 0) { r = 0; }
+        if (r >= rows) { r = rows - 1; }
+        return (sbCount - viewOff + r) * cols + c;
+    }
+
+    public void scrollView(int lines) {
+        viewOff = viewOff + lines;
+        if (viewOff > sbCount) { viewOff = sbCount; }
+        if (viewOff < 0) { viewOff = 0; }
+        invalidate();
+    }
+
+    public bool hasSelection() {
+        return selA >= 0 && selA != selB;
+    }
+
+    // the selected text (as UTF-8), "" when nothing is selected
+    public char* selectedText() {
+        if (!hasSelection()) {
+            return "";
+        }
+        int lo = (selA < selB) ? selA : selB;
+        int hi = (selA < selB) ? selB : selA;
+        int l0 = lo / cols;
+        int l1 = hi / cols;
+        int cap = (l1 - l0 + 1) * (cols * 4 + 1) + 1;
+        char* out = malloc(cap);
+        int n = 0;
+        for (int l = l0; l <= l1; l++) {
+            int from = (l == l0) ? lo % cols : 0;
+            int to = (l == l1) ? hi % cols + 1 : cols;
+            char* t = textOfLine(lineAt(l), from, to);
+            int tl = strlen(t);
+            memcpy(&out[n], t, tl);
+            n = n + tl;
+            if (l < l1) {
+                out[n] = 10;
+                n++;
+            }
+        }
+        out[n] = 0;
+        return out;
+    }
+
+    private gui.Display* disp() {
+        if (display != null) {
+            return display;
+        }
+        if (win != null) {
+            return win->display;
+        }
+        return null;
+    }
+
+    public void copy() {
+        gui.Display* d = disp();
+        if (hasSelection() && d != null) {
+            d->setClipboard(selectedText());
+        }
+    }
+
+    public void paste() {
+        gui.Display* d = disp();
+        if (d != null) {
+            d->requestPasteTo(this);
+        }
+    }
+
+    // the clipboard text arrived: it goes to the program (with the markers for bracketed paste if it asked for them)
+    public virtual void onPaste(char* t) {
+        if (bracketed) { send("\x1b[200~"); }
+        // newlines become carriage returns, as typed
+        int n = strlen(t);
+        char* conv = malloc(n + 1);
+        for (int i = 0; i < n; i++) {
+            conv[i] = (t[i] == 10) ? 13 : t[i];
+        }
+        sendBytes(conv, n);
+        if (bracketed) { send("\x1b[201~"); }
+        viewOff = 0;
+    }
+
+    private int lastClickAt;
+    private int lastClickCell;
+
+    // selects the word (letters, digits and a few characters of paths and names) around a cell
+    private void selectWord(int cell) {
+        Line* ln = lineAt(cell / cols);
+        if (ln == null) {
+            return;
+        }
+        int c = cell % cols;
+        int a = c;
+        int b = c;
+        while (a > 0 && wordChar(ln->c[(a - 1) * 2] & 0xFFFFFF)) { a--; }
+        while (b < cols - 1 && wordChar(ln->c[(b + 1) * 2] & 0xFFFFFF)) { b++; }
+        int base = (cell / cols) * cols;
+        selA = base + a;
+        selB = base + b;
+    }
+
+    private bool wordChar(int cp) {
+        if (cp == 32 || cp == 0) { return false; }
+        if (cp >= 'a' && cp <= 'z') { return true; }
+        if (cp >= 'A' && cp <= 'Z') { return true; }
+        if (cp >= '0' && cp <= '9') { return true; }
+        return cp == '_' || cp == '-' || cp == '.' || cp == '/' || cp == '~' || cp == ':' || cp > 127;
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (kind == adp.M_SCROLL) {
+            scrollView(button * 3);
+            return true;
+        }
+        if (kind == adp.M_DOWN && button == 1) {
+            int cell = cellAbs(mx, my);
+            int now = millis();
+            if (now - lastClickAt < 400 && cell == lastClickCell) {
+                selectWord(cell);
+                selecting = false;
+                copy();
+            } else {
+                selA = cell;
+                selB = cell;
+                selecting = true;
+            }
+            lastClickAt = now;
+            lastClickCell = cell;
+            invalidate();
+        } else if (kind == adp.M_MOVE && selecting) {
+            selB = cellAbs(mx, my);
+            invalidate();
+        } else if (kind == adp.M_UP && button == 1) {
+            if (selecting) {
+                selecting = false;
+                if (selA == selB) {
+                    selA = -1;
+                    selB = -1;
+                } else {
+                    copy();
+                }
+                invalidate();
+            }
+        } else if (kind == adp.M_DOWN && button == 2) {
+            paste();
+        }
+        return true;
+    }
+
+    // ---- the program ---------------------------------------------------------------------------------------------------------------------------
+    // runs command through /bin/sh -c, or the user's shell when command is null or empty; false if there is no pseudo terminal
+    public bool start(gui.Display* d, char* command) {
+        if (__OS == 1) {
+            return false;
+        }
+        display = d;
+        int fd = open("/dev/ptmx", 2 | 0x100 | 0x80000, 0);          // O_RDWR | O_NOCTTY | O_CLOEXEC
+        if (fd < 0) {
+            return false;
+        }
+        char zero[8];
+        memset(&zero[0], 0, 8);
+        sysIoctl(fd, 0x40045431, &zero[0]);                           // TIOCSPTLCK: unlock the slave
+        char nb[8];
+        memset(&nb[0], 0, 8);
+        if (sysIoctl(fd, 0x80045430, &nb[0]) < 0) {                  // TIOCGPTN: its number
+            close(fd);
+            return false;
+        }
+        int num = (nb[0] & 255) | ((nb[1] & 255) << 8) | ((nb[2] & 255) << 16);
+        char name[40];
+        format(&name[0], 40, "/dev/pts/%d", num);
+        master = fd;
+        setWindowSize();
+        int child = fork();
+        if (child < 0) {
+            close(fd);
+            master = -1;
+            return false;
+        }
+        if (child == 0) {
+            sysSetsid();
+            int slave = open(&name[0], 2, 0);                          // the controlling terminal of the new session
+            if (slave < 0) {
+                _exit(127);
+            }
+            sysIoctl(slave, 0x540E, null);                            // TIOCSCTTY
+            dup2(slave, 0);
+            dup2(slave, 1);
+            dup2(slave, 2);
+            for (int i = 3; i < 256; i++) {
+                close(i);
+            }
+            setenv("TERM", "xterm-256color");
+            setenv("COLORTERM", "truecolor");
+            char* argv[5];
+            char* prog = "/bin/sh";
+            if (command == null || strlen(command) == 0) {
+                char* sh = getenv("SHELL");
+                if (sh != null && strlen(sh) > 0) {
+                    prog = sh;
+                }
+                argv[0] = prog;
+                argv[1] = null;
+            } else {
+                argv[0] = "/bin/sh";
+                argv[1] = "-c";
+                argv[2] = command;
+                argv[3] = null;
+            }
+            execv(prog, &argv[0]);
+            _exit(127);
+        }
+        pid = child;
+        running = true;
+        d->watch(master, ptyReadable, (int) this);
+        return true;
+    }
+
+    // called when the pseudo terminal has something to read (or has been closed by the program)
+    public void readPty() {
+        char buf[4096];
+        int n = read(master, &buf[0], 4096);
+        if (n <= 0) {
+            finished();
+            return;
+        }
+        feedBytes(&buf[0], n);
+    }
+
+    private void finished() {
+        if (display != null) {
+            display->unwatch(master);
+        }
+        close(master);
+        master = -1;
+        running = false;
+        int st = 0;
+        int r = waitpid(pid, &st, 1);
+        if (r == 0) {
+            kill(pid, 1);
+            r = waitpid(pid, &st, 0);
+        }
+        exitStatus = (st >> 8) & 255;
+        if (onExit != null) {
+            onExit(this);
+        }
+    }
+
+    // ends the program (it gets SIGHUP) and closes the pseudo terminal
+    public void stop() {
+        if (master < 0) {
+            return;
+        }
+        if (display != null) {
+            display->unwatch(master);
+        }
+        close(master);
+        master = -1;
+        running = false;
+        kill(pid, 1);
+        int st = 0;
+        waitpid(pid, &st, 1);
+    }
+}
+
+int ptyReadable(int arg) {
+    Terminal* t = (Terminal*) arg;
+    t->readPty();
+    return 0;
+}

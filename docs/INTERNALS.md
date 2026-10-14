@@ -334,3 +334,10 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   needs many reads on the server side.
 * `tests/t115_gui_widgets.a` (menus, popups, accelerators, combo, radio, tabs, scrolling, spin box, splitter, tooltip, all the
   dialogs, with a directory made by the test), `tests/t116_gui_lock.a` (lock, wrong password, delay, unlock).
+* `gterm`: the screen is an array of `Line*` (two ints per cell: code point + flags, foreground + background colour), so scrolling
+  moves pointers; the history is a ring of 2000 lines. The parser is a small state machine fed byte by byte (`feedByte`); it
+  is the only way output reaches the grid, so `feed()` and the pseudo terminal share one path. The pty is opened by hand:
+  `/dev/ptmx`, `TIOCSPTLCK`, `TIOCGPTN` (the ioctl numbers are the same on all four CPU families), `fork`, `setsid`, open the
+  slave (it becomes the controlling terminal), `dup2`, close every other descriptor (also the display socket, so the display
+  server notices when the terminal program ends), `execv`. The master is polled by `gui.Display.watch`.
+* `tests/t117_gui_term.a` covers the escape sequences, keys, selection and a real shell on a pty (`.out.windows`: `no pty`).

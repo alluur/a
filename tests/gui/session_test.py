@@ -114,6 +114,31 @@ try:
         fail("typing with actl changed nothing")
     print("actl input ok")
 
+    # aterm: a shell on a pseudo terminal. Keys typed through VNC reach the shell, and when it ends the window and the program go away
+    term = start("aterm")
+    time.sleep(1.2)
+    c.grab()
+    if not c.find_color((20, 24, 28), tol=2):
+        fail("the terminal window (dark background) was not found")
+    c.type_text("exit")
+    c.key(0xff0d, 1)
+    c.key(0xff0d, 0)
+    for _ in range(50):
+        if term.poll() is not None:
+            break
+        time.sleep(0.1)
+    if term.poll() != 0:
+        fail("aterm did not end after exit was typed (%s)" % term.poll())
+    print("terminal shell ok")
+    term2 = start("aterm", "exit", "0")
+    for _ in range(50):
+        if term2.poll() is not None:
+            break
+        time.sleep(0.1)
+    if term2.poll() != 0:
+        fail("aterm with a command did not end (%s)" % term2.poll())
+    print("terminal command ok")
+
     # a second display with the screen locker: a wrong password keeps it locked, the right one removes it
     env2 = dict(os.environ, ADISPLAY="10")
     def start2(name, *args):

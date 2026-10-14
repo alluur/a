@@ -28,10 +28,11 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `gui` | the client library and the basic widgets, popups, tooltips |
 | `guix` | more widgets: menus, combo box, radio buttons, tabs, scroll view, spin box, splitter; dialogs (confirm, prompt, file, colour) |
 | `glock` | a screen locker (works with the server's `F_LOCK` windows) |
+| `gterm` | a terminal emulator widget (pseudo terminal, ANSI/xterm escape sequences) |
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t116`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t117`, `tests/gui.sh`.
 
 ## Quick start
 
@@ -42,6 +43,7 @@ ac examples/gui/calc.a -o calc
 ./adisplayd -vnc 5900 -control &               # 127.0.0.1:7000 (ADISPLAY=0), VNC on 127.0.0.1:5900
 ADISPLAY=0 ./hello &
 ADISPLAY=0 ./calc &
+ac examples/gui/aterm.a -o aterm && ADISPLAY=0 ./aterm &     # a terminal (also: showcase, notes, paint, alock)
 vncviewer localhost:5900                       # look at it (any VNC viewer; tunnel the port for remote use)
 ```
 
@@ -192,6 +194,39 @@ After a wrong password the next try has to wait one second more each time (at mo
 [-u usersfile] [user]` (`examples/gui/alock.a`) is the program: it checks the password against `/etc/shadow` (it must be
 allowed to read it, so run it as root, or give the display manager's users file with `-u`) with the same `$6$` code as the
 display manager. `wsrv.Server.locked()` and `lockWindow()` tell an embedding program whether a lock is showing.
+
+## A terminal: `gterm` and `aterm`
+
+```c
+import gterm;
+gterm.Terminal* t = new gterm.Terminal();
+t->flex = 1;
+col->add(t);
+window->setRoot(col);
+t->onExit = shellEnded;              // int shellEnded(int terminal) { ... }
+t->start(display, null);             // runs $SHELL; start(display, "ls -l") runs a command through /bin/sh -c
+```
+
+`aterm` (`examples/gui/aterm.a`) is a terminal program made of it: `ADISPLAY=0 ./aterm` opens your shell, `./aterm htop`
+runs a command and closes when it ends. Ctrl+Shift+N opens another window, Ctrl+Shift+W closes one.
+
+* **What it understands**: UTF-8 (Latin-1 characters are drawn with the built-in font, the box-drawing and block characters
+  are drawn as lines and rectangles, other characters show as `?`), colours with 16, 256 and 24-bit values, bold, dim,
+  underline, reverse; cursor movement, erasing, inserting and deleting characters and lines, scroll regions, tabs; the
+  alternate screen (vim, less, top, nano, mc work); application cursor keys, bracketed paste, cursor reports and device
+  attributes, window titles (`OSC 0` and `OSC 2`; the window title follows unless `onTitle` is set). `TERM` is `xterm-256color`.
+* **Keys**: arrows, Home/End, PageUp/Down, Insert/Delete, F1-F12 with the Shift/Alt/Ctrl variants, Ctrl+letters, Alt+key
+  (sends Esc first), Shift+Tab. **History**: 2000 lines; mouse wheel or Shift+PageUp/PageDown. **Mouse**: select by dragging
+  (a double click selects a word); a selection is copied to the clipboard when it is made, the middle button and
+  Ctrl+Shift+V paste, Ctrl+Shift+C copies. The size of the pseudo terminal follows the widget (the program gets `SIGWINCH`).
+* **Without a program**: `t->feed("text\r\n")` writes to the screen as if a program had printed it, and what the user types
+  is collected for `t->takeSent()`; `lineText(row)`, `cursorRow`, `cursorCol`, `selectedText()` read the screen back.
+* **Limits**: Linux and Android only (Windows has no pseudo terminals here: `start` returns false); no mouse reporting for
+  programs, no wide (CJK) characters, no italics, one font size.
+
+Two small additions to `gui` made it possible: `d->watch(fd, f, arg)` calls `int f(int arg)` whenever a file descriptor
+(a pipe, a pseudo terminal, a socket) is readable inside the event loop (`d->unwatch(fd)`), and `d->requestPasteTo(widget)`
+asks the clipboard and calls `widget->onPaste(text)`.
 
 ## The display server: `wsrv`
 
