@@ -721,7 +721,34 @@ enum_find:
 ; function is not defined yet)
 emit_call_sym:
     call record_edge
+    cmp dword [obj_mode], 0
+    je .direct
+    call sym_is_external
+    test eax, eax
+    jz .direct
+    ; a function of another object or of the built-in libraries: through its address (a relocation the linker resolves)
+    CG lea_func_a
+    CG call_a
+    ret
+.direct:
     CG call_sym
+    ret
+
+; sym_is_external: rdi = function symbol -> eax = 1 when its body is not part of the object being compiled
+sym_is_external:
+    test dword [rdi+SYM_FLAGS], F_BUILTIN
+    jnz .yes
+    test dword [rdi+SYM_FLAGS], F_DEFINED
+    jz .yes
+    mov eax, [rdi+SYM_FILE]
+    shl rax, 6
+    add rax, file_table
+    cmp dword [rax+32], 0
+    jne .yes
+    xor eax, eax
+    ret
+.yes:
+    mov eax, 1
     ret
 
 ; emit_funcaddr_sym: rdi = function symbol. A = the address of the function (a "func" value)
@@ -871,6 +898,7 @@ gen_call:
     mov rcx, 0x5A5A000000000000         ; a text default: its address in the data section
     xor rdi, rcx
     mov edx, edi
+    call obj_localize_string
     mov esi, R_DATA
     CG lea_global_a
     jmp .fillpush
@@ -1723,6 +1751,30 @@ parse_primary:
     jz .g1
     mov esi, R_BSS
 .g1:
+    test dword [r12+SYM_FLAGS], F_EXTERN
+    jz .g2
+    cmp dword [obj_mode], 0
+    jne .gext
+    ERR "extern variable is not defined in this program"
+.g2:
+    cmp dword [obj_mode], 0
+    je .g3
+    ; a variable of the built-in libraries lives in the program that is linked later
+    cmp esi, R_BSS
+    je .g2b
+    cmp edx, FOREIGN_DATA_BASE
+    jae .gext
+    jmp .g3
+.g2b:
+    cmp edx, FOREIGN_BSS_BASE
+    jb .g3
+.gext:
+    mov rax, r12
+    call sym_index
+    inc eax
+    mov [ext_reloc_sym], eax
+    xor edx, edx
+.g3:
     CG lea_global_a
     mov rax, [r12+SYM_TYPE]
     mov [e_type], rax
@@ -1742,6 +1794,7 @@ parse_primary:
     jmp .out
 .conststr:
     mov edx, [r12+SYM_VAL]
+    call obj_localize_string
     mov esi, R_DATA
     CG lea_global_a
     mov qword [e_type], TY_CHAR | TY_PTR1
@@ -3298,3 +3351,35 @@ count_list_elems:
     pop r12
     pop rbx
     ret
+
+; obj_localize_string: edx = data offset of a string -> edx = offset of a copy in this object's own data when the string
+; belongs to a built-in library (object mode only)
+obj_localize_string:
+    cmp dword [obj_mode], 0
+    je .r
+    cmp edx, FOREIGN_DATA_BASE
+    jb .r
+    cmp dword [foreign_active], 0
+    jne .r                              ; library code is not emitted in an object anyway
+    push rax
+    push rsi
+    push rdi
+    push rcx
+    lea rdi, [data_buf + rdx]
+    mov rsi, rdi
+    xor ecx, ecx
+.l: cmp byte [rsi+rcx], 0
+    je .e
+    inc ecx
+    jmp .l
+.e: mov rdx, rcx
+    push rdi
+    pop rsi
+    call data_add_string
+.got:
+    mov edx, eax
+    pop rcx
+    pop rdi
+    pop rsi
+    pop rax
+.r: ret

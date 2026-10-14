@@ -271,7 +271,15 @@ compile_function:
     cmp dword [pass], 3
     jne .go
     test dword [rdi+SYM_FLAGS], F_USED
-    jnz .go
+    jnz .used
+    jmp skip_block
+.used:
+    cmp dword [obj_mode], 0
+    je .go
+    mov r8, rdi
+    call sym_is_external                ; the library is compiled when the program is linked
+    test eax, eax
+    jz .go
     jmp skip_block
 .go:
     push rbx
@@ -1366,6 +1374,13 @@ parse_global_vars:
     cmp qword [tk], '['
     jne .noarr
     call next_token
+    cmp qword [tk], ']'
+    jne .szexpr
+    cmp dword [extern_decl], 0
+    je .szexpr
+    mov eax, 1                          ; extern int table[];  the size is not needed
+    jmp .a1
+.szexpr:
     call const_expr
     test rax, rax
     jg .a1
@@ -1389,6 +1404,16 @@ parse_global_vars:
     jae .big
     mov r15d, 8
 .big:
+    cmp dword [extern_decl], 0
+    je .notextern
+    cmp qword [tk], '='
+    jne .extok
+    ERR "an extern variable cannot have an initializer"
+.extok:
+    xor r13d, r13d
+    mov edx, F_EXTERN
+    jmp .reg
+.notextern:
     cmp qword [tk], '='
     je .init
     ; an object with virtual methods lives in the data section so that its vtable pointer can be set
@@ -1476,8 +1501,28 @@ parse_global_vars:
     mov rdi, [agg_mname]
     mov esi, [agg_mnlen]
     push r13
+    mov edx, [cur_module]
+    call sym_find_global
+    test rax, rax
+    jz .newsym
+    cmp dword [rax+SYM_KIND], S_GLOBAL
+    jne .newsym
+    cmp dword [extern_decl], 0
+    jne .redecl                         ; extern after the definition (or twice): nothing to do
+    test dword [rax+SYM_FLAGS], F_EXTERN
+    jz .newsym
+    and dword [rax+SYM_FLAGS], ~F_EXTERN    ; the definition of an extern declaration
+    jmp .symok
+.redecl:
+    pop r13
+    pop rdx
+    jmp .v1
+.newsym:
+    mov rdi, [agg_mname]
+    mov esi, [agg_mnlen]
     mov edx, S_GLOBAL
     call sym_new
+.symok:
     pop r13
     pop rdx
     mov [rax+SYM_TYPE], rbx
@@ -1520,6 +1565,7 @@ parse_items:
     push r14
     push r15
 .loop:
+    mov dword [extern_decl], 0
     cmp qword [tk], T_EOF
     je .done
     cmp dword [block_depth], 0
@@ -1580,8 +1626,9 @@ parse_items:
     je fatal_error_tok
     jmp fatal_error
 .extern:
-    call skip_to_semi                   ; extern int x;   the definition is somewhere in the program
-    jmp .loop
+    call next_token                     ; extern int x;  extern int f(int);   the definition is somewhere else
+    mov dword [extern_decl], 1
+    jmp .vdone
 .aggr?:
     ; struct Name { ... }  defines a type;  struct Name x;  uses one
     sub rsp, 128

@@ -434,10 +434,21 @@ x86_prologue:
     xor edi, edi
     call emit_d
     EM 0xE8
+    cmp dword [obj_mode], 0
+    jne .objchk
     mov rdi, [chkstk_pos]
     sub rdi, [code_pos]
     sub rdi, 4
     call emit_d
+    jmp .chkdone
+.objchk:
+    mov edi, [code_pos]                 ; an object: the linker patches this call
+    mov esi, R_CHKSTK
+    xor edx, edx
+    call add_reloc
+    xor edi, edi
+    call emit_d
+.chkdone:
     EM 0x48, 0x29, 0xC4
 .out:
     pop rdi

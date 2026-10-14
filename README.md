@@ -2,8 +2,9 @@
 
 **A** is a small, C-like systems programming language with a compiler written entirely in
 **x86-64 assembly**. It compiles straight to native machine code — no C compiler, no assembler,
-no linker and no libc are needed, neither to build the compiler (just `nasm` and `ld`) nor to
-run it. The compiler writes finished executables itself.
+no external linker and no libc are needed, neither to build the compiler (just `nasm` and `ld`) nor to
+run it. The compiler writes finished executables itself, and it has a built-in C-style preprocessor and a built-in linker
+(`ac -c a.a`, then `ac a.ao b.ao -o program`).
 
 ```c
 class Counter {
@@ -28,7 +29,7 @@ int main() {
 | Language | C-like syntax: variables, constants, functions, structs, **classes** (`public` / `private`), enums, modules, pointers, arrays, `if` / `else if` / `else`, `while`, `do`, `for`, `switch`, logical and arithmetic operators |
 | Compiler | ~9,000 lines of NASM assembly, a single binary of about 470 KB (it carries the source of the standard library and the C library), three passes with dead function elimination, direct machine-code generation, generated code about as fast as `gcc -O0` |
 | Targets | **Linux** x86-64, ARM64, RISC-V 64 and LoongArch64 · **Windows** x86-64 · **Android** ARM64, x86-64 and RISC-V 64 |
-| Output | static native executables (ELF64 / PE32+), typically 4–10 KB for a small program |
+| Output | static native executables (ELF64 / PE32+), typically 4–10 KB for a small program; relocatable objects (`.ao`) for separate compilation |
 | Status | version 0.1.0 — complete enough for real programs, see [Limitations](#limitations-and-roadmap) |
 
 Created by [Aytict](https://aytict.fi).

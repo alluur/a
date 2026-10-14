@@ -450,6 +450,42 @@ Macros are global: a macro defined in one file is also visible in files that are
 itself (`#define A A + 1` is fine). For constants the compile-time features of A itself (`const`, `static if`) are usually the better choice; use
 macros for code that has to differ between builds.
 
+### Separate compilation: objects and the linker
+
+Besides compiling a whole program from one source file, `ac` can compile files separately and link them, like a C toolchain:
+
+    ac -c util.a -o util.ao          # compile one unit to an object file
+    ac -c main.a -o main.ao
+    ac main.ao util.ao -o prog       # link the objects into a program
+
+Declarations are shared the C way, with a header that both units `#include`: function prototypes (`int add(int a, int b);`),
+`extern` variables (`extern int counter;`), and the definitions of structs, classes and constants.
+
+    // util.h
+    int add(int a, int b);
+    extern int counter;
+    struct Pair { int x; int y; }
+
+    // util.a                         // main.a
+    #include "util.h"                 #include "util.h"
+    int counter = 100;                int main() { printlnInt(add(20, 22)); return counter; }
+    int add(int a, int b) { return a + b; }
+
+* A unit that is compiled with `-c` contains the code and data of its own file (and of the files it `#include`s or `import`s
+  from disk). The built-in library (`println`, `collections`, `net`, ...) is not part of an object: the link step
+  compiles the parts of it that the objects use, so there is only one copy of it and library state (the heap, `rand`) is shared.
+* Every function and global variable that is not `private` / `static` is visible to the other objects. Two objects that both
+  define the same name give a link error (`duplicate definition of 'f'`); the methods of a class that is defined in a header are
+  the exception, they may be defined once in every object. A name that nobody defines gives `undefined reference to 'f'`.
+* `static` (or `private`) functions and variables belong to their own object.
+* The link step needs the same target for all objects (`-t`) and the same compiler version; an object records both. The order
+  of the objects on the command line does not matter. `main` must be defined in exactly one object.
+* Calls between objects go through a relocation (an indirect call), so the first call of a function from another object is
+  a little slower than a call inside one unit.
+* Because every unit is compiled without seeing the others, an `import` of a user file in two objects makes two copies of that
+  file (and a duplicate definition). Put shared declarations in a header and the definitions in exactly one unit.
+* Object files are made for one target: `-t windows -c x.a` produces a Windows object.
+
 ### Inline assembly
 
 `asm` puts machine code of your choice into a function. The program lists the code for every CPU it should run on;
@@ -1128,5 +1164,5 @@ The process exit code is 1; on success it is 0.
 * `const NAME = value;` declares a compile-time constant.
 * No unsigned arithmetic or bit-fields. Function pointers exist as the type `func`; parameters can have default values.
 * Structs can be passed and returned by value (a hidden copy), `typedef`, `union`, `static` locals, default values (also text) and
-  variadic functions (`...` with `va_arg`) exist; unsigned arithmetic and bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in.
+  variadic functions (`...` with `va_arg`) exist; unsigned arithmetic and bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in, and units can be compiled separately and linked (`ac -c`).
 * `switch` labels must be constant expressions (like C), and `case` values must fit in 32 bits.

@@ -28,4 +28,5 @@ section .text
 %include "stmt.asm"
 %include "decl.asm"
 %include "pp.asm"
+%include "link.asm"
 %include "main.asm"

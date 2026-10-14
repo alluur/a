@@ -282,3 +282,30 @@ the ELF machine number in `build_elf` and the `__ARCH` value. Instruction words 
   forward chain is open the second word holds the link. 64 bit constants take at most 8 instructions.
 * **LoongArch64:** A = $a0, B = $a1, D = $a2, scratch $t0-$t3, frame pointer $fp. Jumps and calls are single `b` / `bl`
   instructions (+-128 MiB); data and function addresses are `pcaddu12i` + `addi.d`.
+
+## Object files and the linker (`src/link.asm`)
+
+`ac -c` runs the normal three passes with `obj_mode` set and writes the result as an object (`write_object`); `ac a.ao b.ao`
+(`link_mode`) compiles only the library part and then appends the objects (`link_place`).
+
+**Object mode.** Functions that live in a built-in library file (file table flag at offset 32), prototypes without a body
+and builtins are *external* (`sym_is_external`). A call to one is emitted as `lea_func_a` + `call_a`, i.e. an `R_CODE`
+relocation that names the symbol, so no backend needs to know about linking. Global variables of the libraries and `extern`
+variables are accessed with an `R_DATA` / `R_BSS` relocation whose spare dword (`rel_buf+12`, set through `ext_reloc_sym`)
+holds the symbol index. While a library file is compiled the data and bss allocation positions are swapped for a separate
+area (`swap_foreign`, offsets from `FOREIGN_DATA_BASE` / `FOREIGN_BSS_BASE`), so the object contains only the unit's own data;
+library relocations in the data section are dropped and library string constants are copied (`obj_localize_string`).
+There is no entry stub and no runtime blob in an object; the Windows stack probe call is an `R_CHKSTK` relocation.
+
+**Format.** Header, code, data, relocations (`offset, kind[|0x100 symbol], target`), symbols (`name, kind, flags, value, npar`),
+the library modules to import (`needs`) and a string table; see the comment at the top of `src/link.asm`. A symbol key is
+`module:Class:name` (`<ctor>` for constructors).
+
+**Link.** `link_load_objects` reads the objects and synthesizes the "main" file of the program: `import` lines for the needed
+library modules and a prototype of `main`. The three passes then compile the library; `link_mark_roots` keeps the library
+functions the objects call; `link_place` copies code / data / bss behind the library output, builds the export table
+(a second strong definition is an error, methods are weak), resolves every undefined symbol against the other objects and then
+the library symbol table, creates hidden function symbols for `R_CODE` / `R_CODE64` targets, and adds the relocations
+(`R_DATA64` words are rebased in place) to `rel_buf`. After that the usual `check_undefined` and `build_elf` / `build_pe` run.
+
+Tests: `tests/link.sh` (every directory of `tests/link` is a multi-file program).

@@ -402,6 +402,11 @@ add_reloc:
     mov [rel_buf+rax], edi
     mov [rel_buf+rax+4], esi
     mov [rel_buf+rax+8], edx
+    push rcx
+    mov ecx, [ext_reloc_sym]            ; object mode: the relocation names an external global
+    mov [rel_buf+rax+12], ecx
+    mov dword [ext_reloc_sym], 0
+    pop rcx
     pop rax
     ret
 

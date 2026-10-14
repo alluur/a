@@ -83,13 +83,18 @@ s_libdir3:      db "/usr/local/lib/a/", 0
 
 s_usage:
     db "A compiler ", VERSION_NAME, " (version code ", '0'+VERSION_CODE, ")  -  Aytict, https://aytict.fi", 10
-    db "Usage: ac [options] source.a", 10
+    db "Usage: ac [options] source.a          compile a program", 10
+    db "       ac -c [options] source.a       compile to an object file (.ao)", 10
+    db "       ac [options] a.ao b.ao ...     link object files into a program", 10
     db 10
     db "Options:", 10
     db "  -o FILE     output file (default: NAME-VERSION-RELEASE.EXT)", 10
     db "  -t TARGET   linux (default) | windows | android | linux-arm64 | android-x64 |", 10
     db "              linux-riscv64 | android-riscv64 | linux-loongarch64 | android-loongarch64", 10
     db "              linux = linux-x64, android = android-arm64, windows = windows x64", 10
+    db "  -c          compile to an object file instead of a program", 10
+    db "  -D NAME[=V] define a preprocessor macro (may be repeated)", 10
+    db "  -E          print the preprocessed source and stop", 10
     db "  -v CODE     version code used in the default output name (default 1)", 10
     db "  -r TYPE     release type used in the default output name (default debug)", 10
     db "  -h          show this help", 10
@@ -97,6 +102,10 @@ s_usage:
     db 0
 s_version_text: db "ac ", VERSION_NAME, 10, 0
 s_err_noinput:  db "no input file (try: ac -h)", 0
+s_err_mixed:    db "object files (.ao) cannot be combined with source files or -c", 0
+s_link_prog:    db "a.a", 0
+s_err_onesrc:   db "only one source file can be compiled at a time (use -c and link the objects)", 0
+s_ext_ao:       db ".ao", 0
 s_err_badopt:   db "unknown option or missing value (try: ac -h)", 0
 s_err_badtgt:   db "unknown target, use linux, windows, android, linux-arm64, android-x64, linux-riscv64, android-riscv64 or linux-loongarch64", 0
 s_err_read:     db "cannot read the input file", 0
@@ -646,6 +655,7 @@ file_try:
     mov [rcx+16], rbx
     mov [rcx+24], eax
     mov dword [rcx+28], 0
+    mov dword [rcx+32], 0                ; read from disk
     mov rax, rcx
     jmp .out
 .fail:
@@ -742,6 +752,12 @@ file_include:
     call fatal_error_tok
 .found:
     mov rdi, rax
+    cmp dword [obj_mode], 0
+    je .go
+    cmp dword [rax+32], 0
+    je .go
+    call obj_note_need                  ; the link step has to import this module as well
+.go:
     call compile_file
     pop r12
     pop rbx
@@ -765,6 +781,18 @@ compile_file:
     je .skip
     mov eax, [pass]
     mov [r12+28], eax
+    ; object mode: the data of the built-in libraries is not part of the object
+    xor ebx, ebx
+    cmp dword [obj_mode], 0
+    je .noswap
+    cmp dword [r12+32], 0
+    je .noswap
+    cmp dword [foreign_active], 0
+    jne .noswap
+    mov dword [foreign_active], 1
+    mov ebx, 1
+    call swap_foreign
+.noswap:
     sub rsp, 128
     mov rdi, rsp
     call lex_save
@@ -804,6 +832,10 @@ compile_file:
     mov eax, [rsp+116]
     mov [block_depth], eax
     add rsp, 128
+    test ebx, ebx
+    jz .skip
+    call swap_foreign
+    mov dword [foreign_active], 0
 .skip:
     mov eax, [r12+24]
     mov [last_file_id], eax
@@ -1103,7 +1135,11 @@ begin_codegen_pass:
     inc edx
     jmp .l
 .done:
+    cmp dword [obj_mode], 0
+    jne .noprologue                     ; an object has no entry stub and no runtime blobs
     jmp emit_prologue
+.noprologue:
+    ret
 
 ; compute_reachable: marks every function reachable from the entry stub as F_USED
 compute_reachable:
@@ -1674,8 +1710,39 @@ _start:
     mov dword [opt_E], 1
     jmp .arg
 .notE:
+    cmp word [rbx], 0x632D              ; -c : compile to an object file
+    jne .notC
+    cmp byte [rbx+2], 0
+    jne .notC
+    mov dword [obj_mode], 1
+    jmp .arg
+.notC:
     cmp byte [rbx], '-'
     je .badopt
+    mov rdi, rbx
+    call cstrlen
+    cmp rax, 3
+    jb .source
+    cmp byte [rbx+rax-1], 'o'
+    jne .source
+    cmp byte [rbx+rax-2], 'a'
+    jne .source
+    cmp byte [rbx+rax-3], '.'
+    jne .source
+    ; an object file: the program is linked
+    mov ecx, [opt_nobjs]
+    cmp ecx, 64
+    jae .badopt
+    mov [opt_objs + rcx*8], rbx
+    inc dword [opt_nobjs]
+    mov dword [link_mode], 1
+    jmp .arg
+.source:
+    cmp qword [opt_input], 0
+    je .src1
+    mov edi, s_err_onesrc
+    call fatal_error
+.src1:
     mov [opt_input], rbx
     jmp .arg
 .define:
@@ -1745,6 +1812,22 @@ _start:
     call sys_exit
 
 .args_done:
+    mov qword [data_pos_f], FOREIGN_DATA_BASE
+    mov qword [bss_pos_f], FOREIGN_BSS_BASE
+    cmp dword [link_mode], 0
+    je .nolink
+    cmp qword [opt_input], 0
+    je .linkname
+    mov edi, s_err_mixed
+    call fatal_error
+.linkname:
+    cmp dword [obj_mode], 0
+    je .linkok
+    mov edi, s_err_mixed
+    call fatal_error
+.linkok:
+    mov qword [opt_input], s_link_prog      ; output name a-<version>-<release>
+.nolink:
     cmp qword [opt_input], 0
     jne .have_input
     mov edi, s_err_noinput
@@ -1814,8 +1897,14 @@ _start:
     mov [float_entry], rax
 .regdone2:
     call pp_init
+    cmp dword [link_mode], 0
+    je .srcmain
+    call link_load_objects              ; reads the objects and makes the program text that imports their modules
+    jmp .mainset
+.srcmain:
     mov rdi, [opt_input]
     call file_try
+.mainset:
     mov [main_entry], rax
     cmp dword [opt_E], 0
     je .noE
@@ -1847,19 +1936,37 @@ _start:
     mov [rel_base], eax
     mov rax, [data_pos]
     mov [data_base], rax
+    mov rax, [data_pos_f]
+    mov [data_base_f], rax
     mov dword [pass], 2
     call begin_codegen_pass
     call compile_all
+    cmp dword [obj_mode], 0
+    je .o_noroots
+    call obj_mark_roots                 ; every function of this unit is part of the object
+.o_noroots:
+    cmp dword [link_mode], 0
+    je .l_noroots
+    call link_mark_roots                ; library functions that the objects call must be kept
+.l_noroots:
     call compute_reachable
     ; --- pass 3: the real output, only functions reachable from main
     mov eax, [sym_base]
     mov [sym_count], eax
     mov rax, [data_base]
     mov [data_pos], rax
+    mov rax, [data_base_f]
+    mov [data_pos_f], rax
     mov dword [pass], 3
     call begin_codegen_pass
     call compile_all
     mov qword [cur_file_name], 0
+    cmp dword [obj_mode], 0
+    jne .write_obj
+    cmp dword [link_mode], 0
+    je .l_noplace
+    call link_place                     ; puts the objects behind the library code and resolves the symbols
+.l_noplace:
     call check_undefined
     ; --- write the image
     cmp dword [target], TGT_WINDOWS
@@ -1868,6 +1975,9 @@ _start:
     jmp .written
 .pe:
     call build_pe
+    jmp .written
+.write_obj:
+    call write_object
 .written:
     mov rdx, rax
     call choose_outname
@@ -1895,6 +2005,7 @@ add_embedded_file:
     mov [rcx+16], rdx
     mov [rcx+24], eax
     mov dword [rcx+28], 0
+    mov dword [rcx+32], 1                ; built into the compiler
     ret
 
 ; init_tables: operator precedence table
@@ -1965,6 +2076,9 @@ choose_outname:
     inc rdi
     mov rsi, [opt_release]
     call cstr_copy
+    mov rsi, s_ext_ao
+    cmp dword [obj_mode], 0
+    jne .e3
     mov rsi, s_ext_linux
     cmp dword [target], TGT_WINDOWS
     jne .e1
@@ -2104,6 +2218,16 @@ lf_alen:        resq 1
 lf_blen:        resq 1
 lf_ex:          resd 1
 init_count:     resq 1
+obj_mode:       resd 1                  ; ac -c : the output is an object file
+link_mode:      resd 1                  ; the inputs are object files
+ext_reloc_sym:  resd 1
+foreign_active: resd 1
+extern_decl:    resd 1
+opt_nobjs:      resd 1
+data_pos_f:     resq 1
+bss_pos_f:      resq 1
+data_base_f:    resq 1
+opt_objs:       resq 64
 opt_E:          resd 1
 init_mode:      resd 1
 defer_n:        resd 1

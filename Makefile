@@ -31,10 +31,11 @@ build/ac: $(SRC)
 
 test: build/ac
 	tests/run.sh
+	tests/link.sh
 
 test-all: build/ac
 	@for t in linux windows linux-arm64 android android-x64 linux-riscv64 android-riscv64 linux-loongarch64; do \
-	    echo "== target: $$t"; TARGET=$$t tests/run.sh || exit 1; done
+	    echo "== target: $$t"; TARGET=$$t tests/run.sh || exit 1; TARGET=$$t tests/link.sh || exit 1; done
 
 examples: build/ac
 	@mkdir -p build/examples

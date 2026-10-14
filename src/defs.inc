@@ -154,6 +154,7 @@
 %define F_VARIADIC      1024    ; the parameter list ends with ...
 %define F_VIRTUAL       4096    ; a method that is called through the vtable of the object
 %define F_PROTECTED     8192
+%define F_EXTERN        16384   ; extern declaration: the storage is defined in another object
 %define F_BYREF         2048    ; a struct parameter: the slot holds the address of the caller's copy
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
@@ -200,6 +201,9 @@
 %define R_CODE64        5       ; abs64 in data -> code address of function symbol (index) target (vtables)
 %define R_CODE          4       ; rel32 / adrp pair in code -> code address of function symbol (index) target
 %define R_CODE32        4       ; rel32 in code -> code + target (unused)
+%define R_CHKSTK        7       ; rel32 call of the Windows stack probe (only in objects: the linker patches it)
+%define FOREIGN_DATA_BASE 0x400000          ; in object mode the data of the built-in libraries is allocated up here and left out
+%define FOREIGN_BSS_BASE  0x10000000
 
 ; =============================================================================
 ;  macros
