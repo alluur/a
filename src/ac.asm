@@ -27,4 +27,5 @@ section .text
 %include "float.asm"
 %include "stmt.asm"
 %include "decl.asm"
+%include "pp.asm"
 %include "main.asm"

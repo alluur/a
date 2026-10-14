@@ -91,3 +91,9 @@ hi def link aDelim        Delimiter
 hi def link aAccessGroup  Keyword
 
 let b:current_syntax = "a"
+
+" preprocessor directives
+syn match aPreCond "^\s*#\s*\(if\|ifdef\|ifndef\|elif\|else\|endif\)\>"
+syn match aPreDef "^\s*#\s*\(define\|undef\|include\|pragma\|error\|warning\|line\)\>"
+hi def link aPreCond PreCondit
+hi def link aPreDef Macro

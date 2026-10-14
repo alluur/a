@@ -418,6 +418,38 @@ appear somewhere.
 such as `int apply(int (*f)(int, int), int a, int b)` are accepted. They all become the type `func`; as before the signature
 is not checked.
 
+### The preprocessor
+
+Every source file is run through a C-style preprocessor before it is compiled. (The modules that are built into the compiler
+do not need it.) Directives start with `#` at the beginning of a line (spaces before it are fine); a line that ends with `\`
+continues on the next line.
+
+| Directive | Meaning |
+|-----------|---------|
+| `#define NAME body` | object-like macro: `NAME` is replaced by `body` |
+| `#define NAME(a, b) body` | function-like macro. In the body `#a` makes a string of the argument, `a ## b` pastes two tokens, `...` / `__VA_ARGS__` take the remaining arguments |
+| `#undef NAME` | removes a macro |
+| `#include "file"` / `#include <file>` | inserts a file. `"file"` is looked for next to the including file first, then as given, then in the `lib` directories |
+| `#pragma once` | the file is only included once |
+| `#ifdef X` `#ifndef X` `#if expr` `#elif expr` `#else` `#endif` | conditional compilation. `expr` may use `defined(X)`, integers, character constants, `+ - * / % << >> & | ^ ~ ! && || == != < > <= >=`; names that are not macros count as 0 |
+| `#error text` | stops with an error. `#warning` and `#line` are accepted and ignored |
+
+Predefined macros: `__A__` (1), `__ARCH__` (0 x64, 1 arm64, 2 riscv64, 3 loongarch64), `__OS__` (0 Linux, 1 Windows, 2 Android),
+`__FILE__` and `__LINE__`. On the command line `-DNAME` and `-DNAME=value` define a macro, and `-E` prints the preprocessed
+source instead of compiling it.
+
+    #define SQUARE(x) ((x) * (x))
+    #define LOG(...) println(__VA_ARGS__)
+    #if defined(DEBUG) && __OS__ == 0
+        LOG("debug build on Linux");
+    #endif
+
+Comments are removed and a macro call may span several lines, but the output always has the same number of lines as the
+input, so error messages show the right line. The lines of an `#include`d file are joined into the line of the directive.
+Macros are global: a macro defined in one file is also visible in files that are imported later. A macro is not expanded inside
+itself (`#define A A + 1` is fine). For constants the compile-time features of A itself (`const`, `static if`) are usually the better choice; use
+macros for code that has to differ between builds.
+
 ### Inline assembly
 
 `asm` puts machine code of your choice into a function. The program lists the code for every CPU it should run on;
@@ -1089,13 +1121,12 @@ The process exit code is 1; on success it is 0.
 
 ## 15. Differences from C
 
-* Classes with methods, constructors and `public` / `private`; modules instead of `#include`.
+* Classes with methods, constructors and `public` / `private`; modules (`import`) as well as the C-style `#include`.
 * `int` is 64-bit; `char` is unsigned; `bool` is a real type.
 * All variables start zeroed; `new` returns zeroed memory; `new` has no `free` (`malloc` / `free` come with `cstdlib`).
 * Functions may be used before their definition without prototypes.
 * `const NAME = value;` declares a compile-time constant.
-* No unsigned arithmetic, bit-fields or preprocessor —
-  yet. Function pointers exist as the type `func`; parameters can have default values.
+* No unsigned arithmetic or bit-fields. Function pointers exist as the type `func`; parameters can have default values.
 * Structs can be passed and returned by value (a hidden copy), `typedef`, `union`, `static` locals, default values (also text) and
-  variadic functions (`...` with `va_arg`) exist; unsigned arithmetic, bit-fields and the preprocessor do not.
+  variadic functions (`...` with `va_arg`) exist; unsigned arithmetic and bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in.
 * `switch` labels must be constant expressions (like C), and `case` values must fit in 32 bits.

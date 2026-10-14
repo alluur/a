@@ -614,6 +614,13 @@ file_try:
     jz .fail
     mov r13, rax
     mov rbx, rdx
+    ; the preprocessor
+    mov rsi, r13
+    mov rdx, rbx
+    mov rdi, r12
+    call pp_file
+    mov r13, rax
+    mov rbx, rdx
     ; keep a copy of the path
     mov rdi, r12
     call cstrlen
@@ -1658,9 +1665,31 @@ _start:
     call cstr_eq
     test eax, eax
     jnz .showver
+    cmp word [rbx], 0x442D              ; -D
+    je .define
+    cmp word [rbx], 0x452D              ; -E
+    jne .notE
+    cmp byte [rbx+2], 0
+    jne .notE
+    mov dword [opt_E], 1
+    jmp .arg
+.notE:
     cmp byte [rbx], '-'
     je .badopt
     mov [opt_input], rbx
+    jmp .arg
+.define:
+    ; -DNAME   -DNAME=value   -D NAME=value
+    lea rax, [rbx+2]
+    cmp byte [rax], 0
+    jne .def1
+    call .value
+.def1:
+    mov ecx, [opt_ndefs]
+    cmp ecx, 32
+    jae .badopt
+    mov [opt_defs + rcx*8], rax
+    inc dword [opt_ndefs]
     jmp .arg
 .value:
     cmp r13, r14
@@ -1784,9 +1813,24 @@ _start:
     mov rax, [rbx+32]
     mov [float_entry], rax
 .regdone2:
+    call pp_init
     mov rdi, [opt_input]
     call file_try
     mov [main_entry], rax
+    cmp dword [opt_E], 0
+    je .noE
+    ; -E: print the preprocessed source and stop
+    test rax, rax
+    jz .noE
+    mov rsi, [rax+8]
+    mov rdx, [rax+16]
+    mov edi, 1
+    mov eax, SYS_WRITE
+    syscall
+    xor edi, edi
+    jmp sys_exit
+.noE:
+    mov rax, [main_entry]
     test rax, rax
     jnz .loaded
     mov edi, s_err_read
@@ -2060,6 +2104,7 @@ lf_alen:        resq 1
 lf_blen:        resq 1
 lf_ex:          resd 1
 init_count:     resq 1
+opt_E:          resd 1
 init_mode:      resd 1
 defer_n:        resd 1
 agg_anon_ptr:   resq 1

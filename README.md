@@ -183,7 +183,7 @@ Version 0.1.0 is deliberately small. Known limitations — all of them are on th
 
 * **No floating point types** yet (`float` / `double`): the `cmath` module does IEEE 754 arithmetic and all of `<math.h>` in
   software on doubles held in ints. No `unsigned` or sized integer types.
-* Function pointers are the type `func` (no signature checking); no bit-fields or preprocessor (modules replace `#include`).
+* Function pointers are the type `func` (no signature checking); no bit-fields; a C-style preprocessor (`#define`, `#include`, `#if`) is built in.
   `typedef`, `union`, `static` locals, structs by value, default parameter values and `...` with `va_arg` exist.
 
 * **Single inheritance only:** `class D : B`, `virtual`, `super`, `protected`; no multiple inheritance, abstract classes or destructors.
