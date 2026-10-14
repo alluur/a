@@ -190,6 +190,10 @@ EMB "gfx",          "lib/gfx.a"
 EMB "adp",          "lib/adp.a"
 EMB "wsrv",         "lib/wsrv.a"
 EMB "gui",          "lib/gui.a"
+EMB "wvnc",         "lib/wvnc.a"
+EMB "wfb",          "lib/wfb.a"
+EMB "syscrypt",     "lib/syscrypt.a"
+EMB "dm",           "lib/dm.a"
 section .data
         dq 0
 section .rodata

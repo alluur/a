@@ -1,0 +1,505 @@
+// =============================================================================
+//  wfb - the Linux framebuffer backend: /dev/fb0 for the output, evdev for the keyboard, mouse and touch screen   import wfb;
+//
+//    wfb.Framebuffer* fb = new wfb.Framebuffer("/dev/fb0", "us");      // layout: "us" or "fi" (Finnish)
+//    if (!fb->ok()) { println(fb->error()); return 1; }
+//    wsrv.Server* srv = new wsrv.Server(fb, 7000);
+//    srv->run();
+//
+//  Needs Linux or Android with a framebuffer (a virtual console without a desktop running, or a device with fbdev)
+//  and permission to read /dev/fb0 and /dev/input/event* (root, or the "video" and "input" groups).
+//  32 and 16 bits per pixel are supported. The pointer is moved by relative mice, by absolute devices (touch screens,
+//  tablets) and the wheel; the keyboard layouts are "us" and "fi" (with AltGr).
+//  With takeConsole = true the text console is switched to graphics mode and its keyboard is turned off while the display
+//  runs (it is restored by shutdown() - if the program dies in between, switch to another console with Alt+F2 or run
+//  "reset"). The key mapping and the pixel conversion are plain functions (keyFor, writeRect) that can be tested.
+// =============================================================================
+import net;
+import gfx;
+import adp;
+import wsrv;
+import cstdlib;
+import cunistd;
+module wfb;
+
+// ---- Linux input event codes -------------------------------------------------------------------------------------------------
+const EV_KEY = 1;
+const EV_REL = 2;
+const EV_ABS = 3;
+const REL_X = 0;
+const REL_Y = 1;
+const REL_WHEEL = 8;
+const ABS_X = 0;
+const ABS_Y = 1;
+const BTN_LEFT = 0x110;
+const BTN_RIGHT = 0x111;
+const BTN_MIDDLE = 0x112;
+const BTN_TOUCH = 0x14A;
+
+const KEYMAP_SIZE = 128;
+
+// the characters of the keys (Linux key code -> character without and with Shift); 0 = not a character key
+private char* usBase = "\0\0" "1234567890-=\0\0" "qwertyuiop[]\0\0" "asdfghjkl;'`\0\\" "zxcvbnm,./\0*\0 ";
+private char* usShift = "\0\0" "!@#$%^&*()_+\0\0" "QWERTYUIOP{}\0\0" "ASDFGHJKL:\"~\0|" "ZXCVBNM<>?\0*\0 ";
+
+int* keyBase;
+int* keyShift;
+int* keyAlt;
+int* keyDead;
+char* layoutName;
+
+private void setKey(int code, int base, int shift, int alt) {
+    keyBase[code] = base;
+    keyShift[code] = shift;
+    keyAlt[code] = alt;
+}
+
+// prepares the tables of a layout ("us" or "fi")
+public void useLayout(char* name) {
+    if (keyBase == null) {
+        keyBase = (int*) calloc(KEYMAP_SIZE, 8);
+        keyShift = (int*) calloc(KEYMAP_SIZE, 8);
+        keyAlt = (int*) calloc(KEYMAP_SIZE, 8);
+    }
+    layoutName = name;
+    for (int i = 0; i < KEYMAP_SIZE; i++) {
+        keyBase[i] = 0;
+        keyShift[i] = 0;
+        keyAlt[i] = 0;
+    }
+    // the letters and the keys that are the same on both layouts
+    char* letters = "qwertyuiop";
+    for (int i = 0; i < 10; i++) {
+        setKey(16 + i, letters[i], letters[i] - 32, 0);
+    }
+    letters = "asdfghjkl";
+    for (int i = 0; i < 9; i++) {
+        setKey(30 + i, letters[i], letters[i] - 32, 0);
+    }
+    letters = "zxcvbnm";
+    for (int i = 0; i < 7; i++) {
+        setKey(44 + i, letters[i], letters[i] - 32, 0);
+    }
+    setKey(57, ' ', ' ', 0);
+    if (streq(name, "fi")) {
+        // digits: 1 ! / 2 " @ / 3 # £ / 4 ¤ $ / 5 % / 6 & / 7 / { / 8 ( [ / 9 ) ] / 0 = }
+        setKey(2, '1', '!', 0);
+        setKey(3, '2', '"', '@');
+        setKey(4, '3', '#', 0xA3);
+        setKey(5, '4', 0xA4, '$');
+        setKey(6, '5', '%', 0x20AC);
+        setKey(7, '6', '&', 0);
+        setKey(8, '7', '/', '{');
+        setKey(9, '8', '(', '[');
+        setKey(10, '9', ')', ']');
+        setKey(11, '0', '=', '}');
+        setKey(12, '+', '?', '\\');
+        setKey(13, 0xB4, '`', 0);
+        setKey(26, 0xE5, 0xC5, 0);                 // å Å
+        setKey(27, 0xA8, '^', '~');
+        setKey(39, 0xF6, 0xD6, 0);                 // ö Ö
+        setKey(40, 0xE4, 0xC4, 0);                 // ä Ä
+        setKey(41, 0xA7, 0xBD, 0);                 // § ½
+        setKey(43, '\'', '*', 0);
+        setKey(51, ',', ';', 0);
+        setKey(52, '.', ':', 0);
+        setKey(53, '-', '_', 0);
+        setKey(86, '<', '>', '|');
+    } else {
+        for (int i = 2; i < 58; i++) {
+            if (usBase[i] != 0 && keyBase[i] == 0) {
+                keyBase[i] = usBase[i];
+                keyShift[i] = usShift[i];
+            }
+        }
+        keyBase[43] = '\\';
+        keyShift[43] = '|';
+    }
+}
+
+// the display protocol key for a Linux key code; uni receives the character it types with the modifiers shift / altgr
+public int keyFor(int code, bool shift, bool altgr, int* uni) {
+    *uni = 0;
+    if (keyBase == null) {
+        useLayout("us");
+    }
+    if (code == 1) { return adp.KEY_ESCAPE; }
+    if (code == 14) { return adp.KEY_BACKSPACE; }
+    if (code == 15) { return adp.KEY_TAB; }
+    if (code == 28 || code == 96) { return adp.KEY_ENTER; }
+    if (code == 29 || code == 97) { return adp.KEY_CTRL; }
+    if (code == 42 || code == 54) { return adp.KEY_SHIFT; }
+    if (code == 56 || code == 100) { return adp.KEY_ALT; }
+    if (code == 125 || code == 126) { return adp.KEY_META; }
+    if (code == 58) { return adp.KEY_CAPS; }
+    if (code >= 59 && code <= 68) { return adp.KEY_F1 + (code - 59); }
+    if (code == 87) { return adp.KEY_F1 + 10; }
+    if (code == 88) { return adp.KEY_F1 + 11; }
+    if (code == 102) { return adp.KEY_HOME; }
+    if (code == 103) { return adp.KEY_UP; }
+    if (code == 104) { return adp.KEY_PGUP; }
+    if (code == 105) { return adp.KEY_LEFT; }
+    if (code == 106) { return adp.KEY_RIGHT; }
+    if (code == 107) { return adp.KEY_END; }
+    if (code == 108) { return adp.KEY_DOWN; }
+    if (code == 109) { return adp.KEY_PGDN; }
+    if (code == 110) { return adp.KEY_INSERT; }
+    if (code == 111) { return adp.KEY_DELETE; }
+    if (code < 0 || code >= KEYMAP_SIZE || keyBase[code] == 0) {
+        return 0;
+    }
+    int ch = keyBase[code];
+    if (altgr && keyAlt[code] != 0) {
+        *uni = keyAlt[code];
+    } else if (shift) {
+        *uni = keyShift[code];
+    } else {
+        *uni = ch;
+    }
+    return ch;
+}
+
+// ---- pixel formats -----------------------------------------------------------------------------------------------------------
+// writes the rectangle x, y, w, h of the screen into the framebuffer memory mem (line_length bytes per line), for a
+// format given by the bits per pixel and the offset and length of the red, green and blue fields
+public void writeRect(gfx.Surface* s, int x, int y, int w, int h, char* mem, int lineLength, int bpp,
+                      int roff, int rlen, int goff, int glen, int boff, int blen) {
+    if (x < 0) { w = w + x; x = 0; }
+    if (y < 0) { h = h + y; y = 0; }
+    if (x + w > s->w) { w = s->w - x; }
+    if (y + h > s->h) { h = s->h - y; }
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    int bytes = bpp / 8;
+    bool plain = (bpp == 32 && roff == 16 && goff == 8 && boff == 0 && rlen == 8 && glen == 8 && blen == 8);
+    for (int yy = y; yy < y + h; yy++) {
+        char* row = &mem[yy * lineLength + x * bytes];
+        if (plain) {
+            s->pack(x, yy, w, 1, row);
+            continue;
+        }
+        for (int xx = 0; xx < w; xx++) {
+            int c = s->px[yy * s->w + x + xx];
+            int r = gfx.red(c) >> (8 - rlen);
+            int g = gfx.green(c) >> (8 - glen);
+            int b = gfx.blue(c) >> (8 - blen);
+            int v = (r << roff) | (g << goff) | (b << boff);
+            for (int k = 0; k < bytes; k++) {
+                row[xx * bytes + k] = (v >> (k * 8)) & 255;
+            }
+        }
+    }
+}
+
+// ---- system calls ----------------------------------------------------------------------------------------------------------------
+private int sysIoctl(int fd, int req, char* arg) {
+    return __syscall(__ARCH == 0 ? 16 : 29, fd, req, arg, 0, 0, 0);
+}
+
+private char* sysMmap(int len, int fd) {
+    int r = __syscall(__ARCH == 0 ? 9 : 222, 0, len, 3, 1, fd, 0);
+    if (r < 0 && r > -4096) {
+        return null;
+    }
+    return (char*) r;
+}
+
+private int u32at(char* b, int at) {
+    return b[at] | (b[at + 1] << 8) | (b[at + 2] << 16) | (b[at + 3] << 24);
+}
+
+private bool bitSet(char* mask, int bit) {
+    return ((mask[bit >> 3] >> (bit & 7)) & 1) != 0;
+}
+
+// ioctl EVIOCGBIT(ev, len)
+private int evioGbit(int ev, int len) {
+    return (2 << 30) | (len << 16) | (0x45 << 8) | (0x20 + ev);
+}
+
+// ioctl EVIOCGABS(axis)
+private int evioGabs(int axis) {
+    return (2 << 30) | (24 << 16) | (0x45 << 8) | (0x40 + axis);
+}
+
+public class Framebuffer : wsrv.Backend {
+    public bool takeConsole;
+    private char* mem;
+    private int memLen;
+    private int fbFd;
+    private int lineLength;
+    private int bpp;
+    private int roff;
+    private int rlen;
+    private int goff;
+    private int glen;
+    private int boff;
+    private int blen;
+    private int xoff;
+    private int yoff;
+    private int* devFd;
+    private int* devKind;           // 1 keyboard, 2 pointer, 4 absolute pointer
+    private int* devAbsMaxX;
+    private int* devAbsMaxY;
+    private int ndev;
+    private int ttyFd;
+    private int px;
+    private int py;
+    private int absX;
+    private int absY;
+    private bool shift;
+    private bool altgr;
+    private bool consoleTaken;
+    private char* err;
+    private char* ibuf;
+
+    public Framebuffer(char* path, char* layout) {
+        err = "";
+        useLayout(layout);
+        devFd = (int*) calloc(32, 8);
+        devKind = (int*) calloc(32, 8);
+        devAbsMaxX = (int*) calloc(32, 8);
+        devAbsMaxY = (int*) calloc(32, 8);
+        ibuf = malloc(24 * 32);
+        ttyFd = -1;
+        if (__OS == 1) {
+            err = "the framebuffer needs Linux or Android";
+            return;
+        }
+        fbFd = open(path, O_RDWR);
+        if (fbFd < 0) {
+            err = "cannot open the framebuffer device";
+            return;
+        }
+        char var[160];
+        char fix[80];
+        if (sysIoctl(fbFd, 0x4600, &var[0]) < 0 || sysIoctl(fbFd, 0x4602, &fix[0]) < 0) {
+            err = "cannot read the framebuffer parameters";
+            return;
+        }
+        w = u32at(&var[0], 0);
+        h = u32at(&var[0], 4);
+        xoff = u32at(&var[0], 16);
+        yoff = u32at(&var[0], 20);
+        bpp = u32at(&var[0], 24);
+        roff = u32at(&var[0], 32);
+        rlen = u32at(&var[0], 36);
+        goff = u32at(&var[0], 44);
+        glen = u32at(&var[0], 48);
+        boff = u32at(&var[0], 56);
+        blen = u32at(&var[0], 60);
+        lineLength = u32at(&fix[0], 48);
+        memLen = u32at(&fix[0], 24);
+        if (bpp != 32 && bpp != 16) {
+            err = "only 16 and 32 bits per pixel are supported";
+            return;
+        }
+        mem = sysMmap(memLen, fbFd);
+        if (mem == null) {
+            err = "cannot map the framebuffer";
+            return;
+        }
+        findDevices();
+        px = w / 2;
+        py = h / 2;
+    }
+
+    public bool ok() { return mem != null; }
+    public char* error() { return err; }
+    public int devices() { return ndev; }
+
+    // opens the keyboards, mice and touch devices in /dev/input
+    private void findDevices() {
+        char path[32];
+        for (int i = 0; i < 32 && ndev < 30; i++) {
+            format(&path[0], 32, "/dev/input/event%d", i);
+            int fd = open(&path[0], O_RDONLY | 2048);
+            if (fd < 0) {
+                continue;
+            }
+            char evbits[8];
+            char keybits[96];
+            char relbits[8];
+            char absbits[8];
+            memset(&evbits[0], 0, 8);
+            memset(&keybits[0], 0, 96);
+            memset(&relbits[0], 0, 8);
+            memset(&absbits[0], 0, 8);
+            sysIoctl(fd, evioGbit(0, 8), &evbits[0]);
+            sysIoctl(fd, evioGbit(EV_KEY, 96), &keybits[0]);
+            sysIoctl(fd, evioGbit(EV_REL, 8), &relbits[0]);
+            sysIoctl(fd, evioGbit(EV_ABS, 8), &absbits[0]);
+            int kind = 0;
+            if (bitSet(&evbits[0], EV_KEY) && bitSet(&keybits[0], 30) && bitSet(&keybits[0], 57)) {
+                kind = kind | 1;
+            }
+            if (bitSet(&evbits[0], EV_REL) && bitSet(&relbits[0], REL_X) && bitSet(&keybits[0], BTN_LEFT)) {
+                kind = kind | 2;
+            }
+            if (bitSet(&evbits[0], EV_ABS) && bitSet(&absbits[0], ABS_X) && (bitSet(&keybits[0], BTN_TOUCH) || bitSet(&keybits[0], BTN_LEFT))) {
+                kind = kind | 4;
+                char info[24];
+                if (sysIoctl(fd, evioGabs(ABS_X), &info[0]) >= 0) {
+                    devAbsMaxX[ndev] = u32at(&info[0], 8);
+                }
+                if (sysIoctl(fd, evioGabs(ABS_Y), &info[0]) >= 0) {
+                    devAbsMaxY[ndev] = u32at(&info[0], 8);
+                }
+            }
+            if (kind == 0) {
+                close(fd);
+                continue;
+            }
+            devFd[ndev] = fd;
+            devKind[ndev] = kind;
+            ndev++;
+        }
+        if (takeConsole) {
+            grabConsole();
+        }
+    }
+
+    // the text console stays quiet while the display runs
+    public void grabConsole() {
+        if (consoleTaken) {
+            return;
+        }
+        ttyFd = open("/dev/tty0", O_RDWR);
+        if (ttyFd >= 0) {
+            sysIoctl(ttyFd, 0x4B3A, (char*) 1);        // KDSETMODE KD_GRAPHICS
+            sysIoctl(ttyFd, 0x4B45, (char*) 4);        // KDSKBMODE K_OFF
+            consoleTaken = true;
+        }
+    }
+
+    public void releaseConsole() {
+        if (consoleTaken && ttyFd >= 0) {
+            sysIoctl(ttyFd, 0x4B45, (char*) 3);        // KDSKBMODE K_UNICODE
+            sysIoctl(ttyFd, 0x4B3A, (char*) 0);        // KDSETMODE KD_TEXT
+            close(ttyFd);
+        }
+        consoleTaken = false;
+    }
+
+    public virtual void present(gfx.Surface* screen, int x, int y, int rw, int rh) {
+        if (mem == null) {
+            return;
+        }
+        writeRect(screen, x, y, rw, rh, &mem[yoff * lineLength + xoff * (bpp / 8)], lineLength, bpp, roff, rlen, goff, glen, boff, blen);
+    }
+
+    public virtual int pollFds(int* handles, int* events, int max) {
+        int n = 0;
+        for (int i = 0; i < ndev && n < max; i++) {
+            handles[n] = devFd[i];
+            events[n] = net.READABLE;
+            n++;
+        }
+        return n;
+    }
+
+    // one evdev event (type, code, value); the pointer and keyboard state is kept here
+    public void handleEvent(int etype, int code, int value) {
+        if (etype == EV_KEY) {
+            if (code == BTN_LEFT || code == BTN_TOUCH) {
+                push(value != 0 ? wsrv.IE_DOWN : wsrv.IE_UP, 0, 0, 1, 0, 0);
+            } else if (code == BTN_RIGHT) {
+                push(value != 0 ? wsrv.IE_DOWN : wsrv.IE_UP, 0, 0, 3, 0, 0);
+            } else if (code == BTN_MIDDLE) {
+                push(value != 0 ? wsrv.IE_DOWN : wsrv.IE_UP, 0, 0, 2, 0, 0);
+            } else {
+                if (code == 42 || code == 54) { shift = value != 0; }
+                if (code == 100) { altgr = value != 0; }
+                int uni = 0;
+                int key = keyFor(code, shift, altgr, &uni);
+                if (key != 0) {
+                    if (value == 0) {
+                        push(wsrv.IE_KEYUP, 0, 0, 0, key, 0);
+                    } else {
+                        push(wsrv.IE_KEYDOWN, 0, 0, 0, key, uni);
+                    }
+                }
+            }
+        } else if (etype == EV_REL) {
+            if (code == REL_X || code == REL_Y) {
+                if (code == REL_X) { px = px + value; } else { py = py + value; }
+                if (px < 0) { px = 0; }
+                if (py < 0) { py = 0; }
+                if (px >= w) { px = w - 1; }
+                if (py >= h) { py = h - 1; }
+                push(wsrv.IE_MOVE, px, py, 0, 0, 0);
+            } else if (code == REL_WHEEL) {
+                push(wsrv.IE_SCROLL, 0, 0, value, 0, 0);
+            }
+        } else if (etype == EV_ABS) {
+            // absolute devices report in their own range; scaled to the screen by the caller through setAbsRange
+            if (code == ABS_X) {
+                absX = value;
+                px = scaleAbs(value, absMaxX, w);
+                push(wsrv.IE_MOVE, px, py, 0, 0, 0);
+            } else if (code == ABS_Y) {
+                absY = value;
+                py = scaleAbs(value, absMaxY, h);
+                push(wsrv.IE_MOVE, px, py, 0, 0, 0);
+            }
+        }
+    }
+
+    private int absMaxX;
+    private int absMaxY;
+
+    // the range of the absolute device that is used (touch screens: 0 .. max)
+    public void setAbsRange(int maxX, int maxY) {
+        absMaxX = maxX;
+        absMaxY = maxY;
+    }
+
+    private int scaleAbs(int v, int max, int size) {
+        if (max <= 0) {
+            return v;
+        }
+        int r = v * (size - 1) / max;
+        if (r < 0) { r = 0; }
+        if (r >= size) { r = size - 1; }
+        return r;
+    }
+
+    public virtual void service(int* handles, int* revents, int n) {
+        for (int i = 0; i < ndev; i++) {
+            bool ready = false;
+            for (int j = 0; j < n; j++) {
+                if (handles[j] == devFd[i] && (revents[j] & net.READABLE) != 0) {
+                    ready = true;
+                }
+            }
+            if (!ready) {
+                continue;
+            }
+            if ((devKind[i] & 4) != 0) {
+                absMaxX = devAbsMaxX[i];
+                absMaxY = devAbsMaxY[i];
+            }
+            int got = read(devFd[i], ibuf, 24 * 32);
+            int off = 0;
+            while (got - off >= 24) {
+                int t = ibuf[off + 16] | (ibuf[off + 17] << 8);
+                int c = ibuf[off + 18] | (ibuf[off + 19] << 8);
+                int v = u32at(ibuf, off + 20);
+                if (v >= 0x80000000) {
+                    v = v - 0x100000000;
+                }
+                handleEvent(t, c, v);
+                off = off + 24;
+            }
+        }
+    }
+
+    public virtual void shutdown() {
+        releaseConsole();
+        for (int i = 0; i < ndev; i++) {
+            close(devFd[i]);
+        }
+        ndev = 0;
+    }
+}

@@ -1,0 +1,471 @@
+// =============================================================================
+//  wvnc - a VNC (RFB) backend for the display server                                import wvnc;
+//
+//  Lets any VNC viewer show and control the display:
+//
+//    wvnc.Vnc* v = new wvnc.Vnc(1024, 768, 5900, "127.0.0.1");       // listen on 127.0.0.1:5900
+//    wsrv.Server* srv = new wsrv.Server(v, 7000);
+//    srv->run();
+//
+//  Then connect a viewer to localhost:5900 (:0). It speaks RFB 3.3 / 3.7 / 3.8 with the "None" security type and the Raw
+//  encoding, for 8, 16 and 32 bits per pixel true colour formats. There is no password and no encryption: the default
+//  host is 127.0.0.1; to use the display from another computer tunnel the port (ssh -L 5900:localhost:5900 ...).
+//  Several viewers can be connected at the same time. The mouse, the wheel and the keyboard (including international
+//  characters) are passed on to the display server.
+//    int  v->viewers()        the number of connected viewers
+// =============================================================================
+import net;
+import gfx;
+import adp;
+import wsrv;
+import cstdlib;
+module wvnc;
+
+private void put16(char* b, int at, int v) {
+    b[at] = (v >> 8) & 255;
+    b[at + 1] = v & 255;
+}
+
+private void put32be(char* b, int at, int v) {
+    b[at] = (v >> 24) & 255;
+    b[at + 1] = (v >> 16) & 255;
+    b[at + 2] = (v >> 8) & 255;
+    b[at + 3] = v & 255;
+}
+
+private int get16(char* b, int at) {
+    return (b[at] << 8) | b[at + 1];
+}
+
+private int get32be(char* b, int at) {
+    return (b[at] << 24) | (b[at + 1] << 16) | (b[at + 2] << 8) | b[at + 3];
+}
+
+// the display server key code and character for an X11 keysym; returns the key code, 0 for keys we do not know
+public int keyOfKeysym(int sym, int* uni) {
+    *uni = 0;
+    if (sym >= 0x20 && sym <= 0x7E) {
+        *uni = sym;
+        if (sym >= 'A' && sym <= 'Z') {
+            return sym + 32;
+        }
+        return sym;
+    }
+    if (sym >= 0xA0 && sym <= 0xFF) {
+        *uni = sym;
+        return sym;
+    }
+    if (sym >= 0x01000000) {
+        *uni = sym - 0x01000000;
+        return *uni;
+    }
+    if (sym == 0xFF08) { return adp.KEY_BACKSPACE; }
+    if (sym == 0xFF09) { return adp.KEY_TAB; }
+    if (sym == 0xFF0D || sym == 0xFF8D) { return adp.KEY_ENTER; }
+    if (sym == 0xFF1B) { return adp.KEY_ESCAPE; }
+    if (sym == 0xFFFF) { return adp.KEY_DELETE; }
+    if (sym == 0xFF50) { return adp.KEY_HOME; }
+    if (sym == 0xFF51) { return adp.KEY_LEFT; }
+    if (sym == 0xFF52) { return adp.KEY_UP; }
+    if (sym == 0xFF53) { return adp.KEY_RIGHT; }
+    if (sym == 0xFF54) { return adp.KEY_DOWN; }
+    if (sym == 0xFF55) { return adp.KEY_PGUP; }
+    if (sym == 0xFF56) { return adp.KEY_PGDN; }
+    if (sym == 0xFF57) { return adp.KEY_END; }
+    if (sym == 0xFF63) { return adp.KEY_INSERT; }
+    if (sym >= 0xFFBE && sym <= 0xFFC9) { return adp.KEY_F1 + (sym - 0xFFBE); }
+    if (sym == 0xFFE1 || sym == 0xFFE2) { return adp.KEY_SHIFT; }
+    if (sym == 0xFFE3 || sym == 0xFFE4) { return adp.KEY_CTRL; }
+    if (sym == 0xFFE9 || sym == 0xFFEA || sym == 0xFE03) { return adp.KEY_ALT; }
+    if (sym == 0xFFEB || sym == 0xFFEC) { return adp.KEY_META; }
+    if (sym == 0xFFE5) { return adp.KEY_CAPS; }
+    if (sym >= 0xFFB0 && sym <= 0xFFB9) {
+        *uni = '0' + (sym - 0xFFB0);
+        return *uni;
+    }
+    return 0;
+}
+
+class Viewer {
+    public int fd;
+    public int state;              // 0 version, 1 security choice, 2 ClientInit, 3 running
+    public int minor;
+    public bool dead;
+    public adp.Bytes* in;
+    public bool pending;           // a FramebufferUpdateRequest is waiting for something to send
+    public bool dirty;
+    public int dx0;
+    public int dy0;
+    public int dx1;
+    public int dy1;
+    public int bpp;
+    public bool bigEndian;
+    public int rmax;
+    public int gmax;
+    public int bmax;
+    public int rshift;
+    public int gshift;
+    public int bshift;
+    public int lastMask;
+    public int lastX;
+    public int lastY;
+
+    public Viewer(int h) {
+        fd = h;
+        in = new adp.Bytes();
+        bpp = 32;
+        rmax = 255;
+        gmax = 255;
+        bmax = 255;
+        rshift = 16;
+        gshift = 8;
+        bshift = 0;
+    }
+
+    public void addDirty(int x, int y, int x1, int y1) {
+        if (!dirty) {
+            dx0 = x; dy0 = y; dx1 = x1; dy1 = y1;
+            dirty = true;
+            return;
+        }
+        if (x < dx0) { dx0 = x; }
+        if (y < dy0) { dy0 = y; }
+        if (x1 > dx1) { dx1 = x1; }
+        if (y1 > dy1) { dy1 = y1; }
+    }
+}
+
+public class Vnc : wsrv.Backend {
+    public int port;
+    public char* title;
+    private int listenFd;
+    private Viewer** vs;
+    private int nv;
+    private adp.Bytes* out;
+    private gfx.Surface* last;
+
+    public Vnc(int width, int height, int tcpPort, char* host) {
+        w = width;
+        h = height;
+        port = tcpPort;
+        title = "A display";
+        vs = (Viewer**) calloc(16, 8);
+        out = new adp.Bytes();
+        net.init();
+        listenFd = net.listenOn(host, tcpPort, 8);
+    }
+
+    public bool ok() { return listenFd >= 0; }
+    public int viewers() { return nv; }
+
+    public virtual int pollFds(int* handles, int* events, int max) {
+        int n = 0;
+        if (listenFd >= 0 && n < max) {
+            handles[n] = listenFd;
+            events[n] = net.READABLE;
+            n++;
+        }
+        for (int i = 0; i < nv && n < max; i++) {
+            handles[n] = vs[i]->fd;
+            events[n] = net.READABLE;
+            n++;
+        }
+        return n;
+    }
+
+    private bool ready(int* handles, int* revents, int n, int fd) {
+        for (int i = 0; i < n; i++) {
+            if (handles[i] == fd && (revents[i] & (net.READABLE | net.HUNGUP | net.FAILED)) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public virtual void service(int* handles, int* revents, int n) {
+        if (listenFd >= 0 && ready(handles, revents, n, listenFd) && nv < 15) {
+            int c = net.accept(listenFd);
+            if (c >= 0) {
+                net.setTimeout(c, 2000);
+                net.setNoDelay(c, true);
+                Viewer* v = new Viewer(c);
+                vs[nv] = v;
+                nv++;
+                net.sendText(c, "RFB 003.008\n");
+            }
+        }
+        for (int i = 0; i < nv; i++) {
+            Viewer* v = vs[i];
+            if (ready(handles, revents, n, v->fd)) {
+                readViewer(v);
+            }
+        }
+        int i = 0;
+        while (i < nv) {
+            if (vs[i]->dead) {
+                net.close(vs[i]->fd);
+                for (int j = i; j < nv - 1; j++) {
+                    vs[j] = vs[j + 1];
+                }
+                nv--;
+            } else {
+                i++;
+            }
+        }
+    }
+
+    private void send(Viewer* v) {
+        if (net.send(v->fd, out->data, out->len) < 0) {
+            v->dead = true;
+        }
+    }
+
+    private void readViewer(Viewer* v) {
+        v->in->reserve(4096);
+        int n = net.recv(v->fd, &v->in->data[v->in->len], 4096);
+        if (n <= 0) {
+            v->dead = true;
+            return;
+        }
+        v->in->len = v->in->len + n;
+        while (!v->dead && parse(v)) {
+        }
+    }
+
+    // handles one complete client message from the buffer; false when there is none
+    private bool parse(Viewer* v) {
+        adp.Bytes* b = v->in;
+        char* d = b->data;
+        if (v->state == 0) {
+            if (b->len < 12) { return false; }
+            v->minor = (d[8] - '0') * 100 + (d[9] - '0') * 10 + (d[10] - '0');
+            b->consume(12);
+            out->clear();
+            if (v->minor >= 7) {
+                char sec[2];
+                sec[0] = 1;
+                sec[1] = 1;
+                net.send(v->fd, &sec[0], 2);
+                v->state = 1;
+            } else {
+                char sec4[4];
+                put32be(&sec4[0], 0, 1);
+                net.send(v->fd, &sec4[0], 4);
+                v->state = 2;
+            }
+            return true;
+        }
+        if (v->state == 1) {
+            if (b->len < 1) { return false; }
+            b->consume(1);
+            if (v->minor >= 8) {
+                char ok4[4];
+                put32be(&ok4[0], 0, 0);
+                net.send(v->fd, &ok4[0], 4);
+            }
+            v->state = 2;
+            return true;
+        }
+        if (v->state == 2) {
+            if (b->len < 1) { return false; }
+            b->consume(1);
+            int tl = strlen(title);
+            out->clear();
+            char head[24];
+            memset(&head[0], 0, 24);
+            put16(&head[0], 0, w);
+            put16(&head[0], 2, h);
+            head[4] = 32;                       // bits per pixel
+            head[5] = 24;                       // depth
+            head[6] = 0;                        // little endian
+            head[7] = 1;                        // true colour
+            put16(&head[0], 8, 255);
+            put16(&head[0], 10, 255);
+            put16(&head[0], 12, 255);
+            head[14] = 16;                      // red shift
+            head[15] = 8;
+            head[16] = 0;
+            out->addBytes(&head[0], 20);
+            char len4[4];
+            put32be(&len4[0], 0, tl);
+            out->addBytes(&len4[0], 4);
+            out->addBytes(title, tl);
+            send(v);
+            v->state = 3;
+            return true;
+        }
+        // running
+        if (b->len < 1) { return false; }
+        int type = d[0];
+        if (type == 0) {                        // SetPixelFormat
+            if (b->len < 20) { return false; }
+            int bpp = d[4];
+            bool true_colour = d[7] != 0;
+            if (true_colour && (bpp == 8 || bpp == 16 || bpp == 32)) {
+                v->bpp = bpp;
+                v->bigEndian = d[6] != 0;
+                v->rmax = get16(d, 8);
+                v->gmax = get16(d, 10);
+                v->bmax = get16(d, 12);
+                v->rshift = d[14];
+                v->gshift = d[15];
+                v->bshift = d[16];
+            }
+            b->consume(20);
+            return true;
+        }
+        if (type == 2) {                        // SetEncodings
+            if (b->len < 4) { return false; }
+            int cnt = get16(d, 2);
+            if (b->len < 4 + cnt * 4) { return false; }
+            b->consume(4 + cnt * 4);
+            return true;
+        }
+        if (type == 3) {                        // FramebufferUpdateRequest
+            if (b->len < 10) { return false; }
+            bool incremental = d[1] != 0;
+            int rx = get16(d, 2);
+            int ry = get16(d, 4);
+            int rw = get16(d, 6);
+            int rh = get16(d, 8);
+            b->consume(10);
+            if (!incremental) {
+                v->addDirty(rx, ry, rx + rw, ry + rh);
+            }
+            v->pending = true;
+            flushViewer(v);
+            return true;
+        }
+        if (type == 4) {                        // KeyEvent
+            if (b->len < 8) { return false; }
+            bool down = d[1] != 0;
+            int sym = get32be(d, 4);
+            b->consume(8);
+            int uni = 0;
+            int key = keyOfKeysym(sym, &uni);
+            if (key != 0) {
+                push(down ? wsrv.IE_KEYDOWN : wsrv.IE_KEYUP, 0, 0, 0, key, down ? uni : 0);
+            }
+            return true;
+        }
+        if (type == 5) {                        // PointerEvent
+            if (b->len < 6) { return false; }
+            int mask = d[1];
+            int px = get16(d, 2);
+            int py = get16(d, 4);
+            b->consume(6);
+            if (px != v->lastX || py != v->lastY) {
+                push(wsrv.IE_MOVE, px, py, 0, 0, 0);
+                v->lastX = px;
+                v->lastY = py;
+            }
+            for (int bit = 0; bit < 3; bit++) {
+                int now = (mask >> bit) & 1;
+                int was = (v->lastMask >> bit) & 1;
+                if (now != was) {
+                    push(now != 0 ? wsrv.IE_DOWN : wsrv.IE_UP, 0, 0, bit + 1, 0, 0);
+                }
+            }
+            if ((mask & 8) != 0 && (v->lastMask & 8) == 0) {
+                push(wsrv.IE_SCROLL, 0, 0, 1, 0, 0);
+            }
+            if ((mask & 16) != 0 && (v->lastMask & 16) == 0) {
+                push(wsrv.IE_SCROLL, 0, 0, -1, 0, 0);
+            }
+            v->lastMask = mask;
+            return true;
+        }
+        if (type == 6) {                        // ClientCutText
+            if (b->len < 8) { return false; }
+            int tl = get32be(d, 4);
+            if (tl < 0 || tl > 1000000) {
+                v->dead = true;
+                return false;
+            }
+            if (b->len < 8 + tl) { return false; }
+            b->consume(8 + tl);
+            return true;
+        }
+        v->dead = true;                         // an unknown message: the stream cannot be followed any more
+        return false;
+    }
+
+    // sends the changed part of the screen if the viewer is waiting for it
+    private void flushViewer(Viewer* v) {
+        if (!v->pending || !v->dirty || last == null) {
+            return;
+        }
+        int x0 = v->dx0;
+        int y0 = v->dy0;
+        int x1 = v->dx1;
+        int y1 = v->dy1;
+        if (x0 < 0) { x0 = 0; }
+        if (y0 < 0) { y0 = 0; }
+        if (x1 > w) { x1 = w; }
+        if (y1 > h) { y1 = h; }
+        v->dirty = false;
+        v->pending = false;
+        if (x0 >= x1 || y0 >= y1) {
+            return;
+        }
+        int rw = x1 - x0;
+        int rh = y1 - y0;
+        int bytes = v->bpp / 8;
+        out->clear();
+        char head[16];
+        head[0] = 0;
+        head[1] = 0;
+        put16(&head[0], 2, 1);
+        put16(&head[0], 4, x0);
+        put16(&head[0], 6, y0);
+        put16(&head[0], 8, rw);
+        put16(&head[0], 10, rh);
+        put32be(&head[0], 12, 0);
+        out->addBytes(&head[0], 16);
+        out->reserve(rw * rh * bytes);
+        char* dst = &out->data[out->len];
+        if (v->bpp == 32 && !v->bigEndian && v->rmax == 255 && v->gmax == 255 && v->bmax == 255 && v->rshift == 16 && v->gshift == 8 && v->bshift == 0) {
+            last->pack(x0, y0, rw, rh, dst);
+        } else {
+            int n = 0;
+            for (int yy = y0; yy < y1; yy++) {
+                for (int xx = x0; xx < x1; xx++) {
+                    int c = last->get(xx, yy);
+                    int r = (gfx.red(c) * v->rmax + 127) / 255;
+                    int g = (gfx.green(c) * v->gmax + 127) / 255;
+                    int bl = (gfx.blue(c) * v->bmax + 127) / 255;
+                    int px = (r << v->rshift) | (g << v->gshift) | (bl << v->bshift);
+                    for (int k = 0; k < bytes; k++) {
+                        int sh = v->bigEndian ? (bytes - 1 - k) * 8 : k * 8;
+                        dst[n] = (px >> sh) & 255;
+                        n++;
+                    }
+                }
+            }
+        }
+        out->len = out->len + rw * rh * bytes;
+        send(v);
+    }
+
+    public virtual void present(gfx.Surface* screen, int x, int y, int rw, int rh) {
+        last = screen;
+        for (int i = 0; i < nv; i++) {
+            Viewer* v = vs[i];
+            if (v->state == 3) {
+                v->addDirty(x, y, x + rw, y + rh);
+                flushViewer(v);
+            }
+        }
+    }
+
+    public virtual void shutdown() {
+        for (int i = 0; i < nv; i++) {
+            net.close(vs[i]->fd);
+        }
+        nv = 0;
+        if (listenFd >= 0) {
+            net.close(listenFd);
+            listenFd = -1;
+        }
+    }
+}

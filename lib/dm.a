@@ -1,0 +1,479 @@
+// =============================================================================
+//  dm - a display manager                                                       import dm;
+//
+//  Runs the display server, shows a login screen, checks the password, starts the session of the user and shows the
+//  login screen again when the session ends. See examples/gui/adm.a for a complete program.
+//
+//    dm.Config* cfg = new dm.Config();
+//    dm.loadConfig(cfg, "/etc/adm/adm.conf");                // optional: key = value lines
+//    wsrv.Server* srv = new wsrv.Server(backend, cfg->displayPort);
+//    dm.Manager* m = new dm.Manager(srv, cfg);
+//    m->run();
+//
+//  Users come from /etc/passwd + /etc/shadow ("users = system", needs root and $6$ SHA-512 hashes) or from a file of
+//  lines   name:hash:uid:gid:home:session   (hash made by syscrypt.sha512crypt, see dm.makeUserLine). The session is a command
+//  that is started through /bin/sh as the user (with setgid / setuid when the display manager runs as root), with
+//  ADISPLAY pointing at this display; when it ends, every program that is still connected is disconnected and the
+//  login screen comes back. Login attempts that fail make the next one wait 1, 2, 3 ... seconds (at most 8).
+//
+//  Configuration keys: port, vnc (port, 0 = off), vnchost, fb (device, "none" = off), layout (us / fi), width, height, users,
+//  session, greeting, shutdown, reboot, minuid (default 1000), allowroot (0 / 1), takeconsole (0 / 1).
+// =============================================================================
+import net;
+import gfx;
+import adp;
+import wsrv;
+import gui;
+import syscrypt;
+import cstdlib;
+import cunistd;
+module dm;
+
+public class Config {
+    public int displayPort;
+    public int vncPort;
+    public char* vncHost;
+    public char* fbDevice;
+    public char* layout;
+    public int width;
+    public int height;
+    public char* usersFile;
+    public char* session;
+    public char* greeting;
+    public char* shutdownCmd;
+    public char* rebootCmd;
+    public int minUid;
+    public bool allowRoot;
+    public bool takeConsole;
+
+    public Config() {
+        displayPort = 7000;
+        vncPort = 0;
+        vncHost = "127.0.0.1";
+        fbDevice = "none";
+        layout = "us";
+        width = 1024;
+        height = 768;
+        usersFile = "system";
+        session = "/usr/bin/asession";
+        greeting = "Welcome";
+        shutdownCmd = "/sbin/poweroff";
+        rebootCmd = "/sbin/reboot";
+        minUid = 1000;
+        allowRoot = false;
+        takeConsole = false;
+    }
+}
+
+// ---- text helpers ------------------------------------------------------------------------------------------------------------------
+// the n-th field (from 0) of a line with the separator sep, as a new string ("" if there is none)
+public char* field(char* line, int n, int sep) {
+    int start = 0;
+    int idx = 0;
+    int i = 0;
+    for (;;) {
+        if (line[i] == sep || line[i] == 0 || line[i] == 10 || line[i] == 13) {
+            if (idx == n) {
+                char* f = malloc(i - start + 1);
+                memcpy(f, &line[start], i - start);
+                f[i - start] = 0;
+                return f;
+            }
+            if (line[i] != sep) {
+                return strdup("");
+            }
+            idx++;
+            start = i + 1;
+        }
+        i++;
+    }
+    return strdup("");
+}
+
+private char* trimmed(char* s) {
+    int a = 0;
+    int b = strlen(s);
+    while (a < b && (s[a] == ' ' || s[a] == 9)) { a++; }
+    while (b > a && (s[b - 1] == ' ' || s[b - 1] == 9 || s[b - 1] == 13 || s[b - 1] == 10)) { b--; }
+    char* r = malloc(b - a + 1);
+    memcpy(r, &s[a], b - a);
+    r[b - a] = 0;
+    return r;
+}
+
+// reads a configuration file of "key = value" lines (# starts a comment); unknown keys are ignored. false if unreadable
+public bool loadConfig(Config* c, char* path) {
+    char* text = readFile(path);
+    if (text == null) {
+        return false;
+    }
+    int pos = 0;
+    int len = strlen(text);
+    while (pos < len) {
+        int end = pos;
+        while (end < len && text[end] != 10) { end++; }
+        char* line = malloc(end - pos + 1);
+        memcpy(line, &text[pos], end - pos);
+        line[end - pos] = 0;
+        pos = end + 1;
+        if (line[0] == '#' || indexOf(line, '=') < 0) {
+            continue;
+        }
+        char* key = strLower(trimmed(field(line, 0, '=')));
+        char* val = trimmed(&line[indexOf(line, '=') + 1]);
+        if (streq(key, "port")) { c->displayPort = atoi(val); }
+        else if (streq(key, "vnc")) { c->vncPort = atoi(val); }
+        else if (streq(key, "vnchost")) { c->vncHost = val; }
+        else if (streq(key, "fb")) { c->fbDevice = val; }
+        else if (streq(key, "layout")) { c->layout = val; }
+        else if (streq(key, "width")) { c->width = atoi(val); }
+        else if (streq(key, "height")) { c->height = atoi(val); }
+        else if (streq(key, "users")) { c->usersFile = val; }
+        else if (streq(key, "session")) { c->session = val; }
+        else if (streq(key, "greeting")) { c->greeting = val; }
+        else if (streq(key, "shutdown")) { c->shutdownCmd = val; }
+        else if (streq(key, "reboot")) { c->rebootCmd = val; }
+        else if (streq(key, "minuid")) { c->minUid = atoi(val); }
+        else if (streq(key, "allowroot")) { c->allowRoot = atoi(val) != 0; }
+        else if (streq(key, "takeconsole")) { c->takeConsole = atoi(val) != 0; }
+    }
+    return true;
+}
+
+// ---- users -------------------------------------------------------------------------------------------------------------------------
+public class User {
+    public char* name;
+    public char* hash;
+    public int uid;
+    public int gid;
+    public char* home;
+    public char* session;
+}
+
+// the line of a users file for a new user: name:hash:uid:gid:home:session (the salt is made from the arguments)
+public char* makeUserLine(char* name, char* password, char* salt, int uid, int gid, char* home, char* session) {
+    char setting[64];
+    format(&setting[0], 64, "$6$%s", salt);
+    char* h = syscrypt.sha512crypt(password, &setting[0]);
+    char* line = malloc(strlen(name) + strlen(h) + strlen(home) + strlen(session) + 64);
+    format(line, 1000, "%s:%s:%d:%d:%s:%s", name, h, uid, gid, home, session);
+    return line;
+}
+
+// searches the line that starts with "name:" in a text, null if there is none
+private char* findLine(char* text, char* name) {
+    int nl = strlen(name);
+    int pos = 0;
+    int len = strlen(text);
+    while (pos < len) {
+        int end = pos;
+        while (end < len && text[end] != 10) { end++; }
+        if (end - pos > nl && text[pos + nl] == ':' && startsWith(&text[pos], name)) {
+            char* line = malloc(end - pos + 1);
+            memcpy(line, &text[pos], end - pos);
+            line[end - pos] = 0;
+            return line;
+        }
+        pos = end + 1;
+    }
+    return null;
+}
+
+// the user with this name, null if there is none (the hash may be unreadable: then it is "")
+public User* lookup(Config* c, char* name) {
+    if (name[0] == 0 || indexOf(name, ':') >= 0 || indexOf(name, 10) >= 0) {
+        return null;
+    }
+    User* u = new User();
+    u->name = strdup(name);
+    if (streq(c->usersFile, "system")) {
+        char* passwd = readFile("/etc/passwd");
+        if (passwd == null) {
+            return null;
+        }
+        char* line = findLine(passwd, name);
+        if (line == null) {
+            return null;
+        }
+        u->uid = atoi(field(line, 2, ':'));
+        u->gid = atoi(field(line, 3, ':'));
+        u->home = field(line, 5, ':');
+        u->session = "";
+        u->hash = "";
+        char* shadow = readFile("/etc/shadow");
+        if (shadow != null) {
+            char* sl = findLine(shadow, name);
+            if (sl != null) {
+                u->hash = field(sl, 1, ':');
+            }
+        }
+        return u;
+    }
+    char* text = readFile(c->usersFile);
+    if (text == null) {
+        return null;
+    }
+    char* line = findLine(text, name);
+    if (line == null) {
+        return null;
+    }
+    u->hash = field(line, 1, ':');
+    u->uid = atoi(field(line, 2, ':'));
+    u->gid = atoi(field(line, 3, ':'));
+    u->home = field(line, 4, ':');
+    u->session = field(line, 5, ':');
+    return u;
+}
+
+// the user if the password is right and the account may log in, otherwise null
+public User* authenticate(Config* c, char* name, char* password) {
+    User* u = lookup(c, name);
+    if (u == null) {
+        // the same work as for a real user, so that the time does not tell whether the name exists
+        syscrypt.sha512crypt(password, "$6$0123456789abcdef");
+        return null;
+    }
+    if (u->hash[0] != '$') {
+        return null;                    // locked ("!" or "*"), empty or unreadable
+    }
+    if (!syscrypt.verify(password, u->hash)) {
+        return null;
+    }
+    if (u->uid == 0 && !c->allowRoot) {
+        return null;
+    }
+    if (u->uid != 0 && u->uid < c->minUid) {
+        return null;
+    }
+    return u;
+}
+
+// ---- sessions ----------------------------------------------------------------------------------------------------------------------
+private int sysSetsid() { return __syscall(__ARCH == 0 ? 112 : 157, 0, 0, 0, 0, 0, 0); }
+private int sysSetgroups() { return __syscall(__ARCH == 0 ? 116 : 159, 0, 0, 0, 0, 0, 0); }
+private int sysSetgid(int g) { return __syscall(__ARCH == 0 ? 106 : 144, g, 0, 0, 0, 0, 0); }
+private int sysSetuid(int u) { return __syscall(__ARCH == 0 ? 105 : 146, u, 0, 0, 0, 0, 0); }
+
+// runs a command through /bin/sh and returns its pid (-1 if it cannot be started). As the user when u is not null.
+public int spawn(User* u, char* command, int displayPort) {
+    int pid = fork();
+    if (pid != 0) {
+        return pid;
+    }
+    // ---- the child
+    sysSetsid();
+    if (u != null) {
+        if (u->uid != getuid() || u->gid != getgid()) {
+            sysSetgroups();
+            if (sysSetgid(u->gid) < 0 || sysSetuid(u->uid) < 0) {
+                _exit(126);
+            }
+        }
+        chdir(u->home);
+        setenv("HOME", u->home, 1);
+        setenv("USER", u->name, 1);
+        setenv("LOGNAME", u->name, 1);
+    }
+    char spec[40];
+    format(&spec[0], 40, "127.0.0.1:%d", displayPort);
+    setenv("ADISPLAY", &spec[0], 1);
+    if (getenv("PATH") == null) {
+        setenv("PATH", "/usr/local/bin:/usr/bin:/bin", 1);
+    }
+    char* argv[4];
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = command;
+    argv[3] = null;
+    execv("/bin/sh", &argv[0]);
+    _exit(127);
+    return -1;
+}
+
+// ---- the login screen and the session loop -------------------------------------------------------------------------------
+class Manager;
+Manager* theManager;
+
+int stepServerHook(int unused) {
+    theManager->server->step(0);
+    return 0;
+}
+
+int loginClicked(int self) {
+    theManager->tryLogin();
+    return 0;
+}
+
+int restartClicked(int self) {
+    spawn(null, theManager->cfg->rebootCmd, theManager->cfg->displayPort);
+    return 0;
+}
+
+int shutdownClicked(int self) {
+    spawn(null, theManager->cfg->shutdownCmd, theManager->cfg->displayPort);
+    return 0;
+}
+
+public class Manager {
+    public wsrv.Server* server;
+    public Config* cfg;
+    public gui.Display* d;
+    public gui.Window* win;
+    public gui.TextBox* userBox;
+    public gui.TextBox* passBox;
+    public gui.Label* status;
+    public int sessionPid;
+    public int greeterNum;
+    public int failures;
+    public int lockedUntil;
+    public char* loggedIn;
+    public int sessions;
+
+    public Manager(wsrv.Server* s, Config* c) {
+        server = s;
+        cfg = c;
+        theManager = this;
+        gui.idleHook = stepServerHook;
+        d = gui.connectAs(adpSpec(c->displayPort), "adm-greeter");
+        greeterNum = d->clientNum;
+        gui.idleHook = null;
+        buildGreeter();
+    }
+
+    private char* adpSpec(int port) {
+        char* t = malloc(24);
+        format(t, 24, "127.0.0.1:%d", port);
+        return t;
+    }
+
+    // the login window in the middle of the screen
+    private void buildGreeter() {
+        int ww = 340;
+        win = d->createWindowAt("Login", 0, 0, ww, 300, adp.F_NODECOR);
+        gui.Box* card = gui.vbox(8, 18);
+        card->background = 0xFFF6F7FA;
+        card->border = 0xFF7C86A0;
+        gui.Label* title = new gui.Label("A display manager");
+        title->font = gfx.sansBold();
+        title->align = 1;
+        card->add(title);
+        gui.Label* greeting = new gui.Label(cfg->greeting);
+        greeting->color = gui.cTextDim;
+        greeting->align = 1;
+        card->add(greeting);
+        card->add(new gui.Separator());
+        card->add(new gui.Label("User name"));
+        userBox = new gui.TextBox();
+        card->add(userBox);
+        card->add(new gui.Label("Password"));
+        passBox = new gui.TextBox();
+        passBox->password = true;
+        passBox->onEnter = loginClicked;
+        card->add(passBox);
+        status = new gui.Label("");
+        status->color = 0xFFC02828;
+        card->add(status);
+        gui.Box* row = gui.hbox(8, 0);
+        gui.Button* login = new gui.Button("Log in");
+        login->primary = true;
+        login->onClick = loginClicked;
+        login->flex = 1;
+        row->add(login);
+        gui.Button* restart = new gui.Button("Restart");
+        restart->onClick = restartClicked;
+        row->add(restart);
+        gui.Button* off = new gui.Button("Shut down");
+        off->onClick = shutdownClicked;
+        row->add(off);
+        card->add(row);
+        win->setRoot(card);
+        win->defaultButton = login;
+        win->setFocus(userBox);
+        userBox->onEnter = focusPassword;
+        // the window is as high as the card needs and sits in the middle of the screen
+        int wh = card->prefH();
+        win->resize(ww, wh);
+        win->move((server->screen->w - ww) / 2, (server->screen->h - wh) / 2);
+    }
+
+    public void tryLogin() {
+        int now = millis();
+        if (sessionPid > 0) {
+            return;
+        }
+        if (now < lockedUntil) {
+            status->setText("Please wait a moment");
+            return;
+        }
+        char* name = strdup(userBox->text());
+        User* u = authenticate(cfg, name, passBox->text());
+        if (u == null) {
+            failures++;
+            int wait = failures * 1000;
+            if (wait > 8000) { wait = 8000; }
+            lockedUntil = now + wait;
+            status->setText("Wrong user name or password");
+            passBox->setText("");
+            passBox->focusMe();
+            return;
+        }
+        failures = 0;
+        status->setText("");
+        passBox->setText("");
+        char* cmd = u->session;
+        if (cmd[0] == 0) {
+            cmd = cfg->session;
+        }
+        int pid = spawn(u, cmd, cfg->displayPort);
+        if (pid <= 0) {
+            status->setText("Cannot start the session");
+            return;
+        }
+        sessionPid = pid;
+        loggedIn = u->name;
+        sessions++;
+        win->hide();
+    }
+
+    // checks whether the session has ended; the login screen comes back
+    private void checkSession() {
+        if (sessionPid <= 0) {
+            return;
+        }
+        int st = 0;
+        int r = waitpid(sessionPid, &st, 1);
+        if (r == sessionPid || r < 0) {
+            kill(-sessionPid, 15);
+            sessionPid = 0;
+            server->disconnectAllExcept(greeterNum);
+            loggedIn = null;
+            userBox->setText("");
+            win->show();
+            win->raise();
+            win->focusWindow();
+            win->setFocus(userBox);
+        }
+    }
+
+    // one round of the main loop
+    public void step(int ms) {
+        server->step(ms);
+        d->pump(0);
+        checkSession();
+    }
+
+    public void run() {
+        while (!server->quit) {
+            step(10);
+        }
+    }
+
+    public bool sessionRunning() {
+        return sessionPid > 0;
+    }
+}
+
+int focusPassword(int self) {
+    theManager->passBox->focusMe();
+    return 0;
+}
