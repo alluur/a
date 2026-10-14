@@ -51,6 +51,7 @@ kw_table:
     db 0
 
 ops3:
+    db "...", T_ELLIPSIS
     db "<<=", T_SHLEQ
     db ">>=", T_SHREQ
     db 0
@@ -75,6 +76,7 @@ ops2:
     db "|=", T_OREQ
     db "^=", T_XOREQ
     db "::", T_SCOPE
+    db "..", T_RANGE
     db 0
 singles:
     db "(){}[];,.:?~=!<>&|^+-*/%", 0

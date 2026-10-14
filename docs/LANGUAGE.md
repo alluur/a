@@ -354,6 +354,15 @@ declared before the `defer`. It is meant for cleanup:
 
 `defer` is only allowed directly in a function body (not inside `if`, loops or other blocks), at most 16 per function.
 
+### Range loops
+
+`for (i in a..b) statement` counts `i` from `a` up to, but not including, `b`; `for (i in a..=b)` includes `b`. `i` is a new
+`int` that only exists inside the loop, and the end value is evaluated once before the loop starts. If `a` is not below `b`
+the body never runs. `break` and `continue` work as usual.
+
+    for (i in 0..n) total += data[i];
+    for (i in 1..=10) println(i);
+
 ### Inline assembly
 
 `asm` puts machine code of your choice into a function. The program lists the code for every CPU it should run on;

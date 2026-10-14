@@ -68,6 +68,8 @@
 %define T_SHLEQ         147
 %define T_SHREQ         148
 %define T_SCOPE         149     ; ::
+%define T_RANGE         150     ; ..
+%define T_ELLIPSIS      151     ; ...
 ; keywords
 %define K_INT           160
 %define K_CHAR          161
