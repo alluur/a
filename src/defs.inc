@@ -104,6 +104,7 @@
 %define K_PROTECTED     194
 %define K_AMODULE       195     ; a_module NAME { ... }
 %define K_AIMPORT       196     ; a_import('file.am');
+%define K_ASM           197     ; asm(a, b, c) { x64: ...; arm64: ...; }
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1

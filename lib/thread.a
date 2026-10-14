@@ -1,0 +1,162 @@
+// =============================================================================
+//  thread - threads (Linux and Android)                                 import thread;
+//
+//    int worker(int n) { ... return result; }          // runs in its own thread
+//    thread.Thread* t = thread.spawn(worker, 42);
+//    int r = thread.join(t);                            // waits, returns what worker returned
+//    thread.parallelFor(1000, body, 4);                 // body(i) for i = 0 .. 999 on 4 threads
+//
+//  A thread is a real operating system thread (the clone system call, started by an asm block). They share all
+//  memory. The runtime of A is NOT thread safe: do not call alloc / new, print or the file functions from several
+//  threads at the same time (guard them with cpu.lock) - compute into arrays or counters (cpu.atomicAdd) and print from
+//  the main thread. On Windows threads are not available yet: spawn runs the function at once in the calling thread
+//  (supported() is false), so programs still give the same results.
+// =============================================================================
+import cpu;
+module thread;
+
+public class Thread {
+    public int* rec;                // the record for the asm block (see below)
+    public int tid;                 // the thread id; the kernel sets it to 0 when the thread has ended
+    public int result;
+    public bool real;               // false: the function was run synchronously
+    public bool joined;
+}
+
+// true where spawn starts a real thread
+public bool supported() {
+    return __OS != 1;
+}
+
+private int nr(int x64, int generic) {
+    if (__ARCH == 0) return x64;
+    return generic;
+}
+
+// the clone system call; rec[0] flags, rec[1] top of the stack, rec[2] parent tid address, rec[3] child tid address,
+// rec[4] function, rec[5] argument, rec[6] result. Returns the new thread id or a negative error number
+private int startThread(int* rec) {
+    return asm(rec) {
+        x64: 0x49, 0x89, 0xC4, 0x49, 0x8B, 0x3C, 0x24, 0x49, 0x8B, 0x74, 0x24, 0x08, 0x49, 0x8B, 0x54, 0x24, 0x10, 0x4D, 0x8B, 0x54, 0x24, 0x18, 0x45, 0x31, 0xC0, 0xB8, 0x38, 0x00, 0x00, 0x00, 0x0F, 0x05, 0x48, 0x85, 0xC0, 0x75, 0x18, 0x41, 0xFF, 0x74, 0x24, 0x28, 0x41, 0xFF, 0x54, 0x24, 0x20, 0x49, 0x89, 0x44, 0x24, 0x30, 0xB8, 0x3C, 0x00, 0x00, 0x00, 0x31, 0xFF, 0x0F, 0x05;
+        arm64: 0xAA0003E9, 0xF9400120, 0xF9400521, 0xF9400922, 0xD2800003, 0xF9400D24, 0xD2801B88, 0xD4000001, 0xB5000120, 0xF9401521, 0xF81F0FE1, 0xF940112A, 0xD63F0140, 0xF9001920, 0xD2800000, 0xD2800BA8, 0xD4000001;
+        riscv64: 0x00050F93, 0x000FB503, 0x008FB583, 0x010FB603, 0x00000693, 0x018FB703, 0x0DC00893, 0x00000073, 0x02051463, 0x028FB283, 0xFF010113, 0x00513023, 0x020FB303, 0x000300E7, 0x02AFB823, 0x00000513, 0x05D00893, 0x00000073;
+        loongarch64: 0x00150094, 0x28C00284, 0x28C02285, 0x28C04286, 0x28C06287, 0x03800008, 0x0383700B, 0x002B0000, 0x44002880, 0x28C0A28C, 0x02FFC063, 0x29C0006C, 0x28C0828D, 0x4C0001A1, 0x29C0C284, 0x03800004, 0x0381740B, 0x002B0000;
+    };
+}
+
+// starts fn(arg) in a new thread (the function takes one int and returns an int)
+public Thread* spawn(func fn, int arg) {
+    Thread* t = new Thread();
+    if (!supported()) {
+        t->result = fn(arg);
+        t->real = false;
+        return t;
+    }
+    int size = 1048576;
+    int stack = __syscall(nr(9, 222), 0, size, 3, 0x22, -1, 0);        // mmap(read / write, anonymous)
+    if (stack < 0 && stack > -4096) {
+        return null;
+    }
+    int* rec = alloc(10 * 8);
+    // CLONE_VM | FS | FILES | SIGHAND | THREAD | SYSVSEM | PARENT_SETTID | CHILD_CLEARTID
+    rec[0] = 0x350F00;
+    rec[1] = (stack + size - 64) & ~15;
+    rec[2] = (int) &t->tid;
+    rec[3] = (int) &t->tid;
+    rec[4] = (int) fn;
+    rec[5] = arg;
+    t->rec = rec;
+    t->real = true;
+    int id = startThread(rec);
+    if (id < 0 && id > -4096) {
+        return null;
+    }
+    return t;
+}
+
+// waits for the thread to end and returns the result of its function
+public int join(Thread* t) {
+    if (t->real && !t->joined) {
+        int id = cpu.atomicLoad(&t->tid);
+        while (id != 0) {
+            // futex wait: sleeps while the thread id is still `id` (the kernel clears it and wakes us when the thread ends)
+            __syscall(nr(202, 98), &t->tid, 0, id, 0, 0, 0);
+            id = cpu.atomicLoad(&t->tid);
+        }
+        t->result = t->rec[6];
+        t->joined = true;
+    }
+    return t->result;
+}
+
+// true if the thread has ended
+public bool finished(Thread* t) {
+    return !t->real || cpu.atomicLoad(&t->tid) == 0;
+}
+
+public int currentId() {
+    if (__OS == 1) return 0;
+    return __syscall(nr(186, 178), 0, 0, 0, 0, 0, 0);
+}
+
+// gives the processor to another thread
+public void yield() {
+    if (__OS != 1) {
+        __syscall(nr(24, 124), 0, 0, 0, 0, 0, 0);
+    }
+}
+
+// the number of processors this program may use
+public int cpuCount() {
+    if (__OS == 1) return 1;
+    int mask[16];
+    int n = __syscall(nr(204, 123), 0, 128, &mask[0], 0, 0, 0);       // sched_getaffinity
+    if (n <= 0) return 1;
+    int count = 0;
+    for (int i = 0; i < n / 8; i++) {
+        int v = mask[i];
+        while (v != 0) {
+            count++;
+            v = v & (v - 1);
+        }
+    }
+    if (count < 1) count = 1;
+    return count;
+}
+
+// ---- parallel loops ---------------------------------------------------------------------------------------------------
+private class Slice {
+    public func body;
+    public int lo;
+    public int hi;
+}
+
+private int runSlice(int p) {
+    Slice* s = (Slice*) p;
+    for (int i = s->lo; i < s->hi; i++) {
+        s->body(i);
+    }
+    return 0;
+}
+
+// calls body(i) for i = 0 .. n - 1, spread over `workers` threads (0 = one per processor). Returns when all are done
+public void parallelFor(int n, func body, int workers) {
+    if (workers <= 0) workers = cpuCount();
+    if (workers > n) workers = n;
+    if (workers <= 1) {
+        for (int i = 0; i < n; i++) body(i);
+        return;
+    }
+    Thread* ts[64];
+    if (workers > 64) workers = 64;
+    for (int w = 0; w < workers; w++) {
+        Slice* s = new Slice();
+        s->body = body;
+        s->lo = n * w / workers;
+        s->hi = n * (w + 1) / workers;
+        ts[w] = spawn(runSlice, (int) s);
+    }
+    for (int w = 0; w < workers; w++) {
+        join(ts[w]);
+    }
+}

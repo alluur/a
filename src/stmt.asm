@@ -82,6 +82,8 @@ parse_stmt:
     je .badmod
     cmp eax, K_PRIVATE
     je .badmod
+    cmp eax, K_ASM
+    je parse_asm_stmt
     call is_type_start
     test eax, eax
     jnz parse_local_decl
@@ -760,4 +762,14 @@ parse_static_local:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; asm(...) { ... }   as a statement: the closing semicolon is optional
+parse_asm_stmt:
+    call parse_expr
+    call discard_result
+    cmp qword [tk], ';'
+    jne .out
+    jmp next_token
+.out:
     ret

@@ -44,6 +44,7 @@ kw_table:
     KW "protected", K_PROTECTED
     KW "a_module", K_AMODULE
     KW "a_import", K_AIMPORT
+    KW "asm",      K_ASM
     db 0
 
 ops3:

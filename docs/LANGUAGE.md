@@ -300,6 +300,36 @@ int next() {
 A `static` local is zero-initialized (or set from its constant initializer once, before the program starts), is visible only
 in its block and may be an array (`static int table[16];`).
 
+### Inline assembly
+
+`asm` puts machine code of your choice into a function. The program lists the code for every CPU it should run on;
+the compiler uses the section of the CPU it is compiling for (`x64`, `arm64`, `riscv64`, `loongarch64`) and skips the others.
+
+```c
+int add2(int a, int b) {
+    return asm(a, b) {                       // a goes into the register A, b into B (a third operand into D)
+        x64: 0x48, 0x01, 0xC8;               // add rax, rcx           (x64 values are bytes)
+        arm64: 0x8B010000;                   // add x0, x0, x1         (the other CPUs: 32 bit instruction words)
+        riscv64: 0x00B50533;                 // add a0, a0, a1
+        loongarch64: 0x00109484;             // add.d a0, a0, a1
+    };                                       // the value of the expression is the register A afterwards
+}
+asm() { x64: 0x90; arm64: 0xD503201F; riscv64: 0x00000013; loongarch64: 0x03400000; }     // as a statement the ';' is optional
+```
+
+| | x64 (Linux, Windows, Android) | arm64 | riscv64 | loongarch64 |
+|---|---|---|---|---|
+| A, B, D | rax, rcx, rdx | x0, x1, x2 | a0, a1, a2 | $a0, $a1, $a2 |
+| free to clobber | rsi, rdi, r8-r11 | x3-x5, x9-x17 | t0-t6, a3-a7 | $t0-$t8, $a3-$a7 |
+| keep intact | rsp, rbp, rbx, r12-r15 | sp, x29, x30 | sp, s0, ra | $sp, $fp, $ra |
+
+* At most three operands. Section names: `x64` (`x86_64`, `amd64`), `arm64` (`aarch64`), `riscv64` (`rv64`), `loongarch64` (`la64`).
+  An unknown name is an error, and so is a block without a section for the CPU being compiled.
+* There is no assembler in the compiler: get the instruction words from an assembler (`llvm-mc -show-encoding`, `as`) or from
+  a manual. `docs/gen_cpu.py` shows how the `cpu` module's blocks are generated from assembler text with `llvm-mc`.
+* The code must not change the stack pointer permanently, must keep the registers listed under "keep intact" and may not jump
+  out of the block (jumps inside it are fine, offsets are relative). The `cpu` and `thread` modules are written with `asm`.
+
 ## 8. Structs and classes
 
 `struct` and `class` are the same construct with different defaults:
@@ -709,6 +739,7 @@ code only to programs that import them, and a file of the same name next to your
 | `net` | TCP / UDP networking and DNS, see [12a](#12a-networking) |
 | `http` | HTTP/1.1 client and server, see [12a](#12a-networking) |
 | `netaddr`, `packet`, `netif`, `dns`, `conn`, `websocket`, `netutil`, `rawnet` | addresses, packets (ARP, IP, ICMP, UDP, TCP, pcap), interfaces / ARP table / routes / connections, DNS records, buffered connections and a poller, WebSocket, ping / Wake-on-LAN / NTP, raw frames: see [12e](#12e-the-networking-modules) |
+| `cpu`, `thread` | atomics, barriers, timers, CPU identification, threads: see [12f](#12f-the-processor-cpu-and-thread) |
 | `fixed`, `nn`, `codec` | fixed-point numbers, neural networks, text / binary / image converters, see [12d](#12d-fixed-point-numbers-neural-networks-and-converters) |
 
 ```c
@@ -798,6 +829,49 @@ println(codec.imageToText(page, 3));                          // picture -> text
 // let a trained network read it: int recognise(int* glyph) { return alphabet[net->predict(glyph)]; }
 println(codec.imageToTextWith(page, 3, recognise));
 ```
+
+## 12f. The processor: `cpu` and `thread`
+
+`import cpu;` is built on `asm` blocks and works the same on x86-64, ARM64, RISC-V 64 and LoongArch64:
+
+| Function | Description |
+|---|---|
+| `cpu.cycles()` | a monotonic counter (cycles on x86-64, the fixed rate system timer elsewhere) |
+| `cpu.pause()`, `cpu.fence()` | spin-loop hint, full memory barrier |
+| `cpu.atomicAdd(&n, v)` `atomicSub` `atomicInc` `atomicDec` | atomic update, returns the **old** value |
+| `cpu.atomicSwap(&n, v)`, `cpu.atomicCas(&n, expected, desired)` | exchange / compare-and-swap, return the old value |
+| `cpu.atomicLoad(&n)`, `cpu.atomicStore(&n, v)` | with memory barriers |
+| `cpu.lock(&flag)`, `unlock`, `tryLock` | a spin lock on an `int` (0 = free) |
+| `cpu.archName()`, `cpu.arch()` | which CPU the program was built for |
+| `cpu.cpuid(leaf, sub, reg)`, `cpu.vendor()`, `cpu.brand()` | x86-64 CPU identification (empty / 0 on other CPUs) |
+| `cpu.hwcap()`, `cpu.hwcap2()` | the capability bits the Linux / Android kernel reports |
+
+`import thread;` starts real operating system threads (the `clone` system call, started by an asm block) on Linux and Android:
+
+```c
+import thread;
+import cpu;
+
+int counter;
+int worker(int n) {                              // int function(int)
+    for (int i = 0; i < 1000; i++) cpu.atomicAdd(&counter, 1);
+    return n * 10;
+}
+
+int main() {
+    thread.Thread* a = thread.spawn(worker, 1);
+    thread.Thread* b = thread.spawn(worker, 2);
+    printlnInt(thread.join(a) + thread.join(b));   // 30
+    printlnInt(counter);                           // 2000
+    thread.parallelFor(1000, body, 4);             // body(i) for i = 0 .. 999 on 4 threads
+}
+```
+
+`thread.spawn(fn, arg)`, `thread.join(t)`, `thread.finished(t)`, `thread.parallelFor(n, body, workers)` (0 = one per processor),
+`thread.cpuCount()`, `thread.currentId()`, `thread.yield()`, `thread.supported()`.
+**The runtime of A is not thread safe:** `alloc` / `new`, printing and the file functions must not be used from several threads at the
+same time (guard them with `cpu.lock`); compute into arrays or counters and print from the main thread. On Windows `spawn` runs the
+function at once in the calling thread (`supported()` is false), so programs give the same results there.
 
 ## 12e. The networking modules
 

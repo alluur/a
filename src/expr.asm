@@ -867,6 +867,8 @@ parse_primary:
     je .new
     cmp eax, K_SUPER
     je .super
+    cmp eax, K_ASM
+    je .asm
     ERR "expected an expression"
 
 .num:
@@ -924,6 +926,116 @@ parse_primary:
     mov [e_type], rax
     mov qword [e_lval], 0
     call next_token
+    jmp .out
+
+;  ---- inline assembly:  asm(a, b, c) { x64: 0x48, 0x01, 0xD8; arm64: 0x8B010000; riscv64: ...; loongarch64: ...; }
+; The operands (at most three, evaluated left to right) are loaded into the registers A, B and D of the CPU, the
+; machine code of the section for the CPU being compiled is copied into the function (bytes for x64, 32 bit
+; words for the others) and the value of the expression is the register A afterwards.
+.asm:
+    call next_token
+    xor r13d, r13d
+    cmp qword [tk], '('
+    jne .asm_body
+    call next_token
+    cmp qword [tk], ')'
+    je .asm_close
+.asm_arg:
+    call parse_assign
+    call to_rvalue
+    CG push_a
+    inc r13d
+    cmp r13d, 3
+    jbe .asm_a1
+    ERR "asm takes at most three operands (they go into the registers A, B and D)"
+.asm_a1:
+    cmp qword [tk], ','
+    jne .asm_close
+    call next_token
+    jmp .asm_arg
+.asm_close:
+    mov edi, ')'
+    call expect
+    cmp r13d, 3
+    jne .asm_p2
+    CG pop_a
+    CG mov_d_a
+    CG pop_a
+    CG mov_b_a
+    CG pop_a
+    jmp .asm_body
+.asm_p2:
+    cmp r13d, 2
+    jne .asm_p1
+    CG pop_a
+    CG mov_b_a
+    CG pop_a
+    jmp .asm_body
+.asm_p1:
+    cmp r13d, 1
+    jne .asm_body
+    CG pop_a
+.asm_body:
+    mov edi, '{'
+    call expect
+    xor r14d, r14d                  ; found a section for this CPU
+.asm_sec:
+    cmp qword [tk], '}'
+    je .asm_end
+    cmp qword [tk], T_ID
+    je .asm_lab
+    ERR "expected a CPU name (x64, arm64, riscv64, loongarch64) in the asm block"
+.asm_lab:
+    mov rdi, [tk_ptr]
+    mov esi, [tk_len]
+    call asm_arch_match
+    mov r12d, eax
+    call next_token
+    mov edi, ':'
+    call expect
+.asm_val:
+    call const_expr
+    test r12d, r12d
+    jz .asm_next
+    mov r14d, 1
+    cmp dword [arch], ARCH_X64
+    jne .asm_word
+    lea rcx, [rax+128]
+    cmp rcx, 383
+    jbe .asm_byte
+    ERR "x64 asm values are single bytes (-128 .. 255)"
+.asm_byte:
+    mov edi, eax
+    call emit_b
+    jmp .asm_next
+.asm_word:
+    mov rcx, rax
+    shr rcx, 32
+    jz .asm_wok
+    cmp ecx, 0xFFFFFFFF
+    je .asm_wok
+    ERR "asm values for this CPU are 32 bit instruction words"
+.asm_wok:
+    mov edi, eax
+    call emit_d
+.asm_next:
+    cmp qword [tk], ','
+    jne .asm_semi
+    call next_token
+    jmp .asm_val
+.asm_semi:
+    cmp qword [tk], ';'
+    jne .asm_sec
+    call next_token
+    jmp .asm_sec
+.asm_end:
+    call next_token
+    test r14d, r14d
+    jnz .asm_ok
+    ERR "this asm block has no code for the CPU being compiled"
+.asm_ok:
+    mov qword [e_type], TY_INT
+    mov qword [e_lval], 0
     jmp .out
 
 ; ---- super(args) calls the constructor of the base class, super.method(args) a base class method
@@ -2482,3 +2594,71 @@ const_unary:
     pop r12
     pop rbx
     ret
+
+; asm_arch_match: rdi = name, esi = length -> eax = 1 if the name is the CPU being compiled, 0 for another known CPU;
+; an unknown name is an error
+asm_arch_match:
+    push rbx
+    mov rbx, asm_cpu_names
+.l:
+    cmp qword [rbx], 0
+    je .unknown
+    mov rdx, [rbx]
+    push rdi
+    push rsi
+    mov rcx, rdi
+    mov rdi, rcx
+    ; compare (rdi, esi) with the zero terminated name at rdx
+    xor eax, eax
+.c:
+    cmp eax, esi
+    jae .end
+    mov r8b, [rdx+rax]
+    cmp r8b, [rdi+rax]
+    jne .no
+    inc eax
+    jmp .c
+.end:
+    cmp byte [rdx+rax], 0
+    jne .no
+    pop rsi
+    pop rdi
+    mov eax, [rbx+8]
+    xor ecx, ecx
+    cmp eax, [arch]
+    sete cl
+    mov eax, ecx
+    pop rbx
+    ret
+.no:
+    pop rsi
+    pop rdi
+    add rbx, 16
+    jmp .l
+.unknown:
+    mov edi, msg_asmcpu
+    call fatal_error_tok
+CSTR msg_asmcpu, "unknown CPU name in the asm block, use x64, arm64, riscv64 or loongarch64:"
+section .rodata
+a_x64:   db "x64", 0
+a_x8664: db "x86_64", 0
+a_amd64: db "amd64", 0
+a_arm64: db "arm64", 0
+a_aarch: db "aarch64", 0
+a_rv64:  db "riscv64", 0
+a_rv:    db "rv64", 0
+a_la64:  db "loongarch64", 0
+a_la:    db "la64", 0
+align 8
+asm_cpu_names:
+    dq a_x64, ARCH_X64
+    dq a_x8664, ARCH_X64
+    dq a_amd64, ARCH_X64
+    dq a_arm64, ARCH_A64
+    dq a_aarch, ARCH_A64
+    dq a_rv64, ARCH_RV64
+    dq a_rv, ARCH_RV64
+    dq a_la64, ARCH_LA64
+    dq a_la, ARCH_LA64
+    dq 0
+section .text
