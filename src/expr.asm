@@ -1192,8 +1192,29 @@ parse_primary:
 .cast:
     call parse_type
     mov rbx, rax
+    xor r13d, r13d                      ; array element count of a compound literal, -1 = counted from the list
+    cmp qword [tk], '['
+    jne .cast1
+    call next_token
+    mov r13, -1
+    cmp qword [tk], ']'
+    je .castbr
+    call const_expr
+    mov r13, rax
+.castbr:
+    mov edi, ']'
+    call expect
+    add rbx, TY_PTR1
+    bts rbx, TF_ARRAY_BIT
+.cast1:
     mov edi, ')'
     call expect
+    cmp qword [tk], '{'
+    je .complit
+    test r13, r13
+    jz .castval
+    ERR "an array type can only be used in a compound literal"
+.castval:
     call parse_unary
     call to_rvalue
     cmp rbx, TY_DOUBLE
@@ -1219,6 +1240,60 @@ parse_primary:
 .cdone:
     mov [e_type], rbx
     mov qword [e_lval], 0
+    jmp .out
+
+; (Type){ ... }   (Type[n]){ ... }   (Type[]){ ... }  - a nameless local object that lives until the function returns
+.complit:
+    cmp qword [cur_func], 0
+    jne .cl1
+    ERR "a compound literal can only be used inside a function"
+.cl1:
+    test r13, r13
+    jns .cl2
+    call count_list_elems
+    mov r13, rax
+.cl2:
+    bt rbx, TF_ARRAY_BIT
+    jc .cl_arr
+    test ebx, 0xFF00
+    jnz .cl_bad
+    cmp bl, TY_STRUCT
+    je .cl_size
+.cl_bad:
+    ERR "a compound literal needs a struct or array type"
+.cl_arr:
+    test r13, r13
+    jg .cl_size
+    ERR "array size must be positive"
+.cl_size:
+    mov rdi, rbx
+    bt rbx, TF_ARRAY_BIT
+    jnc .cl3
+    btr rdi, TF_ARRAY_BIT
+    sub rdi, TY_PTR1
+    call type_size
+    imul rax, r13
+    jmp .cl4
+.cl3:
+    call type_size
+.cl4:
+    add rax, 7
+    and rax, -8
+    mov r14, rax
+    add [frame_size], eax
+    mov r12d, [frame_size]
+    neg r12
+    mov edi, r12d
+    mov esi, r14d
+    CG zero_local
+    mov rdi, rbx
+    mov rsi, r12
+    mov rdx, r13
+    call init_local_list
+    mov edi, r12d
+    CG lea_local_a
+    mov [e_type], rbx
+    mov qword [e_lval], 1
     jmp .out
 
 ; ---- new T(args)
@@ -2954,4 +3029,69 @@ peek_is_flt:
     add rsp, 128
     ret
 .no:
+    ret
+
+; count_list_elems: the current token is the '{' of an initializer list -> rax = number of top level elements (the position is not changed)
+count_list_elems:
+    push rbx
+    push r12
+    push r13
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    xor ebx, ebx                        ; depth
+    xor r12d, r12d                      ; finished elements
+    xor r13d, r13d                      ; 1 = the current element has started
+.l: mov rax, [tk]
+    cmp rax, T_EOF
+    je .eof
+    cmp rax, '{'
+    je .open
+    cmp rax, '('
+    je .open
+    cmp rax, '['
+    je .open
+    cmp rax, '}'
+    je .close
+    cmp rax, ')'
+    je .close
+    cmp rax, ']'
+    je .close
+    cmp rax, ','
+    je .comma
+    mov r13d, 1
+    jmp .nx
+.open:
+    test ebx, ebx
+    jz .o1
+    mov r13d, 1
+.o1:
+    inc ebx
+    jmp .nx
+.close:
+    dec ebx
+    jz .done
+    jmp .nx
+.comma:
+    cmp ebx, 1
+    jne .nx
+    test r13d, r13d
+    jz .nx
+    inc r12d
+    xor r13d, r13d
+.nx:
+    call next_token
+    jmp .l
+.eof:
+    ERR "unexpected end of file in an initializer list"
+.done:
+    add r12d, r13d
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    mov eax, r12d
+    add rsp, 0
+    pop r13
+    pop r12
+    pop rbx
     ret

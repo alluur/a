@@ -107,6 +107,7 @@
 %define K_AMODULE       195     ; a_module NAME { ... }
 %define K_AIMPORT       196     ; a_import('file.am');
 %define K_ASM           197
+%define K_GOTO          200
 %define K_DEFER         199     ; defer expression;
 %define K_DOUBLE        198     ; double, float     ; asm(a, b, c) { x64: ...; arm64: ...; }
 
@@ -171,6 +172,11 @@
 %define FD_OFFSET       24      ; dword
 %define FD_OWNER        28      ; dword  struct index of the class that declared the field
 %define FD_SIZEOF       32
+%define LB_NAME         0       ; goto labels: qword name, dword length, dword defined, qword position, qword chain
+%define LB_LEN          8
+%define LB_DEF          12
+%define LB_POS          16
+%define LB_CHAIN        24
 
 ; ---- types -------------------------------------------------------------------
 ; bits 0-7 kind, bits 8-15 pointer depth, bits 16-31 struct index, bit 32 array

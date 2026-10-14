@@ -48,6 +48,7 @@ kw_table:
     KW "double",   K_DOUBLE
     KW "float",    K_DOUBLE
     KW "defer",    K_DEFER
+    KW "goto",     K_GOTO
     db 0
 
 ops3:

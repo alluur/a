@@ -354,6 +354,39 @@ declared before the `defer`. It is meant for cleanup:
 
 `defer` is only allowed directly in a function body (not inside `if`, loops or other blocks), at most 16 per function.
 
+### `goto`, designated initializers and compound literals
+
+These work as in C99.
+
+`goto label;` jumps to `label:` anywhere in the same function, forwards or backwards. Labels are per function; a duplicate
+label or a `goto` to a label that does not exist is a compile error (at most 64 labels per function).
+
+    for (int i = 0; i < n; i++) {
+        if (bad(i)) goto fail;
+    }
+    return 0;
+fail:
+    return -1;
+
+Designated initializers pick the field or element by name or index; whatever follows continues from there, and everything
+that is not named is 0:
+
+    Point p = {.y = 5, .x = 3};
+    int table[8] = {[1] = 10, [4] = 40, 50};      // table[5] is 50
+    Box b = {.hi = {7, 8}, .tag = {1, 2, 3}};
+
+Chained designators such as `.a.b = 1` are not supported; write `.a = {.b = 1}`.
+
+A compound literal builds a nameless object inside a function. It lives until the function returns, and its address may
+be taken:
+
+    area((Point){6, 7});
+    p = (Point){.x = 1, .y = 2};
+    sum((int[]){1, 2, 3}, 3);                     // the size is counted from the list
+    Point* q = &(Point){5, 6};
+
+An unsized `(T[]){...}` list must be written without `[index] =` designators (the elements are counted).
+
 ### Inline assembly
 
 `asm` puts machine code of your choice into a function. The program lists the code for every CPU it should run on;

@@ -120,6 +120,8 @@ parse_stmt:
     je parse_return
     cmp eax, K_DEFER
     je parse_defer
+    cmp eax, K_GOTO
+    je parse_goto
     cmp eax, K_BREAK
     je parse_break
     cmp eax, K_CONTINUE
@@ -140,6 +142,43 @@ parse_stmt:
     je .badmod
     cmp eax, K_ASM
     je parse_asm_stmt
+    cmp eax, T_ID
+    jne .notlabel
+    mov rax, [tk_ptr]
+    mov [lbl_tmp], rax
+    mov eax, [tk_len]
+    mov [lbl_tlen], eax
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    cmp qword [tk], ':'
+    jne .nolabel
+    add rsp, 128
+    mov rsi, [lbl_tmp]
+    mov edx, [lbl_tlen]
+    call lbl_get
+    cmp dword [rax+LB_DEF], 0
+    je .newlabel
+    ERR "duplicate label"
+.newlabel:
+    mov dword [rax+LB_DEF], 1
+    mov rcx, [code_pos]
+    mov [rax+LB_POS], rcx
+    mov rdi, [rax+LB_CHAIN]
+    mov qword [rax+LB_CHAIN], 0
+    call patch_here
+    call next_token                     ; past ':'
+    cmp qword [tk], '}'
+    je .lblend
+    jmp parse_stmt
+.lblend:
+    ret
+.nolabel:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+.notlabel:
     call is_type_start
     test eax, eax
     jnz parse_local_decl
@@ -1091,6 +1130,36 @@ init_local_list:
 .sloop:
     cmp qword [tk], '}'
     je .close
+    cmp qword [tk], '.'
+    jne .nodesig
+    call next_token
+    cmp qword [tk], T_ID
+    je .d1
+    ERR "expected a field name after '.'"
+.d1:
+    mov edi, ebx
+    shr edi, 16
+    and edi, 0xFFFF
+    mov rsi, [tk_ptr]
+    mov edx, [tk_len]
+    call struct_find_field
+    test rax, rax
+    jnz .d2
+    ERR "this struct has no field with that name"
+.d2:
+    mov r13, rax
+    mov eax, [r15+ST_FIRST]
+    shl rax, 5
+    add rax, field_tab
+    mov rcx, r13
+    sub rcx, rax
+    shr rcx, 5
+    mov r14d, [r15+ST_NFIELDS]
+    sub r14d, ecx
+    call next_token
+    mov edi, '='
+    call expect
+.nodesig:
     test r14d, r14d
     jnz .s1
     ERR "too many values in the initializer list"
@@ -1141,6 +1210,16 @@ init_local_list:
 .aloop:
     cmp qword [tk], '}'
     je .close
+    cmp qword [tk], '['
+    jne .anodesig
+    call next_token
+    call const_expr
+    mov rbp, rax
+    mov edi, ']'
+    call expect
+    mov edi, '='
+    call expect
+.anodesig:
     cmp rbp, r14
     jb .a1
     ERR "too many values in the initializer list"
@@ -1165,4 +1244,92 @@ init_local_list:
     pop r13
     pop r12
     pop rbx
+    ret
+
+; ---- goto and labels -----------------------------------------------------------------------------------------------------
+; lbl_get: rsi = name, edx = length -> rax = the label's entry (created when it is new)
+lbl_get:
+    push rbx
+    push r12
+    push r13
+    mov r12, rsi
+    mov r13d, edx
+    xor ebx, ebx
+.l: cmp ebx, [lbl_n]
+    jae .new
+    mov rax, rbx
+    shl rax, 5
+    add rax, lbl_tab
+    cmp [rax+LB_LEN], r13d
+    jne .next
+    push rax
+    mov rdi, [rax+LB_NAME]
+    mov rsi, r12
+    mov ecx, r13d
+    repe cmpsb
+    pop rax
+    je .out
+.next:
+    inc ebx
+    jmp .l
+.new:
+    cmp ebx, 64
+    jb .room
+    ERR "too many labels in one function (64)"
+.room:
+    inc dword [lbl_n]
+    mov rax, rbx
+    shl rax, 5
+    add rax, lbl_tab
+    mov [rax+LB_NAME], r12
+    mov [rax+LB_LEN], r13d
+    mov dword [rax+LB_DEF], 0
+    mov qword [rax+LB_POS], 0
+    mov qword [rax+LB_CHAIN], 0
+.out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; goto label;
+parse_goto:
+    call next_token
+    cmp qword [tk], T_ID
+    je .ok
+    ERR "expected a label name after goto"
+.ok:
+    mov rsi, [tk_ptr]
+    mov edx, [tk_len]
+    call lbl_get
+    push rax
+    call next_token
+    mov edi, ';'
+    call expect
+    pop rax
+    cmp dword [rax+LB_DEF], 0
+    jne .back
+    lea rdi, [rax+LB_CHAIN]
+    CG jmp_chain
+    ret
+.back:
+    mov rdi, [rax+LB_POS]
+    CG jmp_back
+    ret
+
+; lbl_check: at the end of a function every label that was jumped to must exist
+lbl_check:
+    xor ecx, ecx
+.l: cmp ecx, [lbl_n]
+    jae .ok
+    mov rax, rcx
+    shl rax, 5
+    add rax, lbl_tab
+    inc ecx
+    cmp dword [rax+LB_DEF], 0
+    jne .l
+    cmp qword [rax+LB_CHAIN], 0
+    je .l
+    ERR "goto to a label that is not defined in this function"
+.ok:
     ret

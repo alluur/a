@@ -2062,6 +2062,11 @@ lf_ex:          resd 1
 init_count:     resq 1
 init_mode:      resd 1
 defer_n:        resd 1
+lbl_n:          resd 1
+lbl_tmp:        resq 1
+lbl_tlen:       resd 1
+alignb 16
+lbl_tab:        resb 32*64
 blk_nest:       resd 1
 fn_body_flag:   resd 1
 alignb 16

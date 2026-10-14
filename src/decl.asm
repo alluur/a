@@ -286,6 +286,7 @@ compile_function:
     mov dword [frame_size], 0
     mov qword [ret_chain], 0
     mov dword [defer_n], 0
+    mov dword [lbl_n], 0
     mov dword [blk_nest], 0
     mov dword [loop_sp], 0
     ; total number of stack slots = params (+ this)
@@ -386,6 +387,7 @@ compile_function:
 .pd:
     mov dword [fn_body_flag], 1
     call parse_block
+    call lbl_check
     xor edi, edi
     CG imm_a
     mov rdi, [ret_chain]
