@@ -346,6 +346,8 @@ CGLIST CGI_DEF
 ; ---- targets / architectures ---------------------------------------------------
 %define ARCH_X64        0
 %define ARCH_A64        1
+%define ARCH_RV64       2
+%define ARCH_LA64       3
 
 ; Windows builtin blob: lea r10,[rip + start of the import address table]
 %macro IATLEA 0

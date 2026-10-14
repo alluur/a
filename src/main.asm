@@ -19,8 +19,55 @@ s_linux_x64:    db "linux-x64", 0
 s_linux_arm64:  db "linux-arm64", 0
 s_android_arm64: db "android-arm64", 0
 s_android_x64:  db "android-x64", 0
+s_linux_riscv64: db "linux-riscv64", 0
+s_linux_rv64:   db "linux-rv64", 0
+s_android_riscv64: db "android-riscv64", 0
+s_android_rv64: db "android-rv64", 0
+s_linux_loong:  db "linux-loongarch64", 0
+s_linux_la64:   db "linux-la64", 0
+s_android_loong: db "android-loongarch64", 0
 s_ext_arm_elf:  db ".arm64.elf", 0
 s_ext_x64_bin:  db ".x64.bin", 0
+s_ext_rv_elf:   db ".riscv64.elf", 0
+s_ext_rv_bin:   db ".riscv64.bin", 0
+s_ext_la_elf:   db ".loongarch64.elf", 0
+s_ext_la_bin:   db ".loongarch64.bin", 0
+align 8
+; target name, operating system, CPU architecture
+target_table:
+    dq s_linux
+    dd TGT_LINUX, ARCH_X64
+    dq s_linux_x64
+    dd TGT_LINUX, ARCH_X64
+    dq s_linux_arm64
+    dd TGT_LINUX, ARCH_A64
+    dq s_linux_riscv64
+    dd TGT_LINUX, ARCH_RV64
+    dq s_linux_rv64
+    dd TGT_LINUX, ARCH_RV64
+    dq s_linux_loong
+    dd TGT_LINUX, ARCH_LA64
+    dq s_linux_la64
+    dd TGT_LINUX, ARCH_LA64
+    dq s_windows
+    dd TGT_WINDOWS, ARCH_X64
+    dq s_win
+    dd TGT_WINDOWS, ARCH_X64
+    dq s_win64
+    dd TGT_WINDOWS, ARCH_X64
+    dq s_android
+    dd TGT_ANDROID, ARCH_A64
+    dq s_android_arm64
+    dd TGT_ANDROID, ARCH_A64
+    dq s_android_x64
+    dd TGT_ANDROID, ARCH_X64
+    dq s_android_riscv64
+    dd TGT_ANDROID, ARCH_RV64
+    dq s_android_rv64
+    dd TGT_ANDROID, ARCH_RV64
+    dq s_android_loong
+    dd TGT_ANDROID, ARCH_LA64
+    dq 0
 s_ver_default:  db "1", 0
 s_rel_default:  db "debug", 0
 s_ext_linux:    db ".elf", 0
@@ -39,7 +86,8 @@ s_usage:
     db 10
     db "Options:", 10
     db "  -o FILE     output file (default: NAME-VERSION-RELEASE.EXT)", 10
-    db "  -t TARGET   linux (default) | windows | android | linux-arm64 | android-x64", 10
+    db "  -t TARGET   linux (default) | windows | android | linux-arm64 | android-x64 |", 10
+    db "              linux-riscv64 | android-riscv64 | linux-loongarch64 | android-loongarch64", 10
     db "              linux = linux-x64, android = android-arm64, windows = windows x64", 10
     db "  -v CODE     version code used in the default output name (default 1)", 10
     db "  -r TYPE     release type used in the default output name (default debug)", 10
@@ -49,7 +97,7 @@ s_usage:
 s_version_text: db "ac ", VERSION_NAME, 10, 0
 s_err_noinput:  db "no input file (try: ac -h)", 0
 s_err_badopt:   db "unknown option or missing value (try: ac -h)", 0
-s_err_badtgt:   db "unknown target, use linux, windows, android, linux-arm64 or android-x64", 0
+s_err_badtgt:   db "unknown target, use linux, windows, android, linux-arm64, android-x64, linux-riscv64, android-riscv64 or linux-loongarch64", 0
 s_err_read:     db "cannot read the input file", 0
 s_err_nomain:   db "no 'main' function found", 0
 s_err_write:    db "cannot write the output file", 0
@@ -162,19 +210,19 @@ s_win_argv: db "__win_argv_get", 0
 
 align 8
 ; name, parameter count, then start/end of the runtime code for: x86-64 Linux/Android,
-; Windows x64, AArch64 Linux/Android (64 bytes per entry)
+; Windows x64, AArch64, RISC-V 64, LoongArch64 Linux/Android (96 bytes per entry)
 builtin_tab:
-    dq bn_write,   3, bl_lin_write,   bl_lin_write_end,   bl_win_write,   bl_win_write_end,   bl_a64_write,   bl_a64_write_end
-    dq bn_read,    3, bl_lin_read,    bl_lin_read_end,    bl_win_read,    bl_win_read_end,    bl_a64_read,    bl_a64_read_end
-    dq bn_exit,    1, bl_lin_exit,    bl_lin_exit_end,    bl_win_exit,    bl_win_exit_end,    bl_a64_exit,    bl_a64_exit_end
-    dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, bl_win_fail,    bl_win_fail_end,    bl_a64_syscall, bl_a64_syscall_end
-    dq bn_winapi,  5, bl_lin_fail,    bl_lin_fail_end,    bl_win_winapi,  bl_win_winapi_end,  bl_a64_fail,    bl_a64_fail_end
-    dq bn_winapix, 11, bl_lin_fail,   bl_lin_fail_end,    bl_win_winapix, bl_win_winapix_end, bl_a64_fail,    bl_a64_fail_end
-    dq bn_setjmp,  1, bl_lin_setjmp,  bl_lin_setjmp_end,  bl_lin_setjmp,  bl_lin_setjmp_end,  bl_a64_setjmp,  bl_a64_setjmp_end
-    dq bn_longjmp, 2, bl_lin_longjmp, bl_lin_longjmp_end, bl_lin_longjmp, bl_lin_longjmp_end, bl_a64_longjmp, bl_a64_longjmp_end
-    dq bn_cmdline, 0, bl_lin_cmdline, bl_lin_cmdline_end, bl_win_cmdline, bl_win_cmdline_end, bl_a64_cmdline, bl_a64_cmdline_end
-    dq bn_open,    2, bl_lin_open,    bl_lin_open_end,    bl_win_open,    bl_win_open_end,    bl_a64_open,    bl_a64_open_end
-    dq bn_close,   1, bl_lin_close,   bl_lin_close_end,   bl_win_close,   bl_win_close_end,   bl_a64_close,   bl_a64_close_end
+    dq bn_write, 3, bl_lin_write, bl_lin_write_end, bl_win_write, bl_win_write_end, bl_a64_write, bl_a64_write_end, bl_rv64_write, bl_rv64_write_end, bl_la64_write, bl_la64_write_end
+    dq bn_read, 3, bl_lin_read, bl_lin_read_end, bl_win_read, bl_win_read_end, bl_a64_read, bl_a64_read_end, bl_rv64_read, bl_rv64_read_end, bl_la64_read, bl_la64_read_end
+    dq bn_exit, 1, bl_lin_exit, bl_lin_exit_end, bl_win_exit, bl_win_exit_end, bl_a64_exit, bl_a64_exit_end, bl_rv64_exit, bl_rv64_exit_end, bl_la64_exit, bl_la64_exit_end
+    dq bn_syscall, 7, bl_lin_syscall, bl_lin_syscall_end, bl_win_fail, bl_win_fail_end, bl_a64_syscall, bl_a64_syscall_end, bl_rv64_syscall, bl_rv64_syscall_end, bl_la64_syscall, bl_la64_syscall_end
+    dq bn_winapi, 5, bl_lin_fail, bl_lin_fail_end, bl_win_winapi, bl_win_winapi_end, bl_a64_fail, bl_a64_fail_end, bl_rv64_fail, bl_rv64_fail_end, bl_la64_fail, bl_la64_fail_end
+    dq bn_winapix, 11, bl_lin_fail, bl_lin_fail_end, bl_win_winapix, bl_win_winapix_end, bl_a64_fail, bl_a64_fail_end, bl_rv64_fail, bl_rv64_fail_end, bl_la64_fail, bl_la64_fail_end
+    dq bn_setjmp, 1, bl_lin_setjmp, bl_lin_setjmp_end, bl_lin_setjmp, bl_lin_setjmp_end, bl_a64_setjmp, bl_a64_setjmp_end, bl_rv64_setjmp, bl_rv64_setjmp_end, bl_la64_setjmp, bl_la64_setjmp_end
+    dq bn_longjmp, 2, bl_lin_longjmp, bl_lin_longjmp_end, bl_lin_longjmp, bl_lin_longjmp_end, bl_a64_longjmp, bl_a64_longjmp_end, bl_rv64_longjmp, bl_rv64_longjmp_end, bl_la64_longjmp, bl_la64_longjmp_end
+    dq bn_cmdline, 0, bl_lin_cmdline, bl_lin_cmdline_end, bl_win_cmdline, bl_win_cmdline_end, bl_a64_cmdline, bl_a64_cmdline_end, bl_rv64_cmdline, bl_rv64_cmdline_end, bl_la64_cmdline, bl_la64_cmdline_end
+    dq bn_open, 2, bl_lin_open, bl_lin_open_end, bl_win_open, bl_win_open_end, bl_a64_open, bl_a64_open_end, bl_rv64_open, bl_rv64_open_end, bl_la64_open, bl_la64_open_end
+    dq bn_close, 1, bl_lin_close, bl_lin_close_end, bl_win_close, bl_win_close_end, bl_a64_close, bl_a64_close_end, bl_rv64_close, bl_rv64_close_end, bl_la64_close, bl_la64_close_end
     dq 0
 
 ; Linux / Android x86-64 runtime (raw syscalls). Arguments were pushed left to
@@ -761,8 +809,18 @@ compile_all:
 builtin_col:
     mov eax, 16
     cmp dword [arch], ARCH_A64
-    jne .x
+    jne .a1
     mov eax, 48
+    ret
+.a1:
+    cmp dword [arch], ARCH_RV64
+    jne .a2
+    mov eax, 64
+    ret
+.a2:
+    cmp dword [arch], ARCH_LA64
+    jne .x
+    mov eax, 80
     ret
 .x: cmp dword [target], TGT_WINDOWS
     jne .r
@@ -814,7 +872,7 @@ register_builtins:
     mov qword [rax+SYM_TYPE], TY_INT
     mov dword [rax+SYM_FLAGS], F_BUILTIN | F_DEFINED
 .next:
-    add rbx, 64
+    add rbx, 96
     jmp .l
 .done:
     pop r12
@@ -962,7 +1020,7 @@ emit_prologue:
     pop rsi
     call emit_blob
 .bnext:
-    add rbx, 64
+    add rbx, 96
     jmp .bl
 .done:
     pop r12
@@ -1123,6 +1181,10 @@ check_undefined:
 apply_relocs:
     cmp dword [arch], ARCH_A64
     je apply_relocs_a64
+    cmp dword [arch], ARCH_RV64
+    je apply_relocs_rv64
+    cmp dword [arch], ARCH_LA64
+    je apply_relocs_la64
     jmp apply_relocs_x86
 
 ; install_backend: edi = architecture; fills the primitive table
@@ -1131,8 +1193,20 @@ install_backend:
     mov esi, cg_tab_x86
     mov dword [slot_bytes], 8
     cmp edi, ARCH_A64
-    jne .copy
+    jne .rv
     mov esi, cg_tab_a64
+    mov dword [slot_bytes], 16
+    jmp .copy
+.rv:
+    cmp edi, ARCH_RV64
+    jne .la
+    mov esi, cg_tab_rv64
+    mov dword [slot_bytes], 16
+    jmp .copy
+.la:
+    cmp edi, ARCH_LA64
+    jne .copy
+    mov esi, cg_tab_la64
     mov dword [slot_bytes], 16
 .copy:
     mov edi, cg_vt
@@ -1156,6 +1230,15 @@ build_elf:
     mov r13d, 0x4000                        ; AArch64: 16 KiB (works on 4K and 16K kernels)
     mov ebx, 0xB7                           ; EM_AARCH64
 .a:
+    cmp dword [arch], ARCH_RV64
+    jne .b
+    mov ebx, 0xF3                           ; EM_RISCV
+.b:
+    cmp dword [arch], ARCH_LA64
+    jne .c
+    mov r13d, 0x10000                       ; LoongArch: 64 KiB covers every page size
+    mov ebx, 0x102                          ; EM_LOONGARCH
+.c:
     mov rax, [code_pos]
     add rax, ELF_CODE_OFF
     lea rax, [rax + r13 - 1]
@@ -1577,73 +1660,26 @@ _start:
     jmp .arg
 .t: call .value
     mov rbx, rax
+    mov r12, target_table
+.tt:
+    mov rsi, [r12]
+    test rsi, rsi
+    jz .tbad
     mov rdi, rbx
-    mov rsi, s_linux
     call cstr_eq
     test eax, eax
-    jnz .t_linux
-    mov rdi, rbx
-    mov rsi, s_linux_x64
-    call cstr_eq
-    test eax, eax
-    jnz .t_linux
-    mov rdi, rbx
-    mov rsi, s_linux_arm64
-    call cstr_eq
-    test eax, eax
-    jnz .t_linux_arm
-    mov rdi, rbx
-    mov rsi, s_windows
-    call cstr_eq
-    test eax, eax
-    jnz .t_win
-    mov rdi, rbx
-    mov rsi, s_win
-    call cstr_eq
-    test eax, eax
-    jnz .t_win
-    mov rdi, rbx
-    mov rsi, s_win64
-    call cstr_eq
-    test eax, eax
-    jnz .t_win
-    mov rdi, rbx
-    mov rsi, s_android
-    call cstr_eq
-    test eax, eax
-    jnz .t_android
-    mov rdi, rbx
-    mov rsi, s_android_arm64
-    call cstr_eq
-    test eax, eax
-    jnz .t_android
-    mov rdi, rbx
-    mov rsi, s_android_x64
-    call cstr_eq
-    test eax, eax
-    jnz .t_android_x64
+    jnz .tfound
+    add r12, 16
+    jmp .tt
+.tfound:
+    mov eax, [r12+8]
+    mov [target], eax
+    mov eax, [r12+12]
+    mov [arch], eax
+    jmp .arg
+.tbad:
     mov edi, s_err_badtgt
     call fatal_error
-.t_linux:
-    mov dword [target], TGT_LINUX
-    mov dword [arch], ARCH_X64
-    jmp .arg
-.t_linux_arm:
-    mov dword [target], TGT_LINUX
-    mov dword [arch], ARCH_A64
-    jmp .arg
-.t_win:
-    mov dword [target], TGT_WINDOWS
-    mov dword [arch], ARCH_X64
-    jmp .arg
-.t_android:
-    mov dword [target], TGT_ANDROID
-    mov dword [arch], ARCH_A64
-    jmp .arg
-.t_android_x64:
-    mov dword [target], TGT_ANDROID
-    mov dword [arch], ARCH_X64
-    jmp .arg
 .badopt:
     mov edi, s_err_badopt
     call fatal_error
@@ -1856,19 +1892,34 @@ choose_outname:
     mov rsi, s_ext_win
     jmp .e3
 .e1:
+    ; Linux: .elf (x86-64), .arm64.elf, .riscv64.elf, .loongarch64.elf; Android: .bin, .x64.bin, .riscv64.bin, ...
     cmp dword [target], TGT_ANDROID
     je .and
-    ; Linux: .elf for x86-64, .arm64.elf for AArch64
     cmp dword [arch], ARCH_A64
-    jne .e3
+    jne .e1a
     mov rsi, s_ext_arm_elf
     jmp .e3
+.e1a:
+    cmp dword [arch], ARCH_RV64
+    jne .e1b
+    mov rsi, s_ext_rv_elf
+    jmp .e3
+.e1b:
+    cmp dword [arch], ARCH_LA64
+    jne .e3
+    mov rsi, s_ext_la_elf
+    jmp .e3
 .and:
-    ; Android: .bin for AArch64 (default), .x64.bin for x86-64
     mov rsi, s_ext_android
     cmp dword [arch], ARCH_A64
     je .e3
     mov rsi, s_ext_x64_bin
+    cmp dword [arch], ARCH_X64
+    je .e3
+    mov rsi, s_ext_rv_bin
+    cmp dword [arch], ARCH_RV64
+    je .e3
+    mov rsi, s_ext_la_bin
 .e3:
     call cstr_copy
     mov rax, outnamebuf

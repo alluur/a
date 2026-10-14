@@ -21,6 +21,8 @@ section .text
 %include "symtab.asm"
 %include "cg_x86.asm"
 %include "cg_a64.asm"
+%include "cg_rv64.asm"
+%include "cg_la64.asm"
 %include "expr.asm"
 %include "stmt.asm"
 %include "decl.asm"

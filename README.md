@@ -27,7 +27,7 @@ int main() {
 |---|---|
 | Language | C-like syntax: variables, constants, functions, structs, **classes** (`public` / `private`), enums, modules, pointers, arrays, `if` / `else if` / `else`, `while`, `do`, `for`, `switch`, logical and arithmetic operators |
 | Compiler | ~9,000 lines of NASM assembly, a single binary of about 470 KB (it carries the source of the standard library and the C library), three passes with dead function elimination, direct machine-code generation, generated code about as fast as `gcc -O0` |
-| Targets | **Linux** x86-64 and ARM64 · **Windows** x86-64 · **Android** ARM64 and x86-64 |
+| Targets | **Linux** x86-64, ARM64, RISC-V 64 and LoongArch64 · **Windows** x86-64 · **Android** ARM64, x86-64 and RISC-V 64 |
 | Output | static native executables (ELF64 / PE32+), typically 4–10 KB for a small program |
 | Status | version 0.1.0 — complete enough for real programs, see [Limitations](#limitations-and-roadmap) |
 
@@ -61,6 +61,8 @@ ac hello.a                          # Linux x86-64        -> hello-1-debug.elf
 ac -t linux-arm64 hello.a           # Linux ARM64         -> hello-1-debug.arm64.elf
 ac -t windows hello.a               # Windows x86-64      -> hello-1-debug.exe
 ac -t android hello.a               # Android ARM64       -> hello-1-debug.bin
+ac -t linux-riscv64 hello.a         # Linux RISC-V 64     -> hello-1-debug.riscv64.elf
+ac -t linux-loongarch64 hello.a     # Linux LoongArch64   -> hello-1-debug.loongarch64.elf
 ac -t android-x64 hello.a           # Android x86-64      -> hello-1-debug.x64.bin
 ```
 

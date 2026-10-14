@@ -5,6 +5,7 @@
 #        TARGET=linux-arm64 tests/run.sh   (AArch64 ELF, run through qemu-aarch64)
 #        TARGET=android tests/run.sh       (Android ARM64 ELF, run through qemu-aarch64)
 #        TARGET=android-x64 tests/run.sh   (Android x86-64 ELF, run natively)
+#        TARGET=linux-riscv64 | android-riscv64 | linux-loongarch64   (run through qemu-riscv64 / qemu-loongarch64)
 cd "$(dirname "$0")/.."
 AC=./build/ac
 TARGET=${TARGET:-linux}
@@ -17,6 +18,10 @@ windows)
     RUN=$(command -v wine64 || echo /usr/lib/wine/wine64) ;;
 linux-arm64|android|android-arm64)
     RUN=$(command -v qemu-aarch64) ;;
+linux-riscv64|android-riscv64|linux-rv64|android-rv64)
+    RUN=$(command -v qemu-riscv64) ;;
+linux-loongarch64|linux-la64|android-loongarch64)
+    RUN=$(command -v qemu-loongarch64) ;;
 esac
 pass=0; fail=0
 mkdir -p build/tests

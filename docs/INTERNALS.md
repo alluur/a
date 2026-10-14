@@ -245,7 +245,7 @@ Python results.
 
 `lib/net.a` is embedded in the compiler like `std.a` but only compiled when a program says `import net;`.
 It is plain A code. On Linux / Android it calls `__syscall` with the socket system call numbers of the
-current CPU (`__ARCH` picks x86-64 or ARM64). Windows has no stable syscalls, so the PE image imports
+current CPU (`__ARCH`: 0 x86-64, 1 ARM64, 2 RISC-V 64, 3 LoongArch64; the last three share the generic system call numbers). Windows has no stable syscalls, so the PE image imports
 `WS2_32.DLL` as a second descriptor (IAT slots 40-48, slot 39 is the null terminator of the kernel32
 thunks) and `net.a` reaches it through the generic builtin `__winapi(slot, a1..a4)`, a small blob
 that does `call [IAT + slot*8]` with the Windows x64 convention. Adding another Windows API needs
@@ -267,3 +267,18 @@ symbol (`SYM_VAL` = index of the real symbol) in the importing module for each l
 that was just compiled (`last_file_id`). `sym_lookup` and `sym_find_global` resolve aliases through
 `alias_resolve`. Inside `a_import( ... )` the lexer reads `'text'` as a string (`sq_string`). The name list is
 kept on the stack because nested imports reuse `importbuf`.
+
+## CPU backends
+
+`src/cg_x86.asm`, `cg_a64.asm`, `cg_rv64.asm` and `cg_la64.asm` implement the same list of primitives (`CGLIST` in `defs.inc`);
+`install_backend` copies the table of the chosen CPU into `cg_vt`. A new CPU needs: the primitives, `apply_relocs_*`, a column
+of runtime blobs in `builtin_tab` (write, read, exit, syscall, open, close, setjmp, longjmp ...), a row in `target_table`,
+the ELF machine number in `build_elf` and the `__ARCH` value. Instruction words are built with assembly-time macros
+(`RV_I(...)`, `LA_2RI12(...)`) and were checked with `llvm-mc` (`llvm-mc --disassemble -triple=riscv64` /
+`loongarch64` on the bytes of an output file). Both new backends use 16 byte stack slots and the frame layout of AArch64
+(`[fp+16]` = the last parameter), so the compiler core did not change.
+
+* **RISC-V 64:** A = a0, B = a1, D = a2, scratch t0-t3, frame pointer s0. Jumps and calls are `auipc` + `jalr` pairs; while a
+  forward chain is open the second word holds the link. 64 bit constants take at most 8 instructions.
+* **LoongArch64:** A = $a0, B = $a1, D = $a2, scratch $t0-$t3, frame pointer $fp. Jumps and calls are single `b` / `bl`
+  instructions (+-128 MiB); data and function addresses are `pcaddu12i` + `addi.d`.

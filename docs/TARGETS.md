@@ -10,6 +10,9 @@ so it doubles as a cross compiler. Pick the target with `-t`:
 | `windows`, `win`, `win64` | Windows 7+ | x86-64 | `hello-1-debug.exe` | PE32+, console |
 | `android`, `android-arm64` | Android | AArch64 | `hello-1-debug.bin` | ELF64, static |
 | `android-x64` | Android | x86-64 | `hello-1-debug.x64.bin` | ELF64, static |
+| `linux-riscv64`, `linux-rv64` | Linux | RISC-V 64 (RV64GC) | `hello-1-debug.riscv64.elf` | ELF64, static |
+| `android-riscv64`, `android-rv64` | Android | RISC-V 64 | `hello-1-debug.riscv64.bin` | ELF64, static |
+| `linux-loongarch64`, `linux-la64` | Linux | LoongArch64 | `hello-1-debug.loongarch64.elf` | ELF64, static |
 
 The default name is `{app_name}-{version-code}-{release-type}.{ext}`; change it with `-v CODE`,
 `-r TYPE`, or take full control with `-o FILE`:
@@ -34,6 +37,30 @@ ac -t linux-arm64 -o hello-arm hello.a      # Raspberry Pi, AWS Graviton, Apple 
 
 An ARM64 file can be tried on an x86-64 machine with QEMU user mode emulation
 (`sudo apt install qemu-user`, then `qemu-aarch64 ./hello-arm`).
+
+## RISC-V 64 and LoongArch64
+
+Two more CPU families with the same source, the same standard library and the same ABI idea as AArch64
+(arguments on the stack in 16 byte slots, `__ARCH` tells the code which CPU it is built for):
+
+| CPU | `__ARCH` | `-t` | Notes |
+|---|---|---|---|
+| x86-64 | 0 | `linux`, `windows`, `android-x64` | |
+| AArch64 (ARM64) | 1 | `linux-arm64`, `android` | phones, tablets, Raspberry Pi, Apple silicon VMs |
+| RISC-V 64 | 2 | `linux-riscv64`, `android-riscv64` | needs the base integer set and the M extension (every RV64GC chip); no floating point or compressed instructions are used |
+| LoongArch64 | 3 | `linux-loongarch64` | Loongson 3A5000 and later |
+
+Both are static Linux ELF files without libc, using the generic Linux system call numbers (the ones of AArch64);
+differences such as `renameat2`, `statx` (LoongArch has no `stat`) and the `O_DIRECTORY` flag value are handled by the
+standard library. They run on real hardware or under QEMU user mode:
+
+```sh
+ac -t linux-riscv64 -o hello.rv hello.a && qemu-riscv64 ./hello.rv
+ac -t linux-loongarch64 -o hello.la hello.a && qemu-loongarch64 ./hello.la
+```
+
+The complete test-suite passes on all of them (`TARGET=linux-riscv64 tests/run.sh`, `TARGET=linux-loongarch64 tests/run.sh`).
+Not supported (yet): 32-bit CPUs (A's `int` is 64 bits), macOS / iOS (Mach-O, code signing) and the BSDs.
 
 ## Windows
 
