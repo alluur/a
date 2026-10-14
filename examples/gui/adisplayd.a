@@ -8,12 +8,23 @@
 //     -layout L     keyboard layout for -fb: us (default) or fi
 //     -size WxH     screen size without a framebuffer (default 1024x768)
 //     -control      let clients take screenshots and inject input (see actl)
+//     -cookie FILE  require clients to prove that they know the secret in FILE (hex text, 16 bytes or more)
+//     -newcookie    with -cookie: make the file (32 random bytes, mode 600) when it does not exist
+//     -listen HOST  listen on another address than 127.0.0.1, for example 0.0.0.0 (only with -cookie)
+//     -vncpass FILE use the first line of FILE (at most 8 characters count) as the password of the VNC server
 //
+//   Remote display:   adisplayd -newcookie -cookie ~/.adisplay-cookie -listen 0.0.0.0 -p 0 &
+//   copy the cookie file to the other computer (a safe way), then there:  ADISPLAY=server:7000 ./hello
+//   (clients read ~/.adisplay-cookie, or ADISPLAY_COOKIE_FILE, or ADISPLAY_COOKIE). The display protocol is NOT encrypted:
+//   the cookie is never sent, but windows and keystrokes are; use an SSH tunnel on networks you do not trust.
+
 //   Example:  adisplayd -vnc 5900 -control &      then      ADISPLAY=0 ./hello      and connect a VNC viewer to localhost:5900
 import wsrv;
 import wvnc;
 import wfb;
 import adp;
+import secure;
+import cunistd;
 
 int main(int argc, char** argv) {
     int port = 7000;
@@ -24,6 +35,10 @@ int main(int argc, char** argv) {
     int width = 1024;
     int height = 768;
     bool control = false;
+    char* cookieFile = null;
+    bool newCookie = false;
+    char* listenHost = "127.0.0.1";
+    char* vncPassFile = null;
     for (int i = 1; i < argc; i++) {
         char* a = argv[i];
         if (streq(a, "-p") && i + 1 < argc) {
@@ -51,8 +66,19 @@ int main(int argc, char** argv) {
             i++;
         } else if (streq(a, "-control")) {
             control = true;
+        } else if (streq(a, "-cookie") && i + 1 < argc) {
+            cookieFile = argv[i + 1];
+            i++;
+        } else if (streq(a, "-newcookie")) {
+            newCookie = true;
+        } else if (streq(a, "-listen") && i + 1 < argc) {
+            listenHost = argv[i + 1];
+            i++;
+        } else if (streq(a, "-vncpass") && i + 1 < argc) {
+            vncPassFile = argv[i + 1];
+            i++;
         } else {
-            println("usage: adisplayd [-p N] [-vnc PORT] [-vnchost H] [-fb DEV] [-layout us|fi] [-size WxH] [-control]");
+            println("usage: adisplayd [-p N] [-vnc PORT] [-vnchost H] [-fb DEV] [-layout us|fi] [-size WxH] [-control] [-cookie FILE [-newcookie]] [-listen HOST] [-vncpass FILE]");
             return 1;
         }
     }
@@ -79,6 +105,19 @@ int main(int argc, char** argv) {
             eprintln("cannot listen on the VNC port");
             return 1;
         }
+        if (vncPassFile != null) {
+            char* pw = readFile(vncPassFile);
+            if (pw == null) {
+                eprintln("cannot read the VNC password file");
+                return 1;
+            }
+            int n = strlen(pw);
+            while (n > 0 && (pw[n - 1] == 10 || pw[n - 1] == 13)) {
+                pw[n - 1] = 0;
+                n--;
+            }
+            vnc->setPassword(pw);
+        }
     }
     if (primary == null) {
         primary = vnc;
@@ -89,12 +128,40 @@ int main(int argc, char** argv) {
         eprintln("cannot listen on the display port");
         return 1;
     }
+    if (cookieFile != null) {
+        char* text = readFile(cookieFile);
+        if (text == null && newCookie) {
+            char raw[32];
+            if (!secure.bytes(&raw[0], 32)) {
+                eprintln("this system has no secure random generator: make the cookie elsewhere (openssl rand -hex 32)");
+                return 1;
+            }
+            text = secure.toHex(&raw[0], 32);
+            int fd = open(cookieFile, 1 | 64 | 512, 384);                  // O_WRONLY | O_CREAT | O_TRUNC, mode 600
+            if (fd < 0) {
+                eprintln("cannot write the cookie file");
+                return 1;
+            }
+            write(fd, text, strlen(text));
+            write(fd, "\n", 1);
+            close(fd);
+            println("made a new cookie file");
+        }
+        if (text == null || !srv->setCookie(text)) {
+            eprintln("the cookie file is missing or not 16 or more bytes of hex text");
+            return 1;
+        }
+    }
+    if (!streq(listenHost, "127.0.0.1") && !srv->listenOn(listenHost, port)) {
+        eprintln("cannot listen on that address (anything but 127.0.0.1 needs -cookie)");
+        return 1;
+    }
     if (vnc != null) {
         srv->addBackend(vnc);
     }
     srv->allowScreenshots = control;
     srv->allowInject = control;
-    printf("display on 127.0.0.1:%d, %dx%d", port, width, height);
+    printf("display on %s:%d, %dx%d%s", listenHost, port, width, height, srv->hasCookie() ? ", cookie required" : "");
     if (vncPort > 0) {
         printf(", VNC on %s:%d", vncHost, vncPort);
     }

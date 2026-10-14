@@ -348,3 +348,11 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
 * Minimizing: `Win.minimized` and `Win.shown()` (visible, mapped, not minimized) replace the old visibility tests in the server;
   `listed()` decides which windows a taskbar sees. The window list is pulled (a taskbar polls every 400 ms), the server never
   pushes it. Notifications are undecorated `F_ABOVE | F_NOFOCUS` windows in six slots. `tests/t120_gui_extras.a` covers all of it.
+* Display authentication: `wsrv.Client.authed/nonce/born`; `handleRequest` answers `Q_HELLO` with `E_AUTH` when a cookie is set and ignores
+  everything but `Q_AUTH` until it verifies (`hash.hmacSha256`, compared with `hash.equalConstantTime`). `secure.unique` gives
+  the nonce (getrandom/`/dev/urandom`; a SHA-256 mix of counter, clock and an address on Windows, where only uniqueness is needed
+  for a challenge). `wvnc` adds security type 2 with `des.vncResponse` (the DES tables are checked against `openssl enc -des-ecb`
+  in `tests/gui/rfbclient.py`, an independent implementation). `tests/t121_gui_auth.a`: RFC 4231 HMAC vectors, the DES vector,
+  the handshake in one process. `tests/t122_gui_net.a`: `gnet.Fetch` against a tiny server stepped from `gui.idleHook`.
+* A name clash to know about: `cstdlib` defines a function `random`, so a module called `random` cannot be imported by a file that
+  imports `cstdlib` (the secure helpers live in `secure`).

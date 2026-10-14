@@ -7,8 +7,9 @@
 //    wsrv.Server* srv = new wsrv.Server(v, 7000);
 //    srv->run();
 //
-//  Then connect a viewer to localhost:5900 (:0). It speaks RFB 3.3 / 3.7 / 3.8 with the "None" security type and the Raw
-//  encoding, for 8, 16 and 32 bits per pixel true colour formats. There is no password and no encryption: the default
+//  Then connect a viewer to localhost:5900 (:0). It speaks RFB 3.3 / 3.7 / 3.8 with the "None" (or, with setPassword, "VNC Authentication") security type and the Raw
+//  encoding, for 8, 16 and 32 bits per pixel true colour formats. There is no encryption (and no password unless you call
+//  v->setPassword("..."): only the first 8 characters count, a wrong one makes the next try wait): the default
 //  host is 127.0.0.1; to use the display from another computer tunnel the port (ssh -L 5900:localhost:5900 ...).
 //  Several viewers can be connected at the same time. The mouse, the wheel and the keyboard (including international
 //  characters) are passed on to the display server.
@@ -19,6 +20,9 @@ import gfx;
 import adp;
 import wsrv;
 import cstdlib;
+import des;
+import hash;
+import secure;
 module wvnc;
 
 private void put16(char* b, int at, int v) {
@@ -88,7 +92,8 @@ public int keyOfKeysym(int sym, int* uni) {
 
 class Viewer {
     public int fd;
-    public int state;              // 0 version, 1 security choice, 2 ClientInit, 3 running
+    public int state;              // 0 version, 1 security choice, 2 ClientInit, 3 running, 4 password answer
+    public char* challenge;
     public int minor;
     public bool dead;
     public adp.Bytes* in;
@@ -143,6 +148,9 @@ public class Vnc : wsrv.Backend {
     private int nv;
     private adp.Bytes* out;
     private gfx.Surface* last;
+    private char* password;         // null: no authentication
+    private int failures;
+    private int lockedUntil;
 
     public Vnc(int width, int height, int tcpPort, char* host) {
         w = width;
@@ -153,6 +161,11 @@ public class Vnc : wsrv.Backend {
         out = new adp.Bytes();
         net.init();
         listenFd = net.listenOn(host, tcpPort, 8);
+    }
+
+    // asks viewers for this password (VNC authentication: only the first 8 characters count; the traffic is not encrypted)
+    public void setPassword(char* pw) {
+        password = (pw != null && strlen(pw) > 0) ? strdup(pw) : null;
     }
 
     public bool ok() { return listenFd >= 0; }
@@ -185,6 +198,10 @@ public class Vnc : wsrv.Backend {
     public virtual void service(int* handles, int* revents, int n) {
         if (listenFd >= 0 && ready(handles, revents, n, listenFd) && nv < 15) {
             int c = net.accept(listenFd);
+            if (c >= 0 && millis() - lockedUntil < 0) {
+                net.close(c);                   // after a wrong password the next try has to wait
+                c = -1;
+            }
             if (c >= 0) {
                 net.setTimeout(c, 2000);
                 net.setNoDelay(c, true);
@@ -212,6 +229,13 @@ public class Vnc : wsrv.Backend {
                 i++;
             }
         }
+    }
+
+    private void sendChallenge(Viewer* v) {
+        v->challenge = malloc(16);
+        secure.unique(v->challenge);
+        net.send(v->fd, v->challenge, 16);
+        v->state = 4;
     }
 
     private void send(Viewer* v) {
@@ -244,9 +268,14 @@ public class Vnc : wsrv.Backend {
             if (v->minor >= 7) {
                 char sec[2];
                 sec[0] = 1;
-                sec[1] = 1;
+                sec[1] = (password != null) ? 2 : 1;
                 net.send(v->fd, &sec[0], 2);
                 v->state = 1;
+            } else if (password != null) {
+                char sec4[4];
+                put32be(&sec4[0], 0, 2);
+                net.send(v->fd, &sec4[0], 4);
+                sendChallenge(v);
             } else {
                 char sec4[4];
                 put32be(&sec4[0], 0, 1);
@@ -257,12 +286,49 @@ public class Vnc : wsrv.Backend {
         }
         if (v->state == 1) {
             if (b->len < 1) { return false; }
+            int chosen = d[0];
             b->consume(1);
+            if (password != null) {
+                if (chosen != 2) {
+                    v->dead = true;
+                    return false;
+                }
+                sendChallenge(v);
+                return true;
+            }
             if (v->minor >= 8) {
                 char ok4[4];
                 put32be(&ok4[0], 0, 0);
                 net.send(v->fd, &ok4[0], 4);
             }
+            v->state = 2;
+            return true;
+        }
+        if (v->state == 4) {
+            if (b->len < 16) { return false; }
+            char expect[16];
+            des.vncResponse(password, v->challenge, &expect[0]);
+            bool good = hash.equalConstantTime(&expect[0], d, 16);
+            b->consume(16);
+            char res[4];
+            put32be(&res[0], 0, good ? 0 : 1);
+            net.send(v->fd, &res[0], 4);
+            if (!good) {
+                if (v->minor >= 8) {
+                    char* why = "Authentication failed";
+                    char l4[4];
+                    put32be(&l4[0], 0, strlen(why));
+                    net.send(v->fd, &l4[0], 4);
+                    net.sendText(v->fd, why);
+                }
+                failures++;
+                int wait = failures * 1000;
+                if (wait > 10000) { wait = 10000; }
+                lockedUntil = millis() + wait;
+                v->dead = true;
+                return false;
+            }
+            failures = 0;
             v->state = 2;
             return true;
         }

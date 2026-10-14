@@ -1,0 +1,365 @@
+// =============================================================================
+//  gnet - network helpers that keep a gui program responsive                                          import gnet;
+//
+//    gnet.Fetch* f = new gnet.Fetch();
+//    f->onDone = finished;                        // int finished(int fetch) { ... return 0; }
+//    f->onProgress = progress;                    // int progress(int fetch)   received / contentLength
+//    f->start(display, "http://example.org/index.html", null);
+//    ... in finished:  f->status  f->headers  f->body  f->bodyLen  f->error
+//
+//  Fetch is an HTTP/1.1 GET that does not block: the response is read as it arrives, inside the event loop of the display
+//  (gui.Display.watch). Redirects (up to 5), chunked bodies and Content-Length are handled; plain http:// only. Connecting
+//  and looking up the name still wait (the time limit is 4 seconds).
+//
+//    gnet.Scan* s = new gnet.Scan();              a port scanner that tests one port per turn of the event loop
+//    s->onFound = found;  s->onDone = scanned;    int found(int scan) { ... s->lastFound ... }
+//    s->start(display, "192.168.1.10", 1, 1024, 200);
+// =============================================================================
+import gui;
+import net;
+import http;
+import netutil;
+import cstdlib;
+module gnet;
+
+int fetchReadable(int arg);
+int scanTick(int arg);
+
+public class Fetch {
+    public func onDone;             // int f(int fetch)
+    public func onProgress;         // int f(int fetch)
+    public int status;              // the HTTP status, 0 until the headers are in
+    public char* headers;           // the response headers (text)
+    public char* body;              // the body (NUL terminated)
+    public int bodyLen;
+    public char* error;             // null when it worked
+    public char* url;               // the address that was finally fetched
+    public int received;            // bytes of the body so far
+    public int contentLength;       // -1 when the server did not say
+    public int elapsed;             // milliseconds
+    public bool done;
+    public int maxBytes;
+    public int userData;
+    private gui.Display* display;
+    private int fd;
+    private char* buf;
+    private int len;
+    private int cap;
+    private int headEnd;            // offset of the body in buf, -1 until the headers are complete
+    private bool chunked;
+    private int redirects;
+    private int started;
+    private char* extra;
+
+    public Fetch() {
+        fd = -1;
+        headEnd = -1;
+        contentLength = -1;
+        maxBytes = 8 * 1024 * 1024;
+        body = "";
+        headers = "";
+    }
+
+    public bool running() { return fd >= 0; }
+
+    private void fail(char* why) {
+        error = why;
+        finish();
+    }
+
+    // starts the request; false (and error set) if it could not be started
+    public bool start(gui.Display* d, char* address, char* extraHeaders) {
+        display = d;
+        extra = extraHeaders;
+        if (started == 0) {
+            started = millis();
+        }
+        url = strdup(address);
+        http.Url u;
+        if (!http.parseUrl(address, &u)) {
+            error = "not a valid http:// address";
+            done = true;
+            return false;
+        }
+        if (streq(&u.scheme[0], "https")) {
+            error = "https is not supported (no TLS)";
+            done = true;
+            return false;
+        }
+        fd = net.connectTimeout(&u.host[0], u.port, 4000);
+        if (fd < 0) {
+            error = "cannot connect";
+            done = true;
+            return false;
+        }
+        char* req = malloc(strlen(&u.path[0]) + strlen(&u.host[0]) + 300 + ((extraHeaders != null) ? strlen(extraHeaders) : 0));
+        strcpy(req, "GET ");
+        strcat(req, &u.path[0]);
+        strcat(req, " HTTP/1.1\r\nHost: ");
+        strcat(req, &u.host[0]);
+        strcat(req, "\r\nConnection: close\r\nUser-Agent: A-gnet/1\r\nAccept: */*\r\n");
+        if (extraHeaders != null) {
+            strcat(req, extraHeaders);
+        }
+        strcat(req, "\r\n");
+        if (net.send(fd, req, strlen(req)) < 0) {
+            net.close(fd);
+            fd = -1;
+            error = "cannot send the request";
+            done = true;
+            return false;
+        }
+        cap = 16384;
+        buf = malloc(cap);
+        len = 0;
+        headEnd = -1;
+        received = 0;
+        contentLength = -1;
+        chunked = false;
+        status = 0;
+        d->watch(fd, fetchReadable, (int) this);
+        return true;
+    }
+
+    public void cancel() {
+        if (fd >= 0) {
+            display->unwatch(fd);
+            net.close(fd);
+            fd = -1;
+        }
+        if (!done) {
+            error = "cancelled";
+            done = true;
+        }
+    }
+
+    // called when the socket has something to read
+    public void readable() {
+        if (len + 8192 > cap) {
+            cap = cap * 2;
+            buf = realloc(buf, cap);
+        }
+        int n = net.recv(fd, &buf[len], 8192);
+        if (n < 0) {
+            fail("the connection failed");
+            return;
+        }
+        if (n == 0) {
+            finish();
+            return;
+        }
+        len = len + n;
+        if (len > maxBytes + 65536) {
+            fail("the response is too large");
+            return;
+        }
+        if (headEnd < 0) {
+            findHeaders();
+        }
+        if (headEnd >= 0) {
+            received = len - headEnd;
+            if (onProgress != null) {
+                onProgress(this);
+            }
+        }
+    }
+
+    private void findHeaders() {
+        for (int i = 3; i < len; i++) {
+            if (buf[i - 3] == 13 && buf[i - 2] == 10 && buf[i - 1] == 13 && buf[i] == 10) {
+                headEnd = i + 1;
+                char* h = malloc(headEnd + 1);
+                memcpy(h, buf, headEnd);
+                h[headEnd] = 0;
+                headers = h;
+                // "HTTP/1.1 200 OK"
+                int sp = indexOf(h, ' ');
+                status = (sp > 0) ? atoi(&h[sp + 1]) : 0;
+                char value[64];
+                if (http.headerOf(h, "Content-Length", &value[0], 64)) {
+                    contentLength = atoi(&value[0]);
+                }
+                if (http.headerOf(h, "Transfer-Encoding", &value[0], 64) && indexOf(&value[0], 'c') >= 0) {
+                    chunked = true;
+                }
+                return;
+            }
+        }
+    }
+
+    private void finish() {
+        if (fd >= 0) {
+            display->unwatch(fd);
+            net.close(fd);
+            fd = -1;
+        }
+        if (headEnd < 0 && error == null) {
+            error = "no response";
+        }
+        if (headEnd >= 0) {
+            // a redirect starts the next request
+            if ((status == 301 || status == 302 || status == 303 || status == 307 || status == 308) && redirects < 5 && error == null) {
+                char loc[1024];
+                if (http.headerOf(headers, "Location", &loc[0], 1024)) {
+                    redirects++;
+                    char* next = absolute(&loc[0]);
+                    if (start(display, next, extra)) {
+                        return;
+                    }
+                    done = true;
+                    elapsed = millis() - started;
+                    if (onDone != null) { onDone(this); }
+                    return;
+                }
+            }
+            int bl = len - headEnd;
+            char* raw = &buf[headEnd];
+            if (chunked) {
+                char* dec = malloc(bl + 1);
+                bl = unchunk(raw, bl, dec);
+                body = dec;
+            } else {
+                if (contentLength >= 0 && bl > contentLength) {
+                    bl = contentLength;
+                }
+                char* b = malloc(bl + 1);
+                memcpy(b, raw, bl);
+                b[bl] = 0;
+                body = b;
+                if (contentLength >= 0 && bl < contentLength && error == null) {
+                    error = "the connection ended before the whole body arrived";
+                }
+            }
+            bodyLen = bl;
+            received = bl;
+        }
+        done = true;
+        elapsed = millis() - started;
+        if (onDone != null) {
+            onDone(this);
+        }
+    }
+
+    // the absolute address for the value of a Location header
+    private char* absolute(char* loc) {
+        if (startsWith(loc, "http://") || startsWith(loc, "https://")) {
+            return strdup(loc);
+        }
+        http.Url u;
+        http.parseUrl(url, &u);
+        char* r = malloc(strlen(loc) + 300);
+        strcpy(r, "http://");
+        strcat(r, &u.host[0]);
+        if (u.port != 80) {
+            char p[12];
+            format(&p[0], 12, ":%d", u.port);
+            strcat(r, &p[0]);
+        }
+        if (loc[0] != '/') {
+            strcat(r, "/");
+        }
+        strcat(r, loc);
+        return r;
+    }
+}
+
+// decodes a chunked body; returns the length of the data
+int unchunk(char* in, int n, char* out) {
+    int at = 0;
+    int o = 0;
+    while (at < n) {
+        int size = 0;
+        while (at < n && in[at] != 13 && in[at] != 10 && in[at] != ';') {
+            int c = in[at];
+            int v = -1;
+            if (c >= '0' && c <= '9') { v = c - '0'; }
+            else if (c >= 'a' && c <= 'f') { v = c - 'a' + 10; }
+            else if (c >= 'A' && c <= 'F') { v = c - 'A' + 10; }
+            if (v < 0) { break; }
+            size = size * 16 + v;
+            at++;
+        }
+        while (at < n && in[at] != 10) { at++; }
+        at++;
+        if (size == 0 || at > n) {
+            break;
+        }
+        if (at + size > n) {
+            size = n - at;
+        }
+        memcpy(&out[o], &in[at], size);
+        o = o + size;
+        at = at + size + 2;
+    }
+    out[o] = 0;
+    return o;
+}
+
+int fetchReadable(int arg) {
+    Fetch* f = (Fetch*) arg;
+    f->readable();
+    return 0;
+}
+
+// =============================================================================
+//  Scan: a port scanner that works one port at a time between events
+// =============================================================================
+public class Scan {
+    public func onFound;            // int f(int scan): lastFound is the open port
+    public func onProgress;         // int f(int scan): current
+    public func onDone;             // int f(int scan)
+    public int current;
+    public int last;
+    public int first;
+    public int lastFound;
+    public int found;
+    public int timeout;
+    public bool running;
+    private char* host;
+    private gui.Display* display;
+
+    public bool start(gui.Display* d, char* hostName, int from, int to, int timeoutMs) {
+        if (running || from < 1 || to > 65535 || from > to) {
+            return false;
+        }
+        display = d;
+        host = strdup(hostName);
+        first = from;
+        current = from;
+        last = to;
+        timeout = timeoutMs;
+        found = 0;
+        running = true;
+        d->after(1, scanTick, (int) this);
+        return true;
+    }
+
+    public void stop() {
+        running = false;
+    }
+
+    public void tick() {
+        if (!running) {
+            return;
+        }
+        if (current > last) {
+            running = false;
+            if (onDone != null) { onDone(this); }
+            return;
+        }
+        if (netutil.portOpen(host, current, timeout)) {
+            lastFound = current;
+            found++;
+            if (onFound != null) { onFound(this); }
+        }
+        current++;
+        if (onProgress != null) { onProgress(this); }
+        display->after(1, scanTick, (int) this);
+    }
+}
+
+int scanTick(int arg) {
+    Scan* s = (Scan*) arg;
+    s->tick();
+    return 0;
+}

@@ -1,19 +1,44 @@
 #!/usr/bin/env python3
 """A minimal RFB (VNC) client for testing the VNC backend: connects, grabs the screen, sends mouse and key events."""
-import socket, struct, time
+import socket, struct, subprocess, time
+
+
+class AuthFailed(Exception):
+    pass
+
+
+def vnc_response(password, challenge):
+    """the VNC authentication answer; DES comes from openssl (legacy provider) so that it is independent of the A code"""
+    key = bytearray(8)
+    for i, ch in enumerate(password.encode()[:8]):
+        key[i] = int(format(ch, '08b')[::-1], 2)
+    out = b''
+    for off in (0, 8):
+        r = subprocess.run(['openssl', 'enc', '-des-ecb', '-provider', 'legacy', '-provider', 'default', '-K', bytes(key).hex(), '-nopad'],
+                           input=challenge[off:off + 8], capture_output=True)
+        out += r.stdout
+    assert len(out) == 16, out
+    return out
 
 class Rfb:
-    def __init__(self, host="127.0.0.1", port=5900, timeout=5):
+    def __init__(self, host="127.0.0.1", port=5900, timeout=5, password=None):
         self.s = socket.create_connection((host, port), timeout=timeout)
         ver = self.recvn(12)
         assert ver.startswith(b"RFB 003.00"), ver
         self.s.sendall(b"RFB 003.008\n")
         n = self.recvn(1)[0]
         types = self.recvn(n)
-        assert 1 in types, types
-        self.s.sendall(bytes([1]))
+        if password is None:
+            assert 1 in types, types
+            self.s.sendall(bytes([1]))
+        else:
+            assert types == bytes([2]), types
+            self.s.sendall(bytes([2]))
+            challenge = self.recvn(16)
+            self.s.sendall(vnc_response(password, challenge))
         res = struct.unpack(">I", self.recvn(4))[0]
-        assert res == 0, res
+        if res != 0:
+            raise AuthFailed(res)
         self.s.sendall(bytes([1]))                       # shared
         self.w, self.h = struct.unpack(">HH", self.recvn(4))
         self.pf = self.recvn(16)

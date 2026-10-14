@@ -170,6 +170,69 @@ try:
         fail("aterm with a command did not end (%s)" % term2.poll())
     print("terminal command ok")
 
+    # a protected display: cookie authentication for clients and a VNC password
+    from rfbclient import AuthFailed
+    cookie_file = os.path.join(bindir, "cookie.txt")
+    pass_file = os.path.join(bindir, "vncpass.txt")
+    if os.path.exists(cookie_file):
+        os.remove(cookie_file)
+    open(pass_file, "w").write("s3cret99\n")
+    env3 = dict(os.environ, ADISPLAY="11")
+    p3 = subprocess.Popen([os.path.join(bindir, "adisplayd"), "-p", "11", "-vnc", "5911", "-control", "-size", "640x400",
+                           "-cookie", cookie_file, "-newcookie", "-vncpass", pass_file], env=env3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(p3)
+    time.sleep(0.8)
+    if oct(os.stat(cookie_file).st_mode & 0o777) != "0o600":
+        fail("the cookie file is not mode 600")
+    # VNC: no password and a wrong password are refused, the right one works
+    try:
+        Rfb(port=5911)
+        fail("the VNC server accepted a viewer without a password")
+    except (AssertionError, OSError):
+        pass
+    time.sleep(1.2)
+    try:
+        Rfb(port=5911, password="wrongpw")
+        fail("the VNC server accepted a wrong password")
+    except AuthFailed:
+        pass
+    time.sleep(1.3)
+    v = Rfb(port=5911, password="s3cret99")
+    if (v.w, v.h) != (640, 400):
+        fail("protected VNC screen size")
+    print("vnc password ok")
+    # display clients: no cookie and a wrong cookie are refused; the right cookie lets hello and actl in
+    def run3(prog, extra, *args, timeout=10):
+        e = dict(env3)
+        e.update(extra)
+        return subprocess.run([os.path.join(bindir, prog)] + list(args), env=e, capture_output=True, text=True, timeout=timeout)
+    r = run3("actl", {"HOME": "/nonexistent"}, "-d", "11", "shot", os.path.join(bindir, "p3.ppm"))
+    if r.returncode == 0 or "cookie" not in r.stdout:
+        fail("actl without a cookie: " + r.stdout)
+    r = run3("actl", {"ADISPLAY_COOKIE": "00112233445566778899aabbccddeeff"}, "-d", "11", "shot", os.path.join(bindir, "p3.ppm"))
+    if r.returncode == 0:
+        fail("actl with a wrong cookie got in")
+    r = run3("hello", {"HOME": "/nonexistent"})
+    if r.returncode == 0:
+        fail("hello without a cookie got in")
+    r = run3("actl", {"ADISPLAY_COOKIE_FILE": cookie_file}, "-d", "11", "shot", os.path.join(bindir, "p3.ppm"))
+    if r.returncode != 0:
+        fail("actl with the cookie: " + r.stdout + r.stderr)
+    hp = subprocess.Popen([os.path.join(bindir, "hello")], env=dict(env3, ADISPLAY_COOKIE_FILE=cookie_file), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(hp)
+    time.sleep(0.8)
+    if hp.poll() is not None:
+        fail("hello with the cookie ended")
+    v.grab()
+    if not v.find_color((60, 120, 216)):
+        fail("hello with the cookie did not show its button")
+    print("cookie authentication ok")
+    # listening on all interfaces is only allowed with a cookie
+    r = subprocess.run([os.path.join(bindir, "adisplayd"), "-p", "12", "-vnc", "5912", "-listen", "0.0.0.0"], capture_output=True, text=True, timeout=10)
+    if r.returncode == 0 or "cookie" not in r.stderr:
+        fail("adisplayd -listen without a cookie: " + r.stdout + r.stderr)
+    print("listen needs a cookie ok")
+
     # a second display with the screen locker: a wrong password keeps it locked, the right one removes it
     env2 = dict(os.environ, ADISPLAY="10")
     def start2(name, *args):

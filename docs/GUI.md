@@ -28,12 +28,14 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `gui` | the client library and the basic widgets, popups, tooltips |
 | `guix` | more widgets: menus, combo box, radio buttons, tabs, scroll view, spin box, splitter; dialogs (confirm, prompt, file, colour) |
 | `glock` | a screen locker (works with the server's `F_LOCK` windows) |
+| `gnet` | non-blocking HTTP fetches and a port scanner that keep a window responsive |
+| `secure` | secure random bytes, unique nonces, hex; (`hash` has `hmacSha256`, `des` the DES cipher for VNC passwords) |
 | `gimg` | colour images: load PNG, BMP and PPM, save PNG, smooth scaling |
 | `gterm` | a terminal emulator widget (pseudo terminal, ANSI/xterm escape sequences) |
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t120`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t122`, `tests/gui.sh`.
 
 ## Quick start
 
@@ -214,6 +216,48 @@ After a wrong password the next try has to wait one second more each time (at mo
 [-u usersfile] [user]` (`examples/gui/alock.a`) is the program: it checks the password against `/etc/shadow` (it must be
 allowed to read it, so run it as root, or give the display manager's users file with `-u`) with the same `$6$` code as the
 display manager. `wsrv.Server.locked()` and `lockWindow()` tell an embedding program whether a lock is showing.
+
+## Remote display and authentication
+
+By default the display server listens on `127.0.0.1` only, and every local user can connect. To use it from another computer
+(or to keep other local users out) give it a **cookie**, a shared secret, and let it listen on more addresses:
+
+```sh
+adisplayd -newcookie -cookie ~/.adisplay-cookie -listen 0.0.0.0 -vnc 5900 -vncpass ~/.vncpass &
+scp ~/.adisplay-cookie other:~/                       # a safe way to copy it
+ADISPLAY=server:7000 ./hello                          # on the other computer; reads ~/.adisplay-cookie
+```
+
+* **Cookie authentication**: the cookie file holds 16 or more bytes as hex text (`-newcookie` makes one with 32 random bytes and
+  mode 600 when the file does not exist; on Windows there is no secure random source, make it elsewhere, for example
+  `openssl rand -hex 32`). After `Q_HELLO` a server with a cookie sends a 16 byte nonce (`E_AUTH`); the client answers with
+  `HMAC-SHA256(cookie, nonce)` (`Q_AUTH`). The cookie itself never travels; a wrong answer closes the connection (`E_DENIED`),
+  nothing else is accepted before the answer, and a client has 5 seconds to give it.
+* **Clients** find the cookie in `ADISPLAY_COOKIE` (hex text), or the file named by `ADISPLAY_COOKIE_FILE`, or
+  `~/.adisplay-cookie`; or in a program: `gui.connectWith("host:7000", "name", cookieHex)`. `actl` does the same.
+  Embedding programs call `server->setCookie(hex)` and `server->listenOn("0.0.0.0", port)`; listening on anything but
+  127.0.0.1 is refused unless a cookie is set.
+* **VNC password**: `adisplayd -vncpass FILE` (the first line is the password; only 8 characters count, that is how VNC works) or
+  `vnc->setPassword("...")`. It speaks the standard VNC authentication (DES challenge); a wrong password makes the next try
+  wait 1 s longer each time (at most 10 s).
+* **No encryption**: the display protocol and VNC send windows and keystrokes in the clear. The cookie proves who may connect;
+  on a network you do not trust, also use an SSH tunnel (`ssh -L 7000:localhost:7000 server`).
+
+## Networking from a GUI program: `gnet` and `anet`
+
+```c
+gnet.Fetch* f = new gnet.Fetch();
+f->onDone = finished;                                  // int finished(int fetch) { ... f->status, f->body ... }
+f->onProgress = progress;                              // f->received of f->contentLength bytes
+f->start(display, "http://example.org/", null);        // returns at once; the window stays responsive
+f->cancel();
+```
+
+`Fetch` is an HTTP/1.1 GET inside the event loop (`d->watch`): redirects (up to 5), chunked bodies, `Content-Length`, a
+check that the body is complete, `https://` is reported as unsupported (no TLS). Connecting and name lookup still wait (4 s at
+most). `gnet.Scan` tests the ports of a host one per turn of the event loop (`onFound`, `onProgress`, `onDone`, `stop()`).
+`examples/gui/anet.a` is a network tool made of them and of `netif`, `dns` and `netutil`: interfaces, connections, ARP table,
+routes, DNS lookups (A, AAAA, MX, NS, TXT, CNAME), an HTTP fetch with headers and body, a port scanner, TCP connect timing.
 
 ## Images: `gimg`
 

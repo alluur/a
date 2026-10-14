@@ -1,0 +1,153 @@
+// gnet: HTTP fetches that do not block the display connection (against a small server in the same process), and a port scan
+import wsrv;
+import gui;
+import gnet;
+import net;
+import http;
+
+wsrv.Server* srv;
+int web = -1;
+gui.Display* d;
+int progressCalls = 0;
+int doneCalls = 0;
+int scanFound = 0;
+int scanDone = 0;
+int ports[8];
+
+// serves one pending connection of the little web server
+void serveOne() {
+    if (web < 0 || !net.waitReadable(web, 0)) {
+        return;
+    }
+    int c = net.accept(web);
+    if (c < 0) {
+        return;
+    }
+    http.Request* q = new http.Request();
+    if (http.readRequest(c, q)) {
+        char* path = &q->path[0];
+        if (streq(path, "/hello")) {
+            http.respond(c, 200, "text/plain", "hello world");
+        } else if (streq(path, "/redir")) {
+            net.sendText(c, "HTTP/1.1 302 Found\r\nLocation: /hello\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        } else if (streq(path, "/chunked")) {
+            net.sendText(c, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+        } else if (streq(path, "/big")) {
+            char* body = malloc(200001);
+            for (int i = 0; i < 200000; i++) { body[i] = 'a' + i % 26; }
+            body[200000] = 0;
+            http.respond(c, 200, "text/plain", body);
+        } else if (streq(path, "/trunc")) {
+            net.sendText(c, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort");
+        } else {
+            http.respond(c, 404, "text/plain", "nothing here");
+        }
+    }
+    net.close(c);
+}
+
+int stepServer(int unused) {
+    srv->step(0);
+    serveOne();
+    return 0;
+}
+
+int onProgress(int self) { progressCalls++; return 0; }
+int onDone(int self) { doneCalls++; return 0; }
+int onFound(int self) {
+    gnet.Scan* s = (gnet.Scan*) self;
+    ports[scanFound] = s->lastFound;
+    scanFound++;
+    return 0;
+}
+int onScanDone(int self) { scanDone++; return 0; }
+
+// runs the event loops until the fetch is done (or 6 seconds)
+gnet.Fetch* fetch(char* path) {
+    gnet.Fetch* f = new gnet.Fetch();
+    f->onProgress = onProgress;
+    f->onDone = onDone;
+    char url[100];
+    format(&url[0], 100, "http://127.0.0.1:7230%s", path);
+    progressCalls = 0;
+    if (!f->start(d, &url[0], null)) {
+        return f;
+    }
+    int t0 = millis();
+    while (!f->done && millis() - t0 < 6000) {
+        stepServer(0);
+        d->pump(5);
+    }
+    return f;
+}
+
+void show(gnet.Fetch* f) {
+    printInt(f->status);
+    print(" ");
+    printInt(f->bodyLen);
+    print(" ");
+    print(f->error == null ? "ok" : f->error);
+    print(" [");
+    if (f->bodyLen < 40) { print(f->body); }
+    println("]");
+}
+
+int main() {
+    wsrv.Headless* hb = new wsrv.Headless(320, 200);
+    srv = new wsrv.Server(hb, 7229);
+    gui.idleHook = stepServer;
+    d = gui.connectAs("7229", "net");
+    web = net.listen(7230, 8);
+    int other = net.listen(7231, 4);
+    printlnInt(web >= 0 && other >= 0);
+
+    show(fetch("/hello"));
+    printlnInt(doneCalls);
+    gnet.Fetch* f = fetch("/redir");
+    show(f);
+    println(f->url);
+    show(fetch("/chunked"));
+    show(fetch("/404"));
+    show(fetch("/trunc"));
+    f = fetch("/big");
+    show(f);
+    printlnInt(f->contentLength);
+    printlnInt(progressCalls > 1);
+    printlnInt(f->body[0] == 'a' && f->body[199999] == 'a' + 199999 % 26);
+    // a server that is not there, a bad address, https
+    gnet.Fetch* g = new gnet.Fetch();
+    printlnInt(g->start(d, "http://127.0.0.1:7239/", null));
+    println(g->error);
+    g = new gnet.Fetch();
+    printlnInt(g->start(d, "ftp://x", null));
+    println(g->error);
+    g = new gnet.Fetch();
+    printlnInt(g->start(d, "https://127.0.0.1/", null));
+    println(g->error);
+    // a fetch can be cancelled
+    g = new gnet.Fetch();
+    g->start(d, "http://127.0.0.1:7230/hello", null);
+    g->cancel();
+    println(g->error);
+    printlnInt(g->running());
+
+    // the port scan
+    gnet.Scan* s = new gnet.Scan();
+    s->onFound = onFound;
+    s->onDone = onScanDone;
+    printlnInt(s->start(d, "127.0.0.1", 7228, 7233, 300));
+    printlnInt(s->start(d, "127.0.0.1", 7228, 7233, 300));
+    int t0 = millis();
+    while (s->running && millis() - t0 < 8000) {
+        stepServer(0);
+        d->pump(5);
+    }
+    printlnInt(scanDone);
+    printlnInt(s->found);
+    printlnInt(ports[0]);
+    printlnInt(ports[1]);
+    printlnInt(s->start(d, "127.0.0.1", 10, 5, 100));
+    d->disconnect();
+    srv->close();
+    return 0;
+}

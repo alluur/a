@@ -21,6 +21,8 @@ import net;
 import gfx;
 import adp;
 import cstdlib;
+import hash;
+import secure;
 module wsrv;
 
 // ---- input events delivered by the backends ---------------------------------------------------------------------------------------------
@@ -184,8 +186,14 @@ public class Client {
     public bool dead;
     public char* name;
     public adp.Bytes* in;
+    public bool authed;
+    public char* nonce;
+    public int born;
+    public int failures;
 
     public Client(int h, int n) {
+        born = millis();
+        nonce = malloc(16);
         fd = h;
         num = n;
         dead = false;
@@ -257,6 +265,9 @@ public class Server {
     public int cursorY;
     public Win* focus;
     public char* clipboard;
+    public char* bindHost;
+    private char* cookie;           // the shared secret (raw bytes) or null
+    private int cookieLen;
 
     private Backend** backends;
     private int nbackends;
@@ -309,9 +320,42 @@ public class Server {
         cursorY = b->h / 2;
         clipboard = "";
         net.init();
+        bindHost = "127.0.0.1";
         listenFd = net.listenOn("127.0.0.1", port, 16);
         ok = listenFd >= 0;
         addDamage(0, 0, screen->w, screen->h);
+    }
+
+    // turns on cookie authentication: clients have to prove that they know the secret (hex text, at least 32 digits = 16 bytes)
+    public bool setCookie(char* hex) {
+        char* raw = malloc(300);
+        int n = secure.fromHex(hex, raw, 256);
+        if (n < 16) {
+            return false;
+        }
+        cookie = raw;
+        cookieLen = n;
+        return true;
+    }
+
+    public bool hasCookie() { return cookie != null; }
+
+    // listens on another address (for example "0.0.0.0" for every interface). Only 127.0.0.1 is allowed without a cookie.
+    public bool listenOn(char* host, int port) {
+        if (cookie == null && !streq(host, "127.0.0.1") && !streq(host, "localhost")) {
+            return false;
+        }
+        int fd = net.listenOn(host, port, 16);
+        if (fd < 0) {
+            return false;
+        }
+        if (listenFd >= 0) {
+            net.close(listenFd);
+        }
+        listenFd = fd;
+        bindHost = host;
+        ok = true;
+        return true;
     }
 
     public void addBackend(Backend* b) {
@@ -817,6 +861,40 @@ public class Server {
     }
 
     private void handleRequest(Client* c, int op, char* p, int len) {
+        if (op == adp.Q_HELLO && cookie != null && !c->authed) {
+            if (len >= 4) {
+                c->name = textOf(p, 4, len);
+            }
+            secure.unique(c->nonce);
+            msg->begin(adp.E_AUTH);
+            msg->addBytes(c->nonce, 16);
+            sendMsg(c);
+            return;
+        }
+        if (op == adp.Q_AUTH) {
+            if (cookie == null || c->authed) {
+                return;
+            }
+            char expect[32];
+            hash.hmacSha256(cookie, cookieLen, c->nonce, 16, &expect[0]);
+            if (len == 32 && hash.equalConstantTime(&expect[0], p, 32)) {
+                c->authed = true;
+                msg->begin(adp.E_WELCOME);
+                msg->add32(adp.VERSION);
+                msg->add32(c->num);
+                msg->add32(screen->w);
+                msg->add32(screen->h);
+                sendMsg(c);
+            } else {
+                msg->begin(adp.E_DENIED);
+                sendMsg(c);
+                c->dead = true;
+            }
+            return;
+        }
+        if (!c->authed) {
+            return;                     // nothing else before the authentication
+        }
         if (op == adp.Q_HELLO) {
             if (len >= 4) {
                 c->name = textOf(p, 4, len);
@@ -1422,6 +1500,7 @@ public class Server {
                         net.setTimeout(h, 1000);
                         net.setNoDelay(h, true);
                         clients[nclients] = new Client(h, nextClientNum);
+                        clients[nclients]->authed = (cookie == null);
                         nextClientNum++;
                         nclients++;
                     }
@@ -1445,6 +1524,12 @@ public class Server {
         for (int i = 0; i < nbackends; i++) {
             while (backends[i]->nextEvent(&ev) != 0) {
                 handleInput(&ev);
+            }
+        }
+        int now = millis();
+        for (int k = 0; k < nclients; k++) {
+            if (!clients[k]->authed && now - clients[k]->born > 5000) {
+                clients[k]->dead = true;              // five seconds to answer the challenge
             }
         }
         int i = 0;
