@@ -6,7 +6,6 @@ section .rodata
 
 kw_table:
     KW "int",      K_INT
-    KW "long",     K_INT
     KW "char",     K_CHAR
     KW "byte",     K_CHAR
     KW "bool",     K_BOOL
@@ -49,6 +48,11 @@ kw_table:
     KW "float",    K_DOUBLE
     KW "defer",    K_DEFER
     KW "goto",     K_GOTO
+    KW "extern",   K_EXTERN
+    KW "short",    K_INTMOD
+    KW "long",     K_INTMOD
+    KW "signed",   K_INTMOD
+    KW "unsigned", K_INTMOD
     db 0
 
 ops3:
@@ -222,6 +226,8 @@ lex_escape:
 
 ; next_token: advances the lexer to the next token
 next_token:
+    cmp dword [fp_pending], 0
+    jne .fpresume
     push rbx
     push r12
     mov rsi, [src_ptr]
@@ -504,6 +510,38 @@ next_token:
     jmp .s1
 .s_end:
     inc rsi
+    cmp byte [str_term], '"'
+    jne .s_fin
+    ; "abc" "def" : adjacent string literals are one string
+    push r8
+    push rcx
+    mov r8, rsi
+    xor ecx, ecx
+.sk:movzx eax, byte [r8]
+    cmp al, ' '
+    je .skn
+    cmp al, 9
+    je .skn
+    cmp al, 13
+    je .skn
+    cmp al, 10
+    jne .skd
+    inc ecx
+.skn:
+    inc r8
+    jmp .sk
+.skd:
+    cmp al, '"'
+    jne .skno
+    add [src_line], rcx
+    lea rsi, [r8+1]
+    pop rcx
+    pop r8
+    jmp .s1
+.skno:
+    pop rcx
+    pop r8
+.s_fin:
     mov byte [rdi], 0
     sub rdi, strbuf
     mov qword [tk], T_STR
@@ -556,6 +594,10 @@ next_token:
     pop r12
     pop rbx
     ret
+.fpresume:
+    mov dword [fp_pending], 0
+    mov rsi, fp_after
+    jmp lex_restore
 
 ; lex_save: rdi = 128 byte buffer. Saves the complete lexer + file state.
 lex_save:

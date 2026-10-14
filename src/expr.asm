@@ -434,6 +434,16 @@ is_type_start_impl:
     mov eax, [tk]
     cmp eax, K_INT
     je .yes
+    cmp eax, K_STRUCT
+    je .yes
+    cmp eax, K_CLASS
+    je .yes
+    cmp eax, K_UNION
+    je .yes
+    cmp eax, K_ENUM
+    je .yes
+    cmp eax, K_INTMOD
+    je .yes
     cmp eax, K_DOUBLE
     je .yes
     cmp eax, K_CHAR
@@ -503,6 +513,35 @@ parse_type:
     push rbx
     push r12
     mov eax, [tk]
+    cmp eax, K_STRUCT
+    je .tagkw
+    cmp eax, K_CLASS
+    je .tagkw
+    cmp eax, K_UNION
+    je .tagkw
+    cmp eax, K_ENUM
+    jne .notag
+.tagkw:
+    call next_token                     ; C style:  struct Point p;   enum Color c;
+    mov eax, [tk]
+.notag:
+    cmp eax, K_INTMOD
+    jne .nomod
+    ; short / long / signed / unsigned [long] [int | char | double]: every one of them is an int, char or double
+.mod:
+    call next_token
+    cmp qword [tk], K_INTMOD
+    je .mod
+    mov eax, [tk]
+    cmp eax, K_INT
+    je .int
+    cmp eax, K_CHAR
+    je .char
+    cmp eax, K_DOUBLE
+    je .double
+    mov ebx, TY_INT
+    jmp .star
+.nomod:
     cmp eax, K_INT
     je .int
     cmp eax, K_DOUBLE
@@ -588,10 +627,64 @@ parse_type:
     call next_token
     jmp .star
 .done:
+    cmp qword [tk], '('
+    je .fpcheck
+.ret:
     mov rax, rbx
     pop r12
     pop rbx
     ret
+; int (*name)(params)  -  a C function pointer declarator. The signature is not checked (see "func"): the type becomes func,
+; the current token becomes the name, and the lexer jumps over ")(params)" when the name is consumed.
+.fpcheck:
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    cmp qword [tk], '*'
+    jne .fpno
+    call next_token
+    cmp qword [tk], T_ID
+    jne .fpno
+    call next_token
+    cmp qword [tk], ')'
+    jne .fpno
+    call next_token
+    cmp qword [tk], '('
+    jne .fpno
+    xor r12d, r12d
+.fpscan:
+    mov rax, [tk]
+    cmp rax, T_EOF
+    je .fpno
+    cmp rax, '('
+    jne .fp1
+    inc r12d
+.fp1:
+    cmp rax, ')'
+    jne .fp2
+    dec r12d
+    jz .fpend
+.fp2:
+    call next_token
+    jmp .fpscan
+.fpend:
+    call next_token                     ; the token after the parameter list
+    mov rdi, fp_after
+    call lex_save
+    mov rsi, rsp
+    call lex_restore                    ; back to the '('
+    add rsp, 128
+    call next_token                     ; '*'
+    call next_token                     ; the name
+    mov dword [fp_pending], 1
+    mov ebx, TY_FUNC
+    jmp .ret
+.fpno:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    jmp .ret
 
 ; enum_find: edi = enum symbol index, rsi = name, edx = len -> rax = const symbol / 0
 enum_find:
@@ -640,6 +733,7 @@ emit_funcaddr_sym:
 ; record_edge: rdi = function symbol that the current function uses.
 ; Pass 2 records the call graph: edge  cur_func -> callee  (no caller = called from the entry stub)
 record_edge:
+    inc dword [call_ctr]
     cmp dword [pass], 2
     jne .out
     push rax
@@ -1166,14 +1260,113 @@ parse_primary:
 
 .sizeof:
     call next_token
-    mov edi, '('
-    call expect
+    xor r13d, r13d                      ; 1 = the operand is in parentheses
+    cmp qword [tk], '('
+    jne .sz_expr
+    mov r13d, 1
+    call next_token
+    call is_type_start
+    test eax, eax
+    jz .sz_expr
     call parse_type
     mov rdi, rax
     call type_size
     mov rbx, rax
     mov edi, ')'
     call expect
+    jmp .sz_done
+.sz_expr:
+    ; the name of an array: its size is the element size times the element count
+    cmp qword [tk], T_ID
+    jne .sz_gen
+    mov rdi, [tk_ptr]
+    mov esi, [tk_len]
+    call sym_lookup
+    test rax, rax
+    jz .sz_gen
+    mov r12, rax
+    mov ecx, [r12+SYM_KIND]
+    cmp ecx, S_LOCAL
+    je .sz_sym
+    cmp ecx, S_GLOBAL
+    jne .sz_gen
+.sz_sym:
+    mov rax, [r12+SYM_TYPE]
+    bt rax, TF_ARRAY_BIT
+    jnc .sz_gen
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor ebx, ebx                        ; 1 = the identifier stands alone
+    test r13d, r13d
+    jz .sz_alone
+    cmp qword [tk], ')'
+    jne .sz_back
+    mov ebx, 1
+    jmp .sz_back
+.sz_alone:
+    mov ebx, 1
+    cmp qword [tk], '['
+    je .sz_no
+    cmp qword [tk], '.'
+    je .sz_no
+    cmp qword [tk], T_ARROW
+    jne .sz_back
+.sz_no:
+    xor ebx, ebx
+.sz_back:
+    test ebx, ebx
+    jz .sz_restore
+    add rsp, 128                        ; keep the position after the identifier
+    test r13d, r13d
+    jz .sz_arr
+    mov edi, ')'
+    call expect
+.sz_arr:
+    mov rdi, [r12+SYM_TYPE]
+    btr rdi, TF_ARRAY_BIT
+    sub rdi, TY_PTR1
+    call type_size
+    imul rax, [r12+SYM_EXTRA]
+    mov rbx, rax
+    jmp .sz_done
+.sz_restore:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+.sz_gen:
+    ; any other expression: only its type matters, the code is thrown away
+    mov r12, [code_pos]
+    mov r14d, [rel_count]
+    push qword [call_ctr]
+    test r13d, r13d
+    jz .sz_unary
+    call parse_expr
+    jmp .sz_typed
+.sz_unary:
+    call parse_unary
+.sz_typed:
+    pop rax
+    cmp eax, [call_ctr]
+    je .sz_nocall
+    ERR "sizeof cannot contain a function call"
+.sz_nocall:
+    mov [rel_count], r14d
+    mov rdi, r12
+    call rewind_code
+    mov rdi, [e_type]
+    bt rdi, TF_ARRAY_BIT
+    jnc .sz_scalar
+    ERR "sizeof of this array expression is not supported, use the name of the array"
+.sz_scalar:
+    call type_size
+    mov rbx, rax
+    test r13d, r13d
+    jz .sz_done
+    mov edi, ')'
+    call expect
+.sz_done:
     mov rdi, rbx
     call gen_imm_a
     mov qword [e_type], TY_INT
@@ -2351,7 +2544,17 @@ store_local_typed:
 .b: CG store_local_a1
     ret
 
+; parse_expr: an expression with the comma operator,  a, b  evaluates a, then b, and has the value of b
 parse_expr:
+    call parse_assign
+.more:
+    cmp qword [tk], ','
+    jne .r
+    call next_token
+    call parse_assign
+    jmp .more
+.r: ret
+
 parse_assign:
     STACKCHK
     push rbx

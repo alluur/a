@@ -387,6 +387,37 @@ be taken:
 
 An unsized `(T[]){...}` list must be written without `[index] =` designators (the elements are counted).
 
+### More C syntax
+
+**Comma operator.** `a = 1, b = 2` evaluates both and has the value of the last one. It works anywhere a full expression is
+allowed: statements, `for (i = 0, j = n; i < j; i++, j--)`, conditions and parentheses (not between function arguments).
+
+**`sizeof` of values.** `sizeof(x)`, `sizeof x` and `sizeof(expr)` give the size of a variable, array or expression; the
+expression is not evaluated and must not contain function calls. For an array name the result is the whole array, so
+`sizeof(a) / sizeof(a[0])` is the element count. (An array that is a struct field cannot be measured this way; use `sizeof(Type)`.)
+
+**C integer words.** `short`, `long`, `signed`, `unsigned` (also `long long`, `unsigned long int`, `long double`) are accepted
+and mean the ordinary A types: all integers are the 64-bit signed `int`, `unsigned char` is `char`, `long double` is `double`.
+No unsigned arithmetic happens, so use the `%u`/`%x` conversions or the unsigned helpers of the library when it matters.
+
+**Adjacent string literals** are joined: `"Hello, " "world"` (also across lines).
+
+**`typedef enum` and `typedef struct`.**
+
+    typedef enum { RED, GREEN = 5, BLUE } Color;
+    typedef struct { int x; int y; } Point;
+    typedef struct Node { int val; struct Node* next; } Node;
+
+**`struct`, `class`, `union` and `enum` in types.** `struct Point p;`, `struct Node* next;` and `sizeof(struct Point)` are
+accepted next to the plain `Point p;`.
+
+**`extern`.** `extern int counter;` is accepted and ignored: a whole program is compiled together, so the definition just has to
+appear somewhere.
+
+**Function pointer declarators.** `int (*op)(int, int) = add;`, `typedef int (*BinOp)(int, int);`, struct fields and parameters
+such as `int apply(int (*f)(int, int), int a, int b)` are accepted. They all become the type `func`; as before the signature
+is not checked.
+
 ### Inline assembly
 
 `asm` puts machine code of your choice into a function. The program lists the code for every CPU it should run on;
@@ -1063,8 +1094,8 @@ The process exit code is 1; on success it is 0.
 * All variables start zeroed; `new` returns zeroed memory; `new` has no `free` (`malloc` / `free` come with `cstdlib`).
 * Functions may be used before their definition without prototypes.
 * `const NAME = value;` declares a compile-time constant.
-* No floating point *types* (the `cmath` module computes with doubles held in ints), no `unsigned`, bit-fields or preprocessor —
+* No unsigned arithmetic, bit-fields or preprocessor —
   yet. Function pointers exist as the type `func`; parameters can have default values.
 * Structs can be passed and returned by value (a hidden copy), `typedef`, `union`, `static` locals, default values (also text) and
-  variadic functions (`...` with `va_arg`) exist; `unsigned` types, bit-fields and the preprocessor do not.
+  variadic functions (`...` with `va_arg`) exist; unsigned arithmetic, bit-fields and the preprocessor do not.
 * `switch` labels must be constant expressions (like C), and `case` values must fit in 32 bits.

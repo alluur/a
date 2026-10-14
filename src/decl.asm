@@ -505,10 +505,20 @@ parse_aggregate:
     call next_token
     cmp qword [tk], T_ID
     je .n1
+    cmp dword [agg_anon_len], 0
+    jne .anon
     ERR "expected a class or struct name"
+.anon:
+    ; typedef struct { ... } Name;   the structure is called Name
+    mov r12, [agg_anon_ptr]
+    mov r13d, [agg_anon_len]
+    mov dword [agg_anon_len], 0
+    mov dword [agg_anon_nt], 1
+    jmp .n1b
 .n1:
     mov r12, [tk_ptr]
     mov r13d, [tk_len]
+.n1b:
     cmp dword [pass], 1
     jne .p2
     mov eax, [struct_count]
@@ -547,7 +557,13 @@ parse_aggregate:
     mov rbx, [rax+SYM_VAL]
 .named:
     mov r15d, r14d                  ; default member visibility: classes private
+    cmp dword [agg_anon_nt], 0
+    je .nt0
+    mov dword [agg_anon_nt], 0      ; an anonymous structure: the current token already is the '{'
+    jmp .nt1
+.nt0:
     call next_token
+.nt1:
     cmp qword [tk], ':'
     jne .nobase
     ; class D : B  - single inheritance, the base class must be complete
@@ -1542,12 +1558,14 @@ parse_items:
     je .amodule
     cmp eax, K_AIMPORT
     je .aimport
+    cmp eax, K_EXTERN
+    je .extern
     cmp eax, K_STRUCT
-    je .aggr
+    je .aggr?
     cmp eax, K_CLASS
-    je .aggr
+    je .aggr?
     cmp eax, K_UNION
-    je .aggr
+    je .aggr?
     cmp eax, K_TYPEDEF
     je .typedef
     cmp eax, K_ENUM
@@ -1561,6 +1579,33 @@ parse_items:
     cmp qword [tk], T_ID
     je fatal_error_tok
     jmp fatal_error
+.extern:
+    call skip_to_semi                   ; extern int x;   the definition is somewhere in the program
+    jmp .loop
+.aggr?:
+    ; struct Name { ... }  defines a type;  struct Name x;  uses one
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    cmp qword [tk], T_ID
+    jne .aggr_def
+    call next_token
+    cmp qword [tk], '{'
+    je .aggr_def
+    cmp qword [tk], ':'
+    je .aggr_def
+    cmp qword [tk], ';'
+    je .aggr_def
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    jmp .decl
+.aggr_def:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    jmp .aggr
 .import:
     call parse_import
     jmp .loop
@@ -1582,6 +1627,23 @@ parse_items:
     call parse_enum
     jmp .loop
 .typedef:
+    ; typedef struct { ... } Name;   (the structure is compiled in every pass, like any other)
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    mov eax, [tk]
+    mov rsi, rsp
+    push rax
+    call lex_restore
+    pop rax
+    add rsp, 128
+    cmp eax, K_STRUCT
+    je .tdagg
+    cmp eax, K_CLASS
+    je .tdagg
+    cmp eax, K_UNION
+    je .tdagg
     cmp dword [pass], 1
     jne .tdskip
     call parse_typedef
@@ -1595,6 +1657,10 @@ parse_items:
     jmp .loop
 .tdskip:
     call skip_to_semi
+    jmp .loop
+.tdagg:
+    mov edi, ebx
+    call parse_typedef_aggregate
     jmp .loop
 .const:
     cmp dword [pass], 1
@@ -1793,5 +1859,114 @@ skip_static_if:
     jne .out
     call skip_static_if
 .out:
+    pop rbx
+    ret
+
+; typedef struct [Tag] { ... } Name;      (current token: typedef)
+; The structure is called Tag, or Name when there is no tag; Name is a type name for it.
+parse_typedef_aggregate:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r15d, edi
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token                     ; struct
+    call next_token
+    xor r12d, r12d                      ; tag
+    xor r13d, r13d
+    cmp qword [tk], T_ID
+    jne .notag
+    mov r12, [tk_ptr]
+    mov r13d, [tk_len]
+    call next_token
+.notag:
+    cmp qword [tk], '{'
+    je .scan
+    mov rsi, rsp                        ; typedef struct Tag Name;  a plain alias of an existing type
+    call lex_restore
+    add rsp, 128
+    cmp dword [pass], 1
+    jne .skip
+    call parse_typedef
+    jmp .out
+.skip:
+    call skip_to_semi
+    jmp .out
+.scan:
+    xor ebx, ebx
+.sl:cmp qword [tk], T_EOF
+    jne .s1
+    ERR "unexpected end of file in a typedef"
+.s1:cmp qword [tk], '{'
+    jne .s2
+    inc ebx
+.s2:cmp qword [tk], '}'
+    jne .s3
+    dec ebx
+    jz .sdone
+.s3:call next_token
+    jmp .sl
+.sdone:
+    call next_token
+    cmp qword [tk], T_ID
+    je .alias
+    ERR "expected a name for the new type"
+.alias:
+    mov r14, [tk_ptr]
+    mov ebx, [tk_len]
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    call next_token                     ; from typedef to the keyword struct / class / union
+    test r13d, r13d
+    jnz .tagged
+    mov [agg_anon_ptr], r14
+    mov [agg_anon_len], ebx
+.tagged:
+    mov edi, r15d
+    call parse_aggregate                ; leaves the alias name as the current token
+    cmp qword [tk], T_ID
+    jne .fin
+    test r13d, r13d
+    jz .noalias
+    cmp dword [pass], 1
+    jne .noalias
+    ; typedef struct Tag { ... } Alias;  - Alias is another name for the type Tag (not needed when they are the same)
+    cmp r13d, ebx
+    jne .mk
+    mov rdi, r12
+    mov rsi, [tk_ptr]
+    mov ecx, ebx
+    repe cmpsb
+    je .noalias
+.mk:
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, [cur_module]
+    call sym_find_global
+    mov r12, rax
+    mov rdi, [tk_ptr]
+    mov esi, [tk_len]
+    mov edx, S_TYPEDEF
+    call sym_new
+    mov rcx, [r12+SYM_VAL]
+    shl rcx, 16
+    or rcx, TY_STRUCT
+    mov [rax+SYM_TYPE], rcx
+.noalias:
+    call next_token                     ; the alias name
+.fin:
+    cmp qword [tk], ';'
+    jne .out
+    call next_token
+.out:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
     pop rbx
     ret

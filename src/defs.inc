@@ -108,6 +108,8 @@
 %define K_AIMPORT       196     ; a_import('file.am');
 %define K_ASM           197
 %define K_GOTO          200
+%define K_EXTERN        202
+%define K_INTMOD        201     ; short long signed unsigned (all the same 64-bit int, see LANGUAGE.md)
 %define K_DEFER         199     ; defer expression;
 %define K_DOUBLE        198     ; double, float     ; asm(a, b, c) { x64: ...; arm64: ...; }
 

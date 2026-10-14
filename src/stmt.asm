@@ -118,6 +118,8 @@ parse_stmt:
     je parse_for
     cmp eax, K_RETURN
     je parse_return
+    cmp eax, K_EXTERN
+    je skip_to_semi
     cmp eax, K_DEFER
     je parse_defer
     cmp eax, K_GOTO
@@ -591,6 +593,7 @@ parse_local_decl:
     bts rbx, TF_ARRAY_BIT
     jmp .size
 .scalar:
+    mov qword [init_count], 0
     mov rdi, rbx
     call type_size
 .size:
@@ -602,6 +605,8 @@ parse_local_decl:
     mov esi, r14d
     mov edx, S_LOCAL
     call sym_new
+    mov rcx, [init_count]
+    mov [rax+SYM_EXTRA], rcx
     mov [rax+SYM_TYPE], rbx
     mov r14d, [frame_size]
     neg r14
@@ -775,6 +780,14 @@ parse_typedef:
     push r12
     push r13
     call next_token
+    cmp qword [tk], K_ENUM
+    jne .plain
+    call parse_typedef_enum
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.plain:
     call parse_type
     mov rbx, rax
     cmp qword [tk], T_ID
@@ -1332,4 +1345,73 @@ lbl_check:
     je .l
     ERR "goto to a label that is not defined in this function"
 .ok:
+    ret
+
+; typedef enum [Tag] { A, B = 5, C } Name;      the enum type is int, the members are global constants
+parse_typedef_enum:
+    push rbx
+    push r12
+    push r13
+    cmp qword [cur_func], 0
+    jne .go
+    cmp dword [pass], 1
+    je .go
+    call skip_to_semi
+    jmp .out
+.go:
+    call next_token
+    cmp qword [tk], T_ID
+    jne .body
+    call next_token                     ; the tag is not needed, the typedef name is the type
+.body:
+    mov edi, '{'
+    call expect
+    xor r13d, r13d
+.m:
+    cmp qword [tk], '}'
+    je .end
+    cmp qword [tk], T_ID
+    je .m1
+    ERR "expected an enum member name"
+.m1:
+    mov rdi, [tk_ptr]
+    mov esi, [tk_len]
+    mov edx, S_CONST
+    call sym_new
+    mov rbx, rax
+    call next_token
+    cmp qword [tk], '='
+    jne .m2
+    call next_token
+    call const_expr
+    mov r13, rax
+.m2:
+    mov [rbx+SYM_VAL], r13
+    mov qword [rbx+SYM_TYPE], TY_INT
+    or dword [rbx+SYM_FLAGS], F_ENUMVAL
+    mov dword [rbx+SYM_OWNER], -1
+    inc r13
+    cmp qword [tk], ','
+    jne .end
+    call next_token
+    jmp .m
+.end:
+    mov edi, '}'
+    call expect
+    cmp qword [tk], T_ID
+    je .name
+    ERR "expected a name for the new type"
+.name:
+    mov rdi, [tk_ptr]
+    mov esi, [tk_len]
+    mov edx, S_TYPEDEF
+    call sym_new
+    mov qword [rax+SYM_TYPE], TY_INT
+    call next_token
+    mov edi, ';'
+    call expect
+.out:
+    pop r13
+    pop r12
+    pop rbx
     ret

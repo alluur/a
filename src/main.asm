@@ -2062,6 +2062,12 @@ lf_ex:          resd 1
 init_count:     resq 1
 init_mode:      resd 1
 defer_n:        resd 1
+agg_anon_ptr:   resq 1
+agg_anon_len:   resd 1
+agg_anon_nt:    resd 1
+fp_pending:     resd 1
+fp_after:       resb 128
+call_ctr:       resd 1
 lbl_n:          resd 1
 lbl_tmp:        resq 1
 lbl_tlen:       resd 1

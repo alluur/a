@@ -7,7 +7,7 @@ syn keyword aConditional if else switch case default
 syn keyword aRepeat      while do for
 syn keyword aStatement   break continue return
 syn keyword aStructure   struct class enum
-syn keyword aStorage     const static typedef union asm double float defer goto
+syn keyword aStorage     const static typedef union asm double float defer goto extern
 syn keyword aAccess      public private protected virtual super
 syn keyword aModule      module import a_module a_import
 syn keyword aType        int long char byte bool void func
