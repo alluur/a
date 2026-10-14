@@ -1,0 +1,163 @@
+// actl - control a display server that was started with -control (screenshots and input injection).
+//
+//   actl [-d N|host:port] shot FILE.ppm      save a screenshot
+//   actl [-d ...] move X Y                   move the pointer
+//   actl [-d ...] click X Y                  move there and click the left button
+//   actl [-d ...] down B  /  up B            press / release a button (1 left, 2 middle, 3 right)
+//   actl [-d ...] type TEXT                  type text
+//   actl [-d ...] key NAME                   enter, tab, escape, backspace, delete, left, right, up, down, home, end
+import net;
+import adp;
+import gfx;
+
+int fd;
+adp.Bytes* msg;
+
+void sendMsg() {
+    msg->finish();
+    net.send(fd, msg->data, msg->len);
+}
+
+// waits for a message with this opcode; returns its payload (a new buffer) and its length in *len
+char* waitFor(int op, int* len) {
+    adp.Bytes* in = new adp.Bytes();
+    for (int i = 0; i < 100; i++) {
+        if (!net.waitReadable(fd, 100)) {
+            continue;
+        }
+        in->reserve(65536);
+        int n = net.recv(fd, &in->data[in->len], 65536);
+        if (n <= 0) {
+            return null;
+        }
+        in->len = in->len + n;
+        for (;;) {
+            int size = adp.messageSize(in);
+            if (size <= 0) {
+                break;
+            }
+            if (adp.get32(in->data, 4) == op) {
+                char* p = malloc(size);
+                memcpy(p, &in->data[8], size - 8);
+                *len = size - 8;
+                return p;
+            }
+            in->consume(size);
+        }
+    }
+    return null;
+}
+
+void inject(int kind, int x, int y, int button, int key, int uni) {
+    msg->begin(16);
+    msg->add32(kind);
+    msg->add32(x);
+    msg->add32(y);
+    msg->add32(button);
+    msg->add32(key);
+    msg->add32(uni);
+    sendMsg();
+}
+
+int keyCode(char* name) {
+    if (streq(name, "enter")) { return adp.KEY_ENTER; }
+    if (streq(name, "tab")) { return adp.KEY_TAB; }
+    if (streq(name, "escape")) { return adp.KEY_ESCAPE; }
+    if (streq(name, "backspace")) { return adp.KEY_BACKSPACE; }
+    if (streq(name, "delete")) { return adp.KEY_DELETE; }
+    if (streq(name, "left")) { return adp.KEY_LEFT; }
+    if (streq(name, "right")) { return adp.KEY_RIGHT; }
+    if (streq(name, "up")) { return adp.KEY_UP; }
+    if (streq(name, "down")) { return adp.KEY_DOWN; }
+    if (streq(name, "home")) { return adp.KEY_HOME; }
+    if (streq(name, "end")) { return adp.KEY_END; }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    int at = 1;
+    char* spec = "0";
+    if (argc > 2 && streq(argv[1], "-d")) {
+        spec = argv[2];
+        at = 3;
+    }
+    if (at >= argc) {
+        println("usage: actl [-d N|host:port] shot FILE | move X Y | click X Y | down B | up B | type TEXT | key NAME");
+        return 1;
+    }
+    char* cmd = argv[at];
+    net.init();
+    fd = net.connect(adp.hostOf(spec), adp.portOf(spec));
+    if (fd < 0) {
+        println("cannot connect to the display server");
+        return 1;
+    }
+    msg = new adp.Bytes();
+    msg->begin(adp.Q_HELLO);
+    msg->add32(adp.VERSION);
+    msg->addText("actl");
+    sendMsg();
+    int len = 0;
+    if (waitFor(adp.E_WELCOME, &len) == null) {
+        println("no answer from the display server");
+        return 1;
+    }
+    if (streq(cmd, "shot") && at + 1 < argc) {
+        msg->begin(15);
+        sendMsg();
+        char* p = waitFor(112, &len);
+        if (p == null) {
+            println("the display server does not allow screenshots (start it with -control)");
+            return 1;
+        }
+        int w = adp.get32(p, 0);
+        int h = adp.get32(p, 4);
+        gfx.Surface* s = new gfx.Surface(w, h);
+        s->unpack(0, 0, w, h, &p[8]);
+        if (!s->savePPM(argv[at + 1])) {
+            println("cannot write the file");
+            return 1;
+        }
+        printf("%dx%d saved to %s\n", w, h, argv[at + 1]);
+    } else if (streq(cmd, "move") && at + 2 < argc) {
+        inject(1, atoi(argv[at + 1]), atoi(argv[at + 2]), 0, 0, 0);
+    } else if (streq(cmd, "click") && at + 2 < argc) {
+        inject(1, atoi(argv[at + 1]), atoi(argv[at + 2]), 0, 0, 0);
+        inject(2, 0, 0, 1, 0, 0);
+        inject(3, 0, 0, 1, 0, 0);
+    } else if (streq(cmd, "down") && at + 1 < argc) {
+        inject(2, 0, 0, atoi(argv[at + 1]), 0, 0);
+    } else if (streq(cmd, "up") && at + 1 < argc) {
+        inject(3, 0, 0, atoi(argv[at + 1]), 0, 0);
+    } else if (streq(cmd, "type") && at + 1 < argc) {
+        char* t = argv[at + 1];
+        for (int i = 0; t[i] != 0; i++) {
+            int c = t[i];
+            int key = c;
+            if (c >= 'A' && c <= 'Z') {
+                key = c + 32;
+                inject(5, 0, 0, 0, adp.KEY_SHIFT, 0);
+            }
+            inject(5, 0, 0, 0, key, c);
+            inject(6, 0, 0, 0, key, 0);
+            if (c >= 'A' && c <= 'Z') {
+                inject(6, 0, 0, 0, adp.KEY_SHIFT, 0);
+            }
+        }
+    } else if (streq(cmd, "key") && at + 1 < argc) {
+        int k = keyCode(argv[at + 1]);
+        if (k == 0) {
+            println("unknown key name");
+            return 1;
+        }
+        inject(5, 0, 0, 0, k, 0);
+        inject(6, 0, 0, 0, k, 0);
+    } else {
+        println("unknown command");
+        return 1;
+    }
+    // give the server time to process what was sent before the connection closes
+    net.waitReadable(fd, 150);
+    net.close(fd);
+    return 0;
+}

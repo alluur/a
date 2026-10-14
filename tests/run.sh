@@ -45,8 +45,10 @@ for src in tests/${1:-t}*.a; do
     if [ "$got_exit" != "$want_exit" ]; then
         echo "FAIL  $name (exit code $got_exit, expected $want_exit)"; fail=$((fail+1)); continue
     fi
-    if [ -f tests/$name.out ] && ! diff -q tests/$name.out build/tests/$name.got >/dev/null; then
-        echo "FAIL  $name (output differs)"; diff tests/$name.out build/tests/$name.got | head -5; fail=$((fail+1)); continue
+    want_out=tests/$name.out
+    [ -f tests/$name.out.$TARGET ] && want_out=tests/$name.out.$TARGET     # a different result on this target
+    if [ -f $want_out ] && ! diff -q $want_out build/tests/$name.got >/dev/null; then
+        echo "FAIL  $name (output differs)"; diff $want_out build/tests/$name.got | head -5; fail=$((fail+1)); continue
     fi
     pass=$((pass+1))
 done

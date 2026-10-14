@@ -32,6 +32,7 @@ build/ac: $(SRC)
 test: build/ac
 	tests/run.sh
 	tests/link.sh
+	tests/gui.sh
 
 test-all: build/ac
 	@for t in linux windows linux-arm64 android android-x64 linux-riscv64 android-riscv64 linux-loongarch64; do \
@@ -40,7 +41,7 @@ test-all: build/ac
 examples: build/ac
 	@mkdir -p build/examples
 	@for t in linux windows linux-arm64 android android-x64 linux-riscv64 android-riscv64 linux-loongarch64; do \
-	    for f in examples/*.a; do \
+	    for f in examples/*.a examples/gui/*.a; do \
 	        ./build/ac -t $$t $$f -v $(VERSION_CODE) -r $(RELEASE) -o build/examples/$$(basename $$f .a)-$$t.out || exit 1; \
 	    done; echo "examples compiled for $$t"; done
 

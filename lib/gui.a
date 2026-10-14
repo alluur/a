@@ -49,6 +49,13 @@ class Window;
 class Widget;
 class Display;
 
+// moves count bytes up in a buffer (the ranges may overlap, so the copy runs backwards)
+private void moveUp(char* b, int from, int to, int count) {
+    for (int i = count - 1; i >= 0; i--) {
+        b[to + i] = b[from + i];
+    }
+}
+
 // =============================================================================
 //  widgets
 // =============================================================================
@@ -592,7 +599,7 @@ public class TextBox : Widget {
         deleteSelection();
         int n = strlen(t);
         grow(n);
-        memcpy(&buf[cur + n], &buf[cur], len - cur + 1);
+        moveUp(buf, cur, cur + n, len - cur + 1);
         memcpy(&buf[cur], t, n);
         len = len + n;
         cur = cur + n;
@@ -1140,6 +1147,346 @@ public class Spacer : Widget {
     public virtual int prefH() { return h; }
 }
 
+// ---- TextArea: a multi-line text editor ---------------------------------------------------------------------------------------
+public class TextArea : Widget {
+    public func onChange;
+    public bool readOnly;
+    private char* buf;
+    private int cap;
+    private int len;
+    private int cur;
+    private int top;                // first visible line
+    private int left;               // pixels the text is shifted left
+    private int wantCol;            // the column that Up / Down try to keep
+    private bool caretOn;
+
+    public TextArea() {
+        super();
+        focusable = true;
+        cap = 1024;
+        buf = malloc(cap);
+        buf[0] = 0;
+        w = 240;
+        h = 120;
+        flex = 1;
+    }
+
+    public virtual int prefW() { return 240; }
+    public virtual int prefH() { return 120; }
+    public char* text() { return buf; }
+
+    public void setText(char* t) {
+        len = 0;
+        buf[0] = 0;
+        cur = 0;
+        top = 0;
+        left = 0;
+        insert(t, strlen(t));
+        cur = 0;
+        invalidate();
+    }
+
+    private void insert(char* t, int n) {
+        if (len + n + 8 > cap) {
+            while (len + n + 8 > cap) {
+                cap = cap * 2;
+            }
+            buf = realloc(buf, cap);
+        }
+        moveUp(buf, cur, cur + n, len - cur + 1);
+        memcpy(&buf[cur], t, n);
+        len = len + n;
+        cur = cur + n;
+    }
+
+    private int lineHeight() { return gfx.mono()->height + 2; }
+    private int visibleLines() { return (h - 8) / lineHeight(); }
+
+    private int lineStart(int pos) {
+        while (pos > 0 && buf[pos - 1] != 10) { pos--; }
+        return pos;
+    }
+
+    private int lineEnd(int pos) {
+        while (pos < len && buf[pos] != 10) { pos++; }
+        return pos;
+    }
+
+    private int lineOf(int pos) {
+        int n = 0;
+        for (int i = 0; i < pos; i++) {
+            if (buf[i] == 10) { n++; }
+        }
+        return n;
+    }
+
+    public int lineCount() {
+        return lineOf(len) + 1;
+    }
+
+    // the byte position of the start of line n (clamped)
+    private int startOfLine(int n) {
+        int pos = 0;
+        while (n > 0) {
+            int e = lineEnd(pos);
+            if (e >= len) { break; }
+            pos = e + 1;
+            n--;
+        }
+        return pos;
+    }
+
+    private int widthOf(int from, int to) {
+        char save = buf[to];
+        buf[to] = 0;
+        int tw = gfx.textWidth(gfx.mono(), &buf[from]);
+        buf[to] = save;
+        return tw;
+    }
+
+    private void changed() {
+        invalidate();
+        if (onChange != null) {
+            onChange(this);
+        }
+    }
+
+    private void keepCaretVisible() {
+        int line = lineOf(cur);
+        int rows = visibleLines();
+        if (line < top) { top = line; }
+        if (line >= top + rows) { top = line - rows + 1; }
+        int cx = widthOf(lineStart(cur), cur);
+        int room = w - 24;
+        if (cx - left > room) { left = cx - room; }
+        if (cx - left < 0) { left = cx; }
+        if (left < 0) { left = 0; }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        bool focused = (win != null && win->focusWidget == this);
+        s->fill(ox, oy, w, h, enabled ? cField : cBack);
+        gfx.Font* f = gfx.mono();
+        int lh = lineHeight();
+        int rows = visibleLines();
+        int pos = startOfLine(top);
+        for (int i = 0; i <= rows && pos <= len; i++) {
+            int e = lineEnd(pos);
+            char save = buf[e];
+            buf[e] = 0;
+            s->text(f, ox + 6 - left, oy + 4 + i * lh, &buf[pos], cText);
+            buf[e] = save;
+            if (focused && caretOn && cur >= pos && cur <= e) {
+                int cx = ox + 6 - left + widthOf(pos, cur);
+                s->fill(cx, oy + 4 + i * lh, 1, lh - 1, cText);
+            }
+            if (e >= len) { break; }
+            pos = e + 1;
+        }
+        int total = lineCount();
+        if (total > rows && rows > 0) {
+            int trackH = h - 4;
+            int thumbH = trackH * rows / total;
+            if (thumbH < 12) { thumbH = 12; }
+            int thumbY = (trackH - thumbH) * top / (total - rows);
+            s->fillRoundRect(ox + w - 8, oy + 2 + thumbY, 6, thumbH, 3, cBorder);
+        }
+        s->rect(ox, oy, w, h, focused ? cAccent : cBorder);
+    }
+
+    private int posAtPoint(int mx, int my) {
+        int line = top + (my - 4) / lineHeight();
+        if (line < 0) { line = 0; }
+        int ls = startOfLine(line);
+        int le = lineEnd(ls);
+        int best = ls;
+        int p = ls;
+        while (p <= le) {
+            if (widthOf(ls, p) - left > mx - 6) { break; }
+            best = p;
+            if (p == le) { break; }
+            p++;
+            while (p < le && (buf[p] & 0xC0) == 0x80) { p++; }
+        }
+        return best;
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (kind == adp.M_DOWN && button == 1) {
+            cur = posAtPoint(mx, my);
+            wantCol = cur - lineStart(cur);
+            caretOn = true;
+            invalidate();
+        } else if (kind == adp.M_SCROLL) {
+            top = top - button * 3;
+            int maxTop = lineCount() - visibleLines();
+            if (top > maxTop) { top = maxTop; }
+            if (top < 0) { top = 0; }
+            invalidate();
+        }
+        return true;
+    }
+
+    public virtual void onFocus(bool gained) {
+        caretOn = gained;
+        if (gained && win != null) {
+            win->display->after(500, blinkArea, (int) this);
+        }
+        invalidate();
+    }
+
+    public void toggleCaret() {
+        if (win != null && win->focusWidget == this) {
+            caretOn = !caretOn;
+            invalidate();
+            win->display->after(500, blinkArea, (int) this);
+        }
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn == 0 || !enabled) {
+            return false;
+        }
+        caretOn = true;
+        if ((mods & adp.MOD_CTRL) != 0) {
+            if (key == 'v' && !readOnly) {
+                win->display->requestPasteArea(this);
+                return true;
+            }
+            return false;
+        }
+        int ls = lineStart(cur);
+        if (key == adp.KEY_LEFT) {
+            if (cur > 0) {
+                cur--;
+                while (cur > 0 && (buf[cur] & 0xC0) == 0x80) { cur--; }
+            }
+            wantCol = cur - lineStart(cur);
+        } else if (key == adp.KEY_RIGHT) {
+            if (cur < len) {
+                cur++;
+                while (cur < len && (buf[cur] & 0xC0) == 0x80) { cur++; }
+            }
+            wantCol = cur - lineStart(cur);
+        } else if (key == adp.KEY_UP || key == adp.KEY_DOWN || key == adp.KEY_PGUP || key == adp.KEY_PGDN) {
+            int line = lineOf(cur);
+            int delta = 1;
+            if (key == adp.KEY_PGUP || key == adp.KEY_PGDN) { delta = visibleLines() - 1; }
+            if (key == adp.KEY_UP || key == adp.KEY_PGUP) { delta = -delta; }
+            int target = line + delta;
+            if (target < 0) { target = 0; }
+            if (target > lineCount() - 1) { target = lineCount() - 1; }
+            int ns = startOfLine(target);
+            int ne = lineEnd(ns);
+            cur = ns + wantCol;
+            if (cur > ne) { cur = ne; }
+        } else if (key == adp.KEY_HOME) {
+            cur = ls;
+            wantCol = 0;
+        } else if (key == adp.KEY_END) {
+            cur = lineEnd(cur);
+            wantCol = cur - ls;
+        } else if (readOnly) {
+            return false;
+        } else if (key == adp.KEY_BACKSPACE) {
+            if (cur > 0) {
+                int p = cur - 1;
+                while (p > 0 && (buf[p] & 0xC0) == 0x80) { p--; }
+                memcpy(&buf[p], &buf[cur], len - cur + 1);
+                len = len - (cur - p);
+                cur = p;
+                changed();
+            }
+            wantCol = cur - lineStart(cur);
+        } else if (key == adp.KEY_DELETE) {
+            if (cur < len) {
+                int p = cur + 1;
+                while (p < len && (buf[p] & 0xC0) == 0x80) { p++; }
+                memcpy(&buf[cur], &buf[p], len - p + 1);
+                len = len - (p - cur);
+                changed();
+            }
+        } else if (key == adp.KEY_ENTER) {
+            insert("\n", 1);
+            wantCol = 0;
+            changed();
+        } else if (uni >= 32 && uni != 127 && uni < 2048) {
+            char tmp[4];
+            int n = 1;
+            if (uni < 128) {
+                tmp[0] = uni;
+            } else {
+                tmp[0] = 0xC0 | (uni >> 6);
+                tmp[1] = 0x80 | (uni & 63);
+                n = 2;
+            }
+            insert(&tmp[0], n);
+            wantCol = cur - lineStart(cur);
+            changed();
+        } else {
+            return false;
+        }
+        keepCaretVisible();
+        invalidate();
+        return true;
+    }
+
+    // text that arrives from the clipboard
+    public void paste(char* t) {
+        if (!readOnly) {
+            insert(t, strlen(t));
+            changed();
+            keepCaretVisible();
+        }
+    }
+}
+
+int blinkArea(int self) {
+    TextArea* t = (TextArea*) self;
+    t->toggleCaret();
+    return 0;
+}
+
+// ---- Canvas: a picture that the program draws into ---------------------------------------------------------------------------------
+public class Canvas : Widget {
+    public gfx.Surface* surf;
+    public func onMouseEvent;       // int f(int canvas): see lastKind, lastButton, lastX, lastY
+    public int lastKind;
+    public int lastButton;
+    public int lastX;
+    public int lastY;
+    public int mods;
+
+    public Canvas(int width, int height) {
+        super();
+        surf = new gfx.Surface(width, height);
+        surf->clear(0xFFFFFFFF);
+        w = width;
+        h = height;
+        flex = 1;
+    }
+
+    public virtual int prefW() { return surf->w; }
+    public virtual int prefH() { return surf->h; }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        s->blit(surf, 0, 0, surf->w, surf->h, ox, oy);
+        s->rect(ox, oy, w, h, cBorder);
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int m) {
+        lastKind = kind;
+        lastButton = button;
+        lastX = mx;
+        lastY = my;
+        mods = m;
+        if (onMouseEvent != null) {
+            onMouseEvent(this);
+        }
+        return true;
+    }
+}
+
 // =============================================================================
 //  windows
 // =============================================================================
@@ -1164,6 +1511,7 @@ public class Window {
     public int lastMouseKind;
     public int lastMouseButton;
     public bool needLayout;
+    public bool noClear;            // do not paint the background colour first (for windows that draw everything themselves)
     public bool closed;
     public bool focused;
     private Widget* hoverWidget;
@@ -1285,7 +1633,9 @@ public class Window {
         }
         dirty = false;
         surf->setClip(dx0, dy0, dx1 - dx0, dy1 - dy0);
-        surf->fill(0, 0, w, h, cBack);
+        if (!noClear) {
+            surf->fill(0, 0, w, h, cBack);
+        }
         if (root != null) {
             root->paintTree(surf, 0, 0);
         }
@@ -1441,6 +1791,7 @@ public class Display {
     private int* timerId;
     private int nextTimer;
     private TextBox* pasteTarget;
+    private TextArea* pasteArea;
     private bool welcomed;
 
     public Display(int handle) {
@@ -1534,6 +1885,12 @@ public class Display {
 
     public void requestPaste(TextBox* t) {
         pasteTarget = t;
+        msg->begin(adp.Q_CLIPGET);
+        queue();
+    }
+
+    public void requestPasteArea(TextArea* t) {
+        pasteArea = t;
         msg->begin(adp.Q_CLIPGET);
         queue();
     }
@@ -1664,6 +2021,11 @@ public class Display {
                 TextBox* tb = pasteTarget;
                 pasteTarget = null;
                 tb->paste(t);
+            }
+            if (pasteArea != null) {
+                TextArea* ta = pasteArea;
+                pasteArea = null;
+                ta->paste(t);
             }
             return;
         }
