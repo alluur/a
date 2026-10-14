@@ -47,6 +47,7 @@ kw_table:
     KW "asm",      K_ASM
     KW "double",   K_DOUBLE
     KW "float",    K_DOUBLE
+    KW "defer",    K_DEFER
     db 0
 
 ops3:

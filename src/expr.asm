@@ -1807,6 +1807,8 @@ emit_incdec_postfix:
     jnc .noarr
     ERR "cannot modify an array"
 .noarr:
+    cmp rbx, TY_DOUBLE
+    je .dbl
     mov rdi, rbx
     call type_ls
     test eax, eax
@@ -1873,6 +1875,40 @@ emit_incdec_postfix:
     pop r12
     pop rbx
     ret
+; a double: x +/- 1.0 through the float runtime; the stack holds [address, old value, new value] while storing
+.dbl:
+    CG push_a                           ; address
+    mov rdi, rbx
+    call emit_load_type
+    CG push_a                           ; old value (the result of a postfix operation)
+    CG push_a                           ; left operand
+    mov rdi, 0x3FF0000000000000
+    call gen_imm_a
+    mov edi, '+'
+    test r13, r13
+    jg .dop
+    mov edi, '-'
+.dop:
+    mov esi, TY_DOUBLE
+    mov edx, TY_DOUBLE
+    call float_binop
+    CG push_a                           ; new value
+    mov edi, 2
+    CG load_stack_a
+    CG mov_b_a
+    CG pop_a
+    mov rdi, rbx
+    call emit_store_type
+    test r12d, r12d
+    jz .dpre
+    CG pop_a                            ; old value
+    mov edi, 1
+    CG drop
+    jmp .fin
+.dpre:
+    mov edi, 2
+    CG drop
+    jmp .fin
 
 ; discard_result: called after an expression statement. If the whole statement was a
 ; postfix ++ / -- of a local variable, the old value is not needed: regenerate it as

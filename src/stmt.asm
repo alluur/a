@@ -30,7 +30,11 @@ loop_pop:
 ; ---- blocks -----------------------------------------------------------------------
 parse_block:
     push rbx
+    push r12
     mov ebx, [sym_count]
+    mov r12d, [fn_body_flag]
+    mov dword [fn_body_flag], 0
+    inc dword [blk_nest]
     mov edi, '{'
     call expect
 .l:
@@ -43,10 +47,60 @@ parse_block:
     call parse_stmt
     jmp .l
 .e:
+    test r12d, r12d
+    jz .e1
+    cmp dword [defer_n], 0
+    je .e1
+    call emit_defers                    ; falling off the end of the function body
+.e1:
     mov edi, '}'
     call expect
+    dec dword [blk_nest]
     mov [sym_count], ebx
+    pop r12
     pop rbx
+    ret
+
+; defer expression;   runs when the function returns (last deferred, first run). Only directly in a function body.
+parse_defer:
+    cmp dword [blk_nest], 1
+    je .ok
+    ERR "defer is only allowed directly in a function body"
+.ok:
+    mov eax, [defer_n]
+    cmp eax, 16
+    jb .room
+    ERR "too many defer statements in one function (16)"
+.room:
+    call next_token
+    mov eax, [defer_n]
+    shl eax, 7
+    lea rdi, [defer_buf + rax]
+    call lex_save
+    inc dword [defer_n]
+    jmp skip_to_semi
+
+; emit_defers: compiles the deferred expressions again, last one first (the value in A is the caller's business)
+emit_defers:
+    push rbx
+    mov ebx, [defer_n]
+.l: test ebx, ebx
+    jz .d
+    dec ebx
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    mov eax, ebx
+    shl eax, 7
+    lea rsi, [defer_buf + rax]
+    call lex_restore
+    call parse_expr
+    call discard_result
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    jmp .l
+.d: pop rbx
     ret
 
 parse_stmt:
@@ -64,6 +118,8 @@ parse_stmt:
     je parse_for
     cmp eax, K_RETURN
     je parse_return
+    cmp eax, K_DEFER
+    je parse_defer
     cmp eax, K_BREAK
     je parse_break
     cmp eax, K_CONTINUE
@@ -288,6 +344,12 @@ parse_return:
 .j:
     mov edi, ';'
     call expect
+    cmp dword [defer_n], 0
+    je .nodefer
+    CG push_a
+    call emit_defers
+    CG pop_a
+.nodefer:
     mov rdi, ret_chain
     CG jmp_chain
     ret

@@ -323,7 +323,7 @@ for bit identical on every target. Helpers: `printDouble`, `printlnDouble`, `dou
 log2 log10 log1p hypot sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh floor ceil round trunc fabs fmod fmin
 fmax copysign nan` and the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`.
 
-Not available yet: `++`/`--` on doubles.
+`++` and `--` work on doubles too (they add or subtract 1.0).
 
 ### Initializer lists
 
@@ -339,6 +339,20 @@ a trailing comma is allowed, lists nest, and a `char` array can be filled from a
 
 Too many values (`int a[2] = {1, 2, 3};`) or a string longer than the array is a compile error. Global and `static` lists
 must be made of constants; local lists may use any expression.
+
+### `defer`
+
+`defer expression;` postpones an expression until the function returns, whether through `return` or by reaching the closing
+brace. Deferred expressions run last-in first-out, after the return value has been computed, and can use every local that was
+declared before the `defer`. It is meant for cleanup:
+
+    int work(int fd) {
+        defer close(fd);
+        if (bad()) { return -1; }     // close(fd) still runs
+        return process(fd);
+    }
+
+`defer` is only allowed directly in a function body (not inside `if`, loops or other blocks), at most 16 per function.
 
 ### Inline assembly
 

@@ -107,6 +107,7 @@
 %define K_AMODULE       195     ; a_module NAME { ... }
 %define K_AIMPORT       196     ; a_import('file.am');
 %define K_ASM           197
+%define K_DEFER         199     ; defer expression;
 %define K_DOUBLE        198     ; double, float     ; asm(a, b, c) { x64: ...; arm64: ...; }
 
 ; ---- symbol kinds ------------------------------------------------------------

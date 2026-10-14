@@ -285,6 +285,8 @@ compile_function:
     CG prologue
     mov dword [frame_size], 0
     mov qword [ret_chain], 0
+    mov dword [defer_n], 0
+    mov dword [blk_nest], 0
     mov dword [loop_sp], 0
     ; total number of stack slots = params (+ this)
     mov ebx, [r12+SYM_NPAR]
@@ -382,6 +384,7 @@ compile_function:
     inc ecx
     jmp .pl
 .pd:
+    mov dword [fn_body_flag], 1
     call parse_block
     xor edi, edi
     CG imm_a
