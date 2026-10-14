@@ -1,0 +1,229 @@
+// =============================================================================
+//  glock - a screen locker for the display server                                                  import glock;
+//
+//    glock.Locker* l = new glock.Locker(display, "aleksi", checkPassword);   // int checkPassword(int password) { ... }
+//    l->run();                          // returns when the right password was entered
+//
+//  The locker opens a window with the flag adp.F_LOCK. The display server then draws only that window, sends all mouse and
+//  keyboard input to it, and ignores Alt+Tab and Alt+F4 until the window is gone. The password check is your function: it gets
+//  the password as a char* (in an int) and returns 1 when it is right. After a wrong password the next try has to wait
+//  (1 s for the first mistake, 2 s for the second, ... at most 30 s).
+// =============================================================================
+import gui;
+import gfx;
+import adp;
+import cstdlib;
+import datetime;
+module glock;
+
+public int cBg1 = 0xFF0E1A33;
+public int cBg2 = 0xFF2A4A7A;
+
+// the page: a gradient, the time in big digits and a card with the password field
+class LockView : gui.Widget {
+    public char* user;
+    public char* timeText;
+    public char* dateText;
+    public gui.Label* name;
+    public gui.TextBox* pass;
+    public gui.Label* msg;
+    public gui.Button* button;
+
+    public LockView() {
+        super();
+        timeText = "";
+        dateText = "";
+    }
+
+    public virtual void layout() {
+        int cw = 320;
+        int chh = 214;
+        int cx = (w - cw) / 2;
+        int cy = h / 2 - 10;
+        name->x = cx;
+        name->y = cy + 62;
+        name->w = cw;
+        name->h = 24;
+        pass->x = cx + 20;
+        pass->y = cy + 96;
+        pass->w = cw - 40;
+        pass->h = 28;
+        msg->x = cx + 20;
+        msg->y = cy + 132;
+        msg->w = cw - 40;
+        msg->h = 22;
+        button->x = cx + cw / 2 - 50;
+        button->y = cy + 162;
+        button->w = 100;
+        button->h = 30;
+    }
+
+    // text at an enlarged size: drawn small on black, then scaled up with bilinear sampling (the blue value is the coverage)
+    private void big(gfx.Surface* s, int cx, int top, char* text, int scale, int color) {
+        gfx.Font* f = gfx.sansBold();
+        int tw = gfx.textWidth(f, text);
+        int th = f->height;
+        if (tw < 1) {
+            return;
+        }
+        gfx.Surface* t = new gfx.Surface(tw + 2, th + 2);
+        t->clear(gfx.BLACK);
+        t->text(f, 1, 1, text, gfx.WHITE);
+        int dw = (tw + 2) * scale;
+        int dh = (th + 2) * scale;
+        int x0 = cx - dw / 2;
+        for (int dy = 0; dy < dh; dy++) {
+            int fy = (dy * 256 + 128) / scale - 128;          // source position in 1/256 pixel
+            int sy = fy >> 8;
+            int wy = fy & 255;
+            for (int dx = 0; dx < dw; dx++) {
+                int fx = (dx * 256 + 128) / scale - 128;
+                int sx = fx >> 8;
+                int wx = fx & 255;
+                int c00 = gfx.blue(t->get(sx, sy));
+                int c10 = gfx.blue(t->get(sx + 1, sy));
+                int c01 = gfx.blue(t->get(sx, sy + 1));
+                int c11 = gfx.blue(t->get(sx + 1, sy + 1));
+                int top2 = c00 * (256 - wx) + c10 * wx;
+                int bot2 = c01 * (256 - wx) + c11 * wx;
+                int cover = (top2 * (256 - wy) + bot2 * wy) >> 16;
+                if (cover > 0) {
+                    s->blend(x0 + dx, top + dy, color, cover);
+                }
+            }
+        }
+        t->release();
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        s->gradientV(ox, oy, w, h, cBg1, cBg2);
+        big(s, ox + w / 2, oy + h / 6, timeText, 5, gfx.WHITE);
+        gfx.Font* f = gfx.sans();
+        int dw = gfx.textWidth(f, dateText);
+        s->text(f, ox + (w - dw) / 2, oy + h / 6 + gfx.sansBold()->height * 5 + 8, dateText, 0xFFD0DCF0);
+        int cw = 320;
+        int chh = 214;
+        int cx = ox + (w - cw) / 2;
+        int cy = oy + h / 2 - 10;
+        s->shadow(cx, cy, cw, chh, 8, 90);
+        s->fillRoundRect(cx, cy, cw, chh, 10, gui.cBack);
+        // the avatar: a circle with the first letter of the name
+        int ax = cx + cw / 2;
+        int ay = cy + 32;
+        s->fillCircle(ax, ay, 24, gui.cAccent);
+        char one[2];
+        one[0] = (user[0] >= 'a' && user[0] <= 'z') ? user[0] - 32 : user[0];
+        one[1] = 0;
+        s->textCentered(gfx.sansBold(), ax - 24, ay - 24, 48, 48, &one[0], gfx.WHITE);
+    }
+}
+
+public class Locker {
+    public gui.Display* display;
+    public gui.Window* win;
+    public char* user;
+    public func verify;
+    public int failures;
+    public bool unlocked;
+    public int waitUntil;               // millis() before which no password is accepted
+    private LockView* view;
+
+    public Locker(gui.Display* d, char* userName, func verifyFn) {
+        display = d;
+        user = strdup(userName);
+        verify = verifyFn;
+        win = d->createWindowAt("locked", 0, 0, d->screenW, d->screenH, adp.F_LOCK | adp.F_NODECOR);
+        win->noClear = true;
+        win->userData = (int) this;
+        view = new LockView();
+        view->user = user;
+        view->name = new gui.Label(user);
+        view->name->align = 1;
+        view->name->font = gfx.sansBold();
+        view->pass = new gui.TextBox();
+        view->pass->password = true;
+        view->pass->placeholder = "Password";
+        view->pass->onEnter = tryUnlock;
+        view->msg = new gui.Label("");
+        view->msg->align = 1;
+        view->msg->color = 0xFFC02020;
+        view->button = new gui.Button("Unlock");
+        view->button->primary = true;
+        view->button->onClick = tryUnlock;
+        view->add(view->name);
+        view->add(view->pass);
+        view->add(view->msg);
+        view->add(view->button);
+        win->setRoot(view);
+        win->defaultButton = view->button;
+        win->setFocus(view->pass);
+        tickClock();
+        display->after(1000, clockTimer, (int) this);
+    }
+
+    public void tickClock() {
+        datetime.DateTime* t = new datetime.DateTime(datetime.now());
+        char* tt = malloc(16);
+        format(tt, 16, "%02d:%02d", t->hour, t->minute);
+        char* dd = malloc(32);
+        format(dd, 32, "%04d-%02d-%02d", t->year, t->month, t->day);
+        if (!streq(tt, view->timeText) || !streq(dd, view->dateText)) {
+            view->timeText = tt;
+            view->dateText = dd;
+            view->invalidate();
+        }
+    }
+
+    // the password in the field was entered
+    public void attempt() {
+        if (unlocked) {
+            return;
+        }
+        int now = millis();
+        if (now - waitUntil < 0) {
+            view->pass->setText("");
+            view->msg->setText("Please wait a moment");
+            return;
+        }
+        char* pw = strdup(view->pass->text());
+        bool ok = false;
+        if (verify != null) {
+            ok = verify(pw) != 0;
+        }
+        if (ok) {
+            unlock();
+            return;
+        }
+        failures++;
+        int delay = failures * 1000;
+        if (delay > 30000) { delay = 30000; }
+        waitUntil = now + delay;
+        view->pass->setText("");
+        view->msg->setText("Wrong password");
+    }
+
+    public void unlock() {
+        unlocked = true;
+        win->close();
+    }
+
+    public void run() {
+        display->run();
+    }
+}
+
+int tryUnlock(int self) {
+    gui.Widget* wd = (gui.Widget*) self;
+    Locker* l = (Locker*) wd->win->userData;
+    l->attempt();
+    return 0;
+}
+
+int clockTimer(int arg) {
+    Locker* l = (Locker*) arg;
+    if (!l->unlocked) {
+        l->tickClock();
+        l->display->after(1000, clockTimer, arg);
+    }
+    return 0;
+}

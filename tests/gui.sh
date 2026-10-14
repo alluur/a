@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 AC=./build/ac
 OUT=build/guitest
 mkdir -p $OUT
-for prog in adisplayd actl hello calc paint notes asession adm vnc_demo; do
+for prog in adisplayd actl hello calc paint notes asession adm vnc_demo alock showcase; do
     if ! $AC examples/gui/$prog.a -o $OUT/$prog 2> $OUT/$prog.err; then
         echo "FAIL  gui/$prog (compile error: $(head -1 $OUT/$prog.err))"; exit 1
     fi

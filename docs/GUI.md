@@ -25,11 +25,13 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `wsrv` | the display server: compositor, window manager, input routing; the `Headless` backend |
 | `wvnc` | a VNC (RFB) backend: view and control the display with any VNC viewer |
 | `wfb` | the Linux framebuffer + evdev (keyboard, mouse, touch) backend |
-| `gui` | the client library and the widgets |
+| `gui` | the client library and the basic widgets, popups, tooltips |
+| `guix` | more widgets: menus, combo box, radio buttons, tabs, scroll view, spin box, splitter; dialogs (confirm, prompt, file, colour) |
+| `glock` | a screen locker (works with the server's `F_LOCK` windows) |
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t114`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t116`, `tests/gui.sh`.
 
 ## Quick start
 
@@ -114,6 +116,83 @@ text widgets use Ctrl+A / C / X / V. `gui.messageBox(d, title, text)` shows a sm
 
 **Your own loop**: instead of `d->run()` call `d->pump(ms)` (handles events for up to `ms`) in a loop.
 
+## More widgets: `guix`
+
+```c
+import gui;
+import guix;
+
+guix.MenuBar* bar = new guix.MenuBar();
+guix.Menu* file = bar->addMenu("&File");                  // & marks the Alt key: Alt+F opens the menu
+file->add("Open...", doOpen)->accel("Ctrl+O");             // int doOpen(int item) { ... return 0; }
+file->add("Save", doSave)->accel("Ctrl+S");
+file->addSeparator();
+file->add("Quit", doQuit)->accel("Ctrl+Q");
+guix.Menu* view = bar->addMenu("&View");
+view->addCheck("Word wrap", true, wrapChanged);            // item->checked changes by itself
+guix.Menu* more = new guix.Menu();
+more->add("Alpha", pickAlpha);
+view->addSub("More", more);                                // a submenu
+col->add(bar);                                             // the bar goes at the top of the window
+```
+
+* **Menus**: a `MenuBar` shows menus from its titles; accelerators (`"Ctrl+S"`, `"Ctrl+Shift+Z"`, `"F5"`, `"Alt+Enter"`,
+  `"Del"`, ...) work anywhere in the window while the bar is in it; `F10` opens the first menu; Alt+letter opens the
+  menu whose title has that letter after an `&`. Arrow keys, Enter and Esc move through open menus, the pointer opens a
+  menu on a click and switches menus when it moves over another title. Items can be disabled (`->disable()`), checkable
+  (`addCheck`), have a submenu (`addSub`) and an `id` (`->setId(n)`, `menu->byId(n)`). A callback is
+  `int f(int item)`; cast the item: `(guix.MenuItem*) item`.
+* **Context menus**: give any widget `onContext = f;` (called on a right click). In `f` show a menu where the pointer is:
+  `menu->popup(widget->win, widget->win->lastMouseX, widget->win->lastMouseY);`. A menu that does not fit moves
+  inside the window.
+* **ComboBox** (`addItem`, `select`, `text()`, `selected`, `onChange`): a drop-down list that opens below (or above)
+  and scrolls when it has more than eight rows. **RadioButton** + **RadioGroup**: create the group, then buttons with
+  `new guix.RadioButton("text", group)`; `group->selectedIndex()`, `group->selectIndex(i)`, `group->onChange`;
+  the arrow keys move inside a group.
+* **TabView**: `addTab("Title", page)` where the page is any widget (usually a `Box`); `select(i)`, `onChange`,
+  `closable = true` gives the tabs close buttons (`onTabClose`, `removeTab(i)`). Left/Right switch tabs.
+* **ScrollView**: `setContent(widget)`; scrollbars appear when the content is larger (the content has its preferred
+  size, or exactly the width of the view with `fitWidth = true`). The mouse wheel scrolls (Shift for sideways), and a
+  widget inside that gets the keyboard focus is scrolled into view. **ScrollBar** can be used on its own.
+* **SpinBox** (`min`, `max`, `step`, `value`, `onChange`): type digits, use Up/Down/PageUp/PageDown, click the arrows
+  or turn the wheel. **Splitter**: `new guix.Splitter(true, 120)` puts two widgets side by side (false: one above the
+  other) with a divider you drag. **Swatch** shows a colour.
+* **Tooltips**: `widget->tooltip = "text";` (a field of every widget) shows the text when the pointer rests on it.
+
+**Dialogs** open a window, and when the user is done they call your function `int f(int result)` and close:
+
+| Function | Result |
+|----------|--------|
+| `guix.confirm(d, title, text, f)` | 1 for Yes, 0 for No or when the window was closed |
+| `guix.prompt(d, title, label, initial, f)` | the text as a `char*` (cast to int), 0 when cancelled |
+| `guix.openFile(d, title, startDir, f)` | the path as a `char*`, 0 when cancelled; folders can be entered, `..` goes up, hidden files can be shown |
+| `guix.saveFile(d, title, startDir, name, f)` | the path; asks before an existing file is replaced |
+| `guix.chooseColor(d, title, 0xFFRRGGBB, f)` | the colour as `0xFFRRGGBB`, 0 when cancelled |
+
+The `...Arg` versions (`confirmArg`, `promptArg`, `openFileArg`, `saveFileArg`) take one more int that your function reads
+from `guix.dialogArg`. `examples/gui/showcase.a` shows every widget and dialog; `examples/gui/notes.a` is an editor with
+menus, accelerators, a context menu and the file dialogs.
+
+**Popups** (`gui.Window`): `w->showPopup(widget)` puts a widget that covers the window above everything; it receives all
+mouse and key events until `w->closePopup()` (Esc also closes it, and then `widget->onDismiss()` is called). Menus and the
+combo box's list are built on this, so you can make your own.
+
+## Locking the screen: `glock` and `alock`
+
+A window with the flag `adp.F_LOCK` covers the screen, stays above everything and gets **all** input; the server does not
+draw the other windows, ignores `Alt+Tab` and `Alt+F4`, and does not let anything else take the focus until the window is
+destroyed. `glock.Locker` is a ready-made locker (clock, user name, password field):
+
+```c
+glock.Locker* l = new glock.Locker(display, "aleksi", checkPassword);   // int checkPassword(int password) -> 1 if right
+l->run();                                                               // returns when it was unlocked
+```
+
+After a wrong password the next try has to wait one second more each time (at most 30 s). `alock [-d display]
+[-u usersfile] [user]` (`examples/gui/alock.a`) is the program: it checks the password against `/etc/shadow` (it must be
+allowed to read it, so run it as root, or give the display manager's users file with `-u`) with the same `$6$` code as the
+display manager. `wsrv.Server.locked()` and `lockWindow()` tell an embedding program whether a lock is showing.
+
 ## The display server: `wsrv`
 
 ```c
@@ -126,9 +205,11 @@ srv->run();                                           // or: while (...) { srv->
 * **Window manager**: title bars with a close button, move by dragging the title, resize with the grip at the bottom right,
   focus follows the click, windows come to the front; `Alt+Tab` switches, `Alt+F4` asks the window to close. The
   window decides (`E_CLOSE`), the server never kills a program.
-* **Layers**: `F_BELOW` windows stay under everything, `F_ABOVE` windows over everything; `F_NODECOR` windows have no frame.
+* **Layers**: `F_BELOW` windows stay under everything, `F_ABOVE` windows over everything; `F_NODECOR` windows have no frame;
+  `F_LOCK` windows are screen lockers (see below).
 * **Input**: pointer events go to the window under the pointer (to the window that was pressed while a button is down),
-  keys go to the focused window. The cursor is drawn by the server (arrow, text beam, hand).
+  keys go to the focused window. The cursor is drawn by the server (arrow, text beam, hand, two resize arrows:
+  `CURSOR_SIZE_H`, `CURSOR_SIZE_V`).
 * **Embedding**: `srv->screen` is the screen surface (take screenshots with `savePPM`), `srv->windowCount()`, `windowAt(i)`,
   `clientCount()`, `disconnectAllExcept(clientNumber)`, `setBackground(top, bottom)`.
   `allowScreenshots` and `allowInject` (default off) let clients take screenshots and inject input (used by `actl` and tests).
@@ -193,7 +274,10 @@ takeconsole = 1
 * **Failed logins** make the next attempt wait 1, 2, 3 ... seconds (at most 8); a wrong user name takes as long as a wrong
   password.
 * **Security notes**: the display port listens on 127.0.0.1 only, and every local user can connect to it; the display is
-  therefore for the programs of one session. VNC has no authentication. There is no screen locker yet.
+  therefore for the programs of one session. VNC has no authentication. The screen locker (`alock`) stops the keyboard
+  and pointer of the display from reaching other windows; it is not protection against a local user who connects to the
+  display port (such a client can create windows, and with `allowInject` send input), so on a shared machine also lock the
+  console or session of the operating system.
 
 ## Limits
 

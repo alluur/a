@@ -113,6 +113,65 @@ try:
     if bytes(c.fb) == vnc_png:
         fail("typing with actl changed nothing")
     print("actl input ok")
+
+    # a second display with the screen locker: a wrong password keeps it locked, the right one removes it
+    env2 = dict(os.environ, ADISPLAY="10")
+    def start2(name, *args):
+        p = subprocess.Popen([os.path.join(bindir, name)] + list(args), env=env2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(p)
+        return p
+    users = os.path.join(bindir, "users.txt")
+    h = subprocess.run(["openssl", "passwd", "-6", "-salt", "abcdefgh", "hunter2"], capture_output=True, text=True).stdout.strip()
+    open(users, "w").write("aleksi:%s:1000:1000:/home/aleksi:/bin/sh\n" % h)
+    start2("adisplayd", "-p", "10", "-vnc", "5910", "-control", "-size", "800x600")
+    c2 = None
+    for _ in range(50):
+        try:
+            c2 = Rfb(port=5910)
+            break
+        except OSError:
+            time.sleep(0.1)
+    if c2 is None:
+        fail("cannot connect to the second VNC server")
+    start2("hello")
+    time.sleep(0.6)
+    c2.grab()
+    card_spot = (260, 300)
+    before = c2.pixel(*card_spot)
+    box2 = c2.find_color((60, 120, 216))
+    if not box2:
+        fail("hello button not found on display 10")
+    lock = start2("alock", "-d", "10", "-u", users, "aleksi")
+    time.sleep(1.0)
+    c2.grab()
+    after = c2.pixel(*card_spot)
+    if after == before or abs(after[0] - 238) > 3:
+        fail("the lock screen card is not there: %s -> %s" % (before, after))
+    print("screen locked")
+    c2.click((box2[0] + box2[2]) // 2, (box2[1] + box2[3]) // 2)
+    time.sleep(0.3)
+    c2.type_text("wrongpw")
+    c2.key(0xff0d, 1)
+    c2.key(0xff0d, 0)
+    time.sleep(0.5)
+    if lock.poll() is not None:
+        fail("the locker quit after a wrong password")
+    print("wrong password rejected")
+    time.sleep(1.2)
+    c2.type_text("hunter2")
+    c2.key(0xff0d, 1)
+    c2.key(0xff0d, 0)
+    for _ in range(40):
+        if lock.poll() is not None:
+            break
+        time.sleep(0.1)
+    if lock.poll() != 0:
+        fail("the locker did not end after the right password (%s)" % lock.poll())
+    time.sleep(0.4)
+    c2.grab()
+    if c2.pixel(*card_spot) != before:
+        fail("the screen is not back after unlocking")
+    print("unlocked")
     print("ok")
 finally:
     for p in procs:

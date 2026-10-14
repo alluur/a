@@ -69,6 +69,8 @@ public class Widget {
     public bool visible;
     public bool enabled;
     public bool focusable;
+    public char* tooltip;           // shown when the pointer rests on the widget (null = none)
+    public func onContext;          // right click:  int f(int widget)  (see win->lastMouseX / lastMouseY)
     public Widget* parent;
     public Window* win;
     public Widget** kids;
@@ -107,7 +109,7 @@ public class Widget {
     }
 
     // tells the widget and its children which window they belong to
-    public void attach(Window* wn) {
+    public virtual void attach(Window* wn) {
         win = wn;
         for (int i = 0; i < nkids; i++) {
             kids[i]->attach(wn);
@@ -132,6 +134,20 @@ public class Widget {
     public virtual void onFocus(bool gained) {
     }
     public virtual void onHover(bool inside) {
+    }
+    // true for widgets that scroll by themselves (the mouse wheel goes to the first one of these under the pointer)
+    public virtual bool wantsScroll() {
+        return false;
+    }
+    // a child of this widget got the focus: scroll it into view (containers that scroll override this)
+    public virtual void reveal(Widget* child) {
+    }
+    // keys that are offered to the widget before the focused widget sees them (see Window.keyPreview)
+    public virtual bool onShortcut(int key, int uni, int mods) {
+        return false;
+    }
+    // the widget was shown as a popup of the window and got closed by the window (Esc or a click elsewhere)
+    public virtual void onDismiss() {
     }
 
     public int absX() {
@@ -988,6 +1004,7 @@ public class ListBox : Widget {
 
     public virtual int prefW() { return 160; }
     public virtual int prefH() { return 120; }
+    public virtual bool wantsScroll() { return true; }
     public int size() { return count; }
 
     public void clear() {
@@ -1171,6 +1188,7 @@ public class TextArea : Widget {
         flex = 1;
     }
 
+    public virtual bool wantsScroll() { return true; }
     public virtual int prefW() { return 240; }
     public virtual int prefH() { return 120; }
     public char* text() { return buf; }
@@ -1490,6 +1508,31 @@ public class Canvas : Widget {
 // =============================================================================
 //  windows
 // =============================================================================
+int tipFire(int arg) {
+    Window* w = (Window*) arg;
+    w->showTip();
+    return 0;
+}
+
+// ---- the little yellow text that appears when the pointer rests on a widget ------------------------------------------------------------
+class TipView : Widget {
+    public char* text;
+
+    public TipView(char* t) {
+        super();
+        text = strdup(t);
+        w = gfx.textWidth(gfx.sans(), t) + 12;
+        h = gfx.sans()->height + 8;
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        s->shadow(ox, oy, w, h, 4, 50);
+        s->fill(ox, oy, w, h, 0xFFFFFBE0);
+        s->rect(ox, oy, w, h, 0xFF707070);
+        s->text(gfx.sans(), ox + 6, oy + 4, text, cText);
+    }
+}
+
 public class Window {
     public int id;
     public Display* display;
@@ -1514,6 +1557,11 @@ public class Window {
     public bool noClear;            // do not paint the background colour first (for windows that draw everything themselves)
     public bool closed;
     public bool focused;
+    public Widget* popup;           // a widget drawn above everything and getting all the mouse and key events (menus, drop-down lists)
+    public Widget* keyPreview;      // sees every key press first (onShortcut); a menu bar sets itself here
+    private TipView* tipView;
+    private int tipTimer;
+    private Widget* tipFor;
     private Widget* hoverWidget;
     private Widget* captureWidget;
     private bool dirty;
@@ -1566,12 +1614,80 @@ public class Window {
         invalidate(0, 0, w, h);
     }
 
+    // shows p above the whole window. p covers the window (its own children are laid out by p itself); it gets the mouse
+    // and keyboard events until closePopup() or until it is dismissed.
+    public void showPopup(Widget* p) {
+        closePopup();
+        hideTip();
+        popup = p;
+        p->parent = null;
+        p->x = 0;
+        p->y = 0;
+        p->w = w;
+        p->h = h;
+        p->attach(this);
+        p->layout();
+        captureWidget = null;
+        invalidateAll();
+    }
+
+    public void closePopup() {
+        if (popup == null) {
+            return;
+        }
+        Widget* p = popup;
+        popup = null;
+        captureWidget = null;
+        hoverWidget = null;
+        p->attach(null);
+        invalidateAll();
+        p->onDismiss();
+    }
+
+    // ---- tooltips ------------------------------------------------------------------------------------------------------------------
+    public bool tipVisible() { return tipView != null; }
+
+    public void hideTip() {
+        if (tipTimer != 0) {
+            display->cancel(tipTimer);
+            tipTimer = 0;
+        }
+        if (tipView != null) {
+            tipView = null;
+            invalidateAll();
+        }
+    }
+
+    public void showTip() {
+        tipTimer = 0;
+        if (tipFor == null || tipFor->tooltip == null || popup != null || closed) {
+            return;
+        }
+        tipView = new TipView(tipFor->tooltip);
+        int tx = lastMouseX + 12;
+        int ty = lastMouseY + 20;
+        if (tx + tipView->w > w) { tx = w - tipView->w; }
+        if (tx < 0) { tx = 0; }
+        if (ty + tipView->h > h) { ty = lastMouseY - tipView->h - 6; }
+        if (ty < 0) { ty = 0; }
+        tipView->x = tx;
+        tipView->y = ty;
+        invalidateAll();
+    }
+
     public void setFocus(Widget* wd) {
         if (wd == focusWidget) {
             return;
         }
         Widget* old = focusWidget;
         focusWidget = wd;
+        if (wd != null) {
+            Widget* anc = wd->parent;
+            while (anc != null) {
+                anc->reveal(wd);
+                anc = anc->parent;
+            }
+        }
         if (old != null) {
             old->onFocus(false);
             old->invalidate();
@@ -1639,6 +1755,12 @@ public class Window {
         if (root != null) {
             root->paintTree(surf, 0, 0);
         }
+        if (popup != null) {
+            popup->paintTree(surf, popup->x, popup->y);
+        }
+        if (tipView != null) {
+            tipView->paintTree(surf, tipView->x, tipView->y);
+        }
         surf->resetClip();
         display->sendPresent(this, dx0, dy0, dx1 - dx0, dy1 - dy0);
     }
@@ -1680,6 +1802,7 @@ public class Window {
             return;
         }
         closed = true;
+        hideTip();
         display->send3(adp.Q_DESTROY, id, 0, 0);
         display->windowClosed(this);
     }
@@ -1696,12 +1819,13 @@ public class Window {
         if (root == null) {
             return;
         }
+        Widget* top = (popup != null) ? popup : root;
         Widget* target = captureWidget;
         if (target == null) {
-            target = root->hit(mx, my);
+            target = top->hit(mx - top->x, my - top->y);
         }
         if (kind == adp.M_MOVE || kind == adp.M_DOWN) {
-            Widget* under = root->hit(mx, my);
+            Widget* under = top->hit(mx - top->x, my - top->y);
             if (under != hoverWidget) {
                 if (hoverWidget != null) {
                     hoverWidget->onHover(false);
@@ -1710,6 +1834,13 @@ public class Window {
                 if (under != null) {
                     under->onHover(true);
                 }
+                hideTip();
+                tipFor = under;
+            }
+            if (kind == adp.M_DOWN) {
+                hideTip();
+            } else if (tipView == null && tipTimer == 0 && under != null && under->tooltip != null && popup == null) {
+                tipTimer = display->after(500, tipFire, (int) this);
             }
         }
         if (target == null) {
@@ -1719,15 +1850,31 @@ public class Window {
             if (captureWidget == null) {
                 captureWidget = target;
             }
-            Widget* f = target;
-            while (f != null && !f->focusable) {
-                f = f->parent;
+            if (popup == null) {
+                Widget* f = target;
+                while (f != null && !f->focusable) {
+                    f = f->parent;
+                }
+                if (f != null) {
+                    setFocus(f);
+                }
             }
-            if (f != null) {
-                setFocus(f);
+            if (button == 3 && target->onContext != null && popup == null) {
+                target->onContext(target);
             }
         }
-        target->onMouse(kind, button, mx - target->absX(), my - target->absY(), mods);
+        if (kind == adp.M_SCROLL) {
+            // the wheel goes to the first widget (from the one under the pointer upwards) that uses it
+            Widget* t = target;
+            while (t != null) {
+                if (t->wantsScroll() && t->onMouse(kind, button, mx - t->absX(), my - t->absY(), mods)) {
+                    break;
+                }
+                t = t->parent;
+            }
+        } else {
+            target->onMouse(kind, button, mx - target->absX(), my - target->absY(), mods);
+        }
         if (kind == adp.M_UP) {
             captureWidget = null;
         }
@@ -1741,6 +1888,19 @@ public class Window {
     }
 
     public void handleKey(int down, int key, int uni, int mods) {
+        if (popup != null) {
+            Widget* p = popup;
+            if (!p->onKey(down, key, uni, mods) && down != 0 && key == adp.KEY_ESCAPE) {
+                closePopup();
+            }
+            return;
+        }
+        if (down != 0) {
+            hideTip();
+            if (keyPreview != null && keyPreview->enabled && keyPreview->onShortcut(key, uni, mods)) {
+                return;
+            }
+        }
         bool done = false;
         if (focusWidget != null && focusWidget->enabled) {
             done = focusWidget->onKey(down, key, uni, mods);
@@ -1761,6 +1921,7 @@ public class Window {
     }
 
     public void handleResize(int nw, int nh) {
+        closePopup();
         resize(nw, nh);
         if (onResize != null) {
             onResize(this);

@@ -322,3 +322,15 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   limit of the lexer) decoded at first use.
 * `tests/t111_gui_server.a` runs a display server and its clients in one process (`gui.idleHook`); rendering checksums are
   compared between all targets. `tests/gui.sh` runs real processes with a VNC client (`tests/gui/rfbclient.py`).
+* `guix` is a separate module on top of `gui` (derived widgets across modules). The only changes `gui` needed: `Window.popup`
+  (a window-sized widget drawn after the root and given all mouse/key events: menus and the combo list are popups that paint
+  their own panels and do their own hit tests), `Window.keyPreview` (the menu bar sees keys first, for accelerators),
+  `Widget.wantsScroll` (the wheel goes to the first widget under the pointer, walking up the parents, that scrolls),
+  `Widget.reveal` (called up the parent chain when a widget gets the focus; the scroll view scrolls to it), tooltips
+  (a `Display` timer started when the pointer moves onto a widget with a `tooltip`), and `Widget.onContext`.
+* `F_LOCK` windows: layer 3, the server's `findWin`, `setFocus` and `topFocusable` consider only the lock window while one is
+  mapped, `Alt+Tab`/`Alt+F4` are swallowed. The lock window is forced to the screen size and gets an `E_RESIZE` at its first
+  present. The tests use `settle()` loops of the server and the client with `Display.sync()` because a full-screen frame
+  needs many reads on the server side.
+* `tests/t115_gui_widgets.a` (menus, popups, accelerators, combo, radio, tabs, scrolling, spin box, splitter, tooltip, all the
+  dialogs, with a directory made by the test), `tests/t116_gui_lock.a` (lock, wrong password, delay, unlock).
