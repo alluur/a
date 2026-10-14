@@ -175,6 +175,7 @@ const PART_TITLE = 2;
 const PART_CLOSE = 3;
 const PART_GRIP = 4;
 const PART_BORDER = 5;
+const PART_MAX = 6;
 
 public class Client {
     public int fd;
@@ -205,9 +206,15 @@ public class Win {
     public bool mapped;            // it has shown pixels
     public bool visible;
     public int cursor;
+    public bool maximized;
+    public int restoreX;
+    public int restoreY;
+    public int restoreW;
+    public int restoreH;
     public gfx.Surface* buf;
 
     public bool decorated() { return (flags & adp.F_NODECOR) == 0; }
+    public bool canMaximize() { return decorated() && (flags & adp.F_FIXED) == 0; }
     public int fx() { return decorated() ? x - BW : x; }
     public int fy() { return decorated() ? y - TH : y; }
     public int fw() { return decorated() ? w + BW * 2 : w; }
@@ -374,7 +381,7 @@ public class Server {
             int sx1 = screen->clipX1;
             int sy1 = screen->clipY1;
             int tx0 = fx + 6;
-            int tw = fw - 12 - 24;
+            int tw = fw - 12 - 24 - (w->canMaximize() ? 24 : 0);
             int ax0 = (tx0 > sx0) ? tx0 : sx0;
             int ax1 = (tx0 + tw < sx1) ? tx0 + tw : sx1;
             screen->clipX0 = ax0;
@@ -392,6 +399,18 @@ public class Server {
             screen->line(cx + 11, cy + 4, cx + 4, cy + 11, gfx.WHITE);
             screen->line(cx + 5, cy + 4, cx + 11, cy + 10, gfx.WHITE);
             screen->line(cx + 10, cy + 4, cx + 4, cy + 10, gfx.WHITE);
+            if (w->canMaximize()) {
+                int mx = cx - 22;
+                bool mhot = (hover == w && hoverPart == PART_MAX);
+                screen->fillRoundRect(mx, cy, 16, 16, 4, mhot ? gfx.argb(130, 255, 255, 255) : gfx.argb(70, 255, 255, 255));
+                if (w->maximized) {
+                    screen->rect(mx + 5, cy + 3, 7, 7, gfx.WHITE);
+                    screen->rect(mx + 3, cy + 6, 7, 7, gfx.WHITE);
+                } else {
+                    screen->rect(mx + 3, cy + 3, 10, 10, gfx.WHITE);
+                    screen->hline(mx + 3, cy + 4, 10, gfx.WHITE);
+                }
+            }
             // the client area
             screen->fill(w->x, w->y, w->w, w->h, gfx.rgb(238, 238, 242));
         }
@@ -593,13 +612,15 @@ public class Server {
             if (w->decorated()) {
                 if (px >= w->x && px < w->x + w->w && py >= w->y && py < w->y + w->h) {
                     p = PART_CLIENT;
-                    if ((w->flags & adp.F_FIXED) == 0 && px >= w->x + w->w - 14 && py >= w->y + w->h - 14) {
+                    if ((w->flags & adp.F_FIXED) == 0 && !w->maximized && px >= w->x + w->w - 14 && py >= w->y + w->h - 14) {
                         p = PART_GRIP;
                     }
                 } else if (py < w->y) {
                     p = PART_TITLE;
                     if (px >= fx + w->fw() - BW - 22 && px < fx + w->fw() - BW - 2 && py >= fy + 3 && py < fy + 23) {
                         p = PART_CLOSE;
+                    } else if (w->canMaximize() && px >= fx + w->fw() - BW - 42 && px < fx + w->fw() - BW - 22 && py >= fy + 3 && py < fy + 23) {
+                        p = PART_MAX;
                     }
                 } else {
                     p = PART_BORDER;
@@ -921,6 +942,36 @@ public class Server {
         }
     }
 
+    // makes the window fill the screen (below the title bar) or puts it back
+    public void toggleMaximize(Win* w) {
+        if (!w->canMaximize()) {
+            return;
+        }
+        damageWin(w);
+        if (w->maximized) {
+            w->maximized = false;
+            w->x = w->restoreX;
+            w->y = w->restoreY;
+            w->w = w->restoreW;
+            w->h = w->restoreH;
+        } else {
+            w->maximized = true;
+            w->restoreX = w->x;
+            w->restoreY = w->y;
+            w->restoreW = w->w;
+            w->restoreH = w->h;
+            w->x = BW;
+            w->y = TH;
+            w->w = screen->w - BW * 2;
+            w->h = screen->h - TH - BW;
+        }
+        damageWin(w);
+        sendResize(w);
+    }
+
+    private int lastTitleAt;
+    private Win* lastTitleWin;
+
     private void closeRequest(Win* w) {
         sendWin2(w, adp.E_CLOSE, 0);
     }
@@ -1011,6 +1062,17 @@ public class Server {
                     setFocus(under);
                 }
                 if (b == 1 && part == PART_TITLE) {
+                    int now = millis();
+                    if (lastTitleWin == under && now - lastTitleAt < 400 && under->canMaximize()) {
+                        lastTitleWin = null;
+                        toggleMaximize(under);
+                        return;
+                    }
+                    lastTitleWin = under;
+                    lastTitleAt = now;
+                    if (under->maximized) {
+                        return;
+                    }
                     dragMode = 1;
                     dragWin = under;
                     dragX = cursorX - under->x;
@@ -1031,6 +1093,11 @@ public class Server {
                     dragMode = 3;
                     return;
                 }
+                if (b == 1 && part == PART_MAX) {
+                    grab = under;
+                    dragMode = 4;
+                    return;
+                }
                 if (part == PART_CLIENT) {
                     grab = under;
                     sendMouse(under, adp.M_DOWN, b, mods);
@@ -1043,6 +1110,16 @@ public class Server {
             if (dragMode == 1 || dragMode == 2) {
                 dragMode = 0;
                 dragWin = null;
+                return;
+            }
+            if (dragMode == 4) {
+                dragMode = 0;
+                int part = 0;
+                Win* under = findWin(cursorX, cursorY, &part);
+                if (under != null && under == grab && part == PART_MAX) {
+                    toggleMaximize(under);
+                }
+                grab = null;
                 return;
             }
             if (dragMode == 3) {

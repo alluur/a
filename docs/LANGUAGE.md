@@ -1019,7 +1019,7 @@ println(codec.imageToTextWith(page, 3, recognise));
 ## 12g. Graphics, windows and a display server
 
 `gfx` (software 2D graphics with antialiased fonts), `gui` (client library and widgets), `guix` (menus, combo boxes, tabs,
-scroll views, dialogs, ...), `wsrv` (display server), `wvnc` / `wfb` (VNC and Linux framebuffer backends), `adp` (the
+scroll views, tables, trees, dialogs, ...), `gimg` (PNG/BMP/PPM images), `wsrv` (display server), `wvnc` / `wfb` (VNC and Linux framebuffer backends), `adp` (the
 protocol), `glock` (screen locker), `gterm` (terminal emulator) and `dm` + `syscrypt` (display manager and `$6$` password hashes) make a complete
 graphical stack in A. See [GUI.md](GUI.md).
 

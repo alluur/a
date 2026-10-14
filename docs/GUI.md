@@ -28,11 +28,12 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `gui` | the client library and the basic widgets, popups, tooltips |
 | `guix` | more widgets: menus, combo box, radio buttons, tabs, scroll view, spin box, splitter; dialogs (confirm, prompt, file, colour) |
 | `glock` | a screen locker (works with the server's `F_LOCK` windows) |
+| `gimg` | colour images: load PNG, BMP and PPM, save PNG, smooth scaling |
 | `gterm` | a terminal emulator widget (pseudo terminal, ANSI/xterm escape sequences) |
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t117`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t119`, `tests/gui.sh`.
 
 ## Quick start
 
@@ -159,6 +160,14 @@ col->add(bar);                                             // the bar goes at th
 * **SpinBox** (`min`, `max`, `step`, `value`, `onChange`): type digits, use Up/Down/PageUp/PageDown, click the arrows
   or turn the wheel. **Splitter**: `new guix.Splitter(true, 120)` puts two widgets side by side (false: one above the
   other) with a divider you drag. **Swatch** shows a colour.
+* **TableView**: `addColumn("Name", 120)` first, then rows with `addRow("a\tb\tc")` (cells separated by tabs) or
+  `addEmptyRow()` + `setCell(row, col, text)`; `setAlign(col, 1)` right-aligns a column. Click a header to sort (text
+  without regard to case, numbers by value; `sortBy(col, ascending)`, or your own `onSort`), drag the edge of a header to
+  resize the column, `selected`, `onSelect`, `onActivate` (double click or Enter), `cell(row, col)`, `clear()`.
+* **TreeView**: `TreeNode* n = tree->addRoot("text"); n->add("child");` Nodes have `userData`, `expanded` and `lazy` (an
+  arrow although there are no children yet: add them in `tree->onExpand`, the node is `tree->expandedNode`). Click the
+  arrow or press Right/Left/Enter to open and close, Up/Down/Home/End/PageUp/PageDown to move, `selected`, `onSelect`,
+  `onActivate`. `examples/gui/afiles.a` (a file browser: a tree of folders, a table of files, a splitter) uses all three.
 * **Tooltips**: `widget->tooltip = "text";` (a field of every widget) shows the text when the pointer rests on it.
 
 **Dialogs** open a window, and when the user is done they call your function `int f(int result)` and close:
@@ -194,6 +203,20 @@ After a wrong password the next try has to wait one second more each time (at mo
 [-u usersfile] [user]` (`examples/gui/alock.a`) is the program: it checks the password against `/etc/shadow` (it must be
 allowed to read it, so run it as root, or give the display manager's users file with `-u`) with the same `$6$` code as the
 display manager. `wsrv.Server.locked()` and `lockWindow()` tell an embedding program whether a lock is showing.
+
+## Images: `gimg`
+
+```c
+import gimg;
+gfx.Surface* s = gimg.load("photo.png");            // PNG, BMP or PPM/PGM (by content); null if it cannot be read
+gfx.Surface* t = gimg.fit(s, 300, 200);              // smooth, keeps the proportions; gimg.scale(s, w, h) for any size
+gimg.savePng(s, "copy.png");                         // 8-bit RGBA, stored without compression
+col->add(new gui.ImageView(t));
+```
+
+PNG: every colour type and bit depth (not interlaced), palettes with transparency; BMP: 1, 4, 8, 24 and 32 bits without
+compression; the decoder contains its own inflate. `gimg.decode(bytes, n)` and `gimg.encodePng(surface, &n)` work in memory.
+`examples/gui/aview.a` is an image viewer (open, save as PNG, zoom, fit to the window).
 
 ## A terminal: `gterm` and `aterm`
 
@@ -237,7 +260,8 @@ srv->addBackend(otherBackend);                        // several outputs at once
 srv->run();                                           // or: while (...) { srv->step(20); }
 ```
 
-* **Window manager**: title bars with a close button, move by dragging the title, resize with the grip at the bottom right,
+* **Window manager**: title bars with close and maximize buttons (a double click on the title also maximizes; windows
+  with `F_FIXED` do not maximize; `srv->toggleMaximize(win)`), move by dragging the title, resize with the grip at the bottom right,
   focus follows the click, windows come to the front; `Alt+Tab` switches, `Alt+F4` asks the window to close. The
   window decides (`E_CLOSE`), the server never kills a program.
 * **Layers**: `F_BELOW` windows stay under everything, `F_ABOVE` windows over everything; `F_NODECOR` windows have no frame;

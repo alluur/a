@@ -341,3 +341,7 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   slave (it becomes the controlling terminal), `dup2`, close every other descriptor (also the display socket, so the display
   server notices when the terminal program ends), `execv`. The master is polled by `gui.Display.watch`.
 * `tests/t117_gui_term.a` covers the escape sequences, keys, selection and a real shell on a pty (`.out.windows`: `no pty`).
+* `gimg` decodes PNG with a puff-style inflate (canonical Huffman decoding by code length counts); `tests/t118_gimg.a` embeds images made
+  by another program (PNG of every kind, BMP, PPM) as hex and compares pixel hashes. Maximized windows (`wsrv.Win.maximized`) keep
+  their old rectangle and get an `E_RESIZE`; dragging and the resize grip are off while maximized. `tests/t119_gui_table.a`:
+  maximize, TableView, TreeView.

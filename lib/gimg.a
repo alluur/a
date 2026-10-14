@@ -1,0 +1,741 @@
+// =============================================================================
+//  gimg - colour images for gfx: PNG, BMP and PPM files                                              import gimg;
+//
+//    gfx.Surface* s = gimg.load("photo.png");          // PNG, BMP or PPM/PGM (by content); null when it cannot be read
+//    gfx.Surface* small = gimg.scale(s, 120, 80);      // smooth (bilinear) resize
+//    gfx.Surface* fit = gimg.fit(s, 300, 300);         // as large as fits in the box, same proportions
+//    gimg.savePng(surface, "out.png");                 // 8-bit RGBA, not compressed
+//    gimg.decode(bytes, length)                        // the same as load, from memory
+//
+//  PNG: all colour types, bit depths 1 to 16, palettes with transparency, not interlaced. BMP: 1, 4, 8, 24 and 32 bits per
+//  pixel without compression. PPM/PGM: P2, P3, P5, P6.
+// =============================================================================
+import gfx;
+import cstdlib;
+import cunistd;
+import os;
+module gimg;
+
+// ---- reading a whole file -----------------------------------------------------------------------------------------------------------
+// the bytes of a file (a new buffer); the length goes to *len. null if it cannot be read.
+public char* readAll(char* path, int* len) {
+    int size = os.fileSize(path);
+    if (size < 0) {
+        return null;
+    }
+    int fd = open(path, 0, 0);
+    if (fd < 0) {
+        return null;
+    }
+    char* buf = malloc(size + 8);
+    int got = 0;
+    while (got < size) {
+        int k = read(fd, &buf[got], size - got);
+        if (k <= 0) {
+            break;
+        }
+        got = got + k;
+    }
+    close(fd);
+    *len = got;
+    return buf;
+}
+
+private int be32(char* p, int at) {
+    return ((p[at] & 255) << 24) | ((p[at + 1] & 255) << 16) | ((p[at + 2] & 255) << 8) | (p[at + 3] & 255);
+}
+
+private int le16(char* p, int at) {
+    return (p[at] & 255) | ((p[at + 1] & 255) << 8);
+}
+
+private int le32(char* p, int at) {
+    return (p[at] & 255) | ((p[at + 1] & 255) << 8) | ((p[at + 2] & 255) << 16) | ((p[at + 3] & 255) << 24);
+}
+
+// ---- inflate (RFC 1951) -------------------------------------------------------------------------------------------------------------
+class Huff {
+    public int count[16];
+    public int symbol[320];
+
+    public Huff() { }
+
+    // lengths[0..n-1] are the code lengths of the symbols
+    public void build(int* lengths, int n) {
+        for (int i = 0; i < 16; i++) { count[i] = 0; }
+        for (int i = 0; i < n; i++) { count[lengths[i]]++; }
+        count[0] = 0;
+        int offs[16];
+        offs[1] = 0;
+        for (int i = 1; i < 15; i++) { offs[i + 1] = offs[i] + count[i]; }
+        for (int i = 0; i < n; i++) {
+            if (lengths[i] != 0) {
+                symbol[offs[lengths[i]]] = i;
+                offs[lengths[i]]++;
+            }
+        }
+    }
+}
+
+class Inflater {
+    public char* in;
+    public int inLen;
+    public int pos;
+    public int bitBuf;
+    public int bitCnt;
+    public char* out;
+    public int outLen;
+    public int outCap;
+    public bool bad;
+
+    public Inflater(char* data, int len) {
+        in = data;
+        inLen = len;
+        outCap = 65536;
+        out = malloc(outCap);
+    }
+
+    private int bits(int need) {
+        while (bitCnt < need) {
+            if (pos >= inLen) {
+                bad = true;
+                return 0;
+            }
+            bitBuf = bitBuf | ((in[pos] & 255) << bitCnt);
+            pos++;
+            bitCnt = bitCnt + 8;
+        }
+        int v = bitBuf & ((1 << need) - 1);
+        bitBuf = bitBuf >> need;
+        bitCnt = bitCnt - need;
+        return v;
+    }
+
+    private void put(int b) {
+        if (outLen == outCap) {
+            outCap = outCap * 2;
+            out = realloc(out, outCap);
+        }
+        out[outLen] = b;
+        outLen++;
+    }
+
+    private int decode(Huff* h) {
+        int code = 0;
+        int first = 0;
+        int index = 0;
+        for (int len = 1; len <= 15; len++) {
+            code = code | bits(1);
+            if (bad) {
+                return -1;
+            }
+            int c = h->count[len];
+            if (code - c < first) {
+                return h->symbol[index + (code - first)];
+            }
+            index = index + c;
+            first = (first + c) << 1;
+            code = code << 1;
+        }
+        bad = true;
+        return -1;
+    }
+
+    private void codes(Huff* lit, Huff* dist) {
+        int lbase[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+        int lext[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+        int dbase[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+        int dext[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+        for (;;) {
+            int sym = decode(lit);
+            if (bad || sym < 0) {
+                bad = true;
+                return;
+            }
+            if (sym < 256) {
+                put(sym);
+            } else if (sym == 256) {
+                return;
+            } else {
+                sym = sym - 257;
+                if (sym >= 29) {
+                    bad = true;
+                    return;
+                }
+                int len = lbase[sym] + bits(lext[sym]);
+                int ds = decode(dist);
+                if (bad || ds < 0 || ds >= 30) {
+                    bad = true;
+                    return;
+                }
+                int d = dbase[ds] + bits(dext[ds]);
+                if (d > outLen) {
+                    bad = true;
+                    return;
+                }
+                for (int i = 0; i < len; i++) {
+                    put(out[outLen - d] & 255);
+                }
+            }
+        }
+    }
+
+    // inflates a raw deflate stream; false if it is damaged
+    public bool run() {
+        Huff* fixedLit = null;
+        Huff* fixedDist = null;
+        int last = 0;
+        while (last == 0 && !bad) {
+            last = bits(1);
+            int type = bits(2);
+            if (type == 0) {
+                bitBuf = 0;
+                bitCnt = 0;
+                if (pos + 4 > inLen) {
+                    return false;
+                }
+                int len = (in[pos] & 255) | ((in[pos + 1] & 255) << 8);
+                pos = pos + 4;
+                if (pos + len > inLen) {
+                    return false;
+                }
+                for (int i = 0; i < len; i++) {
+                    put(in[pos + i] & 255);
+                }
+                pos = pos + len;
+            } else if (type == 1) {
+                if (fixedLit == null) {
+                    int l[320];
+                    for (int i = 0; i < 144; i++) { l[i] = 8; }
+                    for (int i = 144; i < 256; i++) { l[i] = 9; }
+                    for (int i = 256; i < 280; i++) { l[i] = 7; }
+                    for (int i = 280; i < 288; i++) { l[i] = 8; }
+                    fixedLit = new Huff();
+                    fixedLit->build(&l[0], 288);
+                    for (int i = 0; i < 30; i++) { l[i] = 5; }
+                    fixedDist = new Huff();
+                    fixedDist->build(&l[0], 30);
+                }
+                codes(fixedLit, fixedDist);
+            } else if (type == 2) {
+                int nlen = bits(5) + 257;
+                int ndist = bits(5) + 1;
+                int ncode = bits(4) + 4;
+                if (nlen > 286 || ndist > 30) {
+                    return false;
+                }
+                int order[19] = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+                int lengths[320];
+                for (int i = 0; i < 19; i++) { lengths[i] = 0; }
+                for (int i = 0; i < ncode; i++) { lengths[order[i]] = bits(3); }
+                Huff* lencode = new Huff();
+                lencode->build(&lengths[0], 19);
+                int idx = 0;
+                int all[320];
+                while (idx < nlen + ndist && !bad) {
+                    int sym = decode(lencode);
+                    if (sym < 0) {
+                        return false;
+                    }
+                    if (sym < 16) {
+                        all[idx] = sym;
+                        idx++;
+                    } else {
+                        int prev = 0;
+                        int rep;
+                        if (sym == 16) {
+                            if (idx == 0) { return false; }
+                            prev = all[idx - 1];
+                            rep = 3 + bits(2);
+                        } else if (sym == 17) {
+                            rep = 3 + bits(3);
+                        } else {
+                            rep = 11 + bits(7);
+                        }
+                        if (idx + rep > nlen + ndist) {
+                            return false;
+                        }
+                        for (int i = 0; i < rep; i++) {
+                            all[idx] = prev;
+                            idx++;
+                        }
+                    }
+                }
+                Huff* lit = new Huff();
+                lit->build(&all[0], nlen);
+                Huff* dist = new Huff();
+                dist->build(&all[nlen], ndist);
+                codes(lit, dist);
+            } else {
+                return false;
+            }
+        }
+        return !bad;
+    }
+}
+
+// ---- PNG ----------------------------------------------------------------------------------------------------------------------------------
+private int paeth(int a, int b, int c) {
+    int p = a + b - c;
+    int pa = (p > a) ? p - a : a - p;
+    int pb = (p > b) ? p - b : b - p;
+    int pc = (p > c) ? p - c : c - p;
+    if (pa <= pb && pa <= pc) { return a; }
+    if (pb <= pc) { return b; }
+    return c;
+}
+
+private gfx.Surface* decodePng(char* d, int n) {
+    if (n < 33) {
+        return null;
+    }
+    int pos = 8;
+    int w = 0;
+    int h = 0;
+    int depth = 0;
+    int ctype = 0;
+    int interlace = 0;
+    char* pal = malloc(1024);
+    for (int i = 0; i < 256; i++) {
+        pal[i * 4] = 0; pal[i * 4 + 1] = 0; pal[i * 4 + 2] = 0; pal[i * 4 + 3] = 255;
+    }
+    char* idat = malloc(n + 8);
+    int idatLen = 0;
+    while (pos + 12 <= n) {
+        int len = be32(d, pos);
+        int a = d[pos + 4];
+        int b = d[pos + 5];
+        int c = d[pos + 6];
+        int e = d[pos + 7];
+        int body = pos + 8;
+        if (len < 0 || body + len > n) {
+            break;
+        }
+        if (a == 'I' && b == 'H' && c == 'D' && e == 'R') {
+            w = be32(d, body);
+            h = be32(d, body + 4);
+            depth = d[body + 8] & 255;
+            ctype = d[body + 9] & 255;
+            interlace = d[body + 12] & 255;
+        } else if (a == 'P' && b == 'L' && c == 'T' && e == 'E') {
+            for (int i = 0; i < len / 3 && i < 256; i++) {
+                pal[i * 4] = d[body + i * 3];
+                pal[i * 4 + 1] = d[body + i * 3 + 1];
+                pal[i * 4 + 2] = d[body + i * 3 + 2];
+            }
+        } else if (a == 't' && b == 'R' && c == 'N' && e == 'S') {
+            if (ctype == 3) {
+                for (int i = 0; i < len && i < 256; i++) {
+                    pal[i * 4 + 3] = d[body + i];
+                }
+            }
+        } else if (a == 'I' && b == 'D' && c == 'A' && e == 'T') {
+            memcpy(&idat[idatLen], &d[body], len);
+            idatLen = idatLen + len;
+        } else if (a == 'I' && b == 'E' && c == 'N' && e == 'D') {
+            break;
+        }
+        pos = body + len + 4;
+    }
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384 || interlace != 0 || idatLen < 6) {
+        return null;
+    }
+    int channels = 1;
+    if (ctype == 0) { channels = 1; }
+    else if (ctype == 2) { channels = 3; }
+    else if (ctype == 3) { channels = 1; }
+    else if (ctype == 4) { channels = 2; }
+    else if (ctype == 6) { channels = 4; }
+    else { return null; }
+    int bitsPerPixel = channels * depth;
+    int stride = (w * bitsPerPixel + 7) / 8;
+    int bpp = (bitsPerPixel + 7) / 8;
+    Inflater* inf = new Inflater(&idat[2], idatLen - 2);        // skip the zlib header
+    if (!inf->run() || inf->outLen < (stride + 1) * h) {
+        return null;
+    }
+    char* raw = inf->out;
+    // undo the filters, row by row (in place)
+    for (int y = 0; y < h; y++) {
+        int row = y * (stride + 1);
+        int ft = raw[row] & 255;
+        int cur = row + 1;
+        int prev = row - (stride + 1) + 1;
+        for (int x = 0; x < stride; x++) {
+            int left = (x >= bpp) ? (raw[cur + x - bpp] & 255) : 0;
+            int up = (y > 0) ? (raw[prev + x] & 255) : 0;
+            int upleft = (y > 0 && x >= bpp) ? (raw[prev + x - bpp] & 255) : 0;
+            int v = raw[cur + x] & 255;
+            if (ft == 1) { v = v + left; }
+            else if (ft == 2) { v = v + up; }
+            else if (ft == 3) { v = v + (left + up) / 2; }
+            else if (ft == 4) { v = v + paeth(left, up, upleft); }
+            raw[cur + x] = v & 255;
+        }
+    }
+    gfx.Surface* s = new gfx.Surface(w, h);
+    for (int y = 0; y < h; y++) {
+        int cur = y * (stride + 1) + 1;
+        for (int x = 0; x < w; x++) {
+            int r = 0;
+            int g = 0;
+            int bl = 0;
+            int al = 255;
+            if (depth == 8 || depth == 16) {
+                int step = depth / 8;
+                int at = cur + x * channels * step;
+                if (ctype == 0) { r = raw[at] & 255; g = r; bl = r; }
+                else if (ctype == 2) { r = raw[at] & 255; g = raw[at + step] & 255; bl = raw[at + 2 * step] & 255; }
+                else if (ctype == 3) {
+                    int pi = raw[at] & 255;
+                    r = pal[pi * 4] & 255; g = pal[pi * 4 + 1] & 255; bl = pal[pi * 4 + 2] & 255; al = pal[pi * 4 + 3] & 255;
+                }
+                else if (ctype == 4) { r = raw[at] & 255; g = r; bl = r; al = raw[at + step] & 255; }
+                else { r = raw[at] & 255; g = raw[at + step] & 255; bl = raw[at + 2 * step] & 255; al = raw[at + 3 * step] & 255; }
+            } else {
+                // 1, 2 and 4 bits: gray or palette
+                int bitPos = x * depth;
+                int bval = raw[cur + bitPos / 8] & 255;
+                int shift = 8 - depth - (bitPos % 8);
+                int v = (bval >> shift) & ((1 << depth) - 1);
+                if (ctype == 3) {
+                    r = pal[v * 4] & 255; g = pal[v * 4 + 1] & 255; bl = pal[v * 4 + 2] & 255; al = pal[v * 4 + 3] & 255;
+                } else {
+                    r = v * 255 / ((1 << depth) - 1);
+                    g = r;
+                    bl = r;
+                }
+            }
+            s->put(x, y, gfx.argb(al, r, g, bl));
+        }
+    }
+    return s;
+}
+
+// ---- BMP ------------------------------------------------------------------------------------------------------------------------------------
+private gfx.Surface* decodeBmp(char* d, int n) {
+    if (n < 54) {
+        return null;
+    }
+    int offset = le32(d, 10);
+    int hdr = le32(d, 14);
+    int w = le32(d, 18);
+    int h = le32(d, 22);
+    int bits = le16(d, 28);
+    int comp = le32(d, 30);
+    int colors = le32(d, 46);
+    if (hdr < 40 || comp != 0 || w <= 0 || w > 16384) {
+        return null;
+    }
+    bool topDown = false;
+    if (h < 0) {
+        h = -h;
+        topDown = true;
+    }
+    if (h == 0 || h > 16384) {
+        return null;
+    }
+    int palAt = 14 + hdr;
+    if (colors == 0 && bits <= 8) {
+        colors = 1 << bits;
+    }
+    int stride = ((w * bits + 31) / 32) * 4;
+    if (offset + stride * h > n) {
+        return null;
+    }
+    gfx.Surface* s = new gfx.Surface(w, h);
+    for (int y = 0; y < h; y++) {
+        int row = offset + (topDown ? y : h - 1 - y) * stride;
+        for (int x = 0; x < w; x++) {
+            int r = 0;
+            int g = 0;
+            int b = 0;
+            int a = 255;
+            if (bits == 24) {
+                b = d[row + x * 3] & 255; g = d[row + x * 3 + 1] & 255; r = d[row + x * 3 + 2] & 255;
+            } else if (bits == 32) {
+                b = d[row + x * 4] & 255; g = d[row + x * 4 + 1] & 255; r = d[row + x * 4 + 2] & 255;
+                a = d[row + x * 4 + 3] & 255;
+                if (a == 0) { a = 255; }       // many writers leave the unused bval at 0
+            } else if (bits == 8 || bits == 4 || bits == 1) {
+                int bitPos = x * bits;
+                int bval = d[row + bitPos / 8] & 255;
+                int v = (bval >> (8 - bits - (bitPos % 8))) & ((1 << bits) - 1);
+                if (v < colors) {
+                    b = d[palAt + v * 4] & 255; g = d[palAt + v * 4 + 1] & 255; r = d[palAt + v * 4 + 2] & 255;
+                }
+            } else {
+                return null;
+            }
+            s->put(x, y, gfx.argb(a, r, g, b));
+        }
+    }
+    return s;
+}
+
+// ---- PPM / PGM -----------------------------------------------------------------------------------------------------------------------------
+private int skipSpace(char* d, int n, int p) {
+    while (p < n) {
+        if (d[p] == '#') {
+            while (p < n && d[p] != 10) { p++; }
+        } else if (d[p] == 32 || d[p] == 9 || d[p] == 10 || d[p] == 13) {
+            p++;
+        } else {
+            break;
+        }
+    }
+    return p;
+}
+
+private gfx.Surface* decodePnm(char* d, int n) {
+    int kind = d[1] - '0';
+    if (kind != 2 && kind != 3 && kind != 5 && kind != 6) {
+        return null;
+    }
+    int p = 2;
+    int v[3];
+    for (int i = 0; i < 3; i++) {
+        p = skipSpace(d, n, p);
+        int x = 0;
+        while (p < n && d[p] >= '0' && d[p] <= '9') {
+            x = x * 10 + d[p] - '0';
+            p++;
+        }
+        v[i] = x;
+    }
+    int w = v[0];
+    int h = v[1];
+    int maxv = v[2];
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384 || maxv <= 0 || maxv > 255) {
+        return null;
+    }
+    bool binary = (kind == 5 || kind == 6);
+    bool color = (kind == 3 || kind == 6);
+    if (binary) {
+        p++;                                // one whitespace after the maximum
+    }
+    gfx.Surface* s = new gfx.Surface(w, h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int c[3];
+            for (int k = 0; k < (color ? 3 : 1); k++) {
+                if (binary) {
+                    if (p >= n) { return null; }
+                    c[k] = d[p] & 255;
+                    p++;
+                } else {
+                    p = skipSpace(d, n, p);
+                    int t = 0;
+                    while (p < n && d[p] >= '0' && d[p] <= '9') {
+                        t = t * 10 + d[p] - '0';
+                        p++;
+                    }
+                    c[k] = t;
+                }
+                c[k] = c[k] * 255 / maxv;
+            }
+            if (!color) {
+                c[1] = c[0];
+                c[2] = c[0];
+            }
+            s->put(x, y, gfx.rgb(c[0], c[1], c[2]));
+        }
+    }
+    return s;
+}
+
+// the image in a buffer (format by content); null if it is not a readable PNG, BMP or PPM/PGM
+public gfx.Surface* decode(char* d, int n) {
+    if (n >= 8 && (d[0] & 255) == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G') {
+        return decodePng(d, n);
+    }
+    if (n >= 2 && d[0] == 'B' && d[1] == 'M') {
+        return decodeBmp(d, n);
+    }
+    if (n >= 3 && d[0] == 'P' && d[1] >= '2' && d[1] <= '6') {
+        return decodePnm(d, n);
+    }
+    return null;
+}
+
+public gfx.Surface* load(char* path) {
+    int n = 0;
+    char* d = readAll(path, &n);
+    if (d == null) {
+        return null;
+    }
+    return decode(d, n);
+}
+
+// ---- resizing ----------------------------------------------------------------------------------------------------------------------------
+// a smooth copy of src with another size
+public gfx.Surface* scale(gfx.Surface* src, int nw, int nh) {
+    if (nw < 1) { nw = 1; }
+    if (nh < 1) { nh = 1; }
+    gfx.Surface* d = new gfx.Surface(nw, nh);
+    for (int y = 0; y < nh; y++) {
+        int fy = (y * 2 + 1) * src->h * 128 / nh - 128;       // source position in 1/256 pixel
+        if (fy < 0) { fy = 0; }
+        int sy = fy >> 8;
+        int wy = fy & 255;
+        int sy1 = (sy + 1 < src->h) ? sy + 1 : sy;
+        for (int x = 0; x < nw; x++) {
+            int fx = (x * 2 + 1) * src->w * 128 / nw - 128;
+            if (fx < 0) { fx = 0; }
+            int sx = fx >> 8;
+            int wx = fx & 255;
+            int sx1 = (sx + 1 < src->w) ? sx + 1 : sx;
+            int p00 = src->get(sx, sy);
+            int p10 = src->get(sx1, sy);
+            int p01 = src->get(sx, sy1);
+            int p11 = src->get(sx1, sy1);
+            int out = 0;
+            for (int sh = 0; sh < 32; sh = sh + 8) {
+                int a = (p00 >> sh) & 255;
+                int b = (p10 >> sh) & 255;
+                int c = (p01 >> sh) & 255;
+                int e = (p11 >> sh) & 255;
+                int top = a * (256 - wx) + b * wx;
+                int bot = c * (256 - wx) + e * wx;
+                int v = (top * (256 - wy) + bot * wy + 32768) >> 16;
+                out = out | (v << sh);
+            }
+            d->put(x, y, out);
+        }
+    }
+    return d;
+}
+
+// as large as fits in a box without changing the proportions (never larger than the original when enlarge is false)
+public gfx.Surface* fit(gfx.Surface* src, int boxW, int boxH) {
+    int nw = boxW;
+    int nh = src->h * boxW / src->w;
+    if (nh > boxH) {
+        nh = boxH;
+        nw = src->w * boxH / src->h;
+    }
+    return scale(src, nw, nh);
+}
+
+// ---- writing PNG -----------------------------------------------------------------------------------------------------------------
+private int crcTable[256];
+private bool crcReady;
+
+private int crc32(char* p, int n, int crc) {
+    if (!crcReady) {
+        for (int i = 0; i < 256; i++) {
+            int c = i;
+            for (int k = 0; k < 8; k++) {
+                if ((c & 1) != 0) { c = 0xEDB88320 ^ (c >> 1); } else { c = c >> 1; }
+            }
+            crcTable[i] = c;
+        }
+        crcReady = true;
+    }
+    int c = crc ^ 0xFFFFFFFF;
+    for (int i = 0; i < n; i++) {
+        c = crcTable[(c ^ p[i]) & 255] ^ (c >> 8);
+    }
+    return (c ^ 0xFFFFFFFF) & 0xFFFFFFFF;
+}
+
+private void put32(char* p, int at, int v) {
+    p[at] = (v >> 24) & 255;
+    p[at + 1] = (v >> 16) & 255;
+    p[at + 2] = (v >> 8) & 255;
+    p[at + 3] = v & 255;
+}
+
+// the PNG file as bytes (a new buffer, length in *len)
+public char* encodePng(gfx.Surface* s, int* len) {
+    int w = s->w;
+    int h = s->h;
+    int rawLen = (w * 4 + 1) * h;
+    char* raw = malloc(rawLen + 8);
+    for (int y = 0; y < h; y++) {
+        int row = y * (w * 4 + 1);
+        raw[row] = 0;
+        for (int x = 0; x < w; x++) {
+            int c = s->get(x, y);
+            raw[row + 1 + x * 4] = (c >> 16) & 255;
+            raw[row + 2 + x * 4] = (c >> 8) & 255;
+            raw[row + 3 + x * 4] = c & 255;
+            raw[row + 4 + x * 4] = (c >> 24) & 255;
+        }
+    }
+    // zlib: header, stored blocks, Adler-32
+    int blocks = (rawLen + 65534) / 65535;
+    int zlen = 2 + rawLen + blocks * 5 + 4;
+    char* z = malloc(zlen + 8);
+    z[0] = 0x78;
+    z[1] = 1;
+    int zp = 2;
+    int done = 0;
+    int a = 1;
+    int b = 0;
+    while (done < rawLen || (rawLen == 0 && done == 0)) {
+        int n = rawLen - done;
+        if (n > 65535) { n = 65535; }
+        bool lastBlock = (done + n >= rawLen);
+        z[zp] = lastBlock ? 1 : 0;
+        z[zp + 1] = n & 255;
+        z[zp + 2] = (n >> 8) & 255;
+        z[zp + 3] = (~n) & 255;
+        z[zp + 4] = ((~n) >> 8) & 255;
+        memcpy(&z[zp + 5], &raw[done], n);
+        zp = zp + 5 + n;
+        done = done + n;
+        if (rawLen == 0) { break; }
+    }
+    for (int i = 0; i < rawLen; i++) {
+        a = (a + (raw[i] & 255)) % 65521;
+        b = (b + a) % 65521;
+    }
+    put32(z, zp, (b << 16) | a);
+    zp = zp + 4;
+    int total = 8 + 25 + 12 + zp + 12;
+    char* out = malloc(total + 8);
+    int p = 0;
+    out[0] = 0x89; out[1] = 'P'; out[2] = 'N'; out[3] = 'G'; out[4] = 13; out[5] = 10; out[6] = 26; out[7] = 10;
+    p = 8;
+    // IHDR
+    put32(out, p, 13);
+    out[p + 4] = 'I'; out[p + 5] = 'H'; out[p + 6] = 'D'; out[p + 7] = 'R';
+    put32(out, p + 8, w);
+    put32(out, p + 12, h);
+    out[p + 16] = 8; out[p + 17] = 6; out[p + 18] = 0; out[p + 19] = 0; out[p + 20] = 0;
+    put32(out, p + 21, crc32(&out[p + 4], 17, 0));
+    p = p + 25;
+    // IDAT
+    put32(out, p, zp);
+    out[p + 4] = 'I'; out[p + 5] = 'D'; out[p + 6] = 'A'; out[p + 7] = 'T';
+    memcpy(&out[p + 8], z, zp);
+    put32(out, p + 8 + zp, crc32(&out[p + 4], zp + 4, 0));
+    p = p + 12 + zp;
+    // IEND
+    put32(out, p, 0);
+    out[p + 4] = 'I'; out[p + 5] = 'E'; out[p + 6] = 'N'; out[p + 7] = 'D';
+    put32(out, p + 8, crc32(&out[p + 4], 4, 0));
+    p = p + 12;
+    *len = p;
+    return out;
+}
+
+public bool savePng(gfx.Surface* s, char* path) {
+    int n = 0;
+    char* d = encodePng(s, &n);
+    int fd = open(path, 1 | 64 | 512, 420);               // O_WRONLY | O_CREAT | O_TRUNC
+    if (fd < 0) {
+        return false;
+    }
+    int done = 0;
+    while (done < n) {
+        int k = write(fd, &d[done], n - done);
+        if (k <= 0) {
+            break;
+        }
+        done = done + k;
+    }
+    close(fd);
+    return done == n;
+}
