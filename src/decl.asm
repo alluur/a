@@ -82,10 +82,14 @@ parse_params:
     cmp qword [tk], ')'
     je .end
 .p:
-    cmp qword [tk], T_ELLIPSIS
+    cmp qword [tk], '.'
     jne .ptype
     ; "..." : any number of further arguments (they are read with va_arg(i), counted by va_count())
     call next_token
+    mov edi, '.'
+    call expect
+    mov edi, '.'
+    call expect
     mov dword [ptmp_variadic], 1
     cmp dword [ptmp_nreq], 0x7FFFFFFF
     je .end

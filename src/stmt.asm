@@ -249,36 +249,10 @@ parse_for:
     push rbx
     push r12
     push r13
-    push r14
-    push r15
     call next_token
     mov edi, '('
     call expect
     mov r13d, [sym_count]
-    cmp qword [tk], T_ID
-    jne .notrange
-    mov rax, [tk_ptr]
-    mov [rng_name], rax
-    mov eax, [tk_len]
-    mov [rng_nlen], eax
-    sub rsp, 128
-    mov rdi, rsp
-    call lex_save
-    call next_token
-    cmp qword [tk], T_ID
-    jne .norange
-    cmp dword [tk_len], 2
-    jne .norange
-    mov rax, [tk_ptr]
-    cmp word [rax], 0x6E69              ; "in"
-    jne .norange
-    add rsp, 128
-    jmp .range
-.norange:
-    mov rsi, rsp
-    call lex_restore
-    add rsp, 128
-.notrange:
     cmp qword [tk], ';'
     jne .init
     call next_token
@@ -331,94 +305,6 @@ parse_for:
     call patch_here
     call loop_pop
     mov [sym_count], r13d
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-; for (i in start..end) statement      for (i in start..=end) statement      (i is a new int, end is evaluated once)
-.range:
-    call next_token                     ; past 'in'
-    add dword [frame_size], 16
-    mov r14d, [frame_size]
-    neg r14
-    lea r15, [r14 + 8]                  ; the hidden slot for the end value
-    call parse_assign
-    call to_rvalue
-    mov edi, TY_INT
-    call coerce_to
-    mov edi, r14d
-    mov esi, TY_INT
-    call store_local_typed
-    cmp qword [tk], T_RANGE
-    je .r1
-    ERR "expected '..' in a range loop"
-.r1:
-    call next_token
-    xor ebx, ebx
-    cmp qword [tk], '='
-    jne .r2
-    mov ebx, 1                          ; inclusive
-    call next_token
-.r2:
-    call parse_assign
-    call to_rvalue
-    mov edi, TY_INT
-    call coerce_to
-    test ebx, ebx
-    jz .r3
-    mov edi, 1
-    CG add_imm_a
-.r3:
-    mov edi, r15d
-    mov esi, TY_INT
-    call store_local_typed
-    mov edi, ')'
-    call expect
-    mov rdi, [rng_name]
-    mov esi, [rng_nlen]
-    mov edx, S_LOCAL
-    call sym_new
-    mov qword [rax+SYM_TYPE], TY_INT
-    mov [rax+SYM_VAL], r14
-    mov rbx, [code_pos]
-    xor edi, edi
-    xor esi, esi
-    call loop_push
-    mov r12, rax
-    mov edi, r14d
-    CG load_local_a
-    mov edi, r15d
-    CG load_local_b
-    CG cmp_lt
-    mov rdi, r12
-    call cond_jz
-    push 0
-    mov rdi, rsp
-    CG jmp_chain
-    mov rax, [code_pos]
-    mov [r12+16], rax
-    mov edi, r14d
-    CG load_local_a
-    mov edi, 1
-    CG add_imm_a
-    mov edi, r14d
-    CG store_local_a
-    mov rdi, rbx
-    CG jmp_back
-    pop rdi
-    call patch_here
-    call parse_stmt
-    mov rdi, [r12+16]
-    CG jmp_back
-    mov rdi, [r12]
-    call patch_here
-    call loop_pop
-    mov [sym_count], r13d
-    pop r15
-    pop r14
     pop r13
     pop r12
     pop rbx
