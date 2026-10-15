@@ -1,0 +1,1033 @@
+// =============================================================================
+//  tls - TLS 1.3 (RFC 8446), client and server, written from scratch                                        import tls;
+//
+//  The session is a state machine that does no I/O itself: you feed it the bytes that came from the network and send
+//  the bytes it produces. That works the same with a blocking socket (tls.connect below), with the GUI loop (gnet.Fetch)
+//  and in tests.
+//
+//    tls.Tls* t = tls.client("example.com", true);       // true: verify the certificate against the system roots
+//    // loop: send tls.outData(t) / tls.outLength(t) bytes, then tls.outConsumed(t, n); read the socket;
+//    //       tls.feed(t, bytes, n); when tls.ready(t): tls.write(t, request, n); tls.readApp(t, buf, max) gives the answer.
+//
+//  Blocking convenience:   tls.Stream* s = tls.connect("example.com", 443, true);   // null on failure, tls.lastError() says why
+//                          tls.sendAll(s, data, n); int got = tls.recv(s, buf, max); tls.close(s);
+//
+//  Server:                 tls.Config* cfg = tls.loadConfig(certChainPem, privateKeyPem);
+//                          tls.Stream* s = tls.accept(clientFd, cfg);
+//
+//  Offered/accepted: TLS_AES_128_GCM_SHA256, TLS_CHACHA20_POLY1305_SHA256, TLS_AES_256_GCM_SHA384; key exchange X25519;
+//  signatures RSA-PSS, ECDSA P-256/P-384. Server certificates are checked by x509.verifyChain. No session resumption,
+//  no client certificates, no 0-RTT, no HelloRetryRequest. The cryptography is not constant time: do not use it to
+//  protect long-lived secrets against local attackers.
+// =============================================================================
+import hash;
+import secure;
+import aes;
+import chacha;
+import x25519;
+import x509;
+import rsa;
+import ec;
+import net;
+import ctime;
+import cstring;
+module tls;
+
+public const ST_HELLO = 1;          // client: waiting for the ServerHello
+public const ST_READY = 20;
+public const ST_CLOSED = 30;        // the peer said goodbye (close_notify)
+public const ST_FAILED = 31;
+
+public class Buf {
+    public char* d;
+    public int len;
+    public int cap;
+}
+
+public Buf* newBuf(int cap) {
+    Buf* b = new Buf();
+    b->d = alloc(cap);
+    b->cap = cap;
+    return b;
+}
+
+public void bufAdd(Buf* b, char* data, int n) {
+    if (b->len + n > b->cap) {
+        int nc = b->cap * 2;
+        while (nc < b->len + n) { nc = nc * 2; }
+        char* nd = alloc(nc);
+        for (int i = 0; i < b->len; i++) { nd[i] = b->d[i]; }
+        b->d = nd;
+        b->cap = nc;
+    }
+    for (int i = 0; i < n; i++) { b->d[b->len + i] = data[i]; }
+    b->len = b->len + n;
+}
+
+private void add8(Buf* b, int v) { char c = v & 255; bufAdd(b, &c, 1); }
+private void add16(Buf* b, int v) { add8(b, v >> 8); add8(b, v); }
+private void add24(Buf* b, int v) { add8(b, v >> 16); add8(b, v >> 8); add8(b, v); }
+
+private void bufDrop(Buf* b, int n) {
+    for (int i = n; i < b->len; i++) { b->d[i - n] = b->d[i]; }
+    b->len = b->len - n;
+}
+
+// what a server needs: its certificate chain and private key
+public class Config {
+    public x509.Cert** chain;
+    public int chainCount;
+    public int keyKind;              // 1 RSA, 2 EC
+    public char* rsaN; public int rsaNLen;
+    public char* rsaD; public int rsaDLen;
+    public char* ecPriv; public int ecBits;
+}
+
+public class Tls {
+    public bool server;
+    public bool verifyPeer;
+    public char* host;
+    public int state;
+    public char* error;              // null, or why the session failed
+    public char* certProblem;        // set when the certificate was refused (also in error)
+    public char* suiteName;
+    public x509.Cert* leaf;          // the peer's certificate
+    public x509.Cert** chain;
+    public int chainCount;
+    public char* sniName;            // server side: the name the client asked for
+    public Config* config;
+    public Buf* inb;
+    public Buf* outb;
+    public Buf* app;
+    public int appPos;
+    public Buf* hs;
+    public Buf* tx;
+    public char* scratch;
+    public int suite;
+    public int hbits;
+    public int hlen;
+    public int klen;
+    public char* priv;
+    public char* hsSecret;
+    public char* master;
+    public char* cHs;
+    public char* sHs;
+    public char* cAp;
+    public char* sAp;
+    public bool rEnc;
+    public bool wEnc;
+    public char* rKey; public char* rIv; public int rSeq; public aes.Gcm* rGcm; public char* rSecret;
+    public char* wKey; public char* wIv; public int wSeq; public aes.Gcm* wGcm; public char* wSecret;
+    public bool sawCertReq;
+    public bool closeSent;
+}
+
+private char* lastErr = null;
+public char* lastError() { return lastErr; }
+
+private Tls* newSession(bool server) {
+    Tls* t = new Tls();
+    t->server = server;
+    t->inb = newBuf(4096);
+    t->outb = newBuf(4096);
+    t->app = newBuf(4096);
+    t->hs = newBuf(4096);
+    t->tx = newBuf(4096);
+    t->scratch = alloc(16384 + 512);
+    t->priv = alloc(32);
+    t->verifyPeer = true;
+    t->chain = (x509.Cert**) alloc(16 * 8);
+    return t;
+}
+
+// ---- HKDF ----------------------------------------------------------------------------------------------------------------------------
+private void extract(Tls* t, char* salt, int slen, char* ikm, int ilen, char* out) {
+    hash.hmac(t->hbits, salt, slen, ikm, ilen, out);
+}
+
+// HKDF-Expand-Label for outputs of at most one hash length
+private void expandLabel(Tls* t, char* secret, char* label, char* ctx, int clen, int outLen, char* out) {
+    char info[160];
+    int ll = strlen(label);
+    int p = 0;
+    info[p] = (outLen >> 8) & 255; info[p + 1] = outLen & 255; p = p + 2;
+    info[p] = 6 + ll; p++;
+    memcpy(&info[p], "tls13 ", 6); p = p + 6;
+    memcpy(&info[p], label, ll); p = p + ll;
+    info[p] = clen; p++;
+    for (int i = 0; i < clen; i++) { info[p + i] = ctx[i]; }
+    p = p + clen;
+    info[p] = 1; p++;
+    char full[64];
+    hash.hmac(t->hbits, secret, t->hlen, &info[0], p, &full[0]);
+    for (int i = 0; i < outLen; i++) { out[i] = full[i]; }
+}
+
+private char* newSecret(Tls* t) { return alloc(t->hlen + 8); }
+
+private void transcriptHash(Tls* t, char* out) {
+    hash.digest(t->hbits, t->tx->d, t->tx->len, out);
+}
+
+private char* deriveSecret(Tls* t, char* secret, char* label, char* th) {
+    char* r = newSecret(t);
+    expandLabel(t, secret, label, th, t->hlen, t->hlen, r);
+    return r;
+}
+
+// install the traffic keys of a secret for reading or writing
+private void setKeys(Tls* t, bool write, char* secret) {
+    char* key = alloc(40);
+    char* iv = alloc(16);
+    expandLabel(t, secret, "key", "", 0, t->klen, key);
+    expandLabel(t, secret, "iv", "", 0, 12, iv);
+    aes.Gcm* g = null;
+    if (t->suite != 0x1303) { g = aes.gcm(key, t->klen); }
+    if (write) {
+        t->wKey = key; t->wIv = iv; t->wSeq = 0; t->wGcm = g; t->wSecret = secret; t->wEnc = true;
+    } else {
+        t->rKey = key; t->rIv = iv; t->rSeq = 0; t->rGcm = g; t->rSecret = secret; t->rEnc = true;
+    }
+}
+
+private void chooseSuite(Tls* t, int suite) {
+    t->suite = suite;
+    if (suite == 0x1302) {
+        t->hbits = 384; t->hlen = 48; t->klen = 32; t->suiteName = "TLS_AES_256_GCM_SHA384";
+    } else if (suite == 0x1303) {
+        t->hbits = 256; t->hlen = 32; t->klen = 32; t->suiteName = "TLS_CHACHA20_POLY1305_SHA256";
+    } else {
+        t->hbits = 256; t->hlen = 32; t->klen = 16; t->suiteName = "TLS_AES_128_GCM_SHA256";
+    }
+}
+
+// early -> handshake secret -> traffic secrets for the handshake (the transcript holds ClientHello..ServerHello)
+private void deriveHandshake(Tls* t, char* shared) {
+    char zero[64];
+    for (int i = 0; i < 64; i++) { zero[i] = 0; }
+    char early[64];
+    extract(t, &zero[0], t->hlen, &zero[0], t->hlen, &early[0]);
+    char empty[64];
+    hash.digest(t->hbits, "", 0, &empty[0]);
+    char derived[64];
+    expandLabel(t, &early[0], "derived", &empty[0], t->hlen, t->hlen, &derived[0]);
+    t->hsSecret = newSecret(t);
+    extract(t, &derived[0], t->hlen, shared, 32, t->hsSecret);
+    char th[64];
+    transcriptHash(t, &th[0]);
+    t->cHs = deriveSecret(t, t->hsSecret, "c hs traffic", &th[0]);
+    t->sHs = deriveSecret(t, t->hsSecret, "s hs traffic", &th[0]);
+    expandLabel(t, t->hsSecret, "derived", &empty[0], t->hlen, t->hlen, &derived[0]);
+    t->master = newSecret(t);
+    extract(t, &derived[0], t->hlen, &zero[0], t->hlen, t->master);
+}
+
+// the transcript now ends with the server Finished
+private void deriveApplication(Tls* t) {
+    char th[64];
+    transcriptHash(t, &th[0]);
+    t->cAp = deriveSecret(t, t->master, "c ap traffic", &th[0]);
+    t->sAp = deriveSecret(t, t->master, "s ap traffic", &th[0]);
+}
+
+private void finishedData(Tls* t, char* baseSecret, char* out) {
+    char fk[64];
+    expandLabel(t, baseSecret, "finished", "", 0, t->hlen, &fk[0]);
+    char th[64];
+    transcriptHash(t, &th[0]);
+    hash.hmac(t->hbits, &fk[0], t->hlen, &th[0], t->hlen, out);
+}
+
+// ---- records -------------------------------------------------------------------------------------------------------------------------
+private void sendRecord(Tls* t, int type, char* data, int n) {
+    int pos = 0;
+    while (true) {
+        int take = n - pos;
+        if (take > 16384) { take = 16384; }
+        if (!t->wEnc) {
+            add8(t->outb, type); add16(t->outb, 0x0303); add16(t->outb, take);
+            bufAdd(t->outb, data + pos, take);
+        } else {
+            char* sc = t->scratch;
+            for (int i = 0; i < take; i++) { sc[i] = data[pos + i]; }
+            sc[take] = type;
+            int clen = take + 1 + 16;
+            char hdr[5];
+            hdr[0] = 23; hdr[1] = 3; hdr[2] = 3; hdr[3] = (clen >> 8) & 255; hdr[4] = clen & 255;
+            char nonce[12];
+            for (int i = 0; i < 12; i++) { nonce[i] = t->wIv[i]; }
+            for (int i = 0; i < 8; i++) { nonce[11 - i] = nonce[11 - i] ^ ((t->wSeq >> (8 * i)) & 255); }
+            if (t->suite == 0x1303) {
+                chacha.seal(t->wKey, &nonce[0], &hdr[0], 5, sc, take + 1, sc);
+            } else {
+                aes.seal(t->wGcm, &nonce[0], &hdr[0], 5, sc, take + 1, sc);
+            }
+            t->wSeq++;
+            bufAdd(t->outb, &hdr[0], 5);
+            bufAdd(t->outb, sc, clen);
+        }
+        pos = pos + take;
+        if (pos >= n) { break; }
+    }
+}
+
+private void sendAlert(Tls* t, int level, int desc) {
+    char a[2];
+    a[0] = level; a[1] = desc;
+    sendRecord(t, 21, &a[0], 2);
+}
+
+private void fail(Tls* t, int alert, char* why) {
+    if (t->state >= ST_CLOSED) { return; }
+    if (alert > 0) { sendAlert(t, 2, alert); }
+    t->error = why;
+    lastErr = why;
+    t->state = ST_FAILED;
+}
+
+private void sendCcs(Tls* t) {
+    char one = 1;
+    sendRecord(t, 20, &one, 1);
+}
+
+// a handshake message (type, body) in a record; it also goes into the transcript
+private void sendHandshake(Tls* t, int type, Buf* body) {
+    Buf* m = newBuf(body->len + 8);
+    add8(m, type);
+    add24(m, body->len);
+    bufAdd(m, body->d, body->len);
+    sendRecord(t, 22, m->d, m->len);
+    bufAdd(t->tx, m->d, m->len);
+}
+
+private int rd16(char* p) { return ((p[0] & 255) << 8) | (p[1] & 255); }
+private int rd24(char* p) { return ((p[0] & 255) << 16) | ((p[1] & 255) << 8) | (p[2] & 255); }
+
+private bool isIpText(char* h) {
+    int dots = 0;
+    for (int i = 0; h[i] != 0; i++) {
+        if (h[i] == '.') { dots++; }
+        else if (h[i] < '0' || h[i] > '9') { return false; }
+    }
+    return dots == 3;
+}
+
+// secure random bytes, or the session fails (never fall back to weak randomness)
+private bool rnd(Tls* t, char* out, int n) {
+    if (secure.bytes(out, n)) { return true; }
+    fail(t, 0, "no secure random generator is available");
+    return false;
+}
+
+// ---- the client hello ----------------------------------------------------------------------------------------------------------------
+public Tls* client(char* host, bool verify) {
+    return clientOnly(host, verify, 0);
+}
+
+// a client that offers only one cipher suite (0x1301, 0x1302 or 0x1303; 0 offers all three)
+public Tls* clientOnly(char* host, bool verify, int onlySuite) {
+    Tls* t = newSession(false);
+    t->host = host;
+    t->verifyPeer = verify;
+    t->state = ST_HELLO;
+    if (!rnd(t, t->priv, 32)) { return t; }
+    char pub[32];
+    x25519.base(&pub[0], t->priv);
+    Buf* b = newBuf(512);
+    add16(b, 0x0303);
+    char rb[32];
+    if (!rnd(t, &rb[0], 32)) { return t; }
+    bufAdd(b, &rb[0], 32);
+    add8(b, 32);
+    if (!rnd(t, &rb[0], 32)) { return t; }      // a random legacy session id (middlebox compatibility mode)
+    bufAdd(b, &rb[0], 32);
+    if (onlySuite != 0) {
+        add16(b, 2); add16(b, onlySuite);
+    } else {
+        add16(b, 6); add16(b, 0x1301); add16(b, 0x1303); add16(b, 0x1302);
+    }
+    add8(b, 1); add8(b, 0);
+    Buf* e = newBuf(256);
+    if (host != null && !isIpText(host) && strlen(host) > 0) {
+        int hl = strlen(host);
+        add16(e, 0); add16(e, hl + 5); add16(e, hl + 3); add8(e, 0); add16(e, hl);
+        bufAdd(e, host, hl);
+    }
+    add16(e, 10); add16(e, 4); add16(e, 2); add16(e, 0x001d);                          // supported_groups: x25519
+    add16(e, 13); add16(e, 16); add16(e, 14);                                          // signature_algorithms
+    add16(e, 0x0804); add16(e, 0x0805); add16(e, 0x0806); add16(e, 0x0403); add16(e, 0x0503);
+    add16(e, 0x0401); add16(e, 0x0501);
+    add16(e, 43); add16(e, 3); add8(e, 2); add16(e, 0x0304);                           // supported_versions: 1.3
+    add16(e, 51); add16(e, 38); add16(e, 36); add16(e, 0x001d); add16(e, 32);          // key_share
+    bufAdd(e, &pub[0], 32);
+    add16(b, e->len);
+    bufAdd(b, e->d, e->len);
+    sendHandshake(t, 1, b);
+    return t;
+}
+
+// ---- handling messages (client) ------------------------------------------------------------------------------------------------------
+private void serverHello(Tls* t, char* p, int n, char* full, int fullLen) {
+    if (n < 40) { fail(t, 50, "short ServerHello"); return; }
+    char hrr[32];
+    secure.fromHex("CF21AD74E59A6111BE1D8C021E65B891C2A211167ABB8C5E079E09E2C8A8339C", &hrr[0], 32);
+    if (hash.equalConstantTime(p + 2, &hrr[0], 32)) { fail(t, 40, "the server asked for another key exchange group (not supported)"); return; }
+    int sidLen = p[34] & 255;
+    int pos = 35 + sidLen;
+    if (pos + 5 > n) { fail(t, 50, "short ServerHello"); return; }
+    int suite = rd16(p + pos);
+    pos = pos + 3;
+    int extLen = rd16(p + pos);
+    pos = pos + 2;
+    if (pos + extLen > n) { fail(t, 50, "short ServerHello"); return; }
+    bool version13 = false;
+    char* serverKey = null;
+    int end = pos + extLen;
+    while (pos + 4 <= end) {
+        int et = rd16(p + pos);
+        int el = rd16(p + pos + 2);
+        pos = pos + 4;
+        if (pos + el > end) { break; }
+        if (et == 43 && el == 2 && rd16(p + pos) == 0x0304) { version13 = true; }
+        if (et == 51 && el == 36 && rd16(p + pos) == 0x001d && rd16(p + pos + 2) == 32) { serverKey = p + pos + 4; }
+        pos = pos + el;
+    }
+    if (!version13) { fail(t, 70, "the server does not speak TLS 1.3"); return; }
+    if (serverKey == null) { fail(t, 40, "the server did not use the X25519 key exchange"); return; }
+    if (suite != 0x1301 && suite != 0x1302 && suite != 0x1303) { fail(t, 47, "the server chose a cipher suite we did not offer"); return; }
+    chooseSuite(t, suite);
+    bufAdd(t->tx, full, fullLen);
+    char shared[32];
+    if (!x25519.scalarmult(&shared[0], t->priv, serverKey)) { fail(t, 47, "bad key share from the server"); return; }
+    deriveHandshake(t, &shared[0]);
+    setKeys(t, false, t->sHs);
+    t->state = 2;
+}
+
+private void certificateMessage(Tls* t, char* p, int n, char* full, int fullLen) {
+    if (n < 4) { fail(t, 50, "short Certificate"); return; }
+    int ctx = p[0] & 255;
+    int pos = 1 + ctx;
+    if (pos + 3 > n) { fail(t, 50, "short Certificate"); return; }
+    int listLen = rd24(p + pos);
+    pos = pos + 3;
+    int end = pos + listLen;
+    if (end > n) { fail(t, 50, "short Certificate"); return; }
+    while (pos + 3 <= end && t->chainCount < 12) {
+        int cl = rd24(p + pos);
+        pos = pos + 3;
+        if (pos + cl + 2 > end) { break; }
+        char* der = alloc(cl + 8);
+        for (int i = 0; i < cl; i++) { der[i] = p[pos + i]; }
+        x509.Cert* c = x509.parse(der, cl);
+        if (c == null) { fail(t, 42, "the server sent a certificate we cannot read"); t->certProblem = t->error; return; }
+        t->chain[t->chainCount] = c;
+        t->chainCount++;
+        pos = pos + cl;
+        int xl = rd16(p + pos);
+        pos = pos + 2 + xl;
+    }
+    if (t->chainCount == 0) { fail(t, 42, "the server sent no certificate"); t->certProblem = t->error; return; }
+    t->leaf = t->chain[0];
+    if (t->verifyPeer) {
+        char* why = x509.verifyChain(t->chain, t->chainCount, t->host, time());
+        if (why != null) {
+            fail(t, 42, why);
+            t->certProblem = why;
+            return;
+        }
+    }
+    bufAdd(t->tx, full, fullLen);
+    t->state = 4;
+}
+
+// 64 spaces, the context string, a zero byte and the transcript hash: what the CertificateVerify signature covers
+private int verifyContent(Tls* t, char* who, char* out) {
+    char th[64];
+    transcriptHash(t, &th[0]);
+    for (int i = 0; i < 64; i++) { out[i] = 32; }
+    int p = 64;
+    int l = strlen(who);
+    for (int i = 0; i < l; i++) { out[p + i] = who[i]; }
+    p = p + l;
+    out[p] = 0; p++;
+    for (int i = 0; i < t->hlen; i++) { out[p + i] = th[i]; }
+    return p + t->hlen;
+}
+
+private void certificateVerify(Tls* t, char* p, int n, char* full, int fullLen) {
+    if (n < 4) { fail(t, 50, "short CertificateVerify"); return; }
+    int alg = rd16(p);
+    int sl = rd16(p + 2);
+    if (4 + sl > n) { fail(t, 50, "short CertificateVerify"); return; }
+    int hb = 0;
+    int kind = 0;
+    if (alg == 0x0804 || alg == 0x0809) { hb = 256; kind = 2; }
+    else if (alg == 0x0805 || alg == 0x080A) { hb = 384; kind = 2; }
+    else if (alg == 0x0806 || alg == 0x080B) { hb = 512; kind = 2; }
+    else if (alg == 0x0403) { hb = 256; kind = 3; }
+    else if (alg == 0x0503) { hb = 384; kind = 3; }
+    if (kind == 0) { fail(t, 47, "the server signed with an algorithm we do not support"); return; }
+    if (t->verifyPeer) {
+        char content[200];
+        int cl = verifyContent(t, "TLS 1.3, server CertificateVerify", &content[0]);
+        char dig[64];
+        hash.digest(hb, &content[0], cl, &dig[0]);
+        if (!x509.verifyWithKey(t->leaf, kind, hb, &dig[0], p + 4, sl)) {
+            fail(t, 51, "the server's handshake signature is wrong");
+            return;
+        }
+    }
+    bufAdd(t->tx, full, fullLen);
+    t->state = 5;
+}
+
+private void serverFinished(Tls* t, char* p, int n, char* full, int fullLen) {
+    char want[64];
+    finishedData(t, t->sHs, &want[0]);
+    if (n != t->hlen || !hash.equalConstantTime(p, &want[0], t->hlen)) { fail(t, 51, "the server's Finished message is wrong"); return; }
+    bufAdd(t->tx, full, fullLen);
+    deriveApplication(t);
+    // our flight, protected by the client handshake keys
+    sendCcs(t);
+    setKeys(t, true, t->cHs);
+    if (t->sawCertReq) {
+        Buf* b = newBuf(8);
+        add8(b, 0); add24(b, 0);                 // no certificate
+        sendHandshake(t, 11, b);
+    }
+    char fin[64];
+    finishedData(t, t->cHs, &fin[0]);
+    Buf* fb = newBuf(64);
+    bufAdd(fb, &fin[0], t->hlen);
+    sendHandshake(t, 20, fb);
+    setKeys(t, true, t->cAp);
+    setKeys(t, false, t->sAp);
+    t->state = ST_READY;
+}
+
+private void updateKeys(Tls* t, bool write) {
+    char* old = write ? t->wSecret : t->rSecret;
+    char* next = newSecret(t);
+    expandLabel(t, old, "traffic upd", "", 0, t->hlen, next);
+    setKeys(t, write, next);
+}
+
+// a KeyUpdate message and new write keys; with askPeer the peer is asked to change its keys too
+public void keyUpdate(Tls* t, bool askPeer) {
+    if (t->state != ST_READY) { return; }
+    char m[5];
+    m[0] = 24; m[1] = 0; m[2] = 0; m[3] = 1; m[4] = askPeer ? 1 : 0;
+    sendRecord(t, 22, &m[0], 5);
+    updateKeys(t, true);
+}
+
+private void postHandshake(Tls* t, int type, char* p, int n) {
+    if (type == 24 && n == 1) {                                  // KeyUpdate
+        updateKeys(t, false);
+        if (p[0] == 1) { keyUpdate(t, false); }
+    }
+    // NewSessionTicket and the rest are ignored (no resumption)
+}
+
+private void clientMessage(Tls* t, int type, char* p, int n, char* full, int fullLen) {
+    int s = t->state;
+    if (s == ST_HELLO && type == 2) { serverHello(t, p, n, full, fullLen); }
+    else if (s == 2 && type == 8) { bufAdd(t->tx, full, fullLen); t->state = 3; }
+    else if (s == 3 && type == 13) { t->sawCertReq = true; bufAdd(t->tx, full, fullLen); }
+    else if (s == 3 && type == 11) { certificateMessage(t, p, n, full, fullLen); }
+    else if (s == 4 && type == 15) { certificateVerify(t, p, n, full, fullLen); }
+    else if (s == 5 && type == 20) { serverFinished(t, p, n, full, fullLen); }
+    else if (s == ST_READY) { postHandshake(t, type, p, n); }
+    else { fail(t, 10, "unexpected handshake message"); }
+}
+
+// ---- the server side -----------------------------------------------------------------------------------------------------------------
+private void clientHello(Tls* t, char* p, int n, char* full, int fullLen) {
+    Config* c = t->config;
+    if (n < 40) { fail(t, 50, "short ClientHello"); return; }
+    int sidLen = p[34] & 255;
+    int pos = 35 + sidLen;
+    if (pos + 2 > n) { fail(t, 50, "short ClientHello"); return; }
+    char* sid = p + 35;
+    int csLen = rd16(p + pos);
+    char* cs = p + pos + 2;
+    pos = pos + 2 + csLen;
+    if (pos + 1 > n) { fail(t, 50, "short ClientHello"); return; }
+    int comp = p[pos] & 255;
+    pos = pos + 1 + comp;
+    if (pos + 2 > n) { fail(t, 50, "short ClientHello"); return; }
+    int extLen = rd16(p + pos);
+    pos = pos + 2;
+    int end = pos + extLen;
+    if (end > n) { fail(t, 50, "short ClientHello"); return; }
+    bool v13 = false;
+    char* clientKey = null;
+    bool sigOk = false;
+    int wantSig = (c->keyKind == 1) ? 0x0804 : ((c->ecBits == 384) ? 0x0503 : 0x0403);
+    while (pos + 4 <= end) {
+        int et = rd16(p + pos);
+        int el = rd16(p + pos + 2);
+        pos = pos + 4;
+        if (pos + el > end) { break; }
+        if (et == 0 && el >= 5) {
+            int nl = rd16(p + pos + 3);
+            if (nl > 0 && nl < 250 && 5 + nl <= el) {
+                char* nm = alloc(nl + 1);
+                for (int i = 0; i < nl; i++) { nm[i] = p[pos + 5 + i]; }
+                nm[nl] = 0;
+                t->sniName = nm;
+            }
+        } else if (et == 43 && el >= 1) {
+            int ll = p[pos] & 255;
+            for (int i = 0; i + 1 < ll && 1 + i + 1 < el; i = i + 2) {
+                if (rd16(p + pos + 1 + i) == 0x0304) { v13 = true; }
+            }
+        } else if (et == 51 && el >= 2) {
+            int ll = rd16(p + pos);
+            int q = pos + 2;
+            while (q + 4 <= pos + 2 + ll && q + 4 <= pos + el) {
+                int grp = rd16(p + q);
+                int kl = rd16(p + q + 2);
+                if (grp == 0x001d && kl == 32 && q + 4 + kl <= pos + el) { clientKey = p + q + 4; }
+                q = q + 4 + kl;
+            }
+        } else if (et == 13 && el >= 2) {
+            int ll = rd16(p + pos);
+            for (int i = 0; i + 1 < ll && 2 + i + 1 < el; i = i + 2) {
+                if (rd16(p + pos + 2 + i) == wantSig) { sigOk = true; }
+            }
+        }
+        pos = pos + el;
+    }
+    if (!v13) { fail(t, 70, "the client does not speak TLS 1.3"); return; }
+    if (clientKey == null) { fail(t, 40, "the client offered no X25519 key share"); return; }
+    if (!sigOk) { fail(t, 40, "the client does not accept our certificate's signature type"); return; }
+    int pref[3];
+    pref[0] = 0x1301; pref[1] = 0x1303; pref[2] = 0x1302;
+    int chosen = 0;
+    for (int k = 0; k < 3 && chosen == 0; k++) {
+        for (int i = 0; i + 1 < csLen; i = i + 2) {
+            if (rd16(cs + i) == pref[k]) { chosen = pref[k]; break; }
+        }
+    }
+    if (chosen == 0) { fail(t, 40, "no common cipher suite"); return; }
+    chooseSuite(t, chosen);
+    bufAdd(t->tx, full, fullLen);
+    if (!rnd(t, t->priv, 32)) { return; }
+    char pub[32];
+    x25519.base(&pub[0], t->priv);
+    char shared[32];
+    if (!x25519.scalarmult(&shared[0], t->priv, clientKey)) { fail(t, 47, "bad key share from the client"); return; }
+    // ServerHello
+    Buf* b = newBuf(256);
+    add16(b, 0x0303);
+    char rb[32];
+    if (!rnd(t, &rb[0], 32)) { return; }
+    bufAdd(b, &rb[0], 32);
+    add8(b, sidLen);
+    bufAdd(b, sid, sidLen);
+    add16(b, chosen);
+    add8(b, 0);
+    add16(b, 46);
+    add16(b, 43); add16(b, 2); add16(b, 0x0304);
+    add16(b, 51); add16(b, 36); add16(b, 0x001d); add16(b, 32);
+    bufAdd(b, &pub[0], 32);
+    sendHandshake(t, 2, b);
+    deriveHandshake(t, &shared[0]);
+    sendCcs(t);
+    setKeys(t, true, t->sHs);
+    setKeys(t, false, t->cHs);
+    // EncryptedExtensions
+    Buf* ee = newBuf(8);
+    add16(ee, 0);
+    sendHandshake(t, 8, ee);
+    // Certificate
+    Buf* cb = newBuf(4096);
+    add8(cb, 0);
+    Buf* lst = newBuf(4096);
+    for (int i = 0; i < c->chainCount; i++) {
+        add24(lst, c->chain[i]->len);
+        bufAdd(lst, c->chain[i]->der, c->chain[i]->len);
+        add16(lst, 0);
+    }
+    add24(cb, lst->len);
+    bufAdd(cb, lst->d, lst->len);
+    sendHandshake(t, 11, cb);
+    // CertificateVerify
+    char content[200];
+    int cl = verifyContent(t, "TLS 1.3, server CertificateVerify", &content[0]);
+    Buf* cv = newBuf(600);
+    char sig[1100];
+    int sl = 0;
+    char dig[64];
+    if (c->keyKind == 1) {
+        hash.digest(256, &content[0], cl, &dig[0]);
+        if (!rsa.signPss(c->rsaN, c->rsaNLen, c->rsaD, c->rsaDLen, 256, &dig[0], &sig[0])) { fail(t, 80, "cannot sign"); return; }
+        sl = c->rsaNLen;
+        add16(cv, 0x0804);
+    } else {
+        int hb = (c->ecBits == 384) ? 384 : 256;
+        hash.digest(hb, &content[0], cl, &dig[0]);
+        sl = ec.sign(c->ecBits, c->ecPriv, &dig[0], hb / 8, &sig[0]);
+        if (sl <= 0) { fail(t, 80, "cannot sign"); return; }
+        add16(cv, (c->ecBits == 384) ? 0x0503 : 0x0403);
+    }
+    add16(cv, sl);
+    bufAdd(cv, &sig[0], sl);
+    sendHandshake(t, 15, cv);
+    // Finished
+    char fin[64];
+    finishedData(t, t->sHs, &fin[0]);
+    Buf* fb = newBuf(64);
+    bufAdd(fb, &fin[0], t->hlen);
+    sendHandshake(t, 20, fb);
+    deriveApplication(t);
+    setKeys(t, true, t->sAp);
+    t->state = 11;
+}
+
+private void clientFinished(Tls* t, char* p, int n, char* full, int fullLen) {
+    char want[64];
+    finishedData(t, t->cHs, &want[0]);
+    if (n != t->hlen || !hash.equalConstantTime(p, &want[0], t->hlen)) { fail(t, 51, "the client's Finished message is wrong"); return; }
+    bufAdd(t->tx, full, fullLen);
+    setKeys(t, false, t->cAp);
+    t->state = ST_READY;
+}
+
+private void serverMessage(Tls* t, int type, char* p, int n, char* full, int fullLen) {
+    int s = t->state;
+    if (s == 10 && type == 1) { clientHello(t, p, n, full, fullLen); }
+    else if (s == 11 && type == 20) { clientFinished(t, p, n, full, fullLen); }
+    else if (s == ST_READY) { postHandshake(t, type, p, n); }
+    else { fail(t, 10, "unexpected handshake message"); }
+}
+
+// ---- the record reader -----------------------------------------------------------------------------------------------------------------
+private void processHandshake(Tls* t) {
+    while (t->state < ST_CLOSED) {
+        Buf* h = t->hs;
+        if (h->len < 4) { break; }
+        int type = h->d[0] & 255;
+        int len = rd24(h->d + 1);
+        if (len > 262144) { fail(t, 50, "handshake message too large"); return; }
+        if (h->len < 4 + len) { break; }
+        // the message must survive being dropped from the buffer while it is handled: copy it
+        char* msg = alloc(4 + len + 8);
+        for (int i = 0; i < 4 + len; i++) { msg[i] = h->d[i]; }
+        bufDrop(h, 4 + len);
+        if (t->server) { serverMessage(t, type, msg + 4, len, msg, 4 + len); }
+        else { clientMessage(t, type, msg + 4, len, msg, 4 + len); }
+    }
+}
+
+private void gotAlert(Tls* t, char* a, int n) {
+    if (n < 2) { fail(t, 50, "short alert"); return; }
+    int desc = a[1] & 255;
+    if (desc == 0) {
+        t->state = ST_CLOSED;
+    } else if (a[0] == 1 && desc == 90) {
+        t->state = ST_CLOSED;
+    } else {
+        char* msg = alloc(60);
+        format(msg, 60, "the peer sent alert %d", desc);
+        fail(t, 0, msg);
+    }
+}
+
+private void handleRecord(Tls* t, int type, char* hdr, char* body, int len) {
+    if (type == 20) { return; }                                  // change_cipher_spec (compatibility)
+    if (!t->rEnc) {
+        if (type == 22) {
+            bufAdd(t->hs, body, len);
+            processHandshake(t);
+        } else if (type == 21) {
+            gotAlert(t, body, len);
+        } else {
+            fail(t, 10, "unexpected record");
+        }
+        return;
+    }
+    if (type == 21) { gotAlert(t, body, len); return; }           // an alert from a peer that is not encrypting (yet)
+    if (type != 23) { fail(t, 10, "unexpected plaintext record"); return; }
+    if (len < 17) { fail(t, 50, "short record"); return; }
+    char nonce[12];
+    for (int i = 0; i < 12; i++) { nonce[i] = t->rIv[i]; }
+    for (int i = 0; i < 8; i++) { nonce[11 - i] = nonce[11 - i] ^ ((t->rSeq >> (8 * i)) & 255); }
+    char* out = t->scratch;
+    bool ok;
+    if (t->suite == 0x1303) { ok = chacha.open(t->rKey, &nonce[0], hdr, 5, body, len, out); }
+    else { ok = aes.open(t->rGcm, &nonce[0], hdr, 5, body, len, out); }
+    if (!ok) { fail(t, 20, "a record failed its integrity check"); return; }
+    t->rSeq++;
+    int plen = len - 16;
+    int j = plen - 1;
+    while (j >= 0 && out[j] == 0) { j--; }
+    if (j < 0) { fail(t, 10, "empty record"); return; }
+    int itype = out[j] & 255;
+    if (itype == 22) {
+        bufAdd(t->hs, out, j);
+        processHandshake(t);
+    } else if (itype == 23) {
+        if (t->state == ST_READY) { bufAdd(t->app, out, j); }
+        else { fail(t, 10, "application data before the handshake ended"); }
+    } else if (itype == 21) {
+        gotAlert(t, out, j);
+    } else {
+        fail(t, 10, "unknown record type");
+    }
+}
+
+private void pump(Tls* t) {
+    while (t->state < ST_CLOSED) {
+        Buf* b = t->inb;
+        if (b->len < 5) { break; }
+        int type = b->d[0] & 255;
+        int len = rd16(b->d + 3);
+        if (type < 20 || type > 23 || (b->d[1] & 255) != 3) { fail(t, 0, "this is not a TLS connection"); return; }
+        if (len > 16384 + 256) { fail(t, 22, "record too large"); return; }
+        if (b->len < 5 + len) { break; }
+        char hdr[5];
+        for (int i = 0; i < 5; i++) { hdr[i] = b->d[i]; }
+        // handle a copy of the record: the handlers may add to buffers
+        handleRecord(t, type, &hdr[0], b->d + 5, len);
+        bufDrop(b, 5 + len);
+    }
+}
+
+// ---- the interface ---------------------------------------------------------------------------------------------------------------------
+// bytes that came from the network; false once the session has failed (error says why)
+public bool feed(Tls* t, char* data, int n) {
+    if (t->state >= ST_CLOSED) { return t->state == ST_CLOSED; }
+    bufAdd(t->inb, data, n);
+    pump(t);
+    return t->state != ST_FAILED;
+}
+
+public int outLength(Tls* t) { return t->outb->len; }
+public char* outData(Tls* t) { return t->outb->d; }
+public void outConsumed(Tls* t, int n) { bufDrop(t->outb, n); }
+public bool ready(Tls* t) { return t->state == ST_READY; }
+public bool closed(Tls* t) { return t->state == ST_CLOSED; }
+public bool failed(Tls* t) { return t->state == ST_FAILED; }
+
+// how many bytes of application data wait to be read
+public int available(Tls* t) { return t->app->len - t->appPos; }
+
+public int readApp(Tls* t, char* buf, int max) {
+    int have = t->app->len - t->appPos;
+    if (have <= 0) { return 0; }
+    int n = (have < max) ? have : max;
+    for (int i = 0; i < n; i++) { buf[i] = t->app->d[t->appPos + i]; }
+    t->appPos = t->appPos + n;
+    if (t->appPos >= t->app->len) {
+        t->appPos = 0;
+        t->app->len = 0;
+    }
+    return n;
+}
+
+// queue application data (encrypted into the output); false if the session is not ready
+public bool write(Tls* t, char* data, int n) {
+    if (t->state != ST_READY || t->closeSent) { return false; }
+    if (n > 0) { sendRecord(t, 23, data, n); }
+    return true;
+}
+
+// queue the close_notify alert
+public void shutdown(Tls* t) {
+    if (t->state == ST_READY && !t->closeSent) {
+        sendAlert(t, 1, 0);
+        t->closeSent = true;
+    }
+}
+
+public char* peerName(Tls* t) {
+    if (t->leaf == null) { return null; }
+    return t->leaf->cn;
+}
+
+// ---- server configuration --------------------------------------------------------------------------------------------------------------
+// a private key (PKCS#1 or PKCS#8 RSA, SEC1 or PKCS#8 EC P-256/P-384) from PEM text into cfg; false if unusable
+private bool loadKey(Config* cfg, char* pem) {
+    int n = 0;
+    int next = 0;
+    bool pkcs8 = false;
+    char* der = x509.pemBlock(pem, "RSA PRIVATE KEY", 0, &n, &next);
+    bool ec1 = false;
+    if (der == null) {
+        der = x509.pemBlock(pem, "EC PRIVATE KEY", 0, &n, &next);
+        ec1 = (der != null);
+    }
+    if (der == null) {
+        der = x509.pemBlock(pem, "PRIVATE KEY", 0, &n, &next);
+        pkcs8 = (der != null);
+    }
+    if (der == null) { return false; }
+    int tag; int st;
+    int l = x509.readTlv(der, n, 0, &tag, &st);
+    if (l < 0 || tag != 0x30) { return false; }
+    if (pkcs8) {
+        // SEQUENCE { INTEGER 0, SEQUENCE { OID, params }, OCTET STRING { key } }
+        int vt; int vs;
+        int vl = x509.readTlv(der, n, st, &vt, &vs);
+        int at; int as;
+        int al = x509.readTlv(der, n, vs + vl, &at, &as);
+        int ot; int os;
+        int ol = x509.readTlv(der, n, as, &ot, &os);
+        if (vl < 0 || al < 0 || ol < 0) { return false; }
+        bool isRsa = (ol == 9 && (der[os + 6] & 255) == 1 && (der[os + 8] & 255) == 1);
+        int kt; int ks;
+        int kl = x509.readTlv(der, n, as + al, &kt, &ks);
+        if (kl < 0 || kt != 4) { return false; }
+        der = der + ks;
+        n = kl;
+        if (!isRsa) { ec1 = true; }
+        l = x509.readTlv(der, n, 0, &tag, &st);
+        if (l < 0 || tag != 0x30) { return false; }
+    }
+    if (ec1) {
+        // SEQUENCE { INTEGER 1, OCTET STRING privateKey, ... }
+        int vt; int vs;
+        int vl = x509.readTlv(der, n, st, &vt, &vs);
+        int pt; int ps;
+        int pl = x509.readTlv(der, n, vs + vl, &pt, &ps);
+        if (vl < 0 || pl < 0 || pt != 4) { return false; }
+        if (pl != 32 && pl != 48) { return false; }
+        cfg->keyKind = 2;
+        cfg->ecBits = pl * 8;
+        cfg->ecPriv = alloc(pl + 8);
+        for (int i = 0; i < pl; i++) { cfg->ecPriv[i] = der[ps + i]; }
+        return true;
+    }
+    // RSAPrivateKey: SEQUENCE { version, n, e, d, ... }
+    int vt; int vs;
+    int vl = x509.readTlv(der, n, st, &vt, &vs);
+    int nt; int ns;
+    int nl = x509.readTlv(der, n, vs + vl, &nt, &ns);
+    int et; int es;
+    int el = x509.readTlv(der, n, ns + nl, &et, &es);
+    int dt; int ds;
+    int dl = x509.readTlv(der, n, es + el, &dt, &ds);
+    if (vl < 0 || nl < 0 || el < 0 || dl < 0) { return false; }
+    while (nl > 1 && der[ns] == 0) { ns++; nl--; }
+    while (dl > 1 && der[ds] == 0) { ds++; dl--; }
+    cfg->keyKind = 1;
+    cfg->rsaN = alloc(nl + 8);
+    for (int i = 0; i < nl; i++) { cfg->rsaN[i] = der[ns + i]; }
+    cfg->rsaNLen = nl;
+    cfg->rsaD = alloc(dl + 8);
+    for (int i = 0; i < dl; i++) { cfg->rsaD[i] = der[ds + i]; }
+    cfg->rsaDLen = dl;
+    return true;
+}
+
+// a server configuration from a PEM certificate chain (the server's certificate first) and the PEM private key; null if unusable
+public Config* loadConfig(char* certPem, char* keyPem) {
+    Config* c = new Config();
+    c->chain = (x509.Cert**) alloc(16 * 8);
+    c->chainCount = x509.parsePem(certPem, c->chain, 16);
+    if (c->chainCount == 0) { lastErr = "no certificate in the PEM text"; return null; }
+    if (!loadKey(c, keyPem)) { lastErr = "cannot read the private key (RSA or EC P-256/P-384 PEM)"; return null; }
+    return c;
+}
+
+// a server session for a new connection
+public Tls* accept(Config* cfg) {
+    Tls* t = newSession(true);
+    t->config = cfg;
+    t->state = 10;
+    return t;
+}
+
+// ---- blocking streams over sockets ---------------------------------------------------------------------------------------------------
+public class Stream {
+    public int fd;
+    public Tls* t;
+    public int timeoutMs;
+}
+
+private bool flush(Stream* s) {
+    Tls* t = s->t;
+    while (outLength(t) > 0) {
+        int n = net.send(s->fd, outData(t), outLength(t));
+        if (n <= 0) { return false; }
+        outConsumed(t, n);
+    }
+    return true;
+}
+
+// reads from the socket into the session; false on EOF / error
+private bool pull(Stream* s) {
+    if (!net.waitReadable(s->fd, s->timeoutMs)) { lastErr = "timed out"; return false; }
+    char buf[4096];
+    int n = net.recv(s->fd, &buf[0], 4096);
+    if (n <= 0) { return false; }
+    feed(s->t, &buf[0], n);
+    return true;
+}
+
+private bool handshake(Stream* s) {
+    while (!ready(s->t)) {
+        if (!flush(s)) { if (lastErr == null) { lastErr = "the connection failed"; } return false; }
+        if (failed(s->t)) { lastErr = s->t->error; return false; }
+        if (closed(s->t)) { lastErr = "the peer closed the connection"; return false; }
+        if (!pull(s)) {
+            if (failed(s->t)) { flush(s); lastErr = s->t->error; }
+            else if (lastErr == null) { lastErr = "the connection ended during the handshake"; }
+            return false;
+        }
+    }
+    flush(s);
+    return true;
+}
+
+// opens a TCP connection and runs the client handshake; null on failure (lastError() says why)
+public Stream* connect(char* host, int port, bool verify) {
+    lastErr = null;
+    int fd = net.connectTimeout(host, port, 5000);
+    if (fd < 0) { lastErr = "cannot connect"; return null; }
+    Stream* s = new Stream();
+    s->fd = fd;
+    s->timeoutMs = 10000;
+    s->t = client(host, verify);
+    if (!handshake(s)) {
+        net.close(fd);
+        return null;
+    }
+    return s;
+}
+
+// the server handshake on an accepted socket
+public Stream* acceptStream(int fd, Config* cfg) {
+    lastErr = null;
+    Stream* s = new Stream();
+    s->fd = fd;
+    s->timeoutMs = 10000;
+    s->t = accept(cfg);
+    if (!handshake(s)) { return null; }
+    return s;
+}
+
+public bool sendAll(Stream* s, char* data, int n) {
+    if (!write(s->t, data, n)) { return false; }
+    return flush(s);
+}
+
+// blocking read of at least one byte of application data; 0 at the end of the stream, -1 on an error
+public int recv(Stream* s, char* buf, int max) {
+    while (available(s->t) == 0) {
+        if (closed(s->t)) { return 0; }
+        if (failed(s->t)) { return -1; }
+        if (!pull(s)) { return (failed(s->t)) ? -1 : 0; }
+        flush(s);
+    }
+    return readApp(s->t, buf, max);
+}
+
+public void close(Stream* s) {
+    shutdown(s->t);
+    flush(s);
+    net.close(s->fd);
+}

@@ -115,6 +115,78 @@ for n, an in ((0, 0), (1, 0), (15, 5), (16, 16), (17, 3), (64, 13), (65, 0), (10
     bad = bytearray(ct); bad[-1] ^= 0x80
     case(nm + " tampered", 'ccOpen("%s", "%s", "%s", "%s")' % (H(key), H(iv), H(aad), H(bytes(bad))), "rejected")
 
+
+# ---- X.509 chains ------------------------------------------------------------------------------------------------------------------
+import datetime
+from cryptography import x509 as cx
+from cryptography.x509.oid import NameOID
+NOW = 1790000000       # the fixed "current time" of the test (2026-09-21)
+def dt(year): return datetime.datetime(year, 1, 1, tzinfo=datetime.timezone.utc)
+def mkname(cn): return cx.Name([cx.NameAttribute(NameOID.COMMON_NAME, cn)])
+def mkcert(subject_cn, key, issuer_cn, issuer_key, ca, sans=None, nb=2026, na=2030, hash_alg=None, pss=False, ski_ca_flag=True, pathlen=None):
+    b = cx.CertificateBuilder().subject_name(mkname(subject_cn)).issuer_name(mkname(issuer_cn)).public_key(key.public_key())
+    b = b.serial_number(random.getrandbits(63) + 1).not_valid_before(dt(nb)).not_valid_after(dt(na))
+    if ca is not None:
+        b = b.add_extension(cx.BasicConstraints(ca=ca, path_length=None), critical=True)
+    if sans:
+        names = []
+        for x in sans:
+            if x[0].isdigit():
+                import ipaddress
+                names.append(cx.IPAddress(ipaddress.ip_address(x)))
+            else:
+                names.append(cx.DNSName(x))
+        b = b.add_extension(cx.SubjectAlternativeName(names), critical=False)
+    halg = hash_alg or hashes.SHA256()
+    if isinstance(issuer_key, rsa.RSAPrivateKey) and pss:
+        return b.sign(issuer_key, halg, rsa_padding=padding.PSS(mgf=padding.MGF1(halg), salt_length=halg.digest_size))
+    return b.sign(issuer_key, halg)
+def pem(*certs): return ''.join(c.public_bytes(serialization.Encoding.PEM).decode() for c in certs)
+def lit(text): return '"' + text.replace('\n', '\\n') + '"'
+
+rootkey = rsa.generate_private_key(65537, 2048); root = mkcert("Test Root", rootkey, "Test Root", rootkey, True, hash_alg=hashes.SHA384())
+other_key = rsa.generate_private_key(65537, 2048); other = mkcert("Other Root", other_key, "Other Root", other_key, True)
+ikey = ec.generate_private_key(ec.SECP256R1()); inter = mkcert("Test Intermediate", ikey, "Test Root", rootkey, True, hash_alg=hashes.SHA256())
+ikey384 = ec.generate_private_key(ec.SECP384R1()); inter384 = mkcert("Test Intermediate 384", ikey384, "Test Root", rootkey, True, hash_alg=hashes.SHA384(), pss=True)
+lkey = rsa.generate_private_key(65537, 2048)
+leaf_a = mkcert("a.example.test", lkey, "Test Intermediate", ikey, False, ["a.example.test", "*.wild.example.test", "10.1.2.3"], hash_alg=hashes.SHA256())
+leaf_b = mkcert("b.example.test", ec.generate_private_key(ec.SECP384R1()), "Test Intermediate 384", ikey384, False, ["b.example.test"], hash_alg=hashes.SHA384())
+leaf_cn = mkcert("cn-only.example.test", lkey, "Test Intermediate", ikey, False, None)
+leaf_old = mkcert("a.example.test", lkey, "Test Intermediate", ikey, False, ["a.example.test"], nb=2018, na=2019)
+leaf_future = mkcert("a.example.test", lkey, "Test Intermediate", ikey, False, ["a.example.test"], nb=2029, na=2031)
+leaf_direct = mkcert("direct.example.test", lkey, "Test Root", rootkey, False, ["direct.example.test"], hash_alg=hashes.SHA256())
+fakeca_key = ec.generate_private_key(ec.SECP256R1()); fakeca = mkcert("Not A CA", fakeca_key, "Test Root", rootkey, False)
+leaf_bad = mkcert("evil.example.test", lkey, "Not A CA", fakeca_key, False, ["evil.example.test"])
+selfsigned = mkcert("self.example.test", lkey, "self.example.test", lkey, False, ["self.example.test"])
+# a certificate whose signature was made by a different key than the one in the issuer certificate
+imposter_key = ec.generate_private_key(ec.SECP256R1())
+leaf_forged = mkcert("a.example.test", lkey, "Test Intermediate", imposter_key, False, ["a.example.test"])
+
+def vcase(name, chain, roots, host, want):
+    line('    chk("%s", chainCheck(%s, %s, "%s"), "%s");' % (name, lit(pem(*chain)), lit(pem(*roots)), host, want), "%s ok" % name)
+
+vcase("chain rsa root, ec intermediate, rsa leaf", [leaf_a, inter], [root], "a.example.test", "trusted")
+vcase("chain without the intermediate in the roots", [leaf_a, inter], [root, inter], "a.example.test", "trusted")
+vcase("chain rsa-pss intermediate, p384 leaf", [leaf_b, inter384], [root], "b.example.test", "trusted")
+vcase("chain leaf signed directly by the root", [leaf_direct], [root], "direct.example.test", "trusted")
+vcase("host name case", [leaf_a, inter], [root], "A.Example.TEST", "trusted")
+vcase("wildcard one label", [leaf_a, inter], [root], "foo.wild.example.test", "trusted")
+vcase("wildcard not two labels", [leaf_a, inter], [root], "x.foo.wild.example.test", "the certificate is for a different host name")
+vcase("wildcard not the bare domain", [leaf_a, inter], [root], "wild.example.test", "the certificate is for a different host name")
+vcase("ip address san", [leaf_a, inter], [root], "10.1.2.3", "trusted")
+vcase("other ip address", [leaf_a, inter], [root], "10.1.2.4", "the certificate is for a different host name")
+vcase("common name only", [leaf_cn, inter], [root], "cn-only.example.test", "trusted")
+vcase("wrong host", [leaf_a, inter], [root], "evil.example.test", "the certificate is for a different host name")
+vcase("expired", [leaf_old, inter], [root], "a.example.test", "a certificate has expired")
+vcase("not yet valid", [leaf_future, inter], [root], "a.example.test", "a certificate is not valid yet")
+vcase("unknown root", [leaf_a, inter], [other], "a.example.test", "the certificate was issued by an unknown authority")
+vcase("missing intermediate", [leaf_a], [root], "a.example.test", "the certificate was issued by an unknown authority")
+vcase("self signed", [selfsigned], [root], "self.example.test", "the certificate is self signed (not trusted)")
+vcase("self signed but trusted", [selfsigned], [selfsigned], "self.example.test", "trusted")
+vcase("intermediate that is not a CA", [leaf_bad, fakeca], [root], "evil.example.test", "the certificate was issued by an unknown authority")
+vcase("forged signature", [leaf_forged, inter], [root], "a.example.test", "the certificate was issued by an unknown authority")
+vcase("no roots", [leaf_a, inter], [], "a.example.test", "no trusted root certificates are installed")
+
 # SECTIONS-END (more sections are added above this line)
 
 prelude = r'''// generated by tests/gen/gen_crypto_test.py from reference values of Python's `cryptography` and `hashlib`: do not edit
@@ -126,6 +198,9 @@ import ec;
 import x25519;
 import aes;
 import chacha;
+import x509;
+import encoding;
+import cstring;
 
 int bad = 0;
 
@@ -263,6 +338,41 @@ char* ccOpen(char* keyHex, char* ivHex, char* aadHex, char* ctHex) {
     char* out = alloc(cl + 16);
     if (!chacha.open(k, iv, aad, al, ct, cl, out)) { return "rejected"; }
     return secure.toHex(out, cl - 16);
+}
+
+char* chainCheck(char* chainPem, char* rootPem, char* host) {
+    x509.clearRoots();
+    x509.addRootPem(rootPem);
+    x509.Cert** chain = (x509.Cert**) alloc(64 * 8);
+    int count = 0;
+    // read the CERTIFICATE blocks of chainPem
+    int at = 0;
+    while (true) {
+        int b = findText(chainPem + at, "-----BEGIN CERTIFICATE-----");
+        if (b < 0) { break; }
+        int s = at + b + 27;
+        int e = findText(chainPem + s, "-----END CERTIFICATE-----");
+        if (e < 0) { break; }
+        char* text = alloc(e + 1);
+        memcpy(text, chainPem + s, e);
+        text[e] = 0;
+        char* der = alloc(e);
+        int n = encoding.base64Decode(text, der);
+        chain[count] = x509.parse(der, n);
+        if (chain[count] == null) { return "parse failed"; }
+        count++;
+        at = s + e + 25;
+    }
+    char* why = x509.verifyChain(chain, count, host, 1790000000);
+    return (why == null) ? "trusted" : why;
+}
+
+int findText(char* hay, char* needle) {
+    int nl = strlen(needle);
+    for (int i = 0; hay[i] != 0; i++) {
+        if (hay[i] == needle[0] && strncmp(hay + i, needle, nl) == 0) { return i; }
+    }
+    return -1;
 }
 
 int main() {

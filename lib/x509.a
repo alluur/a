@@ -1,0 +1,600 @@
+// =============================================================================
+//  x509 - certificates: DER / PEM parsing, signature and chain checks, host names, trust store             import x509;
+//
+//    x509.Cert* c = x509.parse(der, len);                       // null if it is not a certificate we understand
+//    x509.loadSystemRoots();                                    // /etc/ssl/certs/ca-certificates.crt and friends, once
+//    x509.addRootPem(pemText);                                  // trust one more certificate (self signed test servers)
+//    char* why = x509.verifyChain(chain, count, "example.com"); // null when the chain is trusted and the name fits
+//
+//  Understood: RSA (PKCS#1 v1.5 and PSS) and ECDSA (P-256, P-384) public keys and signatures with SHA-1/256/384/512,
+//  subject alternative names (DNS with a leading wildcard label, IP addresses), basic constraints and validity dates.
+//  Not checked: revocation, name constraints, policies, key usage.
+// =============================================================================
+import hash;
+import rsa;
+import ec;
+import encoding;
+import ctime;
+import cstring;
+module x509;
+
+public class Cert {
+    public char* der;
+    public int len;
+    public int tbsOff; public int tbsLen;
+    public int issuerOff; public int issuerLen;
+    public int subjectOff; public int subjectLen;
+    public int notBefore; public int notAfter;
+    public int keyKind;                 // 1 RSA, 2 EC
+    public int curve;                   // 256 or 384 (EC)
+    public int keyOff; public int keyLen;      // RSA: modulus; EC: the 04||X||Y point
+    public int expOff; public int expLen;      // RSA: public exponent
+    public int sigKind;                 // 1 RSA PKCS#1 v1.5, 2 RSA-PSS, 3 ECDSA
+    public int sigHash;                 // 160, 256, 384 or 512
+    public int sigOff; public int sigLen;
+    public bool hasBasic;
+    public bool isCA;
+    public char* cn;
+    public char** san;
+    public bool* sanIp;
+    public int sanCount;
+}
+
+// ---- DER ---------------------------------------------------------------------------------------------------------------------------
+// reads the tag and length at 'at'; returns the content length (or -1) and sets *tag and *start (offset of the content)
+private int tlv(char* d, int len, int at, int* tag, int* start) {
+    if (at + 2 > len) { return -1; }
+    *tag = d[at] & 255;
+    int l = d[at + 1] & 255;
+    int p = at + 2;
+    if (l >= 128) {
+        int nb = l & 127;
+        if (nb == 0 || nb > 4 || p + nb > len) { return -1; }
+        l = 0;
+        for (int i = 0; i < nb; i++) { l = (l << 8) | (d[p + i] & 255); }
+        p = p + nb;
+    }
+    if (l < 0 || p + l > len) { return -1; }
+    *start = p;
+    return l;
+}
+
+private bool oidIs(char* d, int off, int n, char* hex) {
+    if (strlen(hex) != n * 2) { return false; }
+    char* h = "0123456789ABCDEF";
+    for (int i = 0; i < n; i++) {
+        int b = d[off + i] & 255;
+        if (hex[2 * i] != h[b >> 4] || hex[2 * i + 1] != h[b & 15]) { return false; }
+    }
+    return true;
+}
+
+private int daysFromCivil(int y, int m, int d) {
+    if (m <= 2) { y--; }
+    int era = (y >= 0 ? y : y - 399) / 400;
+    int yoe = y - era * 400;
+    int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+private int two(char* d, int at) { return ((d[at] - '0') * 10) + (d[at + 1] - '0'); }
+
+// UTCTime (0x17) or GeneralizedTime (0x18) at off, as seconds since 1970 (0 if malformed)
+private int parseTime(char* d, int tag, int off, int n) {
+    int y; int p;
+    if (tag == 0x17 && n >= 12) {
+        y = two(d, off);
+        y = (y < 50) ? 2000 + y : 1900 + y;
+        p = off + 2;
+    } else if (tag == 0x18 && n >= 14) {
+        y = two(d, off) * 100 + two(d, off + 2);
+        p = off + 4;
+    } else {
+        return 0;
+    }
+    int mo = two(d, p); int da = two(d, p + 2); int h = two(d, p + 4); int mi = two(d, p + 6); int s = two(d, p + 8);
+    return daysFromCivil(y, mo, da) * 86400 + h * 3600 + mi * 60 + s;
+}
+
+private char* textOf(char* d, int off, int n) {
+    char* t = alloc(n + 1);
+    for (int i = 0; i < n; i++) { t[i] = d[off + i]; }
+    t[n] = 0;
+    return t;
+}
+
+private void addSan(Cert* c, char* text, bool ip) {
+    if (c->sanCount >= 100) { return; }
+    c->san[c->sanCount] = text;
+    c->sanIp[c->sanCount] = ip;
+    c->sanCount++;
+}
+
+// the hash named by a hash algorithm OID at off (SHA-1/256/384/512), else 0
+private int hashOid(char* d, int off, int n) {
+    if (oidIs(d, off, n, "2B0E03021A")) { return 160; }
+    if (oidIs(d, off, n, "608648016503040201")) { return 256; }
+    if (oidIs(d, off, n, "608648016503040202")) { return 384; }
+    if (oidIs(d, off, n, "608648016503040203")) { return 512; }
+    return 0;
+}
+
+// the AlgorithmIdentifier SEQUENCE content at off..off+n: sets kind and hash
+private bool sigAlgorithm(Cert* c, char* d, int off, int n) {
+    int tag; int st;
+    int ol = tlv(d, off + n, off, &tag, &st);
+    if (ol < 0 || tag != 6) { return false; }
+    if (oidIs(d, st, ol, "2A864886F70D010105")) { c->sigKind = 1; c->sigHash = 160; return true; }
+    if (oidIs(d, st, ol, "2A864886F70D01010B")) { c->sigKind = 1; c->sigHash = 256; return true; }
+    if (oidIs(d, st, ol, "2A864886F70D01010C")) { c->sigKind = 1; c->sigHash = 384; return true; }
+    if (oidIs(d, st, ol, "2A864886F70D01010D")) { c->sigKind = 1; c->sigHash = 512; return true; }
+    if (oidIs(d, st, ol, "2A8648CE3D040302")) { c->sigKind = 3; c->sigHash = 256; return true; }
+    if (oidIs(d, st, ol, "2A8648CE3D040303")) { c->sigKind = 3; c->sigHash = 384; return true; }
+    if (oidIs(d, st, ol, "2A8648CE3D040304")) { c->sigKind = 3; c->sigHash = 512; return true; }
+    if (oidIs(d, st, ol, "2A864886F70D01010A")) {
+        // RSASSA-PSS-params: SEQUENCE { [0] hashAlgorithm, [1] maskGen, [2] saltLength }: the hash is the first thing in [0]
+        c->sigKind = 2;
+        c->sigHash = 1;
+        int p = st + ol;
+        int pt; int ps;
+        int pl = tlv(d, off + n, p, &pt, &ps);
+        if (pl >= 0 && pt == 0x30) {
+            int a = ps;
+            int at; int as;
+            int al = tlv(d, ps + pl, a, &at, &as);
+            if (al >= 0 && at == 0xA0) {
+                int ht; int hs;
+                int hl = tlv(d, as + al, as, &ht, &hs);          // AlgorithmIdentifier
+                if (hl >= 0 && ht == 0x30) {
+                    int ot; int os;
+                    int oll = tlv(d, hs + hl, hs, &ot, &os);
+                    if (oll >= 0 && ot == 6) { c->sigHash = hashOid(d, os, oll); }
+                }
+            } else if (pl == 0) {
+                c->sigHash = 0;
+            }
+        }
+        return c->sigHash != 0;
+    }
+    return false;
+}
+
+private void parseName(Cert* c, char* d, int off, int n) {
+    int p = off;
+    int end = off + n;
+    while (p < end) {
+        int t; int s;
+        int l = tlv(d, end, p, &t, &s);
+        if (l < 0) { return; }
+        if (t == 0x31) {
+            int q = s;
+            while (q < s + l) {
+                int t2; int s2;
+                int l2 = tlv(d, s + l, q, &t2, &s2);
+                if (l2 < 0) { break; }
+                int t3; int s3;
+                int l3 = tlv(d, s2 + l2, s2, &t3, &s3);
+                if (l3 >= 0 && t3 == 6 && oidIs(d, s3, l3, "550403")) {
+                    int t4; int s4;
+                    int l4 = tlv(d, s2 + l2, s3 + l3, &t4, &s4);
+                    if (l4 >= 0) { c->cn = textOf(d, s4, l4); }
+                }
+                q = s2 + l2;
+            }
+        }
+        p = s + l;
+    }
+}
+
+private void parseExtensions(Cert* c, char* d, int off, int n) {
+    int p = off;
+    int end = off + n;
+    while (p < end) {
+        int t; int s;
+        int l = tlv(d, end, p, &t, &s);
+        if (l < 0) { return; }
+        int t1; int s1;
+        int l1 = tlv(d, s + l, s, &t1, &s1);                    // the OID
+        if (l1 >= 0 && t1 == 6) {
+            int q = s1 + l1;
+            int t2; int s2;
+            int l2 = tlv(d, s + l, q, &t2, &s2);
+            if (l2 >= 0 && t2 == 1) {                           // critical flag
+                q = s2 + l2;
+                l2 = tlv(d, s + l, q, &t2, &s2);
+            }
+            if (l2 >= 0 && t2 == 4) {
+                if (oidIs(d, s1, l1, "551D11")) {               // subjectAltName
+                    int t3; int s3;
+                    int l3 = tlv(d, s2 + l2, s2, &t3, &s3);
+                    if (l3 >= 0 && t3 == 0x30) {
+                        int g = s3;
+                        while (g < s3 + l3) {
+                            int gt; int gs;
+                            int gl = tlv(d, s3 + l3, g, &gt, &gs);
+                            if (gl < 0) { break; }
+                            if (gt == 0x82) {
+                                addSan(c, textOf(d, gs, gl), false);
+                            } else if (gt == 0x87 && gl == 4) {
+                                char* ip = alloc(20);
+                                format(ip, 20, "%d.%d.%d.%d", d[gs] & 255, d[gs + 1] & 255, d[gs + 2] & 255, d[gs + 3] & 255);
+                                addSan(c, ip, true);
+                            }
+                            g = gs + gl;
+                        }
+                    }
+                } else if (oidIs(d, s1, l1, "551D13")) {        // basicConstraints
+                    c->hasBasic = true;
+                    int t3; int s3;
+                    int l3 = tlv(d, s2 + l2, s2, &t3, &s3);
+                    if (l3 >= 0 && t3 == 0x30 && l3 > 0) {
+                        int t4; int s4;
+                        int l4 = tlv(d, s3 + l3, s3, &t4, &s4);
+                        if (l4 >= 1 && t4 == 1) { c->isCA = (d[s4] != 0); }
+                    }
+                }
+            }
+        }
+        p = s + l;
+    }
+}
+
+// the certificate in DER form (the bytes are not copied: keep them alive)
+public Cert* parse(char* d, int len) {
+    int t; int s;
+    int l = tlv(d, len, 0, &t, &s);
+    if (l < 0 || t != 0x30) { return null; }
+    Cert* c = new Cert();
+    c->der = d;
+    c->len = s + l;
+    c->san = (char**) alloc(100 * 8);
+    c->sanIp = (bool*) alloc(100 * 8);
+    // tbsCertificate
+    int tt; int ts;
+    int tl = tlv(d, len, s, &tt, &ts);
+    if (tl < 0 || tt != 0x30) { return null; }
+    c->tbsOff = s;
+    c->tbsLen = (ts - s) + tl;
+    int p = ts;
+    int end = ts + tl;
+    int ft; int fs;
+    int fl = tlv(d, end, p, &ft, &fs);
+    if (fl < 0) { return null; }
+    if (ft == 0xA0) {                                           // version
+        p = fs + fl;
+        fl = tlv(d, end, p, &ft, &fs);
+        if (fl < 0) { return null; }
+    }
+    p = fs + fl;                                                // after the serial number
+    fl = tlv(d, end, p, &ft, &fs);                              // signature algorithm (inside tbs)
+    if (fl < 0 || ft != 0x30) { return null; }
+    p = fs + fl;
+    fl = tlv(d, end, p, &ft, &fs);                              // issuer
+    if (fl < 0 || ft != 0x30) { return null; }
+    c->issuerOff = p;
+    c->issuerLen = (fs - p) + fl;
+    p = fs + fl;
+    fl = tlv(d, end, p, &ft, &fs);                              // validity
+    if (fl < 0 || ft != 0x30) { return null; }
+    int vt; int vs;
+    int vl = tlv(d, fs + fl, fs, &vt, &vs);
+    if (vl < 0) { return null; }
+    c->notBefore = parseTime(d, vt, vs, vl);
+    int v2 = vs + vl;
+    int vt2; int vs2;
+    int vl2 = tlv(d, fs + fl, v2, &vt2, &vs2);
+    if (vl2 < 0) { return null; }
+    c->notAfter = parseTime(d, vt2, vs2, vl2);
+    p = fs + fl;
+    fl = tlv(d, end, p, &ft, &fs);                              // subject
+    if (fl < 0 || ft != 0x30) { return null; }
+    c->subjectOff = p;
+    c->subjectLen = (fs - p) + fl;
+    parseName(c, d, fs, fl);
+    p = fs + fl;
+    fl = tlv(d, end, p, &ft, &fs);                              // subjectPublicKeyInfo
+    if (fl < 0 || ft != 0x30) { return null; }
+    int spkiEnd = fs + fl;
+    int at; int as;
+    int al = tlv(d, spkiEnd, fs, &at, &as);                     // AlgorithmIdentifier
+    if (al < 0 || at != 0x30) { return null; }
+    int ot; int os;
+    int ol = tlv(d, as + al, as, &ot, &os);
+    if (ol < 0 || ot != 6) { return null; }
+    int bt; int bs;
+    int bl = tlv(d, spkiEnd, as + al, &bt, &bs);                // the BIT STRING of the key
+    if (bl < 2 || bt != 3) { return null; }
+    if (oidIs(d, os, ol, "2A864886F70D010101")) {
+        c->keyKind = 1;
+        int qt; int qs;
+        int ql = tlv(d, bs + bl, bs + 1, &qt, &qs);             // RSAPublicKey SEQUENCE
+        if (ql < 0 || qt != 0x30) { return null; }
+        int nt; int ns;
+        int nl = tlv(d, qs + ql, qs, &nt, &ns);
+        if (nl < 0 || nt != 2) { return null; }
+        c->keyOff = ns; c->keyLen = nl;
+        while (c->keyLen > 1 && d[c->keyOff] == 0) { c->keyOff++; c->keyLen--; }
+        int et; int es;
+        int el = tlv(d, qs + ql, ns + nl, &et, &es);
+        if (el < 0 || et != 2) { return null; }
+        c->expOff = es; c->expLen = el;
+    } else if (oidIs(d, os, ol, "2A8648CE3D0201")) {
+        c->keyKind = 2;
+        int ct; int cs;
+        int cl = tlv(d, as + al, os + ol, &ct, &cs);
+        if (cl < 0 || ct != 6) { return null; }
+        if (oidIs(d, cs, cl, "2A8648CE3D030107")) { c->curve = 256; }
+        else if (oidIs(d, cs, cl, "2B81040022")) { c->curve = 384; }
+        else { c->curve = 0; }
+        c->keyOff = bs + 1;
+        c->keyLen = bl - 1;
+    }
+    p = spkiEnd;
+    while (p < end) {                                           // optional parts and the extensions [3]
+        fl = tlv(d, end, p, &ft, &fs);
+        if (fl < 0) { break; }
+        if (ft == 0xA3) {
+            int xt; int xs;
+            int xl = tlv(d, fs + fl, fs, &xt, &xs);
+            if (xl >= 0 && xt == 0x30) { parseExtensions(c, d, xs, xl); }
+        }
+        p = fs + fl;
+    }
+    // the outer signature algorithm and the signature
+    int q = ts + tl;
+    int ct2; int cs2;
+    int cl2 = tlv(d, len, q, &ct2, &cs2);
+    if (cl2 < 0 || ct2 != 0x30) { return null; }
+    if (!sigAlgorithm(c, d, cs2, cl2)) { c->sigKind = 0; }
+    q = cs2 + cl2;
+    int gt; int gs;
+    int gl = tlv(d, len, q, &gt, &gs);
+    if (gl < 2 || gt != 3) { return null; }
+    c->sigOff = gs + 1;
+    c->sigLen = gl - 1;
+    return c;
+}
+
+// ---- signatures ----------------------------------------------------------------------------------------------------------------------
+// verify the signature 'sig' (len n) over 'digest' made with c's public key; kind 1 PKCS#1, 2 PSS, 3 ECDSA (DER encoded)
+public bool verifyWithKey(Cert* key, int kind, int hbits, char* digest, char* sig, int n) {
+    char* d = key->der;
+    if (kind == 1 || kind == 2) {
+        if (key->keyKind != 1) { return false; }
+        if (kind == 1) {
+            return rsa.verifyPkcs1(d + key->keyOff, key->keyLen, d + key->expOff, key->expLen, hbits, digest, sig, n);
+        }
+        return rsa.verifyPss(d + key->keyOff, key->keyLen, d + key->expOff, key->expLen, hbits, digest, sig, n);
+    }
+    if (kind == 3) {
+        if (key->keyKind != 2 || key->curve == 0) { return false; }
+        // SEQUENCE { INTEGER r, INTEGER s }
+        int t; int s;
+        int l = tlv(sig, n, 0, &t, &s);
+        if (l < 0 || t != 0x30) { return false; }
+        int rt; int rs;
+        int rl = tlv(sig, s + l, s, &rt, &rs);
+        if (rl < 0 || rt != 2) { return false; }
+        int st; int ss;
+        int sl = tlv(sig, s + l, rs + rl, &st, &ss);
+        if (sl < 0 || st != 2) { return false; }
+        return ec.verify(key->curve, d + key->keyOff, key->keyLen, digest, hbits / 8, sig + rs, rl, sig + ss, sl);
+    }
+    return false;
+}
+
+// did 'issuer' sign c?
+public bool signedBy(Cert* c, Cert* issuer) {
+    if (c->sigKind == 0) { return false; }
+    char dig[64];
+    int dl = hash.digest(c->sigHash, c->der + c->tbsOff, c->tbsLen, &dig[0]);
+    if (dl <= 0) { return false; }
+    return verifyWithKey(issuer, c->sigKind, c->sigHash, &dig[0], c->der + c->sigOff, c->sigLen);
+}
+
+private bool sameBytes(char* a, char* b, int n) {
+    for (int i = 0; i < n; i++) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+public bool isIssuer(Cert* c, Cert* issuer) {
+    return c->issuerLen == issuer->subjectLen && sameBytes(c->der + c->issuerOff, issuer->der + issuer->subjectOff, c->issuerLen);
+}
+
+public bool isSelfIssued(Cert* c) { return isIssuer(c, c); }
+
+// ---- host names ----------------------------------------------------------------------------------------------------------------------
+private bool lowerEq(char* a, char* b) {
+    int i = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (toLower(a[i]) != toLower(b[i])) { return false; }
+        i++;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
+// is 'pattern' (possibly *.example.com) a match for the host name
+private bool nameMatches(char* pattern, char* host) {
+    if (pattern[0] == '*' && pattern[1] == '.') {
+        int dot = indexOf(host, '.');
+        if (dot <= 0) { return false; }
+        // the wildcard stands for exactly one label, and the rest needs at least two labels
+        char* rest = pattern + 2;
+        if (indexOf(rest, '.') < 0) { return false; }
+        return lowerEq(rest, host + dot + 1);
+    }
+    return lowerEq(pattern, host);
+}
+
+private bool isIpText(char* h) {
+    int dots = 0;
+    for (int i = 0; h[i] != 0; i++) {
+        if (h[i] == '.') { dots++; }
+        else if (h[i] < '0' || h[i] > '9') { return false; }
+    }
+    return dots == 3;
+}
+
+public bool matchesHost(Cert* c, char* host) {
+    bool ip = isIpText(host);
+    if (c->sanCount > 0) {
+        for (int i = 0; i < c->sanCount; i++) {
+            if (c->sanIp[i] == ip && ((ip && streq(c->san[i], host)) || (!ip && nameMatches(c->san[i], host)))) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return !ip && c->cn != null && nameMatches(c->cn, host);       // no SAN: the common name (old certificates)
+}
+
+// ---- the trust store -------------------------------------------------------------------------------------------------------------------
+private Cert** roots = null;
+private int rootCount = 0;
+private bool loaded = false;
+
+public int rootsLoaded() { return rootCount; }
+
+// forgets the trusted roots, including the system ones (for tests and for programs that bring their own)
+public void clearRoots() {
+    rootCount = 0;
+    loaded = true;
+}
+
+public void addRoot(Cert* c) {
+    if (roots == null) { roots = (Cert**) alloc(1024 * 8); }
+    if (rootCount < 1024) {
+        roots[rootCount] = c;
+        rootCount++;
+    }
+}
+
+// the DER bytes of the next PEM block called 'label' (CERTIFICATE, PRIVATE KEY, ...) at or after 'from'; null when there is none.
+// *n gets the length and *next the position after the block
+public char* pemBlock(char* pem, char* label, int from, int* n, int* next) {
+    char begin[60];
+    char end[60];
+    format(&begin[0], 60, "-----BEGIN %s-----", label);
+    format(&end[0], 60, "-----END %s-----", label);
+    int b = find(pem + from, &begin[0]);
+    if (b < 0) { return null; }
+    int start = from + b + strlen(&begin[0]);
+    int e = find(pem + start, &end[0]);
+    if (e < 0) { return null; }
+    char* text = textOf(pem, start, e);
+    char* der = alloc(e / 4 * 3 + 8);
+    int len = encoding.base64Decode(text, der);
+    if (len <= 0) { return null; }
+    *n = len;
+    *next = start + e + strlen(&end[0]);
+    return der;
+}
+
+// the certificates of a PEM text, in order (up to max); returns how many
+public int parsePem(char* pem, Cert** out, int max) {
+    int count = 0;
+    int at = 0;
+    while (count < max) {
+        int n = 0;
+        int next = 0;
+        char* der = pemBlock(pem, "CERTIFICATE", at, &n, &next);
+        if (der == null) { break; }
+        Cert* c = parse(der, n);
+        if (c != null) {
+            out[count] = c;
+            count++;
+        }
+        at = next;
+    }
+    return count;
+}
+
+// every CERTIFICATE block of a PEM text; returns how many were added
+public int addRootPem(char* pem) {
+    Cert** list = (Cert**) alloc(1100 * 8);
+    int n = parsePem(pem, list, 1100);
+    for (int i = 0; i < n; i++) { addRoot(list[i]); }
+    return n;
+}
+
+// reads one DER element: the content length (or -1); *tag is its tag byte and *start the offset of its content
+public int readTlv(char* d, int len, int at, int* tag, int* start) {
+    return tlv(d, len, at, tag, start);
+}
+
+// the first position of 'needle' in 'hay' or -1
+private int find(char* hay, char* needle) {
+    int nl = strlen(needle);
+    for (int i = 0; hay[i] != 0; i++) {
+        if (hay[i] == needle[0] && strncmp(hay + i, needle, nl) == 0) { return i; }
+    }
+    return -1;
+}
+
+public int addRootFile(char* path) {
+    char* text = readFile(path);
+    if (text == null) { return 0; }
+    return addRootPem(text);
+}
+
+// the system's trusted roots (once): $SSL_CERT_FILE, else the usual bundle locations
+public int loadSystemRoots() {
+    if (loaded) { return rootCount; }
+    loaded = true;
+    char* env = getenv("SSL_CERT_FILE");
+    if (env != null && strlen(env) > 0 && addRootFile(env) > 0) { return rootCount; }
+    char* files[5];
+    files[0] = "/etc/ssl/certs/ca-certificates.crt";
+    files[1] = "/etc/pki/tls/certs/ca-bundle.crt";
+    files[2] = "/etc/ssl/cert.pem";
+    files[3] = "/etc/ssl/ca-bundle.pem";
+    files[4] = "/usr/local/share/certs/ca-root-nss.crt";
+    for (int i = 0; i < 5; i++) {
+        if (addRootFile(files[i]) > 0) { break; }
+    }
+    return rootCount;
+}
+
+// ---- chains --------------------------------------------------------------------------------------------------------------------------
+// null when chain[0] is valid for 'host' and leads to a trusted root; else a short description of what is wrong
+public char* verifyChain(Cert** chain, int count, char* host, int now) {
+    if (count < 1) { return "the server sent no certificate"; }
+    loadSystemRoots();
+    if (rootCount == 0) { return "no trusted root certificates are installed"; }
+    if (host != null && !matchesHost(chain[0], host)) { return "the certificate is for a different host name"; }
+    for (int i = 0; i < count; i++) {
+        if (now < chain[i]->notBefore) { return "a certificate is not valid yet"; }
+        if (now > chain[i]->notAfter) { return "a certificate has expired"; }
+    }
+    Cert* cur = chain[0];
+    for (int depth = 0; depth < 10; depth++) {
+        // a trusted root with this very certificate, or one that signed it
+        for (int r = 0; r < rootCount; r++) {
+            Cert* root = roots[r];
+            if (cur->len == root->len && sameBytes(cur->der, root->der, cur->len)) {
+                return null;
+            }
+            if (isIssuer(cur, root) && now >= root->notBefore && now <= root->notAfter && signedBy(cur, root)) {
+                return null;
+            }
+        }
+        // else an intermediate from the chain
+        Cert* next = null;
+        for (int i = 0; i < count; i++) {
+            Cert* cand = chain[i];
+            if (cand != cur && isIssuer(cur, cand) && cand->hasBasic && cand->isCA && signedBy(cur, cand)) {
+                next = cand;
+                break;
+            }
+        }
+        if (next == null) {
+            if (isSelfIssued(cur)) { return "the certificate is self signed (not trusted)"; }
+            return "the certificate was issued by an unknown authority";
+        }
+        cur = next;
+    }
+    return "the certificate chain is too long";
+}

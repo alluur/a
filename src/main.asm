@@ -166,6 +166,8 @@ EMB "ec",            "lib/ec.a"
 EMB "x25519",       "lib/x25519.a"
 EMB "aes",          "lib/aes.a"
 EMB "chacha",       "lib/chacha.a"
+EMB "x509",         "lib/x509.a"
+EMB "tls",          "lib/tls.a"
 EMB "gnet",          "lib/gnet.a"
 EMB "ghtml",         "lib/ghtml.a"
 EMB "wwebpage",      "lib/wwebpage.a"
@@ -228,7 +230,7 @@ std_src_end:
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
 %define IAT_K32             39
-%define IAT_SLOTS           (IAT_K32 + 1 + 20 + 1 + 8 + 1)   ; kernel32 + null + ws2_32 + null
+%define IAT_SLOTS           (IAT_K32 + 1 + 20 + 1 + 8 + 1 + 1 + 1)   ; kernel32 + null + ws2_32 + null + iphlpapi + null + advapi32 + null
 
 bn_write:   db "__write", 0
 bn_read:    db "__read", 0
@@ -582,6 +584,11 @@ imp_names_iph:
     db "IcmpCloseHandle", 0     ; slot 67
     db "GetUdpTable", 0         ; slot 68
     db 0
+; ADVAPI32.DLL imports: slot 70 (slot 69 is the null terminator of the iphlpapi list)
+imp_names_adv:
+    db "SystemFunction036", 0   ; slot 70: RtlGenRandom
+    db 0
+s_advapi32: db "ADVAPI32.DLL", 0
 s_iphlpapi: db "IPHLPAPI.DLL", 0
 s_kernel32: db "KERNEL32.DLL", 0
 s_ws2_32:   db "WS2_32.DLL", 0
@@ -1409,8 +1416,8 @@ build_elf:
 
 ; ---- PE32+ (Windows x64) -----------------------------------------------------------------
 %define PE_BASE 0x140000000
-%define PE_IDATA_ILT 80
-%define PE_IDATA_IAT (80 + IAT_SLOTS*8)
+%define PE_IDATA_ILT 100
+%define PE_IDATA_IAT (100 + IAT_SLOTS*8)
 %define PE_IDATA_NAMES (PE_IDATA_IAT + IAT_SLOTS*8)
 
 ; align_up: rax = value, rcx = alignment (power of two) -> rax
@@ -1530,7 +1537,7 @@ build_pe:
     mov dword [rdi+108], 16
     mov rax, [pe_idata_rva]
     mov [rdi+112+8], eax                    ; import directory
-    mov dword [rdi+112+8+4], 60
+    mov dword [rdi+112+8+4], 80
     add rax, PE_IDATA_IAT
     mov [rdi+112+96], eax                   ; IAT directory
     mov dword [rdi+112+96+4], IAT_SLOTS*8
@@ -1614,6 +1621,7 @@ build_idata:
     push r13
     push r14
     push r15
+    push rbp
     mov rbx, [pe_idata_rva]
     mov r12d, PE_IDATA_NAMES
     xor r13d, r13d
@@ -1624,6 +1632,9 @@ build_idata:
     call idata_list
     inc r13d                                ; null slot ends the ws2_32 thunk array
     mov rsi, imp_names_iph
+    call idata_list
+    inc r13d                                ; null slot ends the iphlpapi thunk array
+    mov rsi, imp_names_adv
     call idata_list
     ; DLL name strings
     lea rdi, [idata_buf + r12]
@@ -1644,6 +1655,13 @@ build_idata:
     call cstr_copy
     lea rax, [r12 + 13]
     mov r12, rax
+    lea rdi, [idata_buf + r12]
+    mov rbp, rdi
+    mov rsi, s_advapi32
+    call cstr_copy
+    lea rax, [r12 + 13]
+    mov r12, rax
+    sub rbp, idata_buf
     sub r14, idata_buf
     sub r13, idata_buf
     sub r15, idata_buf
@@ -1668,7 +1686,15 @@ build_idata:
     mov [idata_buf + 52], eax
     lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1+20+1)*8]
     mov [idata_buf + 56], eax
+    ; descriptor 3: ADVAPI32
+    lea rax, [rbx + PE_IDATA_ILT + (IAT_K32+1+20+1+8+1)*8]
+    mov [idata_buf + 60], eax
+    lea rax, [rbx + rbp]
+    mov [idata_buf + 72], eax
+    lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1+20+1+8+1)*8]
+    mov [idata_buf + 76], eax
     mov rax, r12
+    pop rbp
     pop r15
     pop r14
     pop r13

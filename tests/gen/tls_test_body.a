@@ -1,0 +1,159 @@
+// ---- the in-memory wire ------------------------------------------------------------------------------------------------------------
+char* wire = null;
+int tamperAt = -1;          // flip a bit of the byte at this offset in the next chunk the server sends to the client
+
+// moves what each side wants to send to the other, until nothing moves
+void pump(tls.Tls* c, tls.Tls* s) {
+    if (wire == null) { wire = alloc(70000); }
+    for (int round = 0; round < 500; round++) {
+        bool moved = false;
+        int n = tls.outLength(c);
+        if (n > 0) {
+            if (n > 60000) { n = 60000; }
+            memcpy(wire, tls.outData(c), n);
+            tls.outConsumed(c, n);
+            tls.feed(s, wire, n);
+            moved = true;
+        }
+        n = tls.outLength(s);
+        if (n > 0) {
+            if (n > 60000) { n = 60000; }
+            memcpy(wire, tls.outData(s), n);
+            tls.outConsumed(s, n);
+            if (tamperAt >= 0 && tamperAt < n) {
+                wire[tamperAt] = wire[tamperAt] ^ 1;
+                tamperAt = -1;
+            }
+            tls.feed(c, wire, n);
+            moved = true;
+        }
+        if (!moved) { return; }
+    }
+}
+
+char* describe(tls.Tls* t) {
+    if (tls.ready(t)) { return "ready"; }
+    if (tls.closed(t)) { return "closed"; }
+    if (tls.failed(t)) { return t->error; }
+    return "waiting";
+}
+
+// a pattern of n bytes
+char* pattern(int n, int seed) {
+    char* p = alloc(n + 8);
+    int v = seed;
+    for (int i = 0; i < n; i++) {
+        v = (v * 1103515245 + 12345) & 0x7FFFFFFF;
+        p[i] = (v >> 16) & 255;
+    }
+    return p;
+}
+
+// everything the session has for the application, as a checksum line
+void report(char* label, tls.Tls* t, int expectLen, int seed) {
+    char* got = alloc(expectLen + 70000);
+    int total = 0;
+    while (true) {
+        int n = tls.readApp(t, got + total, 65536);
+        if (n <= 0) { break; }
+        total = total + n;
+    }
+    char* want = pattern(expectLen, seed);
+    bool same = (total == expectLen) && memcmp(got, want, expectLen) == 0;
+    print(label);
+    print(": ");
+    printInt(total);
+    println(same ? " bytes, identical" : " bytes, DIFFERENT");
+}
+
+void session(char* name, tls.Config* cfg, char* host, int suite, bool verify, int mode) {
+    print("== ");
+    println(name);
+    tls.Tls* c = tls.clientOnly(host, verify, suite);
+    tls.Tls* s = tls.accept(cfg);
+    pump(c, s);
+    print("client: ");
+    println(describe(c));
+    print("server: ");
+    println(describe(s));
+    if (!tls.ready(c) || !tls.ready(s)) { return; }
+    println(c->suiteName);
+    // small messages both ways
+    tls.write(c, "hello server", 12);
+    pump(c, s);
+    char buf[100];
+    int n = tls.readApp(s, &buf[0], 99);
+    buf[n] = 0;
+    print("server got: ");
+    println(&buf[0]);
+    tls.write(s, "hello client", 12);
+    pump(c, s);
+    n = tls.readApp(c, &buf[0], 99);
+    buf[n] = 0;
+    print("client got: ");
+    println(&buf[0]);
+    if (mode == 1) {
+        // a damaged record
+        tamperAt = 30;
+        tls.write(s, "this will be damaged", 20);
+        pump(c, s);
+        print("client after damage: ");
+        println(describe(c));
+        return;
+    }
+    // 50000 bytes each way (several records), with key updates in between
+    tls.write(c, pattern(50000, 1), 50000);
+    pump(c, s);
+    report("server received", s, 50000, 1);
+    tls.keyUpdate(c, true);
+    tls.write(c, pattern(3000, 2), 3000);
+    tls.write(s, pattern(40000, 3), 40000);
+    pump(c, s);
+    report("server received", s, 3000, 2);
+    report("client received", c, 40000, 3);
+    tls.keyUpdate(s, false);
+    tls.write(s, pattern(100, 4), 100);
+    pump(c, s);
+    report("client received", c, 100, 4);
+    // goodbye
+    tls.shutdown(c);
+    pump(c, s);
+    print("server after goodbye: ");
+    println(describe(s));
+}
+
+int main() {
+    x509.clearRoots();
+    x509.addRootPem(CA_PEM);
+    tls.Config* rsa8 = tls.loadConfig(RSA_CERT, RSA_KEY8);
+    tls.Config* rsa1 = tls.loadConfig(RSA_CERT, RSA_KEY1);
+    tls.Config* ec8 = tls.loadConfig(EC_CERT, EC_KEY8);
+    tls.Config* ec1 = tls.loadConfig(EC_CERT, EC_KEY1);
+    tls.Config* ec384 = tls.loadConfig(EC384_CERT, EC384_KEY1);
+    println((rsa8 != null && rsa1 != null && ec8 != null && ec1 != null && ec384 != null) ? "keys loaded" : "KEY LOADING FAILED");
+    println((tls.loadConfig(RSA_CERT, "not a key") == null) ? "bad key refused" : "bad key accepted");
+    session("rsa key (PKCS#8), AES-128-GCM", rsa8, "server.test", 0x1301, true, 0);
+    session("rsa key (PKCS#1), ChaCha20-Poly1305", rsa1, "server.test", 0x1303, true, 0);
+    session("rsa key, AES-256-GCM", rsa8, "server.test", 0x1302, true, 0);
+    session("ecdsa p-256 key (PKCS#8)", ec8, "server.test", 0, true, 0);
+    session("ecdsa p-256 key (SEC1), ChaCha20", ec1, "server.test", 0x1303, true, 0);
+    session("ecdsa p-384 key (SEC1)", ec384, "server.test", 0x1302, true, 0);
+    session("wrong host name", rsa8, "other.test", 0, true, 0);
+    session("wrong host name, not verifying", rsa8, "other.test", 0, false, 0);
+    session("a damaged record", rsa8, "server.test", 0, true, 1);
+    x509.clearRoots();
+    x509.addRootPem(OTHER_CA_PEM);
+    session("unknown authority", ec8, "server.test", 0, true, 0);
+    x509.clearRoots();
+    session("no roots at all", ec8, "server.test", 0, true, 0);
+    // garbage to a server
+    tls.Tls* g = tls.accept(rsa8);
+    tls.feed(g, "\x16\x03\x01\x00\x05hello", 10);
+    print("== garbage handshake record\nserver: ");
+    println(describe(g));
+    tls.Tls* g2 = tls.accept(rsa8);
+    tls.feed(g2, "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 27);
+    print("server fed plain HTTP: ");
+    println(describe(g2));
+    return 0;
+}
