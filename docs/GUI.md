@@ -448,6 +448,8 @@ client.
 
 ## The display manager: `dm` and `adm`
 
+(A fuller display manager and display server for Linux and AOS lives in its own repository, https://github.com/alluur/adm: sessions chosen at login, a secret per session, automatic login, `$5$` hashes, `admctl`, a systemd unit and a Debian package. It is built on the same `wsrv`, `wfb` and `gui` modules. The `dm` module and `examples/gui/adm.a` described here stay as the small version.)
+
 ```sh
 ac examples/gui/adm.a -o adm
 ac examples/gui/asession.a -o asession    # a small desktop: wallpaper, panel with launchers and a clock
