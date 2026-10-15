@@ -17,6 +17,7 @@
 //  Helpers: ghtml.resolveUrl(base, ref), ghtml.markdownToHtml(text), ghtml.decodeEntities(text), ghtml.plainText(html).
 // =============================================================================
 import gui;
+import guix;
 import gfx;
 import adp;
 import cstdlib;
@@ -32,6 +33,19 @@ const K_WORD = 0;
 const K_IMAGE = 1;
 const K_BREAK = 2;
 const K_GAP = 3;
+const K_CONTROL = 4;
+
+const C_TEXT = 1;
+const C_PASSWORD = 2;
+const C_CHECK = 3;
+const C_RADIO = 4;
+const C_SUBMIT = 5;
+const C_HIDDEN = 6;
+const C_AREA = 7;
+const C_SELECT = 8;
+const C_BUTTON = 9;
+
+class HtmlView;
 
 const B_TEXT = 0;
 const B_RULE = 1;
@@ -52,6 +66,7 @@ class Item {
     public int declW;               // width and height given in the tag (0 = not given)
     public int declH;
     public bool spaceBefore;
+    public int control;             // K_CONTROL: the index in Doc.controls
     // set by layout
     public int x;
     public int y;
@@ -89,6 +104,21 @@ class Block {
     }
 }
 
+// a form control: what it is, its name and (start) value, and the widget that shows it
+class Control {
+    public int type;
+    public int form;                // index in Doc.formAction, -1 when outside a form
+    public char* name;
+    public char* value;             // the value sent for checkboxes, radios and buttons; the start text of fields
+    public bool checked;
+    public gui.Widget* widget;
+    public guix.RadioGroup* group;
+    public char** optionValues;     // select
+    public int noptions;
+    public int selectedOption;
+    public HtmlView* view;
+}
+
 public class Doc {
     public Block** blocks;
     public int nblocks;
@@ -97,8 +127,21 @@ public class Doc {
     public int nlinks;
     public int capLinks;
     public char* title;
+    public char** formAction;
+    public char** formMethod;
+    public int nforms;
+    public Control** controls;
+    public int ncontrols;
+    public char** anchorName;
+    public int* anchorBlock;
+    public int nanchors;
 
     public Doc() {
+        formAction = (char**) calloc(16, 8);
+        formMethod = (char**) calloc(16, 8);
+        controls = (Control**) calloc(128, 8);
+        anchorName = (char**) calloc(128, 8);
+        anchorBlock = (int*) calloc(128, 8);
         cap = 32;
         blocks = (Block**) calloc(cap, 8);
         capLinks = 16;
@@ -115,6 +158,38 @@ public class Doc {
         blocks[nblocks] = b;
         nblocks++;
         return b;
+    }
+
+    public Control* addControl(int type, int form) {
+        if (ncontrols >= 128) {
+            return null;
+        }
+        Control* c = new Control();
+        c->type = type;
+        c->form = form;
+        c->name = "";
+        c->value = "";
+        controls[ncontrols] = c;
+        ncontrols++;
+        return c;
+    }
+
+    public int addForm(char* action, char* method) {
+        if (nforms >= 16) {
+            return nforms - 1;
+        }
+        formAction[nforms] = action;
+        formMethod[nforms] = method;
+        nforms++;
+        return nforms - 1;
+    }
+
+    public void addAnchor(char* name, int block) {
+        if (nanchors < 128) {
+            anchorName[nanchors] = name;
+            anchorBlock[nanchors] = block;
+            nanchors++;
+        }
     }
 
     public int addLink(char* href) {
@@ -354,8 +429,20 @@ class Builder {
     public bool inTitle;
     public char* base;
     public bool pendingSpace;
+    public int form;                // the current form, -1 none
+    public Control* capture;        // a button or an option whose text is being read
+    public char* captureText;
+    public int captureKind;         // 1 button, 2 option
+    public Control* openSelect;
+    public char* optionValue;
+    public bool optionSelected;
+    public guix.RadioGroup* groups[32];
+    public char* groupName[32];
+    public int groupForm[32];
+    public int ngroups;
 
     public Builder(char* baseUrl) {
+        form = -1;
         doc = new Doc();
         base = baseUrl;
         size = 100;
@@ -436,6 +523,16 @@ class Builder {
 
     // text between tags
     public void text(char* raw) {
+        if (captureKind != 0) {
+            char* t = decodeEntities(raw);
+            char* old = (captureText != null) ? captureText : "";
+            char* nt = malloc(strlen(old) + strlen(t) + 2);
+            strcpy(nt, old);
+            if (strlen(old) > 0 && strlen(t) > 0 && t[0] == ' ') { strcat(nt, " "); }
+            strcat(nt, t);
+            captureText = nt;
+            return;
+        }
         if (inTitle) {
             char* t = decodeEntities(raw);
             char* nt = malloc(strlen(doc->title) + strlen(t) + 1);
@@ -494,6 +591,30 @@ class Builder {
     }
 }
 
+// collapses runs of white space to one space and cuts the ends
+private char* trimText(char* t) {
+    int n = strlen(t);
+    char* r = malloc(n + 1);
+    int o = 0;
+    bool space = false;
+    for (int i = 0; i < n; i++) {
+        int c = t[i];
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            space = true;
+        } else {
+            if (space && o > 0) { r[o] = ' '; o++; }
+            space = false;
+            r[o] = c;
+            o++;
+        }
+    }
+    r[o] = 0;
+    return r;
+}
+
+int controlClick(int self);
+int controlEnter(int self);
+
 // the value of an attribute inside a tag text (` href='x' b=2`); null when there is none
 private char* attrValue(char* tag, char* name) {
     int n = strlen(tag);
@@ -534,7 +655,244 @@ private bool tagIs(char* name, char* want) {
     return streqi(name, want);
 }
 
+// ---- form controls (made while parsing) ----------------------------------------------------------------------------------------------
+private void controlItem(Builder* b) {
+    b->ensure();
+    Item* it = new Item();
+    it->kind = K_CONTROL;
+    it->control = b->doc->ncontrols - 1;
+    it->size = 100;
+    it->link = -1;
+    it->spaceBefore = b->pendingSpace && b->cur->n > 0;
+    b->pendingSpace = false;
+    b->cur->add(it);
+}
+
+private void finishOption(Builder* b) {
+    if (b->captureKind != 2 || b->openSelect == null) {
+        return;
+    }
+    Control* c = b->openSelect;
+    guix.ComboBox* cb = (guix.ComboBox*) c->widget;
+    char* label = trimText((b->captureText != null) ? b->captureText : "");
+    char* value = (b->optionValue != null) ? b->optionValue : label;
+    if (c->noptions < 64) {
+        cb->addItem(label);
+        c->optionValues[c->noptions] = value;
+        if (b->optionSelected) { c->selectedOption = c->noptions; }
+        c->noptions++;
+    }
+    b->captureKind = 0;
+    b->captureText = null;
+    b->optionValue = null;
+    b->optionSelected = false;
+}
+
+private void finishButton(Builder* b) {
+    if (b->captureKind != 1 || b->capture == null) {
+        return;
+    }
+    Control* c = b->capture;
+    char* label = trimText((b->captureText != null) ? b->captureText : "");
+    if (strlen(label) == 0) { label = (strlen(c->value) > 0) ? c->value : "Submit"; }
+    gui.Button* btn = new gui.Button(label);
+    btn->userData = (int) c;
+    btn->onClick = controlClick;
+    c->widget = btn;
+    btn->w = btn->prefW();
+    btn->h = btn->prefH();
+    controlItem(b);
+    b->capture = null;
+    b->captureKind = 0;
+    b->captureText = null;
+}
+
+private void makeInput(Builder* b, char* tag) {
+    char* type = attrValue(tag, "type");
+    if (type == null) { type = "text"; }
+    char* name = attrValue(tag, "name");
+    char* value = attrValue(tag, "value");
+    if (name == null) { name = ""; }
+    bool hasValue = (value != null);
+    if (value == null) { value = ""; }
+    bool disabled = attrValue(tag, "disabled") != null;
+    if (streqi(type, "hidden")) {
+        Control* c = b->doc->addControl(C_HIDDEN, b->form);
+        if (c != null) { c->name = name; c->value = value; }
+        return;
+    }
+    if (streqi(type, "checkbox")) {
+        Control* c = b->doc->addControl(C_CHECK, b->form);
+        if (c == null) { return; }
+        c->name = name;
+        c->value = hasValue ? value : "on";
+        gui.CheckBox* cb = new gui.CheckBox("");
+        cb->checked = attrValue(tag, "checked") != null;
+        cb->enabled = !disabled;
+        cb->w = cb->prefW();
+        cb->h = 22;
+        c->widget = cb;
+        cb->userData = (int) c;
+        controlItem(b);
+        return;
+    }
+    if (streqi(type, "radio")) {
+        Control* c = b->doc->addControl(C_RADIO, b->form);
+        if (c == null) { return; }
+        c->name = name;
+        c->value = hasValue ? value : "on";
+        guix.RadioGroup* g = null;
+        for (int i = 0; i < b->ngroups; i++) {
+            if (b->groupForm[i] == b->form && streq(b->groupName[i], name)) { g = b->groups[i]; }
+        }
+        if (g == null) {
+            g = new guix.RadioGroup();
+            if (b->ngroups < 32) {
+                b->groups[b->ngroups] = g;
+                b->groupName[b->ngroups] = name;
+                b->groupForm[b->ngroups] = b->form;
+                b->ngroups++;
+            }
+        }
+        guix.RadioButton* rb = new guix.RadioButton("", g);
+        if (attrValue(tag, "checked") != null) { g->select(rb); }
+        rb->enabled = !disabled;
+        rb->w = 22;
+        rb->h = 22;
+        c->widget = rb;
+        c->group = g;
+        rb->userData = (int) c;
+        controlItem(b);
+        return;
+    }
+    if (streqi(type, "submit") || streqi(type, "button") || streqi(type, "reset") || streqi(type, "image")) {
+        bool submit = streqi(type, "submit") || streqi(type, "image");
+        Control* c = b->doc->addControl(submit ? C_SUBMIT : C_BUTTON, b->form);
+        if (c == null) { return; }
+        c->name = name;
+        c->value = value;
+        char* label = hasValue ? value : (submit ? "Submit" : (streqi(type, "reset") ? "Reset" : "Button"));
+        gui.Button* btn = new gui.Button(label);
+        btn->enabled = !disabled;
+        btn->onClick = controlClick;
+        btn->userData = (int) c;
+        btn->w = btn->prefW();
+        btn->h = btn->prefH();
+        c->widget = btn;
+        controlItem(b);
+        return;
+    }
+    // everything else is a line of text (text, password, search, email, number ...)
+    bool pw = streqi(type, "password");
+    Control* c = b->doc->addControl(pw ? C_PASSWORD : C_TEXT, b->form);
+    if (c == null) { return; }
+    c->name = name;
+    c->value = value;
+    gui.TextBox* tb = new gui.TextBox();
+    tb->password = pw;
+    tb->setText(value);
+    char* ph = attrValue(tag, "placeholder");
+    if (ph != null) { tb->placeholder = ph; }
+    tb->enabled = !disabled;
+    char* sz = attrValue(tag, "size");
+    int chars = (sz != null && atoi(sz) > 0) ? atoi(sz) : 20;
+    if (chars > 60) { chars = 60; }
+    tb->w = chars * 8 + 16;
+    tb->h = 26;
+    tb->onEnter = controlEnter;
+    tb->userData = (int) c;
+    c->widget = tb;
+    controlItem(b);
+}
+
+private void makeTextArea(Builder* b, char* tag) {
+    Control* c = b->doc->addControl(C_AREA, b->form);
+    if (c == null) { return; }
+    char* name = attrValue(tag, "name");
+    c->name = (name != null) ? name : "";
+    gui.TextArea* ta = new gui.TextArea();
+    ta->flex = 0;
+    char* cols = attrValue(tag, "cols");
+    char* rows = attrValue(tag, "rows");
+    int nc = (cols != null && atoi(cols) > 0) ? atoi(cols) : 30;
+    int nr = (rows != null && atoi(rows) > 0) ? atoi(rows) : 4;
+    if (nc > 80) { nc = 80; }
+    if (nr > 20) { nr = 20; }
+    ta->w = nc * 8 + 16;
+    ta->h = nr * 18 + 12;
+    ta->userData = (int) c;
+    c->widget = ta;
+    controlItem(b);
+}
+
+private void makeSelect(Builder* b, char* tag) {
+    Control* c = b->doc->addControl(C_SELECT, b->form);
+    if (c == null) { return; }
+    char* name = attrValue(tag, "name");
+    c->name = (name != null) ? name : "";
+    c->optionValues = (char**) calloc(64, 8);
+    guix.ComboBox* cb = new guix.ComboBox();
+    c->widget = cb;
+    cb->userData = (int) c;
+    b->openSelect = c;
+}
+
+private void closeSelect(Builder* b) {
+    if (b->openSelect == null) {
+        return;
+    }
+    finishOption(b);
+    Control* c = b->openSelect;
+    guix.ComboBox* cb = (guix.ComboBox*) c->widget;
+    if (c->noptions > 0) { cb->select(c->selectedOption); }
+    cb->w = cb->prefW();
+    cb->h = 28;
+    b->openSelect = null;
+    controlItem(b);
+}
+
 private void openTag(Builder* b, char* name, char* tag) {
+    // places that can be linked to (id= on any tag, name= on a)
+    char* anchor = attrValue(tag, "id");
+    if (anchor == null && tagIs(name, "a")) { anchor = attrValue(tag, "name"); }
+    if (anchor != null && strlen(anchor) > 0) {
+        bool reuse = (b->cur != null && b->cur->n == 0 && b->cur->bullet == null);
+        b->doc->addAnchor(anchor, reuse ? b->doc->nblocks - 1 : b->doc->nblocks);
+    }
+    if (tagIs(name, "form")) {
+        char* action = attrValue(tag, "action");
+        char* method = attrValue(tag, "method");
+        char* m = strdup((method != null && strlen(method) > 0) ? method : "get");
+        for (int i = 0; m[i] != 0; i++) { m[i] = (m[i] >= 'a' && m[i] <= 'z') ? m[i] - 32 : m[i]; }
+        b->form = b->doc->addForm(resolveUrl(b->base, (action != null) ? action : ""), m);
+        b->block(6, 6);
+        return;
+    }
+    if (tagIs(name, "input")) { makeInput(b, tag); return; }
+    if (tagIs(name, "textarea")) { makeTextArea(b, tag); return; }
+    if (tagIs(name, "select")) { makeSelect(b, tag); return; }
+    if (tagIs(name, "option")) {
+        finishOption(b);
+        b->captureKind = 2;
+        b->captureText = "";
+        b->optionValue = attrValue(tag, "value");
+        b->optionSelected = attrValue(tag, "selected") != null;
+        return;
+    }
+    if (tagIs(name, "button")) {
+        char* type = attrValue(tag, "type");
+        bool submit = (type == null || streqi(type, "submit"));
+        Control* c = b->doc->addControl(submit ? C_SUBMIT : C_BUTTON, b->form);
+        if (c == null) { return; }
+        char* nm = attrValue(tag, "name");
+        char* val = attrValue(tag, "value");
+        c->name = (nm != null) ? nm : "";
+        c->value = (val != null) ? val : "";
+        b->capture = c;
+        b->captureKind = 1;
+        b->captureText = "";
+        return;
+    }
     if (tagIs(name, "p") || tagIs(name, "section") || tagIs(name, "article") || tagIs(name, "header") || tagIs(name, "footer") || tagIs(name, "nav") || tagIs(name, "main") || tagIs(name, "aside")) {
         b->block(tagIs(name, "p") ? 10 : 0, tagIs(name, "p") ? 10 : 0);
     } else if (tagIs(name, "div") || tagIs(name, "form") || tagIs(name, "center") || tagIs(name, "figure") || tagIs(name, "figcaption") || tagIs(name, "dl") || tagIs(name, "dt") || tagIs(name, "address")) {
@@ -626,6 +984,14 @@ private void openTag(Builder* b, char* name, char* tag) {
 }
 
 private void closeTag(Builder* b, char* name) {
+    if (tagIs(name, "form")) {
+        b->form = -1;
+        b->cur = null;
+        return;
+    }
+    if (tagIs(name, "option")) { finishOption(b); return; }
+    if (tagIs(name, "select")) { closeSelect(b); return; }
+    if (tagIs(name, "button")) { finishButton(b); return; }
     if (tagIs(name, "p") || tagIs(name, "div") || tagIs(name, "section") || tagIs(name, "article") || tagIs(name, "header") || tagIs(name, "footer") || tagIs(name, "nav") || tagIs(name, "main") || tagIs(name, "aside") || tagIs(name, "form") || tagIs(name, "center") || tagIs(name, "figure") || tagIs(name, "dl")) {
         b->cur = null;
     } else if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && name[2] == 0) {
@@ -723,6 +1089,20 @@ public Doc* parseHtml(char* html, char* base) {
             } else {
                 openTag(b, &name[0], tag);
                 // the content of script and style is not text
+                if (streqi(&name[0], "textarea")) {
+                    int m = e + 1;
+                    while (m < n && !(html[m] == '<' && html[m + 1] == '/' && toLower(html[m + 2]) == 't' && toLower(html[m + 3]) == 'e')) { m++; }
+                    int from = e + 1;
+                    if (html[from] == 10) { from++; }
+                    char* raw = malloc(m - from + 1);
+                    memcpy(raw, &html[from], (m > from) ? m - from : 0);
+                    raw[(m > from) ? m - from : 0] = 0;
+                    if (b->doc->ncontrols > 0 && b->doc->controls[b->doc->ncontrols - 1]->type == C_AREA) {
+                        gui.TextArea* ta = (gui.TextArea*) b->doc->controls[b->doc->ncontrols - 1]->widget;
+                        ta->setText(decodeEntities(raw));
+                    }
+                    e = m - 1;
+                }
                 if (streqi(&name[0], "script") || streqi(&name[0], "style")) {
                     int m = e + 1;
                     while (m < n) {
@@ -1074,6 +1454,52 @@ public char* markdownToHtml(char* md) {
     return out;
 }
 
+// the text as it goes into a form: letters, digits and -._~ stay, a space is +, everything else %XX (newlines become %0D%0A)
+public char* urlEncode(char* t) {
+    int n = strlen(t);
+    char* out = malloc(n * 6 + 1);
+    char* hex = "0123456789ABCDEF";
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+        int c = t[i] & 255;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~') {
+            out[o] = c;
+            o++;
+        } else if (c == 32) {
+            out[o] = '+';
+            o++;
+        } else if (c == 10) {
+            out[o] = '%'; out[o + 1] = '0'; out[o + 2] = 'D'; out[o + 3] = '%'; out[o + 4] = '0'; out[o + 5] = 'A';
+            o = o + 6;
+        } else if (c == 13) {
+            // dropped: the newline brings its own %0D
+        } else {
+            out[o] = '%';
+            out[o + 1] = hex[c >> 4];
+            out[o + 2] = hex[c & 15];
+            o = o + 3;
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+int controlClick(int self) {
+    gui.Widget* wd = (gui.Widget*) self;
+    Control* c = (Control*) wd->userData;
+    if (c->type == C_SUBMIT) {
+        c->view->submit(c);
+    }
+    return 0;
+}
+
+int controlEnter(int self) {
+    gui.Widget* wd = (gui.Widget*) self;
+    Control* c = (Control*) wd->userData;
+    c->view->submit(c);
+    return 0;
+}
+
 // ---- the view -----------------------------------------------------------------------------------------------------------------------------
 class ImageEntry {
     public char* src;
@@ -1112,7 +1538,15 @@ public class HtmlView : gui.Widget {
     public virtual bool wantsScroll() { return true; }
 
     public void setDoc(Doc* d, char* base) {
+        removeAll();
         doc = d;
+        for (int i = 0; i < d->ncontrols; i++) {
+            Control* c = d->controls[i];
+            c->view = this;
+            if (c->widget != null) {
+                add(c->widget);
+            }
+        }
         baseUrl = base;
         scrollY = 0;
         nimages = 0;
@@ -1291,6 +1725,10 @@ public class HtmlView : gui.Widget {
                 } else if (it->kind == K_GAP) {
                     it->w = 20;
                     it->h = fontOf(0)->height + 2;
+                } else if (it->kind == K_CONTROL) {
+                    gui.Widget* cw = doc->controls[it->control]->widget;
+                    it->w = cw->w;
+                    it->h = cw->h;
                 } else {
                     it->w = 0;
                     it->h = fontOf(it->style)->height + 2;
@@ -1346,6 +1784,23 @@ public class HtmlView : gui.Widget {
         int max = contentHeight - h;
         if (scrollY > max) { scrollY = max; }
         if (scrollY < 0) { scrollY = 0; }
+        positionControls();
+    }
+
+    // the widgets of the form controls sit where their items are, moved by the scrolling
+    private void positionControls() {
+        for (int b = 0; b < doc->nblocks; b++) {
+            Block* blk = doc->blocks[b];
+            for (int i = 0; i < blk->n; i++) {
+                Item* it = blk->items[i];
+                if (it->kind == K_CONTROL) {
+                    gui.Widget* cw = doc->controls[it->control]->widget;
+                    cw->x = it->x;
+                    cw->y = it->y - scrollY;
+                    cw->visible = (cw->y + cw->h > 0 && cw->y < h);
+                }
+            }
+        }
     }
 
     public virtual void layout() {
@@ -1448,6 +1903,125 @@ public class HtmlView : gui.Widget {
     }
 
     // ---- links ----------------------------------------------------------------------------------------------------------------------------
+    public func onSubmit;           // int f(int view): submitMethod ("GET" or "POST"), submitUrl, submitBody
+    public char* submitMethod;
+    public char* submitUrl;
+    public char* submitBody;
+
+    // the form data of one form: name=value pairs in the order of the controls (clicked: the submit button that was used)
+    private char* queryOf(int form, Control* clicked) {
+        char* q = malloc(64);
+        int cap = 64;
+        int len = 0;
+        q[0] = 0;
+        for (int i = 0; i < doc->ncontrols; i++) {
+            Control* c = doc->controls[i];
+            if (c->form != form || strlen(c->name) == 0) {
+                continue;
+            }
+            char* value = null;
+            if (c->type == C_TEXT || c->type == C_PASSWORD) { value = ((gui.TextBox*) c->widget)->text(); }
+            else if (c->type == C_HIDDEN) { value = c->value; }
+            else if (c->type == C_AREA) { value = ((gui.TextArea*) c->widget)->text(); }
+            else if (c->type == C_CHECK) { if (((gui.CheckBox*) c->widget)->checked) { value = c->value; } }
+            else if (c->type == C_RADIO) { if (((guix.RadioButton*) c->widget)->checked) { value = c->value; } }
+            else if (c->type == C_SELECT) {
+                guix.ComboBox* cb = (guix.ComboBox*) c->widget;
+                if (cb->selected >= 0 && cb->selected < c->noptions) { value = c->optionValues[cb->selected]; }
+            }
+            else if (c->type == C_SUBMIT) { if (c == clicked) { value = c->value; } }
+            if (value == null) {
+                continue;
+            }
+            char* pair = malloc(strlen(c->name) * 3 + strlen(value) * 3 + 8);
+            strcpy(pair, urlEncode(c->name));
+            strcat(pair, "=");
+            strcat(pair, urlEncode(value));
+            int pl = strlen(pair);
+            if (len + pl + 2 > cap) {
+                while (len + pl + 2 > cap) { cap = cap * 2; }
+                q = realloc(q, cap);
+            }
+            if (len > 0) { q[len] = '&'; len++; }
+            memcpy(&q[len], pair, pl);
+            len = len + pl;
+            q[len] = 0;
+        }
+        return q;
+    }
+
+    // sends the form of a control (a click on its submit button, or Enter in a text field)
+    public void submit(Control* c) {
+        if (c->form < 0 || onSubmit == null) {
+            return;
+        }
+        char* query = queryOf(c->form, c);
+        char* action = doc->formAction[c->form];
+        submitMethod = doc->formMethod[c->form];
+        if (streq(submitMethod, "POST")) {
+            submitUrl = action;
+            submitBody = query;
+        } else {
+            submitMethod = "GET";
+            int hash = indexOf(action, '#');
+            int an = (hash >= 0) ? hash : strlen(action);
+            char* u = malloc(an + strlen(query) + 4);
+            memcpy(u, action, an);
+            u[an] = 0;
+            int qm = indexOf(u, '?');
+            strcat(u, qm >= 0 ? "&" : "?");
+            strcat(u, query);
+            submitUrl = u;
+            submitBody = "";
+        }
+        onSubmit(this);
+    }
+
+    public int controlCount() { return doc->ncontrols; }
+
+    // the widget of form control i (null for hidden fields); its name and value as the page gave them
+    public gui.Widget* controlWidget(int i) { return doc->controls[i]->widget; }
+    public char* controlName(int i) { return doc->controls[i]->name; }
+
+    // the vertical position of a place that can be linked to (id= or name=), -1 if the page has none like that
+    public int anchorY(char* name) {
+        if (needLayout || w != laidWidth) {
+            layoutAll();
+        }
+        for (int i = 0; i < doc->nanchors; i++) {
+            if (streq(doc->anchorName[i], name)) {
+                int bi = doc->anchorBlock[i];
+                if (bi >= doc->nblocks) { bi = doc->nblocks - 1; }
+                if (bi < 0) { return 0; }
+                return doc->blocks[bi]->y0;
+            }
+        }
+        return -1;
+    }
+
+    // scrolls to an anchor ("section" for the link #section); false if there is none
+    public bool scrollToAnchor(char* name) {
+        int y = anchorY(name);
+        if (y < 0) {
+            return false;
+        }
+        scrollY = (y < 40) ? 0 : y - 6;
+        clampScroll();
+        invalidate();
+        return true;
+    }
+
+    // a control got the focus (Tab): scroll it into view
+    public virtual void reveal(gui.Widget* child) {
+        if (child->y < 0) {
+            scrollY = scrollY + child->y - 10;
+        } else if (child->y + child->h > h) {
+            scrollY = scrollY + (child->y + child->h - h) + 10;
+        }
+        clampScroll();
+        invalidate();
+    }
+
     // where the first piece of link number k is (in the coordinates of the page, after layout); false if there is none
     public bool linkBox(int k, int* x, int* y, int* bw, int* bh) {
         if (needLayout || w != laidWidth) {
@@ -1561,7 +2135,7 @@ public class HtmlView : gui.Widget {
         if (key == adp.KEY_UP) { scrollBy(-40); return true; }
         if (key == adp.KEY_PGDN || key == adp.KEY_SPACE) { scrollBy(h - 40); return true; }
         if (key == adp.KEY_PGUP) { scrollBy(-(h - 40)); return true; }
-        if (key == adp.KEY_HOME) { scrollY = 0; invalidate(); return true; }
+        if (key == adp.KEY_HOME) { scrollY = 0; clampScroll(); invalidate(); return true; }
         if (key == adp.KEY_END) { scrollY = contentHeight; clampScroll(); invalidate(); return true; }
         return false;
     }

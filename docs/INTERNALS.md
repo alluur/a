@@ -370,3 +370,10 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   again when the width changes or a picture arrives; painting and link hit tests only look at the blocks in view. Markdown is
   converted to HTML text first, so there is one renderer. `tests/t125_gui_html.a` covers text, entities, URLs, Markdown, links,
   scrolling and a screenshot checksum; `tests/gui.sh` runs `abrowse` against a local web server.
+* Forms in `ghtml`: the parser makes a `Control` (type, name, value, widget) for every input, textarea, select (its options are added to a
+  `guix.ComboBox` when the option closes) and button (whose label is the text up to `</button>`), and an item of kind `K_CONTROL`
+  that reserves the widget's size in the line. The widgets are real children of the `HtmlView`; `positionControls` moves them with
+  the scrolling (`clampScroll` calls it) and hides the ones outside the view. `Widget.reveal` of the view scrolls a control into view
+  when it gets the focus. `queryOf` builds the data in the order of the controls. Anchors are recorded when a tag with `id` or an `a name`
+  is opened (the index of the block that follows, or the empty current block that is reused). `tests/t126_gui_forms.a` runs
+  the page, the clicks and keys, and a tiny web server in the same process for the POST, cookie and redirect cases.

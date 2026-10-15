@@ -26,6 +26,121 @@ module gnet;
 int fetchReadable(int arg);
 int scanTick(int arg);
 
+// =============================================================================
+//  CookieJar: the cookies of the servers a program talked to (by host name; Path, Domain and the expiry are not used, a cookie
+//  lives until the program ends or the server deletes it with Max-Age=0 or an empty value)
+// =============================================================================
+public class CookieJar {
+    private char** hosts;
+    private char** names;
+    private char** values;
+    private int count;
+
+    public CookieJar() {
+        hosts = (char**) calloc(128, 8);
+        names = (char**) calloc(128, 8);
+        values = (char**) calloc(128, 8);
+    }
+
+    public int size() { return count; }
+
+    private int find(char* host, char* name) {
+        for (int i = 0; i < count; i++) {
+            if (streqi(hosts[i], host) && streq(names[i], name)) { return i; }
+        }
+        return -1;
+    }
+
+    public void set(char* host, char* name, char* value) {
+        int at = find(host, name);
+        if (strlen(value) == 0) {
+            if (at >= 0) {
+                for (int i = at; i < count - 1; i++) {
+                    hosts[i] = hosts[i + 1]; names[i] = names[i + 1]; values[i] = values[i + 1];
+                }
+                count--;
+            }
+            return;
+        }
+        if (at < 0) {
+            if (count >= 128) { return; }
+            at = count;
+            count++;
+            hosts[at] = strdup(host);
+            names[at] = strdup(name);
+        }
+        values[at] = strdup(value);
+    }
+
+    public char* get(char* host, char* name) {
+        int at = find(host, name);
+        return (at >= 0) ? values[at] : null;
+    }
+
+    // the value of a Set-Cookie header ("sid=abc; Path=/; HttpOnly")
+    public void store(char* host, char* header) {
+        int eq = indexOf(header, '=');
+        if (eq <= 0) {
+            return;
+        }
+        int semi = indexOf(header, ';');
+        if (semi >= 0 && semi < eq) {
+            return;
+        }
+        int end = (semi >= 0) ? semi : strlen(header);
+        char* name = malloc(eq + 1);
+        memcpy(name, header, eq);
+        name[eq] = 0;
+        char* value = malloc(end - eq + 1);
+        memcpy(value, &header[eq + 1], end - eq - 1);
+        value[end - eq - 1] = 0;
+        // Max-Age=0 deletes the cookie
+        char* lower = strdup(header);
+        strLower(lower);
+        char* ma = lower;
+        for (int i = 0; lower[i] != 0; i++) {
+            if (startsWith(&lower[i], "max-age=")) {
+                if (atoi(&lower[i + 8]) <= 0) { value[0] = 0; }
+            }
+        }
+        set(host, name, value);
+    }
+
+    // the Cookie header value for a host ("a=1; b=2"), null when there are none
+    public char* header(char* host) {
+        int total = 0;
+        for (int i = 0; i < count; i++) {
+            if (streqi(hosts[i], host)) { total = total + strlen(names[i]) + strlen(values[i]) + 3; }
+        }
+        if (total == 0) {
+            return null;
+        }
+        char* r = malloc(total + 1);
+        r[0] = 0;
+        for (int i = 0; i < count; i++) {
+            if (streqi(hosts[i], host)) {
+                if (strlen(r) > 0) { strcat(r, "; "); }
+                strcat(r, names[i]);
+                strcat(r, "=");
+                strcat(r, values[i]);
+            }
+        }
+        return r;
+    }
+
+    public void clear() { count = 0; }
+}
+
+// the cookies that every Fetch uses (set Fetch.useCookies = false to skip them)
+public CookieJar* jar;
+
+public CookieJar* cookies() {
+    if (jar == null) {
+        jar = new CookieJar();
+    }
+    return jar;
+}
+
 public class Fetch {
     public func onDone;             // int f(int fetch)
     public func onProgress;         // int f(int fetch)
@@ -41,6 +156,11 @@ public class Fetch {
     public bool done;
     public int maxBytes;
     public int userData;
+    public char* method;            // "GET" (the default) or "POST"
+    public char* postBody;          // the body of a POST
+    public int postLen;
+    public char* contentType;       // of the body (default application/x-www-form-urlencoded)
+    public bool useCookies;
     private gui.Display* display;
     private int fd;
     private char* buf;
@@ -59,6 +179,16 @@ public class Fetch {
         maxBytes = 8 * 1024 * 1024;
         body = "";
         headers = "";
+        method = "GET";
+        useCookies = true;
+    }
+
+    // a POST of a body (for example a form: name=value&...)
+    public void post(char* data, char* type) {
+        method = "POST";
+        postBody = strdup(data);
+        postLen = strlen(data);
+        contentType = (type != null) ? type : "application/x-www-form-urlencoded";
     }
 
     public bool running() { return fd >= 0; }
@@ -93,17 +223,32 @@ public class Fetch {
             done = true;
             return false;
         }
-        char* req = malloc(strlen(&u.path[0]) + strlen(&u.host[0]) + 300 + ((extraHeaders != null) ? strlen(extraHeaders) : 0));
-        strcpy(req, "GET ");
+        char* cookieHeader = useCookies ? cookies()->header(&u.host[0]) : null;
+        char* req = malloc(strlen(&u.path[0]) + strlen(&u.host[0]) + 500 + ((extraHeaders != null) ? strlen(extraHeaders) : 0) + ((cookieHeader != null) ? strlen(cookieHeader) : 0) + ((contentType != null) ? strlen(contentType) : 0));
+        strcpy(req, method);
+        strcat(req, " ");
         strcat(req, &u.path[0]);
         strcat(req, " HTTP/1.1\r\nHost: ");
         strcat(req, &u.host[0]);
         strcat(req, "\r\nConnection: close\r\nUser-Agent: A-gnet/1\r\nAccept: */*\r\n");
+        if (cookieHeader != null) {
+            strcat(req, "Cookie: ");
+            strcat(req, cookieHeader);
+            strcat(req, "\r\n");
+        }
         if (extraHeaders != null) {
             strcat(req, extraHeaders);
         }
+        if (streq(method, "POST")) {
+            char cl[100];
+            format(&cl[0], 100, "Content-Length: %d\r\n", postLen);
+            strcat(req, "Content-Type: ");
+            strcat(req, (contentType != null) ? contentType : "application/x-www-form-urlencoded");
+            strcat(req, "\r\n");
+            strcat(req, &cl[0]);
+        }
         strcat(req, "\r\n");
-        if (net.send(fd, req, strlen(req)) < 0) {
+        if (net.send(fd, req, strlen(req)) < 0 || (streq(method, "POST") && postLen > 0 && net.send(fd, postBody, postLen) < 0)) {
             net.close(fd);
             fd = -1;
             error = "cannot send the request";
@@ -177,6 +322,27 @@ public class Fetch {
                 int sp = indexOf(h, ' ');
                 status = (sp > 0) ? atoi(&h[sp + 1]) : 0;
                 char value[64];
+                if (useCookies) {
+                    // every Set-Cookie line
+                    http.Url cu;
+                    if (http.parseUrl(url, &cu)) {
+                        int at = 0;
+                        while (h[at] != 0) {
+                            if (startsWithNoCase(&h[at], "set-cookie:")) {
+                                int vs = at + 11;
+                                while (h[vs] == ' ') { vs++; }
+                                int ve = vs;
+                                while (h[ve] != 0 && h[ve] != 13 && h[ve] != 10) { ve++; }
+                                char* line = malloc(ve - vs + 1);
+                                memcpy(line, &h[vs], ve - vs);
+                                line[ve - vs] = 0;
+                                cookies()->store(&cu.host[0], line);
+                            }
+                            while (h[at] != 0 && h[at] != 10) { at++; }
+                            if (h[at] == 10) { at++; }
+                        }
+                    }
+                }
                 if (http.headerOf(h, "Content-Length", &value[0], 64)) {
                     contentLength = atoi(&value[0]);
                 }
@@ -203,6 +369,11 @@ public class Fetch {
                 char loc[1024];
                 if (http.headerOf(headers, "Location", &loc[0], 1024)) {
                     redirects++;
+                    if (status != 307 && status != 308) {
+                        method = "GET";                 // the browser rule: a form's POST answered with a redirect is followed with GET
+                        postBody = null;
+                        postLen = 0;
+                    }
                     char* next = absolute(&loc[0]);
                     if (start(display, next, extra)) {
                         return;
@@ -262,6 +433,13 @@ public class Fetch {
         strcat(r, loc);
         return r;
     }
+}
+
+private bool startsWithNoCase(char* s, char* prefix) {
+    for (int i = 0; prefix[i] != 0; i++) {
+        if (s[i] == 0 || toLower(s[i]) != toLower(prefix[i])) { return false; }
+    }
+    return true;
 }
 
 // decodes a chunked body; returns the length of the data

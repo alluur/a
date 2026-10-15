@@ -37,7 +37,7 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t125`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t126`, `tests/gui.sh`.
 
 ## Quick start
 
@@ -288,7 +288,10 @@ f->start(display, "http://example.org/", null);        // returns at once; the w
 f->cancel();
 ```
 
-`Fetch` is an HTTP/1.1 GET inside the event loop (`d->watch`): redirects (up to 5), chunked bodies, `Content-Length`, a
+`Fetch` is an HTTP/1.1 request inside the event loop (`f->post("a=1&b=2", null)` makes it a POST with a body; a form POST answered
+with a redirect is followed with GET, like a browser does; **cookies**: `Set-Cookie` headers go into `gnet.cookies()`, a `CookieJar`
+by host name, and are sent back to the same host, so logins work; `f->useCookies = false` skips this; Path, Domain and expiry are
+not used, `Max-Age=0` or an empty value deletes a cookie) (`d->watch`): redirects (up to 5), chunked bodies, `Content-Length`, a
 check that the body is complete, `https://` is reported as unsupported (no TLS). Connecting and name lookup still wait (4 s at
 most). `gnet.Scan` tests the ports of a host one per turn of the event loop (`onFound`, `onProgress`, `onDone`, `stop()`).
 `examples/gui/anet.a` is a network tool made of them and of `netif`, `dns` and `netutil`: interfaces, connections, ARP table,
@@ -318,6 +321,16 @@ scroll bar), shows the hand cursor over links and relays out when its width chan
 pictures of a page load four at a time in the background) and the toolbar widgets: address bar, back/forward/reload/home, history
 that remembers the scroll position, files and Markdown (`abrowse docs/GUI.md`), images and plain text, view source. There is
 no TLS, so `https://` shows a message.
+
+**Forms**: `<form action method>` with `input` (text, password, search, email, number ... as text fields; checkbox; radio;
+submit, button, image; hidden), `textarea`, `select` with `option` and `button` become real widgets inside the view (they
+scroll with the page, Tab moves between them and brings them into view). A click on a submit button, or Enter in a text field,
+collects the fields in order as `name=value` pairs (URL-encoded, `+` for spaces, `%0D%0A` for newlines; unchecked boxes and
+radios are left out, and only the submit button that was used is sent) and calls `view->onSubmit`: `submitMethod` (`GET` or
+`POST`), `submitUrl` (for GET the query is added to the action address) and `submitBody`. `abrowse` sends them with
+`gnet.Fetch`; the back button repeats the address with GET.
+**Anchors**: `<h2 id=x>` and `<a name=x>` can be linked to with `#x`: `view->scrollToAnchor("x")`, `view->anchorY("x")`;
+`abrowse` scrolls on a click and for addresses with a fragment.
 
 Text at other sizes: `surface->textScaled(font, x, y, text, colour, percent)` (and `scaledWidth`) draws text larger or smaller
 with bilinear sampling.
