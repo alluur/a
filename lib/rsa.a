@@ -1,0 +1,161 @@
+// =============================================================================
+//  rsa - RSA signature verification (PKCS#1 v1.5 and PSS)                                           import rsa;
+//
+//    rsa.verifyPkcs1(modulus, modLen, exponent, expLen, 256, digestOfMessage, signature, sigLen)
+//    rsa.verifyPss(modulus, modLen, exponent, expLen, 256, digestOfMessage, signature, sigLen)
+//
+//  The numbers are big-endian bytes (as in a certificate). The hash size is 256, 384 or 512 (SHA-1 is 160, for old
+//  certificates); the digest is the hash of the signed message. Verification only: no signing, no key generation.
+// =============================================================================
+import bn;
+import hash;
+import secure;
+module rsa;
+
+private int limbsFor(int nbytes) {
+    return (nbytes * 8 + 29) / 30;
+}
+
+// the signature raised to the public exponent: the encoded message as modLen bytes (null if the signature is not below the modulus)
+private char* recover(char* modulus, int modLen, char* exponent, int expLen, char* sig, int sigLen) {
+    if (sigLen != modLen || modLen < 64 || modLen > 1024) {
+        return null;
+    }
+    int n = limbsFor(modLen);
+    bn.Num* m = bn.fromBytes(modulus, modLen, n);
+    if ((m->d[0] & 1) == 0) {
+        return null;
+    }
+    bn.Num* s = bn.fromBytes(sig, sigLen, n);
+    if (bn.cmp(s, m) >= 0) {
+        return null;
+    }
+    bn.Num* e = bn.fromBytes(exponent, expLen, limbsFor(expLen));
+    bn.Mont* c = bn.mont(m);
+    bn.Num* r = bn.powMod(c, s, e);
+    char* em = alloc(modLen + 8);
+    bn.toBytes(r, em, modLen);
+    return em;
+}
+
+// the DigestInfo prefix of an EMSA-PKCS1-v1_5 encoding; returns its length (0 for an unknown hash)
+private int prefixFor(int bits, char* out) {
+    char* hex = null;
+    if (bits == 160) { hex = "3021300906052b0e03021a05000414"; }
+    else if (bits == 256) { hex = "3031300d060960864801650304020105000420"; }
+    else if (bits == 384) { hex = "3041300d060960864801650304020205000430"; }
+    else if (bits == 512) { hex = "3051300d060960864801650304020305000440"; }
+    if (hex == null) { return 0; }
+    return secure.fromHex(hex, out, 32);
+}
+
+public bool verifyPkcs1(char* modulus, int modLen, char* exponent, int expLen, int hashBits, char* digest, char* sig, int sigLen) {
+    char* em = recover(modulus, modLen, exponent, expLen, sig, sigLen);
+    if (em == null) {
+        return false;
+    }
+    char prefix[32];
+    int pl = prefixFor(hashBits, &prefix[0]);
+    int hl = (hashBits == 160) ? 20 : hashBits / 8;
+    if (pl == 0) {
+        return false;
+    }
+    int tl = pl + hl;
+    // 00 01 FF ... FF 00 prefix digest
+    if (em[0] != 0 || em[1] != 1 || modLen < tl + 11) {
+        return false;
+    }
+    int psEnd = modLen - tl - 1;
+    for (int i = 2; i < psEnd; i++) {
+        if ((em[i] & 255) != 255) { return false; }
+    }
+    if (em[psEnd] != 0) {
+        return false;
+    }
+    for (int i = 0; i < pl; i++) {
+        if (em[psEnd + 1 + i] != prefix[i]) { return false; }
+    }
+    return hash.equalConstantTime(&em[psEnd + 1 + pl], digest, hl);
+}
+
+// MGF1 (RFC 8017): len bytes of mask from a seed
+private void mgf1(int bits, char* seed, int seedLen, char* out, int len) {
+    int hl = bits / 8;
+    char* buf = alloc(seedLen + 8);
+    for (int i = 0; i < seedLen; i++) { buf[i] = seed[i]; }
+    int done = 0;
+    int counter = 0;
+    while (done < len) {
+        buf[seedLen] = (counter >> 24) & 255;
+        buf[seedLen + 1] = (counter >> 16) & 255;
+        buf[seedLen + 2] = (counter >> 8) & 255;
+        buf[seedLen + 3] = counter & 255;
+        char h[64];
+        char* tmp = alloc(seedLen + 8);
+        for (int i = 0; i < seedLen; i++) { tmp[i] = seed[i]; }
+        tmp[seedLen] = buf[seedLen];
+        tmp[seedLen + 1] = buf[seedLen + 1];
+        tmp[seedLen + 2] = buf[seedLen + 2];
+        tmp[seedLen + 3] = buf[seedLen + 3];
+        hash.digest(bits, tmp, seedLen + 4, &h[0]);
+        for (int i = 0; i < hl && done < len; i++) {
+            out[done] = h[i];
+            done++;
+        }
+        counter++;
+    }
+}
+
+// RSASSA-PSS with MGF1 of the same hash and a salt as long as the hash (what TLS 1.3 uses)
+public bool verifyPss(char* modulus, int modLen, char* exponent, int expLen, int hashBits, char* digest, char* sig, int sigLen) {
+    char* em = recover(modulus, modLen, exponent, expLen, sig, sigLen);
+    if (em == null) {
+        return false;
+    }
+    int hl = hashBits / 8;
+    // the bits of the modulus decide emBits = modBits - 1
+    int modBits = 0;
+    for (int i = 0; i < modLen; i++) {
+        if ((modulus[i] & 255) != 0) {
+            int v = modulus[i] & 255;
+            int b = 0;
+            while (v > 0) { b++; v = v >> 1; }
+            modBits = (modLen - i - 1) * 8 + b;
+            break;
+        }
+    }
+    int emBits = modBits - 1;
+    int emLen = (emBits + 7) / 8;
+    char* e = em;
+    if (emLen < modLen) {
+        e = &em[modLen - emLen];            // one leading zero byte
+    }
+    int saltLen = hl;
+    if (emLen < hl + saltLen + 2 || (e[emLen - 1] & 255) != 0xBC) {
+        return false;
+    }
+    int dbLen = emLen - hl - 1;
+    char* h = &e[dbLen];
+    int unused = 8 * emLen - emBits;
+    if (unused > 0 && ((e[0] & 255) >> (8 - unused)) != 0) {
+        return false;
+    }
+    char* db = alloc(dbLen + 8);
+    mgf1(hashBits, h, hl, db, dbLen);
+    for (int i = 0; i < dbLen; i++) { db[i] = db[i] ^ e[i]; }
+    if (unused > 0) { db[0] = db[0] & (255 >> unused); }
+    int ps = dbLen - saltLen - 1;
+    for (int i = 0; i < ps; i++) {
+        if (db[i] != 0) { return false; }
+    }
+    if (db[ps] != 1) {
+        return false;
+    }
+    char* mp = alloc(8 + hl + saltLen + 8);
+    for (int i = 0; i < 8; i++) { mp[i] = 0; }
+    for (int i = 0; i < hl; i++) { mp[8 + i] = digest[i]; }
+    for (int i = 0; i < saltLen; i++) { mp[8 + hl + i] = db[ps + 1 + i]; }
+    char h2[64];
+    hash.digest(hashBits, mp, 8 + hl + saltLen, &h2[0]);
+    return hash.equalConstantTime(&h2[0], h, hl);
+}

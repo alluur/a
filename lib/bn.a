@@ -1,0 +1,301 @@
+// =============================================================================
+//  bn - fixed size big numbers with modular arithmetic, for RSA, elliptic curves and X25519          import bn;
+//
+//    bn.Num* a = bn.fromBytes(bytes, 32, 9);          // big-endian bytes -> a number with 9 limbs (30 bits each)
+//    bn.Mont* m = bn.mont(modulus);                     // for an odd modulus
+//    bn.Num* r = bn.powMod(m, base, exponent);          // base ^ exponent mod modulus
+//    bn.toBytes(r, out, 32);
+//
+//  A number has a fixed number of limbs (n); all the numbers that meet in an operation have the same n. Multiplication is
+//  Montgomery multiplication (CIOS, 30 bit limbs so that a limb product fits in an A int). The values of curve arithmetic
+//  are kept in Montgomery form (toMont / fromMont); addMod, subMod and mulInto work on them. This code is not written to be
+//  constant time: use it for verification and for ephemeral keys, not for long-lived secrets.
+// =============================================================================
+module bn;
+
+const BITS = 30;
+const MASK = 0x3FFFFFFF;
+
+public class Num {
+    public int* d;
+    public int n;
+}
+
+public Num* make(int n) {
+    Num* a = new Num();
+    a->n = n;
+    a->d = (int*) alloc(n * 8 + 8);
+    for (int i = 0; i < n; i++) { a->d[i] = 0; }
+    return a;
+}
+
+public Num* copy(Num* a) {
+    Num* r = make(a->n);
+    for (int i = 0; i < a->n; i++) { r->d[i] = a->d[i]; }
+    return r;
+}
+
+public void set(Num* r, Num* a) {
+    for (int i = 0; i < r->n; i++) { r->d[i] = a->d[i]; }
+}
+
+public Num* fromInt(int v, int n) {
+    Num* a = make(n);
+    int i = 0;
+    while (v > 0 && i < n) {
+        a->d[i] = v & MASK;
+        v = v >> BITS;
+        i++;
+    }
+    return a;
+}
+
+// big-endian bytes into a number of n limbs (bytes that do not fit are dropped from the left)
+public Num* fromBytes(char* b, int len, int n) {
+    Num* a = make(n);
+    int bit = 0;
+    for (int i = len - 1; i >= 0; i--) {
+        int v = b[i] & 255;
+        int limb = bit / BITS;
+        int off = bit % BITS;
+        if (limb < n) {
+            a->d[limb] = a->d[limb] | ((v << off) & MASK);
+            if (off + 8 > BITS && limb + 1 < n) {
+                a->d[limb + 1] = a->d[limb + 1] | (v >> (BITS - off));
+            }
+        }
+        bit = bit + 8;
+    }
+    return a;
+}
+
+// into len big-endian bytes (high bytes beyond len are dropped)
+public void toBytes(Num* a, char* out, int len) {
+    for (int i = 0; i < len; i++) { out[i] = 0; }
+    int bit = 0;
+    for (int i = len - 1; i >= 0; i--) {
+        int limb = bit / BITS;
+        int off = bit % BITS;
+        int v = 0;
+        if (limb < a->n) {
+            v = a->d[limb] >> off;
+            if (off + 8 > BITS && limb + 1 < a->n) {
+                v = v | (a->d[limb + 1] << (BITS - off));
+            }
+        }
+        out[i] = v & 255;
+        bit = bit + 8;
+    }
+}
+
+public int cmp(Num* a, Num* b) {
+    for (int i = a->n - 1; i >= 0; i--) {
+        if (a->d[i] != b->d[i]) {
+            return (a->d[i] > b->d[i]) ? 1 : -1;
+        }
+    }
+    return 0;
+}
+
+public bool isZero(Num* a) {
+    for (int i = 0; i < a->n; i++) {
+        if (a->d[i] != 0) { return false; }
+    }
+    return true;
+}
+
+public int bitLength(Num* a) {
+    for (int i = a->n - 1; i >= 0; i--) {
+        if (a->d[i] != 0) {
+            int v = a->d[i];
+            int bits = 0;
+            while (v > 0) { bits++; v = v >> 1; }
+            return i * BITS + bits;
+        }
+    }
+    return 0;
+}
+
+public bool bit(Num* a, int i) {
+    int limb = i / BITS;
+    if (limb >= a->n) { return false; }
+    return ((a->d[limb] >> (i % BITS)) & 1) != 0;
+}
+
+// r = a + b; returns the carry (0 or 1)
+public int add(Num* r, Num* a, Num* b) {
+    int carry = 0;
+    for (int i = 0; i < a->n; i++) {
+        int v = a->d[i] + b->d[i] + carry;
+        r->d[i] = v & MASK;
+        carry = v >> BITS;
+    }
+    return carry;
+}
+
+// r = a - b; returns the borrow (0 or 1)
+public int sub(Num* r, Num* a, Num* b) {
+    int borrow = 0;
+    for (int i = 0; i < a->n; i++) {
+        int v = a->d[i] - b->d[i] - borrow;
+        if (v < 0) {
+            v = v + (1 << BITS);
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        r->d[i] = v;
+    }
+    return borrow;
+}
+
+// ---- Montgomery arithmetic -----------------------------------------------------------------------------------------------------------------
+public class Mont {
+    public Num* m;
+    public int n;
+    public int ninv;                // -m^-1 mod 2^30
+    public Num* rr;                 // R^2 mod m
+    public Num* one;                // R mod m: the number 1 in Montgomery form
+    public int* t;                  // scratch of n + 2 limbs
+}
+
+// the context for an odd modulus
+public Mont* mont(Num* m) {
+    Mont* c = new Mont();
+    c->m = m;
+    c->n = m->n;
+    c->t = (int*) alloc((m->n + 2) * 8);
+    int m0 = m->d[0];
+    int x = 1;
+    for (int i = 0; i < 6; i++) {
+        x = (x * (2 - m0 * x)) & MASK;
+    }
+    c->ninv = (-x) & MASK;
+    // R mod m and R^2 mod m by doubling: start with 1, double 30 n times (that is R), then another 30 n times (R^2)
+    Num* v = fromInt(1, m->n);
+    Num* tmp = make(m->n);
+    int total = BITS * m->n;
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < total; i++) {
+            int carry = add(tmp, v, v);
+            set(v, tmp);
+            if (carry != 0 || cmp(v, m) >= 0) {
+                sub(tmp, v, m);
+                set(v, tmp);
+            }
+        }
+        if (round == 0) { c->one = copy(v); }
+    }
+    c->rr = v;
+    return c;
+}
+
+// r = a * b / R mod m (all in Montgomery form gives the product in Montgomery form); r may be a or b
+public void mulInto(Mont* c, Num* r, Num* a, Num* b) {
+    int n = c->n;
+    int* t = c->t;
+    int* md = c->m->d;
+    for (int i = 0; i < n + 2; i++) { t[i] = 0; }
+    for (int i = 0; i < n; i++) {
+        int ai = a->d[i];
+        int carry = 0;
+        for (int j = 0; j < n; j++) {
+            int v = t[j] + ai * b->d[j] + carry;
+            t[j] = v & MASK;
+            carry = v >> BITS;
+        }
+        int v2 = t[n] + carry;
+        t[n] = v2 & MASK;
+        t[n + 1] = v2 >> BITS;
+        int mm = (t[0] * c->ninv) & MASK;
+        int v3 = t[0] + mm * md[0];
+        carry = v3 >> BITS;
+        for (int j = 1; j < n; j++) {
+            int v4 = t[j] + mm * md[j] + carry;
+            t[j - 1] = v4 & MASK;
+            carry = v4 >> BITS;
+        }
+        int v5 = t[n] + carry;
+        t[n - 1] = v5 & MASK;
+        t[n] = t[n + 1] + (v5 >> BITS);
+        t[n + 1] = 0;
+    }
+    // the result is below 2m: subtract m once if needed
+    bool ge = (t[n] != 0);
+    if (!ge) {
+        ge = true;
+        for (int i = n - 1; i >= 0; i--) {
+            if (t[i] != md[i]) {
+                ge = (t[i] > md[i]);
+                break;
+            }
+        }
+    }
+    if (ge) {
+        int borrow = 0;
+        for (int i = 0; i < n; i++) {
+            int v = t[i] - md[i] - borrow;
+            if (v < 0) { v = v + (1 << BITS); borrow = 1; } else { borrow = 0; }
+            r->d[i] = v;
+        }
+    } else {
+        for (int i = 0; i < n; i++) { r->d[i] = t[i]; }
+    }
+}
+
+public Num* mul(Mont* c, Num* a, Num* b) {
+    Num* r = make(c->n);
+    mulInto(c, r, a, b);
+    return r;
+}
+
+public Num* toMont(Mont* c, Num* a) { return mul(c, a, c->rr); }
+
+public Num* fromMont(Mont* c, Num* a) {
+    return mul(c, a, fromInt(1, c->n));
+}
+
+// r = a + b mod m (works for numbers below m in any representation)
+public void addMod(Mont* c, Num* r, Num* a, Num* b) {
+    int carry = add(r, a, b);
+    if (carry != 0 || cmp(r, c->m) >= 0) {
+        sub(r, r, c->m);
+    }
+}
+
+public void subMod(Mont* c, Num* r, Num* a, Num* b) {
+    int borrow = sub(r, a, b);
+    if (borrow != 0) {
+        add(r, r, c->m);
+    }
+}
+
+// base ^ exp mod m, with base, exp and the result as ordinary numbers (exp may have a different number of limbs)
+public Num* powMod(Mont* c, Num* base, Num* exp) {
+    Num* b = toMont(c, base);
+    Num* r = copy(c->one);
+    int bits = bitLength(exp);
+    for (int i = bits - 1; i >= 0; i--) {
+        mulInto(c, r, r, r);
+        if (bit(exp, i)) {
+            mulInto(c, r, r, b);
+        }
+    }
+    return fromMont(c, r);
+}
+
+// a^-1 mod m for a prime m, with a and the result in Montgomery form (a^(m-2))
+public Num* invMont(Mont* c, Num* a) {
+    Num* e = copy(c->m);
+    Num* two = fromInt(2, c->n);
+    sub(e, e, two);
+    Num* r = copy(c->one);
+    int bits = bitLength(e);
+    for (int i = bits - 1; i >= 0; i--) {
+        mulInto(c, r, r, r);
+        if (bit(e, i)) {
+            mulInto(c, r, r, a);
+        }
+    }
+    return r;
+}

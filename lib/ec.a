@@ -1,0 +1,255 @@
+// =============================================================================
+//  ec - ECDSA signature verification on the NIST curves P-256 and P-384                              import ec;
+//
+//    ec.verify(256, publicPoint, 65, digest, 32, r, 32, s, 32)       // publicPoint = 04 || X || Y
+//
+//  The curve is 256 or 384. The digest is the hash of the signed message (any length: the left bytes are used, as in
+//  FIPS 186). r and s are big-endian (leading zeros allowed). Points are kept in Jacobian coordinates in Montgomery form
+//  and u1*G + u2*Q is computed with Shamir's trick. Verification only (not constant time).
+// =============================================================================
+import bn;
+import secure;
+module ec;
+
+class Pt {
+    public bn.Num* x;
+    public bn.Num* y;
+    public bn.Num* z;
+}
+
+class Curve {
+    public int bits;
+    public int nbytes;
+    public int limbs;
+    public bn.Mont* f;          // arithmetic mod p
+    public bn.Mont* q;          // arithmetic mod the group order n
+    public bn.Num* b;           // in Montgomery form
+    public Pt* g;
+    public bn.Num* t1;
+    public bn.Num* t2;
+    public bn.Num* t3;
+    public bn.Num* t4;
+    public bn.Num* t5;
+    public bn.Num* t6;
+    public bn.Num* t7;
+    public bn.Num* t8;
+    public bn.Num* t9;
+    public bn.Num* t10;
+}
+
+private Curve* c256 = null;
+private Curve* c384 = null;
+
+private bn.Num* hexNum(char* h, int limbs) {
+    char buf[64];
+    int n = secure.fromHex(h, &buf[0], 64);
+    return bn.fromBytes(&buf[0], n, limbs);
+}
+
+private Curve* build(int bits, char* p, char* n, char* b, char* gx, char* gy) {
+    Curve* c = new Curve();
+    c->bits = bits;
+    c->nbytes = bits / 8;
+    c->limbs = (bits + 29) / 30;
+    int L = c->limbs;
+    c->f = bn.mont(hexNum(p, L));
+    c->q = bn.mont(hexNum(n, L));
+    c->b = bn.toMont(c->f, hexNum(b, L));
+    c->g = new Pt();
+    c->g->x = bn.toMont(c->f, hexNum(gx, L));
+    c->g->y = bn.toMont(c->f, hexNum(gy, L));
+    c->g->z = bn.copy(c->f->one);
+    c->t1 = bn.make(L); c->t2 = bn.make(L); c->t3 = bn.make(L); c->t4 = bn.make(L); c->t5 = bn.make(L);
+    c->t6 = bn.make(L); c->t7 = bn.make(L); c->t8 = bn.make(L); c->t9 = bn.make(L); c->t10 = bn.make(L);
+    return c;
+}
+
+private Curve* curveFor(int bits) {
+    if (bits == 256) {
+        if (c256 == null) {
+            c256 = build(256, "FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF",
+                         "FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551",
+                         "5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B",
+                         "6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296",
+                         "4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5");
+        }
+        return c256;
+    }
+    if (bits == 384) {
+        if (c384 == null) {
+            c384 = build(384, "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFFFF0000000000000000FFFFFFFF",
+                         "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973",
+                         "B3312FA7E23EE7E4988E056BE3F82D19181D9C6EFE8141120314088F5013875AC656398D8A2ED19D2A85C8EDD3EC2AEF",
+                         "AA87CA22BE8B05378EB1C71EF320AD746E1D3B628BA79B9859F741E082542A385502F25DBF55296C3A545E3872760AB7",
+                         "3617DE4A96262C6F5D9E98BF9292DC29F8F41DBD289A147CE9DA3113B5F0B8C00A60B1CE1D7E819D7A431D7C90EA0E5F");
+        }
+        return c384;
+    }
+    return null;
+}
+
+private void setPt(Pt* r, Pt* a) {
+    bn.set(r->x, a->x);
+    bn.set(r->y, a->y);
+    bn.set(r->z, a->z);
+}
+
+private Pt* newPt(Curve* c) {
+    Pt* p = new Pt();
+    p->x = bn.make(c->limbs);
+    p->y = bn.make(c->limbs);
+    p->z = bn.make(c->limbs);
+    return p;
+}
+
+// R = 2R (a = -3)
+private void dbl(Curve* c, Pt* r) {
+    bn.Mont* f = c->f;
+    bn.mulInto(f, c->t1, r->z, r->z);                       // delta
+    bn.mulInto(f, c->t2, r->y, r->y);                       // gamma
+    bn.mulInto(f, c->t3, r->x, c->t2);                      // beta
+    bn.subMod(f, c->t4, r->x, c->t1);
+    bn.addMod(f, c->t5, r->x, c->t1);
+    bn.mulInto(f, c->t4, c->t4, c->t5);
+    bn.addMod(f, c->t5, c->t4, c->t4);
+    bn.addMod(f, c->t4, c->t5, c->t4);                      // alpha = 3 (x - delta)(x + delta)
+    bn.mulInto(f, c->t5, c->t4, c->t4);
+    bn.addMod(f, c->t6, c->t3, c->t3);
+    bn.addMod(f, c->t6, c->t6, c->t6);                      // 4 beta
+    bn.addMod(f, c->t7, c->t6, c->t6);                      // 8 beta
+    bn.subMod(f, c->t5, c->t5, c->t7);                      // X3
+    bn.addMod(f, c->t7, r->y, r->z);
+    bn.mulInto(f, c->t7, c->t7, c->t7);
+    bn.subMod(f, c->t7, c->t7, c->t2);
+    bn.subMod(f, c->t7, c->t7, c->t1);                      // Z3
+    bn.subMod(f, c->t6, c->t6, c->t5);
+    bn.mulInto(f, c->t6, c->t4, c->t6);
+    bn.mulInto(f, c->t2, c->t2, c->t2);
+    bn.addMod(f, c->t2, c->t2, c->t2);
+    bn.addMod(f, c->t2, c->t2, c->t2);
+    bn.addMod(f, c->t2, c->t2, c->t2);                      // 8 gamma^2
+    bn.subMod(f, c->t6, c->t6, c->t2);                      // Y3
+    bn.set(r->x, c->t5);
+    bn.set(r->y, c->t6);
+    bn.set(r->z, c->t7);
+}
+
+// R = R + Q (either may be the point at infinity, which has z = 0)
+private void addPt(Curve* c, Pt* r, Pt* q) {
+    bn.Mont* f = c->f;
+    if (bn.isZero(r->z)) { setPt(r, q); return; }
+    if (bn.isZero(q->z)) { return; }
+    bn.mulInto(f, c->t1, r->z, r->z);
+    bn.mulInto(f, c->t2, q->z, q->z);
+    bn.mulInto(f, c->t3, r->x, c->t2);                      // u1
+    bn.mulInto(f, c->t4, q->x, c->t1);                      // u2
+    bn.mulInto(f, c->t5, r->y, q->z);
+    bn.mulInto(f, c->t5, c->t5, c->t2);                     // s1
+    bn.mulInto(f, c->t6, q->y, r->z);
+    bn.mulInto(f, c->t6, c->t6, c->t1);                     // s2
+    bn.subMod(f, c->t7, c->t4, c->t3);                      // h
+    bn.subMod(f, c->t8, c->t6, c->t5);
+    bn.addMod(f, c->t8, c->t8, c->t8);                      // rr
+    if (bn.isZero(c->t7)) {
+        if (bn.isZero(c->t8)) {
+            dbl(c, r);
+        } else {
+            bn.set(r->z, bn.make(c->limbs));
+        }
+        return;
+    }
+    bn.addMod(f, c->t9, c->t7, c->t7);
+    bn.mulInto(f, c->t9, c->t9, c->t9);                     // i
+    bn.mulInto(f, c->t10, c->t7, c->t9);                    // j
+    bn.mulInto(f, c->t3, c->t3, c->t9);                     // v
+    bn.mulInto(f, c->t4, c->t8, c->t8);
+    bn.subMod(f, c->t4, c->t4, c->t10);
+    bn.subMod(f, c->t4, c->t4, c->t3);
+    bn.subMod(f, c->t4, c->t4, c->t3);                      // X3
+    bn.subMod(f, c->t3, c->t3, c->t4);
+    bn.mulInto(f, c->t3, c->t8, c->t3);
+    bn.mulInto(f, c->t5, c->t5, c->t10);
+    bn.addMod(f, c->t5, c->t5, c->t5);
+    bn.subMod(f, c->t3, c->t3, c->t5);                      // Y3
+    bn.addMod(f, c->t9, r->z, q->z);
+    bn.mulInto(f, c->t9, c->t9, c->t9);
+    bn.subMod(f, c->t9, c->t9, c->t1);
+    bn.subMod(f, c->t9, c->t9, c->t2);
+    bn.mulInto(f, c->t9, c->t9, c->t7);                     // Z3
+    bn.set(r->x, c->t4);
+    bn.set(r->y, c->t3);
+    bn.set(r->z, c->t9);
+}
+
+// is (x, y) (in Montgomery form) on the curve: y^2 = x^3 - 3x + b
+private bool onCurve(Curve* c, bn.Num* x, bn.Num* y) {
+    bn.Mont* f = c->f;
+    bn.Num* l = bn.mul(f, y, y);
+    bn.Num* r = bn.mul(f, x, x);
+    r = bn.mul(f, r, x);
+    bn.Num* x3 = bn.make(c->limbs);
+    bn.addMod(f, x3, x, x);
+    bn.addMod(f, x3, x3, x);
+    bn.subMod(f, r, r, x3);
+    bn.addMod(f, r, r, c->b);
+    return bn.cmp(l, r) == 0;
+}
+
+// the number from big-endian bytes without leading zeros into limbs (null if it needs more than nbytes)
+private bn.Num* scalar(Curve* c, char* b, int len) {
+    int skip = 0;
+    while (skip < len && b[skip] == 0) { skip++; }
+    if (len - skip > c->nbytes) { return null; }
+    return bn.fromBytes(b + skip, len - skip, c->limbs);
+}
+
+// ECDSA: check the signature (r, s) of a digest against the public point 04||X||Y
+public bool verify(int bits, char* pub, int publen, char* digest, int dlen, char* rb, int rlen, char* sb, int slen) {
+    Curve* c = curveFor(bits);
+    if (c == null) { return false; }
+    int nb = c->nbytes;
+    if (publen != 1 + 2 * nb || pub[0] != 4) { return false; }
+    bn.Num* px = bn.fromBytes(pub + 1, nb, c->limbs);
+    bn.Num* py = bn.fromBytes(pub + 1 + nb, nb, c->limbs);
+    if (bn.cmp(px, c->f->m) >= 0 || bn.cmp(py, c->f->m) >= 0) { return false; }
+    Pt* qp = newPt(c);
+    bn.set(qp->x, bn.toMont(c->f, px));
+    bn.set(qp->y, bn.toMont(c->f, py));
+    bn.set(qp->z, c->f->one);
+    if (!onCurve(c, qp->x, qp->y)) { return false; }
+    bn.Num* r = scalar(c, rb, rlen);
+    bn.Num* s = scalar(c, sb, slen);
+    if (r == null || s == null) { return false; }
+    bn.Num* order = c->q->m;
+    if (bn.isZero(r) || bn.isZero(s) || bn.cmp(r, order) >= 0 || bn.cmp(s, order) >= 0) { return false; }
+    int dl = dlen;
+    if (dl > nb) { dl = nb; }
+    bn.Num* e = bn.fromBytes(digest, dl, c->limbs);
+    if (bn.cmp(e, order) >= 0) { bn.sub(e, e, order); }
+    bn.Mont* q = c->q;
+    bn.Num* w = bn.invMont(q, bn.toMont(q, s));
+    bn.Num* u1 = bn.fromMont(q, bn.mul(q, bn.toMont(q, e), w));
+    bn.Num* u2 = bn.fromMont(q, bn.mul(q, bn.toMont(q, r), w));
+    Pt* gq = newPt(c);
+    setPt(gq, c->g);
+    addPt(c, gq, qp);
+    Pt* acc = newPt(c);
+    bn.set(acc->x, c->f->one);
+    bn.set(acc->y, c->f->one);
+    int top = bn.bitLength(u1);
+    if (bn.bitLength(u2) > top) { top = bn.bitLength(u2); }
+    for (int i = top - 1; i >= 0; i--) {
+        dbl(c, acc);
+        bool b1 = bn.bit(u1, i);
+        bool b2 = bn.bit(u2, i);
+        if (b1 && b2) { addPt(c, acc, gq); }
+        else if (b1) { addPt(c, acc, c->g); }
+        else if (b2) { addPt(c, acc, qp); }
+    }
+    if (bn.isZero(acc->z)) { return false; }
+    bn.Num* zi = bn.invMont(c->f, acc->z);
+    bn.Num* zi2 = bn.mul(c->f, zi, zi);
+    bn.Num* xa = bn.fromMont(c->f, bn.mul(c->f, acc->x, zi2));
+    if (bn.cmp(xa, order) >= 0) { bn.sub(xa, xa, order); }
+    return bn.cmp(xa, r) == 0;
+}
