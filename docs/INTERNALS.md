@@ -356,3 +356,11 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   the handshake in one process. `tests/t122_gui_net.a`: `gnet.Fetch` against a tiny server stepped from `gui.idleHook`.
 * A name clash to know about: `cstdlib` defines a function `random`, so a module called `random` cannot be imported by a file that
   imports `cstdlib` (the secure helpers live in `secure`).
+* `wweb`: a `wsrv.Backend` like `wvnc`. A viewer is first an HTTP request (read up to the empty line; GET `/` serves the page with the
+  token put in, `/ws` with an `Upgrade` header becomes a WebSocket) and then a frame parser (browser frames are always masked,
+  messages are at most 4 KB). The output goes through a queue that is written without blocking (`net.waitWritable(fd, 0)`); a
+  browser that falls 6 MB behind gets its queue dropped and the whole screen again. The pixel format is run-length coded
+  (`queueBand`); the page and `tests/gui/webclient.py` decode it. The test in `tests/gui.sh` compares the web screen pixel for
+  pixel with a VNC viewer of the same server, and the page was also tried in Chromium (Playwright) for the click and the cursor.
+* `gnet.Conn/Listener/Beacon/Chat` run entirely on `Display.watch` and `Display.after`; `t123_gui_chat` runs three chats and the
+  display connection in one process, so the discovery, the connection rule and the messages are tested without extra programs.

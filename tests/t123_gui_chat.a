@@ -1,0 +1,193 @@
+// gnet.Conn / Listener / Beacon and the peer-to-peer Chat: discovery by UDP announcements, automatic connections, messages,
+// leaving. Three chats in one process, all driven by the event loop of one display connection.
+import wsrv;
+import gui;
+import gnet;
+import net;
+
+wsrv.Server* srv;
+gui.Display* d;
+gnet.Chat* a;
+gnet.Chat* b;
+gnet.Chat* c;
+char* lastMsg[3];
+char* lastLeft[3];
+int joined[3];
+
+int idx(int chat) {
+    if (chat == (int) a) { return 0; }
+    if (chat == (int) b) { return 1; }
+    return 2;
+}
+
+int onEvent(int chat) {
+    gnet.Chat* ch = (gnet.Chat*) chat;
+    int i = idx(chat);
+    if (ch->eventKind == 1) { joined[i]++; }
+    if (ch->eventKind == 2) { lastLeft[i] = ch->eventName; }
+    if (ch->eventKind == 3) {
+        char* t = malloc(200);
+        format(t, 200, "%s: %s", ch->eventName, ch->eventText);
+        lastMsg[i] = t;
+    }
+    return 0;
+}
+
+int stepServer(int unused) { srv->step(0); return 0; }
+
+// runs the event loops for up to ms or until done() is true
+void spin(int ms) {
+    int t0 = millis();
+    while (millis() - t0 < ms) {
+        srv->step(0);
+        d->pump(5);
+    }
+}
+
+bool allConnected(int each) {
+    return a->peerCount() == each && b->peerCount() == each && (c == null || c->peerCount() == each);
+}
+
+void waitFor(int ms, int each) {
+    int t0 = millis();
+    while (!allConnected(each) && millis() - t0 < ms) {
+        srv->step(0);
+        d->pump(5);
+    }
+}
+
+// raw data on a connection
+gnet.Conn* serverSide;
+int shout(int conn) {
+    gnet.Conn* x = (gnet.Conn*) conn;
+    char* up = strdup(x->data);
+    for (int i = 0; up[i] != 0; i++) {
+        if (up[i] >= 'a' && up[i] <= 'z') { up[i] = up[i] - 32; }
+    }
+    x->sendText(up);
+    return 0;
+}
+int accepted(int listener) {
+    gnet.Listener* l = (gnet.Listener*) listener;
+    serverSide = l->accepted;
+    serverSide->onData = shout;
+    return 0;
+}
+char* echoed = "";
+int gotEcho(int conn) {
+    gnet.Conn* x = (gnet.Conn*) conn;
+    echoed = x->data;
+    return 0;
+}
+int gotLine(int conn) {
+    gnet.Conn* x = (gnet.Conn*) conn;
+    println(x->line);
+    return 0;
+}
+int closedCalls = 0;
+int onClosed(int conn) { closedCalls++; return 0; }
+
+int main() {
+    wsrv.Headless* hb = new wsrv.Headless(200, 100);
+    srv = new wsrv.Server(hb, 7240);
+    gui.idleHook = stepServer;
+    d = gui.connectAs("7240", "chat");
+
+    // ---- Conn and Listener ----------------------------------------------------------------------------------------------------------
+    gnet.Listener* l = new gnet.Listener();
+    l->onAccept = accepted;
+    printlnInt(l->start(d, "127.0.0.1", 7250));
+    gnet.Conn* cl = new gnet.Conn();
+    cl->onData = gotEcho;
+    cl->onClose = onClosed;
+    printlnInt(cl->connect(d, "127.0.0.1", 7250, 1000));
+    cl->sendText("hello there");
+    spin(300);
+    println(echoed);
+    printlnInt(cl->peerPort);
+    // lines: split at newlines, also when they arrive together or in pieces
+    gnet.Conn* lines = new gnet.Conn();
+    lines->onLine = gotLine;
+    lines->connect(d, "127.0.0.1", 7250, 1000);
+    spin(100);
+    serverSide->onData = null;
+    serverSide->sendText("one\r\ntwo\nthr");
+    spin(100);
+    serverSide->sendText("ee\nfour\n");
+    spin(150);
+    // the other side closes: onClose is called once
+    serverSide->close();
+    spin(150);
+    printlnInt(lines->open);
+    cl->close();
+    printlnInt(closedCalls);
+    printlnInt(cl->connect(d, "127.0.0.1", 7259, 500));
+    l->stop();
+
+    // ---- Beacon ---------------------------------------------------------------------------------------------------------------------
+    gnet.Beacon* b1 = new gnet.Beacon();
+    gnet.Beacon* b2 = new gnet.Beacon();
+    printlnInt(b1->start(d, 7260));
+    printlnInt(b2->start(d, 0));
+    b2->send(0x7F000001, 7260, "ping");
+    spin(150);
+    println(b1->text);
+    printlnInt(b1->fromIp == 0x7F000001);
+    printlnInt(b1->fromPort == b2->port);
+    b1->stop();
+    b2->stop();
+
+    // ---- Chat ------------------------------------------------------------------------------------------------------------------------------
+    a = new gnet.Chat("anna", 7801, 7801);
+    b = new gnet.Chat("bob", 7802, 7802);
+    a->onEvent = onEvent;
+    b->onEvent = onEvent;
+    a->addTarget(0x7F000001, 7802);
+    b->addTarget(0x7F000001, 7801);
+    printlnInt(a->start(d));
+    printlnInt(b->start(d));
+    waitFor(5000, 1);
+    printlnInt(a->peerCount());
+    printlnInt(b->peerCount());
+    println(a->peerName(0));
+    println(b->peerName(0));
+    b->say("hi anna");
+    a->say("hello bob");
+    spin(300);
+    println(lastMsg[0]);
+    println(lastMsg[1]);
+    // a third one joins and connects to both
+    c = new gnet.Chat("carl", 7803, 7803);
+    c->onEvent = onEvent;
+    a->addTarget(0x7F000001, 7803);
+    b->addTarget(0x7F000001, 7803);
+    c->addTarget(0x7F000001, 7801);
+    c->addTarget(0x7F000001, 7802);
+    printlnInt(c->start(d));
+    waitFor(5000, 2);
+    printlnInt(a->peerCount() * 100 + b->peerCount() * 10 + c->peerCount());
+    c->say("hello all");
+    spin(300);
+    println(lastMsg[0]);
+    println(lastMsg[1]);
+    // somebody leaves
+    b->stop();
+    spin(400);
+    println(lastLeft[0]);
+    println(lastLeft[2]);
+    printlnInt(a->peerCount() * 10 + c->peerCount());
+    // a message from a peer that has not said HELLO is not shown, a duplicate name is refused
+    printlnInt(joined[0] + joined[1] + joined[2]);
+    gnet.Chat* dup = new gnet.Chat("anna", 7804, 7804);
+    dup->start(d);
+    printlnInt(dup->connectTo("127.0.0.1", 7803));
+    spin(400);
+    printlnInt(dup->peerCount());
+    printlnInt(c->peerCount());
+    a->stop();
+    c->stop();
+    dup->stop();
+    d->disconnect();
+    srv->close();
+    return 0;
+}

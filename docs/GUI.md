@@ -28,14 +28,15 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `gui` | the client library and the basic widgets, popups, tooltips |
 | `guix` | more widgets: menus, combo box, radio buttons, tabs, scroll view, spin box, splitter; dialogs (confirm, prompt, file, colour) |
 | `glock` | a screen locker (works with the server's `F_LOCK` windows) |
-| `gnet` | non-blocking HTTP fetches and a port scanner that keep a window responsive |
+| `wweb` | a web browser backend: the display in a canvas, mouse and keyboard back over a WebSocket |
+| `gnet` | non-blocking HTTP fetches, a port scanner, TCP connections and listeners, UDP announcements and a peer-to-peer chat, all inside the event loop |
 | `secure` | secure random bytes, unique nonces, hex; (`hash` has `hmacSha256`, `des` the DES cipher for VNC passwords) |
 | `gimg` | colour images: load PNG, BMP and PPM, save PNG, smooth scaling |
 | `gterm` | a terminal emulator widget (pseudo terminal, ANSI/xterm escape sequences) |
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t122`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t124`, `tests/gui.sh`.
 
 ## Quick start
 
@@ -242,6 +243,39 @@ ADISPLAY=server:7000 ./hello                          # on the other computer; r
   wait 1 s longer each time (at most 10 s).
 * **No encryption**: the display protocol and VNC send windows and keystrokes in the clear. The cookie proves who may connect;
   on a network you do not trust, also use an SSH tunnel (`ssh -L 7000:localhost:7000 server`).
+
+## The display in a web browser: `wweb`
+
+```sh
+adisplayd -web 8080 -webtoken mysecret1 &       # open  http://127.0.0.1:8080/?t=mysecret1  in any browser
+```
+
+Nothing has to be installed on the viewing side: the page draws the display on a canvas and sends the mouse (move, buttons,
+wheel) and the keyboard back over a WebSocket. Several browsers can watch at once, together with VNC viewers and a framebuffer.
+Only the changed parts of the screen are sent, run-length coded. `-webhost 0.0.0.0` serves other computers (a token is then
+required; one is made and printed when you do not give one). In a program: `srv->addBackend(new wweb.Web(w, h, port, host, token))`.
+
+* **Safety**: the page and the WebSocket need the token (in the address), a wrong token makes the next try wait, and the
+  WebSocket refuses an `Origin` that is not the page's own host (so a page on another web site cannot take the display over
+  from your browser). It is plain http: the token and the screen are readable on the network path; use an SSH tunnel
+  (`ssh -L 8080:localhost:8080 server`) on networks you do not trust.
+* **Protocol**: documented at the top of `lib/wweb.a`; `docs/web/index.html` is the page (`docs/gen_wweb_page.py` turns it
+  into `lib/wwebpage.a`), and `tests/gui/webclient.py` is an independent client that the tests use.
+* **Keys**: the page sends the browser's keys as `adp` key codes with the typed character; browser shortcuts such as Ctrl+W
+  or Ctrl+T cannot be captured by a page.
+
+## TCP, UDP and a chat: `gnet`
+
+`gnet.Conn` is a TCP connection that lives in the event loop (`onLine` for text protocols or `onData` for raw bytes, `onClose`,
+`sendLine`, `close`), `gnet.Listener` accepts them (`onAccept`, the new connection is `l->accepted`), and `gnet.Beacon` sends and
+receives UDP datagrams (`broadcast`, `send`, `onPacket`). None of them blocks the window; they use `d->watch` (up to 64
+descriptors per display connection).
+
+`gnet.Chat` is a peer-to-peer chat made from them: every program listens, announces its name by UDP every 3 seconds, and
+connects to the others it hears (of two peers the one whose `name@port` sorts higher connects, so there is one connection per
+pair; duplicate names are refused). `chat->say("text")` reaches everybody, `onEvent` reports joins, leaves and messages.
+`examples/gui/achat.a` is a chat program with a peer list, a log, notifications for messages that arrive while the window is in
+the background, and Chat > Connect for an address by hand. There is no encryption or login: use it on a network you trust.
 
 ## Networking from a GUI program: `gnet` and `anet`
 

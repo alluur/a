@@ -20,6 +20,7 @@ import net;
 import http;
 import netutil;
 import cstdlib;
+import cstring;
 module gnet;
 
 int fetchReadable(int arg);
@@ -361,5 +362,576 @@ public class Scan {
 int scanTick(int arg) {
     Scan* s = (Scan*) arg;
     s->tick();
+    return 0;
+}
+
+// =============================================================================
+//  Conn and Listener: TCP connections inside the event loop
+//
+//    gnet.Conn* c = new gnet.Conn();
+//    c->onLine = gotLine;                         // int gotLine(int conn): c->line is one line (without the newline)
+//    c->onClose = closed;
+//    c->connect(display, "192.168.1.20", 7788, 3000);
+//    c->sendLine("hello");
+//
+//    gnet.Listener* l = new gnet.Listener();
+//    l->onAccept = accepted;                      // int accepted(int listener): l->accepted is the new Conn (set its callbacks)
+//    l->start(display, "0.0.0.0", 7788);
+//  With onData instead of onLine the raw bytes arrive (c->data, c->dataLen). Sending waits at most one second.
+// =============================================================================
+int connReadable(int arg);
+int listenReadable(int arg);
+int beaconReadable(int arg);
+
+public class Conn {
+    public func onLine;
+    public func onData;
+    public func onClose;
+    public char* line;
+    public char* data;
+    public int dataLen;
+    public bool open;
+    public int userData;
+    public int peerIp;
+    public int peerPort;
+    private gui.Display* display;
+    private int fd;
+    private char* buf;
+    private int len;
+    private int cap;
+
+    public Conn() {
+        fd = -1;
+        line = "";
+        data = "";
+    }
+
+    // connects (waiting for the connection for at most timeoutMs)
+    public bool connect(gui.Display* d, char* host, int port, int timeoutMs) {
+        int h = net.connectTimeout(host, port, timeoutMs);
+        if (h < 0) {
+            return false;
+        }
+        attach(d, h);
+        return true;
+    }
+
+    // takes over a connected socket
+    public void attach(gui.Display* d, int handle) {
+        display = d;
+        fd = handle;
+        open = true;
+        net.setNoDelay(fd, true);
+        net.setTimeout(fd, 1000);
+        net.peer(fd, &peerIp, &peerPort);
+        cap = 8192;
+        buf = malloc(cap);
+        len = 0;
+        d->watch(fd, connReadable, (int) this);
+    }
+
+    public bool send(char* bytes, int n) {
+        if (!open) {
+            return false;
+        }
+        if (net.send(fd, bytes, n) < 0) {
+            close();
+            return false;
+        }
+        return true;
+    }
+
+    public bool sendText(char* text) { return send(text, strlen(text)); }
+
+    public bool sendLine(char* text) {
+        char* t = malloc(strlen(text) + 2);
+        strcpy(t, text);
+        t[strlen(text)] = 10;
+        t[strlen(text) + 1] = 0;
+        return send(t, strlen(t));
+    }
+
+    public void close() {
+        if (!open) {
+            return;
+        }
+        open = false;
+        display->unwatch(fd);
+        net.close(fd);
+        fd = -1;
+        if (onClose != null) {
+            onClose(this);
+        }
+    }
+
+    public void readable() {
+        if (len + 4096 > cap) {
+            cap = cap * 2;
+            buf = realloc(buf, cap);
+        }
+        int n = net.recv(fd, &buf[len], 4096);
+        if (n <= 0) {
+            close();
+            return;
+        }
+        if (onData != null) {
+            char* d = malloc(n + 1);
+            memcpy(d, &buf[len], n);
+            d[n] = 0;
+            data = d;
+            dataLen = n;
+            onData(this);
+            return;
+        }
+        len = len + n;
+        int start = 0;
+        for (int i = 0; i < len && open; i++) {
+            if (buf[i] == 10) {
+                int e = i;
+                if (e > start && buf[e - 1] == 13) { e--; }
+                char* l = malloc(e - start + 1);
+                memcpy(l, &buf[start], e - start);
+                l[e - start] = 0;
+                line = l;
+                start = i + 1;
+                if (onLine != null) {
+                    onLine(this);
+                }
+            }
+        }
+        if (!open) {
+            return;
+        }
+        if (start > 0) {
+            memmove(buf, &buf[start], len - start);
+            len = len - start;
+        }
+        if (len > 65536) {
+            close();                // a line this long is not a line
+        }
+    }
+}
+
+public class Listener {
+    public func onAccept;
+    public Conn* accepted;
+    public int port;
+    public int userData;
+    private gui.Display* display;
+    private int fd;
+
+    public Listener() {
+        fd = -1;
+    }
+
+    public bool start(gui.Display* d, char* host, int portNumber) {
+        fd = net.listenOn(host, portNumber, 16);
+        if (fd < 0) {
+            return false;
+        }
+        display = d;
+        port = net.localPort(fd);
+        d->watch(fd, listenReadable, (int) this);
+        return true;
+    }
+
+    public void stop() {
+        if (fd >= 0) {
+            display->unwatch(fd);
+            net.close(fd);
+            fd = -1;
+        }
+    }
+
+    public void readable() {
+        int h = net.accept(fd);
+        if (h < 0) {
+            return;
+        }
+        Conn* c = new Conn();
+        c->attach(display, h);
+        accepted = c;
+        if (onAccept != null) {
+            onAccept(this);
+        }
+    }
+}
+
+int connReadable(int arg) {
+    Conn* c = (Conn*) arg;
+    c->readable();
+    return 0;
+}
+
+int listenReadable(int arg) {
+    Listener* l = (Listener*) arg;
+    l->readable();
+    return 0;
+}
+
+// =============================================================================
+//  Beacon: UDP datagrams in the event loop (announcements on a LAN)
+// =============================================================================
+public class Beacon {
+    public func onPacket;           // int f(int beacon): text, fromIp, fromPort
+    public char* text;
+    public int fromIp;
+    public int fromPort;
+    public int port;
+    public int userData;
+    private gui.Display* display;
+    private int fd;
+
+    public Beacon() {
+        fd = -1;
+    }
+
+    // listens for datagrams on a UDP port (0: any free port)
+    public bool start(gui.Display* d, int portNumber) {
+        fd = net.udpBind(portNumber);
+        if (fd < 0) {
+            return false;
+        }
+        display = d;
+        net.setBroadcast(fd, true);
+        port = net.localPort(fd);
+        d->watch(fd, beaconReadable, (int) this);
+        return true;
+    }
+
+    public void stop() {
+        if (fd >= 0) {
+            display->unwatch(fd);
+            net.close(fd);
+            fd = -1;
+        }
+    }
+
+    public bool send(int ip, int portNumber, char* message) {
+        return fd >= 0 && net.sendTo(fd, ip, portNumber, message, strlen(message)) >= 0;
+    }
+
+    // to every computer on the local network
+    public bool broadcast(int portNumber, char* message) {
+        return send(0xFFFFFFFF, portNumber, message);
+    }
+
+    public void readable() {
+        char b[1500];
+        int ip = 0;
+        int p = 0;
+        int n = net.recvFrom(fd, &b[0], 1499, &ip, &p);
+        if (n < 0) {
+            return;
+        }
+        b[n] = 0;
+        text = strdup(&b[0]);
+        fromIp = ip;
+        fromPort = p;
+        if (onPacket != null) {
+            onPacket(this);
+        }
+    }
+}
+
+int beaconReadable(int arg) {
+    Beacon* b = (Beacon*) arg;
+    b->readable();
+    return 0;
+}
+
+// =============================================================================
+//  Chat: peer-to-peer chat on a network (no server): every program listens, announces itself and connects to the others
+//
+//    gnet.Chat* chat = new gnet.Chat("anna", 7788, 7788);     // name, TCP port, UDP port for announcements
+//    chat->onEvent = event;       // int event(int chat): chat->eventKind (1 joined, 2 left, 3 message, 4 note), eventName, eventText
+//    chat->start(display);
+//    chat->say("hello");                                      // goes to everybody
+//    chat->addTarget(ip, udpPort);                            // also announce to this address (the LAN broadcast is always used)
+//    chat->connectTo("192.168.1.20", 7788);                   // connect to a peer by hand
+//
+//  Announcements are  "ACHAT1 name tcpPort"  datagrams every 3 seconds; of two programs that find each other the one whose
+//  "name@ip:port" sorts higher connects. Messages are lines:  HELLO name / MSG text / BYE.  There is no encryption or
+//  authentication: use it on a network you trust.
+// =============================================================================
+int chatListenAccepted(int arg);
+int chatBeaconPacket(int arg);
+int chatAnnounce(int arg);
+int chatLine(int arg);
+int chatClosed(int arg);
+
+public class Chat {
+    public func onEvent;
+    public int eventKind;
+    public char* eventName;
+    public char* eventText;
+    public char* name;
+    public int tcpPort;
+    public int udpPort;
+    public bool running;
+    private gui.Display* display;
+    private Listener* listener;
+    private Beacon* beacon;
+    private Conn** conns;
+    private char** names;                // the name of the peer on conns[i] (null until its HELLO)
+    private int n;
+    private int* targetIp;
+    private int* targetPort;
+    private int ntargets;
+
+    public Chat(char* userName, int tcp, int udp) {
+        name = strdup(userName);
+        tcpPort = tcp;
+        udpPort = udp;
+        conns = (Conn**) calloc(32, 8);
+        names = (char**) calloc(32, 8);
+        targetIp = (int*) calloc(8, 8);
+        targetPort = (int*) calloc(8, 8);
+    }
+
+    public void rearm() {
+        display->after(3000, chatAnnounce, (int) this);
+    }
+
+    public bool start(gui.Display* d) {
+        display = d;
+        listener = new Listener();
+        listener->onAccept = chatListenAccepted;
+        listener->userData = (int) this;
+        if (!listener->start(d, "0.0.0.0", tcpPort)) {
+            return false;
+        }
+        tcpPort = listener->port;
+        beacon = new Beacon();
+        beacon->onPacket = chatBeaconPacket;
+        beacon->userData = (int) this;
+        if (!beacon->start(d, udpPort)) {
+            listener->stop();
+            return false;
+        }
+        udpPort = beacon->port;
+        running = true;
+        announce();
+        d->after(3000, chatAnnounce, (int) this);
+        return true;
+    }
+
+    public void stop() {
+        if (!running) {
+            return;
+        }
+        running = false;
+        for (int i = n - 1; i >= 0; i--) {
+            conns[i]->sendLine("BYE");
+            conns[i]->close();
+        }
+        listener->stop();
+        beacon->stop();
+    }
+
+    public void addTarget(int ip, int port) {
+        if (ntargets < 8) {
+            targetIp[ntargets] = ip;
+            targetPort[ntargets] = port;
+            ntargets++;
+        }
+    }
+
+    public void announce() {
+        char msg[120];
+        format(&msg[0], 120, "ACHAT1 %s %d", name, tcpPort);
+        beacon->broadcast(udpPort, &msg[0]);
+        for (int i = 0; i < ntargets; i++) {
+            beacon->send(targetIp[i], targetPort[i], &msg[0]);
+        }
+    }
+
+    public int peerCount() {
+        int c = 0;
+        for (int i = 0; i < n; i++) {
+            if (names[i] != null) { c++; }
+        }
+        return c;
+    }
+
+    public char* peerName(int k) {
+        int c = 0;
+        for (int i = 0; i < n; i++) {
+            if (names[i] != null) {
+                if (c == k) { return names[i]; }
+                c++;
+            }
+        }
+        return "";
+    }
+
+    private void raise(int kind, char* who, char* text) {
+        eventKind = kind;
+        eventName = who;
+        eventText = text;
+        if (onEvent != null) {
+            onEvent(this);
+        }
+    }
+
+    private int indexOfConn(Conn* c) {
+        for (int i = 0; i < n; i++) {
+            if (conns[i] == c) { return i; }
+        }
+        return -1;
+    }
+
+    private int indexOfName(char* who) {
+        for (int i = 0; i < n; i++) {
+            if (names[i] != null && streq(names[i], who)) { return i; }
+        }
+        return -1;
+    }
+
+    // a connection (made by us or accepted) is part of the chat from now on
+    public void adopt(Conn* c) {
+        if (n >= 32) {
+            c->close();
+            return;
+        }
+        conns[n] = c;
+        names[n] = null;
+        n++;
+        c->onLine = chatLine;
+        c->onClose = chatClosed;
+        c->userData = (int) this;
+        char* hello = malloc(strlen(name) + 8);
+        strcpy(hello, "HELLO ");
+        strcat(hello, name);
+        c->sendLine(hello);
+    }
+
+    public bool connectTo(char* host, int port) {
+        Conn* c = new Conn();
+        if (!c->connect(display, host, port, 2000)) {
+            return false;
+        }
+        adopt(c);
+        return true;
+    }
+
+    public void say(char* text) {
+        char* m = malloc(strlen(text) + 8);
+        strcpy(m, "MSG ");
+        strcat(m, text);
+        for (int i = 0; i < n; i++) {
+            if (names[i] != null) {
+                conns[i]->sendLine(m);
+            }
+        }
+    }
+
+    public void gotLine(Conn* c) {
+        int at = indexOfConn(c);
+        if (at < 0) {
+            return;
+        }
+        char* l = c->line;
+        if (startsWith(l, "HELLO ")) {
+            char* who = strdup(&l[6]);
+            if (strlen(who) == 0 || streq(who, name) || indexOfName(who) >= 0) {
+                c->sendLine("BYE");
+                c->close();
+                return;
+            }
+            names[at] = who;
+            raise(1, who, "");
+        } else if (startsWith(l, "MSG ") && names[at] != null) {
+            raise(3, names[at], &l[4]);
+        } else if (streq(l, "BYE")) {
+            c->close();
+        }
+    }
+
+    public void closed(Conn* c) {
+        int at = indexOfConn(c);
+        if (at < 0) {
+            return;
+        }
+        char* who = names[at];
+        for (int i = at; i < n - 1; i++) {
+            conns[i] = conns[i + 1];
+            names[i] = names[i + 1];
+        }
+        n--;
+        if (who != null) {
+            raise(2, who, "");
+        }
+    }
+
+    public void gotBeacon(Beacon* b) {
+        // "ACHAT1 name port"
+        char* t = b->text;
+        if (!startsWith(t, "ACHAT1 ")) {
+            return;
+        }
+        int sp = indexOf(&t[7], ' ');
+        if (sp <= 0) {
+            return;
+        }
+        char* who = malloc(sp + 1);
+        memcpy(who, &t[7], sp);
+        who[sp] = 0;
+        int port = atoi(&t[7 + sp + 1]);
+        if (streq(who, name) || indexOfName(who) >= 0 || port <= 0) {
+            return;
+        }
+        // the one with the higher "name@ip:port" connects
+        char mine[160];
+        char theirs[160];
+        format(&mine[0], 160, "%s@%d", name, tcpPort);
+        format(&theirs[0], 160, "%s@%d", who, port);
+        if (strcmp(&mine[0], &theirs[0]) > 0) {
+            for (int i = 0; i < n; i++) {
+                if (conns[i]->peerIp == b->fromIp && conns[i]->peerPort == port) {
+                    return;
+                }
+            }
+            char* host = malloc(20);
+            format(host, 20, "%d.%d.%d.%d", (b->fromIp >> 24) & 255, (b->fromIp >> 16) & 255, (b->fromIp >> 8) & 255, b->fromIp & 255);
+            connectTo(host, port);
+        }
+    }
+}
+
+int chatListenAccepted(int arg) {
+    Listener* l = (Listener*) arg;
+    Chat* chat = (Chat*) l->userData;
+    chat->adopt(l->accepted);
+    return 0;
+}
+
+int chatBeaconPacket(int arg) {
+    Beacon* b = (Beacon*) arg;
+    Chat* chat = (Chat*) b->userData;
+    chat->gotBeacon(b);
+    return 0;
+}
+
+int chatLine(int arg) {
+    Conn* c = (Conn*) arg;
+    Chat* chat = (Chat*) c->userData;
+    chat->gotLine(c);
+    return 0;
+}
+
+int chatClosed(int arg) {
+    Conn* c = (Conn*) arg;
+    Chat* chat = (Chat*) c->userData;
+    chat->closed(c);
+    return 0;
+}
+
+int chatAnnounce(int arg) {
+    Chat* chat = (Chat*) arg;
+    if (chat->running) {
+        chat->announce();
+        chat->rearm();
+    }
     return 0;
 }

@@ -233,6 +233,82 @@ try:
         fail("adisplayd -listen without a cookie: " + r.stdout + r.stderr)
     print("listen needs a cookie ok")
 
+    # the web backend: a browser-style client (HTTP + WebSocket) sees the same screen as VNC and controls it
+    from webclient import WebDisplay
+    import urllib.request, urllib.error
+    env4 = dict(os.environ, ADISPLAY="13")
+    p4 = subprocess.Popen([os.path.join(bindir, "adisplayd"), "-p", "13", "-vnc", "5913", "-web", "8093", "-webtoken", "webtok12345", "-control", "-size", "640x400"],
+                          env=env4, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(p4)
+    time.sleep(0.8)
+    page = urllib.request.urlopen("http://127.0.0.1:8093/?t=webtok12345", timeout=5).read().decode()
+    if "<canvas" not in page or "webtok12345" not in page or "@TOKEN@" in page:
+        fail("the web page is wrong")
+    try:
+        urllib.request.urlopen("http://127.0.0.1:8093/", timeout=5)
+        fail("the page was served without the token")
+    except urllib.error.HTTPError as e:
+        if e.code != 403:
+            fail("page without token: %s" % e.code)
+    time.sleep(1.2)
+    for token, origin, label in (("wrongtoken", "same", "wrong token"), ("webtok12345", "http://evil.example", "foreign origin")):
+        try:
+            WebDisplay(8093, token, origin=origin)
+            fail("the web display accepted a " + label)
+        except ConnectionRefusedError as e:
+            if e.args[0] != 403:
+                fail("%s: status %s" % (label, e.args[0]))
+        time.sleep(1.5)
+    hp4 = subprocess.Popen([os.path.join(bindir, "hello")], env=env4, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(hp4)
+    time.sleep(0.8)
+    web = WebDisplay(8093, "webtok12345")
+    web.pump(1.0)
+    if (web.w, web.h) != (640, 400):
+        fail("web display size %dx%d" % (web.w, web.h))
+    vnc4 = Rfb(port=5913)
+    vnc4.grab()
+    same = total = 0
+    for yy in range(0, 400, 7):
+        for xx in range(0, 640, 5):
+            total += 1
+            if web.pixel(xx, yy) == vnc4.pixel(xx, yy):
+                same += 1
+    if same != total:
+        fail("web and VNC show different screens (%d of %d samples)" % (same, total))
+    print("web screen equals the VNC screen")
+    box = web.find_color((60, 120, 216))
+    if not box:
+        fail("hello's button is not on the web screen")
+    def label_area():
+        return bytes(web.fb[((box[1] - 28) * web.w + box[0]) * 3:((box[1] - 10) * web.w + box[0]) * 3 + 600])
+    before = label_area()
+    web.click((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+    web.pump(1.0)
+    if label_area() == before:
+        fail("a click through the web display did nothing")
+    print("web click ok")
+    cp = subprocess.Popen([os.path.join(bindir, "calc")], env=env4, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(cp)
+    time.sleep(0.8)
+    web.pump(0.5)
+    snap = bytes(web.fb)
+    web.type_text("12*7+5=")
+    web.pump(1.0)
+    if bytes(web.fb) == snap:
+        fail("typing through the web display did nothing")
+    vnc4.grab()
+    same = total = 0
+    for yy in range(0, 400, 7):
+        for xx in range(0, 640, 5):
+            total += 1
+            if web.pixel(xx, yy) == vnc4.pixel(xx, yy):
+                same += 1
+    if same != total:
+        fail("after typing, web and VNC differ (%d of %d)" % (same, total))
+    print("web keyboard ok")
+    web.s.close()
+
     # a second display with the screen locker: a wrong password keeps it locked, the right one removes it
     env2 = dict(os.environ, ADISPLAY="10")
     def start2(name, *args):

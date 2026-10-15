@@ -1,0 +1,527 @@
+// =============================================================================
+//  wweb - a web browser backend for the display server                                              import wweb;
+//
+//    wweb.Web* web = new wweb.Web(1024, 768, 8000, "127.0.0.1", "mytoken");
+//    wsrv.Server* srv = new wsrv.Server(web, 7000);          // or srv->addBackend(web)
+//    srv->run();
+//
+//  Open  http://127.0.0.1:8000/?t=mytoken  in any browser: the page draws the display on a canvas and sends the mouse and the
+//  keyboard back, over a WebSocket (/ws). Nothing has to be installed on the viewing side.
+//
+//  Protocol of the WebSocket (binary messages, numbers big endian):
+//    server -> browser   1, width u16, height u16                      the size of the display
+//                        2, x u16, y u16, w u16, h u16, pixels...      a rectangle; the pixels are run-length coded:
+//                          a byte 0..127 is followed by n+1 pixels (3 bytes each: red, green, blue),
+//                          a byte 128..255 is followed by one pixel that repeats (byte - 125) times
+//    browser -> server   1 x u16 y u16 (pointer)   2 button u8 (down)   3 button u8 (up)   4 delta i8 (wheel: +1 up)
+//                        5 key u16 unicode u32 (key down)   6 key u16 (key up)           (key codes of adp: KEY_*)
+//
+//  Safety: the page and the WebSocket need the token (a shared secret in the address; the default host is 127.0.0.1 and any
+//  other host needs a token), the WebSocket's Origin header has to name the same host as the request (against pages of other
+//  sites that try to take over the display), and wrong tokens make the next try wait. There is no encryption (http, not
+//  https): on a network you do not trust use an SSH tunnel, or anyone on the path can read the screen and the token.
+//    int  web->viewers()    the number of connected browsers
+// =============================================================================
+import net;
+import gfx;
+import adp;
+import wsrv;
+import hash;
+import secure;
+import http;
+import websocket;
+import wwebpage;
+import cstdlib;
+module wweb;
+
+class Viewer {
+    public int fd;
+    public int state;               // 0 reading the HTTP request, 1 WebSocket
+    public bool dead;
+    public bool closeWhenSent;
+    public bool needFull;
+    public adp.Bytes* in;
+    public adp.Bytes* outq;
+    public int born;
+
+    public Viewer(int h) {
+        fd = h;
+        in = new adp.Bytes();
+        outq = new adp.Bytes();
+        born = millis();
+    }
+}
+
+public class Web : wsrv.Backend {
+    public int port;
+    public char* token;
+    public char* host;
+    private int listenFd;
+    private Viewer** vs;
+    private int nv;
+    private gfx.Surface* last;
+    private int failures;
+    private int lockedUntil;
+    private char* page;
+
+    // token: the shared secret (letters and digits, at least 8 characters), or null for none (only with host 127.0.0.1)
+    public Web(int width, int height, int tcpPort, char* bindHost, char* tok) {
+        w = width;
+        h = height;
+        port = tcpPort;
+        host = bindHost;
+        token = null;
+        listenFd = -1;
+        vs = (Viewer**) calloc(16, 8);
+        if (tok != null && strlen(tok) > 0) {
+            if (strlen(tok) < 8 || !plain(tok)) {
+                return;
+            }
+            token = strdup(tok);
+        } else if (!streq(bindHost, "127.0.0.1") && !streq(bindHost, "localhost")) {
+            return;                 // a token is needed for any other address
+        }
+        net.init();
+        listenFd = net.listenOn(bindHost, tcpPort, 8);
+        page = wwebpage.html();
+    }
+
+    public bool ok() { return listenFd >= 0; }
+    public int viewers() {
+        int n = 0;
+        for (int i = 0; i < nv; i++) {
+            if (vs[i]->state == 1) { n++; }
+        }
+        return n;
+    }
+
+    // the address to open in a browser
+    public char* url() {
+        char* t = malloc(200);
+        if (token != null) {
+            format(t, 200, "http://%s:%d/?t=%s", host, port, token);
+        } else {
+            format(t, 200, "http://%s:%d/", host, port);
+        }
+        return t;
+    }
+
+    private bool plain(char* t) {
+        for (int i = 0; t[i] != 0; i++) {
+            int c = t[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public virtual int pollFds(int* handles, int* events, int max) {
+        int n = 0;
+        if (listenFd >= 0 && n < max) {
+            handles[n] = listenFd;
+            events[n] = net.READABLE;
+            n++;
+        }
+        for (int i = 0; i < nv && n < max; i++) {
+            handles[n] = vs[i]->fd;
+            events[n] = net.READABLE;
+            if (vs[i]->outq->len > 0) {
+                events[n] = net.READABLE | net.WRITABLE;
+            }
+            n++;
+        }
+        return n;
+    }
+
+    private bool ready(int* handles, int* revents, int n, int fd, int mask) {
+        for (int i = 0; i < n; i++) {
+            if (handles[i] == fd && (revents[i] & mask) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public virtual void service(int* handles, int* revents, int n) {
+        int any = net.READABLE | net.HUNGUP | net.FAILED;
+        if (listenFd >= 0 && ready(handles, revents, n, listenFd, any) && nv < 15) {
+            int c = net.accept(listenFd);
+            if (c >= 0) {
+                if (millis() - lockedUntil < 0) {
+                    net.close(c);               // wrong tokens make the next try wait
+                } else {
+                    net.setNoDelay(c, true);
+                    vs[nv] = new Viewer(c);
+                    nv++;
+                }
+            }
+        }
+        int now = millis();
+        for (int i = 0; i < nv; i++) {
+            Viewer* v = vs[i];
+            if (ready(handles, revents, n, v->fd, any)) {
+                readViewer(v);
+            }
+            flush(v);
+            if (v->state == 0 && now - v->born > 5000) {
+                v->dead = true;                 // five seconds for a request
+            }
+        }
+        int i = 0;
+        while (i < nv) {
+            if (vs[i]->dead) {
+                net.close(vs[i]->fd);
+                for (int j = i; j < nv - 1; j++) {
+                    vs[j] = vs[j + 1];
+                }
+                nv--;
+            } else {
+                i++;
+            }
+        }
+    }
+
+    // sends what the socket takes without waiting
+    private void flush(Viewer* v) {
+        int sent = 0;
+        while (sent < v->outq->len && !v->dead) {
+            if (!net.waitWritable(v->fd, 0)) {
+                break;
+            }
+            int n = v->outq->len - sent;
+            if (n > 32768) { n = 32768; }
+            if (net.send(v->fd, &v->outq->data[sent], n) < 0) {
+                v->dead = true;
+                break;
+            }
+            sent = sent + n;
+        }
+        if (sent > 0) {
+            v->outq->consume(sent);
+        }
+        if (v->closeWhenSent && v->outq->len == 0) {
+            v->dead = true;
+        }
+        if (v->needFull && v->outq->len == 0 && last != null && v->state == 1) {
+            v->needFull = false;
+            queueRect(v, 0, 0, last->w, last->h);
+        }
+    }
+
+    // ---- the HTTP side ------------------------------------------------------------------------------------------------------------------
+    private void respond(Viewer* v, int status, char* type, char* body) {
+        char* head = malloc(400);
+        format(head, 400, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
+               status, http.statusText(status), type, strlen(body));
+        v->outq->addText(head);
+        v->outq->addText(body);
+        v->closeWhenSent = true;
+    }
+
+    // the value of the t= parameter of a request path ("" if none)
+    private char* tokenOf(char* path) {
+        int q = indexOf(path, '?');
+        if (q < 0) {
+            return "";
+        }
+        char* r = malloc(100);
+        r[0] = 0;
+        int i = q + 1;
+        while (path[i] != 0) {
+            if (path[i] == 't' && path[i + 1] == '=' && (i == q + 1 || path[i - 1] == '&')) {
+                int k = 0;
+                i = i + 2;
+                while (path[i] != 0 && path[i] != '&' && path[i] != ' ' && k < 99) {
+                    r[k] = path[i];
+                    k++;
+                    i++;
+                }
+                r[k] = 0;
+                return r;
+            }
+            i++;
+        }
+        return r;
+    }
+
+    private bool tokenOk(char* path) {
+        if (token == null) {
+            return true;
+        }
+        char* given = tokenOf(path);
+        int n = strlen(token);
+        bool good = (strlen(given) == n) && hash.equalConstantTime(given, token, n);
+        if (!good) {
+            failures++;
+            int wait = failures * 500;
+            if (wait > 5000) { wait = 5000; }
+            lockedUntil = millis() + wait;
+        } else {
+            failures = 0;
+        }
+        return good;
+    }
+
+    // the host part of "http://host:port" (an Origin) or "host:port" (a Host header)
+    private bool sameHost(char* origin, char* hostHeader) {
+        char* o = origin;
+        int s = indexOf(o, ':');
+        if (s >= 0 && o[s + 1] == '/' && o[s + 2] == '/') {
+            o = &o[s + 3];
+        }
+        return streq(o, hostHeader);
+    }
+
+    private void handleRequest(Viewer* v, char* raw) {
+        char path[1024];
+        int k = 0;
+        int i = 4;
+        while (raw[i] != ' ' && raw[i] != 0 && raw[i] != 13 && k < 1023) {
+            path[k] = raw[i];
+            k++;
+            i++;
+        }
+        path[k] = 0;
+        if (!startsWith(raw, "GET ")) {
+            respond(v, 405, "text/plain", "only GET");
+            return;
+        }
+        char up[64];
+        char key[128];
+        char hostHeader[200];
+        char origin[200];
+        bool wsRequest = http.headerOf(raw, "Upgrade", &up[0], 64) && indexOf(&up[0], 'e') >= 0 && http.headerOf(raw, "Sec-WebSocket-Key", &key[0], 128);
+        if (wsRequest && startsWith(&path[0], "/ws")) {
+            if (!tokenOk(&path[0])) {
+                respond(v, 403, "text/plain", "wrong token");
+                return;
+            }
+            if (http.headerOf(raw, "Origin", &origin[0], 200)) {
+                if (!http.headerOf(raw, "Host", &hostHeader[0], 200) || !sameHost(&origin[0], &hostHeader[0])) {
+                    respond(v, 403, "text/plain", "wrong origin");
+                    return;
+                }
+            }
+            char* resp = malloc(300);
+            format(resp, 300, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", websocket.acceptKey(&key[0]));
+            v->outq->addText(resp);
+            v->state = 1;
+            char init[5];
+            init[0] = 1;
+            init[1] = (w >> 8) & 255;
+            init[2] = w & 255;
+            init[3] = (h >> 8) & 255;
+            init[4] = h & 255;
+            sendMessage(v, &init[0], 5);
+            v->needFull = true;
+            return;
+        }
+        if (startsWith(&path[0], "/ ") || streq(&path[0], "/") || startsWith(&path[0], "/?") || startsWith(&path[0], "/index.html")) {
+            if (!tokenOk(&path[0])) {
+                respond(v, 403, "text/html", "<!doctype html><meta charset=utf-8><title>Display</title><p>This display needs a token: open the address that adisplayd printed (it ends in ?t=...).");
+                return;
+            }
+            respond(v, 200, "text/html; charset=utf-8", wwebpage.withToken(page, token == null ? "" : token));
+            return;
+        }
+        respond(v, 404, "text/plain", "not found");
+    }
+
+    // ---- the WebSocket side -----------------------------------------------------------------------------------------------------------
+    private void sendMessage(Viewer* v, char* data, int n) {
+        char* frame = malloc(n + 16);
+        int len = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, data, n, frame);
+        v->outq->addBytes(frame, len);
+    }
+
+    private void sendControl(Viewer* v, int opcode, char* data, int n) {
+        char* frame = malloc(n + 16);
+        int len = websocket.buildFrame(opcode, true, false, 0, data, n, frame);
+        v->outq->addBytes(frame, len);
+    }
+
+    // the pixels of a rectangle as one message (type 2)
+    private void queueBand(Viewer* v, int x, int y, int bw, int bh) {
+        int n = bw * bh;
+        char* msg = malloc(9 + n * 3 + n / 64 + 16);
+        msg[0] = 2;
+        msg[1] = (x >> 8) & 255; msg[2] = x & 255;
+        msg[3] = (y >> 8) & 255; msg[4] = y & 255;
+        msg[5] = (bw >> 8) & 255; msg[6] = bw & 255;
+        msg[7] = (bh >> 8) & 255; msg[8] = bh & 255;
+        int o = 9;
+        int* pix = (int*) malloc(n * 8 + 8);
+        for (int yy = 0; yy < bh; yy++) {
+            for (int xx = 0; xx < bw; xx++) {
+                pix[yy * bw + xx] = last->get(x + xx, y + yy) & 0xFFFFFF;
+            }
+        }
+        int i = 0;
+        while (i < n) {
+            int run = 1;
+            while (i + run < n && run < 130 && pix[i + run] == pix[i]) {
+                run++;
+            }
+            if (run >= 3) {
+                msg[o] = 128 + run - 3;
+                msg[o + 1] = (pix[i] >> 16) & 255;
+                msg[o + 2] = (pix[i] >> 8) & 255;
+                msg[o + 3] = pix[i] & 255;
+                o = o + 4;
+                i = i + run;
+            } else {
+                // literal pixels up to the next run of three or 128 pixels
+                int start = i;
+                int count = 0;
+                while (i < n && count < 128) {
+                    if (i + 2 < n && pix[i] == pix[i + 1] && pix[i] == pix[i + 2]) {
+                        break;
+                    }
+                    i++;
+                    count++;
+                }
+                msg[o] = count - 1;
+                o++;
+                for (int k = 0; k < count; k++) {
+                    int p = pix[start + k];
+                    msg[o] = (p >> 16) & 255;
+                    msg[o + 1] = (p >> 8) & 255;
+                    msg[o + 2] = p & 255;
+                    o = o + 3;
+                }
+            }
+        }
+        sendMessage(v, msg, o);
+    }
+
+    private void queueRect(Viewer* v, int x, int y, int rw, int rh) {
+        if (last == null) {
+            return;
+        }
+        if (x < 0) { rw = rw + x; x = 0; }
+        if (y < 0) { rh = rh + y; y = 0; }
+        if (x + rw > last->w) { rw = last->w - x; }
+        if (y + rh > last->h) { rh = last->h - y; }
+        if (rw <= 0 || rh <= 0) {
+            return;
+        }
+        int rows = 40000 / rw;
+        if (rows < 1) { rows = 1; }
+        for (int yy = y; yy < y + rh; yy = yy + rows) {
+            int bh = (yy + rows <= y + rh) ? rows : y + rh - yy;
+            queueBand(v, x, yy, rw, bh);
+        }
+    }
+
+    public virtual void present(gfx.Surface* screen, int x, int y, int rw, int rh) {
+        last = screen;
+        for (int i = 0; i < nv; i++) {
+            Viewer* v = vs[i];
+            if (v->state != 1 || v->needFull) {
+                continue;
+            }
+            if (v->outq->len > 6000000) {
+                // this browser is too slow: forget the queue and send the whole screen when it has caught up
+                v->outq->clear();
+                v->needFull = true;
+                continue;
+            }
+            queueRect(v, x, y, rw, rh);
+            flush(v);
+        }
+    }
+
+    private void input(Viewer* v, char* d, int n) {
+        int t = d[0];
+        if (t == 1 && n >= 5) {
+            push(wsrv.IE_MOVE, ((d[1] & 255) << 8) | (d[2] & 255), ((d[3] & 255) << 8) | (d[4] & 255), 0, 0, 0);
+        } else if (t == 2 && n >= 2) {
+            push(wsrv.IE_DOWN, 0, 0, d[1] & 255, 0, 0);
+        } else if (t == 3 && n >= 2) {
+            push(wsrv.IE_UP, 0, 0, d[1] & 255, 0, 0);
+        } else if (t == 4 && n >= 2) {
+            int delta = d[1];                       // signed byte
+            push(wsrv.IE_SCROLL, 0, 0, delta > 0 ? 1 : -1, 0, 0);
+        } else if (t == 5 && n >= 7) {
+            int key = ((d[1] & 255) << 8) | (d[2] & 255);
+            int uni = ((d[3] & 255) << 24) | ((d[4] & 255) << 16) | ((d[5] & 255) << 8) | (d[6] & 255);
+            push(wsrv.IE_KEYDOWN, 0, 0, 0, key, uni);
+        } else if (t == 6 && n >= 3) {
+            int key = ((d[1] & 255) << 8) | (d[2] & 255);
+            push(wsrv.IE_KEYUP, 0, 0, 0, key, 0);
+        }
+    }
+
+    private void readViewer(Viewer* v) {
+        v->in->reserve(8192);
+        int n = net.recv(v->fd, &v->in->data[v->in->len], 8192);
+        if (n <= 0) {
+            v->dead = true;
+            return;
+        }
+        v->in->len = v->in->len + n;
+        if (v->in->len > 70000) {
+            v->dead = true;                         // nothing we serve needs this much
+            return;
+        }
+        if (v->state == 0) {
+            // the request ends with an empty line
+            adp.Bytes* b = v->in;
+            for (int i = 3; i < b->len; i++) {
+                if (b->data[i - 3] == 13 && b->data[i - 2] == 10 && b->data[i - 1] == 13 && b->data[i] == 10) {
+                    char* raw = malloc(i + 2);
+                    memcpy(raw, b->data, i + 1);
+                    raw[i + 1] = 0;
+                    b->consume(i + 1);
+                    handleRequest(v, raw);
+                    break;
+                }
+            }
+            if (v->state == 0 && v->in->len > 16000) {
+                v->dead = true;
+            }
+            if (v->state != 1) {
+                return;
+            }
+        }
+        // WebSocket frames
+        while (!v->dead) {
+            websocket.Frame f;
+            int hl = websocket.parseHeader(v->in->data, v->in->len, &f);
+            if (hl < 0) {
+                v->dead = true;
+                return;
+            }
+            if (hl == 0 || v->in->len < hl + f.length) {
+                return;
+            }
+            if (f.length > 4096 || !f.masked) {
+                v->dead = true;                     // browsers always mask; our messages are tiny
+                return;
+            }
+            char* payload = &v->in->data[hl];
+            websocket.unmask(payload, f.length, f.maskKey);
+            if (f.opcode == websocket.OP_BINARY && f.length > 0) {
+                input(v, payload, f.length);
+            } else if (f.opcode == websocket.OP_PING) {
+                sendControl(v, websocket.OP_PONG, payload, f.length);
+            } else if (f.opcode == websocket.OP_CLOSE) {
+                sendControl(v, websocket.OP_CLOSE, "", 0);
+                v->closeWhenSent = true;
+            }
+            v->in->consume(hl + f.length);
+        }
+    }
+
+    public virtual void shutdown() {
+        for (int i = 0; i < nv; i++) {
+            net.close(vs[i]->fd);
+        }
+        nv = 0;
+        if (listenFd >= 0) {
+            net.close(listenFd);
+            listenFd = -1;
+        }
+    }
+}
