@@ -8,8 +8,9 @@
 //    ... in finished:  f->status  f->headers  f->body  f->bodyLen  f->error
 //
 //  Fetch is an HTTP/1.1 GET that does not block: the response is read as it arrives, inside the event loop of the display
-//  (gui.Display.watch). Redirects (up to 5), chunked bodies and Content-Length are handled; plain http:// only. Connecting
-//  and looking up the name still wait (the time limit is 4 seconds).
+//  (gui.Display.watch). Redirects (up to 5), chunked bodies and Content-Length are handled. https:// works too (TLS 1.3 from the tls module; the
+//  certificate is checked against the system roots unless f->verifyCerts is false). Connecting and looking up the name
+//  still wait (the time limit is 4 seconds).
 //
 //    gnet.Scan* s = new gnet.Scan();              a port scanner that tests one port per turn of the event loop
 //    s->onFound = found;  s->onDone = scanned;    int found(int scan) { ... s->lastFound ... }
@@ -19,6 +20,7 @@ import gui;
 import net;
 import http;
 import netutil;
+import tls;
 import cstdlib;
 import cstring;
 module gnet;
@@ -161,6 +163,13 @@ public class Fetch {
     public int postLen;
     public char* contentType;       // of the body (default application/x-www-form-urlencoded)
     public bool useCookies;
+    public bool verifyCerts;        // https: check the server certificate (default true)
+    public bool secure;             // the response came over TLS
+    public char* cipher;            // the TLS cipher suite, when secure
+    public char* certError;         // why the certificate was refused (the fetch failed with the same text)
+    private tls.Tls* sess;
+    private char* pendingReq;
+    private int pendingLen;
     private gui.Display* display;
     private int fd;
     private char* buf;
@@ -181,6 +190,7 @@ public class Fetch {
         headers = "";
         method = "GET";
         useCookies = true;
+        verifyCerts = true;
     }
 
     // a POST of a body (for example a form: name=value&...)
@@ -212,11 +222,10 @@ public class Fetch {
             done = true;
             return false;
         }
-        if (streq(&u.scheme[0], "https")) {
-            error = "https is not supported (no TLS)";
-            done = true;
-            return false;
-        }
+        bool useTls = streq(&u.scheme[0], "https");
+        sess = null;
+        pendingReq = null;
+        secure = false;
         fd = net.connectTimeout(&u.host[0], u.port, 4000);
         if (fd < 0) {
             error = "cannot connect";
@@ -224,7 +233,7 @@ public class Fetch {
             return false;
         }
         char* cookieHeader = useCookies ? cookies()->header(&u.host[0]) : null;
-        char* req = malloc(strlen(&u.path[0]) + strlen(&u.host[0]) + 500 + ((extraHeaders != null) ? strlen(extraHeaders) : 0) + ((cookieHeader != null) ? strlen(cookieHeader) : 0) + ((contentType != null) ? strlen(contentType) : 0));
+        char* req = malloc(postLen + strlen(&u.path[0]) + strlen(&u.host[0]) + 500 + ((extraHeaders != null) ? strlen(extraHeaders) : 0) + ((cookieHeader != null) ? strlen(cookieHeader) : 0) + ((contentType != null) ? strlen(contentType) : 0));
         strcpy(req, method);
         strcat(req, " ");
         strcat(req, &u.path[0]);
@@ -248,7 +257,24 @@ public class Fetch {
             strcat(req, &cl[0]);
         }
         strcat(req, "\r\n");
-        if (net.send(fd, req, strlen(req)) < 0 || (streq(method, "POST") && postLen > 0 && net.send(fd, postBody, postLen) < 0)) {
+        int reqLen = strlen(req);
+        if (streq(method, "POST") && postLen > 0) {
+            memcpy(&req[reqLen], postBody, postLen);
+            reqLen = reqLen + postLen;
+        }
+        if (useTls) {
+            sess = tls.client(&u.host[0], verifyCerts);
+            pendingReq = req;
+            pendingLen = reqLen;
+            flushTls();
+            if (tls.failed(sess)) {
+                net.close(fd);
+                fd = -1;
+                error = sess->error;
+                done = true;
+                return false;
+            }
+        } else if (net.send(fd, req, reqLen) < 0) {
             net.close(fd);
             fd = -1;
             error = "cannot send the request";
@@ -281,6 +307,10 @@ public class Fetch {
 
     // called when the socket has something to read
     public void readable() {
+        if (sess != null) {
+            readableTls();
+            return;
+        }
         if (len + 8192 > cap) {
             cap = cap * 2;
             buf = realloc(buf, cap);
@@ -295,6 +325,57 @@ public class Fetch {
             return;
         }
         len = len + n;
+        afterData();
+    }
+
+    // sends what the TLS session wants to send
+    private void flushTls() {
+        while (tls.outLength(sess) > 0) {
+            int n = net.send(fd, tls.outData(sess), tls.outLength(sess));
+            if (n <= 0) { break; }
+            tls.outConsumed(sess, n);
+        }
+    }
+
+    private void readableTls() {
+        char raw[8192];
+        int n = net.recv(fd, &raw[0], 8192);
+        if (n < 0) {
+            fail("the connection failed");
+            return;
+        }
+        if (n == 0) {
+            if (tls.ready(sess) || tls.closed(sess)) { finish(); } else { fail("the secure connection ended during the handshake"); }
+            return;
+        }
+        tls.feed(sess, &raw[0], n);
+        if (tls.failed(sess)) {
+            flushTls();
+            certError = sess->certProblem;
+            fail(sess->error);
+            return;
+        }
+        if (tls.ready(sess) && pendingReq != null) {
+            secure = true;
+            cipher = sess->suiteName;
+            tls.write(sess, pendingReq, pendingLen);
+            pendingReq = null;
+        }
+        flushTls();
+        while (tls.available(sess) > 0) {
+            if (len + 8192 > cap) {
+                cap = cap * 2;
+                buf = realloc(buf, cap);
+            }
+            len = len + tls.readApp(sess, &buf[len], 8192);
+        }
+        afterData();
+        if (!done && fd >= 0 && tls.closed(sess)) {
+            finish();
+        }
+    }
+
+    private void afterData() {
         if (len > maxBytes + 65536) {
             fail("the response is too large");
             return;
@@ -420,9 +501,10 @@ public class Fetch {
         http.Url u;
         http.parseUrl(url, &u);
         char* r = malloc(strlen(loc) + 300);
-        strcpy(r, "http://");
+        bool https = streq(&u.scheme[0], "https");
+        strcpy(r, https ? "https://" : "http://");
         strcat(r, &u.host[0]);
-        if (u.port != 80) {
+        if (u.port != (https ? 443 : 80)) {
             char p[12];
             format(&p[0], 12, ":%d", u.port);
             strcat(r, &p[0]);

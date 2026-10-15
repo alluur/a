@@ -1,0 +1,213 @@
+import wsrv;
+import gui;
+import gnet;
+import net;
+import http;
+import tls;
+import x509;
+import cstring;
+
+wsrv.Server* srv;
+wsrv.Headless* hb;
+gui.Display* d;
+
+// ---- the HTTPS server, polled from the event loop -------------------------------------------------------------------------------
+class Peer {
+    public int fd;
+    public tls.Tls* t;
+    public tls.Config* cfg;
+    public char* req;
+    public int reqLen;
+    public bool answered;
+    public Peer* next;
+}
+
+int listener = -1;
+Peer* peers = null;
+tls.Config* goodCfg;
+tls.Config* strangerCfg;
+tls.Config* current;
+int served = 0;
+
+void flushPeer(Peer* p) {
+    while (tls.outLength(p->t) > 0) {
+        int n = net.send(p->fd, tls.outData(p->t), tls.outLength(p->t));
+        if (n <= 0) { break; }
+        tls.outConsumed(p->t, n);
+    }
+}
+
+char* bigBody = null;
+
+void answer(Peer* p) {
+    p->req[p->reqLen] = 0;
+    char* first = p->req;
+    char head[400];
+    char* body = "";
+    int status = 200;
+    char* extra = "";
+    char tmp[300];
+    if (startsWith(first, "GET /hello")) {
+        body = "hello over tls";
+    } else if (startsWith(first, "GET /big")) {
+        body = bigBody;
+    } else if (startsWith(first, "POST /echo")) {
+        int at = 0;
+        while (p->req[at] != 0 && !(p->req[at] == 13 && p->req[at + 1] == 10 && p->req[at + 2] == 13 && p->req[at + 3] == 10)) { at++; }
+        format(&tmp[0], 300, "you sent: %s", &p->req[at + 4]);
+        body = &tmp[0];
+    } else if (startsWith(first, "GET /moved")) {
+        status = 302;
+        extra = "Location: /hello\r\n";
+    } else {
+        status = 404;
+        body = "nothing here";
+    }
+    char* resp = alloc(strlen(body) + 400);
+    format(resp, strlen(body) + 400, "HTTP/1.1 %d X\r\nContent-Length: %d\r\n%sConnection: close\r\n\r\n%s", status, strlen(body), extra, body);
+    tls.write(p->t, resp, strlen(resp));
+    tls.shutdown(p->t);
+    flushPeer(p);
+    p->answered = true;
+    served++;
+}
+
+void stepPeers() {
+    if (listener >= 0 && net.waitReadable(listener, 0)) {
+        int c = net.accept(listener);
+        if (c >= 0) {
+            Peer* p = new Peer();
+            p->fd = c;
+            p->t = tls.accept(current);
+            p->req = alloc(70000);
+            p->next = peers;
+            peers = p;
+        }
+    }
+    for (Peer* p = peers; p != null; p = p->next) {
+        if (p->fd < 0) { continue; }
+        if (net.waitReadable(p->fd, 0)) {
+            char buf[4096];
+            int n = net.recv(p->fd, &buf[0], 4096);
+            if (n <= 0) {
+                net.close(p->fd);
+                p->fd = -1;
+                continue;
+            }
+            tls.feed(p->t, &buf[0], n);
+            flushPeer(p);
+            if (tls.ready(p->t) && !p->answered) {
+                int got = tls.readApp(p->t, &p->req[p->reqLen], 60000);
+                p->reqLen = p->reqLen + got;
+                p->req[p->reqLen] = 0;
+                // the request is complete when the headers are in (and the body, for a POST)
+                int hdr = -1;
+                for (int i = 3; i < p->reqLen; i++) {
+                    if (p->req[i] == 10 && p->req[i - 1] == 13 && p->req[i - 2] == 10 && p->req[i - 3] == 13) { hdr = i + 1; break; }
+                }
+                if (hdr >= 0) {
+                    bool post = startsWith(p->req, "POST");
+                    if (!post || p->reqLen - hdr >= 10) { answer(p); }
+                }
+            }
+            if (tls.failed(p->t)) {
+                net.close(p->fd);
+                p->fd = -1;
+            }
+        }
+    }
+}
+
+int hook(int unused) {
+    stepPeers();
+    srv->step(0);
+    return 0;
+}
+
+void wait(gnet.Fetch* f) {
+    int t0 = millis();
+    while (!f->done && millis() - t0 < 20000) {
+        stepPeers();
+        srv->step(0);
+        d->pump(5);
+    }
+}
+
+void show(char* label, gnet.Fetch* f) {
+    print(label);
+    print(": ");
+    if (f->error != null) {
+        print("error: ");
+        println(f->error);
+        return;
+    }
+    printInt(f->status);
+    print(" ");
+    printInt(f->bodyLen);
+    print(" bytes secure=");
+    print(f->secure ? "yes" : "no");
+    print(" ");
+    println(f->cipher == null ? "-" : f->cipher);
+}
+
+gnet.Fetch* run(char* path, char* body, bool verify) {
+    gnet.Fetch* f = new gnet.Fetch();
+    f->verifyCerts = verify;
+    char url[100];
+    format(&url[0], 100, "https://127.0.0.1:7443%s", path);
+    if (body != null) { f->post(body, null); }
+    f->start(d, &url[0], null);
+    wait(f);
+    return f;
+}
+
+int main() {
+    x509.clearRoots();
+    x509.addRootPem(CA_PEM);
+    goodCfg = tls.loadConfig(SERVER_CERT, SERVER_KEY);
+    strangerCfg = tls.loadConfig(STRANGER_CERT, STRANGER_KEY);
+    current = goodCfg;
+    hb = new wsrv.Headless(320, 200);
+    srv = new wsrv.Server(hb, 7291);
+    gui.idleHook = hook;
+    d = gui.connectAs("7291", "https");
+    listener = net.listenOn("127.0.0.1", 7443, 8);
+    if (listener < 0) { println("cannot listen"); return 1; }
+    bigBody = alloc(200001);
+    for (int i = 0; i < 200000; i++) { bigBody[i] = 'a' + (i % 26); }
+    bigBody[200000] = 0;
+
+    gnet.Fetch* f = run("/hello", null, true);
+    show("GET /hello", f);
+    println(f->body);
+    f = run("/echo", "name=value", true);
+    show("POST /echo", f);
+    println(f->body);
+    f = run("/moved", null, true);
+    show("GET /moved", f);
+    println(f->url);
+    println(f->body);
+    f = run("/big", null, true);
+    show("GET /big", f);
+    bool same = f->bodyLen == 200000;
+    for (int i = 0; i < f->bodyLen && same; i++) {
+        if (f->body[i] != 'a' + (i % 26)) { same = false; }
+    }
+    println(same ? "big body identical" : "big body DIFFERENT");
+    f = run("/nothing", null, true);
+    show("GET /nothing", f);
+    // a server whose certificate is signed by an authority we do not trust
+    current = strangerCfg;
+    f = run("/hello", null, true);
+    show("untrusted server", f);
+    println(f->certError == null ? "no certError" : f->certError);
+    f = run("/hello", null, false);
+    show("untrusted server, not verifying", f);
+    println(f->body);
+    // a plain http client talking to the TLS port
+    gnet.Fetch* g = new gnet.Fetch();
+    g->start(d, "http://127.0.0.1:7443/hello", null);
+    wait(g);
+    show("plain http to the TLS port", g);
+    return 0;
+}
