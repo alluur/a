@@ -1,0 +1,225 @@
+// =============================================================================
+//  aes - AES-128 / AES-256 and the GCM authenticated mode (for TLS 1.3 suite 0x1301 / 0x1302)         import aes;
+//
+//    aes.Gcm* g = aes.gcm(key, 16);                                       // 16 or 32 byte key
+//    aes.seal(g, iv12, aad, aadLen, plain, n, out);                       // out gets n bytes of cipher text + 16 bytes tag
+//    bool ok = aes.open(g, iv12, aad, aadLen, cipherAndTag, n + 16, out); // false if the tag does not match
+//
+//  A plain byte oriented implementation (S-box computed at start). Not constant time.
+// =============================================================================
+module aes;
+
+private char* sbox = null;
+
+private int rotl8(int x, int n) { return ((x << n) | (x >> (8 - n))) & 255; }
+
+private void initTables() {
+    if (sbox != null) { return; }
+    sbox = alloc(256);
+    int p = 1;
+    int q = 1;
+    while (true) {
+        p = (p ^ ((p << 1) & 255) ^ (((p & 128) != 0) ? 27 : 0)) & 255;
+        q = q ^ (q << 1);
+        q = q ^ (q << 2);
+        q = q ^ (q << 4);
+        q = q & 255;
+        if ((q & 128) != 0) { q = q ^ 9; }
+        int x = q ^ rotl8(q, 1) ^ rotl8(q, 2) ^ rotl8(q, 3) ^ rotl8(q, 4);
+        sbox[p] = x ^ 99;
+        if (p == 1) { break; }
+    }
+    sbox[0] = 99;
+}
+
+public class Gcm {
+    public char* rk;           // the round keys
+    public int rounds;
+    public int h0; public int h1; public int h2; public int h3;
+}
+
+private int xt(int a) {
+    return ((a << 1) ^ (((a & 128) != 0) ? 27 : 0)) & 255;
+}
+
+private void expand(Gcm* g, char* key, int klen) {
+    int nk = klen / 4;
+    g->rounds = nk + 6;
+    int words = 4 * (g->rounds + 1);
+    g->rk = alloc(words * 4 + 8);
+    char* w = g->rk;
+    for (int i = 0; i < klen; i++) { w[i] = key[i]; }
+    int rcon = 1;
+    for (int i = nk; i < words; i++) {
+        int t0 = w[4 * (i - 1)] & 255;
+        int t1 = w[4 * (i - 1) + 1] & 255;
+        int t2 = w[4 * (i - 1) + 2] & 255;
+        int t3 = w[4 * (i - 1) + 3] & 255;
+        if (i % nk == 0) {
+            int s = t0;
+            t0 = (sbox[t1] & 255) ^ rcon;
+            t1 = sbox[t2] & 255;
+            t2 = sbox[t3] & 255;
+            t3 = sbox[s] & 255;
+            rcon = xt(rcon);
+        } else if (nk > 6 && i % nk == 4) {
+            t0 = sbox[t0] & 255;
+            t1 = sbox[t1] & 255;
+            t2 = sbox[t2] & 255;
+            t3 = sbox[t3] & 255;
+        }
+        w[4 * i] = (w[4 * (i - nk)] & 255) ^ t0;
+        w[4 * i + 1] = (w[4 * (i - nk) + 1] & 255) ^ t1;
+        w[4 * i + 2] = (w[4 * (i - nk) + 2] & 255) ^ t2;
+        w[4 * i + 3] = (w[4 * (i - nk) + 3] & 255) ^ t3;
+    }
+}
+
+// one block, in place on 16 bytes
+private void encBlock(Gcm* g, char* s) {
+    char* rk = g->rk;
+    char t[16];
+    for (int i = 0; i < 16; i++) { s[i] = (s[i] & 255) ^ (rk[i] & 255); }
+    for (int round = 1; round <= g->rounds; round++) {
+        // SubBytes + ShiftRows
+        for (int c = 0; c < 4; c++) {
+            for (int r = 0; r < 4; r++) {
+                t[r + 4 * c] = sbox[s[r + 4 * ((c + r) & 3)] & 255];
+            }
+        }
+        if (round < g->rounds) {
+            for (int c = 0; c < 4; c++) {
+                int a0 = t[4 * c] & 255;
+                int a1 = t[4 * c + 1] & 255;
+                int a2 = t[4 * c + 2] & 255;
+                int a3 = t[4 * c + 3] & 255;
+                int all = a0 ^ a1 ^ a2 ^ a3;
+                s[4 * c] = a0 ^ all ^ xt(a0 ^ a1);
+                s[4 * c + 1] = a1 ^ all ^ xt(a1 ^ a2);
+                s[4 * c + 2] = a2 ^ all ^ xt(a2 ^ a3);
+                s[4 * c + 3] = a3 ^ all ^ xt(a3 ^ a0);
+            }
+        } else {
+            for (int i = 0; i < 16; i++) { s[i] = t[i]; }
+        }
+        for (int i = 0; i < 16; i++) { s[i] = (s[i] & 255) ^ (rk[16 * round + i] & 255); }
+    }
+}
+
+private int word(char* b) {
+    return ((b[0] & 255) << 24) | ((b[1] & 255) << 16) | ((b[2] & 255) << 8) | (b[3] & 255);
+}
+
+public Gcm* gcm(char* key, int klen) {
+    initTables();
+    Gcm* g = new Gcm();
+    expand(g, key, klen);
+    char z[16];
+    for (int i = 0; i < 16; i++) { z[i] = 0; }
+    encBlock(g, &z[0]);
+    g->h0 = word(&z[0]);
+    g->h1 = word(&z[4]);
+    g->h2 = word(&z[8]);
+    g->h3 = word(&z[12]);
+    return g;
+}
+
+// x = x * h in GF(2^128); x is four 32 bit words (high word first), kept below 2^32
+private void gmul(Gcm* g, int* x) {
+    int z0 = 0; int z1 = 0; int z2 = 0; int z3 = 0;
+    int v0 = g->h0; int v1 = g->h1; int v2 = g->h2; int v3 = g->h3;
+    for (int i = 0; i < 128; i++) {
+        int xi = (x[i / 32] >> (31 - (i % 32))) & 1;
+        if (xi != 0) {
+            z0 = z0 ^ v0; z1 = z1 ^ v1; z2 = z2 ^ v2; z3 = z3 ^ v3;
+        }
+        int lsb = v3 & 1;
+        v3 = ((v3 >> 1) | ((v2 & 1) << 31)) & 0xFFFFFFFF;
+        v2 = ((v2 >> 1) | ((v1 & 1) << 31)) & 0xFFFFFFFF;
+        v1 = ((v1 >> 1) | ((v0 & 1) << 31)) & 0xFFFFFFFF;
+        v0 = v0 >> 1;
+        if (lsb != 0) { v0 = v0 ^ 0xE1000000; }
+    }
+    x[0] = z0; x[1] = z1; x[2] = z2; x[3] = z3;
+}
+
+// absorb data (zero padded to blocks) into the GHASH state
+private void ghash(Gcm* g, int* y, char* data, int n) {
+    char blk[16];
+    int pos = 0;
+    while (pos < n) {
+        int take = n - pos;
+        if (take > 16) { take = 16; }
+        for (int i = 0; i < 16; i++) { blk[i] = (i < take) ? data[pos + i] : 0; }
+        y[0] = y[0] ^ word(&blk[0]);
+        y[1] = y[1] ^ word(&blk[4]);
+        y[2] = y[2] ^ word(&blk[8]);
+        y[3] = y[3] ^ word(&blk[12]);
+        gmul(g, y);
+        pos = pos + 16;
+    }
+}
+
+// CTR keystream from counter block J0+1 on, xored into out (in and out may be the same buffer)
+private void ctr(Gcm* g, char* iv, char* in, char* out, int n) {
+    char cb[16];
+    char ks[16];
+    for (int i = 0; i < 12; i++) { cb[i] = iv[i]; }
+    int pos = 0;
+    int cnt = 1;
+    while (pos < n) {
+        cnt++;
+        cb[12] = (cnt >> 24) & 255; cb[13] = (cnt >> 16) & 255; cb[14] = (cnt >> 8) & 255; cb[15] = cnt & 255;
+        for (int i = 0; i < 16; i++) { ks[i] = cb[i]; }
+        encBlock(g, &ks[0]);
+        int take = n - pos;
+        if (take > 16) { take = 16; }
+        for (int i = 0; i < take; i++) { out[pos + i] = (in[pos + i] & 255) ^ (ks[i] & 255); }
+        pos = pos + 16;
+    }
+}
+
+// the tag over aad and cipher text
+private void tagOf(Gcm* g, char* iv, char* aad, int alen, char* ctext, int n, char* tag) {
+    int y[4];
+    y[0] = 0; y[1] = 0; y[2] = 0; y[3] = 0;
+    ghash(g, &y[0], aad, alen);
+    ghash(g, &y[0], ctext, n);
+    char lens[16];
+    int abits = alen * 8;
+    int cbits = n * 8;
+    for (int i = 0; i < 8; i++) {
+        lens[i] = (abits >> (56 - 8 * i)) & 255;
+        lens[8 + i] = (cbits >> (56 - 8 * i)) & 255;
+    }
+    ghash(g, &y[0], &lens[0], 16);
+    char ks[16];
+    for (int i = 0; i < 12; i++) { ks[i] = iv[i]; }
+    ks[12] = 0; ks[13] = 0; ks[14] = 0; ks[15] = 1;
+    encBlock(g, &ks[0]);
+    for (int i = 0; i < 4; i++) {
+        tag[4 * i] = ((y[i] >> 24) & 255) ^ (ks[4 * i] & 255);
+        tag[4 * i + 1] = ((y[i] >> 16) & 255) ^ (ks[4 * i + 1] & 255);
+        tag[4 * i + 2] = ((y[i] >> 8) & 255) ^ (ks[4 * i + 2] & 255);
+        tag[4 * i + 3] = (y[i] & 255) ^ (ks[4 * i + 3] & 255);
+    }
+}
+
+// out: n bytes of cipher text followed by the 16 byte tag (out may be the same buffer as plain)
+public void seal(Gcm* g, char* iv, char* aad, int alen, char* plain, int n, char* out) {
+    ctr(g, iv, plain, out, n);
+    tagOf(g, iv, aad, alen, out, n, out + n);
+}
+
+// in: cipher text and tag (inLen bytes in all); out gets inLen - 16 bytes. false if the tag is wrong (out is then not written)
+public bool open(Gcm* g, char* iv, char* aad, int alen, char* in, int inLen, char* out) {
+    if (inLen < 16) { return false; }
+    int n = inLen - 16;
+    char tag[16];
+    tagOf(g, iv, aad, alen, in, n, &tag[0]);
+    int diff = 0;
+    for (int i = 0; i < 16; i++) { diff = diff | ((tag[i] ^ in[n + i]) & 255); }
+    if (diff != 0) { return false; }
+    ctr(g, iv, in, out, n);
+    return true;
+}

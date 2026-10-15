@@ -1,0 +1,149 @@
+// =============================================================================
+//  chacha - ChaCha20 and the ChaCha20-Poly1305 AEAD (RFC 8439; TLS 1.3 suite 0x1303)                    import chacha;
+//
+//    chacha.seal(key32, nonce12, aad, aadLen, plain, n, out);              // out gets n bytes + 16 bytes tag
+//    bool ok = chacha.open(key32, nonce12, aad, aadLen, in, n + 16, out);  // false if the tag does not match
+//
+//  Poly1305 uses bn's Montgomery multiplication modulo 2^130 - 5 (the key r in Montgomery form gives plain products).
+// =============================================================================
+import bn;
+module chacha;
+
+private int rotl(int v, int n) { return ((v << n) | (v >> (32 - n))) & 0xFFFFFFFF; }
+
+private void qr(int* x, int a, int b, int c, int d) {
+    x[a] = (x[a] + x[b]) & 0xFFFFFFFF; x[d] = rotl(x[d] ^ x[a], 16);
+    x[c] = (x[c] + x[d]) & 0xFFFFFFFF; x[b] = rotl(x[b] ^ x[c], 12);
+    x[a] = (x[a] + x[b]) & 0xFFFFFFFF; x[d] = rotl(x[d] ^ x[a], 8);
+    x[c] = (x[c] + x[d]) & 0xFFFFFFFF; x[b] = rotl(x[b] ^ x[c], 7);
+}
+
+private int le32(char* b) {
+    return (b[0] & 255) | ((b[1] & 255) << 8) | ((b[2] & 255) << 16) | ((b[3] & 255) << 24);
+}
+
+// the 64 byte block for a counter
+private void block(char* key, char* nonce, int counter, char* out) {
+    int s[16];
+    int x[16];
+    s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574;
+    for (int i = 0; i < 8; i++) { s[4 + i] = le32(key + 4 * i); }
+    s[12] = counter & 0xFFFFFFFF;
+    for (int i = 0; i < 3; i++) { s[13 + i] = le32(nonce + 4 * i); }
+    for (int i = 0; i < 16; i++) { x[i] = s[i]; }
+    for (int r = 0; r < 10; r++) {
+        qr(&x[0], 0, 4, 8, 12); qr(&x[0], 1, 5, 9, 13); qr(&x[0], 2, 6, 10, 14); qr(&x[0], 3, 7, 11, 15);
+        qr(&x[0], 0, 5, 10, 15); qr(&x[0], 1, 6, 11, 12); qr(&x[0], 2, 7, 8, 13); qr(&x[0], 3, 4, 9, 14);
+    }
+    for (int i = 0; i < 16; i++) {
+        int v = (x[i] + s[i]) & 0xFFFFFFFF;
+        out[4 * i] = v & 255; out[4 * i + 1] = (v >> 8) & 255; out[4 * i + 2] = (v >> 16) & 255; out[4 * i + 3] = (v >> 24) & 255;
+    }
+}
+
+// xor the keystream starting at block counter into in -> out (in and out may be the same buffer)
+public void xorStream(char* key, char* nonce, int counter, char* in, int n, char* out) {
+    char ks[64];
+    int pos = 0;
+    while (pos < n) {
+        block(key, nonce, counter, &ks[0]);
+        counter++;
+        int take = n - pos;
+        if (take > 64) { take = 64; }
+        for (int i = 0; i < take; i++) { out[pos + i] = (in[pos + i] & 255) ^ (ks[i] & 255); }
+        pos = pos + 64;
+    }
+}
+
+private bn.Mont* pm = null;
+
+// a little-endian run of up to 17 bytes (plus an optional extra top byte of 1) as a number
+private bn.Num* leNum(char* b, int n, bool addOne) {
+    char r[20];
+    int total = n;
+    for (int i = 0; i < n; i++) { r[n - 1 - i] = b[i]; }
+    if (addOne) {
+        for (int i = n - 1; i >= 0; i--) { r[i + 1] = r[i]; }
+        r[0] = 1;
+        total = n + 1;
+    }
+    return bn.fromBytes(&r[0], total, 5);
+}
+
+private void polyUpdate(bn.Num* h, bn.Num* r, char* data, int n) {
+    bn.Num* tmp = bn.make(5);
+    int pos = 0;
+    while (pos < n) {
+        int take = n - pos;
+        if (take > 16) { take = 16; }
+        bn.Num* m = leNum(data + pos, take, true);
+        bn.add(tmp, h, m);
+        bn.mulInto(pm, h, tmp, r);
+        pos = pos + 16;
+    }
+}
+
+// zero padded to 16 bytes
+private void polyPad(bn.Num* h, bn.Num* r, char* data, int n) {
+    char blk[16];
+    int pos = 0;
+    while (pos < n) {
+        int take = n - pos;
+        if (take > 16) { take = 16; }
+        for (int i = 0; i < 16; i++) { blk[i] = (i < take) ? data[pos + i] : 0; }
+        polyUpdate(h, r, &blk[0], 16);
+        pos = pos + 16;
+    }
+}
+
+private void tagOf(char* key, char* nonce, char* aad, int alen, char* ct, int n, char* tag) {
+    if (pm == null) {
+        char p[17];
+        for (int i = 0; i < 17; i++) { p[i] = 0; }
+        // 2^130 - 5 as 17 big-endian bytes
+        p[0] = 3;
+        for (int i = 1; i < 16; i++) { p[i] = 255; }
+        p[16] = 251;
+        pm = bn.mont(bn.fromBytes(&p[0], 17, 5));
+    }
+    char otk[64];
+    block(key, nonce, 0, &otk[0]);
+    char rb[16];
+    for (int i = 0; i < 16; i++) { rb[i] = otk[i]; }
+    rb[3] = rb[3] & 15; rb[7] = rb[7] & 15; rb[11] = rb[11] & 15; rb[15] = rb[15] & 15;
+    rb[4] = rb[4] & 252; rb[8] = rb[8] & 252; rb[12] = rb[12] & 252;
+    bn.Num* r = bn.toMont(pm, leNum(&rb[0], 16, false));
+    bn.Num* h = bn.make(5);
+    polyPad(h, r, aad, alen);
+    polyPad(h, r, ct, n);
+    char lens[16];
+    for (int i = 0; i < 8; i++) {
+        lens[i] = (alen >> (8 * i)) & 255;
+        lens[8 + i] = (n >> (8 * i)) & 255;
+    }
+    polyUpdate(h, r, &lens[0], 16);
+    // tag = (h + s) mod 2^128, little endian
+    bn.Num* s = leNum(&otk[16], 16, false);
+    bn.Num* sum = bn.make(5);
+    bn.add(sum, h, s);
+    char be[20];
+    bn.toBytes(sum, &be[0], 20);
+    for (int i = 0; i < 16; i++) { tag[i] = be[19 - i]; }
+}
+
+public void seal(char* key, char* nonce, char* aad, int alen, char* plain, int n, char* out) {
+    xorStream(key, nonce, 1, plain, n, out);
+    tagOf(key, nonce, aad, alen, out, n, out + n);
+}
+
+public bool open(char* key, char* nonce, char* aad, int alen, char* in, int inLen, char* out) {
+    if (inLen < 16) { return false; }
+    int n = inLen - 16;
+    char tag[16];
+    tagOf(key, nonce, aad, alen, in, n, &tag[0]);
+    int diff = 0;
+    for (int i = 0; i < 16; i++) { diff = diff | ((tag[i] ^ in[n + i]) & 255); }
+    if (diff != 0) { return false; }
+    xorStream(key, nonce, 1, in, n, out);
+    return true;
+}
