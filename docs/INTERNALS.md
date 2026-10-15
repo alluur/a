@@ -350,8 +350,8 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   pushes it. Notifications are undecorated `F_ABOVE | F_NOFOCUS` windows in six slots. `tests/t120_gui_extras.a` covers all of it.
 * Display authentication: `wsrv.Client.authed/nonce/born`; `handleRequest` answers `Q_HELLO` with `E_AUTH` when a cookie is set and ignores
   everything but `Q_AUTH` until it verifies (`hash.hmacSha256`, compared with `hash.equalConstantTime`). `secure.unique` gives
-  the nonce (getrandom/`/dev/urandom`; a SHA-256 mix of counter, clock and an address on Windows, where only uniqueness is needed
-  for a challenge). `wvnc` adds security type 2 with `des.vncResponse` (the DES tables are checked against `openssl enc -des-ecb`
+  the nonce (`secure.bytes`, which is getrandom, `/dev/urandom` or `RtlGenRandom`; a SHA-256 mix of counter, clock and an address
+  only if there is no secure source). `wvnc` adds security type 2 with `des.vncResponse` (the DES tables are checked against `openssl enc -des-ecb`
   in `tests/gui/rfbclient.py`, an independent implementation). `tests/t121_gui_auth.a`: RFC 4231 HMAC vectors, the DES vector,
   the handshake in one process. `tests/t122_gui_net.a`: `gnet.Fetch` against a tiny server stepped from `gui.idleHook`.
 * A name clash to know about: `cstdlib` defines a function `random`, so a module called `random` cannot be imported by a file that
@@ -377,3 +377,36 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   when it gets the focus. `queryOf` builds the data in the order of the controls. Anchors are recorded when a tag with `id` or an `a name`
   is opened (the index of the block that follows, or the empty current block that is reused). `tests/t126_gui_forms.a` runs
   the page, the clicks and keys, and a tiny web server in the same process for the POST, cookie and redirect cases.
+
+## TLS and cryptography (`lib/tls.a`, `x509`, `rsa`, `ec`, `x25519`, `aes`, `chacha`, `bn`; user guide in [TLS.md](TLS.md))
+
+* **`bn`**: numbers are `Num { int* d; int n }` with 30 bit limbs (a limb product plus carries fits a 64-bit A `int`), fixed length. `Mont`
+  holds the modulus, `-m^-1 mod 2^30` (Newton iteration), `R mod m` and `R^2 mod m` (by repeated doubling, so no division is needed).
+  `mulInto` is CIOS Montgomery multiplication with a scratch row in the context; it may alias its output with an input. Passing
+  one operand in Montgomery form and one ordinary gives an ordinary product (`chacha` uses this for Poly1305 modulo 2^130-5).
+  Fermat inversion (`invMont`) serves ECDSA and X25519. Nothing here is constant time.
+* **`rsa`**: `recover` is `sig^e mod n`; PKCS#1 compares the DigestInfo padding, PSS unmasks with MGF1 (salt = hash length). `signPss` and
+  `ec.sign` exist for the TLS server. **`ec`**: P-256 and P-384 with `a = -3`, Jacobian points in Montgomery form, preallocated temporaries
+  in the curve object (no garbage per operation, since the heap never frees), Shamir's trick for `u1 G + u2 Q`, on-curve check of the public point,
+  `r`, `s` range checks. **`x25519`**: the RFC 7748 ladder over `bn` modulo 2^255-19.
+* **`aes`**: the S-box is computed at start; GCM's GHASH uses four 32 bit words (so shifts never meet a sign bit). The record path allocates nothing
+  (a long download would exhaust the 64 MB heap). **`chacha`**: ChaCha20 on masked 32 bit values; Poly1305 through `bn` with scratch numbers.
+* **`x509`**: `tlv` is a minimal DER reader (single byte tags). `parse` keeps offsets into the DER bytes (subject, issuer, TBS, key, signature)
+  instead of copies. `verifyChain` looks for a trusted root that is the certificate or signed it, else for an intermediate in the chain
+  that is a CA and signed it, up to ten steps. Name comparison is byte-wise on the DER `Name`.
+* **`tls`**: `Tls` is the whole session: `inb` (bytes from the network), `outb` (bytes to send), `hs` (handshake bytes reassembled across
+  records), `tx` (the transcript, hashed on demand with the suite's hash), `app` (decrypted data). `pump` takes records off `inb`,
+  `handleRecord` decrypts (nonce = IV xor sequence number, AAD = the record header, inner type = the last non-zero byte) and sends handshake
+  bytes to `processHandshake`, which copies each complete message and calls `clientMessage` or `serverMessage` by state. The key
+  schedule follows RFC 8446 section 7.1 (`deriveHandshake`, `deriveApplication`, `expandLabel` for single block outputs, which is all
+  TLS 1.3 needs with these suites). The client sends a dummy `change_cipher_spec` before its encrypted flight and a random legacy session id
+  (middlebox compatibility); the server echoes it. `net.secureHooks` lets `net.send/recv/close/waitReadable` divert handles registered with
+  `net.secureAttach` to the `tls` module (a small table of 32 handles) so that the `http` module needed no change except its connect
+  step; the `tls` module itself uses `net.rawSend/rawRecv/rawClose/rawWaitReadable`.
+* Windows: `secure.bytes` calls `SystemFunction036` (`RtlGenRandom`, IAT slot 70 of ADVAPI32.DLL) and `x509.loadSystemRoots` the
+  system store through CRYPT32.DLL (slots 72..74). The PE import directory in `main.asm` therefore has five descriptors
+  (KERNEL32, WS2_32, IPHLPAPI, ADVAPI32, CRYPT32).
+* Tests: `tests/gen/gen_crypto_test.py` writes `t127_crypto` from Python reference values; `tests/gen/gen_tls_test.py` (with `tls_test_body.a`)
+  writes `t128_tls`, and `gen_https_test.py` (with `https_test_body.a`) writes `t129_gui_https`: re-run the generator and review the output
+  before replacing the `.out` file. `tests/https.sh` checks interoperability with curl, OpenSSL and Python.
+

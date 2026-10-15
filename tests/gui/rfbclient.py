@@ -106,6 +106,20 @@ class Rfb:
                     x0 = min(x0, x); y0 = min(y0, y); x1 = max(x1, x); y1 = max(y1, y)
         return (x0, y0, x1, y1) if x1 >= 0 else None
 
+    def find_color_lowest(self, rgb, tol=6, line=14):
+        """bounding box of the pixels of this colour on the lowest text line (those within `line` pixels of the lowest one)"""
+        pts = []
+        for y in range(self.h):
+            for x in range(self.w):
+                p = self.pixel(x, y)
+                if all(abs(p[i] - rgb[i]) <= tol for i in range(3)):
+                    pts.append((x, y))
+        if not pts:
+            return None
+        ymax = max(y for _, y in pts)
+        sel = [(x, y) for x, y in pts if y > ymax - line]
+        return (min(x for x, _ in sel), min(y for _, y in sel), max(x for x, _ in sel), max(y for _, y in sel))
+
     def save_ppm(self, path):
         with open(path, "wb") as f:
             f.write(b"P6\n%d %d\n255\n" % (self.w, self.h))

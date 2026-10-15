@@ -30,6 +30,7 @@ int main() {
 | Compiler | ~9,000 lines of NASM assembly, a single binary of about 470 KB (it carries the source of the standard library and the C library), three passes with dead function elimination, direct machine-code generation, generated code about as fast as `gcc -O0` |
 | Targets | **Linux** x86-64, ARM64, RISC-V 64 and LoongArch64 · **Windows** x86-64 · **Android** ARM64, x86-64 and RISC-V 64 |
 | GUI | a display server with window manager, VNC and framebuffer backends, a widget toolkit (menus, tabs, dialogs, tables, trees, toolbars, calendar, notifications, ...), a taskbar, remote display with cookie authentication, a VNC password and a web browser backend, a LAN chat, a web browser (forms, cookies), a network tools app, a terminal emulator, a screen locker and a display manager, all written in A (see [docs/GUI.md](docs/GUI.md)) |
+| Networking | TCP/UDP sockets, DNS, HTTP client and server, WebSocket, raw packets, and **TLS 1.3 written from scratch** (client and server, certificate checking, RSA/ECDSA/X25519, AES-GCM/ChaCha20-Poly1305): `https://` in `http`, `gnet` and the `abrowse` browser, `examples/httpsd.a` (see [docs/TLS.md](docs/TLS.md)) |
 | Output | static native executables (ELF64 / PE32+), typically 4–10 KB for a small program; relocatable objects (`.ao`) for separate compilation |
 | Status | version 0.1.0 — complete enough for real programs, see [Limitations](#limitations-and-roadmap) |
 

@@ -354,6 +354,72 @@ try:
     if not v5.find_color((200, 30, 30), tol=4):
         fail("back did not show the index page again")
     print("browser back ok")
+
+    # https: a site whose certificate is signed by a CA the browser is told to trust (SSL_CERT_FILE) shows its page and picture over TLS;
+    # without that trust the browser shows the "not private" page, and "Proceed" opens the site anyway
+    import ssl, datetime, ipaddress
+    from cryptography import x509 as cx
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec as cec
+    def cname(cn): return cx.Name([cx.NameAttribute(NameOID.COMMON_NAME, cn)])
+    def cbuild(sub, key, iss, ikey, ca, sans=None):
+        b = cx.CertificateBuilder().subject_name(cname(sub)).issuer_name(cname(iss)).public_key(key.public_key()).serial_number(cx.random_serial_number())
+        b = b.not_valid_before(datetime.datetime(2020, 1, 1)).not_valid_after(datetime.datetime(2100, 1, 1))
+        b = b.add_extension(cx.BasicConstraints(ca=ca, path_length=None), critical=True)
+        if sans: b = b.add_extension(cx.SubjectAlternativeName(sans), critical=False)
+        return b.sign(ikey, hashes.SHA256())
+    cakey = cec.generate_private_key(cec.SECP256R1()); cacert = cbuild("Session Test CA", cakey, "Session Test CA", cakey, True)
+    lkey = cec.generate_private_key(cec.SECP256R1())
+    lcert = cbuild("localhost", lkey, "Session Test CA", cakey, False, [cx.DNSName("localhost"), cx.IPAddress(ipaddress.ip_address("127.0.0.1"))])
+    cadir = tempfile.mkdtemp()
+    capath = os.path.join(cadir, "ca.pem"); certpath = os.path.join(cadir, "leaf.pem"); keypath = os.path.join(cadir, "leaf.key")
+    open(capath, "wb").write(cacert.public_bytes(serialization.Encoding.PEM))
+    open(certpath, "wb").write(lcert.public_bytes(serialization.Encoding.PEM))
+    open(keypath, "wb").write(lkey.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+    sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); sctx.minimum_version = ssl.TLSVersion.TLSv1_3; sctx.load_cert_chain(certpath, keypath)
+    httpsd = http.server.ThreadingHTTPServer(("127.0.0.1", 8098), handler)
+    httpsd.socket = sctx.wrap_socket(httpsd.socket, server_side=True)
+    threading.Thread(target=httpsd.serve_forever, daemon=True).start()
+    env6 = dict(os.environ, ADISPLAY="15", SSL_CERT_FILE=capath)
+    p6 = subprocess.Popen([os.path.join(bindir, "adisplayd"), "-p", "15", "-vnc", "5915", "-control", "-size", "800x600"], env=env6, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(p6)
+    env7 = dict(os.environ, ADISPLAY="16")
+    env7.pop("SSL_CERT_FILE", None)
+    p7 = subprocess.Popen([os.path.join(bindir, "adisplayd"), "-p", "16", "-vnc", "5916", "-control", "-size", "800x600"], env=env7, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(p7)
+    time.sleep(0.8)
+    v6 = Rfb(port=5915)
+    b6 = subprocess.Popen([os.path.join(bindir, "abrowse"), "https://localhost:8098/index.html"], env=env6, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(b6)
+    time.sleep(2.0)
+    v6.grab()
+    red = v6.find_color((200, 30, 30), tol=4)
+    if not red or red[2] - red[0] < 150 or red[3] - red[1] < 60:
+        fail("the https page or its picture did not load: %s" % (red,))
+    print("browser https page and picture ok")
+    v7 = Rfb(port=5916)
+    b7 = subprocess.Popen([os.path.join(bindir, "abrowse"), "https://localhost:8098/index.html"], env=env7, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(b7)
+    time.sleep(2.0)
+    v7.grab()
+    if v7.find_color((200, 30, 30), tol=4):
+        fail("the page of an untrusted https site was shown without asking")
+    if not v7.find_color((26, 95, 200), tol=10):
+        fail("no links on the not-private page")
+    print("browser untrusted https refused ok")
+    # the links of the page are "Back to safety" and, below it, "Proceed ... anyway": click the lowest one
+    lowest = v7.find_color_lowest((26, 95, 200), tol=10)
+    if not lowest:
+        fail("no Proceed link")
+    v7.click((lowest[0] + lowest[2]) // 2, (lowest[1] + lowest[3]) // 2)
+    time.sleep(2.0)
+    v7.grab()
+    red = v7.find_color((200, 30, 30), tol=4)
+    if not red:
+        fail("Proceed did not open the https page")
+    print("browser proceed anyway ok")
+    httpsd.shutdown()
     httpd.shutdown()
 
     # a second display with the screen locker: a wrong password keeps it locked, the right one removes it

@@ -230,7 +230,7 @@ std_src_end:
 %define IAT_GetCommandLineA 6
 %define IAT_COUNT           7
 %define IAT_K32             39
-%define IAT_SLOTS           (IAT_K32 + 1 + 20 + 1 + 8 + 1 + 1 + 1)   ; kernel32 + null + ws2_32 + null + iphlpapi + null + advapi32 + null
+%define IAT_SLOTS           (IAT_K32 + 1 + 20 + 1 + 8 + 1 + 1 + 1 + 3 + 1)   ; kernel32 + null + ws2_32 + null + iphlpapi + null + advapi32 + null + crypt32 + null
 
 bn_write:   db "__write", 0
 bn_read:    db "__read", 0
@@ -588,6 +588,13 @@ imp_names_iph:
 imp_names_adv:
     db "SystemFunction036", 0   ; slot 70: RtlGenRandom
     db 0
+; CRYPT32.DLL imports: slots 72..74 (slot 71 is the null terminator of the advapi32 list)
+imp_names_crypt:
+    db "CertOpenSystemStoreA", 0        ; slot 72
+    db "CertEnumCertificatesInStore", 0 ; slot 73
+    db "CertCloseStore", 0              ; slot 74
+    db 0
+s_crypt32: db "CRYPT32.DLL", 0
 s_advapi32: db "ADVAPI32.DLL", 0
 s_iphlpapi: db "IPHLPAPI.DLL", 0
 s_kernel32: db "KERNEL32.DLL", 0
@@ -1416,8 +1423,8 @@ build_elf:
 
 ; ---- PE32+ (Windows x64) -----------------------------------------------------------------
 %define PE_BASE 0x140000000
-%define PE_IDATA_ILT 100
-%define PE_IDATA_IAT (100 + IAT_SLOTS*8)
+%define PE_IDATA_ILT 120
+%define PE_IDATA_IAT (120 + IAT_SLOTS*8)
 %define PE_IDATA_NAMES (PE_IDATA_IAT + IAT_SLOTS*8)
 
 ; align_up: rax = value, rcx = alignment (power of two) -> rax
@@ -1537,7 +1544,7 @@ build_pe:
     mov dword [rdi+108], 16
     mov rax, [pe_idata_rva]
     mov [rdi+112+8], eax                    ; import directory
-    mov dword [rdi+112+8+4], 80
+    mov dword [rdi+112+8+4], 100
     add rax, PE_IDATA_IAT
     mov [rdi+112+96], eax                   ; IAT directory
     mov dword [rdi+112+96+4], IAT_SLOTS*8
@@ -1636,6 +1643,9 @@ build_idata:
     inc r13d                                ; null slot ends the iphlpapi thunk array
     mov rsi, imp_names_adv
     call idata_list
+    inc r13d                                ; null slot ends the advapi32 thunk array
+    mov rsi, imp_names_crypt
+    call idata_list
     ; DLL name strings
     lea rdi, [idata_buf + r12]
     mov r14, rdi
@@ -1662,6 +1672,15 @@ build_idata:
     lea rax, [r12 + 13]
     mov r12, rax
     sub rbp, idata_buf
+    lea rdi, [idata_buf + r12]
+    push rdi
+    mov rsi, s_crypt32
+    call cstr_copy
+    lea rax, [r12 + 12]
+    mov r12, rax
+    pop rax
+    sub rax, idata_buf
+    mov [crypt_name_off], eax
     sub r14, idata_buf
     sub r13, idata_buf
     sub r15, idata_buf
@@ -1693,6 +1712,14 @@ build_idata:
     mov [idata_buf + 72], eax
     lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1+20+1+8+1)*8]
     mov [idata_buf + 76], eax
+    ; descriptor 4: CRYPT32
+    lea rax, [rbx + PE_IDATA_ILT + (IAT_K32+1+20+1+8+1+1+1)*8]
+    mov [idata_buf + 80], eax
+    mov eax, [crypt_name_off]
+    add rax, rbx
+    mov [idata_buf + 92], eax
+    lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1+20+1+8+1+1+1)*8]
+    mov [idata_buf + 96], eax
     mov rax, r12
     pop rbp
     pop r15
@@ -2344,6 +2371,7 @@ bss_vaddr:      resq 1
 iat_vaddr:      resq 1
 pe_data_rawsz:  resq 1
 pe_idata_rva:   resq 1
+crypt_name_off: resd 1
 pe_idata_size:  resq 1
 pe_idata_rawsz: resq 1
 pe_text_raw:    resq 1

@@ -848,13 +848,16 @@ int main() {
 
 Host names are resolved like this: on **Windows** by the system (`gethostbyname`); on **Linux and Android** from
 `/etc/hosts`, then by a DNS query over UDP to the servers in `/etc/resolv.conf` (then `8.8.8.8` and `1.1.1.1`).
-Limits: IPv4 only, no IPv6 and no TLS; calls block (use `setTimeout`, there is no `select`).
+Limits: IPv4 only, no IPv6; calls block (use `setTimeout`, there is no `select`). TLS is the `tls` module: after `tls.wrap(fd, host, true)`
+the same `net.send` / `net.recv` / `net.close` calls on that handle are encrypted (see [TLS.md](TLS.md)).
 On Linux and Android the module uses socket system calls; on Windows it calls Winsock
 (`ws2_32.dll`, started automatically) through the built-in `__winapi`.
 
 ### `http` - HTTP client and server
 
-`import http;` builds HTTP/1.1 on top of `net` (plain `http://`, no TLS).
+`import http;` builds HTTP/1.1 on top of `net`. Addresses can be `http://` or `https://` (TLS 1.3 with certificate checks, see
+[TLS.md](TLS.md); `http.setVerify(false)` to skip the check); `http.serveTls(port, cfg, handler, n)` and `http.serveStaticTls`
+serve over https.
 
 ```c
 import http;
@@ -1114,7 +1117,7 @@ websocket.WebSocket* ws = websocket.connect("ws://localhost:8081/");
 ws->sendText("hello");
 ```
 
-Limits: IPv4 only for sockets (IPv6 addresses can be parsed and printed), no TLS, no TCP implementation of your own
+Limits: IPv4 only for sockets (IPv6 addresses can be parsed and printed), no TCP implementation of your own
 (`packet` builds the segments; `rawnet` can send them on Linux).
 
 ## 12c. The C library

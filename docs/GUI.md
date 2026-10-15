@@ -32,12 +32,13 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `ghtml` | shows HTML and Markdown: parser, layout, links, images, scrolling (`HtmlView`) |
 | `gnet` | non-blocking HTTP fetches, a port scanner, TCP connections and listeners, UDP announcements and a peer-to-peer chat, all inside the event loop |
 | `secure` | secure random bytes, unique nonces, hex; (`hash` has `hmacSha256`, `des` the DES cipher for VNC passwords) |
+| `tls`, `x509` | TLS 1.3 client and server and certificate checking, for `https://` in `gnet.Fetch` and `abrowse` (see [TLS.md](TLS.md)) |
 | `gimg` | colour images: load PNG, BMP and PPM, save PNG, smooth scaling |
 | `gterm` | a terminal emulator widget (pseudo terminal, ANSI/xterm escape sequences) |
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t126`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t129`, `tests/gui.sh`, `tests/https.sh`.
 
 ## Quick start
 
@@ -231,8 +232,7 @@ ADISPLAY=server:7000 ./hello                          # on the other computer; r
 ```
 
 * **Cookie authentication**: the cookie file holds 16 or more bytes as hex text (`-newcookie` makes one with 32 random bytes and
-  mode 600 when the file does not exist; on Windows there is no secure random source, make it elsewhere, for example
-  `openssl rand -hex 32`). After `Q_HELLO` a server with a cookie sends a 16 byte nonce (`E_AUTH`); the client answers with
+  mode 600 when the file does not exist, also on Windows, where the random bytes come from `RtlGenRandom`). After `Q_HELLO` a server with a cookie sends a 16 byte nonce (`E_AUTH`); the client answers with
   `HMAC-SHA256(cookie, nonce)` (`Q_AUTH`). The cookie itself never travels; a wrong answer closes the connection (`E_DENIED`),
   nothing else is accepted before the answer, and a client has 5 seconds to give it.
 * **Clients** find the cookie in `ADISPLAY_COOKIE` (hex text), or the file named by `ADISPLAY_COOKIE_FILE`, or
@@ -292,8 +292,9 @@ f->cancel();
 with a redirect is followed with GET, like a browser does; **cookies**: `Set-Cookie` headers go into `gnet.cookies()`, a `CookieJar`
 by host name, and are sent back to the same host, so logins work; `f->useCookies = false` skips this; Path, Domain and expiry are
 not used, `Max-Age=0` or an empty value deletes a cookie) (`d->watch`): redirects (up to 5), chunked bodies, `Content-Length`, a
-check that the body is complete, `https://` is reported as unsupported (no TLS). Connecting and name lookup still wait (4 s at
-most). `gnet.Scan` tests the ports of a host one per turn of the event loop (`onFound`, `onProgress`, `onDone`, `stop()`).
+check that the body is complete, and **`https://`** (TLS 1.3, see [TLS.md](TLS.md): the certificate is checked against the system's
+roots unless `f->verifyCerts = false`; afterwards `f->secure`, `f->cipher`, and for a refused certificate `f->certError`). Connecting and
+name lookup still wait (4 s at most). `gnet.Scan` tests the ports of a host one per turn of the event loop (`onFound`, `onProgress`, `onDone`, `stop()`).
 `examples/gui/anet.a` is a network tool made of them and of `netif`, `dns` and `netutil`: interfaces, connections, ARP table,
 routes, DNS lookups (A, AAAA, MX, NS, TXT, CNAME), an HTTP fetch with headers and body, a port scanner, TCP connect timing.
 
@@ -320,7 +321,9 @@ scroll bar), shows the hand cursor over links and relays out when its width chan
 `examples/gui/abrowse.a` is a browser made of `HtmlView`, `gnet.Fetch` (pages load without freezing the window), `gimg` (the
 pictures of a page load four at a time in the background) and the toolbar widgets: address bar, back/forward/reload/home, history
 that remembers the scroll position, files and Markdown (`abrowse docs/GUI.md`), images and plain text, view source. There is
-no TLS, so `https://` shows a message.
+`https://` pages are fetched over TLS and the status bar shows `Secure: TLS_AES_128_GCM_SHA256` (or `Not secure (plain http)`);
+a site whose certificate is refused shows a "Your connection is not private" page with the reason, **Back to safety** and
+**Proceed anyway (unsafe)**, which opens that host without checking its certificate until the browser is closed.
 
 **Forms**: `<form action method>` with `input` (text, password, search, email, number ... as text fields; checkbox; radio;
 submit, button, image; hidden), `textarea`, `select` with `option` and `button` become real widgets inside the view (they

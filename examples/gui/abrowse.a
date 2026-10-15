@@ -1,5 +1,5 @@
 // abrowse - a small web browser for HTML and Markdown.   ADISPLAY=0 ./abrowse [address or file]
-//   http:// addresses (no https: there is no TLS), files, Markdown (.md), images (PNG, BMP, PPM) and plain text.
+//   http:// and https:// addresses (TLS 1.3, the certificate is checked), files, Markdown (.md), images (PNG, BMP, PPM), plain text.
 //   Alt+Left / Alt+Right back and forward, F5 reload, Ctrl+L the address bar, Ctrl+O open a file, Ctrl+U view the source.
 // Pages load without freezing the window; pictures on a page load one after the other in the background.
 import gui;
@@ -32,6 +32,38 @@ int generation;                 // changes with every navigation: answers of old
 char* pendingAnchor;            // the #fragment to scroll to when the page is there
 char* postMethod;               // set while a form's POST is being sent
 char* postBody;
+char* trustedHosts[16];         // https sites the user chose to open although their certificate was refused
+int nTrusted;
+
+// ---- https: certificates the user accepted -----------------------------------------------------------------------------------------------------
+char* hostOf(char* url) {
+    http.Url u;
+    if (!http.parseUrl(url, &u)) { return ""; }
+    return strdup(&u.host[0]);
+}
+
+bool isTrusted(char* host) {
+    for (int i = 0; i < nTrusted; i++) {
+        if (streq(trustedHosts[i], host)) { return true; }
+    }
+    return false;
+}
+
+// the text escaped for use in HTML (also inside an attribute)
+char* esc(char* t) {
+    char* r = malloc(strlen(t) * 6 + 1);
+    int o = 0;
+    for (int i = 0; t[i] != 0; i++) {
+        char c = t[i];
+        if (c == '<') { strcpy(&r[o], "&lt;"); o = o + 4; }
+        else if (c == '>') { strcpy(&r[o], "&gt;"); o = o + 4; }
+        else if (c == '&') { strcpy(&r[o], "&amp;"); o = o + 5; }
+        else if (c == '"') { strcpy(&r[o], "&quot;"); o = o + 6; }
+        else { r[o] = c; o++; }
+    }
+    r[o] = 0;
+    return r;
+}
 
 // ---- the pictures of a page ------------------------------------------------------------------------------------------------------------------
 char* wanted[48];
@@ -68,11 +100,12 @@ void startImages() {
             }
             continue;
         }
-        if (!startsWith(src, "http://")) {
+        if (!startsWith(src, "http://") && !startsWith(src, "https://")) {
             continue;
         }
         gnet.Fetch* f = new gnet.Fetch();
         f->userData = generation;
+        f->verifyCerts = !isTrusted(hostOf(src));
         f->onDone = imageDone;
         f->maxBytes = 6 * 1024 * 1024;
         if (f->start(disp, src, null)) {
@@ -123,7 +156,7 @@ char* aboutPage() {
     return "<h1>Browser</h1><p>Type an address above (<code>http://...</code>), or open a file with Ctrl+O.</p>"
            "<p>It shows HTML, Markdown (<code>.md</code>), images and plain text. Links are clickable; pictures load in the background.</p>"
            "<ul><li>Alt+Left, Alt+Right: back and forward</li><li>F5: reload</li><li>Ctrl+L: the address bar</li><li>Ctrl+U: the source of the page</li></ul>"
-           "<p>There is no <b>https</b> (no TLS), no CSS and no scripts.</p>";
+           "<p><b>https</b> works (TLS 1.3, certificates are checked against the system's trusted roots). There is no CSS and there are no scripts.</p>";
 }
 
 bool isImageUrl(char* u) {
@@ -176,6 +209,24 @@ void message(char* title, char* text) {
     setTitleFrom(title);
 }
 
+// the page for a refused certificate, with a way to go on at one's own risk
+void certificatePage(char* url, char* why) {
+    char* host = esc(hostOf(url));
+    char* reason = esc(why);
+    char* link = esc(url);
+    int n = strlen(host) * 2 + strlen(reason) + strlen(link) + 700;
+    char* html = malloc(n);
+    format(html, n, "<h2>Your connection is not private</h2>"
+           "<p>The identity of <b>%s</b> could not be confirmed: %s.</p>"
+           "<p>Somebody on the network may be pretending to be this site, or the site's certificate is not set up correctly. "
+           "Nothing but the start of the secure handshake was sent to it.</p>"
+           "<p><a href=\"about:home\">Back to safety</a></p>"
+           "<p><a href=\"about:proceed?%s\">Proceed to %s anyway (unsafe)</a></p>", host, reason, link, host);
+    view->setHtml(html, url);
+    currentSource = html;
+    setTitleFrom("Not private");
+}
+
 int pageDone(int self) {
     gnet.Fetch* f = (gnet.Fetch*) self;
     if (f->userData != generation) {
@@ -183,9 +234,21 @@ int pageDone(int self) {
     }
     busy->stop();
     if (f->error != null) {
-        message("Cannot load the page", f->error);
+        if (f->certError != null) {
+            certificatePage(f->url, f->certError);
+            status->setText(1, "Not secure: certificate refused");
+        } else {
+            message("Cannot load the page", f->error);
+        }
         say(f->error);
         return 0;
+    }
+    if (f->secure) {
+        char sec[120];
+        format(&sec[0], 120, "%s: %s", f->verifyCerts ? "Secure" : "Not verified", f->cipher);
+        status->setText(1, &sec[0]);
+    } else {
+        status->setText(1, startsWith(f->url, "http://") ? "Not secure (plain http)" : "");
     }
     char ct[100];
     ct[0] = 0;
@@ -262,10 +325,6 @@ void load(char* url) {
         say(url);
         return;
     }
-    if (startsWith(url, "https://")) {
-        message("https is not supported", "This browser has no TLS. Try the http:// address, if the site has one.");
-        return;
-    }
     // the fragment is not sent to the server
     char* fetchUrl = strdup(url);
     int hash = indexOf(fetchUrl, '#');
@@ -278,6 +337,7 @@ void load(char* url) {
     pageFetch = new gnet.Fetch();
     pageFetch->userData = generation;
     pageFetch->onDone = pageDone;
+    pageFetch->verifyCerts = !isTrusted(hostOf(fetchUrl));
     if (postMethod != null && streq(postMethod, "POST")) {
         pageFetch->post(postBody, null);
     }
@@ -338,6 +398,16 @@ int linkClicked(int self) {
     char* href = view->linkHref;
     if (startsWith(href, "mailto:")) {
         say("mail links are not handled");
+        return 0;
+    }
+    if (startsWith(href, "about:proceed?")) {
+        // the user accepts the risk for this site (until the browser is closed)
+        char* target = &href[14];
+        if (nTrusted < 16) {
+            trustedHosts[nTrusted] = hostOf(target);
+            nTrusted++;
+        }
+        navigate(target, true);
         return 0;
     }
     int hash = indexOf(href, '#');
@@ -452,6 +522,7 @@ int main(int argc, char** argv) {
     col->add(view);
     status = new guix.StatusBar();
     status->addSection(0);
+    status->addSection(250);
     col->add(status);
     win->setRoot(col);
     win->setFocus(view);
