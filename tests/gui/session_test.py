@@ -309,6 +309,53 @@ try:
     print("web keyboard ok")
     web.s.close()
 
+    # abrowse: loads a page over HTTP without freezing, loads its picture in the background, follows a link, and goes back
+    import tempfile, http.server, threading, functools
+    from PIL import Image
+    site = tempfile.mkdtemp()
+    os.makedirs(os.path.join(site, "sub"))
+    Image.new("RGB", (200, 80), (200, 30, 30)).save(os.path.join(site, "red.png"))
+    open(os.path.join(site, "index.html"), "w").write("<title>Index</title><h1>Index page</h1><p>A picture: <img src='red.png' alt='red'> and <a href='sub/two.html'>the second page</a>.</p>")
+    open(os.path.join(site, "sub", "two.html"), "w").write("<title>Two</title><h1>Second</h1><p><a href='../index.html'>back to the index</a></p>")
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=site)
+    handler.log_message = lambda *a, **k: None
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 8097), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    env5 = dict(os.environ, ADISPLAY="14")
+    p5 = subprocess.Popen([os.path.join(bindir, "adisplayd"), "-p", "14", "-vnc", "5914", "-control", "-size", "800x600"], env=env5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(p5)
+    time.sleep(0.8)
+    v5 = Rfb(port=5914)
+    bp = subprocess.Popen([os.path.join(bindir, "abrowse"), "http://127.0.0.1:8097/index.html"], env=env5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(bp)
+    time.sleep(1.5)
+    v5.grab()
+    red = v5.find_color((200, 30, 30), tol=4)
+    if not red or red[2] - red[0] < 150 or red[3] - red[1] < 60:
+        fail("the picture of the page did not load: %s" % (red,))
+    print("browser page and picture ok")
+    # the link: find the blue link text, click it
+    link = v5.find_color((26, 95, 200), tol=10)
+    if not link:
+        fail("no link on the page")
+    v5.click((link[0] + link[2]) // 2, (link[1] + link[3]) // 2)
+    time.sleep(1.0)
+    v5.grab()
+    if v5.find_color((200, 30, 30), tol=4):
+        fail("the picture is still there after following the link")
+    print("browser link ok")
+    # Alt+Left goes back (the picture comes again)
+    v5.key(0xffe9, 1)                     # Alt_L
+    v5.key(0xff51, 1)                     # Left
+    v5.key(0xff51, 0)
+    v5.key(0xffe9, 0)
+    time.sleep(1.5)
+    v5.grab()
+    if not v5.find_color((200, 30, 30), tol=4):
+        fail("back did not show the index page again")
+    print("browser back ok")
+    httpd.shutdown()
+
     # a second display with the screen locker: a wrong password keeps it locked, the right one removes it
     env2 = dict(os.environ, ADISPLAY="10")
     def start2(name, *args):

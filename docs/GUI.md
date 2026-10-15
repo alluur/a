@@ -29,6 +29,7 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `guix` | more widgets: menus, combo box, radio buttons, tabs, scroll view, spin box, splitter; dialogs (confirm, prompt, file, colour) |
 | `glock` | a screen locker (works with the server's `F_LOCK` windows) |
 | `wweb` | a web browser backend: the display in a canvas, mouse and keyboard back over a WebSocket |
+| `ghtml` | shows HTML and Markdown: parser, layout, links, images, scrolling (`HtmlView`) |
 | `gnet` | non-blocking HTTP fetches, a port scanner, TCP connections and listeners, UDP announcements and a peer-to-peer chat, all inside the event loop |
 | `secure` | secure random bytes, unique nonces, hex; (`hash` has `hmacSha256`, `des` the DES cipher for VNC passwords) |
 | `gimg` | colour images: load PNG, BMP and PPM, save PNG, smooth scaling |
@@ -36,7 +37,7 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t124`, `tests/gui.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t125`, `tests/gui.sh`.
 
 ## Quick start
 
@@ -292,6 +293,34 @@ check that the body is complete, `https://` is reported as unsupported (no TLS).
 most). `gnet.Scan` tests the ports of a host one per turn of the event loop (`onFound`, `onProgress`, `onDone`, `stop()`).
 `examples/gui/anet.a` is a network tool made of them and of `netif`, `dns` and `netutil`: interfaces, connections, ARP table,
 routes, DNS lookups (A, AAAA, MX, NS, TXT, CNAME), an HTTP fetch with headers and body, a port scanner, TCP connect timing.
+
+## A web browser: `ghtml` and `abrowse`
+
+```c
+import ghtml;
+ghtml.HtmlView* v = new ghtml.HtmlView();
+v->onLink = clicked;                       // int clicked(int view): v->linkHref (already absolute)
+v->onHover = hovering;                     // v->hoverHref, null off a link
+v->setHtml("<h1>Hello</h1><p>A <a href='x.html'>link</a>.</p>", "http://example.org/");
+v->setMarkdown(text, "file:///home/me/notes.md");
+v->setPlain(text, "x");                    // plain text in a <pre> block
+// pictures: v->imageCount(), v->imageSource(i) are the wanted ones; v->setImage(address, surface) supplies one
+```
+
+`HtmlView` draws headings (h1 to h6, the big ones scaled), paragraphs, lists (nested, ordered or not), preformatted text, block
+quotes, rules, tables (cells side by side), links, bold, code, underline and images (with their alt text until they are
+loaded). It does not do CSS, forms, frames or scripts (they are skipped), italics or colours. The view scrolls (wheel, keys,
+scroll bar), shows the hand cursor over links and relays out when its width changes. `ghtml.parseHtml`, `markdownToHtml`
+(headings, paragraphs, lists, code blocks, quotes, tables, rules, links, images, **bold**, *italic*, `code`), `plainText`,
+`decodeEntities` and `resolveUrl(base, ref)` (relative, absolute, `..`, `#fragment`, `//host`) work on their own.
+
+`examples/gui/abrowse.a` is a browser made of `HtmlView`, `gnet.Fetch` (pages load without freezing the window), `gimg` (the
+pictures of a page load four at a time in the background) and the toolbar widgets: address bar, back/forward/reload/home, history
+that remembers the scroll position, files and Markdown (`abrowse docs/GUI.md`), images and plain text, view source. There is
+no TLS, so `https://` shows a message.
+
+Text at other sizes: `surface->textScaled(font, x, y, text, colour, percent)` (and `scaledWidth`) draws text larger or smaller
+with bilinear sampling.
 
 ## Images: `gimg`
 

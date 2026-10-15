@@ -1,0 +1,408 @@
+// abrowse - a small web browser for HTML and Markdown.   ADISPLAY=0 ./abrowse [address or file]
+//   http:// addresses (no https: there is no TLS), files, Markdown (.md), images (PNG, BMP, PPM) and plain text.
+//   Alt+Left / Alt+Right back and forward, F5 reload, Ctrl+L the address bar, Ctrl+O open a file, Ctrl+U view the source.
+// Pages load without freezing the window; pictures on a page load one after the other in the background.
+import gui;
+import guix;
+import ghtml;
+import gnet;
+import gimg;
+import path;
+import os;
+import cunistd;
+import cstdlib;
+
+gui.Display* disp;
+gui.Window* win;
+ghtml.HtmlView* view;
+gui.TextBox* address;
+guix.StatusBar* status;
+gui.ProgressBar* busy;
+guix.IconButton* backButton;
+guix.IconButton* forwardButton;
+
+char* history[64];
+int historyScroll[64];
+int historyCount;
+int historyPos;
+char* currentUrl;
+char* currentSource;            // the text of the page (for View source)
+gnet.Fetch* pageFetch;
+int generation;                 // changes with every navigation: answers of older loads are ignored
+
+// ---- the pictures of a page ------------------------------------------------------------------------------------------------------------------
+char* wanted[48];
+int nwanted;
+int nextWanted;
+int active;
+gnet.Fetch* imageFetch[4];
+
+void startImages();
+
+int imageDone(int self) {
+    gnet.Fetch* f = (gnet.Fetch*) self;
+    if (f->userData == generation) {
+        if (f->error == null && f->status == 200) {
+            gfx.Surface* s = gimg.decode(f->body, f->bodyLen);
+            if (s != null) {
+                view->setImage(f->url, s);
+            }
+        }
+    }
+    active--;
+    startImages();
+    return 0;
+}
+
+void startImages() {
+    while (active < 4 && nextWanted < nwanted) {
+        char* src = wanted[nextWanted];
+        nextWanted++;
+        if (startsWith(src, "file://")) {
+            gfx.Surface* s = gimg.load(&src[7]);
+            if (s != null) {
+                view->setImage(src, s);
+            }
+            continue;
+        }
+        if (!startsWith(src, "http://")) {
+            continue;
+        }
+        gnet.Fetch* f = new gnet.Fetch();
+        f->userData = generation;
+        f->onDone = imageDone;
+        f->maxBytes = 6 * 1024 * 1024;
+        if (f->start(disp, src, null)) {
+            active++;
+        }
+    }
+}
+
+void collectImages() {
+    nwanted = 0;
+    nextWanted = 0;
+    active = 0;
+    for (int i = 0; i < view->imageCount() && nwanted < 48; i++) {
+        char* src = view->imageSource(i);
+        bool seen = false;
+        for (int k = 0; k < nwanted; k++) {
+            if (streq(wanted[k], src)) { seen = true; }
+        }
+        if (!seen && !view->hasImage(src)) {
+            wanted[nwanted] = src;
+            nwanted++;
+        }
+    }
+    startImages();
+}
+
+// ---- showing a page ---------------------------------------------------------------------------------------------------------------------------
+void say(char* text) {
+    status->setText(0, text);
+}
+
+void updateButtons() {
+    backButton->enabled = historyPos > 0;
+    forwardButton->enabled = historyPos < historyCount - 1;
+    backButton->invalidate();
+    forwardButton->invalidate();
+}
+
+void setTitleFrom(char* t) {
+    char* title = (t != null && strlen(t) > 0) ? t : currentUrl;
+    char* full = malloc(strlen(title) + 20);
+    strcpy(full, title);
+    strcat(full, " - Browser");
+    win->setTitle(full);
+}
+
+char* aboutPage() {
+    return "<h1>Browser</h1><p>Type an address above (<code>http://...</code>), or open a file with Ctrl+O.</p>"
+           "<p>It shows HTML, Markdown (<code>.md</code>), images and plain text. Links are clickable; pictures load in the background.</p>"
+           "<ul><li>Alt+Left, Alt+Right: back and forward</li><li>F5: reload</li><li>Ctrl+L: the address bar</li><li>Ctrl+U: the source of the page</li></ul>"
+           "<p>There is no <b>https</b> (no TLS), no CSS and no scripts.</p>";
+}
+
+bool isImageUrl(char* u) {
+    char* e = path.extension(u);
+    return streqi(e, ".png") || streqi(e, ".bmp") || streqi(e, ".ppm") || streqi(e, ".pgm");
+}
+
+void showText(char* url, char* contentType, char* text, int n) {
+    currentSource = text;
+    char* ext = path.extension(url);
+    bool md = streqi(ext, ".md") || streqi(ext, ".markdown") || (contentType != null && indexOf(contentType, 'm') >= 0 && startsWith(contentType, "text/markdown"));
+    bool html = streqi(ext, ".html") || streqi(ext, ".htm") || (contentType != null && startsWith(contentType, "text/html"));
+    if (contentType == null && !md && !html && (indexOf(text, '<') >= 0 && (strstrHtml(text)))) {
+        html = true;
+    }
+    if (md) {
+        view->setMarkdown(text, url);
+    } else if (html) {
+        view->setHtml(text, url);
+    } else {
+        view->setPlain(text, url);
+    }
+    setTitleFrom(view->doc->title);
+    collectImages();
+}
+
+// does the text look like an HTML page?
+bool strstrHtml(char* t) {
+    for (int i = 0; i < 200 && t[i] != 0; i++) {
+        if (t[i] == '<' && (toLower(t[i + 1]) == 'h' || toLower(t[i + 1]) == '!' || toLower(t[i + 1]) == 'b' || toLower(t[i + 1]) == 'p' || toLower(t[i + 1]) == 'd')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void message(char* title, char* text) {
+    char* html = malloc(strlen(title) + strlen(text) + 40);
+    format(html, strlen(title) + strlen(text) + 40, "<h2>%s</h2><p>%s</p>", title, text);
+    view->setHtml(html, currentUrl);
+    currentSource = html;
+    setTitleFrom(title);
+}
+
+int pageDone(int self) {
+    gnet.Fetch* f = (gnet.Fetch*) self;
+    if (f->userData != generation) {
+        return 0;
+    }
+    busy->stop();
+    if (f->error != null) {
+        message("Cannot load the page", f->error);
+        say(f->error);
+        return 0;
+    }
+    char ct[100];
+    ct[0] = 0;
+    http.headerOf(f->headers, "Content-Type", &ct[0], 100);
+    char status[60];
+    format(&status[0], 60, "%d, %d bytes, %d ms", f->status, f->bodyLen, f->elapsed);
+    currentUrl = strdup(f->url);
+    address->setText(currentUrl);
+    if (f->status >= 400) {
+        char m[100];
+        format(&m[0], 100, "The server answered %d.", f->status);
+        showText(currentUrl, &ct[0], f->body, f->bodyLen);
+        say(&m[0]);
+        return 0;
+    }
+    if (startsWith(&ct[0], "image/") || isImageUrl(currentUrl)) {
+        gfx.Surface* s = gimg.decode(f->body, f->bodyLen);
+        if (s != null) {
+            view->setImagePage(currentUrl, s);
+            setTitleFrom(currentUrl);
+            say(&status[0]);
+            return 0;
+        }
+    }
+    showText(currentUrl, &ct[0], f->body, f->bodyLen);
+    say(&status[0]);
+    return 0;
+}
+
+void loadFileUrl(char* url) {
+    char* p = &url[7];
+    if (isImageUrl(url)) {
+        gfx.Surface* s = gimg.load(p);
+        if (s == null) {
+            message("Cannot read the picture", p);
+            return;
+        }
+        view->setImagePage(url, s);
+        setTitleFrom(url);
+        return;
+    }
+    char* text = readFile(p);
+    if (text == null) {
+        message("Cannot read the file", p);
+        return;
+    }
+    showText(url, null, text, strlen(text));
+}
+
+void load(char* url) {
+    generation++;
+    if (pageFetch != null) {
+        pageFetch->cancel();
+        pageFetch = null;
+    }
+    busy->stop();
+    currentUrl = url;
+    address->setText(url);
+    if (streq(url, "about:home")) {
+        view->setHtml(aboutPage(), url);
+        currentSource = aboutPage();
+        setTitleFrom("Welcome");
+        return;
+    }
+    if (startsWith(url, "file://")) {
+        loadFileUrl(url);
+        say(url);
+        return;
+    }
+    if (startsWith(url, "https://")) {
+        message("https is not supported", "This browser has no TLS. Try the http:// address, if the site has one.");
+        return;
+    }
+    pageFetch = new gnet.Fetch();
+    pageFetch->userData = generation;
+    pageFetch->onDone = pageDone;
+    say("Loading...");
+    if (pageFetch->start(disp, url, null)) {
+        busy->start();
+    } else {
+        message("Cannot load the page", pageFetch->error);
+        say(pageFetch->error);
+    }
+}
+
+// the address as typed: a file, or a web address with or without http://
+char* normalize(char* t) {
+    if (strlen(t) == 0) { return "about:home"; }
+    if (startsWith(t, "http://") || startsWith(t, "https://") || startsWith(t, "file://") || startsWith(t, "about:")) { return t; }
+    if (fileExists(t)) {
+        char* abs = path.isAbsolute(t) ? t : path.join(os.getCwd(), t);
+        char* u = malloc(strlen(abs) + 10);
+        strcpy(u, "file://");
+        strcat(u, abs);
+        return u;
+    }
+    char* u = malloc(strlen(t) + 10);
+    strcpy(u, "http://");
+    strcat(u, t);
+    return u;
+}
+
+void navigate(char* url, bool remember) {
+    if (remember) {
+        if (historyCount > 0) {
+            historyScroll[historyPos] = view->scrollY;
+        }
+        if (historyPos < historyCount - 1) {
+            historyCount = historyPos + 1;
+        }
+        if (historyCount < 64) {
+            history[historyCount] = strdup(url);
+            historyCount++;
+            historyPos = historyCount - 1;
+        }
+    }
+    load(url);
+    updateButtons();
+}
+
+int linkClicked(int self) {
+    char* href = view->linkHref;
+    if (startsWith(href, "mailto:")) {
+        say("mail links are not handled");
+        return 0;
+    }
+    if (href[0] == '#' || (currentUrl != null && indexOf(href, '#') >= 0 && streq(href, currentUrl))) {
+        return 0;
+    }
+    navigate(href, true);
+    return 0;
+}
+
+int hovering(int self) {
+    say(view->hoverHref != null ? view->hoverHref : "");
+    return 0;
+}
+
+int doGo(int self) { navigate(normalize(address->text()), true); return 0; }
+int doBack(int item) {
+    if (historyPos > 0) {
+        historyScroll[historyPos] = view->scrollY;
+        historyPos--;
+        load(history[historyPos]);
+        view->scrollY = historyScroll[historyPos];
+        updateButtons();
+    }
+    return 0;
+}
+int doForward(int item) {
+    if (historyPos < historyCount - 1) {
+        historyScroll[historyPos] = view->scrollY;
+        historyPos++;
+        load(history[historyPos]);
+        updateButtons();
+    }
+    return 0;
+}
+int doReload(int item) { if (currentUrl != null) { load(currentUrl); } return 0; }
+int doHome(int item) { navigate("about:home", true); return 0; }
+int doQuit(int item) { disp->quit = true; return 0; }
+int doFocusAddress(int item) { address->focusMe(); return 0; }
+int doSource(int item) {
+    if (currentSource != null) {
+        view->setPlain(currentSource, "source");
+        say("source of the page");
+    }
+    return 0;
+}
+int gotFile(int p) {
+    if (p != 0) { navigate(normalize((char*) p), true); }
+    return 0;
+}
+int doOpen(int item) { guix.openFile(disp, "Open", ".", gotFile); return 0; }
+
+int main(int argc, char** argv) {
+    disp = gui.connectAs(null, "abrowse");
+    if (disp == null) {
+        println("cannot connect to the display server (is ADISPLAY set?)");
+        return 1;
+    }
+    win = disp->createWindow("Browser", 760, 560, 0);
+    gui.Box* col = gui.vbox(0, 0);
+    guix.MenuBar* bar = new guix.MenuBar();
+    guix.Menu* file = bar->addMenu("&File");
+    file->add("Open...", doOpen)->accel("Ctrl+O");
+    file->addSeparator();
+    file->add("Quit", doQuit)->accel("Ctrl+Q");
+    guix.Menu* go = bar->addMenu("&Go");
+    go->add("Back", doBack)->accel("Alt+Left");
+    go->add("Forward", doForward)->accel("Alt+Right");
+    go->add("Reload", doReload)->accel("F5");
+    go->add("Home", doHome)->accel("Alt+Home");
+    go->add("Address bar", doFocusAddress)->accel("Ctrl+L");
+    guix.Menu* viewMenu = bar->addMenu("&View");
+    viewMenu->add("Page source", doSource)->accel("Ctrl+U");
+    col->add(bar);
+
+    guix.Toolbar* tb = new guix.Toolbar();
+    backButton = tb->addButton(guix.ICON_LEFT, "Back", doBack);
+    forwardButton = tb->addButton(guix.ICON_RIGHT, "Forward", doForward);
+    tb->addButton(guix.ICON_REFRESH, "Reload", doReload);
+    tb->addButton(guix.ICON_HOME, "Home", doHome);
+    address = new gui.TextBox();
+    address->flex = 1;
+    address->onEnter = doGo;
+    tb->add(address);
+    gui.Button* goButton = new gui.Button("Go");
+    goButton->primary = true;
+    goButton->onClick = doGo;
+    tb->add(goButton);
+    busy = new gui.ProgressBar();
+    busy->w = 70;
+    tb->add(busy);
+    col->add(tb);
+
+    view = new ghtml.HtmlView();
+    view->onLink = linkClicked;
+    view->onHover = hovering;
+    col->add(view);
+    status = new guix.StatusBar();
+    status->addSection(0);
+    col->add(status);
+    win->setRoot(col);
+    win->setFocus(view);
+
+    char* start = (argc > 1) ? normalize(argv[1]) : "about:home";
+    navigate(start, true);
+    disp->run();
+    return 0;
+}

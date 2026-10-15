@@ -1,0 +1,1570 @@
+// =============================================================================
+//  ghtml - show HTML and Markdown in a window                                                        import ghtml;
+//
+//    ghtml.HtmlView* v = new ghtml.HtmlView();
+//    v->flex = 1;
+//    v->setHtml("<h1>Hello</h1><p>A <a href='next.html'>link</a> and <b>bold</b> text.</p>", "http://example.org/");
+//    v->onLink = clicked;            // int clicked(int view): v->linkHref is the address (already made absolute)
+//    v->onHover = hovering;          // v->hoverHref (null when the pointer is not on a link)
+//    v->setMarkdown(text, baseUrl);  // the same for Markdown
+//    // images: v->pendingImage(i) names the ones that are wanted, v->setImage(src, surface) supplies them
+//
+//  What is drawn: headings (h1..h6), paragraphs, line breaks, lists (ul, ol, nested), preformatted text, block quotes,
+//  horizontal rules, links, bold, code, underline, images (with their alt text while they load), simple tables (the cells of a
+//  row are put side by side). Not supported: CSS, forms, frames, scripts (they are skipped), italic (shown upright), colours.
+//  The view scrolls (wheel, keys, scroll bar).
+//
+//  Helpers: ghtml.resolveUrl(base, ref), ghtml.markdownToHtml(text), ghtml.decodeEntities(text), ghtml.plainText(html).
+// =============================================================================
+import gui;
+import gfx;
+import adp;
+import cstdlib;
+import cstring;
+module ghtml;
+
+const ST_BOLD = 1;
+const ST_MONO = 2;
+const ST_ITALIC = 4;
+const ST_UNDER = 8;
+
+const K_WORD = 0;
+const K_IMAGE = 1;
+const K_BREAK = 2;
+const K_GAP = 3;
+
+const B_TEXT = 0;
+const B_RULE = 1;
+
+public int colorText = 0xFF202428;
+public int colorLink = 0xFF1A5FC8;
+public int colorBack = 0xFFFFFFFF;
+public int colorCode = 0xFF7A2E8A;
+
+// ---- the document ------------------------------------------------------------------------------------------------------------------------
+class Item {
+    public int kind;
+    public char* text;              // word, or the alt text of an image
+    public int style;
+    public int size;                // percent
+    public int link;                // index in Doc.links, -1 none
+    public char* src;
+    public int declW;               // width and height given in the tag (0 = not given)
+    public int declH;
+    public bool spaceBefore;
+    // set by layout
+    public int x;
+    public int y;
+    public int w;
+    public int h;
+}
+
+class Block {
+    public int kind;
+    public int indent;
+    public int marginTop;
+    public int marginBottom;
+    public bool pre;
+    public bool quote;
+    public char* bullet;
+    public Item** items;
+    public int n;
+    public int cap;
+    public int y0;
+    public int y1;
+    public int bulletY;
+
+    public Block() {
+        cap = 8;
+        items = (Item**) calloc(cap, 8);
+    }
+
+    public void add(Item* it) {
+        if (n == cap) {
+            cap = cap * 2;
+            items = (Item**) realloc((char*) items, cap * 8);
+        }
+        items[n] = it;
+        n++;
+    }
+}
+
+public class Doc {
+    public Block** blocks;
+    public int nblocks;
+    public int cap;
+    public char** links;
+    public int nlinks;
+    public int capLinks;
+    public char* title;
+
+    public Doc() {
+        cap = 32;
+        blocks = (Block**) calloc(cap, 8);
+        capLinks = 16;
+        links = (char**) calloc(capLinks, 8);
+        title = "";
+    }
+
+    public Block* addBlock() {
+        if (nblocks == cap) {
+            cap = cap * 2;
+            blocks = (Block**) realloc((char*) blocks, cap * 8);
+        }
+        Block* b = new Block();
+        blocks[nblocks] = b;
+        nblocks++;
+        return b;
+    }
+
+    public int addLink(char* href) {
+        if (nlinks == capLinks) {
+            capLinks = capLinks * 2;
+            links = (char**) realloc((char*) links, capLinks * 8);
+        }
+        links[nlinks] = href;
+        nlinks++;
+        return nlinks - 1;
+    }
+}
+
+// ---- URLs -----------------------------------------------------------------------------------------------------------------------------------
+// the address ref (as found in a page) made absolute with the address of the page. Works for http://, file:// and data-less relative
+// paths. "#fragment" references stay on the page.
+public char* resolveUrl(char* base, char* ref) {
+    if (ref == null || strlen(ref) == 0) {
+        return strdup(base);
+    }
+    if (startsWith(ref, "http://") || startsWith(ref, "https://") || startsWith(ref, "file://") || startsWith(ref, "data:") || startsWith(ref, "mailto:")) {
+        return strdup(ref);
+    }
+    // split base into "scheme://host" and the path
+    int p = indexOf(base, ':');
+    int hostEnd = 0;
+    if (p > 0 && base[p + 1] == '/' && base[p + 2] == '/') {
+        hostEnd = p + 3;
+        while (base[hostEnd] != 0 && base[hostEnd] != '/') {
+            hostEnd++;
+        }
+    }
+    char* origin = malloc(hostEnd + 1);
+    memcpy(origin, base, hostEnd);
+    origin[hostEnd] = 0;
+    char* path = &base[hostEnd];
+    if (strlen(path) == 0) {
+        path = "/";
+    }
+    if (ref[0] == '#') {
+        int h = indexOf(base, '#');
+        int n = (h >= 0) ? h : strlen(base);
+        char* r = malloc(n + strlen(ref) + 1);
+        memcpy(r, base, n);
+        r[n] = 0;
+        strcat(r, ref);
+        return r;
+    }
+    if (ref[0] == '/' && ref[1] == '/') {
+        char* r = malloc(strlen(ref) + 16);
+        memcpy(r, base, (p > 0) ? p + 1 : 0);
+        r[(p > 0) ? p + 1 : 0] = 0;
+        strcat(r, ref);
+        return r;
+    }
+    char* full = malloc(strlen(path) + strlen(ref) + 4);
+    if (ref[0] == '/') {
+        strcpy(full, ref);
+    } else {
+        // the directory of the base path (without query or fragment)
+        int end = strlen(path);
+        for (int i = 0; path[i] != 0; i++) {
+            if (path[i] == '?' || path[i] == '#') { end = i; break; }
+        }
+        int slash = -1;
+        for (int i = 0; i < end; i++) {
+            if (path[i] == '/') { slash = i; }
+        }
+        memcpy(full, path, slash + 1);
+        full[slash + 1] = 0;
+        strcat(full, ref);
+    }
+    // . and .. segments (in the part before ? or #)
+    int pathEnd = strlen(full);
+    for (int i = 0; full[i] != 0; i++) {
+        if (full[i] == '?' || full[i] == '#') { pathEnd = i; break; }
+    }
+    char* tail = strdup(&full[pathEnd]);
+    full[pathEnd] = 0;
+    char* out = malloc(strlen(full) + strlen(tail) + 4);
+    int segStart[64];
+    int nseg = 0;
+    int o = 0;
+    int i = 0;
+    while (full[i] != 0) {
+        // one segment: from after the slash to the next slash
+        int j = i + 1;
+        while (full[j] != 0 && full[j] != '/') { j++; }
+        int len = j - (i + 1);
+        char* seg = &full[i + 1];
+        if (len == 1 && seg[0] == '.') {
+            // nothing
+        } else if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+            if (nseg > 0) {
+                nseg--;
+                o = segStart[nseg];
+            }
+        } else {
+            if (nseg < 63) {
+                segStart[nseg] = o;
+                nseg++;
+            }
+            out[o] = '/';
+            memcpy(&out[o + 1], seg, len);
+            o = o + 1 + len;
+        }
+        i = j;
+    }
+    if (o == 0) {
+        out[0] = '/';
+        o = 1;
+    }
+    out[o] = 0;
+    strcat(out, tail);
+    char* result = malloc(strlen(origin) + strlen(out) + 1);
+    strcpy(result, origin);
+    strcat(result, out);
+    return result;
+}
+
+// ---- entities -------------------------------------------------------------------------------------------------------------------------------
+private int entityCode(char* name) {
+    if (streq(name, "amp")) { return '&'; }
+    if (streq(name, "lt")) { return '<'; }
+    if (streq(name, "gt")) { return '>'; }
+    if (streq(name, "quot")) { return '"'; }
+    if (streq(name, "apos")) { return 39; }
+    if (streq(name, "nbsp")) { return 160; }
+    if (streq(name, "copy")) { return 169; }
+    if (streq(name, "reg")) { return 174; }
+    if (streq(name, "deg")) { return 176; }
+    if (streq(name, "plusmn")) { return 177; }
+    if (streq(name, "middot")) { return 183; }
+    if (streq(name, "laquo")) { return 171; }
+    if (streq(name, "raquo")) { return 187; }
+    if (streq(name, "auml")) { return 228; }
+    if (streq(name, "ouml")) { return 246; }
+    if (streq(name, "aring")) { return 229; }
+    if (streq(name, "Auml")) { return 196; }
+    if (streq(name, "Ouml")) { return 214; }
+    if (streq(name, "Aring")) { return 197; }
+    if (streq(name, "eacute")) { return 233; }
+    if (streq(name, "uuml")) { return 252; }
+    if (streq(name, "szlig")) { return 223; }
+    if (streq(name, "times")) { return 215; }
+    if (streq(name, "mdash") || streq(name, "ndash") || streq(name, "minus")) { return '-'; }
+    if (streq(name, "lsquo") || streq(name, "rsquo")) { return 39; }
+    if (streq(name, "ldquo") || streq(name, "rdquo")) { return '"'; }
+    if (streq(name, "bull")) { return 183; }
+    return -1;
+}
+
+private int putUtf8(char* out, int o, int cp) {
+    if (cp < 0x80) {
+        out[o] = cp;
+        return o + 1;
+    }
+    if (cp < 0x800) {
+        out[o] = 0xC0 | (cp >> 6);
+        out[o + 1] = 0x80 | (cp & 63);
+        return o + 2;
+    }
+    out[o] = '?';
+    return o + 1;                   // the built-in font has Latin-1 only
+}
+
+// replaces &name; &#65; and &#x41; (unknown ones stay as they are)
+public char* decodeEntities(char* t) {
+    int n = strlen(t);
+    if (indexOf(t, '&') < 0) {
+        return t;
+    }
+    char* out = malloc(n * 2 + 4);
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+        if (t[i] != '&') {
+            out[o] = t[i];
+            o++;
+            continue;
+        }
+        int semi = -1;
+        for (int k = i + 1; k < n && k < i + 10; k++) {
+            if (t[k] == ';') { semi = k; break; }
+        }
+        if (semi < 0) {
+            out[o] = '&';
+            o++;
+            continue;
+        }
+        char name[12];
+        memcpy(&name[0], &t[i + 1], semi - i - 1);
+        name[semi - i - 1] = 0;
+        int cp = -1;
+        if (name[0] == '#') {
+            int v = 0;
+            if (name[1] == 'x' || name[1] == 'X') {
+                for (int k = 2; name[k] != 0; k++) {
+                    int c = name[k];
+                    int d = (c >= '0' && c <= '9') ? c - '0' : ((c >= 'a' && c <= 'f') ? c - 'a' + 10 : ((c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1));
+                    if (d < 0) { v = -1; break; }
+                    v = v * 16 + d;
+                }
+            } else {
+                v = atoi(&name[1]);
+            }
+            cp = v;
+        } else {
+            cp = entityCode(&name[0]);
+        }
+        if (cp < 0) {
+            out[o] = '&';
+            o++;
+        } else {
+            o = putUtf8(out, o, cp);
+            i = semi;
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+// ---- the parser -------------------------------------------------------------------------------------------------------------------------------
+class Builder {
+    public Doc* doc;
+    public Block* cur;
+    public int bold;
+    public int mono;
+    public int italic;
+    public int under;
+    public int link;
+    public int size;
+    public int listDepth;
+    public int listKind[16];        // 0 ul, 1 ol
+    public int listCount[16];
+    public int quoteDepth;
+    public bool inPre;
+    public bool inTitle;
+    public char* base;
+    public bool pendingSpace;
+
+    public Builder(char* baseUrl) {
+        doc = new Doc();
+        base = baseUrl;
+        size = 100;
+        link = -1;
+    }
+
+    public int style() {
+        int s = 0;
+        if (bold > 0) { s = s | ST_BOLD; }
+        if (mono > 0) { s = s | ST_MONO; }
+        if (italic > 0) { s = s | ST_ITALIC; }
+        if (under > 0 || link >= 0) { s = s | ST_UNDER; }
+        return s;
+    }
+
+    // starts a new block (an empty current one is reused)
+    public void block(int top, int bottom) {
+        if (cur != null && cur->n == 0 && cur->kind == B_TEXT && cur->bullet == null) {
+            if (top > cur->marginTop) { cur->marginTop = top; }
+            cur->marginBottom = bottom;
+            cur->indent = listDepth * 24 + quoteDepth * 20;
+            cur->quote = quoteDepth > 0;
+            cur->pre = inPre;
+            return;
+        }
+        if (cur != null && top < cur->marginBottom) {
+            top = cur->marginBottom;
+        }
+        if (cur != null) {
+            // the gap between two blocks is the larger of the two margins
+            top = (top > cur->marginBottom) ? top - cur->marginBottom : 0;
+        }
+        cur = doc->addBlock();
+        cur->marginTop = top;
+        cur->marginBottom = bottom;
+        cur->indent = listDepth * 24 + quoteDepth * 20;
+        cur->quote = quoteDepth > 0;
+        cur->pre = inPre;
+        pendingSpace = false;
+    }
+
+    public void ensure() {
+        if (cur == null) {
+            block(0, 0);
+        }
+    }
+
+    public void word(char* text, bool space) {
+        ensure();
+        Item* it = new Item();
+        it->kind = K_WORD;
+        it->text = text;
+        it->style = style();
+        it->size = size;
+        it->link = link;
+        it->spaceBefore = space && cur->n > 0;
+        cur->add(it);
+    }
+
+    public void lineBreak() {
+        ensure();
+        Item* it = new Item();
+        it->kind = K_BREAK;
+        it->size = size;
+        it->style = style();
+        cur->add(it);
+        pendingSpace = false;
+    }
+
+    public void gap() {
+        ensure();
+        Item* it = new Item();
+        it->kind = K_GAP;
+        it->size = size;
+        cur->add(it);
+        pendingSpace = false;
+    }
+
+    // text between tags
+    public void text(char* raw) {
+        if (inTitle) {
+            char* t = decodeEntities(raw);
+            char* nt = malloc(strlen(doc->title) + strlen(t) + 1);
+            strcpy(nt, doc->title);
+            strcat(nt, t);
+            doc->title = nt;
+            return;
+        }
+        char* t = decodeEntities(raw);
+        int n = strlen(t);
+        if (inPre) {
+            ensure();
+            int start = 0;
+            for (int i = 0; i <= n; i++) {
+                if (i == n || t[i] == 10) {
+                    int e = i;
+                    if (e > start && t[e - 1] == 13) { e--; }
+                    if (e > start) {
+                        char* piece = malloc(e - start + 1);
+                        memcpy(piece, &t[start], e - start);
+                        piece[e - start] = 0;
+                        Item* it = new Item();
+                        it->kind = K_WORD;
+                        it->text = piece;
+                        it->style = style();
+                        it->size = size;
+                        it->link = link;
+                        cur->add(it);
+                    }
+                    if (i < n) { lineBreak(); }
+                    start = i + 1;
+                }
+            }
+            return;
+        }
+        // words separated by white space
+        int i = 0;
+        bool space = pendingSpace;
+        while (i < n) {
+            int c = t[i];
+            if (c == 32 || c == 9 || c == 10 || c == 13) {
+                space = true;
+                i++;
+                continue;
+            }
+            int j = i;
+            while (j < n && t[j] != 32 && t[j] != 9 && t[j] != 10 && t[j] != 13) { j++; }
+            char* w = malloc(j - i + 1);
+            memcpy(w, &t[i], j - i);
+            w[j - i] = 0;
+            word(w, space);
+            space = false;
+            i = j;
+        }
+        pendingSpace = space;
+    }
+}
+
+// the value of an attribute inside a tag text (` href='x' b=2`); null when there is none
+private char* attrValue(char* tag, char* name) {
+    int n = strlen(tag);
+    int i = 0;
+    while (i < n) {
+        while (i < n && (tag[i] == 32 || tag[i] == 9 || tag[i] == 10 || tag[i] == 13 || tag[i] == '/')) { i++; }
+        int ns = i;
+        while (i < n && tag[i] != '=' && tag[i] != 32 && tag[i] != 9 && tag[i] != 10 && tag[i] != 13 && tag[i] != '/') { i++; }
+        int ne = i;
+        while (i < n && tag[i] == 32) { i++; }
+        char* value = null;
+        if (i < n && tag[i] == '=') {
+            i++;
+            while (i < n && tag[i] == 32) { i++; }
+            int q = 0;
+            if (i < n && (tag[i] == '"' || tag[i] == 39)) { q = tag[i]; i++; }
+            int vs = i;
+            while (i < n && ((q != 0 && tag[i] != q) || (q == 0 && tag[i] != 32 && tag[i] != 9 && tag[i] != 10 && tag[i] != 13))) { i++; }
+            value = malloc(i - vs + 1);
+            memcpy(value, &tag[vs], i - vs);
+            value[i - vs] = 0;
+            if (q != 0 && i < n) { i++; }
+        }
+        if (ne > ns && ne - ns == strlen(name)) {
+            bool match = true;
+            for (int k = 0; k < ne - ns; k++) {
+                if (toLower(tag[ns + k]) != toLower(name[k])) { match = false; break; }
+            }
+            if (match) {
+                return (value != null) ? decodeEntities(value) : "";
+            }
+        }
+    }
+    return null;
+}
+
+private bool tagIs(char* name, char* want) {
+    return streqi(name, want);
+}
+
+private void openTag(Builder* b, char* name, char* tag) {
+    if (tagIs(name, "p") || tagIs(name, "section") || tagIs(name, "article") || tagIs(name, "header") || tagIs(name, "footer") || tagIs(name, "nav") || tagIs(name, "main") || tagIs(name, "aside")) {
+        b->block(tagIs(name, "p") ? 10 : 0, tagIs(name, "p") ? 10 : 0);
+    } else if (tagIs(name, "div") || tagIs(name, "form") || tagIs(name, "center") || tagIs(name, "figure") || tagIs(name, "figcaption") || tagIs(name, "dl") || tagIs(name, "dt") || tagIs(name, "address")) {
+        b->block(0, 0);
+    } else if (tagIs(name, "dd")) {
+        b->block(0, 0);
+        b->cur->indent = b->cur->indent + 24;
+    } else if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && name[2] == 0) {
+        int level = name[1] - '0';
+        int sizes[7] = { 100, 200, 150, 125, 110, 100, 90 };
+        b->block(level <= 2 ? 16 : 12, 8);
+        b->size = sizes[level];
+        b->bold++;
+    } else if (tagIs(name, "br")) {
+        b->lineBreak();
+    } else if (tagIs(name, "hr")) {
+        b->block(6, 6);
+        b->cur->kind = B_RULE;
+        b->cur = null;
+    } else if (tagIs(name, "ul") || tagIs(name, "ol")) {
+        if (b->listDepth < 15) {
+            b->listKind[b->listDepth] = tagIs(name, "ol") ? 1 : 0;
+            b->listCount[b->listDepth] = 0;
+        }
+        b->listDepth++;
+        b->block(b->listDepth == 1 ? 8 : 0, 0);
+    } else if (tagIs(name, "li")) {
+        b->block(3, 3);
+        int d = b->listDepth;
+        if (d == 0) { d = 1; b->cur->indent = 24; }
+        char* bullet = malloc(16);
+        if (d <= 15 && b->listKind[d - 1] == 1) {
+            b->listCount[d - 1]++;
+            format(bullet, 16, "%d.", b->listCount[d - 1]);
+        } else {
+            strcpy(bullet, "*");                       // drawn as a small disc
+        }
+        b->cur->bullet = bullet;
+    } else if (tagIs(name, "pre")) {
+        b->inPre = true;
+        b->block(8, 8);
+        b->cur->pre = true;
+        b->mono++;
+    } else if (tagIs(name, "blockquote")) {
+        b->quoteDepth++;
+        b->block(8, 8);
+    } else if (tagIs(name, "tr")) {
+        b->block(2, 2);
+    } else if (tagIs(name, "td") || tagIs(name, "th")) {
+        if (b->cur != null && b->cur->n > 0) {
+            b->gap();
+        }
+        if (tagIs(name, "th")) { b->bold++; }
+    } else if (tagIs(name, "a")) {
+        char* href = attrValue(tag, "href");
+        if (href != null && strlen(href) > 0) {
+            b->link = b->doc->addLink(resolveUrl(b->base, href));
+        }
+    } else if (tagIs(name, "b") || tagIs(name, "strong")) {
+        b->bold++;
+    } else if (tagIs(name, "i") || tagIs(name, "em") || tagIs(name, "cite") || tagIs(name, "var")) {
+        b->italic++;
+    } else if (tagIs(name, "u") || tagIs(name, "ins")) {
+        b->under++;
+    } else if (tagIs(name, "code") || tagIs(name, "tt") || tagIs(name, "kbd") || tagIs(name, "samp")) {
+        b->mono++;
+    } else if (tagIs(name, "title")) {
+        b->inTitle = true;
+    } else if (tagIs(name, "img")) {
+        char* src = attrValue(tag, "src");
+        if (src != null && strlen(src) > 0 && !startsWith(src, "data:")) {
+            b->ensure();
+            Item* it = new Item();
+            it->kind = K_IMAGE;
+            it->src = resolveUrl(b->base, src);
+            char* alt = attrValue(tag, "alt");
+            it->text = (alt != null) ? alt : "";
+            char* w = attrValue(tag, "width");
+            char* h = attrValue(tag, "height");
+            it->declW = (w != null) ? atoi(w) : 0;
+            it->declH = (h != null) ? atoi(h) : 0;
+            it->link = b->link;
+            it->size = 100;
+            it->spaceBefore = b->pendingSpace && b->cur->n > 0;
+            b->pendingSpace = false;
+            b->cur->add(it);
+        }
+    }
+}
+
+private void closeTag(Builder* b, char* name) {
+    if (tagIs(name, "p") || tagIs(name, "div") || tagIs(name, "section") || tagIs(name, "article") || tagIs(name, "header") || tagIs(name, "footer") || tagIs(name, "nav") || tagIs(name, "main") || tagIs(name, "aside") || tagIs(name, "form") || tagIs(name, "center") || tagIs(name, "figure") || tagIs(name, "dl")) {
+        b->cur = null;
+    } else if (name[0] == 'h' && name[1] >= '1' && name[1] <= '6' && name[2] == 0) {
+        b->size = 100;
+        if (b->bold > 0) { b->bold--; }
+        b->cur = null;
+    } else if (tagIs(name, "ul") || tagIs(name, "ol")) {
+        if (b->listDepth > 0) { b->listDepth--; }
+        b->cur = null;
+    } else if (tagIs(name, "li") || tagIs(name, "tr") || tagIs(name, "dt") || tagIs(name, "dd")) {
+        b->cur = null;
+    } else if (tagIs(name, "pre")) {
+        b->inPre = false;
+        if (b->mono > 0) { b->mono--; }
+        b->cur = null;
+    } else if (tagIs(name, "blockquote")) {
+        if (b->quoteDepth > 0) { b->quoteDepth--; }
+        b->cur = null;
+    } else if (tagIs(name, "th")) {
+        if (b->bold > 0) { b->bold--; }
+    } else if (tagIs(name, "a")) {
+        b->link = -1;
+    } else if (tagIs(name, "b") || tagIs(name, "strong")) {
+        if (b->bold > 0) { b->bold--; }
+    } else if (tagIs(name, "i") || tagIs(name, "em") || tagIs(name, "cite") || tagIs(name, "var")) {
+        if (b->italic > 0) { b->italic--; }
+    } else if (tagIs(name, "u") || tagIs(name, "ins")) {
+        if (b->under > 0) { b->under--; }
+    } else if (tagIs(name, "code") || tagIs(name, "tt") || tagIs(name, "kbd") || tagIs(name, "samp")) {
+        if (b->mono > 0) { b->mono--; }
+    } else if (tagIs(name, "title")) {
+        b->inTitle = false;
+    }
+}
+
+// the document of an HTML text; base is the address of the page (to make links and images absolute)
+public Doc* parseHtml(char* html, char* base) {
+    Builder* b = new Builder(base);
+    int n = strlen(html);
+    int i = 0;
+    int textStart = 0;
+    while (i < n) {
+        if (html[i] != '<') {
+            i++;
+            continue;
+        }
+        // text before the tag
+        if (i > textStart) {
+            char* t = malloc(i - textStart + 1);
+            memcpy(t, &html[textStart], i - textStart);
+            t[i - textStart] = 0;
+            b->text(t);
+        }
+        if (html[i + 1] == '!' && html[i + 2] == '-' && html[i + 3] == '-') {
+            int e = i + 4;
+            while (e < n && !(html[e] == '-' && html[e + 1] == '-' && html[e + 2] == '>')) { e++; }
+            i = e + 3;
+            textStart = i;
+            continue;
+        }
+        // the end of the tag (a '>' inside quotes does not count)
+        int e = i + 1;
+        int q = 0;
+        while (e < n) {
+            if (q != 0) {
+                if (html[e] == q) { q = 0; }
+            } else if (html[e] == '"' || html[e] == 39) {
+                q = html[e];
+            } else if (html[e] == '>') {
+                break;
+            }
+            e++;
+        }
+        int ts = i + 1;
+        bool closing = false;
+        if (html[ts] == '/') { closing = true; ts++; }
+        if (html[ts] == '!' || html[ts] == '?') {
+            i = e + 1;
+            textStart = i;
+            continue;
+        }
+        char name[24];
+        int k = 0;
+        while (ts + k < e && k < 23 && html[ts + k] != 32 && html[ts + k] != '/' && html[ts + k] != 9 && html[ts + k] != 10 && html[ts + k] != 13) {
+            name[k] = html[ts + k];
+            k++;
+        }
+        name[k] = 0;
+        char* tag = malloc(e - (ts + k) + 2);
+        memcpy(tag, &html[ts + k], e - (ts + k));
+        tag[e - (ts + k)] = 0;
+        if (k > 0) {
+            if (closing) {
+                closeTag(b, &name[0]);
+            } else {
+                openTag(b, &name[0], tag);
+                // the content of script and style is not text
+                if (streqi(&name[0], "script") || streqi(&name[0], "style")) {
+                    int m = e + 1;
+                    while (m < n) {
+                        if (html[m] == '<' && html[m + 1] == '/' && toLower(html[m + 2]) == 's' && (toLower(html[m + 3]) == 'c' || toLower(html[m + 3]) == 't')) {
+                            break;
+                        }
+                        m++;
+                    }
+                    e = m - 1;
+                    // the closing tag itself is read normally
+                }
+            }
+        }
+        i = e + 1;
+        textStart = i;
+    }
+    if (i > textStart && textStart < n) {
+        char* t = malloc(n - textStart + 1);
+        memcpy(t, &html[textStart], n - textStart);
+        t[n - textStart] = 0;
+        b->text(t);
+    }
+    return b->doc;
+}
+
+// the text of a page without the tags (for searching and tests)
+public char* plainText(char* html) {
+    Doc* d = parseHtml(html, "");
+    int cap = strlen(html) + 64;
+    char* out = malloc(cap);
+    int o = 0;
+    for (int bi = 0; bi < d->nblocks; bi++) {
+        Block* b = d->blocks[bi];
+        if (b->kind == B_RULE) { continue; }
+        if (bi > 0 && o > 0 && out[o - 1] != 10) { out[o] = 10; o++; }
+        for (int i = 0; i < b->n; i++) {
+            Item* it = b->items[i];
+            if (it->kind == K_BREAK) { out[o] = 10; o++; continue; }
+            if (it->kind == K_IMAGE) { continue; }
+            if (it->spaceBefore || it->kind == K_GAP) { out[o] = ' '; o++; }
+            if (it->kind == K_WORD) {
+                int l = strlen(it->text);
+                if (o + l + 4 >= cap) { cap = cap * 2 + l; out = realloc(out, cap); }
+                memcpy(&out[o], it->text, l);
+                o = o + l;
+            }
+        }
+    }
+    out[o] = 0;
+    return out;
+}
+
+// ---- Markdown -----------------------------------------------------------------------------------------------------------------------------
+private void appendTo(char** buf, int* len, int* cap, char* s) {
+    int n = strlen(s);
+    if (*len + n + 8 > *cap) {
+        while (*len + n + 8 > *cap) { *cap = *cap * 2; }
+        *buf = realloc(*buf, *cap);
+    }
+    memcpy(&(*buf)[*len], s, n);
+    *len = *len + n;
+    (*buf)[*len] = 0;
+}
+
+// escapes < > & and turns `code`, **bold**, *italic*, [text](url) and ![alt](src) into tags
+private char* inlineMd(char* s) {
+    int n = strlen(s);
+    int cap = n * 3 + 64;
+    char* out = malloc(cap);
+    int len = 0;
+    out[0] = 0;
+    int i = 0;
+    while (i < n) {
+        int c = s[i];
+        if (c == '`') {
+            int e = i + 1;
+            while (e < n && s[e] != '`') { e++; }
+            if (e < n) {
+                appendTo(&out, &len, &cap, "<code>");
+                for (int k = i + 1; k < e; k++) {
+                    char one[8];
+                    one[0] = s[k]; one[1] = 0;
+                    if (s[k] == '<') { appendTo(&out, &len, &cap, "&lt;"); }
+                    else if (s[k] == '>') { appendTo(&out, &len, &cap, "&gt;"); }
+                    else if (s[k] == '&') { appendTo(&out, &len, &cap, "&amp;"); }
+                    else { appendTo(&out, &len, &cap, &one[0]); }
+                }
+                appendTo(&out, &len, &cap, "</code>");
+                i = e + 1;
+                continue;
+            }
+        }
+        if (c == '*' && s[i + 1] == '*') {
+            int e = i + 2;
+            while (e + 1 < n && !(s[e] == '*' && s[e + 1] == '*')) { e++; }
+            if (e + 1 < n) {
+                char* inner = malloc(e - i - 1);
+                memcpy(inner, &s[i + 2], e - i - 2);
+                inner[e - i - 2] = 0;
+                appendTo(&out, &len, &cap, "<b>");
+                appendTo(&out, &len, &cap, inlineMd(inner));
+                appendTo(&out, &len, &cap, "</b>");
+                i = e + 2;
+                continue;
+            }
+        }
+        if (c == '*' && s[i + 1] != '*' && s[i + 1] != ' ' && s[i + 1] != 0) {
+            int e = i + 1;
+            while (e < n && s[e] != '*') { e++; }
+            if (e < n && s[e - 1] != ' ') {
+                char* inner = malloc(e - i);
+                memcpy(inner, &s[i + 1], e - i - 1);
+                inner[e - i - 1] = 0;
+                appendTo(&out, &len, &cap, "<i>");
+                appendTo(&out, &len, &cap, inlineMd(inner));
+                appendTo(&out, &len, &cap, "</i>");
+                i = e + 1;
+                continue;
+            }
+        }
+        if (c == '[' || (c == '!' && s[i + 1] == '[')) {
+            bool image = (c == '!');
+            int lb = image ? i + 1 : i;
+            int rb = lb + 1;
+            while (rb < n && s[rb] != ']') { rb++; }
+            if (rb + 1 < n && s[rb + 1] == '(') {
+                int rp = rb + 2;
+                while (rp < n && s[rp] != ')') { rp++; }
+                if (rp < n) {
+                    char* label = malloc(rb - lb);
+                    memcpy(label, &s[lb + 1], rb - lb - 1);
+                    label[rb - lb - 1] = 0;
+                    char* url = malloc(rp - rb - 1);
+                    memcpy(url, &s[rb + 2], rp - rb - 2);
+                    url[rp - rb - 2] = 0;
+                    if (image) {
+                        appendTo(&out, &len, &cap, "<img src=\"");
+                        appendTo(&out, &len, &cap, url);
+                        appendTo(&out, &len, &cap, "\" alt=\"");
+                        appendTo(&out, &len, &cap, label);
+                        appendTo(&out, &len, &cap, "\">");
+                    } else {
+                        appendTo(&out, &len, &cap, "<a href=\"");
+                        appendTo(&out, &len, &cap, url);
+                        appendTo(&out, &len, &cap, "\">");
+                        appendTo(&out, &len, &cap, inlineMd(label));
+                        appendTo(&out, &len, &cap, "</a>");
+                    }
+                    i = rp + 1;
+                    continue;
+                }
+            }
+        }
+        if (c == '<') { appendTo(&out, &len, &cap, "&lt;"); }
+        else if (c == '>') { appendTo(&out, &len, &cap, "&gt;"); }
+        else if (c == '&') { appendTo(&out, &len, &cap, "&amp;"); }
+        else {
+            char one[2];
+            one[0] = c; one[1] = 0;
+            appendTo(&out, &len, &cap, &one[0]);
+        }
+        i++;
+    }
+    return out;
+}
+
+private bool isTableSeparator(char* l) {
+    bool any = false;
+    for (int i = 0; l[i] != 0; i++) {
+        if (l[i] == '-') { any = true; }
+        else if (l[i] != '|' && l[i] != ':' && l[i] != ' ') { return false; }
+    }
+    return any;
+}
+
+// closes every open list
+private void closeLists(char** out, int* len, int* cap, int* depth, int* ordered) {
+    while (*depth > 0) {
+        appendTo(out, len, cap, ordered[*depth - 1] != 0 ? "</ol>\n" : "</ul>\n");
+        *depth = *depth - 1;
+    }
+}
+
+// HTML for a Markdown text: headings, paragraphs, lists (nested by indentation), code blocks, block quotes, tables, rules and the inline
+// forms of inlineMd
+public char* markdownToHtml(char* md) {
+    int cap = strlen(md) * 3 + 256;
+    char* out = malloc(cap);
+    int len = 0;
+    out[0] = 0;
+    int n = strlen(md);
+    int pos = 0;
+    bool inPara = false;
+    bool inCode = false;
+    bool inTable = false;
+    bool inQuote = false;
+    int listDepth = 0;
+    int listIndent[8];
+    int listOrdered[8];
+    while (pos <= n) {
+        int e = pos;
+        while (e < n && md[e] != 10) { e++; }
+        char* line = malloc(e - pos + 1);
+        memcpy(line, &md[pos], e - pos);
+        line[e - pos] = 0;
+        int ll = strlen(line);
+        if (ll > 0 && line[ll - 1] == 13) { line[ll - 1] = 0; ll--; }
+        pos = e + 1;
+        if (pos > n + 1) { break; }
+        if (inCode) {
+            if (startsWith(line, "```")) {
+                appendTo(&out, &len, &cap, "</pre>\n");
+                inCode = false;
+            } else {
+                for (int k = 0; k < ll; k++) {
+                    char one[2];
+                    one[0] = line[k]; one[1] = 0;
+                    if (line[k] == '<') { appendTo(&out, &len, &cap, "&lt;"); }
+                    else if (line[k] == '>') { appendTo(&out, &len, &cap, "&gt;"); }
+                    else if (line[k] == '&') { appendTo(&out, &len, &cap, "&amp;"); }
+                    else { appendTo(&out, &len, &cap, &one[0]); }
+                }
+                appendTo(&out, &len, &cap, "\n");
+            }
+            continue;
+        }
+        int ind = 0;
+        while (line[ind] == ' ') { ind++; }
+        char* t = &line[ind];
+        bool tableRow = (t[0] == '|');
+        if (!tableRow && inTable) { appendTo(&out, &len, &cap, "</table>\n"); inTable = false; }
+        bool quote = (t[0] == '>');
+        if (!quote && inQuote) { appendTo(&out, &len, &cap, "</blockquote>\n"); inQuote = false; }
+        if (startsWith(t, "```")) {
+            if (inPara) { appendTo(&out, &len, &cap, "</p>\n"); inPara = false; }
+            while (listDepth > 0) { appendTo(&out, &len, &cap, listOrdered[listDepth - 1] != 0 ? "</ol>\n" : "</ul>\n"); listDepth--; }
+            appendTo(&out, &len, &cap, "<pre>");
+            inCode = true;
+            continue;
+        }
+        if (strlen(t) == 0) {
+            if (inPara) { appendTo(&out, &len, &cap, "</p>\n"); inPara = false; }
+            continue;
+        }
+        if (t[0] == '#') {
+            int level = 0;
+            while (t[level] == '#' && level < 6) { level++; }
+            if (t[level] == ' ') {
+                if (inPara) { appendTo(&out, &len, &cap, "</p>\n"); inPara = false; }
+                while (listDepth > 0) { appendTo(&out, &len, &cap, listOrdered[listDepth - 1] != 0 ? "</ol>\n" : "</ul>\n"); listDepth--; }
+                char tagOpen[8];
+                format(&tagOpen[0], 8, "<h%d>", level);
+                char tagClose[8];
+                format(&tagClose[0], 8, "</h%d>\n", level);
+                appendTo(&out, &len, &cap, &tagOpen[0]);
+                appendTo(&out, &len, &cap, inlineMd(&t[level + 1]));
+                appendTo(&out, &len, &cap, &tagClose[0]);
+                continue;
+            }
+        }
+        if ((startsWith(t, "---") || startsWith(t, "***")) && strlen(t) >= 3) {
+            bool rule = true;
+            for (int k = 0; t[k] != 0; k++) { if (t[k] != t[0] && t[k] != ' ') { rule = false; } }
+            if (rule) {
+                closeLists(&out, &len, &cap, &listDepth, &listOrdered[0]);
+                if (inPara) { appendTo(&out, &len, &cap, "</p>\n"); inPara = false; }
+                appendTo(&out, &len, &cap, "<hr>\n");
+                continue;
+            }
+        }
+        if (tableRow) {
+            if (isTableSeparator(t)) { continue; }
+            closeLists(&out, &len, &cap, &listDepth, &listOrdered[0]);
+            if (inPara) { appendTo(&out, &len, &cap, "</p>\n"); inPara = false; }
+            if (!inTable) { appendTo(&out, &len, &cap, "<table>\n"); inTable = true; }
+            appendTo(&out, &len, &cap, "<tr>");
+            int k = 1;
+            while (t[k] != 0) {
+                int cs = k;
+                while (t[k] != 0 && t[k] != '|') { k++; }
+                char* cell = malloc(k - cs + 1);
+                memcpy(cell, &t[cs], k - cs);
+                cell[k - cs] = 0;
+                if (t[k] == 0 && strlen(cell) == 0) { break; }
+                appendTo(&out, &len, &cap, "<td>");
+                appendTo(&out, &len, &cap, inlineMd(cell));
+                appendTo(&out, &len, &cap, "</td>");
+                if (t[k] == '|') { k++; }
+            }
+            appendTo(&out, &len, &cap, "</tr>\n");
+            continue;
+        }
+        if (quote) {
+            closeLists(&out, &len, &cap, &listDepth, &listOrdered[0]);
+            if (inPara) { appendTo(&out, &len, &cap, "</p>\n"); inPara = false; }
+            if (!inQuote) { appendTo(&out, &len, &cap, "<blockquote>"); inQuote = true; }
+            char* q = &t[1];
+            if (q[0] == ' ') { q = &q[1]; }
+            appendTo(&out, &len, &cap, inlineMd(q));
+            appendTo(&out, &len, &cap, "<br>\n");
+            continue;
+        }
+        // list items
+        bool bullet = ((t[0] == '-' || t[0] == '*' || t[0] == '+') && t[1] == ' ');
+        int digits = 0;
+        while (t[digits] >= '0' && t[digits] <= '9') { digits++; }
+        bool numbered = (digits > 0 && t[digits] == '.' && t[digits + 1] == ' ');
+        if (bullet || numbered) {
+            if (inPara) { appendTo(&out, &len, &cap, "</p>\n"); inPara = false; }
+            // the nesting follows the indentation
+            while (listDepth > 0 && ind < listIndent[listDepth - 1]) {
+                appendTo(&out, &len, &cap, listOrdered[listDepth - 1] != 0 ? "</ol>\n" : "</ul>\n");
+                listDepth--;
+            }
+            if (listDepth > 0 && ind == listIndent[listDepth - 1] && listOrdered[listDepth - 1] != (numbered ? 1 : 0)) {
+                appendTo(&out, &len, &cap, listOrdered[listDepth - 1] != 0 ? "</ol>\n" : "</ul>\n");
+                listDepth--;
+            }
+            if (listDepth == 0 || ind > listIndent[listDepth - 1]) {
+                if (listDepth < 8) {
+                    listIndent[listDepth] = ind;
+                    listOrdered[listDepth] = numbered ? 1 : 0;
+                    listDepth++;
+                    appendTo(&out, &len, &cap, numbered ? "<ol>\n" : "<ul>\n");
+                }
+            }
+            appendTo(&out, &len, &cap, "<li>");
+            appendTo(&out, &len, &cap, inlineMd(numbered ? &t[digits + 2] : &t[2]));
+            appendTo(&out, &len, &cap, "</li>\n");
+            continue;
+        }
+        // a line of a paragraph (a continuation of a list item stays in the list)
+        if (listDepth > 0 && ind == 0) {
+            while (listDepth > 0) { appendTo(&out, &len, &cap, listOrdered[listDepth - 1] != 0 ? "</ol>\n" : "</ul>\n"); listDepth--; }
+        }
+        if (!inPara) {
+            appendTo(&out, &len, &cap, "<p>");
+            inPara = true;
+        } else {
+            appendTo(&out, &len, &cap, " ");
+        }
+        appendTo(&out, &len, &cap, inlineMd(t));
+    }
+    if (inPara) { appendTo(&out, &len, &cap, "</p>\n"); }
+    if (inTable) { appendTo(&out, &len, &cap, "</table>\n"); }
+    if (inQuote) { appendTo(&out, &len, &cap, "</blockquote>\n"); }
+    if (inCode) { appendTo(&out, &len, &cap, "</pre>\n"); }
+    while (listDepth > 0) { appendTo(&out, &len, &cap, listOrdered[listDepth - 1] != 0 ? "</ol>\n" : "</ul>\n"); listDepth--; }
+    return out;
+}
+
+// ---- the view -----------------------------------------------------------------------------------------------------------------------------
+class ImageEntry {
+    public char* src;
+    public gfx.Surface* surface;
+}
+
+public class HtmlView : gui.Widget {
+    public func onLink;             // int f(int view): linkHref
+    public func onHover;            // int f(int view): hoverHref (null when off a link)
+    public char* linkHref;
+    public char* hoverHref;
+    public Doc* doc;
+    public int scrollY;
+    public int contentHeight;
+    private char* baseUrl;
+    private int laidWidth;
+    private ImageEntry** images;
+    private int nimages;
+    private bool dragging;
+    private int dragGrab;
+    private bool needLayout;
+    private int shape;
+
+    public HtmlView() {
+        super();
+        focusable = true;
+        images = (ImageEntry**) calloc(64, 8);
+        w = 400;
+        h = 300;
+        flex = 1;
+        doc = new Doc();
+    }
+
+    public virtual int prefW() { return 400; }
+    public virtual int prefH() { return 300; }
+    public virtual bool wantsScroll() { return true; }
+
+    public void setDoc(Doc* d, char* base) {
+        doc = d;
+        baseUrl = base;
+        scrollY = 0;
+        nimages = 0;
+        needLayout = true;
+        hoverHref = null;
+        invalidate();
+    }
+
+    public void setHtml(char* html, char* base) {
+        setDoc(parseHtml(html, base), base);
+    }
+
+    public void setMarkdown(char* md, char* base) {
+        setDoc(parseHtml(markdownToHtml(md), base), base);
+    }
+
+    // the plain text of a file in a <pre> block
+    public void setPlain(char* text, char* base) {
+        Doc* d = new Doc();
+        Block* b = d->addBlock();
+        b->pre = true;
+        int n = strlen(text);
+        int start = 0;
+        for (int i = 0; i <= n; i++) {
+            if (i == n || text[i] == 10) {
+                int e = i;
+                if (e > start && text[e - 1] == 13) { e--; }
+                if (e > start) {
+                    char* piece = malloc(e - start + 1);
+                    memcpy(piece, &text[start], e - start);
+                    piece[e - start] = 0;
+                    Item* it = new Item();
+                    it->kind = K_WORD;
+                    it->text = piece;
+                    it->style = ST_MONO;
+                    it->size = 100;
+                    it->link = -1;
+                    b->add(it);
+                }
+                if (i < n) {
+                    Item* br = new Item();
+                    br->kind = K_BREAK;
+                    br->size = 100;
+                    br->style = ST_MONO;
+                    b->add(br);
+                }
+                start = i + 1;
+            }
+        }
+        setDoc(d, base);
+    }
+
+    // a picture alone on a page
+    public void setImagePage(char* src, gfx.Surface* s) {
+        Doc* d = new Doc();
+        Block* b = d->addBlock();
+        Item* it = new Item();
+        it->kind = K_IMAGE;
+        it->src = src;
+        it->text = "";
+        it->size = 100;
+        it->link = -1;
+        b->add(it);
+        setDoc(d, src);
+        setImage(src, s);
+    }
+
+    private ImageEntry* entryFor(char* src) {
+        for (int i = 0; i < nimages; i++) {
+            if (streq(images[i]->src, src)) { return images[i]; }
+        }
+        return null;
+    }
+
+    // supplies a picture for the img tags with this address (src as made absolute by the parser)
+    public void setImage(char* src, gfx.Surface* s) {
+        ImageEntry* e = entryFor(src);
+        if (e == null) {
+            if (nimages >= 64) { return; }
+            e = new ImageEntry();
+            e->src = strdup(src);
+            images[nimages] = e;
+            nimages++;
+        }
+        e->surface = s;
+        needLayout = true;
+        invalidate();
+    }
+
+    // the addresses of the pictures the page wants (all of them, in order; the same one can come twice)
+    public int imageCount() {
+        int c = 0;
+        for (int b = 0; b < doc->nblocks; b++) {
+            for (int i = 0; i < doc->blocks[b]->n; i++) {
+                if (doc->blocks[b]->items[i]->kind == K_IMAGE) { c++; }
+            }
+        }
+        return c;
+    }
+
+    public char* imageSource(int k) {
+        int c = 0;
+        for (int b = 0; b < doc->nblocks; b++) {
+            for (int i = 0; i < doc->blocks[b]->n; i++) {
+                if (doc->blocks[b]->items[i]->kind == K_IMAGE) {
+                    if (c == k) { return doc->blocks[b]->items[i]->src; }
+                    c++;
+                }
+            }
+        }
+        return null;
+    }
+
+    public bool hasImage(char* src) {
+        ImageEntry* e = entryFor(src);
+        return e != null && e->surface != null;
+    }
+
+    private gfx.Font* fontOf(int style) {
+        if ((style & ST_MONO) != 0) { return gfx.mono(); }
+        if ((style & ST_BOLD) != 0) { return gfx.sansBold(); }
+        return gfx.sans();
+    }
+
+    // ---- layout: every item gets x, y, w, h in the coordinates of the page ----------------------------------------------------------------
+    public void layoutAll() {
+        needLayout = false;
+        laidWidth = w;
+        int pad = 10;
+        int y = pad;
+        int avail = w - pad * 2 - 12;
+        for (int bi = 0; bi < doc->nblocks; bi++) {
+            Block* b = doc->blocks[bi];
+            y = y + b->marginTop;
+            b->y0 = y;
+            if (b->kind == B_RULE) {
+                y = y + 8;
+                b->y1 = y;
+                y = y + b->marginBottom;
+                continue;
+            }
+            int x0 = pad + b->indent;
+            int maxW = avail - b->indent;
+            if (maxW < 40) { maxW = 40; }
+            int x = 0;
+            int lineTop = y;
+            int lineH = 0;
+            int first = 0;                 // the first item of the line
+            b->bulletY = y;
+            int count = b->n;
+            for (int i = 0; i < count; i++) {
+                Item* it = b->items[i];
+                gfx.Font* f = fontOf(it->style);
+                if (it->kind == K_WORD) {
+                    it->w = (gfx.textWidth(f, it->text) * it->size + 50) / 100;
+                    it->h = (f->height * it->size + 50) / 100 + 2;
+                } else if (it->kind == K_IMAGE) {
+                    ImageEntry* e = entryFor(it->src);
+                    int iw = 0;
+                    int ih = 0;
+                    if (e != null && e->surface != null) {
+                        iw = e->surface->w;
+                        ih = e->surface->h;
+                    }
+                    if (it->declW > 0 && it->declH > 0) {
+                        iw = it->declW; ih = it->declH;
+                    } else if (it->declW > 0 && iw > 0) {
+                        ih = ih * it->declW / iw; iw = it->declW;
+                    } else if (it->declH > 0 && ih > 0) {
+                        iw = iw * it->declH / ih; ih = it->declH;
+                    }
+                    if (iw == 0) { iw = 64; ih = 40; }         // a place holder until it is loaded
+                    if (iw > maxW) { ih = ih * maxW / iw; iw = maxW; }
+                    it->w = iw;
+                    it->h = ih;
+                } else if (it->kind == K_GAP) {
+                    it->w = 20;
+                    it->h = fontOf(0)->height + 2;
+                } else {
+                    it->w = 0;
+                    it->h = fontOf(it->style)->height + 2;
+                }
+                if (it->kind == K_BREAK) {
+                    lineTop = finishLine(b, first, i, lineTop, lineH);
+                    lineH = 0;
+                    x = 0;
+                    first = i + 1;
+                    continue;
+                }
+                int space = 0;
+                if (x > 0 && it->spaceBefore && it->kind != K_GAP) {
+                    space = f->advance(' ') * it->size / 100;
+                }
+                if (x > 0 && !b->pre && x + space + it->w > maxW) {
+                    lineTop = finishLine(b, first, i, lineTop, lineH);
+                    lineH = 0;
+                    x = 0;
+                    first = i;
+                    space = 0;
+                }
+                it->x = x0 + x + space;
+                x = x + space + it->w;
+                if (it->h > lineH) { lineH = it->h; }
+            }
+            if (first < count) {
+                lineTop = finishLine(b, first, count, lineTop, lineH);
+            }
+            y = lineTop;
+            b->y1 = y;
+            y = y + b->marginBottom;
+        }
+        contentHeight = y + pad;
+        clampScroll();
+    }
+
+    // places the items first .. end-1 on a line that starts at lineTop; returns the top of the next line
+    private int finishLine(Block* b, int first, int end, int lineTop, int lineH) {
+        if (lineH == 0) {
+            lineH = fontOf(0)->height + 2;
+        }
+        for (int k = first; k < end; k++) {
+            Item* m = b->items[k];
+            if (m->kind != K_BREAK) {
+                m->y = lineTop + (lineH - m->h) / 2;
+            }
+        }
+        return lineTop + lineH;
+    }
+
+    private void clampScroll() {
+        int max = contentHeight - h;
+        if (scrollY > max) { scrollY = max; }
+        if (scrollY < 0) { scrollY = 0; }
+    }
+
+    public virtual void layout() {
+        if (w != laidWidth || needLayout) {
+            layoutAll();
+        }
+    }
+
+    // ---- drawing -------------------------------------------------------------------------------------------------------------------------
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        if (needLayout || w != laidWidth) {
+            layoutAll();
+        }
+        s->fill(ox, oy, w, h, colorBack);
+        for (int bi = 0; bi < doc->nblocks; bi++) {
+            Block* b = doc->blocks[bi];
+            if (b->y1 + 4 < scrollY || b->y0 - 4 > scrollY + h) {
+                continue;
+            }
+            int top = oy + b->y0 - scrollY;
+            if (b->kind == B_RULE) {
+                s->hline(ox + 10, top + 3, w - 32, 0xFFB0B4BC);
+                continue;
+            }
+            if (b->quote) {
+                s->fill(ox + b->indent - 12, top, 3, b->y1 - b->y0, 0xFFC4C8D0);
+            }
+            if (b->bullet != null) {
+                gfx.Font* f = gfx.sans();
+                if (streq(b->bullet, "*")) {
+                    s->fillCircle(ox + 10 + b->indent - 9, oy + b->bulletY - scrollY + f->height / 2 + 2, 2, colorText);
+                } else {
+                    int bw = gfx.textWidth(f, b->bullet);
+                    s->text(f, ox + 10 + b->indent - 6 - bw, oy + b->bulletY - scrollY + 1, b->bullet, colorText);
+                }
+            }
+            for (int i = 0; i < b->n; i++) {
+                Item* it = b->items[i];
+                int ix = ox + it->x;
+                int iy = oy + it->y - scrollY;
+                if (iy + it->h < oy || iy > oy + h) { continue; }
+                if (it->kind == K_WORD) {
+                    gfx.Font* f = fontOf(it->style);
+                    int c = colorText;
+                    if (it->link >= 0) { c = colorLink; }
+                    else if ((it->style & ST_MONO) != 0) { c = colorCode; }
+                    s->textScaled(f, ix, iy + 1, it->text, c, it->size);
+                    if ((it->style & ST_UNDER) != 0) {
+                        int ux = ix;
+                        int uw = it->w;
+                        // the underline of a link continues over the space between two words of it
+                        if (i > 0 && it->link >= 0 && it->spaceBefore && b->items[i - 1]->link == it->link && b->items[i - 1]->y == it->y) {
+                            int gapStart = b->items[i - 1]->x + b->items[i - 1]->w;
+                            if (gapStart < ix) { ux = gapStart; uw = it->w + (ix - gapStart); }
+                        }
+                        s->hline(ux, iy + it->h - 2, uw, c);
+                    }
+                } else if (it->kind == K_IMAGE) {
+                    ImageEntry* e = entryFor(it->src);
+                    if (e != null && e->surface != null) {
+                        gfx.Surface* img = e->surface;
+                        if (img->w == it->w && img->h == it->h) {
+                            s->blitBlend(img, 0, 0, img->w, img->h, ix, iy, 255);
+                        } else {
+                            gfx.Surface* sc = scaled(img, it->w, it->h);
+                            s->blitBlend(sc, 0, 0, sc->w, sc->h, ix, iy, 255);
+                        }
+                    } else {
+                        s->rect(ix, iy, it->w, it->h, 0xFFB0B4BC);
+                        if (strlen(it->text) > 0) {
+                            s->text(gfx.sans(), ix + 4, iy + 4, it->text, 0xFF808890);
+                        }
+                    }
+                    if (it->link >= 0) {
+                        s->rect(ix - 1, iy - 1, it->w + 2, it->h + 2, colorLink);
+                    }
+                }
+            }
+        }
+        // the scroll bar
+        if (contentHeight > h) {
+            int bar = h * h / contentHeight;
+            if (bar < 20) { bar = 20; }
+            int pos = (h - bar) * scrollY / (contentHeight - h);
+            s->fillRoundRect(ox + w - 9, oy + pos + 1, 7, bar - 2, 3, dragging ? 0xFF808890 : 0xFFB8BCC4);
+        }
+        s->rect(ox, oy, w, h, (win != null && win->focusWidget == this) ? gui.cAccent : gui.cBorder);
+    }
+
+    // a smaller or larger copy of a picture (nearest neighbour, good enough for showing)
+    private gfx.Surface* scaled(gfx.Surface* src, int nw, int nh) {
+        gfx.Surface* d = new gfx.Surface(nw, nh);
+        for (int y = 0; y < nh; y++) {
+            int sy = y * src->h / nh;
+            for (int x = 0; x < nw; x++) {
+                d->put(x, y, src->get(x * src->w / nw, sy));
+            }
+        }
+        return d;
+    }
+
+    // ---- links ----------------------------------------------------------------------------------------------------------------------------
+    // where the first piece of link number k is (in the coordinates of the page, after layout); false if there is none
+    public bool linkBox(int k, int* x, int* y, int* bw, int* bh) {
+        if (needLayout || w != laidWidth) {
+            layoutAll();
+        }
+        for (int b = 0; b < doc->nblocks; b++) {
+            for (int i = 0; i < doc->blocks[b]->n; i++) {
+                Item* it = doc->blocks[b]->items[i];
+                if (it->link == k && it->kind != K_BREAK) {
+                    *x = it->x;
+                    *y = it->y;
+                    *bw = it->w;
+                    *bh = it->h;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // the link under a position of the view (null if none)
+    public char* linkAt(int mx, int my) {
+        int py = my + scrollY;
+        for (int bi = 0; bi < doc->nblocks; bi++) {
+            Block* b = doc->blocks[bi];
+            if (py < b->y0 - 2 || py > b->y1 + 2 || b->kind == B_RULE) {
+                continue;
+            }
+            for (int i = 0; i < b->n; i++) {
+                Item* it = b->items[i];
+                if (it->link >= 0 && it->kind != K_BREAK && mx >= it->x && mx < it->x + it->w && py >= it->y && py < it->y + it->h) {
+                    return doc->links[it->link];
+                }
+            }
+        }
+        return null;
+    }
+
+    private void setShape(int sh) {
+        if (win != null && sh != shape) {
+            shape = sh;
+            win->setCursor(sh);
+        }
+    }
+
+    public void scrollBy(int dy) {
+        scrollY = scrollY + dy;
+        clampScroll();
+        invalidate();
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (needLayout) {
+            layoutAll();
+        }
+        if (kind == adp.M_SCROLL) {
+            scrollBy(-button * 48);
+            return true;
+        }
+        if (kind == adp.M_DOWN && button == 1) {
+            if (contentHeight > h && mx >= w - 14) {
+                // the scroll bar: a click moves a page, a drag on the thumb scrolls
+                int bar = h * h / contentHeight;
+                if (bar < 20) { bar = 20; }
+                int pos = (h - bar) * scrollY / (contentHeight - h);
+                if (my >= pos && my < pos + bar) {
+                    dragging = true;
+                    dragGrab = my - pos;
+                } else {
+                    scrollBy(my < pos ? -(h - 40) : h - 40);
+                }
+                return true;
+            }
+            char* l = linkAt(mx, my);
+            if (l != null && onLink != null) {
+                linkHref = l;
+                onLink(this);
+            }
+        } else if (kind == adp.M_MOVE) {
+            if (dragging) {
+                int bar = h * h / contentHeight;
+                if (bar < 20) { bar = 20; }
+                int range = h - bar;
+                if (range > 0) {
+                    scrollY = (my - dragGrab) * (contentHeight - h) / range;
+                    clampScroll();
+                    invalidate();
+                }
+                return true;
+            }
+            char* l = linkAt(mx, my);
+            setShape(l != null ? adp.CURSOR_HAND : adp.CURSOR_ARROW);
+            if (l != hoverHref) {
+                hoverHref = l;
+                if (onHover != null) {
+                    onHover(this);
+                }
+            }
+        } else if (kind == adp.M_UP) {
+            dragging = false;
+            invalidate();
+        }
+        return true;
+    }
+
+    public virtual void onHoverEnter(bool inside) { }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn == 0) { return false; }
+        if (key == adp.KEY_DOWN) { scrollBy(40); return true; }
+        if (key == adp.KEY_UP) { scrollBy(-40); return true; }
+        if (key == adp.KEY_PGDN || key == adp.KEY_SPACE) { scrollBy(h - 40); return true; }
+        if (key == adp.KEY_PGUP) { scrollBy(-(h - 40)); return true; }
+        if (key == adp.KEY_HOME) { scrollY = 0; invalidate(); return true; }
+        if (key == adp.KEY_END) { scrollY = contentHeight; clampScroll(); invalidate(); return true; }
+        return false;
+    }
+
+    public virtual void onFocus(bool gained) { invalidate(); }
+}

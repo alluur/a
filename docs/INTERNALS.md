@@ -364,3 +364,9 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   pixel with a VNC viewer of the same server, and the page was also tried in Chromium (Playwright) for the click and the cursor.
 * `gnet.Conn/Listener/Beacon/Chat` run entirely on `Display.watch` and `Display.after`; `t123_gui_chat` runs three chats and the
   display connection in one process, so the discovery, the connection rule and the messages are tested without extra programs.
+* `ghtml`: the parser (`parseHtml`) fills a `Doc` of `Block`s (paragraph, heading, list item, pre, rule) that hold `Item`s (a word, an
+  image, a line break or a gap between table cells) with a style and a size in percent. `layoutAll` places every item in page
+  coordinates (greedy line filling, the line height is the tallest item, items are centred vertically on their line) and runs
+  again when the width changes or a picture arrives; painting and link hit tests only look at the blocks in view. Markdown is
+  converted to HTML text first, so there is one renderer. `tests/t125_gui_html.a` covers text, entities, URLs, Markdown, links,
+  scrolling and a screenshot checksum; `tests/gui.sh` runs `abrowse` against a local web server.
