@@ -25,9 +25,16 @@
 // =============================================================================
 import net;
 import encoding;
+import tls;
 module http;
 
 private char lastError[128];
+private bool verifyCerts = true;
+
+// https: check the server certificate (default true). Turn it off only for servers you know and cannot verify.
+public void setVerify(bool on) {
+    verifyCerts = on;
+}
 
 public char* error() {
     return &lastError[0];
@@ -351,16 +358,21 @@ public Response* request(char* method, char* url, char* extra, char* body, int b
         fail("not an http:// URL");
         return null;
     }
-    if (streq(&u->scheme[0], "https")) {
-        fail("https is not supported (no TLS)");
-        return null;
-    }
     int h = net.connect(&u->host[0], u->port);
     if (h < 0) {
         fail("cannot connect");
         return null;
     }
     net.setTimeout(h, 15000);
+    if (streq(&u->scheme[0], "https")) {
+        // from here on net.send / net.recv / net.close on h go through TLS
+        if (!tls.wrap(h, &u->host[0], verifyCerts)) {
+            char* why = tls.lastError();
+            fail(why == null ? "the TLS handshake failed" : why);
+            net.rawClose(h);
+            return null;
+        }
+    }
     if (!sendRequest(h, method, &u->host[0], &u->path[0], extra, body, bodyLen)) {
         net.close(h);
         fail("sending the request failed");
@@ -371,7 +383,7 @@ public Response* request(char* method, char* url, char* extra, char* body, int b
     return r;
 }
 
-// GET, following up to 5 redirects to http:// locations
+// GET, following up to 5 redirects (to http:// and https:// locations)
 public Response* get(char* url) {
     char* cur = strdup(url);
     for (int hop = 0; hop < 6; hop++) {
@@ -384,13 +396,13 @@ public Response* get(char* url) {
             if (!headerOf(r->headers, "Location", &loc[0], 2048)) {
                 return r;
             }
-            if (startsWith(&loc[0], "http://")) {
+            if (startsWith(&loc[0], "http://") || startsWith(&loc[0], "https://")) {
                 cur = strdup(&loc[0]);
             } else if (loc[0] == '/') {
                 Url* u = new Url();
                 parseUrl(cur, u);
                 char* nu = alloc(4400);
-                format(nu, 4400, "http://%s:%d%s", &u->host[0], u->port, &loc[0]);
+                format(nu, 4400, "%s://%s:%d%s", &u->scheme[0], &u->host[0], u->port, &loc[0]);
                 cur = nu;
             } else {
                 return r;
@@ -553,6 +565,15 @@ public bool respond(int h, int status, char* contentType, char* body) {
 // answers `count` requests on a port (count <= 0: forever). The handler is called as handler(request, client)
 // and has to send the response with respond()
 public void serve(int port, func handler, int count) {
+    serveLoop(port, null, handler, count);
+}
+
+// the same over HTTPS: cfg comes from tls.loadConfig(certificateChainPem, privateKeyPem). A client whose TLS handshake fails is dropped.
+public void serveTls(int port, tls.Config* cfg, func handler, int count) {
+    serveLoop(port, cfg, handler, count);
+}
+
+private void serveLoop(int port, tls.Config* cfg, func handler, int count) {
     int s = net.listen(port, 16);
     if (s < 0) {
         return;
@@ -564,6 +585,11 @@ public void serve(int port, func handler, int count) {
             break;
         }
         net.setTimeout(c, 15000);
+        if (cfg != null && !tls.wrapServer(c, cfg)) {
+            net.rawClose(c);
+            served++;
+            continue;
+        }
         Request* q = new Request();
         if (readRequest(c, q)) {
             handler(q, c);
@@ -705,4 +731,10 @@ private void staticHandler(Request* q, int client) {
 public void serveStatic(int port, char* dir, int count) {
     staticRoot = strdup(dir);
     serve(port, staticHandler, count);
+}
+
+// the same over HTTPS
+public void serveStaticTls(int port, char* dir, int count, tls.Config* cfg) {
+    staticRoot = strdup(dir);
+    serveTls(port, cfg, staticHandler, count);
 }

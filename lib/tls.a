@@ -951,7 +951,7 @@ public class Stream {
 private bool flush(Stream* s) {
     Tls* t = s->t;
     while (outLength(t) > 0) {
-        int n = net.send(s->fd, outData(t), outLength(t));
+        int n = net.rawSend(s->fd, outData(t), outLength(t));
         if (n <= 0) { return false; }
         outConsumed(t, n);
     }
@@ -960,9 +960,9 @@ private bool flush(Stream* s) {
 
 // reads from the socket into the session; false on EOF / error
 private bool pull(Stream* s) {
-    if (!net.waitReadable(s->fd, s->timeoutMs)) { lastErr = "timed out"; return false; }
+    if (!net.rawWaitReadable(s->fd, s->timeoutMs)) { lastErr = "timed out"; return false; }
     char buf[4096];
-    int n = net.recv(s->fd, &buf[0], 4096);
+    int n = net.rawRecv(s->fd, &buf[0], 4096);
     if (n <= 0) { return false; }
     feed(s->t, &buf[0], n);
     return true;
@@ -993,7 +993,7 @@ public Stream* connect(char* host, int port, bool verify) {
     s->timeoutMs = 10000;
     s->t = client(host, verify);
     if (!handshake(s)) {
-        net.close(fd);
+        net.rawClose(fd);
         return null;
     }
     return s;
@@ -1029,5 +1029,65 @@ public int recv(Stream* s, char* buf, int max) {
 public void close(Stream* s) {
     shutdown(s->t);
     flush(s);
-    net.close(s->fd);
+    net.rawClose(s->fd);
+}
+
+// ---- making an ordinary socket secure -------------------------------------------------------------------------------------------------
+// After wrap / wrapServer the socket handle works with net.send / net.recv / net.recvLine / net.close (and so with the http module)
+// and the data goes through TLS. net.close sends the close_notify alert first.
+private bool hooked = false;
+
+private int hookSend(int stream, char* buf, int n) {
+    return sendAll((Stream*) stream, buf, n) ? n : -1;
+}
+
+private int hookRecv(int stream, char* buf, int max) {
+    return recv((Stream*) stream, buf, max);
+}
+
+private int hookClose(int stream) {
+    Stream* s = (Stream*) stream;
+    shutdown(s->t);
+    flush(s);
+    return 0;
+}
+
+private int hookReadable(int stream) {
+    Stream* s = (Stream*) stream;
+    return (available(s->t) > 0 || closed(s->t)) ? 1 : 0;
+}
+
+private void installHooks() {
+    if (hooked) { return; }
+    hooked = true;
+    net.secureHooks(hookSend, hookRecv, hookClose, hookReadable);
+}
+
+// client handshake on a connected socket; false (lastError() says why) if it failed. The socket stays open either way.
+public bool wrap(int fd, char* host, bool verify) {
+    lastErr = null;
+    Stream* s = new Stream();
+    s->fd = fd;
+    s->timeoutMs = 10000;
+    s->t = client(host, verify);
+    if (!handshake(s)) { return false; }
+    installHooks();
+    net.secureAttach(fd, (int) s);
+    return true;
+}
+
+// server handshake on an accepted socket
+public bool wrapServer(int fd, Config* cfg) {
+    Stream* s = acceptStream(fd, cfg);
+    if (s == null) { return false; }
+    installHooks();
+    net.secureAttach(fd, (int) s);
+    return true;
+}
+
+// the TLS session behind a socket made by wrap / wrapServer (null for an ordinary socket); for the cipher, the certificate
+public Tls* sessionOf(int fd) {
+    int st = net.secureStream(fd);
+    if (st == 0) { return null; }
+    return ((Stream*) st)->t;
 }

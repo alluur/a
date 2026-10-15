@@ -18,6 +18,8 @@
 //    int  net.recv(h, buf, max)            bytes received, 0 = connection closed
 //    int  net.recvLine(h, buf, max)        one line without the newline, -1 = closed
 //    void net.close(h)
+//    (a socket that tls.wrap() / tls.wrapServer() made secure sends and receives through TLS with the same calls;
+//     rawSend / rawRecv / rawClose / rawWaitReadable bypass that)
 //    char* net.httpGet(host, port, path)   very small HTTP/1.0 client, returns the body
 //    int  net.parseIp(text)                "1.2.3.4" -> 0x01020304, -1 if invalid
 //    int  net.resolve(host)                host name or address -> IPv4 address, -1 if unknown
@@ -167,7 +169,65 @@ private int newSocket() {
     return newSock(SOCK_STREAM, 6);
 }
 
+// ---- secure handles: tls.wrap() registers a socket here, then send / recv / close / waitReadable go through TLS --------------------
+private func secSend;
+private func secRecv;
+private func secClose;
+private func secReadable;
+private int secHandles[32];
+private int secStreams[32];
+
+// installed by the tls module (the hooks get the stream and the usual arguments)
+public void secureHooks(func sendFn, func recvFn, func closeFn, func readableFn) {
+    secSend = sendFn;
+    secRecv = recvFn;
+    secClose = closeFn;
+    secReadable = readableFn;
+}
+
+// h now talks TLS through the stream (an opaque number the hooks understand)
+public void secureAttach(int h, int stream) {
+    for (int i = 0; i < 32; i++) {
+        if (secStreams[i] == 0) {
+            secHandles[i] = h;
+            secStreams[i] = stream;
+            return;
+        }
+    }
+}
+
+// the stream number tls.wrap gave to a handle, 0 for an ordinary socket
+public int secureStream(int h) {
+    return secureOf(h);
+}
+
+private int secureOf(int h) {
+    for (int i = 0; i < 32; i++) {
+        if (secStreams[i] != 0 && secHandles[i] == h) { return secStreams[i]; }
+    }
+    return 0;
+}
+
+private int secureDetach(int h) {
+    for (int i = 0; i < 32; i++) {
+        if (secStreams[i] != 0 && secHandles[i] == h) {
+            int st = secStreams[i];
+            secStreams[i] = 0;
+            return st;
+        }
+    }
+    return 0;
+}
+
 public void close(int h) {
+    int st = secureDetach(h);
+    if (st != 0) {
+        secClose(st);
+    }
+    rawClose(h);
+}
+
+public void rawClose(int h) {
     if (windows()) {
         __winapi(WS_CLOSE, h, 0, 0, 0);
     } else {
@@ -256,6 +316,13 @@ public int accept(int server) {
 
 // sends exactly n bytes; returns n, or a negative number on error
 public int send(int h, char* buf, int n) {
+    int st = secureOf(h);
+    if (st != 0) { return secSend(st, buf, n); }
+    return rawSend(h, buf, n);
+}
+
+// the same without TLS (what the tls module itself uses)
+public int rawSend(int h, char* buf, int n) {
     int done = 0;
     while (done < n) {
         int r;
@@ -279,6 +346,12 @@ public bool sendText(int h, char* text) {
 
 // receives up to max bytes: >0 bytes, 0 when the other side closed, <0 on error
 public int recv(int h, char* buf, int max) {
+    int st = secureOf(h);
+    if (st != 0) { return secRecv(st, buf, max); }
+    return rawRecv(h, buf, max);
+}
+
+public int rawRecv(int h, char* buf, int max) {
     if (windows()) {
         return i32(__winapi(WS_RECV, h, buf, max, 0));
     }
@@ -787,6 +860,12 @@ public int poll(int* handles, int* events, int* revents, int n, int ms) {
 
 // true if the socket has data (or a pending connection / a closed peer) within ms milliseconds
 public bool waitReadable(int h, int ms) {
+    int st = secureOf(h);
+    if (st != 0 && secReadable(st) != 0) { return true; }
+    return rawWaitReadable(h, ms);
+}
+
+public bool rawWaitReadable(int h, int ms) {
     int hh[1]; int ev[1]; int re[1];
     hh[0] = h; ev[0] = READABLE;
     return poll(&hh[0], &ev[0], &re[0], 1, ms) > 0;

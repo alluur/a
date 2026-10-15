@@ -33,6 +33,7 @@ test: build/ac
 	tests/run.sh
 	tests/link.sh
 	tests/gui.sh
+	tests/https.sh
 
 test-all: build/ac
 	@for t in linux windows linux-arm64 android android-x64 linux-riscv64 android-riscv64 linux-loongarch64; do \
