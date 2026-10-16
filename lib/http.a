@@ -27,14 +27,22 @@
 import net;
 import encoding;
 import tls;
+import zlib;
 module http;
 
 private char lastError[128];
 private bool verifyCerts = true;
+private bool compression = false;
 
 // https: check the server certificate (default true). Turn it off only for servers you know and cannot verify.
 public void setVerify(bool on) {
     verifyCerts = on;
+}
+
+// ask servers for compressed bodies (Accept-Encoding: gzip, deflate); compressed responses are always unpacked, so
+// Response.body is the plain data either way (default off)
+public void setCompression(bool on) {
+    compression = on;
 }
 
 public char* error() {
@@ -265,6 +273,9 @@ public bool sendRequest(int h, char* method, char* host, char* path, char* extra
     net.sendText(h, " HTTP/1.1\r\nHost: ");
     net.sendText(h, host);
     net.sendText(h, "\r\nConnection: close\r\nUser-Agent: A-http/1.0\r\n");
+    if (compression) {
+        net.sendText(h, "Accept-Encoding: gzip, deflate\r\n");
+    }
     if (extra != null) {
         net.sendText(h, extra);
     }
@@ -349,6 +360,22 @@ public Response* readResponse(int h) {
     }
     r->body = body->data;
     r->bodyLen = body->len;
+    if (headerOf(raw, "Content-Encoding", &val[0], 256) && r->bodyLen > 0) {
+        int plainLen;
+        char* plain = null;
+        if (contains(&val[0], "gzip")) {
+            plain = zlib.gunzip(r->body, r->bodyLen, &plainLen);
+        } else if (contains(&val[0], "deflate")) {
+            plain = zlib.decompress(r->body, r->bodyLen, &plainLen);
+            if (plain == null) {
+                plain = zlib.inflate(r->body, r->bodyLen, &plainLen);      // some servers send the raw stream
+            }
+        }
+        if (plain != null) {
+            r->body = plain;
+            r->bodyLen = plainLen;
+        }
+    }
     return r;
 }
 
@@ -557,6 +584,20 @@ public bool respondBytes(int h, int status, char* contentType, char* body, int n
         return net.send(h, body, n) == n;
     }
     return true;
+}
+
+// like respondBytes, but the body is sent gzip-compressed (Content-Encoding: gzip); use it when the request had
+// "Accept-Encoding: gzip" (see headerOf on Request.headers)
+public bool respondGzip(int h, int status, char* contentType, char* body, int n) {
+    int zn;
+    char* z = zlib.gzip(body, n, &zn);
+    char head[512];
+    format(&head[0], 512, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\nConnection: close\r\nServer: A-http/1.0\r\n\r\n",
+        status, statusText(status), contentType, zn);
+    net.sendText(h, &head[0]);
+    bool ok = net.send(h, z, zn) == zn;
+    free(z);
+    return ok;
 }
 
 public bool respond(int h, int status, char* contentType, char* body) {
