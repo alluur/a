@@ -1,0 +1,558 @@
+// =============================================================================
+//  zlib - DEFLATE compression (RFC 1951), zlib (RFC 1950) and gzip (RFC 1952) containers                       import zlib;
+//
+//    int n;
+//    char* packed = zlib.gzip(data, len, &n);          // a .gz file's bytes (a new buffer; free() it); null if out of memory
+//    char* plain  = zlib.gunzip(packed, n, &len);      // null when the data is damaged (header, checksum or length wrong)
+//
+//    zlib.compress(data, len, &n) / zlib.decompress(...)   // the zlib container (2-byte header + Adler-32), used by PNG, HTTP "deflate"
+//    zlib.deflate(data, len, &n)  / zlib.inflate(...)      // the raw stream without any container
+//
+//  The compressor looks for repeated strings in the last 32 KB with hash chains and writes them with the fixed Huffman code
+//  (or as stored blocks when that is smaller), so text shrinks to about a third and random data grows by a few bytes at most.
+//  The decompressor handles every kind of block (stored, fixed, dynamic) and every stream other programs produce.
+//  Every result has a hidden terminating zero byte after its length, so text can be used as a string directly.
+// =============================================================================
+import cstdlib;
+import cstring;
+import hash;
+module zlib;
+
+// ---- inflate -------------------------------------------------------------------------------------------------------------------------
+class Huff {
+    public int count[16];
+    public int symbol[320];
+
+    public Huff() { }
+
+    // lengths[0..n-1] are the code lengths of the symbols
+    public void build(int* lengths, int n) {
+        for (int i = 0; i < 16; i++) { count[i] = 0; }
+        for (int i = 0; i < n; i++) { count[lengths[i]]++; }
+        count[0] = 0;
+        int offs[16];
+        offs[1] = 0;
+        for (int i = 1; i < 15; i++) { offs[i + 1] = offs[i] + count[i]; }
+        for (int i = 0; i < n; i++) {
+            if (lengths[i] != 0) {
+                symbol[offs[lengths[i]]] = i;
+                offs[lengths[i]]++;
+            }
+        }
+    }
+}
+
+class Inflater {
+    public char* in;
+    public int inLen;
+    public int pos;
+    public int bitBuf;
+    public int bitCnt;
+    public char* out;
+    public int outLen;
+    public int outCap;
+    public bool bad;
+
+    public Inflater(char* data, int len) {
+        in = data;
+        inLen = len;
+        outCap = 65536;
+        out = malloc(outCap + 1);
+    }
+
+    private int bits(int need) {
+        while (bitCnt < need) {
+            if (pos >= inLen) {
+                bad = true;
+                return 0;
+            }
+            bitBuf = bitBuf | ((in[pos] & 255) << bitCnt);
+            pos++;
+            bitCnt = bitCnt + 8;
+        }
+        int v = bitBuf & ((1 << need) - 1);
+        bitBuf = bitBuf >> need;
+        bitCnt = bitCnt - need;
+        return v;
+    }
+
+    private void room(int more) {
+        if (outLen + more > outCap) {
+            while (outLen + more > outCap) {
+                outCap = outCap * 2;
+            }
+            out = realloc(out, outCap + 1);
+        }
+    }
+
+    private int decode(Huff* h) {
+        int code = 0;
+        int first = 0;
+        int index = 0;
+        for (int len = 1; len <= 15; len++) {
+            code = code | bits(1);
+            if (bad) {
+                return -1;
+            }
+            int c = h->count[len];
+            if (code - c < first) {
+                return h->symbol[index + (code - first)];
+            }
+            index = index + c;
+            first = (first + c) << 1;
+            code = code << 1;
+        }
+        bad = true;
+        return -1;
+    }
+
+    private void codes(Huff* lit, Huff* dist) {
+        int lbase[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+        int lext[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+        int dbase[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+        int dext[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+        for (;;) {
+            int sym = decode(lit);
+            if (bad || sym < 0) {
+                bad = true;
+                return;
+            }
+            if (sym < 256) {
+                room(1);
+                out[outLen] = sym;
+                outLen++;
+            } else if (sym == 256) {
+                return;
+            } else {
+                sym = sym - 257;
+                if (sym >= 29) {
+                    bad = true;
+                    return;
+                }
+                int len = lbase[sym] + bits(lext[sym]);
+                int ds = decode(dist);
+                if (bad || ds < 0 || ds >= 30) {
+                    bad = true;
+                    return;
+                }
+                int d = dbase[ds] + bits(dext[ds]);
+                if (d > outLen) {
+                    bad = true;
+                    return;
+                }
+                room(len);
+                for (int i = 0; i < len; i++) {
+                    out[outLen] = out[outLen - d];
+                    outLen++;
+                }
+            }
+        }
+    }
+
+    // inflates a raw deflate stream; false if it is damaged
+    public bool run() {
+        Huff* fixedLit = null;
+        Huff* fixedDist = null;
+        int last = 0;
+        while (last == 0 && !bad) {
+            last = bits(1);
+            int type = bits(2);
+            if (bad) {
+                return false;
+            }
+            if (type == 0) {
+                bitBuf = 0;
+                bitCnt = 0;
+                if (pos + 4 > inLen) {
+                    return false;
+                }
+                int len = (in[pos] & 255) | ((in[pos + 1] & 255) << 8);
+                int nlen = (in[pos + 2] & 255) | ((in[pos + 3] & 255) << 8);
+                if ((len ^ nlen) != 65535) {
+                    return false;
+                }
+                pos = pos + 4;
+                if (pos + len > inLen) {
+                    return false;
+                }
+                room(len);
+                memcpy(&out[outLen], &in[pos], len);
+                outLen = outLen + len;
+                pos = pos + len;
+            } else if (type == 1) {
+                if (fixedLit == null) {
+                    int l[320];
+                    for (int i = 0; i < 144; i++) { l[i] = 8; }
+                    for (int i = 144; i < 256; i++) { l[i] = 9; }
+                    for (int i = 256; i < 280; i++) { l[i] = 7; }
+                    for (int i = 280; i < 288; i++) { l[i] = 8; }
+                    fixedLit = new Huff();
+                    fixedLit->build(&l[0], 288);
+                    for (int i = 0; i < 30; i++) { l[i] = 5; }
+                    fixedDist = new Huff();
+                    fixedDist->build(&l[0], 30);
+                }
+                codes(fixedLit, fixedDist);
+            } else if (type == 2) {
+                int nlen = bits(5) + 257;
+                int ndist = bits(5) + 1;
+                int ncode = bits(4) + 4;
+                if (nlen > 286 || ndist > 30) {
+                    return false;
+                }
+                int order[19] = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+                int lengths[320];
+                for (int i = 0; i < 19; i++) { lengths[i] = 0; }
+                for (int i = 0; i < ncode; i++) { lengths[order[i]] = bits(3); }
+                Huff* lencode = new Huff();
+                lencode->build(&lengths[0], 19);
+                int idx = 0;
+                int all[320];
+                while (idx < nlen + ndist && !bad) {
+                    int sym = decode(lencode);
+                    if (sym < 0) {
+                        return false;
+                    }
+                    if (sym < 16) {
+                        all[idx] = sym;
+                        idx++;
+                    } else {
+                        int prev = 0;
+                        int rep;
+                        if (sym == 16) {
+                            if (idx == 0) { return false; }
+                            prev = all[idx - 1];
+                            rep = 3 + bits(2);
+                        } else if (sym == 17) {
+                            rep = 3 + bits(3);
+                        } else {
+                            rep = 11 + bits(7);
+                        }
+                        if (idx + rep > nlen + ndist) {
+                            return false;
+                        }
+                        for (int i = 0; i < rep; i++) {
+                            all[idx] = prev;
+                            idx++;
+                        }
+                    }
+                }
+                Huff* lit = new Huff();
+                lit->build(&all[0], nlen);
+                Huff* dist = new Huff();
+                dist->build(&all[nlen], ndist);
+                codes(lit, dist);
+            } else {
+                return false;
+            }
+        }
+        return !bad;
+    }
+}
+
+// the data of a raw deflate stream; *used (if not null) receives how many input bytes the stream took. null when it is damaged.
+private char* inflateAt(char* data, int n, int* len, int* used) {
+    Inflater* z = new Inflater(data, n);
+    if (!z->run()) {
+        free(z->out);
+        return null;
+    }
+    z->out[z->outLen] = 0;
+    *len = z->outLen;
+    if (used != null) {
+        *used = z->pos;
+    }
+    return z->out;
+}
+
+public char* inflate(char* data, int n, int* len) {
+    return inflateAt(data, n, len, null);
+}
+
+// ---- deflate -------------------------------------------------------------------------------------------------------------------------
+class BitOut {
+    public char* buf;
+    public int len;
+    public int cap;
+    public int acc;
+    public int cnt;
+
+    public BitOut(int capacity) {
+        cap = capacity;
+        buf = malloc(cap + 1);
+    }
+
+    private void grow(int more) {
+        if (len + more > cap) {
+            while (len + more > cap) {
+                cap = cap * 2;
+            }
+            buf = realloc(buf, cap + 1);
+        }
+    }
+
+    // writes the low n bits of v, least significant first
+    public void put(int v, int n) {
+        acc = acc | ((v & ((1 << n) - 1)) << cnt);
+        cnt = cnt + n;
+        if (cnt >= 16) {
+            grow(8);
+        }
+        while (cnt >= 8) {
+            buf[len] = acc & 255;
+            len++;
+            acc = acc >> 8;
+            cnt = cnt - 8;
+        }
+    }
+
+    // a Huffman code of n bits goes out most significant bit first
+    public void code(int c, int n) {
+        int r = 0;
+        for (int i = 0; i < n; i++) {
+            r = (r << 1) | ((c >> i) & 1);
+        }
+        put(r, n);
+    }
+
+    public void align() {
+        if (cnt > 0) {
+            put(0, 8 - cnt);
+        }
+    }
+
+    public void bytes(char* p, int n) {
+        grow(n + 8);
+        memcpy(&buf[len], p, n);
+        len = len + n;
+    }
+}
+
+private void literal(BitOut* o, int sym) {
+    if (sym < 144) {
+        o->code(0x30 + sym, 8);
+    } else if (sym < 256) {
+        o->code(0x190 + sym - 144, 9);
+    } else if (sym < 280) {
+        o->code(sym - 256, 7);
+    } else {
+        o->code(0xC0 + sym - 280, 8);
+    }
+}
+
+private void match(BitOut* o, int len, int dist) {
+    int lbase[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+    int lext[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+    int dbase[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+    int dext[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+    int ls = 28;
+    while (lbase[ls] > len) { ls--; }
+    literal(o, 257 + ls);
+    o->put(len - lbase[ls], lext[ls]);
+    int ds = 29;
+    while (dbase[ds] > dist) { ds--; }
+    o->code(ds, 5);
+    o->put(dist - dbase[ds], dext[ds]);
+}
+
+private int hash3(char* p, int i) {
+    return (((p[i] & 255) << 10) ^ ((p[i + 1] & 255) << 5) ^ (p[i + 2] & 255)) & 32767;
+}
+
+// compresses with the given effort (1 = fast ... 9 = best: how many earlier positions are tried per byte)
+public char* deflateLevel(char* data, int n, int level, int* outLen) {
+    if (level < 1) { level = 1; }
+    if (level > 9) { level = 9; }
+    int chain = 4 << (level - 1);
+    BitOut* o = new BitOut(n / 2 + 64);
+    o->put(1, 1);                 // the one and only block
+    o->put(1, 2);                 // fixed Huffman codes
+    int* head = malloc(32768 * 8);
+    int* prev = malloc(32768 * 8);
+    for (int i = 0; i < 32768; i++) { head[i] = -1; }
+    int i = 0;
+    while (i < n) {
+        int bestLen = 0;
+        int bestDist = 0;
+        if (i + 3 <= n) {
+            int h = hash3(data, i);
+            int cand = head[h];
+            int tries = chain;
+            int maxLen = n - i;
+            if (maxLen > 258) { maxLen = 258; }
+            while (cand >= 0 && i - cand <= 32768 && tries > 0) {
+                int l = 0;
+                while (l < maxLen && data[cand + l] == data[i + l]) { l++; }
+                if (l > bestLen) {
+                    bestLen = l;
+                    bestDist = i - cand;
+                    if (l == maxLen) { break; }
+                }
+                cand = prev[cand & 32767];
+                tries--;
+            }
+        }
+        int step = 1;
+        if (bestLen >= 3) {
+            match(o, bestLen, bestDist);
+            step = bestLen;
+        } else {
+            literal(o, data[i] & 255);
+        }
+        for (int k = 0; k < step; k++) {
+            if (i + 3 <= n) {
+                int h2 = hash3(data, i);
+                prev[i & 32767] = head[h2];
+                head[h2] = i;
+            }
+            i++;
+        }
+    }
+    literal(o, 256);
+    o->align();
+    free(head);
+    free(prev);
+    // random data can come out larger than it went in: then use stored blocks
+    int stored = n + 5 * (n / 65535 + 1);
+    if (o->len > stored) {
+        free(o->buf);
+        BitOut* s = new BitOut(stored + 16);
+        int pos = 0;
+        for (;;) {
+            int chunk = n - pos;
+            if (chunk > 65535) { chunk = 65535; }
+            int fin = (pos + chunk >= n) ? 1 : 0;
+            s->put(fin, 1);
+            s->put(0, 2);
+            s->align();
+            s->put(chunk, 16);
+            s->put(chunk ^ 65535, 16);
+            s->bytes(&data[pos], chunk);
+            pos = pos + chunk;
+            if (fin == 1) { break; }
+        }
+        s->buf[s->len] = 0;
+        *outLen = s->len;
+        return s->buf;
+    }
+    o->buf[o->len] = 0;
+    *outLen = o->len;
+    return o->buf;
+}
+
+public char* deflate(char* data, int n, int* outLen) {
+    return deflateLevel(data, n, 6, outLen);
+}
+
+// ---- zlib container --------------------------------------------------------------------------------------------------------------------
+public char* compress(char* data, int n, int* outLen) {
+    int dn;
+    char* d = deflate(data, n, &dn);
+    char* r = malloc(dn + 7);
+    r[0] = 0x78;
+    r[1] = 0x9C;
+    memcpy(&r[2], d, dn);
+    free(d);
+    int a = hash.adler32(data, n);
+    r[2 + dn] = (a >> 24) & 255;
+    r[3 + dn] = (a >> 16) & 255;
+    r[4 + dn] = (a >> 8) & 255;
+    r[5 + dn] = a & 255;
+    r[6 + dn] = 0;
+    *outLen = dn + 6;
+    return r;
+}
+
+// null when the header, the stream or the Adler-32 checksum is wrong
+public char* decompress(char* data, int n, int* outLen) {
+    if (n < 6 || (data[0] & 15) != 8 || (((data[0] & 255) << 8) | (data[1] & 255)) % 31 != 0 || (data[1] & 32) != 0) {
+        return null;
+    }
+    int used;
+    int len;
+    char* r = inflateAt(&data[2], n - 2, &len, &used);
+    if (r == null) {
+        return null;
+    }
+    if (2 + used + 4 > n) {
+        free(r);
+        return null;
+    }
+    char* t = &data[2 + used];
+    int want = ((t[0] & 255) << 24) | ((t[1] & 255) << 16) | ((t[2] & 255) << 8) | (t[3] & 255);
+    if (hash.adler32(r, len) != want) {
+        free(r);
+        return null;
+    }
+    *outLen = len;
+    return r;
+}
+
+// ---- gzip container --------------------------------------------------------------------------------------------------------------------
+private void le32(char* p, int v) {
+    p[0] = v & 255;
+    p[1] = (v >> 8) & 255;
+    p[2] = (v >> 16) & 255;
+    p[3] = (v >> 24) & 255;
+}
+
+private int rd32(char* p) {
+    return (p[0] & 255) | ((p[1] & 255) << 8) | ((p[2] & 255) << 16) | ((p[3] & 255) << 24);
+}
+
+public char* gzip(char* data, int n, int* outLen) {
+    int dn;
+    char* d = deflate(data, n, &dn);
+    char* r = malloc(dn + 19);
+    r[0] = 0x1F;
+    r[1] = 0x8B;
+    r[2] = 8;
+    for (int i = 3; i < 9; i++) { r[i] = 0; }
+    r[9] = 3;                      // made on Unix
+    memcpy(&r[10], d, dn);
+    free(d);
+    le32(&r[10 + dn], hash.crc32(data, n));
+    le32(&r[14 + dn], n);
+    r[18 + dn] = 0;
+    *outLen = dn + 18;
+    return r;
+}
+
+// null when the header, the stream, the CRC-32 or the stored length is wrong
+public char* gunzip(char* data, int n, int* outLen) {
+    if (n < 18 || (data[0] & 255) != 0x1F || (data[1] & 255) != 0x8B || data[2] != 8) {
+        return null;
+    }
+    int flags = data[3] & 255;
+    int p = 10;
+    if ((flags & 4) != 0) {
+        if (p + 2 > n) { return null; }
+        p = p + 2 + ((data[p] & 255) | ((data[p + 1] & 255) << 8));
+    }
+    if ((flags & 8) != 0) {
+        while (p < n && data[p] != 0) { p++; }
+        p++;
+    }
+    if ((flags & 16) != 0) {
+        while (p < n && data[p] != 0) { p++; }
+        p++;
+    }
+    if ((flags & 2) != 0) {
+        p = p + 2;
+    }
+    if (p + 8 > n) {
+        return null;
+    }
+    int used;
+    int len;
+    char* r = inflateAt(&data[p], n - p, &len, &used);
+    if (r == null) {
+        return null;
+    }
+    if (p + used + 8 > n || hash.crc32(r, len) != rd32(&data[p + used]) || (len & 0xFFFFFFFF) != rd32(&data[p + used + 4])) {
+        free(r);
+        return null;
+    }
+    *outLen = len;
+    return r;
+}

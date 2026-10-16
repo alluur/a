@@ -920,7 +920,10 @@ code only to programs that import them, and a file of the same name next to your
 | `os` | `getCwd rename fileSize listDir(path, out, max)` (plus `fileExists fileDelete makeDir` in the standard library) |
 | `datetime` | `now() nowMillis() toUnix() dayOfWeek() isLeapYear() daysInMonth() weekdayName() monthName()` and class `DateTime` (UTC) |
 | `encoding` | `base64Encode/Decode`, `hexEncode/Decode`, `urlEncode/Decode` |
-| `hash` | `crc32 adler32 fnv1a djb2 sha256` |
+| `hash` | `crc32 crc32Update adler32 fnv1a djb2 md5 sha1 sha256 sha384 sha512` (`...Raw` give the bytes), `hmac`, `digest` |
+| `zlib` | `gzip gunzip compress decompress deflate inflate` (DEFLATE with hash chains, zlib and gzip containers, checksums verified) |
+| `tar` | `Writer` (`add addDir finish`) and `Reader` (`next`, `name size isDir data`): POSIX ustar archives in memory |
+| `ini` | `parse(text)`, `load(path)`; `Ini` has `get getInt getBool set remove has toString` |
 | `cli` | class `ArgParser`: `addFlag addOption parse flag option optionInt positional positionalCount printHelp` (short, long, `--x=value`, combined `-abc`) |
 | `log` | leveled logging with timestamps and colours: `debug info warn error` (+ `f` variants), `setLevel setFd setTimestamps` |
 | `testing` | `assertEq assertStrEq check summary` for unit tests |

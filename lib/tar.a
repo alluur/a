@@ -1,0 +1,230 @@
+// =============================================================================
+//  tar - reading and writing tar archives in memory (POSIX ustar)                                              import tar;
+//
+//    tar.Writer* w = new tar.Writer();
+//    w->addDir("docs");
+//    w->add("docs/readme.txt", data, len);                 // file name up to 255 characters (split at a '/' when over 100)
+//    int n;  char* archive = w->finish(&n);                // the whole archive (a new buffer); gzip it with zlib.gzip(...)
+//
+//    tar.Reader* r = new tar.Reader(archive, n);
+//    while (r->next()) {                                   // false at the end or when the archive is damaged
+//        printf("%s %d %s\n", r->name, r->size, r->isDir ? "dir" : "file");
+//        // r->data points at the file's bytes inside the archive buffer (not a copy)
+//    }
+//    r->bad                                                 // true when the stop was because of a damaged header
+//
+//  Plain files and directories are read; links and device nodes are skipped. GNU long names are understood when reading.
+// =============================================================================
+import cstdlib;
+import cstring;
+module tar;
+
+private void putOctal(char* p, int width, int v) {
+    // width - 1 digits and a terminating zero
+    for (int i = width - 2; i >= 0; i--) {
+        p[i] = '0' + (v & 7);
+        v = v >> 3;
+    }
+    p[width - 1] = 0;
+}
+
+private int getOctal(char* p, int width) {
+    int v = 0;
+    int i = 0;
+    while (i < width && p[i] == ' ') { i++; }
+    while (i < width && p[i] >= '0' && p[i] <= '7') {
+        v = v * 8 + (p[i] - '0');
+        i++;
+    }
+    return v;
+}
+
+private int checksum(char* h) {
+    int s = 0;
+    for (int i = 0; i < 512; i++) {
+        if (i >= 148 && i < 156) {
+            s = s + 32;
+        } else {
+            s = s + (h[i] & 255);
+        }
+    }
+    return s;
+}
+
+public class Writer {
+    public char* buf;
+    public int len;
+    public int cap;
+
+    public Writer() {
+        cap = 4096;
+        buf = malloc(cap);
+        len = 0;
+    }
+
+    private void room(int more) {
+        if (len + more > cap) {
+            while (len + more > cap) { cap = cap * 2; }
+            buf = realloc(buf, cap);
+        }
+    }
+
+    private bool header(char* name, int size, int type, int mode) {
+        int nl = strlen(name);
+        int split = -1;
+        if (nl > 100) {
+            for (int i = nl - 1; i > 0; i--) {
+                if (name[i] == '/' && i <= 155 && nl - i - 1 <= 100) { split = i; break; }
+            }
+            if (split < 0) { return false; }
+        }
+        room(512);
+        char* h = &buf[len];
+        memset(h, 0, 512);
+        if (split < 0) {
+            memcpy(h, name, nl);
+        } else {
+            memcpy(h, &name[split + 1], nl - split - 1);
+            memcpy(&h[345], name, split);
+        }
+        putOctal(&h[100], 8, mode);
+        putOctal(&h[108], 8, 0);
+        putOctal(&h[116], 8, 0);
+        putOctal(&h[124], 12, size);
+        putOctal(&h[136], 12, 0);
+        h[156] = type;
+        memcpy(&h[257], "ustar", 6);
+        h[263] = '0';
+        h[264] = '0';
+        int c = checksum(h);
+        putOctal(&h[148], 7, c);
+        h[155] = ' ';
+        len = len + 512;
+        return true;
+    }
+
+    // appends a file; false when the name is too long
+    public bool add(char* name, char* data, int n) {
+        if (!header(name, n, '0', 0x1A4)) { return false; }
+        int padded = (n + 511) / 512 * 512;
+        room(padded);
+        memcpy(&buf[len], data, n);
+        memset(&buf[len + n], 0, padded - n);
+        len = len + padded;
+        return true;
+    }
+
+    public bool addDir(char* name) {
+        int nl = strlen(name);
+        char* d = malloc(nl + 2);
+        memcpy(d, name, nl);
+        if (nl > 0 && d[nl - 1] != '/') {
+            d[nl] = '/';
+            nl++;
+        }
+        d[nl] = 0;
+        bool ok = header(d, 0, '5', 0x1ED);
+        free(d);
+        return ok;
+    }
+
+    // adds the two empty blocks that end an archive and returns the bytes; the length goes to *n
+    public char* finish(int* n) {
+        room(1024 + 1);
+        memset(&buf[len], 0, 1024);
+        len = len + 1024;
+        buf[len] = 0;
+        *n = len;
+        return buf;
+    }
+}
+
+public class Reader {
+    public char* src;
+    public int srcLen;
+    public int pos;
+    public char* name;       // the current entry (valid until the next call of next())
+    public int size;
+    public bool isDir;
+    public char* data;       // the entry's bytes inside the archive
+    public int mode;
+    public bool bad;
+    private char* longName;
+
+    public Reader(char* archive, int n) {
+        src = archive;
+        srcLen = n;
+        pos = 0;
+        name = null;
+        longName = null;
+        bad = false;
+    }
+
+    // moves to the next file or directory; false at the end of the archive (or when it is damaged: then bad is set)
+    public bool next() {
+        for (;;) {
+            if (pos + 512 > srcLen) {
+                return false;
+            }
+            char* h = &src[pos];
+            bool empty = true;
+            for (int i = 0; i < 512; i++) {
+                if (h[i] != 0) { empty = false; break; }
+            }
+            if (empty) {
+                return false;
+            }
+            if (getOctal(&h[148], 8) != checksum(h)) {
+                bad = true;
+                return false;
+            }
+            int sz = getOctal(&h[124], 12);
+            int type = h[156];
+            if (pos + 512 + sz > srcLen) {
+                bad = true;
+                return false;
+            }
+            char* body = &src[pos + 512];
+            pos = pos + 512 + (sz + 511) / 512 * 512;
+            if (type == 'L') {
+                // GNU long name: the data is the name of the next entry
+                longName = malloc(sz + 1);
+                memcpy(longName, body, sz);
+                longName[sz] = 0;
+                continue;
+            }
+            if (type != 0 && type != '0' && type != '5') {
+                longName = null;
+                continue;
+            }
+            if (longName != null) {
+                name = longName;
+                longName = null;
+            } else {
+                char* nm = malloc(512);
+                int pl = 0;
+                while (pl < 155 && h[345 + pl] != 0) { pl++; }
+                int o = 0;
+                if (pl > 0 && h[257] == 'u') {
+                    memcpy(nm, &h[345], pl);
+                    nm[pl] = '/';
+                    o = pl + 1;
+                }
+                int nl = 0;
+                while (nl < 100 && h[nl] != 0) { nl++; }
+                memcpy(&nm[o], h, nl);
+                nm[o + nl] = 0;
+                name = nm;
+            }
+            size = sz;
+            data = body;
+            mode = getOctal(&h[100], 8);
+            isDir = (type == '5');
+            if (isDir) {
+                int l = strlen(name);
+                if (l > 0 && name[l - 1] == '/') { name[l - 1] = 0; }
+            }
+            return true;
+        }
+    }
+}
