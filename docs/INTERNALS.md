@@ -421,11 +421,11 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   the speed differs. The NASM sources are in `docs/memfast.asm`, `docs/sha256.asm` and `docs/sha512.asm`; to change one, assemble it
   (`nasm -f elf64`), extract `.text` with `objcopy -O binary -j .text` and paste the bytes into the `asm` block.
 * `memcpy`, `memset` and `__fill64` use `rep movsb` / `rep stosq` for blocks of 32 bytes or more and plain moves below that;
-  `strlen` is SSE2 (aligned 16-byte loads, so it never reads across a page boundary). `gfx.Surface.clear`, `fill` (opaque colours) and
+  `strlen` scans eight bytes at a time with aligned loads (so it never reads across a page boundary) and deliberately avoids SSE: AOS does not enable the vector unit or save its registers on a context switch. `gfx.Surface.clear`, `fill` (opaque colours) and
   `blit` call them row by row.
 * `hash.crc32` is table driven, eight bytes per step (slicing-by-8, an 8 KB table built on first use); `sha256Block` and `sha512Block`
   are assembly (the message schedule and all rounds, using the callee-saved registers they save and restore).
-* Measured on one machine, before and after: memcpy 100 x 1 MB 258 -> 8 ms, memset 262 -> 1 ms, strlen 262 -> 5 ms, crc32 20 x 1 MB
+* Measured on one machine, before and after: memcpy 100 x 1 MB 258 -> 8 ms, memset 262 -> 1 ms, strlen 262 -> 18 ms, crc32 20 x 1 MB
   1148 -> 58 ms, sha256 10 x 100 KB 49 -> 4 ms, sha512 38 -> 3 ms, gfx fill 20 x 1024x768 about 60 -> 7 ms, blit 73 -> 13 ms.
 * `zlib`: the compressor is a greedy LZ77 with 3-byte hash chains over a 32 KB window (`deflateLevel` sets how many candidates are
   tried, 4 to 1024) and writes the fixed Huffman code; it falls back to stored blocks if that would be larger. The decompressor is the

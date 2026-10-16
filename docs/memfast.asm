@@ -39,30 +39,36 @@ memset_start:
     rep stosb
 .done:
 memset_end:
-; ---- strlen: A = s
+; ---- strlen: A = s. Eight bytes at a time (aligned loads never cross a page; no SSE, so it also runs where the kernel has not
+; enabled the vector unit, e.g. AOS processes). A byte is zero where (x - 0x01..01) & ~x & 0x80..80 has its high bit set.
 strlen_start:
     mov rsi, rax
     mov rdi, rax
-    and rdi, -16
-    pxor xmm0, xmm0
-    movdqa xmm1, [rdi]
-    pcmpeqb xmm1, xmm0
-    pmovmskb eax, xmm1
+    and rdi, -8
+    mov r10, 0x0101010101010101
+    mov r11, 0x8080808080808080
+    mov r8, [rdi]
     mov ecx, esi
-    and ecx, 15
-    shr eax, cl
-    test eax, eax
-    jz .loop
-    bsf eax, eax
-    jmp .done
+    and ecx, 7
+    shl ecx, 3
+    mov r9, 1
+    shl r9, cl
+    dec r9                  ; the bytes before s become 0xFF so they cannot look like the end
+    or r8, r9
 .loop:
-    add rdi, 16
-    movdqa xmm1, [rdi]
-    pcmpeqb xmm1, xmm0
-    pmovmskb eax, xmm1
-    test eax, eax
-    jz .loop
-    bsf eax, eax
+    mov rax, r8
+    sub rax, r10
+    mov r9, r8
+    not r9
+    and rax, r9
+    and rax, r11
+    jnz .found
+    add rdi, 8
+    mov r8, [rdi]
+    jmp .loop
+.found:
+    bsf rax, rax
+    shr rax, 3
     add rax, rdi
     sub rax, rsi
 .done:
