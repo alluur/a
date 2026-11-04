@@ -533,7 +533,11 @@ int main() {
 * The C library's `stdio` keeps its own buffers: A's `print` and C's `printf` are written in the order of the flushes. On Linux
   `exit` (and returning from `main`) also runs the C library's `exit`, which flushes them; on Windows call
   `fflush(null)` before exiting.
-* Limits: Android executables cannot import libraries yet (the coming shared-library output for APKs can); `-c` objects
+* **Shared libraries:** `ac -shared lib.a -o libname.so` writes a position independent ELF shared library (Linux and
+  Android, every CPU) instead of a program: it has no `main`, its `extern "C"` functions with a body are exported (C, Python
+  `ctypes`, Java's `System.loadLibrary` or another A program through `dlopen` can call them) and it may import C libraries
+  itself. Android apps are such libraries (`libmain.so` exporting `ANativeActivity_onCreate`).
+* Limits: Android executables cannot import libraries (an Android app is a shared library, which can); `-c` objects
   cannot contain `extern "library"` declarations yet; C libraries that need their own threads to call back into A should
   only do so on threads they created with the C library (A's `thread` module does not set up the C library's thread state).
 

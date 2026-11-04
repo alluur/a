@@ -47,6 +47,10 @@ examples: build/ac
 	    for f in examples/*.a examples/gui/*.a; do \
 	        ./build/ac -t $$t $$f -v $(VERSION_CODE) -r $(RELEASE) -o build/examples/$$(basename $$f .a)-$$t.out || exit 1; \
 	    done; echo "examples compiled for $$t"; done
+	@for t in android android-x64 android-riscv64; do \
+	    for f in examples/android/*.a; do \
+	        ./build/ac -t $$t -shared $$f -o build/examples/lib$$(basename $$f .a)-$$t.so || exit 1; \
+	    done; echo "Android app libraries compiled for $$t"; done
 
 dist: build/ac
 	@mkdir -p dist

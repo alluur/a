@@ -189,7 +189,8 @@ Version 0.1.0 is deliberately small. Known limitations — all of them are on th
   still take doubles as bit patterns held in ints.
 * **C libraries:** `extern "libc.so.6" { int printf(char* fmt, ...); }` calls C functions with the target's C ABI (Linux:
   dynamic linking on x86-64, ARM64, RISC-V and LoongArch; Windows: DLL imports); `extern "C"` declares C function pointers
-  (for `dlsym`) and A functions that C can call back. Android executables cannot import libraries yet.
+  (for `dlsym`) and A functions that C can call back. `ac -shared` writes shared libraries (`.so`) that export the
+  `extern "C"` functions, for Linux and for Android apps (`libmain.so`).
 * **Integers:** `int` is 64-bit; `int8_t` … `uint32_t` (and `short`, `unsigned`) are stored with their size and read as an `int`
   (C's promotion with a 64-bit `int`); `uint64_t` has unsigned division, shifts and comparisons. Structs use the C layout.
 * Function pointers are the type `func` (no signature checking); no bit-fields; a C-style preprocessor (`#define`, `#include`, `#if`) is built in.
@@ -200,8 +201,8 @@ Version 0.1.0 is deliberately small. Known limitations — all of them are on th
 * **Light type checking:** pointer types convert freely; this is a systems language in the C
   tradition. Syntax errors, undeclared names, wrong argument counts, private access and similar
   mistakes are reported with the source line.
-* **Android:** executables run from `adb shell` or Termux. Packaging as an `.apk` is not
-  implemented yet (it needs a shared-library output and signing).
+* **Android:** executables run from `adb shell` or Termux; apps are `-shared` libraries packaged by `tools/apk.sh`
+  (NativeActivity, see `examples/android/hello.a` and [TARGETS.md](docs/TARGETS.md)). Executables cannot import C libraries.
 * The compiler **runs on Linux x86-64** (on other hosts use QEMU or a container).
 * Windows executables were verified under **Wine**; Android/ARM64 executables under **QEMU user
   mode**. Real-device reports are very welcome.

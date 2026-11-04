@@ -232,7 +232,17 @@ interpreter name), and `dyn_build` appends `.dynstr`, `.dynsym` (the imports, pl
 `PT_GNU_STACK`; the executable stays `ET_EXEC` at its fixed address (its code is PC-relative anyway). On Windows `pe_prepare`
 numbers the used imports by library after the built-in IAT slots (with a null slot after each library), turns `R_IMPORT` into
 `R_IAT`, and `pe_user_idata` writes their descriptors, DLL names and hint/name entries into the import section.
-`tests/ffi.sh` runs C library programs on Linux (QEMU with the cross glibc as sysroot for the other CPUs) and Windows (Wine).
+**Shared libraries (`-shared`, `shared_mode`).** `emit_prologue` emits no entry stub; `shared_roots` makes every `F_CEXPORT`
+function and its C entry a root of the dead function elimination. `build_elf` links at address 0 (`elf_base`), `dyn_prepare`
+always makes the output dynamic, lists the exports (`exp_sym`) and counts the `R_DATA64` / `R_CODE64` relocations, and
+`dyn_build` adds the exports to `.dynsym` (defined in section 1, `.text`, at the address of the C entry), builds a real
+`DT_HASH`, reserves one `RELATIVE` relocation per absolute address in the data (`dyn_relative` fills them in after
+`apply_relocs`, with the final address as the addend) and writes `DT_SONAME` (the output file name). The header becomes
+`ET_DYN` without an entry point, and `elf_section_headers` appends `.shstrtab` and ten section headers (Android's loader
+refuses libraries without them and checks that `.dynamic` matches `PT_DYNAMIC` and links to `.dynstr`). Android outputs use
+16 KiB segment alignment; RISC-V outputs set `EF_RISCV_FLOAT_ABI_DOUBLE` (glibc refuses lp64d libraries without it).
+`tests/ffi.sh` runs C library programs on Linux (QEMU with the cross glibc as sysroot for the other CPUs) and Windows (Wine),
+and an A program that loads an A shared library (`alib.a`) with `dlopen`.
 
 ## Default parameter values and function pointers
 

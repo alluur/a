@@ -106,11 +106,33 @@ Notes
 * Executables must be started from a location that allows execution (`/data/local/tmp`, Termux's
   home). Android blocks execution from shared storage (`/sdcard`) and from app data directories of
   other apps.
-* These are command line programs. **Building an installable `.apk` is not supported yet**; it
-  requires a shared library output with an Android entry point, a binary manifest and
-  signing. That is on the roadmap.
+* These executables are static. An executable cannot import C libraries (`extern "library"`); an
+  app (below) can.
 * The executables were verified under QEMU user mode emulation of AArch64 and natively for x86-64.
   If you run them on a real device and see a difference, please report it.
+
+### Apps (`.apk`)
+
+An installable app is a **NativeActivity**: Android's own activity class loads `lib/<abi>/libmain.so` from the APK and
+calls its `ANativeActivity_onCreate`. With A that library is simply the program compiled with `-shared`; it reaches the
+system through `extern "libandroid.so"`, `"libEGL.so"`, `"libGLESv2.so"`, `"liblog.so"` ... declarations, and the
+callbacks Android calls are `extern "C"` functions. `examples/android/hello.a` is a complete app (an OpenGL ES surface
+whose colour follows your touches).
+
+```sh
+sudo apt install aapt zipalign apksigner android-sdk-platform-23 zip       # Debian / Ubuntu
+export A_KEYSTORE=release.jks A_KEY_ALIAS=release A_KEYSTORE_PASS=... A_KEY_PASS=...
+tools/apk.sh --app examples/android/hello.a --id fi.aytict.ahello --name "AHello" --version 1.0 --version-code 1
+adb install dist/AHello-1-release.apk
+```
+
+`tools/apk.sh` compiles `libmain.so` for `arm64-v8a` and `x86_64` (`--abis`, also `riscv64`), writes the manifest
+(no Java code, `extractNativeLibs`, landscape by default: `--orientation`), packages it with `aapt`, aligns it with
+`zipalign` and signs it with `apksigner` (v1 + v2 signatures). The passwords are read from the environment only. Without
+`A_KEYSTORE` the APK is left unsigned (`{Name}-{code}-unsigned.apk`).
+
+The shared library output was verified with glibc's loader on every CPU (and from Python `ctypes`), and the APK layout
+with `aapt dump`; running on a device is the next verification step.
 
 ## Testing every target
 

@@ -11,6 +11,10 @@ s_dash_h:       db "-h", 0
 s_help:         db "--help", 0
 s_version:      db "--version", 0
 s_soft_float:   db "--soft-float", 0
+s_shared:       db "-shared", 0
+s_err_shared_win: db "-shared makes ELF shared libraries (Linux, Android); Windows DLLs are not supported yet", 0
+s_err_shared_obj: db "-shared compiles a whole library from source (not with -c or object files)", 0
+s_ext_so:       db ".so", 0
 s_linux:        db "linux", 0
 s_windows:      db "windows", 0
 s_win:          db "win", 0
@@ -98,6 +102,7 @@ s_usage:
     db "  -E          print the preprocessed source and stop", 10
     db "  -v CODE     version code used in the default output name (default 1)", 10
     db "  -r TYPE     release type used in the default output name (default debug)", 10
+    db "  -shared     write a shared library (.so) exporting its extern ", 34, "C", 34, " functions (Linux, Android)", 10
     db "  --soft-float  double / float arithmetic by library calls instead of FPU instructions (AOS)", 10
     db "  -h          show this help", 10
     db "  --version   show the compiler version", 10
@@ -1048,6 +1053,11 @@ find_main:
 emit_prologue:
     push rbx
     push r12
+    cmp dword [shared_mode], 0
+    je .exe
+    call shared_roots                   ; a shared library: no main; its extern "C" functions are the roots
+    jmp .nochk
+.exe:
     call find_main
     test rax, rax
     jnz .m1
@@ -1349,7 +1359,19 @@ build_elf:
     mov r13d, 0x10000                       ; LoongArch: 64 KiB covers every page size
     mov ebx, 0x102                          ; EM_LOONGARCH
 .c:
-    call dyn_prepare                        ; C libraries: dynamically linked (PT_INTERP, PT_DYNAMIC)
+    cmp dword [target], TGT_ANDROID
+    jne .c2
+    mov r13d, 0x4000                        ; Android: 16 KiB pages are possible on every CPU
+    cmp dword [arch], ARCH_LA64
+    jne .c2
+    mov r13d, 0x10000
+.c2:
+    call dyn_prepare                        ; C libraries: dynamically linked (PT_INTERP, PT_DYNAMIC); -shared: a library
+    mov qword [elf_base], ELF_BASE
+    cmp dword [shared_mode], 0
+    je .base
+    mov qword [elf_base], 0                 ; a shared library is position independent: its addresses start at 0
+.base:
     mov qword [elf_code_off], ELF_CODE_OFF
     cmp dword [dyn_on], 0
     je .codeoff
@@ -1362,12 +1384,14 @@ build_elf:
     neg rcx
     and rax, rcx
     mov r12, rax                            ; data file offset
-    mov rax, ELF_BASE
+    mov rax, [elf_base]
     add rax, [elf_code_off]
     mov [code_vaddr], rax
-    mov rax, ELF_BASE
+    mov rax, [elf_base]
     add rax, r12
     mov [data_vaddr], rax
+    mov rax, [data_pos]
+    mov [dyn_data_end], rax
     cmp dword [dyn_on], 0
     je .nodyn
     call dyn_build                          ; (appends the dynamic tables to the data)
@@ -1380,6 +1404,10 @@ build_elf:
     mov [bss_vaddr], rax
     mov qword [iat_vaddr], 0
     call apply_relocs
+    cmp dword [shared_mode], 0
+    je .norel
+    call dyn_relative                       ; the absolute addresses in the data move with the library
+.norel:
     ; copy code and data
     mov rsi, code_buf
     mov rdi, outbuf
@@ -1401,6 +1429,15 @@ build_elf:
     mov dword [rdi+20], 1
     mov rax, [code_vaddr]
     mov [rdi+24], rax
+    cmp dword [shared_mode], 0
+    je .exetype
+    mov word [rdi+16], 3                    ; ET_DYN
+    mov qword [rdi+24], 0                   ; no entry point
+.exetype:
+    cmp dword [arch], ARCH_RV64
+    jne .eflags
+    mov dword [rdi+48], 4                   ; EF_RISCV_FLOAT_ABI_DOUBLE (lp64d: the C library checks it)
+.eflags:
     mov qword [rdi+32], 64
     mov word [rdi+52], 64
     mov word [rdi+54], 56
@@ -1409,6 +1446,9 @@ build_elf:
     add rdi, 64                             ; the program headers
     cmp dword [dyn_on], 0
     je .ph_load
+    mov word [outbuf+56], 4
+    cmp dword [shared_mode], 0
+    jne .ph_load                            ; (a library has no interpreter)
     mov word [outbuf+56], 6
     ; PT_PHDR
     mov dword [rdi], 6
@@ -1441,8 +1481,9 @@ build_elf:
     mov dword [rdi], 1
     mov dword [rdi+4], 5
     mov qword [rdi+8], 0
-    mov qword [rdi+16], ELF_BASE
-    mov qword [rdi+24], ELF_BASE
+    mov rax, [elf_base]
+    mov [rdi+16], rax
+    mov [rdi+24], rax
     mov rax, [code_pos]
     add rax, [elf_code_off]
     mov [rdi+32], rax
@@ -1488,6 +1529,11 @@ build_elf:
     mov qword [rdi+48], 16
     lea rax, [r12 + 0]
     add rax, [data_pos]
+    cmp dword [shared_mode], 0
+    je .done_hdr
+    mov rdi, r12
+    call elf_section_headers                ; (Android's loader wants section headers) -> rax = file size
+.done_hdr:
     pop r13
     pop r12
     pop rbx
@@ -1880,6 +1926,14 @@ _start:
     mov dword [soft_float], 1           ; --soft-float: double arithmetic by calls into the soft-float library (no FPU instructions)
     jmp .arg
 .notSoft:
+    mov rdi, rbx
+    mov rsi, s_shared
+    call cstr_eq
+    test eax, eax
+    jz .notShared
+    mov dword [shared_mode], 1          ; -shared: a shared library (.so) whose extern "C" functions are exported
+    jmp .arg
+.notShared:
     cmp word [rbx], 0x442D              ; -D
     je .define
     cmp word [rbx], 0x452D              ; -E
@@ -1993,6 +2047,20 @@ _start:
 .args_done:
     mov qword [data_pos_f], FOREIGN_DATA_BASE
     mov qword [bss_pos_f], FOREIGN_BSS_BASE
+    cmp dword [shared_mode], 0
+    je .notshared
+    mov edi, s_err_shared_win
+    cmp dword [target], TGT_WINDOWS
+    je .sharedbad
+    mov edi, s_err_shared_obj
+    cmp dword [obj_mode], 0
+    jne .sharedbad
+    cmp dword [link_mode], 0
+    je .notshared
+.sharedbad:
+    mov qword [cur_file_name], 0
+    call fatal_error
+.notshared:
     cmp dword [link_mode], 0
     je .nolink
     cmp qword [opt_input], 0
@@ -2258,6 +2326,9 @@ choose_outname:
     mov rsi, s_ext_ao
     cmp dword [obj_mode], 0
     jne .e3
+    mov rsi, s_ext_so
+    cmp dword [shared_mode], 0
+    jne .e3
     mov rsi, s_ext_linux
     cmp dword [target], TGT_WINDOWS
     jne .e1
@@ -2404,6 +2475,8 @@ ext_reloc_sym:  resd 1
 foreign_active: resd 1
 extern_decl:    resd 1
 elf_code_off:   resq 1
+elf_base:       resq 1
+shared_mode:    resd 1                  ; -shared
 c_ints:         resd 1                  ; inside extern "..." declarations: int means C's int (int32_t)
 lib_count:      resd 1                  ; libraries named by extern "library" (lib_off: offset of the name in lib_names)
 lib_off:        resd LIB_MAX

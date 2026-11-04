@@ -1,0 +1,163 @@
+// hello.a - an Android app written in A: a NativeActivity whose libmain.so is this file compiled with -shared.
+// It opens an OpenGL ES surface with EGL, clears it to a colour, and every touch changes the colour.
+//
+//   ac -t android -shared examples/android/hello.a -o build/apk/lib/arm64-v8a/libmain.so
+//   tools/apk.sh --app examples/android/hello.a --id fi.aytict.ahello --name "A Hello"     (builds and signs the APK)
+//
+// Android calls ANativeActivity_onCreate on the app's main thread; the callbacks it installs run there as well. A game
+// would start its own thread for the frame loop (pthread_create) and keep the callbacks short; this demo draws in them.
+
+// ---- the C interfaces (from the NDK headers <android/native_activity.h>, <android/input.h>, <EGL/egl.h>, <GLES2/gl2.h>)
+struct ANativeActivityCallbacks {
+    void* onStart; void* onResume; void* onSaveInstanceState; void* onPause; void* onStop; void* onDestroy;
+    void* onWindowFocusChanged; void* onNativeWindowCreated; void* onNativeWindowResized; void* onNativeWindowRedrawNeeded;
+    void* onNativeWindowDestroyed; void* onInputQueueCreated; void* onInputQueueDestroyed; void* onContentRectChanged;
+    void* onConfigurationChanged; void* onLowMemory;
+}
+struct ANativeActivity {
+    ANativeActivityCallbacks* callbacks; void* vm; void* env; void* clazz; char* internalDataPath; char* externalDataPath;
+    int32_t sdkVersion; void* instance; void* assetManager; char* obbPath;
+}
+
+a_module ndk {
+    extern "libandroid.so" {
+        int ANativeWindow_getWidth(void* window);
+        int ANativeWindow_getHeight(void* window);
+        void* ALooper_forThread();
+        void AInputQueue_attachLooper(void* queue, void* looper, int ident, void* callback, void* data);
+        void AInputQueue_detachLooper(void* queue);
+        int AInputQueue_getEvent(void* queue, void** event);
+        int AInputQueue_preDispatchEvent(void* queue, void* event);
+        void AInputQueue_finishEvent(void* queue, void* event, int handled);
+        int AInputEvent_getType(void* event);
+        int AMotionEvent_getAction(void* event);
+        float AMotionEvent_getX(void* event, uint64_t pointer);
+        float AMotionEvent_getY(void* event, uint64_t pointer);
+    }
+    extern "liblog.so" int __android_log_write(int priority, char* tag, char* text);
+}
+a_module egl {
+    extern "libEGL.so" {
+        void* eglGetDisplay(void* id);
+        uint32_t eglInitialize(void* dpy, int32_t* major, int32_t* minor);
+        uint32_t eglChooseConfig(void* dpy, int32_t* attribs, void** configs, int32_t size, int32_t* num);
+        void* eglCreateWindowSurface(void* dpy, void* config, void* window, int32_t* attribs);
+        void* eglCreateContext(void* dpy, void* config, void* share, int32_t* attribs);
+        uint32_t eglMakeCurrent(void* dpy, void* draw, void* read, void* ctx);
+        uint32_t eglSwapBuffers(void* dpy, void* surface);
+        uint32_t eglDestroySurface(void* dpy, void* surface);
+        uint32_t eglDestroyContext(void* dpy, void* ctx);
+        uint32_t eglTerminate(void* dpy);
+    }
+}
+a_module gl {
+    extern "libGLESv2.so" {
+        void glClearColor(float r, float g, float b, float a);
+        void glClear(uint32_t mask);
+        void glViewport(int x, int y, int w, int h);
+    }
+}
+
+// ---- the app
+void* display;
+void* surface;
+void* context;
+void* window;
+void* inputQueue;
+int width;
+int height;
+int touches;
+double red = 0.10;
+double green = 0.45;
+double blue = 0.80;
+
+void logText(char* text) { ndk.__android_log_write(4, "AHello", text); }
+
+bool startGraphics(void* win) {
+    display = egl.eglGetDisplay(null);
+    if (egl.eglInitialize(display, null, null) == 0) { logText("eglInitialize failed"); return false; }
+    int32_t attribs[13] = {0x3040, 4, 0x3033, 4, 0x3024, 8, 0x3023, 8, 0x3022, 8, 0x3025, 16, 0x3038};   // ES2, window, RGB888, depth 16
+    void* config = null;
+    int32_t found = 0;
+    if (egl.eglChooseConfig(display, attribs, &config, 1, &found) == 0 || found < 1) { logText("no EGL config"); return false; }
+    surface = egl.eglCreateWindowSurface(display, config, win, null);
+    int32_t ctxattribs[3] = {0x3098, 2, 0x3038};                     // EGL_CONTEXT_CLIENT_VERSION 2
+    context = egl.eglCreateContext(display, config, null, ctxattribs);
+    if (surface == null || context == null || egl.eglMakeCurrent(display, surface, surface, context) == 0) {
+        logText("EGL surface / context failed");
+        return false;
+    }
+    width = ndk.ANativeWindow_getWidth(win);
+    height = ndk.ANativeWindow_getHeight(win);
+    gl.glViewport(0, 0, width, height);
+    logText("graphics ready");
+    return true;
+}
+
+void stopGraphics() {
+    if (display == null) return;
+    egl.eglMakeCurrent(display, null, null, null);
+    if (context != null) egl.eglDestroyContext(display, context);
+    if (surface != null) egl.eglDestroySurface(display, surface);
+    egl.eglTerminate(display);
+    display = null; surface = null; context = null;
+}
+
+void draw() {
+    if (surface == null) return;
+    gl.glClearColor(red, green, blue, 1.0);
+    gl.glClear(0x4000);                                              // GL_COLOR_BUFFER_BIT
+    egl.eglSwapBuffers(display, surface);
+}
+
+void touchAt(double x, double y) {
+    touches++;
+    if (width > 0) red = x / width;
+    if (height > 0) green = y / height;
+    blue = (touches % 4) * 0.25;
+    draw();
+}
+
+// ---- callbacks: C calls these (extern "C" with a body), on the app's main thread
+extern "C" {
+    void onWindowCreated(ANativeActivity* activity, void* win) { window = win; if (startGraphics(win)) draw(); }
+    void onWindowRedraw(ANativeActivity* activity, void* win) { draw(); }
+    void onWindowResized(ANativeActivity* activity, void* win) {
+        width = ndk.ANativeWindow_getWidth(win);
+        height = ndk.ANativeWindow_getHeight(win);
+        gl.glViewport(0, 0, width, height);
+        draw();
+    }
+    void onWindowDestroyed(ANativeActivity* activity, void* win) { stopGraphics(); window = null; }
+
+    int onInput(int fd, int events, void* data) {
+        void* event = null;
+        while (ndk.AInputQueue_getEvent(inputQueue, &event) >= 0) {
+            if (ndk.AInputQueue_preDispatchEvent(inputQueue, event) != 0) continue;
+            int handled = 0;
+            if (ndk.AInputEvent_getType(event) == 2 && (ndk.AMotionEvent_getAction(event) & 0xFF) == 0) {   // motion, ACTION_DOWN
+                touchAt(ndk.AMotionEvent_getX(event, 0), ndk.AMotionEvent_getY(event, 0));
+                handled = 1;
+            }
+            ndk.AInputQueue_finishEvent(inputQueue, event, handled);
+        }
+        return 1;                                                    // keep receiving
+    }
+    void onInputCreated(ANativeActivity* activity, void* queue) {
+        inputQueue = queue;
+        ndk.AInputQueue_attachLooper(queue, ndk.ALooper_forThread(), 1, onInput, null);
+    }
+    void onInputDestroyed(ANativeActivity* activity, void* queue) { ndk.AInputQueue_detachLooper(queue); inputQueue = null; }
+
+    // the entry point that NativeActivity looks up in libmain.so
+    void ANativeActivity_onCreate(ANativeActivity* activity, void* savedState, uint64_t savedStateSize) {
+        ANativeActivityCallbacks* cb = activity.callbacks;
+        cb.onNativeWindowCreated = onWindowCreated;
+        cb.onNativeWindowRedrawNeeded = onWindowRedraw;
+        cb.onNativeWindowResized = onWindowResized;
+        cb.onNativeWindowDestroyed = onWindowDestroyed;
+        cb.onInputQueueCreated = onInputCreated;
+        cb.onInputQueueDestroyed = onInputDestroyed;
+        logText("A app created");
+    }
+}

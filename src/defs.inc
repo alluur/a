@@ -253,6 +253,10 @@
 %define R_AARCH64_GLOB_DAT  1025
 %define R_RISCV_64          2
 %define R_LARCH_64          2
+%define R_X86_64_RELATIVE   8
+%define R_AARCH64_RELATIVE  1027
+%define R_RISCV_RELATIVE    3
+%define R_LARCH_RELATIVE    3
 %define FOREIGN_DATA_BASE 0x400000          ; in object mode the data of the built-in libraries is allocated up here and left out
 %define FOREIGN_BSS_BASE  0x10000000
 
