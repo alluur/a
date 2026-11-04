@@ -98,6 +98,7 @@ s_usage:
     db "              linux-riscv64 | android-riscv64 | linux-loongarch64 | android-loongarch64", 10
     db "              linux = linux-x64, android = android-arm64, windows = windows x64", 10
     db "  -c          compile to an object file instead of a program", 10
+    db "  -I DIR      also look for imported modules in DIR", 10
     db "  -D NAME[=V] define a preprocessor macro (may be repeated)", 10
     db "  -E          print the preprocessed source and stop", 10
     db "  -v CODE     version code used in the default output name (default 1)", 10
@@ -154,6 +155,7 @@ EMB "rawnet",      "lib/rawnet.a"
 EMB "cpu",         "lib/cpu.a"
 EMB "dfloat",      "lib/dfloat.a"
 EMB "dmath",       "lib/dmath.a"
+EMB "fmath",       "lib/fmath.a"
 EMB "thread",      "lib/thread.a"
 EMB "fixed",       "lib/fixed.a"
 EMB "nn",          "lib/nn.a"
@@ -767,6 +769,21 @@ file_include:
     add rbx, 40
     jmp .emb
 .noemb:
+    ; the -I directories
+    xor ebx, ebx
+.incs:
+    cmp ebx, [opt_nincs]
+    jae .incsd
+    push rbx
+    imul ebx, ebx, 256
+    add rbx, opt_incs
+    call .try_prefix
+    pop rbx
+    test rax, rax
+    jnz .found
+    inc ebx
+    jmp .incs
+.incsd:
     ; 2) lib/ in the current directory, 3) installed libraries
     mov rbx, s_libdir1
     call .try_prefix
@@ -1936,6 +1953,8 @@ _start:
 .notShared:
     cmp word [rbx], 0x442D              ; -D
     je .define
+    cmp word [rbx], 0x492D              ; -I
+    je .incdir
     cmp word [rbx], 0x452D              ; -E
     jne .notE
     cmp byte [rbx+2], 0
@@ -1990,6 +2009,26 @@ _start:
     jae .badopt
     mov [opt_defs + rcx*8], rax
     inc dword [opt_ndefs]
+    jmp .arg
+.incdir:
+    ; -IDIR  -I DIR: another directory to search for imported modules (before lib/)
+    lea rax, [rbx+2]
+    cmp byte [rax], 0
+    jne .inc1
+    call .value
+.inc1:
+    mov ecx, [opt_nincs]
+    cmp ecx, 16
+    jae .badopt
+    imul edi, ecx, 256
+    add rdi, opt_incs
+    mov rsi, rax
+    call cstr_copy                      ; (the directory with a '/' at the end)
+    cmp byte [rdi-1], '/'
+    je .inc2
+    mov word [rdi], '/'
+.inc2:
+    inc dword [opt_nincs]
     jmp .arg
 .value:
     cmp r13, r14
@@ -2558,6 +2597,8 @@ agg_gtype:      resq 1
 main_dir:       resq 1
 opt_input:      resq 1
 opt_output:     resq 1
+opt_nincs:      resd 1
+opt_incs:       resb 16 * 256
 opt_version:    resq 1
 opt_release:    resq 1
 code_vaddr:     resq 1

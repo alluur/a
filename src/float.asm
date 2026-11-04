@@ -20,6 +20,7 @@ fn_itod:  db "itod", 0
 fn_dtoi:  db "dtoi", 0
 fn_dneg:  db "dneg", 0
 fn_utod:  db "__utod", 0
+fn_sqrt:  db "sqrt", 0
 fn_dtou:  db "__dtou", 0
 CSTR msg_dblop, "operator not available for double (use + - * / and comparisons)"
 CSTR msg_dblmix, "a double can only be combined with an int or a double"

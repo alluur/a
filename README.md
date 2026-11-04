@@ -187,6 +187,7 @@ Version 0.1.0 is deliberately small. Known limitations — all of them are on th
 * **Floating point:** `double` (binary64) and `float` (binary32, 4 bytes in memory) use the FPU of the target CPU; expressions are
   evaluated in double. `--soft-float` switches to the software implementation (for AOS). The C library modules `cmath` / `cfloat`
   still take doubles as bit patterns held in ints.
+  `fmath` has fast FPU versions of `sin cos atan2 exp log pow ...` (fdlibm algorithms, within 1 ulp, the same bits on every CPU).
 * **C libraries:** `extern "libc.so.6" { int printf(char* fmt, ...); }` calls C functions with the target's C ABI (Linux:
   dynamic linking on x86-64, ARM64, RISC-V and LoongArch; Windows: DLL imports); `extern "C"` declares C function pointers
   (for `dlsym`) and A functions that C can call back. `ac -shared` writes shared libraries (`.so`) that export the

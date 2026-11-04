@@ -90,7 +90,9 @@ which flips the top bit of A and B, so the signed compare and the fused compare-
 `coerce_to` converts `uint64_t` <-> `double` with `utod` / `dtou` (`__utod` / `__dtou` of `lib/dfloat.a` with `--soft-float`).
 `return` and casts call `emit_extend` as well.
 
-**Floating point.** A `double` value is its IEEE 754 binary64 bit pattern in the 64-bit accumulator, so it moves through
+**Floating point.** (`__sqrt(x)` is the primitive `fsqrt`: `sqrtsd`, `fsqrt d0`, `fsqrt.d`, `fsqrt.d`; with `--soft-float` a call of
+cmath's `sqrt`. `lib/fmath.a` builds the fast functions on it and on the arithmetic primitives.) A `double` value is its IEEE 754
+binary64 bit pattern in the 64-bit accumulator, so it moves through
 the stack machine (push/pop, locals, arguments, return values) exactly like an `int`. The FPU primitives of `CGLIST`
 (`fadd fsub fmul fdiv fcmp itod dtoi dtof ftod`) move A and B into floating point registers, do one operation and move
 the result back; `fcmp` returns -1 / 0 / 1 / 2 (less, equal, greater, unordered) like the software `dcmp`, and the

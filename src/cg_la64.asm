@@ -920,6 +920,10 @@ la64_umod:      LA 0x00239484                   ; mod.du $a0, $a0, $a1
                 ret
 la64_shr:       LA 0x00191484                   ; srl.d $a0, $a0, $a1
                 ret
+la64_fsqrt:     LA 0x0114A880                   ; movgr2fr.d $f0, $a0
+                LA 0x01144800                   ; fsqrt.d $f0, $f0
+                LA 0x0114B804                   ; movfr2gr.d $a0, $f0
+                ret
 la64_ubias:     LA 0x0320000C                   ; lu52i.d $t0, $zero, -2048  (1 << 63)
                 LA 0x0015B084                   ; xor $a0, $a0, $t0
                 LA 0x0015B0A5                   ; xor $a1, $a1, $t0

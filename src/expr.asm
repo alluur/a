@@ -2035,6 +2035,29 @@ parse_primary:
     mov qword [e_lval], 0
     jmp .out
 
+; ---- __sqrt(x): the square root of a double with the FPU's instruction (the soft-float sqrt with --soft-float)
+.sqrtfn:
+    call next_token
+    mov edi, '('
+    call expect
+    call parse_assign
+    call to_rvalue
+    mov edi, TY_DOUBLE
+    call coerce_to
+    mov edi, ')'
+    call expect
+    cmp dword [soft_float], 0
+    jne .sqrtsoft
+    CG fsqrt
+    jmp .sqrtd
+.sqrtsoft:
+    mov rdi, fn_sqrt
+    call call_rt1
+.sqrtd:
+    mov qword [e_type], TY_DOUBLE
+    mov qword [e_lval], 0
+    jmp .out
+
 ; ---- va_arg(i) and va_count(): the extra arguments of a function declared with ...
 .vaarg:
     call va_check
@@ -2097,6 +2120,13 @@ parse_primary:
     cmp byte [r13+4], 'l'
     je .dblfn
 .nodbl:
+    cmp r14d, 6
+    jne .nosqrt
+    cmp dword [r13], '__sq'
+    jne .nosqrt
+    cmp word [r13+4], 'rt'
+    je .sqrtfn
+.nosqrt:
     cmp r14d, 8
     jne .nova2
     cmp dword [r13], 'va_c'

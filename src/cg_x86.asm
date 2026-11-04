@@ -597,6 +597,8 @@ x86_umod:       EM 0x31, 0xD2, 0x48, 0xF7, 0xF1, 0x48, 0x89, 0xD0
                 ret                                     ; ... / mov rax, rdx
 x86_shr:        EM 0x48, 0xD3, 0xE8
                 ret                                     ; shr rax, cl
+x86_fsqrt:      EM 0x66, 0x48, 0x0F, 0x6E, 0xC0, 0xF2, 0x0F, 0x51, 0xC0, 0x66, 0x48, 0x0F, 0x7E, 0xC0
+                ret                                     ; movq xmm0, rax / sqrtsd xmm0, xmm0 / movq rax, xmm0
 x86_ubias:      EM 0x48, 0x0F, 0xBA, 0xF8, 0x3F, 0x48, 0x0F, 0xBA, 0xF9, 0x3F
                 ret                                     ; btc rax, 63 / btc rcx, 63
 ; utod: test rax, rax / js .neg / cvtsi2sd xmm0, rax / jmp .done /

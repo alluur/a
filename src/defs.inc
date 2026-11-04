@@ -420,6 +420,7 @@
     %1 ubias ; A ^= 1 << 63, B ^= 1 << 63: a signed comparison after it compares A and B as unsigned
     %1 utod ; A = (double)A, A unsigned
     %1 dtou ; A = (uint64)A, truncated toward zero
+    %1 fsqrt ; A = sqrt(A), a double (correctly rounded, like every IEEE 754 square root)
     ; C calls (cc_n, cc_nfixed, cc_ret, cc_cls describe the call)
     %1 ccall ; A = address of a C function; its cc_n arguments are on the stack (A's order): calls it with the C ABI
              ;   of the target and leaves the result in A (a double as its bits, a float widened to a double)

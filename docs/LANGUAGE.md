@@ -356,7 +356,19 @@ the FPU registers; use it for systems that do not save the FPU state on a contex
 is an alias of `double` (8 bytes), as in earlier versions of A. Helpers: `printDouble`, `printlnDouble`, `doubleToText`, `doubleToFixed(d, n)`,
 `doubleToSci(d, n)`, `parseDouble(text)`, `isNaN`, `isInf`, `isFinite`. The `dmath` module has `sqrt cbrt pow exp exp2 expm1 log
 log2 log10 log1p hypot sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh floor ceil round trunc fabs fmod fmin
-fmax copysign nan` and the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`.
+fmax copysign nan` and the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`; its results are correctly rounded and it runs in
+software (`dmath.sin` takes about 45 microseconds), except `sqrt`.
+
+**Fast mathematics: `fmath`.** For games, graphics and simulations, `import fmath;` has the same functions computed with the FPU:
+`sin cos tan asin acos atan atan2 exp exp2 log log2 log10 pow sqrt cbrt hypot sinh cosh tanh floor ceil trunc round fabs fmod
+copysign fmin fmax scalbn`, plus `isNaN isInf isFinite radians degrees clamp lerp nan()` and `PI TAU HALF_PI E LN2 INFINITY`. A call
+takes 80 to 200 nanoseconds (about 500 times faster than `dmath`). The algorithms are fdlibm's: within 1 ulp (2 for `tanh`), the
+rounding functions and `fmod` exact, and because only `+ - * /` and the square root are used (no fused multiply-add), every result
+is the same on every CPU and with `--soft-float`. `__sqrt(x)` is the FPU's square root instruction itself (correctly rounded).
+
+    import fmath;
+    float angle = fmath.atan2(dy, dx);
+    double fall = 0.5 * 9.81 * fmath.pow(t, 2.0);
 
 `++` and `--` work on doubles too (they add or subtract 1.0).
 
@@ -735,8 +747,9 @@ int main() {
 }
 ```
 
-* `import name;` searches, in this order: the directory of the importing file, `lib/` in the current
-  directory, `/usr/lib/a/`, `/usr/local/lib/a/`, and `lib/` next to the main source file.
+* `import name;` searches, in this order: the directory of the importing file, the modules built into the compiler, the
+  directories given with `-I DIR`, `lib/` in the current directory, `/usr/lib/a/`, `/usr/local/lib/a/`, and `lib/` next to
+  the main source file. `import core.vec;` is the file `core/vec.a` in one of them.
   Dots in the name become directory separators.
 * A file is compiled **once** even if several files import it.
 * Names declared in a `module` are accessed as `module.name`; inside the module they can be used
@@ -998,6 +1011,7 @@ code only to programs that import them, and a file of the same name next to your
 
 | Module | Contents |
 |---|---|
+| `dmath`, `fmath` | mathematics for `double`: correctly rounded in software / fast on the FPU, see [floating point](#static-if--and-floating-point) |
 | `math` | `gcd lcm pow powMod isqrt isPrime nextPrime factorial fibonacci binomial clamp sign mod floorDiv popcount ilog2 digitSum sum minOf maxOf randRange shuffle` (integers only) |
 | `bigint` | arbitrary precision integers: class `BigInt`; `fromInt parse add sub mul mulSmall divSmall pow factorial fibonacci cmp negate`; `toString() digits() toInt()` |
 | `decimal` | exact fixed point decimals (money): `parse format mul div rescale percentOf formatMoney` |

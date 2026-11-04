@@ -904,6 +904,10 @@ a64_umod:       A64 0x9AC10802                  ; udiv x2, x0, x1
                 ret
 a64_shr:        A64 0x9AC12400                  ; lsr x0, x0, x1
                 ret
+a64_fsqrt:      A64 0x9E670000                  ; fmov d0, x0
+                A64 0x1E61C000                  ; fsqrt d0, d0
+                A64 0x9E660000                  ; fmov x0, d0
+                ret
 a64_ubias:      A64 0xD2410000                  ; eor x0, x0, #0x8000000000000000
                 A64 0xD2410021                  ; eor x1, x1, #0x8000000000000000
                 ret

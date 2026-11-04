@@ -1009,6 +1009,10 @@ rv64_umod:      RV 0x02B57533                   ; remu a0, a0, a1
                 ret
 rv64_shr:       RV 0x00B55533                   ; srl a0, a0, a1
                 ret
+rv64_fsqrt:     RV 0xF2050053                   ; fmv.d.x f0, a0
+                RV 0x5A007053                   ; fsqrt.d f0, f0
+                RV 0xE2000553                   ; fmv.x.d a0, f0
+                ret
 rv64_ubias:     RV 0x00100293                   ; addi t0, zero, 1
                 RV 0x03F29293                   ; slli t0, t0, 63
                 RV 0x00554533                   ; xor a0, a0, t0
