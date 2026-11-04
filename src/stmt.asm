@@ -363,6 +363,9 @@ parse_return:
     mov rdi, [rax+SYM_TYPE]
     call coerce_to                      ; int <-> double
     mov rax, [cur_func]
+    mov rdi, [rax+SYM_TYPE]
+    call emit_extend                    ; int8_t ... uint32_t: the result is converted to the type
+    mov rax, [cur_func]
     cmp qword [rax+SYM_TYPE], TY_BOOL
     jne .notbool
     CG tobool
@@ -796,6 +799,16 @@ parse_typedef:
     mov rbx, rax
     cmp qword [tk], T_ID
     je .n1
+    mov eax, [tk]                       ; typedef unsigned char uint8_t;  (C headers): the built-in type is kept
+    cmp eax, K_I8
+    jb .noname
+    cmp eax, K_U64
+    ja .noname
+    call next_token
+    mov edi, ';'
+    call expect
+    jmp .done
+.noname:
     ERR "expected a name for the new type"
 .n1:
     mov r12, [tk_ptr]
@@ -808,6 +821,7 @@ parse_typedef:
     mov edx, S_TYPEDEF
     call sym_new
     mov [rax+SYM_TYPE], rbx
+.done:
     pop r13
     pop r12
     pop rbx
@@ -1090,6 +1104,12 @@ init_elem:
     jmp .dgot
 .dint:
     call const_expr
+    cmp rbx, TY_U64
+    je .dgot
+    test edx, edx
+    jnz .dgot
+    mov rdi, rbx
+    call const_trunc                    ; int8_t ... uint32_t: the constant converted to the type
 .dgot:
     push rax
     push rdx
@@ -1097,13 +1117,22 @@ init_elem:
     call type_ls
     pop rdx
     pop rcx
-    cmp eax, 8
+    cmp eax, LS_Q
     je .dq
-    cmp eax, 1
+    cmp eax, LS_U8
     je .db
-    cmp eax, 4
-    je .dd
+    cmp eax, LS_I8
+    je .db
+    cmp eax, LS_U16
+    je .dh
+    cmp eax, LS_I16
+    je .dh
+    cmp eax, LS_AGG
+    jne .dd
     ERR "a struct value cannot be used here, use a {...} list"
+.dh:
+    mov [data_buf + r12], cx
+    jmp .out
 .dd:
     mov [data_buf + r12], ecx
     jmp .out

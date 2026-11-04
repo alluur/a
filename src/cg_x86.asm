@@ -576,6 +576,42 @@ x86_load4_a:    EM 0x8B, 0x00
 x86_store4:     EM 0x89, 0x01
                 ret                                     ; mov [rcx], eax
 
+; ---- sized and unsigned integers ----
+x86_load2_a:    EM 0x0F, 0xB7, 0x00
+                ret                                     ; movzx eax, word [rax]
+x86_store2:     EM 0x66, 0x89, 0x01
+                ret                                     ; mov [rcx], ax
+x86_sext8:      EM 0x48, 0x0F, 0xBE, 0xC0
+                ret                                     ; movsx rax, al
+x86_sext16:     EM 0x48, 0x0F, 0xBF, 0xC0
+                ret                                     ; movsx rax, ax
+x86_sext32:     EM 0x48, 0x63, 0xC0
+                ret                                     ; movsxd rax, eax
+x86_zext16:     EM 0x0F, 0xB7, 0xC0
+                ret                                     ; movzx eax, ax
+x86_zext32:     EM 0x89, 0xC0
+                ret                                     ; mov eax, eax
+x86_udiv:       EM 0x31, 0xD2, 0x48, 0xF7, 0xF1
+                ret                                     ; xor edx, edx / div rcx
+x86_umod:       EM 0x31, 0xD2, 0x48, 0xF7, 0xF1, 0x48, 0x89, 0xD0
+                ret                                     ; ... / mov rax, rdx
+x86_shr:        EM 0x48, 0xD3, 0xE8
+                ret                                     ; shr rax, cl
+x86_ubias:      EM 0x48, 0x0F, 0xBA, 0xF8, 0x3F, 0x48, 0x0F, 0xBA, 0xF9, 0x3F
+                ret                                     ; btc rax, 63 / btc rcx, 63
+; utod: test rax, rax / js .neg / cvtsi2sd xmm0, rax / jmp .done /
+;       .neg: mov r11, rax / shr r11, 1 / and eax, 1 / or r11, rax / cvtsi2sd xmm0, r11 / addsd xmm0, xmm0 / .done: movq rax, xmm0
+x86_utod:       EM 0x48, 0x85, 0xC0, 0x78, 7, 0xF2, 0x48, 0x0F, 0x2A, 0xC0, 0xEB, 21
+                EM 0x49, 0x89, 0xC3, 0x49, 0xD1, 0xEB, 0x83, 0xE0, 0x01, 0x49, 0x09, 0xC3, 0xF2, 0x49, 0x0F, 0x2A, 0xC3, 0xF2, 0x0F, 0x58, 0xC0
+                EM 0x66, 0x48, 0x0F, 0x7E, 0xC0
+                ret
+; dtou: movq xmm0, rax / mov r11, 2^63 (as a double) / movq xmm1, r11 / ucomisd xmm0, xmm1 / jae .big / cvttsd2si rax, xmm0 /
+;       jmp .done / .big: subsd xmm0, xmm1 / cvttsd2si rax, xmm0 / btc rax, 63 / .done:
+x86_dtou:       EM 0x66, 0x48, 0x0F, 0x6E, 0xC0, 0x49, 0xBB, 0, 0, 0, 0, 0, 0, 0xE0, 0x43, 0x66, 0x49, 0x0F, 0x6E, 0xCB
+                EM 0x66, 0x0F, 0x2E, 0xC1, 0x73, 7, 0xF2, 0x48, 0x0F, 0x2C, 0xC0, 0xEB, 14
+                EM 0xF2, 0x0F, 0x5C, 0xC1, 0xF2, 0x48, 0x0F, 0x2C, 0xC0, 0x48, 0x0F, 0xBA, 0xF8, 0x3F
+                ret
+
 section .rodata
 %macro CGT_X86 1
     dq x86_%1

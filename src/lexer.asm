@@ -49,10 +49,18 @@ kw_table:
     KW "defer",    K_DEFER
     KW "goto",     K_GOTO
     KW "extern",   K_EXTERN
-    KW "short",    K_INTMOD
-    KW "long",     K_INTMOD
-    KW "signed",   K_INTMOD
-    KW "unsigned", K_INTMOD
+    KW "short",    K_SHORT
+    KW "long",     K_LONG
+    KW "signed",   K_SIGNED
+    KW "unsigned", K_UNSIGNED
+    KW "int8_t",   K_I8
+    KW "int16_t",  K_I16
+    KW "int32_t",  K_I32
+    KW "int64_t",  K_I64
+    KW "uint8_t",  K_U8
+    KW "uint16_t", K_U16
+    KW "uint32_t", K_U32
+    KW "uint64_t", K_U64
     db 0
 
 ops3:

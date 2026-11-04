@@ -58,7 +58,8 @@ linked with `ld`. It uses no libc: it talks to Linux through `syscall` only.
 A type is one 64-bit value:
 
 ```
-bits  0..7   kind: 0 void, 1 int, 2 char, 3 bool, 4 struct/class, 5 func, 6 double, 7 float
+bits  0..7   kind: 0 void, 1 int, 2 char, 3 bool, 4 struct/class, 5 func, 6 double, 7 float,
+             8..14 int8_t int16_t int32_t uint8_t uint16_t uint32_t uint64_t
 bits  8..15  pointer depth
 bits 16..31  struct index (for kind 4)
 bit   32     "array" flag (an array lvalue; it decays to a pointer when used as a value)
@@ -73,7 +74,21 @@ the data section, filled by `R_CODE64` relocations; virtual methods are roots of
 unless it comes from `super.`; objects get their vtable pointer from `emit_vptr_init` (new, locals) or a
 `R_DATA64` relocation (globals).
 
-Enums are `int`. Sizes: pointers 8, `int` 8, `double` 8, `float` 4, `char`/`bool` 1, structs from the struct table.
+Enums are `int`. Sizes: pointers 8, `int` 8, `double` 8, `float` 4, `char`/`bool` 1, the sized integers 1 / 2 / 4 / 8, structs
+from the struct table. Struct layout is C's: `ls_align` (in `decl.asm`) gives each scalar field the alignment of its size, a struct
+field gets the alignment of its struct (`st_align`, the largest alignment of its fields; 8 once it has a vtable pointer), and
+`.mend` rounds the size up to `st_align` (an empty struct is 8 bytes).
+
+**Sized integers.** `type_ls` returns how a scalar is loaded and stored (`LS_*` in `defs.inc`: `LS_U8` `LS_U16` `LS_U32` zero
+extend, `LS_I8` `LS_I16` `LS_I32` sign extend, `LS_F32` widens a float, `LS_Q` is 8 bytes). `emit_load_type` /
+`load_local_typed` use `load1_a` / `load2_a` / `load4_a` plus `sext8` / `sext16` / `sext32`; `emit_store_type` /
+`store_local_typed` first call `emit_extend` (truncate and extend A to the type, so A holds exactly the stored value; a constant
+that was just loaded is converted at compile time) and then `store1` / `store2` / `store4`. `value_type` turns `int8_t` …
+`uint32_t` into `int` for every rvalue, so the expression code only ever sees `int` and `uint64_t`. `binop_emit` makes
+`/ % >>` and the comparisons unsigned when an operand is `uint64_t` (`udiv`, `umod`, `shr`; a comparison is preceded by `ubias`,
+which flips the top bit of A and B, so the signed compare and the fused compare-and-branch of `cond_jz` work unchanged), and
+`coerce_to` converts `uint64_t` <-> `double` with `utod` / `dtou` (`__utod` / `__dtou` of `lib/dfloat.a` with `--soft-float`).
+`return` and casts call `emit_extend` as well.
 
 **Floating point.** A `double` value is its IEEE 754 binary64 bit pattern in the 64-bit accumulator, so it moves through
 the stack machine (push/pop, locals, arguments, return values) exactly like an `int`. The FPU primitives of `CGLIST`

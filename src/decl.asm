@@ -759,15 +759,20 @@ parse_aggregate:
     shl rax, 5
     add rax, struct_tab
     mov ecx, [rax+ST_SIZE]
+    movzx edx, byte [ls_align + r14]     ; a scalar is aligned to its size (C layout)
+    test edx, edx
+    jnz .fal
+    mov edx, r13d                       ; a struct field (or an array of structs): the alignment of that struct
+    shr edx, 16
+    movzx edx, byte [st_align + rdx]
+    test edx, edx
+    jnz .fal
     mov edx, 8
-    cmp r14d, 1
-    jne .fal4
-    mov edx, 1
-.fal4:
-    cmp r14d, 4
-    jne .fal
-    mov edx, 4                          ; a float field: 4 byte aligned
 .fal:
+    cmp dl, [st_align + rbx]            ; the struct is aligned like its most aligned field
+    jbe .fal2
+    mov [st_align + rbx], dl
+.fal2:
     lea rsi, [rdx-1]
     add rcx, rsi
     not rsi
@@ -868,10 +873,18 @@ parse_aggregate:
     shl rax, 5
     add rax, struct_tab
     mov ecx, [rax+ST_SIZE]
-    add ecx, 7
-    and ecx, -8
+    movzx edx, byte [st_align + rbx]     ; the size is a multiple of the alignment (so arrays of it stay aligned)
+    test edx, edx
+    jnz .sza
+    mov edx, 8
+.sza:
+    dec edx
+    add ecx, edx
+    not edx
+    and ecx, edx
     jnz .sz
     mov ecx, 8
+    mov byte [st_align + rbx], 8
 .sz:
     mov [rax+ST_SIZE], ecx
     ; the vtable of a class with virtual methods: one code address per slot, filled in by the linker
@@ -947,6 +960,8 @@ inherit_base:
     shl ecx, 5
     rep movsb
     ; vtable layout
+    mov al, [st_align + r9]
+    mov [st_align + r8], al
     mov eax, [st_vptr + r9*4]
     mov [st_vptr + r8*4], eax
     mov ecx, [st_vcount + r9*4]
@@ -1004,6 +1019,7 @@ register_virtual:
     mov [st_vptr + rbx*4], esi
     add edx, 8
     mov [rax+ST_SIZE], edx
+    mov byte [st_align + rbx], 8
 .set:
     or dword [r13+SYM_FLAGS], F_VIRTUAL
     mov rax, r13
@@ -1511,6 +1527,10 @@ parse_global_vars:
     jmp .i0got
 .i0int:
     call const_expr
+    test edx, edx
+    jnz .i0got
+    mov rdi, rbx
+    call const_trunc                    ; int8_t ... uint32_t: the constant converted to the type
 .i0got:
     push rax
     push rdx
@@ -2051,3 +2071,8 @@ parse_typedef_aggregate:
     pop r12
     pop rbx
     ret
+
+section .rodata
+; the alignment of a scalar field by its type_ls kind (0: an aggregate, see st_align)
+ls_align: db 0, 1, 2, 4, 4, 1, 2, 4, 8
+section .text

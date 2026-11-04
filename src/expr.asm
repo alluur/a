@@ -24,12 +24,22 @@ section .text
 ; emit_load_type: rdi = type. Emits  rax = *(type*)rax  (no-op for aggregates)
 emit_load_type:
     call type_ls
-    cmp eax, 8
+    cmp eax, LS_Q
     je .q
-    cmp eax, 1
+    cmp eax, LS_U8
     je .b
-    cmp eax, 4
+    cmp eax, LS_F32
     je .f
+    cmp eax, LS_U16
+    je .h
+    cmp eax, LS_U32
+    je .w
+    cmp eax, LS_I8
+    je .sb
+    cmp eax, LS_I16
+    je .sh
+    cmp eax, LS_I32
+    je .sw
     ret
 .q: CG load8_a
     ret
@@ -38,13 +48,118 @@ emit_load_type:
 .f: CG load4_a                          ; a float: widened to a double
     CG ftod
     ret
+.h: CG load2_a
+    ret
+.w: CG load4_a
+    ret
+.sb:
+    CG load1_a
+    CG sext8
+    ret
+.sh:
+    CG load2_a
+    CG sext16
+    ret
+.sw:
+    CG load4_a
+    CG sext32
+    ret
 
-; value_type: rdi = a declared type -> [e_type] = the type of its value in A (a float is a double there)
+; value_type: rdi = a declared type -> [e_type] = the type of its value in A (a float is a double there, an int8_t ...
+; uint32_t is an int; uint64_t stays uint64_t)
 value_type:
     cmp rdi, TY_FLOAT
-    jne .s
+    jne .i
     mov edi, TY_DOUBLE
+.i: cmp rdi, TY_I8
+    jb .s
+    cmp rdi, TY_U32
+    ja .s
+    mov edi, TY_INT
 .s: mov [e_type], rdi
+    ret
+
+; is_small_int: rdi = type -> eax = 1 for int8_t ... uint32_t (the types whose values are narrower than A)
+is_small_int:
+    xor eax, eax
+    cmp rdi, TY_I8
+    jb .n
+    cmp rdi, TY_U32
+    ja .n
+    inc eax
+.n: ret
+
+; const_trunc: rdi = type, rax = value -> rax = the value converted to the type (int8_t ... uint32_t; others unchanged)
+const_trunc:
+    cmp rdi, TY_I8
+    je .i8
+    cmp rdi, TY_I16
+    je .i16
+    cmp rdi, TY_I32
+    je .i32
+    cmp rdi, TY_U8
+    je .u8
+    cmp rdi, TY_U16
+    je .u16
+    cmp rdi, TY_U32
+    je .u32
+    ret
+.i8:  movsx rax, al
+    ret
+.i16: movsx rax, ax
+    ret
+.i32: movsxd rax, eax
+    ret
+.u8:  movzx eax, al
+    ret
+.u16: movzx eax, ax
+    ret
+.u32: mov eax, eax
+    ret
+
+; emit_extend: rdi = type. For int8_t ... uint32_t: A = A converted to the type (truncated, then sign or zero extended), so
+; that A holds exactly the value the variable will have. A constant that was just loaded is converted at compile time.
+emit_extend:
+    push rdi
+    call is_small_int
+    pop rdi
+    test eax, eax
+    jz .r
+    push rdi
+    mov rdi, [imm_end]
+    call tail_is
+    pop rdi
+    test eax, eax
+    jz .code
+    mov rax, [imm_val]
+    call const_trunc
+    push rax
+    mov rdi, [imm_pos]
+    call rewind_code
+    pop rdi
+    jmp gen_imm_a
+.code:
+    cmp rdi, TY_I8
+    je .i8
+    cmp rdi, TY_I16
+    je .i16
+    cmp rdi, TY_I32
+    je .i32
+    cmp rdi, TY_U8
+    je .u8
+    cmp rdi, TY_U16
+    je .u16
+    CG zext32
+.r: ret
+.i8:  CG sext8
+    ret
+.i16: CG sext16
+    ret
+.i32: CG sext32
+    ret
+.u8:  CG zext8
+    ret
+.u16: CG zext16
     ret
 
 ; emit_store_type: rdi = type. Emits  *(type*)rcx = rax  (memcpy for aggregates:
@@ -52,12 +167,14 @@ value_type:
 emit_store_type:
     push rdi
     call type_ls
-    cmp eax, 8
+    cmp eax, LS_Q
     je .q
-    cmp eax, 1
+    cmp eax, LS_U8
     je .b
-    cmp eax, 4
+    cmp eax, LS_F32
     je .f
+    cmp eax, LS_AGG
+    jne .sized
     call type_size
     mov rdi, rax
     CG copy_mem
@@ -71,13 +188,31 @@ emit_store_type:
 .b: test edi, 0xFF00
     jnz .b1
     cmp dil, TY_BOOL
-    jne .b1
+    jne .bu8
     CG tobool
+    jmp .b1
+.bu8:
+    call emit_extend                    ; uint8_t: A becomes the stored value
 .b1:
     CG store1
 .out:
     pop rdi
     ret
+.sized:                                 ; int8_t ... uint32_t: A becomes the stored value, then the low bytes are stored
+    push rax
+    call emit_extend
+    pop rax
+    cmp eax, LS_I8
+    je .b1
+    cmp eax, LS_U16
+    je .s2
+    cmp eax, LS_I16
+    je .s2
+    CG store4
+    jmp .out
+.s2:
+    CG store2
+    jmp .out
 
 ; ---- peephole support ----------------------------------------------------------------
 ; The generator remembers where the most recent "interesting" instruction started and
@@ -298,11 +433,30 @@ binop_emit:
     push rbx
     push r12
     push r13
+    push r14
     mov ebx, edi
     mov r12, rsi
     mov r13, rdx
     mov qword [e_lval], 0
     mov qword [e_type], TY_INT
+    ; uint64_t: an operation with a uint64_t operand is unsigned and (except comparisons) gives a uint64_t (r14d = 1)
+    xor r14d, r14d
+    cmp r12, TY_U64
+    je .u64
+    cmp r13, TY_U64
+    jne .nou64
+    cmp ebx, T_SHL                      ; the type of a shift is the type of its left operand
+    je .nou64
+    cmp ebx, T_SHR
+    je .nou64
+.u64:
+    test r12d, 0xFF00                   ; pointer arithmetic stays pointer arithmetic
+    jnz .nou64
+    test r13d, 0xFF00
+    jnz .nou64
+    mov r14d, 1
+    mov qword [e_type], TY_U64
+.nou64:
     cmp ebx, '+'
     je .add
     cmp ebx, '-'
@@ -377,10 +531,20 @@ binop_emit:
     CG mul
     jmp .out
 .div:
+    test r14d, r14d
+    jnz .udiv
     CG div
     jmp .out
+.udiv:
+    CG udiv
+    jmp .out
 .mod:
+    test r14d, r14d
+    jnz .umod
     CG mod
+    jmp .out
+.umod:
+    CG umod
     jmp .out
 .and:
     CG and
@@ -395,7 +559,12 @@ binop_emit:
     CG shl
     jmp .out
 .shr:
+    test r14d, r14d
+    jnz .ushr
     CG sar
+    jmp .out
+.ushr:
+    CG shr
     jmp .out
 .eq:
     mov r8d, CC_EQ
@@ -429,13 +598,23 @@ binop_emit:
 .cdone:
     mov rax, [code_pos]
     mov [cmp_end], rax
+    mov qword [e_type], TY_INT
     jmp .out
 .cmark:
+    test r14d, r14d                     ; unsigned: both sides get their top bit flipped, then a signed compare
+    jz .cm
+    cmp r8d, CC_EQ
+    je .cm
+    cmp r8d, CC_NE
+    je .cm
+    CG ubias
+.cm:
     mov rax, [code_pos]
     mov [cmp_pos], rax
     mov [cmp_cc], r8d
     ret
 .out:
+    pop r14
     pop r13
     pop r12
     pop rbx
@@ -463,8 +642,11 @@ is_type_start_impl:
     je .yes
     cmp eax, K_ENUM
     je .yes
-    cmp eax, K_INTMOD
-    je .yes
+    cmp eax, K_I8
+    jb .notsized
+    cmp eax, K_UNSIGNED
+    jbe .yes                            ; int8_t ... uint64_t, short long signed unsigned
+.notsized:
     cmp eax, K_DOUBLE
     je .yes
     cmp eax, K_FLOAT
@@ -548,24 +730,68 @@ parse_type:
     call next_token                     ; C style:  struct Point p;   enum Color c;
     mov eax, [tk]
 .notag:
-    cmp eax, K_INTMOD
-    jne .nomod
-    ; short / long / signed / unsigned [long] [int | char | double]: every one of them is an int, char or double
-.mod:
-    call next_token
-    cmp qword [tk], K_INTMOD
-    je .mod
+    cmp eax, K_I8
+    jb .nomod
+    cmp eax, K_U64
+    ja .cwords
+    movzx ebx, byte [sized_kw_types + rax - K_I8]   ; int8_t ... uint64_t
+    jmp .star0
+    ; the C words: [signed | unsigned] [short | long [long]] [int | char | double | float], with C's sizes except that
+    ; int and long are the 64-bit int: short = int16_t, unsigned short = uint16_t, unsigned (int) = uint32_t,
+    ; unsigned long (long) = uint64_t, signed char = int8_t, unsigned char = char, long double = double
+.cwords:
+    xor r12d, r12d                      ; bit 0 unsigned, 1 signed, 2 short, 3 long
+.cw:
     mov eax, [tk]
-    cmp eax, K_INT
-    je .int
+    mov ecx, 1
+    cmp eax, K_UNSIGNED
+    je .cwbit
+    mov ecx, 2
+    cmp eax, K_SIGNED
+    je .cwbit
+    mov ecx, 4
+    cmp eax, K_SHORT
+    je .cwbit
+    mov ecx, 8
+    cmp eax, K_LONG
+    jne .cwbase
+.cwbit:
+    or r12d, ecx
+    call next_token
+    jmp .cw
+.cwbase:
     cmp eax, K_CHAR
-    je .char
+    je .cwchar
     cmp eax, K_DOUBLE
     je .double
     cmp eax, K_FLOAT
     je .float
+    cmp eax, K_INT
+    jne .cwint
+    call next_token
+.cwint:
     mov ebx, TY_INT
+    test r12d, 4
+    jz .cwnshort
+    mov ebx, TY_I16
+    test r12d, 1
+    jz .star
+    mov ebx, TY_U16
     jmp .star
+.cwnshort:
+    test r12d, 1
+    jz .star
+    mov ebx, TY_U32
+    test r12d, 8
+    jz .star
+    mov ebx, TY_U64
+    jmp .star
+.cwchar:
+    mov ebx, TY_CHAR
+    test r12d, 2
+    jz .star0
+    mov ebx, TY_I8
+    jmp .star0
 .nomod:
     cmp eax, K_INT
     je .int
@@ -1481,13 +1707,17 @@ parse_primary:
     je .cconv
     cmp qword [e_type], TY_DOUBLE
     je .cconv
+    cmp rbx, TY_U64
+    je .cconv
+    cmp qword [e_type], TY_U64
+    je .cconv
     test ebx, 0xFF00
     jnz .cdone
     cmp bl, TY_CHAR
     je .cchar
     cmp bl, TY_BOOL
     je .cbool
-    jmp .cdone
+    jmp .cext
 .cchar:
     CG zext8
     jmp .cdone
@@ -1497,6 +1727,9 @@ parse_primary:
 .cconv:
     mov rdi, rbx
     call coerce_to                      ; int <-> double (a float cast rounds to float precision)
+.cext:
+    mov rdi, rbx
+    call emit_extend                    ; (int8_t) x ... (uint32_t) x: truncated and extended
 .cdone:
     mov rdi, rbx
     call value_type
@@ -2340,7 +2573,10 @@ parse_unary:
     ret
 .negreal:
     CG neg
+    cmp qword [e_type], TY_U64          ; -u of a uint64_t is a uint64_t (2^64 - u)
+    je .negu
     mov qword [e_type], TY_INT
+.negu:
     ret
 .negdbl:
     cmp rax, [imm_pos]
@@ -2382,7 +2618,10 @@ parse_unary:
     call parse_unary
     call to_rvalue
     CG not
+    cmp qword [e_type], TY_U64
+    je .complu
     mov qword [e_type], TY_INT
+.complu:
     ret
 .deref:
     call next_token
@@ -2615,17 +2854,16 @@ load_local_typed:
     mov rdi, rsi
     call type_ls
     pop rdi
-    cmp eax, 1
+    cmp eax, LS_U8
     je .b
-    cmp eax, 4
-    je .f
-    CG load_local_a
+    cmp eax, LS_Q
+    je .q
+    CG lea_local_a                      ; a float (widened to a double) or a sized integer (extended)
+    mov rdi, rsi
+    jmp emit_load_type
+.q: CG load_local_a
     ret
 .b: CG load_local_a1
-    ret
-.f: CG lea_local_a                      ; a float local: widened to a double
-    CG load4_a
-    CG ftod
     ret
 
 ; store_local_typed: edi = frame offset, rsi = type. Stores A into the variable
@@ -2638,15 +2876,34 @@ store_local_typed:
     test esi, 0xFF00
     jnz .st
     cmp sil, TY_BOOL
-    jne .st
+    jne .ext
     CG tobool
+    jmp .st
+.ext:
+    mov rdi, rsi                        ; int8_t ... uint32_t: A becomes the stored value
+    push r9
+    call emit_extend
+    pop r9
 .st:
     pop rdi
-    cmp r9d, 1
+    cmp r9d, LS_U8
     je .b
-    cmp r9d, 4
+    cmp r9d, LS_I8
+    je .b
+    cmp r9d, LS_F32
     je .f
-    CG store_local_a
+    cmp r9d, LS_Q
+    je .q
+    CG lea_local_b                      ; 2 or 4 bytes
+    cmp r9d, LS_U16
+    je .h
+    cmp r9d, LS_I16
+    je .h
+    CG store4
+    ret
+.h: CG store2
+    ret
+.q: CG store_local_a
     ret
 .b: CG store_local_a1
     ret

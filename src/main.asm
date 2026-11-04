@@ -2351,6 +2351,7 @@ force_direct:   resd 1
 agg_base:       resd 1
 st_base:        resd STRUCT_MAX         ; index of the base class + 1 (0 = none)
 st_vptr:        resd STRUCT_MAX         ; offset of the vtable pointer in the object + 1 (0 = none)
+st_align:       resb STRUCT_MAX         ; alignment of the struct: the largest alignment of its fields (0 = none yet)
 st_vcount:      resd STRUCT_MAX         ; number of virtual methods
 st_vt:          resd STRUCT_MAX         ; offset of the vtable in the data section + 1
 vt_method:      resd STRUCT_MAX * VT_MAX ; per class: symbol index of the method in each vtable slot

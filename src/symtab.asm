@@ -407,6 +407,8 @@ type_size:
     test edi, 0xFF00
     jnz .ptr
     movzx eax, dil
+    cmp eax, TY_I8
+    jae .sized
     cmp eax, TY_INT
     je .eight
     cmp eax, TY_DOUBLE
@@ -425,6 +427,9 @@ type_size:
 .four:
     mov eax, 4
     ret
+.sized:
+    movzx eax, byte [sized_size + rax - TY_I8]
+    ret
 .ptr:
     mov eax, 8
     ret
@@ -442,11 +447,13 @@ type_pointee_size:
     sub rdi, TY_PTR1
     jmp type_size
 
-; type_ls: rdi = type -> eax = 0 aggregate (no scalar load), 1 byte, 8 qword
+; type_ls: rdi = type -> eax = LS_* (0 aggregate (no scalar load), 1 unsigned byte, 8 qword, 4 float, ... see defs.inc)
 type_ls:
     test edi, 0xFF00
     jnz .q
     movzx eax, dil
+    cmp eax, TY_I8
+    jae .sized
     cmp eax, TY_CHAR
     je .b
     cmp eax, TY_BOOL
@@ -460,10 +467,21 @@ type_ls:
 .q: mov eax, 8
     ret
 .f4:
-    mov eax, 4                          ; a float: 4 bytes, loads widen to double and stores narrow
+    mov eax, LS_F32                     ; a float: 4 bytes, loads widen to double and stores narrow
+    ret
+.sized:
+    movzx eax, byte [sized_ls + rax - TY_I8]
     ret
 .b: mov eax, 1
     ret
 .agg:
     xor eax, eax
     ret
+
+section .rodata
+; the sized integer types TY_I8 .. TY_U64: size in bytes, and how they are loaded / stored
+sized_size:     db 1, 2, 4, 1, 2, 4, 8
+sized_ls:       db LS_I8, LS_I16, LS_I32, LS_U8, LS_U16, LS_U32, LS_Q
+; the types of the keywords K_I8 .. K_U64 (int64_t is int)
+sized_kw_types: db TY_I8, TY_I16, TY_I32, TY_INT, TY_U8, TY_U16, TY_U32, TY_U64
+section .text

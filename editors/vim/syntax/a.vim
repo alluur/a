@@ -10,7 +10,7 @@ syn keyword aStructure   struct class enum
 syn keyword aStorage     const static typedef union asm double float defer goto extern
 syn keyword aAccess      public private protected virtual super
 syn keyword aModule      module import a_module a_import
-syn keyword aType        int long char byte bool void func
+syn keyword aType        int long char byte bool void func short signed unsigned int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
 syn keyword aOperatorKw  new sizeof asm
 syn keyword aSelf        this
 syn keyword aBoolean     true false

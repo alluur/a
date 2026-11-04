@@ -899,6 +899,58 @@ la64_load4_a:   LA 0x2A800084                   ; ld.wu $a0, $a0, 0
 la64_store4:    LA 0x298000A4                   ; st.w $a0, $a1, 0
                 ret
 
+; ---- sized and unsigned integers ----
+la64_load2_a:   LA 0x2A400084                   ; ld.hu $a0, $a0, 0
+                ret
+la64_store2:    LA 0x294000A4                   ; st.h $a0, $a1, 0
+                ret
+la64_sext8:     LA 0x00005C84                   ; ext.w.b $a0, $a0
+                ret
+la64_sext16:    LA 0x00005884                   ; ext.w.h $a0, $a0
+                ret
+la64_sext32:    LA 0x02800084                   ; addi.w $a0, $a0, 0
+                ret
+la64_zext16:    LA 0x00CF0084                   ; bstrpick.d $a0, $a0, 15, 0
+                ret
+la64_zext32:    LA 0x00DF0084                   ; bstrpick.d $a0, $a0, 31, 0
+                ret
+la64_udiv:      LA 0x00231484                   ; div.du $a0, $a0, $a1
+                ret
+la64_umod:      LA 0x00239484                   ; mod.du $a0, $a0, $a1
+                ret
+la64_shr:       LA 0x00191484                   ; srl.d $a0, $a0, $a1
+                ret
+la64_ubias:     LA 0x0320000C                   ; lu52i.d $t0, $zero, -2048  (1 << 63)
+                LA 0x0015B084                   ; xor $a0, $a0, $t0
+                LA 0x0015B0A5                   ; xor $a1, $a1, $t0
+                ret
+la64_utod:      LA 0x0114A880                   ; movgr2fr.d $f0, $a0
+                LA 0x64002080                   ; bge $a0, $zero, .pos (+32)
+                LA 0x0045048C                   ; srli.d $t0, $a0, 1
+                LA 0x0340048D                   ; andi $t1, $a0, 1
+                LA 0x0015358C                   ; or $t0, $t0, $t1
+                LA 0x0114A980                   ; movgr2fr.d $f0, $t0
+                LA 0x011D2800                   ; ffint.d.l $f0, $f0
+                LA 0x01010000                   ; fadd.d $f0, $f0, $f0
+                LA 0x50000800                   ; b .done (+8)
+                LA 0x011D2800                   ; .pos: ffint.d.l $f0, $f0
+                LA 0x0114B804                   ; .done: movfr2gr.d $a0, $f0
+                ret
+la64_dtou:      LA 0x0114A880                   ; movgr2fr.d $f0, $a0
+                LA 0x0310F80C                   ; lu52i.d $t0, $zero, 0x43e  (2^63 as a double)
+                LA 0x0114A981                   ; movgr2fr.d $f1, $t0
+                LA 0x0C210400                   ; fcmp.clt.d $fcc0, $f0, $f1
+                LA 0x48001D00                   ; bcnez $fcc0, .small (+28)
+                LA 0x01030400                   ; fsub.d $f0, $f0, $f1
+                LA 0x011AA800                   ; ftintrz.l.d $f0, $f0
+                LA 0x0114B804                   ; movfr2gr.d $a0, $f0
+                LA 0x0320000C                   ; lu52i.d $t0, $zero, -2048
+                LA 0x0015B084                   ; xor $a0, $a0, $t0
+                LA 0x50000C00                   ; b .done (+12)
+                LA 0x011AA800                   ; .small: ftintrz.l.d $f0, $f0
+                LA 0x0114B804                   ; movfr2gr.d $a0, $f0
+                ret                             ; .done
+
 section .rodata
 %macro CGT_LA64 1
     dq la64_%1

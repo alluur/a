@@ -186,7 +186,9 @@ Version 0.1.0 is deliberately small. Known limitations — all of them are on th
 
 * **Floating point:** `double` (binary64) and `float` (binary32, 4 bytes in memory) use the FPU of the target CPU; expressions are
   evaluated in double. `--soft-float` switches to the software implementation (for AOS). The C library modules `cmath` / `cfloat`
-  still take doubles as bit patterns held in ints. No `unsigned` or sized integer types yet.
+  still take doubles as bit patterns held in ints.
+* **Integers:** `int` is 64-bit; `int8_t` … `uint32_t` (and `short`, `unsigned`) are stored with their size and read as an `int`
+  (C's promotion with a 64-bit `int`); `uint64_t` has unsigned division, shifts and comparisons. Structs use the C layout.
 * Function pointers are the type `func` (no signature checking); no bit-fields; a C-style preprocessor (`#define`, `#include`, `#if`) is built in.
   `typedef`, `union`, `static` locals, structs by value, default parameter values and `...` with `va_arg` exist.
 

@@ -882,6 +882,38 @@ a64_load4_a:    A64 0xB9400000                  ; ldr w0, [x0]
 a64_store4:     A64 0xB9000020                  ; str w0, [x1]
                 ret
 
+; ---- sized and unsigned integers ----
+a64_load2_a:    A64 0x79400000                  ; ldrh w0, [x0]
+                ret
+a64_store2:     A64 0x79000020                  ; strh w0, [x1]
+                ret
+a64_sext8:      A64 0x93401C00                  ; sxtb x0, w0
+                ret
+a64_sext16:     A64 0x93403C00                  ; sxth x0, w0
+                ret
+a64_sext32:     A64 0x93407C00                  ; sxtw x0, w0
+                ret
+a64_zext16:     A64 0x53003C00                  ; uxth w0, w0
+                ret
+a64_zext32:     A64 0x2A0003E0                  ; mov w0, w0
+                ret
+a64_udiv:       A64 0x9AC10800                  ; udiv x0, x0, x1
+                ret
+a64_umod:       A64 0x9AC10802                  ; udiv x2, x0, x1
+                A64 0x9B018040                  ; msub x0, x2, x1, x0
+                ret
+a64_shr:        A64 0x9AC12400                  ; lsr x0, x0, x1
+                ret
+a64_ubias:      A64 0xD2410000                  ; eor x0, x0, #0x8000000000000000
+                A64 0xD2410021                  ; eor x1, x1, #0x8000000000000000
+                ret
+a64_utod:       A64 0x9E630000                  ; ucvtf d0, x0
+                A64 0x9E660000                  ; fmov x0, d0
+                ret
+a64_dtou:       A64 0x9E670000                  ; fmov d0, x0
+                A64 0x9E790000                  ; fcvtzu x0, d0
+                ret
+
 section .rodata
 %macro CGT_A64 1
     dq a64_%1

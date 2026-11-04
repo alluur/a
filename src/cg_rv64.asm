@@ -984,6 +984,43 @@ rv64_load4_a:   RV 0x00056503                   ; lwu a0, 0(a0)
 rv64_store4:    RV 0x00A5A023                   ; sw a0, 0(a1)
                 ret
 
+; ---- sized and unsigned integers ----
+rv64_load2_a:   RV 0x00055503                   ; lhu a0, 0(a0)
+                ret
+rv64_store2:    RV 0x00A59023                   ; sh a0, 0(a1)
+                ret
+rv64_sext8:     RV 0x03851513                   ; slli a0, a0, 56
+                RV 0x43855513                   ; srai a0, a0, 56
+                ret
+rv64_sext16:    RV 0x03051513                   ; slli a0, a0, 48
+                RV 0x43055513                   ; srai a0, a0, 48
+                ret
+rv64_sext32:    RV 0x0005051B                   ; addiw a0, a0, 0
+                ret
+rv64_zext16:    RV 0x03051513                   ; slli a0, a0, 48
+                RV 0x03055513                   ; srli a0, a0, 48
+                ret
+rv64_zext32:    RV 0x02051513                   ; slli a0, a0, 32
+                RV 0x02055513                   ; srli a0, a0, 32
+                ret
+rv64_udiv:      RV 0x02B55533                   ; divu a0, a0, a1
+                ret
+rv64_umod:      RV 0x02B57533                   ; remu a0, a0, a1
+                ret
+rv64_shr:       RV 0x00B55533                   ; srl a0, a0, a1
+                ret
+rv64_ubias:     RV 0x00100293                   ; addi t0, zero, 1
+                RV 0x03F29293                   ; slli t0, t0, 63
+                RV 0x00554533                   ; xor a0, a0, t0
+                RV 0x0055C5B3                   ; xor a1, a1, t0
+                ret
+rv64_utod:      RV 0xD2357053                   ; fcvt.d.lu f0, a0
+                RV 0xE2000553                   ; fmv.x.d a0, f0
+                ret
+rv64_dtou:      RV 0xF2050053                   ; fmv.d.x f0, a0
+                RV 0xC2301553                   ; fcvt.lu.d a0, f0, rtz
+                ret
+
 section .rodata
 %macro CGT_RV64 1
     dq rv64_%1

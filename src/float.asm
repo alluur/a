@@ -19,6 +19,8 @@ fn_dcmp:  db "dcmp", 0
 fn_itod:  db "itod", 0
 fn_dtoi:  db "dtoi", 0
 fn_dneg:  db "dneg", 0
+fn_utod:  db "__utod", 0
+fn_dtou:  db "__dtou", 0
 CSTR msg_dblop, "operator not available for double (use + - * / and comparisons)"
 CSTR msg_dblmix, "a double can only be combined with an int or a double"
 section .text
@@ -33,10 +35,12 @@ call_rt1:
     CG drop
     ret
 
-; is_intlike: rdi = type -> eax = 1 for plain int, char, bool (also enums)
+; is_intlike: rdi = type -> eax = 1 for plain int, char, bool (also enums) and uint64_t
 is_intlike:
     xor eax, eax
     cmp rdi, TY_INT
+    je .y
+    cmp rdi, TY_U64
     je .y
     cmp rdi, TY_CHAR
     je .y
@@ -61,30 +65,54 @@ coerce_to:
     jne .out
     cmp rbx, TY_BOOL
     je .to_bool
+    cmp rbx, TY_U64
+    je .to_u64
     cmp rbx, TY_INT
     je .to_int
     cmp rbx, TY_CHAR
-    jne .out
-.to_int:
+    je .to_int
+    mov rdi, rbx
+    call is_small_int
+    test eax, eax
+    jz .out
+.to_int:                                ; (the store or emit_extend narrows a small integer type afterwards)
     cmp dword [soft_float], 0
     jne .to_int_soft
     CG dtoi
-    mov [e_type], rbx
-    jmp .out
+    jmp .int_t
 .to_int_soft:
     mov rdi, fn_dtoi
     call call_rt1
-    mov [e_type], rbx
+.int_t:
+    mov rdi, rbx
+    call value_type
+    jmp .out
+.to_u64:
+    cmp dword [soft_float], 0
+    jne .to_u64_soft
+    CG dtou
+    jmp .u64_t
+.to_u64_soft:
+    mov rdi, fn_dtou
+    call call_rt1
+.u64_t:
+    mov qword [e_type], TY_U64
     jmp .out
 .to_bool:
     call double_to_bool
     jmp .out
 .to_double:
+    cmp rax, TY_U64
+    je .from_u64
     mov rdi, rax
     call is_intlike
     test eax, eax
     jz .out
     call emit_itod
+    mov qword [e_type], TY_DOUBLE
+    jmp .out
+.from_u64:
+    call emit_utod
     mov qword [e_type], TY_DOUBLE
 .out:
     pop rbx
@@ -107,6 +135,16 @@ dbits_to_fbits:
     cvtsd2ss xmm0, xmm0
     movd eax, xmm0
     ret
+
+; emit_utod: A = (double)A for an unsigned A (uint64_t)
+emit_utod:
+    cmp dword [soft_float], 0
+    jne .soft
+    CG utod
+    ret
+.soft:
+    mov rdi, fn_utod
+    jmp call_rt1
 
 ; emit_itod: A = (double)A (the FPU, or the soft-float itod with --soft-float)
 emit_itod:
@@ -198,6 +236,10 @@ float_binop:
 .r_int:
     ; right is an int, left a double: convert the right one
     mov rdi, fn_itod
+    cmp r13, TY_U64
+    jne .r_int1
+    mov rdi, fn_utod
+.r_int1:
     call call_rt1
     CG push_a
     jmp .call
@@ -209,6 +251,10 @@ float_binop:
     mov edi, 1
     CG load_stack_a
     mov rdi, fn_itod
+    cmp r12, TY_U64
+    jne .l_int1
+    mov rdi, fn_utod
+.l_int1:
     call call_rt1
     CG pop_b
     mov edi, 1
@@ -232,13 +278,23 @@ float_binop:
     mov edi, msg_dblmix
     jmp fatal_error
 .hw_rint:
+    cmp r13, TY_U64
+    je .hw_ru
     CG itod
+    jmp .hw_r
+.hw_ru:
+    CG utod
 .hw_r:
     CG mov_b_a
     CG pop_a
     cmp r12, TY_DOUBLE
     je .hw_op
+    cmp r12, TY_U64
+    je .hw_lu
     CG itod                             ; (A only: B is kept)
+    jmp .hw_op
+.hw_lu:
+    CG utod
 .hw_op:
     cmp ebx, '+'
     jne .hw1

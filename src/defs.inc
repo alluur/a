@@ -109,7 +109,18 @@
 %define K_ASM           197
 %define K_GOTO          200
 %define K_EXTERN        202
-%define K_INTMOD        201     ; short long signed unsigned (all the same 64-bit int, see LANGUAGE.md)
+%define K_I8            204     ; int8_t ... uint64_t: the sized integer types (K_I8 + n is the type sized_kw_types[n])
+%define K_I16           205
+%define K_I32           206
+%define K_I64           207
+%define K_U8            208
+%define K_U16           209
+%define K_U32           210
+%define K_U64           211
+%define K_SHORT         212     ; the C words short long signed unsigned (combined by parse_type)
+%define K_LONG          213
+%define K_SIGNED        214
+%define K_UNSIGNED      215
 %define K_DEFER         199     ; defer expression;
 %define K_FLOAT         203     ; float (with --soft-float the same type as double)
 %define K_DOUBLE        198     ; double     ; asm(a, b, c) { x64: ...; arm64: ...; }
@@ -192,6 +203,23 @@
 %define TY_DOUBLE       6       ; double: an IEEE 754 binary64 held in the 64-bit slot (FPU instructions, or soft-float calls)
 %define TY_FLOAT        7       ; float: binary32 in memory (4 bytes); its value is a double in A (loads widen, stores narrow)
 %define TY_FUNC         5       ; function pointer (the type "func")
+%define TY_I8           8       ; int8_t ... uint64_t (int16_t is "short", uint32_t "unsigned int", uint64_t "unsigned long").
+%define TY_I16          9       ; In memory they have their size; their values are an int in A (sign or zero extended), except
+%define TY_I32          10      ; uint64_t, which stays uint64_t: with it / % >> and comparisons are unsigned
+%define TY_U8           11
+%define TY_U16          12
+%define TY_U32          13
+%define TY_U64          14
+; type_ls results: how a scalar is loaded and stored
+%define LS_AGG          0       ; an aggregate (no scalar load)
+%define LS_U8           1       ; one byte, zero extended (char, bool, uint8_t)
+%define LS_U16          2
+%define LS_U32          3
+%define LS_F32          4       ; a float: binary32 widened to a double
+%define LS_I8           5       ; one byte, sign extended
+%define LS_I16          6
+%define LS_I32          7
+%define LS_Q            8       ; 8 bytes
 %define TY_PTR1         0x100
 %define TF_ARRAY_BIT    32
 
@@ -353,6 +381,20 @@
     %1 ftod                ; A = the double of the binary32 bits in the low 32 bits of A
     %1 load4_a             ; A = *(dword*)A (zero extended)
     %1 store4              ; *(dword*)B = A (the low 32 bits)
+    ; sized and unsigned integers
+    %1 load2_a ; A = *(word*)A (zero extended)
+    %1 store2 ; *(word*)B = A (the low 16 bits)
+    %1 sext8 ; A = the low 8 bits of A, sign extended
+    %1 sext16
+    %1 sext32
+    %1 zext16 ; A = the low 16 bits of A, zero extended
+    %1 zext32
+    %1 udiv ; A = A / B, unsigned 64 bit
+    %1 umod
+    %1 shr ; A = A >> B, logical (zeros shifted in)
+    %1 ubias ; A ^= 1 << 63, B ^= 1 << 63: a signed comparison after it compares A and B as unsigned
+    %1 utod ; A = (double)A, A unsigned
+    %1 dtou ; A = (uint64)A, truncated toward zero
 %endmacro
 
 %assign CGI_COUNT 0

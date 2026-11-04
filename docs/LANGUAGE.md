@@ -45,17 +45,42 @@ it is defined. (Types, constants and enums, however, must be declared before the
 
 | Type | Size | Notes |
 |---|---|---|
-| `int` (alias `long`) | 8 bytes | signed 64-bit integer |
+| `int` (alias `long`, `int64_t`) | 8 bytes | signed 64-bit integer |
 | `char` (alias `byte`) | 1 byte | unsigned 8-bit, used for text and raw bytes |
 | `bool` | 1 byte | `true` / `false`; any value stored in a `bool` becomes 0 or 1 |
+| `int8_t` `int16_t` `int32_t` | 1, 2, 4 bytes | signed sized integers (`signed char`, `short`) |
+| `uint8_t` `uint16_t` `uint32_t` | 1, 2, 4 bytes | unsigned sized integers (`unsigned short`, `unsigned` / `unsigned int`) |
+| `uint64_t` | 8 bytes | unsigned 64-bit integer (`unsigned long`); `/ % >>` and comparisons are unsigned |
+| `double` / `float` | 8 / 4 bytes | IEEE 754 binary64 / binary32, see [floating point](#static-if--and-floating-point) |
 | `void` | – | no value; also `void*` as a generic pointer |
 | `T*` | 8 bytes | pointer to `T`, e.g. `int*`, `char**`, `Node*` |
 | `T name[N]` | `N * sizeof(T)` | fixed array, `N` is a constant expression |
-| `struct S` / `class C` | sum of the fields | see [section 8](#8-structs-and-classes) |
+| `struct S` / `class C` | the fields, laid out like C | see [section 8](#8-structs-and-classes) |
 | `enum E` | 8 bytes | behaves like `int` |
 
 `sizeof(Type)` gives the size in bytes: `sizeof(int)` is 8, `sizeof(char)` is 1,
 `sizeof(int*)` is 8, `sizeof(Point)` is the size of the struct.
+
+**Sized and unsigned integers.** A variable, field, array element or parameter of a sized type takes exactly its size in
+memory, and a value stored into it is converted like in C: truncated to the low bytes, so `uint8_t b = 300;` gives 44 and
+`int8_t a = 200;` gives -56 (the value of the assignment, `++` and `--` is the converted value too). When it is read, the
+value is sign or zero extended to a 64-bit `int`, so arithmetic on the narrow types is ordinary `int` arithmetic, exactly like
+C's integer promotion on a machine where `int` has 64 bits: `uint32_t h; h * 2` does not wrap at 32 bits until it is stored
+again (write `(uint32_t)(h * 2)` to wrap within an expression). Casts `(int16_t) x` truncate and extend; converting a
+`double` truncates toward zero first. `uint64_t` stays unsigned in expressions: if one operand of `/ % < <= > >=` is a
+`uint64_t` the operation is unsigned (as in C, `u > -1` is false because -1 becomes the largest `uint64_t`), `>>` of a
+`uint64_t` shifts in zeros, and `uint64_t` <-> `double` conversions are unsigned. `printInt` prints the bits as a signed
+number; use `printf("%u", u)` for the unsigned text.
+
+    uint8_t pixels[4] = {255, 128, 300, -1};      // 255 128 44 255
+    int16_t s = 40000;                             // -25536
+    uint64_t u = 0xFFFFFFFFFFFFFFFF;               // u / 3 = 6148914691236517205, u > 1 is true
+    uint32_t crc = 0xEDB88320;                     // a 4-byte field in a file header, a pixel channel ...
+
+The C words combine as in C, with C's sizes, except that `int` and `long` are both the 64-bit `int`: `short` = `int16_t`,
+`unsigned short` = `uint16_t`, `unsigned` / `unsigned int` = `uint32_t`, `unsigned long` / `unsigned long long` = `uint64_t`,
+`signed char` = `int8_t`, `unsigned char` = `char`, `long double` = `double`. A C header line such as
+`typedef unsigned char uint8_t;` is accepted and ignored (the built-in type stays).
 
 Arrays decay to a pointer to their first element when used as a value (`int* p = arr;`).
 Pointers may be compared with `==` / `!=`, added to or subtracted from integers (scaled by the
@@ -407,9 +432,8 @@ expression is not evaluated and must not contain function calls. For an array na
 `sizeof(a) / sizeof(a[0])` is the element count. (An array that is a struct field cannot be measured this way; use `sizeof(Type)`.)
 
 **C integer words.** `short`, `long`, `signed`, `unsigned` (also `long long`, `unsigned long int`, `long double`) are accepted
-and mean the ordinary A types: all integers are the 64-bit signed `int`, `unsigned char` is `char`, `long double` is `double`
-(`float` is a real 4-byte type, see above).
-No unsigned arithmetic happens, so use the `%u`/`%x` conversions or the unsigned helpers of the library when it matters.
+and mean the sized types of [section 2](#2-types): `short` is `int16_t`, `unsigned` is `uint32_t`, `unsigned long` is
+`uint64_t`, while `int`, `long` and `long long` are all the 64-bit `int`.
 
 **Adjacent string literals** are joined: `"Hello, " "world"` (also across lines).
 
@@ -529,7 +553,9 @@ asm() { x64: 0x90; arm64: 0xD503201F; riscv64: 0x00000013; loongarch64: 0x034000
 
 ## 8. Structs and classes
 
-`struct` and `class` are the same construct with different defaults:
+`struct` and `class` are the same construct with different defaults (the layout is C's: every field is aligned to its size,
+a struct to its most aligned field, and its size is a multiple of that, so `struct { float x; float y; float z; }` is 12 bytes and
+`struct { uint8_t r; uint8_t g; uint8_t b; uint8_t a; }` is 4; a class with virtual methods also holds an 8-byte vtable pointer):
 
 | | members are… |
 |---|---|
@@ -1198,11 +1224,11 @@ The process exit code is 1; on success it is 0.
 ## 15. Differences from C
 
 * Classes with methods, constructors and `public` / `private`; modules (`import`) as well as the C-style `#include`.
-* `int` is 64-bit; `char` is unsigned; `bool` is a real type.
+* `int` is 64-bit (so the narrow types promote to a 64-bit `int`, like C on an ILP64 machine); `char` is unsigned; `bool` is a real type.
 * All variables start zeroed; `new` returns zeroed memory; `new` has no `free` (`malloc` / `free` come with `cstdlib`).
 * Functions may be used before their definition without prototypes.
 * `const NAME = value;` declares a compile-time constant.
-* No unsigned arithmetic or bit-fields. Function pointers exist as the type `func`; parameters can have default values.
+* No bit-fields. Function pointers exist as the type `func`; parameters can have default values.
 * Structs can be passed and returned by value (a hidden copy), `typedef`, `union`, `static` locals, default values (also text) and
-  variadic functions (`...` with `va_arg`) exist; unsigned arithmetic and bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in, and units can be compiled separately and linked (`ac -c`).
+  variadic functions (`...` with `va_arg`) exist; bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in, and units can be compiled separately and linked (`ac -c`).
 * `switch` labels must be constant expressions (like C), and `case` values must fit in 32 bits.
