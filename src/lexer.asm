@@ -453,6 +453,21 @@ next_token:
     jne .numdone
     ERR "binary literal has no digits"
 .numdone:
+    ; C style suffixes (u, U, l, L, ul, ull, ...) are accepted and ignored: every integer literal is a 64-bit int
+    xor ecx, ecx
+.sfx:
+    movzx eax, byte [rsi]
+    or al, 0x20
+    cmp al, 'u'
+    je .sfx1
+    cmp al, 'l'
+    jne .sfxend
+.sfx1:
+    inc rsi
+    inc ecx
+    cmp ecx, 3
+    jb .sfx
+.sfxend:
     mov qword [tk], T_NUM
     mov [tk_val], r12
     mov [src_ptr], rsi

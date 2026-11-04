@@ -415,7 +415,23 @@ type_size:
     je .eight
     cmp eax, TY_STRUCT
     je .struct
+    cmp eax, TY_U64
+    je .eight
+    cmp eax, TY_I32
+    je .four
+    cmp eax, TY_U32
+    je .four
+    cmp eax, TY_I16
+    je .two
+    cmp eax, TY_U16
+    je .two
     mov eax, 1
+    ret
+.four:
+    mov eax, 4
+    ret
+.two:
+    mov eax, 2
     ret
 .eight:
     mov eax, 8
@@ -437,7 +453,8 @@ type_pointee_size:
     sub rdi, TY_PTR1
     jmp type_size
 
-; type_ls: rdi = type -> eax = 0 aggregate (no scalar load), 1 byte, 8 qword
+; type_ls: rdi = type -> eax = 0 aggregate (no scalar load), 1 byte (unsigned), 8 qword, and for the fixed width
+; integers 2 (uint16), 4 (uint32), 0x11 (int8), 0x12 (int16), 0x14 (int32): bit 4 = sign extended, low bits = bytes
 type_ls:
     test edi, 0xFF00
     jnz .q
@@ -450,10 +467,108 @@ type_ls:
     je .agg
     cmp eax, TY_VOID
     je .agg
+    cmp eax, TY_I8
+    je .i8
+    cmp eax, TY_I16
+    je .i16
+    cmp eax, TY_U16
+    je .u16
+    cmp eax, TY_I32
+    je .i32
+    cmp eax, TY_U32
+    je .u32
 .q: mov eax, 8
     ret
 .b: mov eax, 1
     ret
+.i8:  mov eax, 0x11
+    ret
+.i16: mov eax, 0x12
+    ret
+.u16: mov eax, 2
+    ret
+.i32: mov eax, 0x14
+    ret
+.u32: mov eax, 4
+    ret
 .agg:
     xor eax, eax
     ret
+
+; ls_align: eax = a type_ls code -> eax = the alignment of such a value inside a structure (1, 2, 4 or 8)
+ls_align:
+    cmp eax, 1
+    je .r
+    cmp eax, 0x11
+    je .one
+    cmp eax, 2
+    je .r
+    cmp eax, 0x12
+    je .two
+    cmp eax, 4
+    je .r
+    cmp eax, 0x14
+    je .four
+    mov eax, 8
+    ret
+.one: mov eax, 1
+    ret
+.two: mov eax, 2
+    ret
+.four: mov eax, 4
+.r: ret
+
+; const_truncate: rdi = type, rax = a constant value -> rax cut to the width of char / int8 / int16 / uint16 / int32 / uint32 (other types: unchanged)
+const_truncate:
+    test edi, 0xFF00
+    jnz .r
+    cmp dil, TY_CHAR
+    je .u8
+    cmp dil, TY_I8
+    je .i8
+    cmp dil, TY_I16
+    je .i16
+    cmp dil, TY_U16
+    je .u16
+    cmp dil, TY_I32
+    je .i32
+    cmp dil, TY_U32
+    je .u32
+.r: ret
+.u8:  movzx eax, al
+    ret
+.i8:  movsx rax, al
+    ret
+.i16: movsx rax, ax
+    ret
+.u16: movzx eax, ax
+    ret
+.i32: movsxd rax, eax
+    ret
+.u32: mov eax, eax
+    ret
+
+; type_wraps: rdi = type -> eax = 1 for int32 and uint32: arithmetic on two such values wraps at 32 bits (int8 / int16 / uint16 are
+; promoted to int first, like in C, and only truncated when they are stored)
+type_wraps:
+    xor eax, eax
+    test edi, 0xFF00
+    jnz .n
+    cmp dil, TY_I32
+    je .y
+    cmp dil, TY_U32
+    jne .n
+.y: mov eax, 1
+.n: ret
+
+; type_is_narrow: rdi = type -> eax = 1 for int8 int16 uint16 int32 uint32 (values that need truncating after arithmetic)
+type_is_narrow:
+    xor eax, eax
+    test edi, 0xFF00
+    jnz .n
+    cmp dil, TY_I8
+    jb .n
+    cmp dil, TY_U32
+    ja .n
+    mov eax, 1
+.n: ret

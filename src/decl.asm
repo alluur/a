@@ -441,6 +441,12 @@ parse_enum:
     call sym_index
     mov r12d, eax
     call next_token
+    cmp qword [tk], ':'
+    jne .nobase
+    call next_token                     ; enum Name : uint8 { ... }  - the storage type of the enum
+    call parse_type
+    mov [rbx+SYM_TYPE], rax
+.nobase:
     mov edi, '{'
     call expect
     xor r13d, r13d
@@ -482,6 +488,11 @@ parse_enum:
     jmp .semi
 .skip:
     call next_token
+    cmp qword [tk], ':'
+    jne .sk1
+    call next_token
+    call parse_type
+.sk1:
     call skip_block
 .semi:
     cmp qword [tk], ';'
@@ -732,7 +743,8 @@ parse_aggregate:
     mov r13, [agg_mtype]
     mov rdi, r13
     call type_ls
-    mov r14d, eax                       ; 1 = byte aligned
+    call ls_align
+    mov r14d, eax                       ; 1, 2, 4 or 8 byte alignment (the size of a narrow integer, else 8)
     cmp qword [tk], '['
     jne .fscalar
     call next_token
@@ -759,10 +771,7 @@ parse_aggregate:
     shl rax, 5
     add rax, struct_tab
     mov ecx, [rax+ST_SIZE]
-    mov edx, 8
-    cmp r14d, 1
-    jne .fal
-    mov edx, 1
+    mov edx, r14d
 .fal:
     lea rsi, [rdx-1]
     add rcx, rsi

@@ -28,10 +28,67 @@ emit_load_type:
     je .q
     cmp eax, 1
     je .b
+    test eax, eax
+    jz .agg
+    cmp eax, 0x11
+    je .i8
+    cmp eax, 2
+    je .u16
+    cmp eax, 0x12
+    je .i16
+    cmp eax, 4
+    je .u32
+    CG load4_a                          ; int32
+    CG sext32
+.agg:
     ret
 .q: CG load8_a
     ret
 .b: CG load1_a
+    ret
+.i8:
+    CG load1_a
+    CG sext8
+    ret
+.u16:
+    CG load2_a
+    ret
+.i16:
+    CG load2_a
+    CG sext16
+    ret
+.u32:
+    CG load4_a
+    ret
+
+; emit_normalize: rdi = type. Emits the truncation of A to the width of a narrow integer type (nothing for other types)
+emit_normalize:
+    test edi, 0xFF00
+    jnz .r
+    cmp dil, TY_CHAR
+    je .u8
+    call type_is_narrow
+    test eax, eax
+    jz .r
+    cmp dil, TY_I8
+    je .i8
+    cmp dil, TY_I16
+    je .i16
+    cmp dil, TY_U16
+    je .u16
+    cmp dil, TY_I32
+    je .i32
+    CG zext32
+.r: ret
+.u8:  CG zext8
+    ret
+.i8:  CG sext8
+    ret
+.i16: CG sext16
+    ret
+.u16: CG zext16
+    ret
+.i32: CG sext32
     ret
 
 ; emit_store_type: rdi = type. Emits  *(type*)rcx = rax  (memcpy for aggregates:
@@ -43,9 +100,28 @@ emit_store_type:
     je .q
     cmp eax, 1
     je .b
+    test eax, eax
+    jnz .narrow
     call type_size
     mov rdi, rax
     CG copy_mem
+    jmp .out
+.narrow:
+    ; int8 .. uint32: A is truncated first so that the value of an assignment expression is the stored one
+    mov rdi, [rsp]
+    call emit_normalize
+    mov rdi, [rsp]
+    call type_ls
+    and eax, 7
+    cmp eax, 1
+    je .n1
+    cmp eax, 2
+    je .n2
+    CG store4
+    jmp .out
+.n1: CG store1
+    jmp .out
+.n2: CG store2
     jmp .out
 .q: CG store8
     jmp .out
@@ -277,11 +353,20 @@ binop_emit:
     push rbx
     push r12
     push r13
+    push r14
     mov ebx, edi
     mov r12, rsi
     mov r13, rdx
     mov qword [e_lval], 0
     mov qword [e_type], TY_INT
+    xor r14d, r14d                      ; 1 when an operand is a uint64: unsigned division, shift and comparison
+    cmp r12, TY_U64
+    je .u64
+    cmp r13, TY_U64
+    jne .nou64
+.u64:
+    mov r14d, 1
+.nou64:
     cmp ebx, '+'
     je .add
     cmp ebx, '-'
@@ -330,7 +415,7 @@ binop_emit:
     mov [e_type], r13
 .doadd:
     CG add
-    jmp .out
+    jmp .aout
 .sub:
     test r12d, 0xFF00
     jz .dosub
@@ -341,7 +426,7 @@ binop_emit:
     mov [e_type], r12
 .dosub:
     CG sub
-    jmp .out
+    jmp .aout
 .ptrdiff:
     CG sub
     mov rdi, r12
@@ -354,28 +439,43 @@ binop_emit:
     jmp .out
 .mul:
     CG mul
-    jmp .out
+    jmp .aout
 .div:
+    test r14d, r14d
+    jnz .udiv
     CG div
-    jmp .out
+    jmp .aout
+.udiv:
+    CG udiv
+    jmp .aout
 .mod:
+    test r14d, r14d
+    jnz .umod
     CG mod
-    jmp .out
+    jmp .aout
+.umod:
+    CG umod
+    jmp .aout
 .and:
     CG and
-    jmp .out
+    jmp .aout
 .or:
     CG or
-    jmp .out
+    jmp .aout
 .xor:
     CG xor
-    jmp .out
+    jmp .aout
 .shl:
     CG shl
-    jmp .out
+    jmp .shout
 .shr:
+    cmp r12, TY_U64
+    je .ushr
     CG sar
-    jmp .out
+    jmp .shout
+.ushr:
+    CG shr
+    jmp .shout
 .eq:
     mov r8d, CC_EQ
     call .cmark
@@ -387,24 +487,45 @@ binop_emit:
     CG cmp_ne
     jmp .cdone
 .lt:
+    test r14d, r14d
+    jnz .ult
     mov r8d, CC_LT
     call .cmark
     CG cmp_lt
     jmp .cdone
+.ult:
+    CG cmp_ult
+    jmp .out
 .gt:
+    test r14d, r14d
+    jnz .ugt
     mov r8d, CC_GT
     call .cmark
     CG cmp_gt
     jmp .cdone
+.ugt:
+    CG cmp_ugt
+    jmp .out
 .le:
+    test r14d, r14d
+    jnz .ule
     mov r8d, CC_LE
     call .cmark
     CG cmp_le
     jmp .cdone
+.ule:
+    CG cmp_ule
+    jmp .out
 .ge:
+    test r14d, r14d
+    jnz .uge
     mov r8d, CC_GE
     call .cmark
     CG cmp_ge
+    jmp .cdone
+.uge:
+    CG cmp_uge
+    jmp .out
 .cdone:
     mov rax, [code_pos]
     mov [cmp_end], rax
@@ -414,11 +535,58 @@ binop_emit:
     mov [cmp_pos], rax
     mov [cmp_cc], r8d
     ret
+; the result type of arithmetic: pointer arithmetic keeps its pointer type; a uint64 operand makes the result a uint64;
+; two operands of the same 32-bit type give that type, truncated (so uint32 arithmetic wraps); 8 and 16 bit values are promoted to int; else int
+.aout:
+    cmp qword [e_type], TY_INT
+    jne .out
+    test r14d, r14d
+    jnz .u64res
+    cmp r12, r13
+    jne .out
+    mov rdi, r12
+    call type_wraps
+    test eax, eax
+    jz .out
+    mov [e_type], r12
+    mov rdi, r12
+    call emit_normalize
+    jmp .out
+.u64res:
+    mov qword [e_type], TY_U64
+    jmp .out
+; a shift has the type of its left operand
+.shout:
+    cmp r12, TY_U64
+    je .u64res
+    mov rdi, r12
+    call type_wraps
+    test eax, eax
+    jz .out
+    mov [e_type], r12
+    mov rdi, r12
+    call emit_normalize
 .out:
+    pop r14
     pop r13
     pop r12
     pop rbx
     ret
+
+; unary_type: the value in A is the result of - or ~ on the operand whose type is in e_type: a uint64 stays one, a narrow integer
+; wraps at its own width, everything else is an int
+unary_type:
+    mov rdi, [e_type]
+    cmp rdi, TY_U64
+    je .r
+    call type_wraps
+    test eax, eax
+    jz .int
+    mov rdi, [e_type]
+    jmp emit_normalize
+.int:
+    mov qword [e_type], TY_INT
+.r: ret
 
 ; ---- types in source -----------------------------------------------------------
 ; is_type_start -> eax = 1 if the current token begins a type
@@ -605,6 +773,9 @@ parse_type:
 .enum:
     call check_access
     mov ebx, TY_INT
+    mov rcx, [rax+SYM_TYPE]             ; enum Name : uint8 { ... }
+    test rcx, rcx
+    cmovnz rbx, rcx
     test dword [rax+SYM_FLAGS], F_FUNCTYPE
     jz .star0
     mov ebx, TY_FUNC
@@ -1448,6 +1619,8 @@ parse_primary:
     je .cchar
     cmp bl, TY_BOOL
     je .cbool
+    mov rdi, rbx
+    call emit_normalize                 ; (int8) (int16) (uint16) (int32) (uint32): truncate and extend
     jmp .cdone
 .cchar:
     CG zext8
@@ -1458,6 +1631,8 @@ parse_primary:
 .cconv:
     mov rdi, rbx
     call coerce_to                      ; int <-> double
+    mov rdi, rbx
+    call emit_normalize
 .cdone:
     mov [e_type], rbx
     mov qword [e_lval], 0
@@ -2297,8 +2472,7 @@ parse_unary:
     ret
 .negreal:
     CG neg
-    mov qword [e_type], TY_INT
-    ret
+    jmp unary_type
 .negdbl:
     cmp rax, [imm_pos]
     jne .negdbl_rt
@@ -2338,8 +2512,7 @@ parse_unary:
     call parse_unary
     call to_rvalue
     CG not
-    mov qword [e_type], TY_INT
-    ret
+    jmp unary_type
 .deref:
     call next_token
     call parse_unary
@@ -2571,10 +2744,18 @@ load_local_typed:
     pop rdi
     cmp eax, 1
     je .b
+    cmp eax, 8
+    jne .narrow
     CG load_local_a
     ret
 .b: CG load_local_a1
     ret
+.narrow:
+    ; int8 .. uint32 (and aggregates, which never get here): through the address
+    push rsi
+    CG lea_local_a
+    pop rdi
+    jmp emit_load_type
 
 ; store_local_typed: edi = frame offset, rsi = type. Stores A into the variable
 ; (bool variables are normalised to 0 / 1). A keeps the stored value.
@@ -2592,10 +2773,18 @@ store_local_typed:
     pop rdi
     cmp r9d, 1
     je .b
+    cmp r9d, 8
+    jne .narrow
     CG store_local_a
     ret
 .b: CG store_local_a1
     ret
+.narrow:
+    ; int8 .. uint32: truncate A, then store the low bytes through the address (A keeps the stored value)
+    push rsi
+    CG lea_local_b
+    pop rdi
+    jmp emit_store_type
 
 ; parse_expr: an expression with the comma operator,  a, b  evaluates a, then b, and has the value of b
 parse_expr:

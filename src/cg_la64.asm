@@ -491,6 +491,58 @@ la64_zext8:     LA LA_2RI12(LA_ANDI, 255, A0, A0)
 la64_tobool:    LA LA_3R(LA_SLTU, A0, ZERO, A0)
                 ret
 
+; ---- narrow integers and unsigned operations (types int8 .. uint64) ----------------------------------------------
+la64_load2_a:
+    LA 0x2A400084   ; ld.hu $a0, $a0, 0
+    ret
+la64_load4_a:
+    LA 0x2A800084   ; ld.wu $a0, $a0, 0
+    ret
+la64_store2:
+    LA 0x294000A4   ; st.h $a0, $a1, 0
+    ret
+la64_store4:
+    LA 0x298000A4   ; st.w $a0, $a1, 0
+    ret
+la64_sext8:
+    LA 0x00005C84   ; ext.w.b $a0, $a0
+    ret
+la64_sext16:
+    LA 0x00005884   ; ext.w.h $a0, $a0
+    ret
+la64_sext32:
+    LA 0x00408084   ; slli.w $a0, $a0, 0
+    ret
+la64_zext16:
+    LA 0x00CF0084   ; bstrpick.d $a0, $a0, 15, 0
+    ret
+la64_zext32:
+    LA 0x00DF0084   ; bstrpick.d $a0, $a0, 31, 0
+    ret
+la64_udiv:
+    LA 0x00231484   ; div.du $a0, $a0, $a1
+    ret
+la64_umod:
+    LA 0x00239484   ; mod.du $a0, $a0, $a1
+    ret
+la64_shr:
+    LA 0x00191484   ; srl.d $a0, $a0, $a1
+    ret
+la64_cmp_ult:
+    LA 0x00129484   ; sltu $a0, $a0, $a1
+    ret
+la64_cmp_ugt:
+    LA 0x001290A4   ; sltu $a0, $a1, $a0
+    ret
+la64_cmp_ule:
+    LA 0x001290A4   ; sltu $a0, $a1, $a0; xori $a0, $a0, 1
+    LA 0x03C00484
+    ret
+la64_cmp_uge:
+    LA 0x00129484   ; sltu $a0, $a0, $a1; xori $a0, $a0, 1
+    LA 0x03C00484
+    ret
+
 ; ---- jumps ---------------------------------------------------------------------------------------
 ; the 26 bit field of b / bl: low 16 bits of the word offset at bit 10, the high 10 bits at bit 0
 ; la64_chain_slot: rdi = &head. Emits a 'b' whose offset field holds the previous chain head (as a word offset)

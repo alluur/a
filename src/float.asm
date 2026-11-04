@@ -38,6 +38,13 @@ is_intlike:
     je .y
     cmp rdi, TY_CHAR
     je .y
+    cmp rdi, TY_U64
+    je .y
+    cmp rdi, TY_I8
+    jb .nb
+    cmp rdi, TY_U32
+    jbe .y
+.nb:
     cmp rdi, TY_BOOL
     jne .n
 .y: mov eax, 1
@@ -60,7 +67,13 @@ coerce_to:
     cmp rbx, TY_INT
     je .to_int
     cmp rbx, TY_CHAR
-    jne .out
+    je .to_int
+    cmp rbx, TY_U64
+    je .to_int
+    cmp rbx, TY_I8
+    jb .out
+    cmp rbx, TY_U32
+    ja .out
 .to_int:
     mov rdi, fn_dtoi
     call call_rt1

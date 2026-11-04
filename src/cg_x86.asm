@@ -256,6 +256,52 @@ x86_zext8:      EM 0x0F, 0xB6, 0xC0
 x86_tobool:     EM 0x48, 0x85, 0xC0, 0x0F, 0x95, 0xC0, 0x0F, 0xB6, 0xC0
                 ret
 
+; ---- narrow integers and unsigned operations (types int8 .. uint64) ----------------------------------------------
+x86_load2_a:    EM 0x0F, 0xB7, 0x00             ; movzx eax, word [rax]
+                ret
+x86_load4_a:    EM 0x8B, 0x00                   ; mov eax, [rax]
+                ret
+x86_store2:     EM 0x66, 0x89, 0x01             ; mov [rcx], ax
+                ret
+x86_store4:     EM 0x89, 0x01                   ; mov [rcx], eax
+                ret
+x86_sext8:      EM 0x48, 0x0F, 0xBE, 0xC0       ; movsx rax, al
+                ret
+x86_sext16:     EM 0x48, 0x0F, 0xBF, 0xC0       ; movsx rax, ax
+                ret
+x86_sext32:     EM 0x48, 0x63, 0xC0             ; movsxd rax, eax
+                ret
+x86_zext16:     EM 0x0F, 0xB7, 0xC0             ; movzx eax, ax
+                ret
+x86_zext32:     EM 0x89, 0xC0                   ; mov eax, eax
+                ret
+x86_udiv:       EM 0x31, 0xD2, 0x48, 0xF7, 0xF1                         ; xor edx, edx ; div rcx
+                ret
+x86_umod:       EM 0x31, 0xD2, 0x48, 0xF7, 0xF1, 0x48, 0x89, 0xD0      ; ... ; mov rax, rdx
+                ret
+x86_shr:        EM 0x48, 0xD3, 0xE8             ; shr rax, cl
+                ret
+x86_cmp_ult:    push rdi
+                mov dil, 0x92                   ; setb
+                call x86_cmp_cc
+                pop rdi
+                ret
+x86_cmp_ugt:    push rdi
+                mov dil, 0x97                   ; seta
+                call x86_cmp_cc
+                pop rdi
+                ret
+x86_cmp_ule:    push rdi
+                mov dil, 0x96                   ; setbe
+                call x86_cmp_cc
+                pop rdi
+                ret
+x86_cmp_uge:    push rdi
+                mov dil, 0x93                   ; setae
+                call x86_cmp_cc
+                pop rdi
+                ret
+
 ; ---- jumps ---------------------------------------------------------------------------
 ; chain_slot: rdi = address of a chain head variable. Emits a 4 byte link
 ; placeholder and makes the head point to it.

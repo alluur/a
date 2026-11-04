@@ -573,6 +573,62 @@ rv64_zext8:     RV RV_I(255, A0, 7, A0, 0x13)          ; andi a0, a0, 255
 rv64_tobool:    RV RV_R(0, A0, X0, 3, A0, 0x33)        ; sltu a0, x0, a0
                 ret
 
+; ---- narrow integers and unsigned operations (types int8 .. uint64) ----------------------------------------------
+rv64_load2_a:
+    RV 0x00055503   ; lhu a0, 0(a0)
+    ret
+rv64_load4_a:
+    RV 0x00056503   ; lwu a0, 0(a0)
+    ret
+rv64_store2:
+    RV 0x00A59023   ; sh a0, 0(a1)
+    ret
+rv64_store4:
+    RV 0x00A5A023   ; sw a0, 0(a1)
+    ret
+rv64_sext8:
+    RV 0x03851513   ; slli a0, a0, 56; srai a0, a0, 56
+    RV 0x43855513
+    ret
+rv64_sext16:
+    RV 0x03051513   ; slli a0, a0, 48; srai a0, a0, 48
+    RV 0x43055513
+    ret
+rv64_sext32:
+    RV 0x0005051B   ; addiw a0, a0, 0
+    ret
+rv64_zext16:
+    RV 0x03051513   ; slli a0, a0, 48; srli a0, a0, 48
+    RV 0x03055513
+    ret
+rv64_zext32:
+    RV 0x02051513   ; slli a0, a0, 32; srli a0, a0, 32
+    RV 0x02055513
+    ret
+rv64_udiv:
+    RV 0x02B55533   ; divu a0, a0, a1
+    ret
+rv64_umod:
+    RV 0x02B57533   ; remu a0, a0, a1
+    ret
+rv64_shr:
+    RV 0x00B55533   ; srl a0, a0, a1
+    ret
+rv64_cmp_ult:
+    RV 0x00B53533   ; sltu a0, a0, a1
+    ret
+rv64_cmp_ugt:
+    RV 0x00A5B533   ; sltu a0, a1, a0
+    ret
+rv64_cmp_ule:
+    RV 0x00A5B533   ; sltu a0, a1, a0; xori a0, a0, 1
+    RV 0x00154513
+    ret
+rv64_cmp_uge:
+    RV 0x00B53533   ; sltu a0, a0, a1; xori a0, a0, 1
+    RV 0x00154513
+    ret
+
 ; ---- jumps ---------------------------------------------------------------------------------------
 ; rv64_chain_slot: rdi = &head. Emits  auipc t0,0 ; <previous head>  and makes this pair the new head
 rv64_chain_slot:

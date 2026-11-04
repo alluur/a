@@ -368,6 +368,9 @@ parse_return:
     CG tobool
     jmp .j
 .notbool:
+    mov rdi, [rax+SYM_TYPE]
+    call emit_normalize                 ; a narrow result is returned truncated and extended
+    mov rax, [cur_func]
     ; a struct result is copied to the address that the caller passed as the hidden last argument
     mov rdx, [rax+SYM_TYPE]
     test edx, 0xFF00
@@ -748,6 +751,8 @@ parse_const_decl:
     jmp .chave
 .iconst:
     call const_expr
+    mov rdi, rbx
+    call const_truncate                 ; const uint8 K = 300;  is 44
 .chave:
     push rax
     push rdx
@@ -1090,6 +1095,17 @@ init_elem:
     je .dq
     cmp eax, 1
     je .db
+    test eax, eax
+    jz .dbad
+    and eax, 7
+    cmp eax, 2
+    je .dw
+    mov [data_buf + r12], ecx           ; int32 / uint32
+    jmp .out
+.dw:
+    mov [data_buf + r12], cx            ; int16 / uint16
+    jmp .out
+.dbad:
     ERR "a struct value cannot be used here, use a {...} list"
 .db:
     mov [data_buf + r12], cl

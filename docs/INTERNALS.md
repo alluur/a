@@ -431,3 +431,16 @@ All of it is ordinary A code in embedded modules (see docs/GUI.md for the user v
   tried, 4 to 1024) and writes the fixed Huffman code; it falls back to stored blocks if that would be larger. The decompressor is the
   puff-style canonical decoder, with the output buffer growing by doubling. `tests/t133_zlib.a` embeds a stream made by another
   program (dynamic Huffman blocks and a file name in the gzip header).
+
+## Fixed width integer types
+
+* Kinds `TY_I8 TY_I16 TY_U16 TY_I32 TY_U32 TY_U64` (`uint8` is `TY_CHAR`, `int64` is `TY_INT`) are registered as predefined typedefs by
+  `register_builtins` (table `int_type_tab`), so they follow ordinary type lookup and a program may still `typedef` its own `uint32`.
+* `type_size` gives 1/2/4/8; `type_ls` returns a load class (1, 8, and 2, 4, 0x11, 0x12, 0x14 for the narrow ones, bit 4 = sign
+  extended); `ls_align` turns it into the alignment used for struct fields. `emit_load_type` / `emit_store_type` use the new
+  back-end primitives `load2_a load4_a store2 store4 sext8 sext16 sext32 zext16 zext32`; a store truncates A first (`emit_normalize`)
+  so an assignment expression yields the stored value.
+* `uint64` adds `udiv umod shr cmp_ult cmp_ugt cmp_ule cmp_uge`; `binop_emit` selects them when either operand is a `uint64`
+  (these comparisons do not set the compare-and-jump peephole markers). `.aout` / `.shout` / `unary_type` give the result type:
+  two equal int32 / uint32 operands wrap at 32 bits, int8 / int16 / uint16 are promoted to int, a uint64 operand makes a uint64.
+* The primitives were assembled with llvm-mc for all four back-ends; `tests/t138_inttypes.a` passes on every target.

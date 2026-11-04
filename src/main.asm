@@ -161,6 +161,8 @@ EMB "hash",        "lib/hash.a"
 EMB "zlib",        "lib/zlib.a"
 EMB "tar",         "lib/tar.a"
 EMB "ini",         "lib/ini.a"
+EMB "bits",        "lib/bits.a"
+EMB "bytebuf",     "lib/bytebuf.a"
 EMB "secure",        "lib/secure.a"
 EMB "des",           "lib/des.a"
 EMB "bn",            "lib/bn.a"
@@ -927,6 +929,39 @@ builtin_col:
     mov eax, 32
 .r: ret
 
+section .rodata
+; names of the fixed width integer types and what they are (uint8 is char, int64 is int)
+itn_int8: db "int8", 0
+itn_int16: db "int16", 0
+itn_int32: db "int32", 0
+itn_int64: db "int64", 0
+itn_uint8: db "uint8", 0
+itn_uint16: db "uint16", 0
+itn_uint32: db "uint32", 0
+itn_uint64: db "uint64", 0
+itn_size_t: db "size_t", 0
+itn_ssize_t: db "ssize_t", 0
+itn_intptr_t: db "intptr_t", 0
+itn_uintptr_t: db "uintptr_t", 0
+itn_ptrdiff_t: db "ptrdiff_t", 0
+align 8
+int_type_tab:
+    dq itn_int8, TY_I8
+    dq itn_int16, TY_I16
+    dq itn_int32, TY_I32
+    dq itn_int64, TY_INT
+    dq itn_uint8, TY_CHAR
+    dq itn_uint16, TY_U16
+    dq itn_uint32, TY_U32
+    dq itn_uint64, TY_U64
+    dq itn_size_t, TY_U64
+    dq itn_ssize_t, TY_INT
+    dq itn_intptr_t, TY_INT
+    dq itn_uintptr_t, TY_U64
+    dq itn_ptrdiff_t, TY_INT
+    dq 0, 0
+section .text
+
 register_builtins:
     push rbx
     push r12
@@ -945,6 +980,23 @@ register_builtins:
     mov qword [rax+SYM_TYPE], TY_INT
     mov ecx, [arch]
     mov [rax+SYM_VAL], rcx
+    ; the fixed width integer type names
+    mov rbx, int_type_tab
+.it:
+    mov rdi, [rbx]
+    test rdi, rdi
+    jz .itdone
+    call cstrlen
+    mov esi, eax
+    mov rdi, [rbx]
+    mov edx, S_TYPEDEF
+    call sym_new
+    mov rcx, [rbx+8]
+    mov [rax+SYM_TYPE], rcx
+    mov dword [rax+SYM_FLAGS], F_BUILTIN | F_DEFINED
+    add rbx, 16
+    jmp .it
+.itdone:
     ; the type name "func" (a function pointer)
     mov rdi, s_func_name
     mov esi, 4

@@ -517,6 +517,61 @@ a64_tobool:     A64 0xF100001F
                 A64 0x9A9F07E0
                 ret
 
+; ---- narrow integers and unsigned operations (types int8 .. uint64) ----------------------------------------------
+a64_load2_a:
+    A64 0x79400000   ; ldrh w0, [x0]
+    ret
+a64_load4_a:
+    A64 0xB9400000   ; ldr w0, [x0]
+    ret
+a64_store2:
+    A64 0x79000020   ; strh w0, [x1]
+    ret
+a64_store4:
+    A64 0xB9000020   ; str w0, [x1]
+    ret
+a64_sext8:
+    A64 0x93401C00   ; sxtb x0, w0
+    ret
+a64_sext16:
+    A64 0x93403C00   ; sxth x0, w0
+    ret
+a64_sext32:
+    A64 0x93407C00   ; sxtw x0, w0
+    ret
+a64_zext16:
+    A64 0x53003C00   ; uxth w0, w0
+    ret
+a64_zext32:
+    A64 0x2A0003E0   ; mov w0, w0
+    ret
+a64_udiv:
+    A64 0x9AC10800   ; udiv x0, x0, x1
+    ret
+a64_umod:
+    A64 0x9AC10802   ; udiv x2, x0, x1; msub x0, x2, x1, x0
+    A64 0x9B018040
+    ret
+a64_shr:
+    A64 0x9AC12400   ; lsr x0, x0, x1
+    ret
+a64_cmp_ult:
+    A64 0xEB01001F   ; cmp x0, x1; cset x0, lo
+    A64 0x9A9F27E0
+    ret
+a64_cmp_ugt:
+    A64 0xEB01001F   ; cmp x0, x1; cset x0, hi
+    A64 0x9A9F97E0
+    ret
+a64_cmp_ule:
+    A64 0xEB01001F   ; cmp x0, x1; cset x0, ls
+    A64 0x9A9F87E0
+    ret
+a64_cmp_uge:
+    A64 0xEB01001F   ; cmp x0, x1; cset x0, hs
+    A64 0x9A9F37E0
+    ret
+
 ; ---- jumps ---------------------------------------------------------------------------------------
 ; a64_chain_slot: rdi = &head. Emits a 'b' whose imm26 holds the previous chain head
 a64_chain_slot:

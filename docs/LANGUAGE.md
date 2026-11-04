@@ -52,7 +52,11 @@ it is defined. (Types, constants and enums, however, must be declared before the
 | `T*` | 8 bytes | pointer to `T`, e.g. `int*`, `char**`, `Node*` |
 | `T name[N]` | `N * sizeof(T)` | fixed array, `N` is a constant expression |
 | `struct S` / `class C` | sum of the fields | see [section 8](#8-structs-and-classes) |
-| `enum E` | 8 bytes | behaves like `int` |
+| `enum E` | 8 bytes | behaves like `int`; `enum E : uint8 { ... }` picks the storage type |
+| `int8` `int16` `int32` `int64` | 1, 2, 4, 8 bytes | signed integers of exactly that width |
+| `uint8` `uint16` `uint32` `uint64` | 1, 2, 4, 8 bytes | unsigned integers (`uint8` is `char`, `int64` is `int`) |
+| `size_t` `uintptr_t` | 8 bytes | `uint64` |
+| `ssize_t` `intptr_t` `ptrdiff_t` | 8 bytes | `int64` |
 
 `sizeof(Type)` gives the size in bytes: `sizeof(int)` is 8, `sizeof(char)` is 1,
 `sizeof(int*)` is 8, `sizeof(Point)` is the size of the struct.
@@ -63,6 +67,33 @@ element size), and subtracted from each other.
 
 Casts use C syntax: `(char)x` truncates to 8 bits, `(bool)x` turns any non-zero value into 1,
 `(int)p` and `(char*)p` reinterpret without changing the value.
+
+### Fixed width integers
+
+`int8` ... `uint64` have exactly the size in their name, in variables, struct fields (naturally aligned: a `uint16` starts at an even
+offset, a `uint32` at a multiple of 4), arrays, pointers (`uint16*` steps by 2), parameters and results.
+
+```c
+struct Header { uint8 kind; uint16 length; uint32 id; int8 delta; int16 offset; int32 code; uint64 stamp; }   // 24 bytes
+uint8 b = 300;           // 44: every store keeps only the bits that fit
+int8 a = 200;            // -56: reading sign extends (unsigned types zero extend)
+uint32 w = 0; w = w - 1; // 4294967295: arithmetic on two int32 / uint32 values wraps at 32 bits
+uint64 big = 0xFFFFFFFFFFFFFFFF;
+big / 2;  big % 10;  big >> 60;  big > 1;     // division, remainder, shifts and comparisons are unsigned
+(uint16) -1;             // 65535: a cast truncates and extends
+```
+
+* Values live in the 64-bit registers sign or zero extended; narrow values are cut when they are **stored** (assignment,
+  initialiser, argument of a narrow parameter, `return`), when they are **cast**, and when **two 32-bit values of the same type
+  are combined** (`uint32 + uint32` is a `uint32`). `int8`, `int16` and `uint16` are promoted to `int` in arithmetic, like in C:
+  `uint16 a = 65535; a + 1` is 65536 and becomes 0 only when stored into a `uint16`.
+* A `uint64` operand makes `/ % >> < > <= >=` unsigned and the result a `uint64`. Mixing it with a signed value converts to unsigned,
+  as in C. Everything else is compared as the 64-bit signed numbers it is, so `uint32 4000000000 > int32 -1` is true.
+* `printf("%d", x)` prints a `uint64` above 2^63 as a negative number; use `%u`.
+* Integer literals may have C suffixes (`10u`, `10L`, `10UL`, `10ull`); they are accepted and ignored, every literal is a 64-bit int.
+* `short`, `long`, `signed` and `unsigned` are still plain 64-bit `int` (existing programs depend on it); use the names above when the
+  width matters. `climits` has `INT8_MIN` ... `UINT64_MAX`; `bits` and `bytebuf` work with the fixed widths (rotations, byte swaps, reading
+  and writing 16/32/64-bit fields in either byte order).
 
 ## 3. Literals
 
@@ -87,6 +118,7 @@ Point q = p;              // copies the whole struct
 const MAX = 100;          // compile-time constant (type inferred: int)
 const TITLE = "A";        // constants may also be strings
 const int MASK = 0xF0;    // optionally with a type
+const uint8 SMALL = 300;  // a typed constant is cut to its type: 44
 ```
 
 * **Every variable is zero-initialised** — locals, arrays, structs and heap memory.
@@ -398,7 +430,7 @@ expression is not evaluated and must not contain function calls. For an array na
 
 **C integer words.** `short`, `long`, `signed`, `unsigned` (also `long long`, `unsigned long int`, `long double`) are accepted
 and mean the ordinary A types: all integers are the 64-bit signed `int`, `unsigned char` is `char`, `long double` is `double`.
-No unsigned arithmetic happens, so use the `%u`/`%x` conversions or the unsigned helpers of the library when it matters.
+Use `uint8` ... `uint64` (see section 2) when you need a width or unsigned arithmetic.
 
 **Adjacent string literals** are joined: `"Hello, " "world"` (also across lines).
 
@@ -614,6 +646,13 @@ Color d = Red;                              // unqualified also works
 
 Enum constants are `int` constants usable in `switch` labels, array sizes and other constant
 expressions. A trailing comma is allowed.
+
+An enum can be stored in fewer bytes with a base type (handy in structures that are sent over a wire or written to a file):
+
+```c
+enum Kind : uint8 { Text, Binary, Image }       // sizeof(Kind) is 1
+struct Frame { Kind kind; uint16 length; }
+```
 
 ## 10. Modules and imports
 
@@ -922,6 +961,8 @@ code only to programs that import them, and a file of the same name next to your
 | `encoding` | `base64Encode/Decode`, `hexEncode/Decode`, `urlEncode/Decode` |
 | `hash` | `crc32 crc32Update adler32 fnv1a djb2 md5 sha1 sha256 sha384 sha512` (`...Raw` give the bytes), `hmac`, `digest` |
 | `zlib` | `gzip gunzip compress decompress deflate inflate` (DEFLATE with hash chains, zlib and gzip containers, checksums verified) |
+| `bits` | `popcount clz ctz log2 isPow2 nextPow2 mask rotl32 rotr32 rotl64 rotr64 bswap16/32/64 rev8..rev64 get set clear flip field insert signExtend fitsSigned fitsUnsigned udiv umod ucmp` |
+| `bytebuf` | `getU16le getU32be getU64le ... putU32be ...`, classes `Buf` (`u8 u16be u32le u64be varint svarint cstr text bytes align patch32be`) and `Reader` (range checked, `bad` flag), `humanSize parseSize hex fromHex hexdump` |
 | `tar` | `Writer` (`add addDir finish`) and `Reader` (`next`, `name size isDir data`): POSIX ustar archives in memory |
 | `ini` | `parse(text)`, `load(path)`; `Ini` has `get getInt getBool set remove has toString` |
 | `cli` | class `ArgParser`: `addFlag addOption parse flag option optionInt positional positionalCount printHelp` (short, long, `--x=value`, combined `-abc`) |
@@ -1187,11 +1228,11 @@ The process exit code is 1; on success it is 0.
 ## 15. Differences from C
 
 * Classes with methods, constructors and `public` / `private`; modules (`import`) as well as the C-style `#include`.
-* `int` is 64-bit; `char` is unsigned; `bool` is a real type.
+* `int` is 64-bit; `char` is unsigned; `bool` is a real type. The sized types `int8` ... `uint64` exist, `short` / `long` / `unsigned` do not change the size.
 * All variables start zeroed; `new` returns zeroed memory; `new` has no `free` (`malloc` / `free` come with `cstdlib`).
 * Functions may be used before their definition without prototypes.
 * `const NAME = value;` declares a compile-time constant.
-* No unsigned arithmetic or bit-fields. Function pointers exist as the type `func`; parameters can have default values.
+* Unsigned arithmetic only through `uint64` (and the narrower unsigned types), no bit-fields. Function pointers exist as the type `func`; parameters can have default values.
 * Structs can be passed and returned by value (a hidden copy), `typedef`, `union`, `static` locals, default values (also text) and
-  variadic functions (`...` with `va_arg`) exist; unsigned arithmetic and bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in, and units can be compiled separately and linked (`ac -c`).
+  variadic functions (`...` with `va_arg`) exist; bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in, and units can be compiled separately and linked (`ac -c`).
 * `switch` labels must be constant expressions (like C), and `case` values must fit in 32 bits.

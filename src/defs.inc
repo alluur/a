@@ -190,6 +190,13 @@
 %define TY_STRUCT       4
 %define TY_DOUBLE       6       ; double (and float): an IEEE 754 binary64 held in the 64-bit slot, arithmetic by soft-float calls
 %define TY_FUNC         5       ; function pointer (the type "func")
+; fixed width integers (uint8 is the type char). Values live sign / zero extended in the 64-bit slot; every store truncates.
+%define TY_I8           7
+%define TY_I16          8
+%define TY_U16          9
+%define TY_I32          10
+%define TY_U32          11
+%define TY_U64          12      ; 64 bits, unsigned division / remainder / right shift / comparisons
 %define TY_PTR1         0x100
 %define TF_ARRAY_BIT    32
 
@@ -339,6 +346,22 @@
     %1 epilogue            ; return to the caller
     %1 set_frame           ; edi = frame size in bytes (multiple of 16)
     %1 entry_args          ; edi = number of main() parameters (0..2): pushes argc/argv
+    %1 load2_a             ; A = *(uint16*)A
+    %1 load4_a             ; A = *(uint32*)A
+    %1 store2              ; *(uint16*)B = A
+    %1 store4              ; *(uint32*)B = A
+    %1 sext8               ; A = sign extended low 8 bits of A
+    %1 sext16
+    %1 sext32
+    %1 zext16              ; A = zero extended low 16 bits of A
+    %1 zext32
+    %1 udiv                ; A = A / B (unsigned)
+    %1 umod
+    %1 shr                 ; A = A >> B (logical)
+    %1 cmp_ult             ; A = (A < B) unsigned
+    %1 cmp_ugt
+    %1 cmp_ule
+    %1 cmp_uge
 %endmacro
 
 %assign CGI_COUNT 0
