@@ -47,7 +47,7 @@ Two more CPU families with the same source, the same standard library and the sa
 |---|---|---|---|
 | x86-64 | 0 | `linux`, `windows`, `android-x64` | |
 | AArch64 (ARM64) | 1 | `linux-arm64`, `android` | phones, tablets, Raspberry Pi, Apple silicon VMs |
-| RISC-V 64 | 2 | `linux-riscv64`, `android-riscv64` | needs the base integer set and the M extension (every RV64GC chip); no floating point or compressed instructions are used |
+| RISC-V 64 | 2 | `linux-riscv64`, `android-riscv64` | needs the base integer set and the M extension; programs that use `double` / `float` also need the F and D extensions (every RV64GC chip has all of them, and `--soft-float` avoids F and D); no compressed instructions are used |
 | LoongArch64 | 3 | `linux-loongarch64` | Loongson 3A5000 and later |
 
 Both are static Linux ELF files without libc, using the generic Linux system call numbers (the ones of AArch64);

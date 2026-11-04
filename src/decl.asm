@@ -761,8 +761,12 @@ parse_aggregate:
     mov ecx, [rax+ST_SIZE]
     mov edx, 8
     cmp r14d, 1
-    jne .fal
+    jne .fal4
     mov edx, 1
+.fal4:
+    cmp r14d, 4
+    jne .fal
+    mov edx, 4                          ; a float field: 4 byte aligned
 .fal:
     lea rsi, [rdx-1]
     add rcx, rsi
@@ -1494,7 +1498,14 @@ parse_global_vars:
     jmp .reg
 .i0:
     cmp rbx, TY_DOUBLE
+    je .i0dbl
+    cmp rbx, TY_FLOAT
     jne .i0int
+    call const_double
+    call dbits_to_fbits                 ; a float global: binary32 bits (in the low 4 bytes of its 8 byte cell)
+    xor edx, edx
+    jmp .i0got
+.i0dbl:
     call const_double
     xor edx, edx
     jmp .i0got

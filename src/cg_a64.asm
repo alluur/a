@@ -831,6 +831,57 @@ apply_relocs_a64:
 .done:
     ret
 
+; ---- hardware floating point (d0 / d1 / s0 and the scratch x3 / x4) --------------------------------------------------
+a64_fadd:       A64 0x9E670000                  ; fmov d0, x0
+                A64 0x9E670021                  ; fmov d1, x1
+                A64 0x1E612800                  ; fadd d0, d0, d1
+                A64 0x9E660000                  ; fmov x0, d0
+                ret
+a64_fsub:       A64 0x9E670000
+                A64 0x9E670021
+                A64 0x1E613800                  ; fsub d0, d0, d1
+                A64 0x9E660000
+                ret
+a64_fmul:       A64 0x9E670000
+                A64 0x9E670021
+                A64 0x1E610800                  ; fmul d0, d0, d1
+                A64 0x9E660000
+                ret
+a64_fdiv:       A64 0x9E670000
+                A64 0x9E670021
+                A64 0x1E611800                  ; fdiv d0, d0, d1
+                A64 0x9E660000
+                ret
+a64_fcmp:       A64 0x9E670000                  ; fmov d0, x0
+                A64 0x9E670021                  ; fmov d1, x1
+                A64 0x1E612000                  ; fcmp d0, d1
+                A64 0xD2800000                  ; mov x0, #0
+                A64 0xD2800023                  ; mov x3, #1
+                A64 0x92800004                  ; mov x4, #-1
+                A64 0x9A80C060                  ; csel x0, x3, x0, gt
+                A64 0x9A804080                  ; csel x0, x4, x0, mi   (less; unordered sets N = 0)
+                A64 0xD2800043                  ; mov x3, #2
+                A64 0x9A806060                  ; csel x0, x3, x0, vs   (unordered)
+                ret
+a64_itod:       A64 0x9E620000                  ; scvtf d0, x0
+                A64 0x9E660000                  ; fmov x0, d0
+                ret
+a64_dtoi:       A64 0x9E670000                  ; fmov d0, x0
+                A64 0x9E780000                  ; fcvtzs x0, d0
+                ret
+a64_dtof:       A64 0x9E670000                  ; fmov d0, x0
+                A64 0x1E624000                  ; fcvt s0, d0
+                A64 0x1E260000                  ; fmov w0, s0 (zero extends)
+                ret
+a64_ftod:       A64 0x1E270000                  ; fmov s0, w0
+                A64 0x1E22C000                  ; fcvt d0, s0
+                A64 0x9E660000                  ; fmov x0, d0
+                ret
+a64_load4_a:    A64 0xB9400000                  ; ldr w0, [x0]
+                ret
+a64_store4:     A64 0xB9000020                  ; str w0, [x1]
+                ret
+
 section .rodata
 %macro CGT_A64 1
     dq a64_%1

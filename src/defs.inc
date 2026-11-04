@@ -111,7 +111,8 @@
 %define K_EXTERN        202
 %define K_INTMOD        201     ; short long signed unsigned (all the same 64-bit int, see LANGUAGE.md)
 %define K_DEFER         199     ; defer expression;
-%define K_DOUBLE        198     ; double, float     ; asm(a, b, c) { x64: ...; arm64: ...; }
+%define K_FLOAT         203     ; float (with --soft-float the same type as double)
+%define K_DOUBLE        198     ; double     ; asm(a, b, c) { x64: ...; arm64: ...; }
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1
@@ -188,7 +189,8 @@
 %define TY_CHAR         2
 %define TY_BOOL         3
 %define TY_STRUCT       4
-%define TY_DOUBLE       6       ; double (and float): an IEEE 754 binary64 held in the 64-bit slot, arithmetic by soft-float calls
+%define TY_DOUBLE       6       ; double: an IEEE 754 binary64 held in the 64-bit slot (FPU instructions, or soft-float calls)
+%define TY_FLOAT        7       ; float: binary32 in memory (4 bytes); its value is a double in A (loads widen, stores narrow)
 %define TY_FUNC         5       ; function pointer (the type "func")
 %define TY_PTR1         0x100
 %define TF_ARRAY_BIT    32
@@ -339,6 +341,18 @@
     %1 epilogue            ; return to the caller
     %1 set_frame           ; edi = frame size in bytes (multiple of 16)
     %1 entry_args          ; edi = number of main() parameters (0..2): pushes argc/argv
+    ; hardware floating point: a double is its IEEE 754 binary64 bit pattern in A / B
+    %1 fadd                ; A = A + B
+    %1 fsub                ; A = A - B
+    %1 fmul                ; A = A * B
+    %1 fdiv                ; A = A / B
+    %1 fcmp                ; A = -1 (A < B), 0 (A == B), 1 (A > B) or 2 (unordered: a NaN)
+    %1 itod                ; A = (double)A
+    %1 dtoi                ; A = (int)A, truncated toward zero
+    %1 dtof                ; A = the binary32 (float) bits of the double A, zero extended
+    %1 ftod                ; A = the double of the binary32 bits in the low 32 bits of A
+    %1 load4_a             ; A = *(dword*)A (zero extended)
+    %1 store4              ; *(dword*)B = A (the low 32 bits)
 %endmacro
 
 %assign CGI_COUNT 0

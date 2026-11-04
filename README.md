@@ -184,8 +184,9 @@ same programs compiled by GCC, on every target (see [`docs/INTERNALS.md`](docs/I
 
 Version 0.1.0 is deliberately small. Known limitations — all of them are on the roadmap:
 
-* **No floating point types** yet (`float` / `double`): the `cmath` module does IEEE 754 arithmetic and all of `<math.h>` in
-  software on doubles held in ints. No `unsigned` or sized integer types.
+* **Floating point:** `double` (binary64) and `float` (binary32, 4 bytes in memory) use the FPU of the target CPU; expressions are
+  evaluated in double. `--soft-float` switches to the software implementation (for AOS). The C library modules `cmath` / `cfloat`
+  still take doubles as bit patterns held in ints. No `unsigned` or sized integer types yet.
 * Function pointers are the type `func` (no signature checking); no bit-fields; a C-style preprocessor (`#define`, `#include`, `#if`) is built in.
   `typedef`, `union`, `static` locals, structs by value, default parameter values and `...` with `va_arg` exist.
 

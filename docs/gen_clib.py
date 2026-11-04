@@ -73,12 +73,14 @@ Not modules because they are part of the language or the standard library that e
 * **There are no variable argument lists.** The `printf` family takes up to **eight** values after the format (default
   parameter values fill the rest), and the `v...` versions (`vsnprintf`, `vfprintf` ...) take an array of values
   (an `int*`) and their count instead of a `va_list`. Text and pointers are passed as they are.
-* **There is no `float` / `double` type.** A double is an `int` holding the 64-bit IEEE 754 pattern; arithmetic is done by
+* **Doubles are kept in ints here.** The C library modules were written before A had its own `double` type, so a double
+  is an `int` holding the 64-bit IEEE 754 pattern (`__dbl(i)` and `__bits(d)` convert to and from the language's `double` /
+  `float`, whose arithmetic uses the FPU); arithmetic is done by
   functions (`dadd dsub dmul ddiv`, compare with `dlt dle deq ...`) in software, exactly rounded. Literals come from text:
   `dlit("3.14")`, `itod(3)`. The `printf` family of the standard library prints integers; **`printfd`, `sprintfd`,
   `snprintfd`, `fprintfd`, `vformatd`** (module `cfloat`) understand `%f %e %g %a` as well.
-* **Speed of the floating point functions.** Everything is done in software with integer instructions, bit-exact on every
-  platform. On a current x86-64 machine: `dadd dsub dmul ddiv` about 0.1-0.3 microseconds, `sqrt` 0.4 microseconds,
+* **Speed of the floating point functions.** Everything in these modules is done in software with integer instructions,
+  bit-exact on every platform (the language's own `double` operators are hardware instructions and much faster). On a current x86-64 machine: `dadd dsub dmul ddiv` about 0.1-0.3 microseconds, `sqrt` 0.4 microseconds,
   `sin cos exp log` 40-60 microseconds, `pow atan` 100-160 microseconds, `erf tgamma` 250-330 microseconds. That is fast enough
   for tools, simulations with thousands of steps and plots, but not for millions of calls.
 * **Function pointers** are values of the type `func`: `func f = compare; f(a, b);`. `qsort`, `bsearch`, `atexit` and `signal`

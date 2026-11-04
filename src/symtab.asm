@@ -411,6 +411,8 @@ type_size:
     je .eight
     cmp eax, TY_DOUBLE
     je .eight
+    cmp eax, TY_FLOAT
+    je .four
     cmp eax, TY_FUNC
     je .eight
     cmp eax, TY_STRUCT
@@ -419,6 +421,9 @@ type_size:
     ret
 .eight:
     mov eax, 8
+    ret
+.four:
+    mov eax, 4
     ret
 .ptr:
     mov eax, 8
@@ -450,7 +455,12 @@ type_ls:
     je .agg
     cmp eax, TY_VOID
     je .agg
+    cmp eax, TY_FLOAT
+    je .f4
 .q: mov eax, 8
+    ret
+.f4:
+    mov eax, 4                          ; a float: 4 bytes, loads widen to double and stores narrow
     ret
 .b: mov eax, 1
     ret

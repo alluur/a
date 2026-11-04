@@ -28,10 +28,23 @@ emit_load_type:
     je .q
     cmp eax, 1
     je .b
+    cmp eax, 4
+    je .f
     ret
 .q: CG load8_a
     ret
 .b: CG load1_a
+    ret
+.f: CG load4_a                          ; a float: widened to a double
+    CG ftod
+    ret
+
+; value_type: rdi = a declared type -> [e_type] = the type of its value in A (a float is a double there)
+value_type:
+    cmp rdi, TY_FLOAT
+    jne .s
+    mov edi, TY_DOUBLE
+.s: mov [e_type], rdi
     ret
 
 ; emit_store_type: rdi = type. Emits  *(type*)rcx = rax  (memcpy for aggregates:
@@ -43,9 +56,15 @@ emit_store_type:
     je .q
     cmp eax, 1
     je .b
+    cmp eax, 4
+    je .f
     call type_size
     mov rdi, rax
     CG copy_mem
+    jmp .out
+.f: CG dtof                             ; a float: the double is narrowed; A = the stored value, as a double again
+    CG store4
+    CG ftod
     jmp .out
 .q: CG store8
     jmp .out
@@ -224,7 +243,9 @@ to_rvalue:
     je .f1
 .plain:
     mov rdi, [e_type]
-    jmp emit_load_type
+    call emit_load_type
+    mov rdi, [e_type]
+    jmp value_type
 .f8:
     mov r8d, [pk_off]
     mov rdi, [pk_pos]
@@ -446,6 +467,8 @@ is_type_start_impl:
     je .yes
     cmp eax, K_DOUBLE
     je .yes
+    cmp eax, K_FLOAT
+    je .yes
     cmp eax, K_CHAR
     je .yes
     cmp eax, K_BOOL
@@ -539,6 +562,8 @@ parse_type:
     je .char
     cmp eax, K_DOUBLE
     je .double
+    cmp eax, K_FLOAT
+    je .float
     mov ebx, TY_INT
     jmp .star
 .nomod:
@@ -546,6 +571,8 @@ parse_type:
     je .int
     cmp eax, K_DOUBLE
     je .double
+    cmp eax, K_FLOAT
+    je .float
     cmp eax, K_CHAR
     je .char
     cmp eax, K_BOOL
@@ -592,6 +619,12 @@ parse_type:
     jmp .star0
 .double:
     mov ebx, TY_DOUBLE
+    jmp .star0
+.float:
+    mov ebx, TY_FLOAT
+    cmp dword [soft_float], 0
+    je .star0
+    mov ebx, TY_DOUBLE                  ; --soft-float: float is double (no FPU to narrow it)
     jmp .star0
 .char:
     mov ebx, TY_CHAR
@@ -816,6 +849,10 @@ gen_call:
     jae .argcv
     mov rdi, [rax+rbx*8]
     call coerce_to
+    mov rax, [r12+SYM_EXTRA]
+    cmp qword [rax+rbx*8], TY_FLOAT
+    jne .argcv
+    CG dtof                             ; a float parameter: its slot holds the binary32 bits (the callee loads 4 bytes)
 .argcv:
     mov rax, [e_type]
     test eax, 0xFF00
@@ -962,8 +999,8 @@ gen_call:
     lea edi, [rbx+r13]
     CG drop
 .noadd:
-    mov rax, [r12+SYM_TYPE]
-    mov [e_type], rax
+    mov rdi, [r12+SYM_TYPE]
+    call value_type                     ; (a float result is returned as a double)
     mov qword [e_lval], r14                  ; a struct result is an address (the temporary)
     pop r15
     pop r14
@@ -1440,6 +1477,8 @@ parse_primary:
     call to_rvalue
     cmp rbx, TY_DOUBLE
     je .cconv
+    cmp rbx, TY_FLOAT
+    je .cconv
     cmp qword [e_type], TY_DOUBLE
     je .cconv
     test ebx, 0xFF00
@@ -1457,9 +1496,10 @@ parse_primary:
     jmp .cdone
 .cconv:
     mov rdi, rbx
-    call coerce_to                      ; int <-> double
+    call coerce_to                      ; int <-> double (a float cast rounds to float precision)
 .cdone:
-    mov [e_type], rbx
+    mov rdi, rbx
+    call value_type
     mov qword [e_lval], 0
     jmp .out
 
@@ -2130,6 +2170,8 @@ emit_incdec_postfix:
 .noarr:
     cmp rbx, TY_DOUBLE
     je .dbl
+    cmp rbx, TY_FLOAT
+    je .dbl
     mov rdi, rbx
     call type_ls
     test eax, eax
@@ -2188,7 +2230,8 @@ emit_incdec_postfix:
     jz .fin
     CG mov_a_d
 .fin:
-    mov [e_type], rbx
+    mov rdi, rbx
+    call value_type
     mov qword [e_lval], 0
     pop r15
     pop r14
@@ -2315,9 +2358,10 @@ parse_unary:
     call gen_imm_a
     mov qword [e_type], TY_DOUBLE
     ret
-.negdbl_rt:
-    mov rdi, fn_dneg
-    call call_rt1
+.negdbl_rt:                             ; flip the sign bit (no FPU or soft-float call needed)
+    mov rdi, 0x8000000000000000
+    CG imm_b
+    CG xor
     mov qword [e_type], TY_DOUBLE
     ret
 .plus:
@@ -2548,6 +2592,8 @@ parse_ternary:
     je .same
     cmp rbx, TY_DOUBLE
     je .conv2
+    cmp rbx, TY_FLOAT
+    je .conv2
     cmp rax, TY_DOUBLE
     jne .same
     ERR "the two results of ?: are an int and a double: cast one of them"
@@ -2571,9 +2617,15 @@ load_local_typed:
     pop rdi
     cmp eax, 1
     je .b
+    cmp eax, 4
+    je .f
     CG load_local_a
     ret
 .b: CG load_local_a1
+    ret
+.f: CG lea_local_a                      ; a float local: widened to a double
+    CG load4_a
+    CG ftod
     ret
 
 ; store_local_typed: edi = frame offset, rsi = type. Stores A into the variable
@@ -2592,9 +2644,16 @@ store_local_typed:
     pop rdi
     cmp r9d, 1
     je .b
+    cmp r9d, 4
+    je .f
     CG store_local_a
     ret
 .b: CG store_local_a1
+    ret
+.f: CG dtof                             ; a float local: narrowed; A = the stored value as a double
+    CG lea_local_b
+    CG store4
+    CG ftod
     ret
 
 ; parse_expr: an expression with the comma operator,  a, b  evaluates a, then b, and has the value of b
@@ -2658,7 +2717,8 @@ parse_assign:
     mov edi, r12d
     mov rsi, rbx
     call store_local_typed
-    mov [e_type], rbx
+    mov rdi, rbx
+    call value_type
     mov qword [e_lval], 0
     jmp .ret
 .p3:
@@ -2671,7 +2731,8 @@ parse_assign:
     CG pop_b
     mov rdi, rbx
     call emit_store_type
-    mov [e_type], rbx
+    mov rdi, rbx
+    call value_type
     mov qword [e_lval], 0
     jmp .ret
 .compound:
@@ -2686,6 +2747,8 @@ parse_assign:
     ERR "cannot assign to an array"
 .c2:
     cmp rbx, TY_DOUBLE
+    je .cdbl
+    cmp rbx, TY_FLOAT
     je .cdbl
     mov rdi, rbx
     call type_ls
@@ -2807,13 +2870,14 @@ parse_assign:
     mov r13, [e_type]
     sub r12d, T_ADDEQ
     movzx edi, byte [compound_map+r12]
-    mov rsi, rbx
+    mov esi, TY_DOUBLE                  ; (the old value of a float variable is a double too)
     mov rdx, r13
     call float_binop
     CG pop_b
     mov rdi, rbx
     call emit_store_type
-    mov [e_type], rbx
+    mov rdi, rbx
+    call value_type
     mov qword [e_lval], 0
     jmp .ret
 

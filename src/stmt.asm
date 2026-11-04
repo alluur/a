@@ -734,6 +734,10 @@ parse_const_decl:
     call next_token
     mov edi, '='
     call expect
+    cmp rbx, TY_FLOAT
+    jne .cnotf
+    mov rbx, TY_DOUBLE                  ; a float constant is a double constant (its value is a double anyway)
+.cnotf:
     cmp rbx, TY_DOUBLE
     je .dconst
     cmp rbx, TY_INT
@@ -1073,7 +1077,14 @@ init_elem:
     jmp .out
 .dvalue:
     cmp rbx, TY_DOUBLE
+    je .ddbl
+    cmp rbx, TY_FLOAT
     jne .dint
+    call const_double
+    call dbits_to_fbits                 ; a float element: binary32 bits
+    xor edx, edx
+    jmp .dgot
+.ddbl:
     call const_double
     xor edx, edx
     jmp .dgot
@@ -1090,7 +1101,12 @@ init_elem:
     je .dq
     cmp eax, 1
     je .db
+    cmp eax, 4
+    je .dd
     ERR "a struct value cannot be used here, use a {...} list"
+.dd:
+    mov [data_buf + r12], ecx
+    jmp .out
 .db:
     mov [data_buf + r12], cl
     jmp .out

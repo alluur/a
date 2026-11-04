@@ -844,6 +844,61 @@ apply_relocs_la64:
 .done:
     ret
 
+; ---- hardware floating point ($fa0 / $fa1, $fcc0 and the scratch $t0-$t2) ---------------------------------------------
+la64_fadd:      LA 0x0114A880                   ; movgr2fr.d $fa0, $a0
+                LA 0x0114A8A1                   ; movgr2fr.d $fa1, $a1
+                LA 0x01010400                   ; fadd.d $fa0, $fa0, $fa1
+                LA 0x0114B804                   ; movfr2gr.d $a0, $fa0
+                ret
+la64_fsub:      LA 0x0114A880
+                LA 0x0114A8A1
+                LA 0x01030400                   ; fsub.d
+                LA 0x0114B804
+                ret
+la64_fmul:      LA 0x0114A880
+                LA 0x0114A8A1
+                LA 0x01050400                   ; fmul.d
+                LA 0x0114B804
+                ret
+la64_fdiv:      LA 0x0114A880
+                LA 0x0114A8A1
+                LA 0x01070400                   ; fdiv.d
+                LA 0x0114B804
+                ret
+la64_fcmp:      LA 0x0114A880                   ; movgr2fr.d $fa0, $a0
+                LA 0x0114A8A1                   ; movgr2fr.d $fa1, $a1
+                LA 0x0C210400                   ; fcmp.clt.d $fcc0, $fa0, $fa1
+                LA 0x0114DC0C                   ; movcf2gr $t0, $fcc0
+                LA 0x0C210020                   ; fcmp.clt.d $fcc0, $fa1, $fa0
+                LA 0x0114DC0D                   ; movcf2gr $t1, $fcc0
+                LA 0x0C240400                   ; fcmp.cun.d $fcc0, $fa0, $fa1
+                LA 0x0114DC0E                   ; movcf2gr $t2, $fcc0
+                LA 0x0011B1A4                   ; sub.d $a0, $t1, $t0   (-1 / 0 / 1)
+                LA 0x004105CE                   ; slli.d $t2, $t2, 1
+                LA 0x0010B884                   ; add.d $a0, $a0, $t2  (+2 when unordered)
+                ret
+la64_itod:      LA 0x0114A880                   ; movgr2fr.d $fa0, $a0
+                LA 0x011D2800                   ; ffint.d.l $fa0, $fa0
+                LA 0x0114B804                   ; movfr2gr.d $a0, $fa0
+                ret
+la64_dtoi:      LA 0x0114A880                   ; movgr2fr.d $fa0, $a0
+                LA 0x011AA800                   ; ftintrz.l.d $fa0, $fa0
+                LA 0x0114B804                   ; movfr2gr.d $a0, $fa0
+                ret
+la64_dtof:      LA 0x0114A880                   ; movgr2fr.d $fa0, $a0
+                LA 0x01191800                   ; fcvt.s.d $fa0, $fa0
+                LA 0x0114B404                   ; movfr2gr.s $a0, $fa0
+                LA 0x00DF0084                   ; bstrpick.d $a0, $a0, 31, 0 (zero extend)
+                ret
+la64_ftod:      LA 0x0114A480                   ; movgr2fr.w $fa0, $a0
+                LA 0x01192400                   ; fcvt.d.s $fa0, $fa0
+                LA 0x0114B804                   ; movfr2gr.d $a0, $fa0
+                ret
+la64_load4_a:   LA 0x2A800084                   ; ld.wu $a0, $a0, 0
+                ret
+la64_store4:    LA 0x298000A4                   ; st.w $a0, $a1, 0
+                ret
+
 section .rodata
 %macro CGT_LA64 1
     dq la64_%1

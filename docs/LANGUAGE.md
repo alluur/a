@@ -309,16 +309,26 @@ classes and inside function bodies. Use it with `__ARCH` (0 x64, 1 arm64, 2 risc
 
 `::name` refers to the global `name` even when a module or local declaration shadows it (`::sqrt(x)` inside module `dmath`).
 
-`double` (and `float`, which is an alias of `double`) is an IEEE 754 binary64 number. The compiler converts between `int` and
+`double` is an IEEE 754 binary64 number and `float` an IEEE 754 binary32 number. The compiler converts between `int` and
 `double` automatically (an `int` operand of a mixed expression becomes a `double`; assigning a `double` to an `int` needs a cast
 `(int) d`, which truncates toward zero). Supported: `+ - * /`, unary `-`, the six comparisons, `!` and truth tests
 (`if (d)` is true when `d != 0`), `+= -= *= /=`, `?:`, struct fields, arrays, globals, parameters and return values.
 Literals like `1.5`, `2e-3` and `1_000.25` are rounded exactly (to nearest, ties to even, like a C compiler).
 
+A `float` takes 4 bytes in memory: in globals, locals, arrays, struct fields (aligned to 4), parameters and return values.
+Storing into a `float` rounds to the nearest binary32 value; reading one widens it exactly to `double`, and expressions are
+evaluated in `double` (what C calls `FLT_EVAL_METHOD == 1`). So `f = a + b` gives the same result as in C, while a comparison like
+`c == a + b` on three floats compares with the unrounded double sum; write `c == (float)(a + b)` to compare as floats.
+`(float) x` rounds a value to binary32 precision (the result is still used as a double).
+
 `__bits(d)` returns the 64 raw bits of a double as an `int`; `__dbl(i)` does the reverse.
 
-Arithmetic uses a built-in software implementation (`dfloat`, loaded only when a program uses doubles), so results are bit
-for bit identical on every target. Helpers: `printDouble`, `printlnDouble`, `doubleToText`, `doubleToFixed(d, n)`,
+Arithmetic, comparisons and `int` <-> `double` conversions are **hardware instructions** of the target CPU (SSE2 on x86-64, the FP/SIMD
+unit on AArch64, the D extension on RISC-V, the FPU on LoongArch64). IEEE 754 requires these operations to be correctly rounded, so
+results are bit for bit identical on every target (only the sign and payload of a NaN result can differ between CPUs, which C
+leaves open too). `--soft-float` makes the compiler use the built-in software implementation (`dfloat`) instead, which never touches
+the FPU registers; use it for systems that do not save the FPU state on a context switch (AOS for now). With `--soft-float`, `float`
+is an alias of `double` (8 bytes), as in earlier versions of A. Helpers: `printDouble`, `printlnDouble`, `doubleToText`, `doubleToFixed(d, n)`,
 `doubleToSci(d, n)`, `parseDouble(text)`, `isNaN`, `isInf`, `isFinite`. The `dmath` module has `sqrt cbrt pow exp exp2 expm1 log
 log2 log10 log1p hypot sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh floor ceil round trunc fabs fmod fmin
 fmax copysign nan` and the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`.
@@ -397,7 +407,8 @@ expression is not evaluated and must not contain function calls. For an array na
 `sizeof(a) / sizeof(a[0])` is the element count. (An array that is a struct field cannot be measured this way; use `sizeof(Type)`.)
 
 **C integer words.** `short`, `long`, `signed`, `unsigned` (also `long long`, `unsigned long int`, `long double`) are accepted
-and mean the ordinary A types: all integers are the 64-bit signed `int`, `unsigned char` is `char`, `long double` is `double`.
+and mean the ordinary A types: all integers are the 64-bit signed `int`, `unsigned char` is `char`, `long double` is `double`
+(`float` is a real 4-byte type, see above).
 No unsigned arithmetic happens, so use the `%u`/`%x` conversions or the unsigned helpers of the library when it matters.
 
 **Adjacent string literals** are joined: `"Hello, " "world"` (also across lines).

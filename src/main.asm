@@ -10,6 +10,7 @@ s_dash_r:       db "-r", 0
 s_dash_h:       db "-h", 0
 s_help:         db "--help", 0
 s_version:      db "--version", 0
+s_soft_float:   db "--soft-float", 0
 s_linux:        db "linux", 0
 s_windows:      db "windows", 0
 s_win:          db "win", 0
@@ -97,6 +98,7 @@ s_usage:
     db "  -E          print the preprocessed source and stop", 10
     db "  -v CODE     version code used in the default output name (default 1)", 10
     db "  -r TYPE     release type used in the default output name (default debug)", 10
+    db "  --soft-float  double / float arithmetic by library calls instead of FPU instructions (AOS)", 10
     db "  -h          show this help", 10
     db "  --version   show the compiler version", 10
     db 0
@@ -1782,6 +1784,14 @@ _start:
     call cstr_eq
     test eax, eax
     jnz .showver
+    mov rdi, rbx
+    mov rsi, s_soft_float
+    call cstr_eq
+    test eax, eax
+    jz .notSoft
+    mov dword [soft_float], 1           ; --soft-float: double arithmetic by calls into the soft-float library (no FPU instructions)
+    jmp .arg
+.notSoft:
     cmp word [rbx], 0x442D              ; -D
     je .define
     cmp word [rbx], 0x452D              ; -E
@@ -2300,6 +2310,7 @@ lf_blen:        resq 1
 lf_ex:          resd 1
 init_count:     resq 1
 obj_mode:       resd 1                  ; ac -c : the output is an object file
+soft_float:     resd 1                  ; --soft-float: no FPU instructions (AOS does not save the FPU / vector state yet)
 link_mode:      resd 1                  ; the inputs are object files
 ext_reloc_sym:  resd 1
 foreign_active: resd 1

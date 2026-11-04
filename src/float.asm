@@ -2,8 +2,10 @@
 ;  float.asm - the type double (and float, which is the same type)
 ;
 ;  A double is an IEEE 754 binary64 held in a normal 64-bit slot (like the "double as int" bit patterns of the cmath module,
-;  so both can be mixed with __bits / __dbl). All arithmetic is done by calls into the soft-float functions of cmath
-;  (dadd dsub dmul ddiv dcmp itod dtoi dneg), which lib/dfloat.a loads when a program mentions double or a floating literal.
+;  so both can be mixed with __bits / __dbl). The arithmetic, comparisons and int <-> double conversions are FPU instructions
+;  (the backend primitives fadd fsub fmul fdiv fcmp itod dtoi: SSE2, AArch64 FP, RISC-V D, LoongArch FP); with --soft-float
+;  they are calls into the soft-float functions of cmath (dadd dsub dmul ddiv dcmp itod dtoi), which lib/dfloat.a loads when a
+;  program mentions double or a floating literal. Negation and truth tests work on the bit pattern in both modes.
 ;  Values are converted between int and double wherever a type is known (assignment, initialisation, arguments, return, casts).
 ; =============================================================================
 section .text
@@ -48,6 +50,8 @@ is_intlike:
 coerce_to:
     push rbx
     mov rbx, rdi
+    cmp rbx, TY_FLOAT
+    je .to_float
     mov rax, [e_type]
     cmp rax, rbx
     je .out
@@ -62,6 +66,12 @@ coerce_to:
     cmp rbx, TY_CHAR
     jne .out
 .to_int:
+    cmp dword [soft_float], 0
+    jne .to_int_soft
+    CG dtoi
+    mov [e_type], rbx
+    jmp .out
+.to_int_soft:
     mov rdi, fn_dtoi
     call call_rt1
     mov [e_type], rbx
@@ -74,23 +84,46 @@ coerce_to:
     call is_intlike
     test eax, eax
     jz .out
-    mov rdi, fn_itod
-    call call_rt1
+    call emit_itod
     mov qword [e_type], TY_DOUBLE
 .out:
     pop rbx
     ret
+.to_float:                              ; a float: the value becomes a double rounded to float precision (it stays a double in A)
+    pop rbx
+    mov edi, TY_DOUBLE
+    call coerce_to
+    cmp qword [e_type], TY_DOUBLE
+    jne .tf_out
+    CG dtof
+    CG ftod
+.tf_out:
+    ret
 
-; double_to_bool: A = a double -> A = (A != 0.0), e_type = bool
+; dbits_to_fbits: rax = the bits of a double -> rax = the binary32 bits of the same value rounded (zero extended).
+; Compile time (the compiler itself runs on x86-64 and may use SSE).
+dbits_to_fbits:
+    movq xmm0, rax
+    cvtsd2ss xmm0, xmm0
+    movd eax, xmm0
+    ret
+
+; emit_itod: A = (double)A (the FPU, or the soft-float itod with --soft-float)
+emit_itod:
+    cmp dword [soft_float], 0
+    jne .soft
+    CG itod
+    ret
+.soft:
+    mov rdi, fn_itod
+    jmp call_rt1
+
+; double_to_bool: A = a double -> A = (A != 0.0), e_type = bool. On the bit pattern: shifted left by one (no sign) it is zero
+; for +0.0 and -0.0 only (a NaN is "true", as in C).
 double_to_bool:
-    CG push_a
-    xor edi, edi
-    CG imm_a
-    CG push_a
-    mov rdi, fn_dcmp
-    call emit_call_named
-    mov edi, 2
-    CG drop
+    mov edi, 1
+    CG imm_b
+    CG shl
     CG tobool
     mov qword [e_type], TY_BOOL
     ret
@@ -152,6 +185,8 @@ float_binop:
     mov edi, msg_dblmix
     jmp fatal_error
 .l_ok:
+    cmp dword [soft_float], 0
+    je .hw
     cmp r13, TY_DOUBLE
     je .r_dbl
     mov rdi, r13
@@ -185,6 +220,48 @@ float_binop:
     call emit_call_named
     mov edi, 2
     CG drop
+    jmp .result
+.hw:                                    ; the FPU: left on the stack, right in A -> B = right, A = left, both double
+    pop rcx                             ; (the soft-float function name is not needed)
+    cmp r13, TY_DOUBLE
+    je .hw_r
+    mov rdi, r13
+    call is_intlike
+    test eax, eax
+    jnz .hw_rint
+    mov edi, msg_dblmix
+    jmp fatal_error
+.hw_rint:
+    CG itod
+.hw_r:
+    CG mov_b_a
+    CG pop_a
+    cmp r12, TY_DOUBLE
+    je .hw_op
+    CG itod                             ; (A only: B is kept)
+.hw_op:
+    cmp ebx, '+'
+    jne .hw1
+    CG fadd
+    jmp .result
+.hw1:
+    cmp ebx, '-'
+    jne .hw2
+    CG fsub
+    jmp .result
+.hw2:
+    cmp ebx, '*'
+    jne .hw3
+    CG fmul
+    jmp .result
+.hw3:
+    cmp ebx, '/'
+    jne .hw4
+    CG fdiv
+    jmp .result
+.hw4:
+    CG fcmp                             ; -1 / 0 / 1 / 2 like dcmp
+.result:
     mov qword [e_type], TY_DOUBLE
     cmp ebx, '+'
     je .done

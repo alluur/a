@@ -930,6 +930,60 @@ apply_relocs_rv64:
 .done:
     ret
 
+; ---- hardware floating point (the D extension; ft0 / ft1 and the scratch t0-t3) ---------------------------------------
+rv64_fadd:      RV 0xF2050053                   ; fmv.d.x ft0, a0
+                RV 0xF20580D3                   ; fmv.d.x ft1, a1
+                RV 0x02107053                   ; fadd.d ft0, ft0, ft1
+                RV 0xE2000553                   ; fmv.x.d a0, ft0
+                ret
+rv64_fsub:      RV 0xF2050053
+                RV 0xF20580D3
+                RV 0x0A107053                   ; fsub.d ft0, ft0, ft1
+                RV 0xE2000553
+                ret
+rv64_fmul:      RV 0xF2050053
+                RV 0xF20580D3
+                RV 0x12107053                   ; fmul.d ft0, ft0, ft1
+                RV 0xE2000553
+                ret
+rv64_fdiv:      RV 0xF2050053
+                RV 0xF20580D3
+                RV 0x1A107053                   ; fdiv.d ft0, ft0, ft1
+                RV 0xE2000553
+                ret
+rv64_fcmp:      RV 0xF2050053                   ; fmv.d.x ft0, a0
+                RV 0xF20580D3                   ; fmv.d.x ft1, a1
+                RV 0xA21023D3                   ; feq.d t2, ft0, ft1
+                RV 0xA21012D3                   ; flt.d t0, ft0, ft1
+                RV 0xA2009353                   ; flt.d t1, ft1, ft0
+                RV 0x40530533                   ; sub a0, t1, t0        (-1 / 0 / 1)
+                RV 0x0062EE33                   ; or t3, t0, t1
+                RV 0x007E6E33                   ; or t3, t3, t2
+                RV 0x001E3E13                   ; seqz t3, t3           (1 when unordered)
+                RV 0x001E1E13                   ; slli t3, t3, 1
+                RV 0x01C50533                   ; add a0, a0, t3
+                ret
+rv64_itod:      RV 0xD2257053                   ; fcvt.d.l ft0, a0
+                RV 0xE2000553                   ; fmv.x.d a0, ft0
+                ret
+rv64_dtoi:      RV 0xF2050053                   ; fmv.d.x ft0, a0
+                RV 0xC2201553                   ; fcvt.l.d a0, ft0, rtz
+                ret
+rv64_dtof:      RV 0xF2050053                   ; fmv.d.x ft0, a0
+                RV 0x40107053                   ; fcvt.s.d ft0, ft0
+                RV 0xE0000553                   ; fmv.x.w a0, ft0 (sign extends:)
+                RV 0x02051513                   ; slli a0, a0, 32
+                RV 0x02055513                   ; srli a0, a0, 32
+                ret
+rv64_ftod:      RV 0xF0050053                   ; fmv.w.x ft0, a0
+                RV 0x42000053                   ; fcvt.d.s ft0, ft0
+                RV 0xE2000553                   ; fmv.x.d a0, ft0
+                ret
+rv64_load4_a:   RV 0x00056503                   ; lwu a0, 0(a0)
+                ret
+rv64_store4:    RV 0x00A5A023                   ; sw a0, 0(a1)
+                ret
+
 section .rodata
 %macro CGT_RV64 1
     dq rv64_%1

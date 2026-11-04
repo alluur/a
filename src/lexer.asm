@@ -45,7 +45,7 @@ kw_table:
     KW "a_import", K_AIMPORT
     KW "asm",      K_ASM
     KW "double",   K_DOUBLE
-    KW "float",    K_DOUBLE
+    KW "float",    K_FLOAT
     KW "defer",    K_DEFER
     KW "goto",     K_GOTO
     KW "extern",   K_EXTERN
@@ -351,7 +351,10 @@ next_token:
     call kw_lookup
     mov [tk], rax
     cmp eax, K_DOUBLE
+    je .needf
+    cmp eax, K_FLOAT
     jne .done
+.needf:
     mov dword [need_float], 1           ; the soft-float runtime is compiled when a program uses double
     jmp .done
 

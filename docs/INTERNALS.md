@@ -58,7 +58,7 @@ linked with `ld`. It uses no libc: it talks to Linux through `syscall` only.
 A type is one 64-bit value:
 
 ```
-bits  0..7   kind: 0 void, 1 int, 2 char, 3 bool, 4 struct/class
+bits  0..7   kind: 0 void, 1 int, 2 char, 3 bool, 4 struct/class, 5 func, 6 double, 7 float
 bits  8..15  pointer depth
 bits 16..31  struct index (for kind 4)
 bit   32     "array" flag (an array lvalue; it decays to a pointer when used as a value)
@@ -73,7 +73,20 @@ the data section, filled by `R_CODE64` relocations; virtual methods are roots of
 unless it comes from `super.`; objects get their vtable pointer from `emit_vptr_init` (new, locals) or a
 `R_DATA64` relocation (globals).
 
-Enums are `int`. Sizes: pointers 8, `int` 8, `char`/`bool` 1, structs from the struct table.
+Enums are `int`. Sizes: pointers 8, `int` 8, `double` 8, `float` 4, `char`/`bool` 1, structs from the struct table.
+
+**Floating point.** A `double` value is its IEEE 754 binary64 bit pattern in the 64-bit accumulator, so it moves through
+the stack machine (push/pop, locals, arguments, return values) exactly like an `int`. The FPU primitives of `CGLIST`
+(`fadd fsub fmul fdiv fcmp itod dtoi dtof ftod`) move A and B into floating point registers, do one operation and move
+the result back; `fcmp` returns -1 / 0 / 1 / 2 (less, equal, greater, unordered) like the software `dcmp`, and the
+comparison operators turn that into a truth value. A `float` exists only in memory: `load4_a` + `ftod` widen it when it is
+read and `dtof` + `store4` + `ftod` round and store it (the value left in A is the rounded one, as C requires for the value
+of an assignment). `value_type` maps a declared `float` to `double` for every rvalue, so `float_binop` and `coerce_to` (in
+`float.asm`) only ever see doubles; `coerce_to(TY_FLOAT)` converts to double and then rounds with `dtof` + `ftod`. A `float`
+parameter's slot holds the raw binary32 bits (the caller converts with `dtof`, the callee's load widens them).
+Constants in initializers are rounded at compile time (`dbits_to_fbits`). With `--soft-float` (`soft_float` in `main.asm`)
+`parse_type` turns `float` into `double` and `float.asm` emits calls of the `dfloat` runtime (`__dadd`, `__dcmp`, …)
+instead of the FPU primitives; AOS needs this because it does not save the FPU / vector registers on a context switch.
 
 ## Expression code generation
 
@@ -137,12 +150,14 @@ CG push_a            ; expands to  call [cg_vt + CGI_push_a*8]
 ```
 
 `CGLIST` in `defs.inc` lists them (push/pop, immediates, local/global addresses, loads and stores,
-arithmetic, comparisons, jumps and chains, calls, prologue/epilogue, …). `cg_x86.asm` and
+arithmetic, comparisons, jumps and chains, calls, prologue/epilogue, the floating point operations, …). `cg_x86.asm` and
 `cg_a64.asm` each implement the whole list; `install_backend` copies the right table into `cg_vt`
 at start-up.
 
 Abstract machine: **A** (accumulator: `rax` / `x0`), **B** (second operand: `rcx` / `x1`),
-**D** (temporary: `rdx` / `x2`), and a stack of one-slot values.
+**D** (temporary: `rdx` / `x2`), and a stack of one-slot values. The floating point primitives use
+`xmm0` / `xmm1` (x86-64), `d0` / `d1` (AArch64), `f0` / `f1` (RISC-V) and `$f0` / `$f1` (LoongArch64) as scratch
+registers; no FP register lives across two primitives.
 
 To add a new architecture:
 1. add `ARCH_xxx` in `defs.inc`, write `cg_xxx.asm` with `xxx_<primitive>` for every name in `CGLIST`
