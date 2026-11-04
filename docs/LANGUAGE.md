@@ -485,6 +485,58 @@ Macros are global: a macro defined in one file is also visible in files that are
 itself (`#define A A + 1` is fine). For constants the compile-time features of A itself (`const`, `static if`) are usually the better choice; use
 macros for code that has to differ between builds.
 
+### Calling C libraries: `extern "library"` and `extern "C"`
+
+A program can call the functions of C libraries (the C library itself, libm, EGL / OpenGL ES, audio libraries, Windows DLLs)
+with the C calling convention of the target, and C can call A functions:
+
+```c
+a_module c {                                   // C names in their own namespace (std already has printf, cmath has cos ...)
+    extern "libc.so.6" {                       // resolved by the dynamic linker when the program starts
+        int printf(char* fmt, ...);            // inside extern "...", int is C's int (int32_t)
+        void qsort(void* base, uint64_t n, uint64_t size, void* cmp);
+        void* dlopen(char* file, int mode);
+        void* dlsym(void* lib, char* name);
+    }
+}
+extern "C" {
+    void glClear(uint32_t mask);               // a C function pointer the program fills in at run time
+    void glClearColor(float r, float g, float b, float a);
+}
+extern "C" int byValue(int32_t* a, int32_t* b) { return *a - *b; }   // an A function that C can call
+
+int main() {
+    c.printf("%s %d %.2f\n", "A", 42, 3.14159);
+    int32_t v[3] = {3, 1, 2};
+    c.qsort(v, 3, 4, byValue);                 // the name of an extern "C" function is its C entry point
+    void* gl = c.dlopen("libGLESv2.so.2", 2);
+    glClear = c.dlsym(gl, "glClear");          // a C function name without a call is its pointer slot (a void*)
+    if (glClear != null) glClear(0x4000);
+    return 0;
+}
+```
+
+* **`extern "library" { prototypes }`** (or one prototype): the functions are imported from that shared library. On Linux the
+  program becomes dynamically linked (`PT_INTERP`, `DT_NEEDED`, one relocation per function, bound at start: a missing
+  library or function stops the program before `main`); on Windows they go into the import table (`"msvcrt.dll"`,
+  `"user32.dll"`, `"opengl32.dll"` ...). Only the functions that the program really calls are imported. Choose names per
+  system with `static if (__OS == 1) { ... }`. Programs without C imports stay static executables without any dependency.
+* **`extern "C" { prototypes }`**: function pointers with a C signature. Each name is a pointer slot, initially `null`, that
+  the program sets (usually from `dlsym` / `GetProcAddress`); a call goes through it. This is how optional libraries are
+  loaded (the program keeps running when they are missing).
+* **`extern "C" type name(params) { body }`**: an ordinary A function that also gets a C entry point. A calls it directly;
+  using its name as a value gives the address of the C entry (for `qsort`, callbacks of audio and windowing libraries ...).
+* Types: `int` means C's 32-bit `int` inside these declarations (use `int64_t` / `long` for 64 bits), `int8_t` … `uint64_t`,
+  `float`, `double`, `bool`, pointers and `char*` map directly. Small integer arguments and results are converted to their
+  type; floats travel as binary32. Structs must be passed by pointer (no structs by value). `...` works for calling C
+  (`printf`): extra `double` arguments go where the target's C convention puts them.
+* The C library's `stdio` keeps its own buffers: A's `print` and C's `printf` are written in the order of the flushes. On Linux
+  `exit` (and returning from `main`) also runs the C library's `exit`, which flushes them; on Windows call
+  `fflush(null)` before exiting.
+* Limits: Android executables cannot import libraries yet (the coming shared-library output for APKs can); `-c` objects
+  cannot contain `extern "library"` declarations yet; C libraries that need their own threads to call back into A should
+  only do so on threads they created with the C library (A's `thread` module does not set up the C library's thread state).
+
 ### Separate compilation: objects and the linker
 
 Besides compiling a whole program from one source file, `ac` can compile files separately and link them, like a C toolchain:

@@ -42,6 +42,11 @@ is_intlike:
     je .y
     cmp rdi, TY_U64
     je .y
+    cmp rdi, TY_I8
+    jb .c
+    cmp rdi, TY_U32
+    jbe .y
+.c:
     cmp rdi, TY_CHAR
     je .y
     cmp rdi, TY_BOOL

@@ -202,6 +202,38 @@ relocations, 8 MiB stack reserve. Calls to Windows go through the import address
 (`call [rip+IAT]`); the entry stub builds `argc`/`argv` with `__win_init_args` (in `std.a`).
 Every function prologue calls a `chkstk` helper that touches the stack pages in order.
 
+## C functions (`extern "C"` / `extern "library"`: `ccall.asm`, `dynlink.asm`)
+
+`parse_cextern` (in `decl.asm`) handles `extern "..."`. A prototype becomes an `S_FUNC` symbol with `F_CFUNC` whose `SYM_VAL`
+is not code but the place of its pointer slot: a data offset (`extern "C"`, the program assigns it) or, with `F_CIMPORT`, an
+index into `imp_sym` / `imp_lib` (`extern "library"`; `lib_intern` keeps the library names). `begin_codegen_pass` leaves these
+`SYM_VAL`s alone. Inside the declarations `c_ints` makes `parse_type` read `int` as `int32_t`. A name that is already an A
+function of the module (std's `printf`) is an error: C functions go into an `a_module`.
+
+`gen_call` pushes the arguments as for an A call (with `coerce_to`, `emit_extend` for small integers and `dtof` for floats; the
+`...` arguments of a C function get no count, a bit in `r14` remembers which are doubles), then `.ccall` fills the descriptor
+`cc_n` / `cc_nfixed` / `cc_cls` / `cc_ret`, loads the function address from the slot (`emit_cslot_lea`: `R_DATA`, or `R_IMPORT`
+for imports) and emits the backend primitive `ccall`. `ccall` (per CPU in `ccall.asm`) uses `cc_classify` to give every
+argument its C register or stack slot, saves one callee-saved register as the base of the A argument slots, aligns the stack,
+loads the registers, calls, restores the stack and moves the result into A (a float result is widened to a double). The ABIs:
+System V x86-64 (6 integer / 8 vector registers, `al` = vector registers used), Windows x64 (four positions, 32 bytes of shadow
+space, `...` doubles also in the integer register), AAPCS64, and the RISC-V / LoongArch LP64D conventions (a float without a
+free float register and every `...` float go in an integer register; 32-bit integers are passed sign extended). An `extern "C"`
+function with a body gets `F_CEXPORT` and a hidden symbol (`sym_cthunk`) for its C entry: after compiling the body,
+`compile_function` calls `emit_cthunk`, and the primitive `cthunk` emits code that saves the callee-saved registers of the C
+ABI, pushes the C arguments into A slots, calls the A function and returns its result in the C result register.
+
+**Dynamic linking.** `build_elf` calls `dyn_prepare`: the imports whose symbols are `F_USED` get slots after the data (cleared
+with `data_alloc_zero`, because the data buffer past `data_pos` may hold bytes of an earlier pass) and their `R_IMPORT`
+relocations become `R_DATA`. If any import is used, the code starts at `ELF_CODE_OFF_DYN` (room for six program headers and the
+interpreter name), and `dyn_build` appends `.dynstr`, `.dynsym` (the imports, plus a weak `exit` whose relocation fills std's
+`__cexit` slot), a one-bucket `DT_HASH`, one `GLOB_DAT` / `R_*_64` relocation per symbol and the `.dynamic` array (`DT_NEEDED`,
+`DT_FLAGS = BIND_NOW`, ...). The program headers become `PT_PHDR`, `PT_INTERP`, the two `PT_LOAD`s, `PT_DYNAMIC` and
+`PT_GNU_STACK`; the executable stays `ET_EXEC` at its fixed address (its code is PC-relative anyway). On Windows `pe_prepare`
+numbers the used imports by library after the built-in IAT slots (with a null slot after each library), turns `R_IMPORT` into
+`R_IAT`, and `pe_user_idata` writes their descriptors, DLL names and hint/name entries into the import section.
+`tests/ffi.sh` runs C library programs on Linux (QEMU with the cross glibc as sysroot for the other CPUs) and Windows (Wine).
+
 ## Default parameter values and function pointers
 
 * `func_register` stores the parameters of a function in the pool `ptype_pool` as `types[n]`, `defaults[n]`, `required`
@@ -236,7 +268,7 @@ and `tk_start` of the current token.
 
 ## Testing
 
-`tests/run.sh [pattern]` compiles and runs each `tests/t*.a`. Expected stdout is `tNN_name.out`,
+`tests/run.sh [pattern]` compiles and runs each `tests/t*.a` (`tests/ffi.sh` the C library programs of `tests/ffi`). Expected stdout is `tNN_name.out`,
 the expected exit code `tNN_name.exit` (default 0), stdin `tNN_name.in`, and `tNN_name.err` holds a
 fragment of the message for tests that must fail to compile (`t9x_err_*`). The same suite is run
 for every target (see [TARGETS.md](TARGETS.md)).

@@ -23,6 +23,7 @@ section .text
 %include "cg_a64.asm"
 %include "cg_rv64.asm"
 %include "cg_la64.asm"
+%include "ccall.asm"
 %include "expr.asm"
 %include "float.asm"
 %include "stmt.asm"
@@ -30,3 +31,4 @@ section .text
 %include "pp.asm"
 %include "link.asm"
 %include "main.asm"
+%include "dynlink.asm"                ; (after main.asm: uses its IAT layout constants)

@@ -407,6 +407,11 @@ compile_function:
     CG set_frame
     mov [sym_count], r13d
     mov qword [cur_func], 0
+    test dword [r12+SYM_FLAGS], F_CEXPORT
+    jz .nothunk
+    mov rdi, r12
+    call emit_cthunk                    ; extern "C": the C entry follows the function
+.nothunk:
     pop r14
     pop r13
     pop r12
@@ -1681,8 +1686,13 @@ parse_items:
     jmp fatal_error
 .extern:
     call next_token                     ; extern int x;  extern int f(int);   the definition is somewhere else
+    cmp qword [tk], T_STR
+    je .cextern
     mov dword [extern_decl], 1
     jmp .vdone
+.cextern:
+    call parse_cextern                  ; extern "C" { ... }  extern "library" { ... }
+    jmp .loop
 .aggr?:
     ; struct Name { ... }  defines a type;  struct Name x;  uses one
     sub rsp, 128
@@ -2075,4 +2085,243 @@ parse_typedef_aggregate:
 section .rodata
 ; the alignment of a scalar field by its type_ls kind (0: an aggregate, see st_align)
 ls_align: db 0, 1, 2, 4, 4, 1, 2, 4, 8
+section .text
+
+; ---- C functions: extern "C" / extern "library" -----------------------------------------------------------------------------
+; parse_cextern: the current token is the string after 'extern'.
+;   extern "libm.so.6" double cos(double x);       a C function the dynamic linker (Windows: the loader) resolves at start
+;   extern "C" void (glClear)(uint32_t mask);       a C function pointer the program sets (glClear = dlsym(lib, "glClear"))
+;   extern "C" int32_t cmp(void* a, void* b) { }   an A function that C can call (its address is a C entry point)
+;   extern "..." { declarations }                  several at once
+parse_cextern:
+    push rbx
+    mov ebx, -1                         ; library index, -1 = "C"
+    cmp dword [tk_len], 1
+    jne .lib
+    cmp byte [strbuf], 'C'
+    je .gotlib
+.lib:
+    call lib_intern
+    mov ebx, eax
+.gotlib:
+    call next_token
+    cmp qword [tk], '{'
+    jne .one
+    call next_token
+.blk:
+    cmp qword [tk], '}'
+    je .blkend
+    call cext_decl
+    jmp .blk
+.blkend:
+    call next_token
+    pop rbx
+    ret
+.one:
+    call cext_decl
+    pop rbx
+    ret
+
+; lib_intern: the library name is the current string token -> eax = its index in lib_off (the same in every pass)
+lib_intern:
+    push rbx
+    push r12
+    xor ebx, ebx
+.find:
+    cmp ebx, [lib_count]
+    jae .new
+    mov eax, [lib_off + rbx*4]
+    lea rdi, [lib_names + rax]
+    mov rsi, strbuf
+    call cstr_eq
+    test eax, eax
+    jnz .found
+    inc ebx
+    jmp .find
+.new:
+    cmp ebx, LIB_MAX
+    jae err_toobig
+    mov eax, [lib_names_pos]
+    mov ecx, [tk_len]
+    lea edx, [eax + ecx + 1]
+    cmp edx, 8192
+    ja err_toobig
+    mov [lib_off + rbx*4], eax
+    mov [lib_names_pos], edx
+    lea rdi, [lib_names + rax]
+    mov rsi, strbuf
+    inc ecx
+    rep movsb
+    inc dword [lib_count]
+.found:
+    mov eax, ebx
+    pop r12
+    pop rbx
+    ret
+
+; cext_decl: ebx = library index (-1 for "C"). One declaration:  type name(params);  or  type name(params) { body }
+cext_decl:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov dword [c_ints], 1
+    call parse_type
+    mov r12, rax
+    cmp qword [tk], T_ID
+    je .named
+    ERR "expected a function name"
+.named:
+    mov r13, [tk_ptr]
+    mov r14d, [tk_len]
+    mov [agg_mname], r13
+    mov [agg_mnlen], r14d
+    call next_token
+    cmp qword [tk], '('
+    je .params
+    ERR "only functions can be declared in an extern block"
+.params:
+    call parse_params
+    mov dword [c_ints], 0
+    ; C functions take and return scalars (pass structs by pointer)
+    mov rax, r12
+    test eax, 0xFF00
+    jnz .retok
+    cmp al, TY_STRUCT
+    jne .retok
+    ERR "a C function cannot return a struct by value (use a pointer)"
+.retok:
+    xor ecx, ecx
+.pchk:
+    cmp ecx, [ptmp_count]
+    jae .pok
+    mov rax, [ptmp_type + rcx*8]
+    inc ecx
+    test eax, 0xFF00
+    jnz .pchk
+    cmp al, TY_STRUCT
+    jne .pchk
+    ERR "a C function cannot take a struct by value (use a pointer)"
+.pok:
+    ; the name must not be an A function of this module already (e.g. std's printf: put C functions in an a_module)
+    mov rdi, r13
+    mov esi, r14d
+    mov edx, [cur_module]
+    call sym_find_global
+    test rax, rax
+    jz .fresh
+    cmp dword [rax+SYM_KIND], S_FUNC
+    jne .clash
+    test dword [rax+SYM_FLAGS], F_CFUNC | F_CEXPORT
+    jnz .fresh
+.clash:
+    mov edi, msg_cclash
+    mov [tk_ptr], r13
+    mov [tk_len], r14d
+    call fatal_error_tok
+.fresh:
+    cmp qword [tk], '{'
+    je .def
+    mov edi, ';'
+    call expect
+    ; a prototype: the function is called through its pointer slot
+    mov r8d, F_CFUNC | F_DEFINED
+    cmp ebx, -1
+    je .reg
+    or r8d, F_CIMPORT
+.reg:
+    mov rdi, r13
+    mov esi, r14d
+    mov rdx, r12
+    mov ecx, -1
+    call func_register
+    mov r15, rax
+    cmp dword [pass], 1
+    jne .out
+    test dword [r15+SYM_FLAGS], F_CEXPORT
+    jz .slot
+    ERR "this function is already defined in A"
+.slot:
+    cmp qword [r15+SYM_VAL], -1
+    jne .out                            ; declared before: keeps its slot
+    cmp ebx, -1
+    jne .imp
+    mov edi, 8
+    mov esi, 8
+    call data_alloc
+    mov [r15+SYM_VAL], rax
+    jmp .out
+.imp:
+    mov eax, [imp_count]
+    cmp eax, IMP_MAX
+    jae err_toobig
+    inc dword [imp_count]
+    mov [r15+SYM_VAL], rax
+    mov rcx, r15
+    sub rcx, symtab
+    shr rcx, 6
+    mov [imp_sym + rax*4], ecx
+    mov [imp_lib + rax*4], ebx
+    jmp .out
+.def:
+    cmp ebx, -1
+    je .defok
+    ERR "a function with a body needs extern 'C' (not a library name)"
+.defok:
+    cmp dword [ptmp_variadic], 0
+    je .defok2
+    ERR "a function that C calls cannot take ..."
+.defok2:
+    mov rdi, r13
+    mov esi, r14d
+    mov rdx, r12
+    mov ecx, -1
+    mov r8d, F_CEXPORT
+    call func_register
+    mov r15, rax
+    test dword [r15+SYM_FLAGS], F_CFUNC
+    jz .defok3
+    ERR "this function is already declared as a C function"
+.defok3:
+    cmp dword [pass], 1
+    jne .compile
+    test dword [r15+SYM_FLAGS], F_DEFINED
+    jz .first
+    mov edi, msg_redef
+    mov [tk_ptr], r13
+    mov [tk_len], r14d
+    call fatal_error_tok
+.first:
+    or dword [r15+SYM_FLAGS], F_DEFINED
+    mov rdi, s_cthunk_name              ; the C entry: a hidden function symbol
+    mov esi, 2
+    mov edx, S_FUNC
+    call sym_new
+    mov qword [rax+SYM_VAL], -1
+    or dword [rax+SYM_FLAGS], F_DEFINED
+    mov rcx, rax
+    sub rcx, symtab
+    shr rcx, 6
+    mov rdx, r15
+    sub rdx, symtab
+    shr rdx, 6
+    mov [sym_cthunk + rdx*4], ecx
+    call skip_block
+    jmp .out
+.compile:
+    mov rdi, r15
+    call compile_function
+.out:
+    mov dword [c_ints], 0
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+section .rodata
+s_cthunk_name: db "$c", 0
+CSTR msg_cclash, "this name is already an A function here (declare the C function inside an a_module, e.g. a_module c { ... })"
 section .text

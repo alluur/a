@@ -402,7 +402,8 @@ to_rvalue:
     mov [ld_off], r8d
     mov rax, [code_pos]
     mov [ld_end], rax
-    ret
+    mov rdi, [e_type]
+    jmp value_type                      ; (a uint8_t is an int as a value)
 .arr:
     btr rdi, TF_ARRAY_BIT
     mov [e_type], rdi
@@ -842,6 +843,9 @@ parse_type:
     jmp fatal_error
 .int:
     mov ebx, TY_INT
+    cmp dword [c_ints], 0
+    je .star0
+    mov ebx, TY_I32                     ; extern "...": C's int
     jmp .star0
 .double:
     mov ebx, TY_DOUBLE
@@ -1060,6 +1064,7 @@ gen_call:
     mov r12, rdi
     mov r13d, esi
     xor ebx, ebx
+    xor r14d, r14d                      ; C calls: bit i = the extra (...) argument i is a double
     mov edi, '('
     call expect
     cmp qword [tk], ')'
@@ -1076,15 +1081,35 @@ gen_call:
     mov rdi, [rax+rbx*8]
     call coerce_to
     mov rax, [r12+SYM_EXTRA]
+    test dword [r12+SYM_FLAGS], F_CFUNC
+    jz .argfl
+    mov rdi, [rax+rbx*8]
+    call emit_extend                    ; a C parameter of a small integer type gets the converted value
+    mov rax, [r12+SYM_EXTRA]
+.argfl:
     cmp qword [rax+rbx*8], TY_FLOAT
     jne .argcv
     CG dtof                             ; a float parameter: its slot holds the binary32 bits (the callee loads 4 bytes)
 .argcv:
+    test dword [r12+SYM_FLAGS], F_CFUNC
+    jz .argcv2
+    cmp ebx, [r12+SYM_NPAR]
+    jb .argcv2
+    cmp qword [e_type], TY_DOUBLE       ; an extra argument of a C function with ...: a double goes in a float register
+    jne .argcv2
+    cmp ebx, 63
+    ja .argcv2
+    bts r14, rbx
+.argcv2:
     mov rax, [e_type]
     test eax, 0xFF00
     jnz .push
     cmp al, TY_STRUCT
     jne .push
+    test dword [r12+SYM_FLAGS], F_CFUNC
+    jz .structarg
+    ERR "a struct cannot be passed by value to a C function (pass a pointer)"
+.structarg:
     ; a struct argument: copy it into a temporary of the caller's frame and pass the address of the copy
     mov rdi, rax
     call type_size
@@ -1125,6 +1150,8 @@ gen_call:
     jae .vcount
     ERR "wrong number of arguments in call"
 .vcount:
+    test dword [r12+SYM_FLAGS], F_CFUNC
+    jnz .ok                             ; (a C function with ... does not get the count)
     mov edi, ebx
     sub edi, [r12+SYM_NPAR]
     CG imm_a
@@ -1174,6 +1201,8 @@ gen_call:
     mov ecx, [r12+SYM_NPAR]
     jmp .fill
 .ok:
+    test dword [r12+SYM_FLAGS], F_CFUNC
+    jnz .ccall
     ; a function that returns a struct: pass the address of a temporary for the result as the last argument
     mov r14d, 0
     mov rax, [r12+SYM_TYPE]
@@ -1228,10 +1257,138 @@ gen_call:
     mov rdi, [r12+SYM_TYPE]
     call value_type                     ; (a float result is returned as a double)
     mov qword [e_lval], r14                  ; a struct result is an address (the temporary)
+.ret:
     pop r15
     pop r14
     pop r13
     pop r12
+    pop rbx
+    ret
+.ccall:
+    ; a C function: the arguments are on the stack in A's order; the call sequence moves them where the C ABI wants them
+    cmp ebx, CC_MAXARG
+    jbe .cc1
+    ERR "too many arguments for a C function"
+.cc1:
+    mov [cc_n], ebx
+    mov eax, [r12+SYM_NPAR]
+    mov [cc_nfixed], eax
+    xor ecx, ecx
+.ccl:
+    cmp ecx, ebx
+    jae .ccd
+    mov eax, CC_INT
+    cmp ecx, [r12+SYM_NPAR]
+    jae .ccx
+    mov rax, [r12+SYM_EXTRA]
+    mov rdi, [rax+rcx*8]
+    call cc_class_of
+    jmp .ccs
+.ccx:
+    bt r14, rcx
+    jnc .ccs
+    mov eax, CC_DBL
+.ccs:
+    mov [cc_cls + rcx], al
+    inc ecx
+    jmp .ccl
+.ccd:
+    mov rdi, [r12+SYM_TYPE]
+    call cc_class_of
+    mov [cc_ret], eax
+    mov rdi, r12
+    call record_edge
+    mov rdi, r12
+    call emit_cslot_lea                 ; A = the function's address (its pointer slot)
+    CG load8_a
+    CG ccall
+    mov edi, ebx
+    CG drop
+    mov rdi, [r12+SYM_TYPE]
+    call emit_extend                    ; a small integer result: the C callee leaves the upper bits undefined
+    mov rdi, [r12+SYM_TYPE]
+    test edi, 0xFF00
+    jnz .ccv
+    cmp dil, TY_BOOL
+    je .ccz
+    cmp dil, TY_CHAR
+    jne .ccv
+.ccz:
+    CG zext8
+.ccv:
+    call value_type
+    mov qword [e_lval], 0
+    jmp .ret
+
+; cc_class_of: rdi = type -> eax = its C argument / result class (CC_*); preserves rcx
+cc_class_of:
+    mov eax, CC_DBL
+    cmp rdi, TY_DOUBLE
+    je .r
+    mov eax, CC_FLT
+    cmp rdi, TY_FLOAT
+    je .r
+    mov eax, CC_I32
+    cmp rdi, TY_I32
+    je .r
+    cmp rdi, TY_U32
+    je .r
+    mov eax, CC_VOID
+    cmp rdi, TY_VOID
+    je .r
+    mov eax, CC_INT
+.r: ret
+
+; emit_cslot_lea: rdi = a C function symbol (F_CFUNC) -> A = the address of its pointer slot
+emit_cslot_lea:
+    push rsi
+    push rdx
+    mov edx, [rdi+SYM_VAL]
+    mov esi, R_DATA
+    test dword [rdi+SYM_FLAGS], F_CIMPORT
+    jz .l
+    mov esi, R_IMPORT
+    cmp dword [obj_mode], 0
+    je .l
+    ERR "extern 'library' functions cannot be compiled to an object file yet (compile the program in one piece)"
+.l: CG lea_global_a
+    pop rdx
+    pop rsi
+    ret
+
+; emit_cthunk: rdi = an extern "C" function that was just compiled. Emits its C entry: it moves the arguments from the
+; C ABI's registers / stack into A's argument slots, calls the A function and moves the result back.
+emit_cthunk:
+    push rbx
+    mov rbx, rdi
+    mov ecx, [rbx+SYM_NPAR]
+    cmp ecx, CC_MAXARG
+    jbe .ok
+    ERR "too many parameters for a function that C calls"
+.ok:
+    mov [cc_n], ecx
+    mov [cc_nfixed], ecx
+    xor ecx, ecx
+.l: cmp ecx, [cc_n]
+    jae .d
+    mov rax, [rbx+SYM_EXTRA]
+    mov rdi, [rax+rcx*8]
+    call cc_class_of
+    mov [cc_cls + rcx], al
+    inc ecx
+    jmp .l
+.d: mov rdi, [rbx+SYM_TYPE]
+    call cc_class_of
+    mov [cc_ret], eax
+    mov rax, rbx
+    sub rax, symtab
+    shr rax, 6
+    mov eax, [sym_cthunk + rax*4]
+    shl rax, 6
+    lea rdi, [symtab + rax]
+    call define_function
+    mov rdi, rbx
+    CG cthunk
     pop rbx
     ret
 
@@ -2077,8 +2234,12 @@ parse_primary:
 .func:
     mov rax, r12
     call check_access
+    test dword [r12+SYM_FLAGS], F_CFUNC
+    jnz .cfunc
     cmp qword [tk], '('
     je .func1
+    test dword [r12+SYM_FLAGS], F_CEXPORT
+    jnz .cexport
     ; a function used as a value: its address, type "func"
     test dword [r12+SYM_FLAGS], F_BUILTIN | F_METHOD
     jz .funcval
@@ -2097,6 +2258,31 @@ parse_primary:
     mov rdi, r12
     xor esi, esi
     call gen_call
+    jmp .out
+.cfunc:
+    cmp qword [tk], '('
+    je .func1
+    ; a C function used as a value: its pointer slot, a void* variable (glClear = dlsym(lib, "glClear"))
+    mov rdi, r12
+    call record_edge
+    mov rdi, r12
+    call emit_cslot_lea
+    mov qword [e_type], TY_VOID | TY_PTR1
+    mov qword [e_lval], 1
+    jmp .out
+.cexport:
+    ; an extern "C" function used as a value: the address of its C entry (for C code to call)
+    mov rdi, r12
+    call record_edge                    ; (keeps the A function, which holds the entry, alive)
+    mov rax, r12
+    sub rax, symtab
+    shr rax, 6
+    mov eax, [sym_cthunk + rax*4]
+    shl rax, 6
+    lea rdi, [symtab + rax]
+    call emit_funcaddr_sym
+    mov qword [e_type], TY_VOID | TY_PTR1
+    mov qword [e_lval], 0
     jmp .out
 
 .module:

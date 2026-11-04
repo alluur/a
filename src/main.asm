@@ -1173,6 +1173,8 @@ begin_codegen_pass:
     add rax, symtab
     cmp dword [rax+SYM_KIND], S_FUNC
     jne .n
+    test dword [rax+SYM_FLAGS], F_CFUNC
+    jnz .n                              ; (a C function's SYM_VAL is its pointer slot)
     mov qword [rax+SYM_VAL], -1
     mov dword [rax+SYM_PATCH], 0
 .n:
@@ -1323,6 +1325,8 @@ install_backend:
 ; ---- ELF64 -----------------------------------------------------------------------------------
 %define ELF_BASE 0x400000
 %define ELF_CODE_OFF 0x100
+%define ELF_CODE_OFF_DYN 0x200                 ; dynamically linked: 6 program headers and the interpreter's name before the code
+%define ELF_INTERP_OFF (64 + 6 * 56)
 
 ; build_elf -> rax = image size (image at outbuf)
 build_elf:
@@ -1345,18 +1349,30 @@ build_elf:
     mov r13d, 0x10000                       ; LoongArch: 64 KiB covers every page size
     mov ebx, 0x102                          ; EM_LOONGARCH
 .c:
+    call dyn_prepare                        ; C libraries: dynamically linked (PT_INTERP, PT_DYNAMIC)
+    mov qword [elf_code_off], ELF_CODE_OFF
+    cmp dword [dyn_on], 0
+    je .codeoff
+    mov qword [elf_code_off], ELF_CODE_OFF_DYN
+.codeoff:
     mov rax, [code_pos]
-    add rax, ELF_CODE_OFF
+    add rax, [elf_code_off]
     lea rax, [rax + r13 - 1]
     mov rcx, r13
     neg rcx
     and rax, rcx
     mov r12, rax                            ; data file offset
-    mov rax, ELF_BASE + ELF_CODE_OFF
+    mov rax, ELF_BASE
+    add rax, [elf_code_off]
     mov [code_vaddr], rax
     mov rax, ELF_BASE
     add rax, r12
     mov [data_vaddr], rax
+    cmp dword [dyn_on], 0
+    je .nodyn
+    call dyn_build                          ; (appends the dynamic tables to the data)
+.nodyn:
+    mov rax, [data_vaddr]
     mov rcx, [data_pos]
     add rcx, 15
     and rcx, -16
@@ -1366,7 +1382,8 @@ build_elf:
     call apply_relocs
     ; copy code and data
     mov rsi, code_buf
-    mov rdi, outbuf + ELF_CODE_OFF
+    mov rdi, outbuf
+    add rdi, [elf_code_off]
     mov rcx, [code_pos]
     rep movsb
     mov rsi, data_buf
@@ -1389,36 +1406,86 @@ build_elf:
     mov word [rdi+54], 56
     mov word [rdi+56], 3
     mov word [rdi+58], 64
+    add rdi, 64                             ; the program headers
+    cmp dword [dyn_on], 0
+    je .ph_load
+    mov word [outbuf+56], 6
+    ; PT_PHDR
+    mov dword [rdi], 6
+    mov dword [rdi+4], 4
+    mov qword [rdi+8], 64
+    mov qword [rdi+16], ELF_BASE + 64
+    mov qword [rdi+24], ELF_BASE + 64
+    mov qword [rdi+32], 6 * 56
+    mov qword [rdi+40], 6 * 56
+    mov qword [rdi+48], 8
+    ; PT_INTERP: the string follows the program headers
+    push rdi
+    call dyn_interp
+    lea rdi, [outbuf + ELF_INTERP_OFF]
+    push rcx
+    rep movsb
+    pop rcx
+    pop rdi
+    mov dword [rdi+56], 3
+    mov dword [rdi+60], 4
+    mov qword [rdi+64], ELF_INTERP_OFF
+    mov qword [rdi+72], ELF_BASE + ELF_INTERP_OFF
+    mov qword [rdi+80], ELF_BASE + ELF_INTERP_OFF
+    mov [rdi+88], rcx
+    mov [rdi+96], rcx
+    mov qword [rdi+104], 1
+    add rdi, 112
+.ph_load:
     ; PT_LOAD headers + code (R+X)
-    mov dword [rdi+64], 1
-    mov dword [rdi+68], 5
-    mov qword [rdi+72], 0
-    mov qword [rdi+80], ELF_BASE
-    mov qword [rdi+88], ELF_BASE
+    mov dword [rdi], 1
+    mov dword [rdi+4], 5
+    mov qword [rdi+8], 0
+    mov qword [rdi+16], ELF_BASE
+    mov qword [rdi+24], ELF_BASE
     mov rax, [code_pos]
-    add rax, ELF_CODE_OFF
-    mov [rdi+96], rax
-    mov [rdi+104], rax
-    mov [rdi+112], r13
+    add rax, [elf_code_off]
+    mov [rdi+32], rax
+    mov [rdi+40], rax
+    mov [rdi+48], r13
     ; PT_LOAD data + bss (R+W)
-    mov dword [rdi+120], 1
-    mov dword [rdi+124], 6
-    mov [rdi+128], r12
+    mov dword [rdi+56], 1
+    mov dword [rdi+60], 6
+    mov [rdi+64], r12
     mov rax, [data_vaddr]
-    mov [rdi+136], rax
-    mov [rdi+144], rax
+    mov [rdi+72], rax
+    mov [rdi+80], rax
     mov rax, [data_pos]
-    mov [rdi+152], rax
+    mov [rdi+88], rax
     mov rcx, [data_pos]
     add rcx, 15
     and rcx, -16
     add rcx, [bss_pos]
-    mov [rdi+160], rcx
-    mov [rdi+168], r13
+    mov [rdi+96], rcx
+    mov [rdi+104], r13
+    add rdi, 112
+    cmp dword [dyn_on], 0
+    je .ph_stack
+    ; PT_DYNAMIC
+    mov dword [rdi], 2
+    mov dword [rdi+4], 6
+    mov rax, [dyn_off]
+    add rax, r12
+    mov [rdi+8], rax
+    mov rax, [dyn_off]
+    add rax, [data_vaddr]
+    mov [rdi+16], rax
+    mov [rdi+24], rax
+    mov rax, [dyn_size]
+    mov [rdi+32], rax
+    mov [rdi+40], rax
+    mov qword [rdi+48], 8
+    add rdi, 56
+.ph_stack:
     ; PT_GNU_STACK
-    mov dword [rdi+176], 0x6474E551
-    mov dword [rdi+180], 6
-    mov qword [rdi+224], 16
+    mov dword [rdi], 0x6474E551
+    mov dword [rdi+4], 6
+    mov qword [rdi+48], 16
     lea rax, [r12 + 0]
     add rax, [data_pos]
     pop r13
@@ -1470,6 +1537,7 @@ build_pe:
     ALIGNUP rax, 0x1000
     mov [pe_idata_rva], rax                 ; idata rva
     ; --- build the import section in a scratch buffer
+    call pe_prepare                         ; C imports: their IAT slots after the built-in ones
     call build_idata                        ; rax = idata size
     mov [pe_idata_size], rax
     ALIGNUP rax, 0x200
@@ -1484,7 +1552,7 @@ build_pe:
     mov [bss_vaddr], rax
     mov rax, PE_BASE
     add rax, [pe_idata_rva]
-    add rax, PE_IDATA_IAT
+    add rax, [pe_iat]
     mov [iat_vaddr], rax
     call apply_relocs
     ; --- raw offsets
@@ -1549,10 +1617,15 @@ build_pe:
     mov dword [rdi+108], 16
     mov rax, [pe_idata_rva]
     mov [rdi+112+8], eax                    ; import directory
-    mov dword [rdi+112+8+4], 100
-    add rax, PE_IDATA_IAT
+    mov ecx, [pe_nuser]
+    lea ecx, [rcx + 5]
+    imul ecx, 20
+    mov [rdi+112+8+4], ecx
+    add rax, [pe_iat]
     mov [rdi+112+96], eax                   ; IAT directory
-    mov dword [rdi+112+96+4], IAT_SLOTS*8
+    mov ecx, [pe_total]
+    shl ecx, 3
+    mov [rdi+112+96+4], ecx
     ; section table at 0x148
     lea rdi, [outbuf + 0x148]
     ; .text
@@ -1605,8 +1678,12 @@ idata_list:
     cmp byte [rsi], 0
     je .done
     lea rax, [rbx + r12]
-    mov [idata_buf + PE_IDATA_ILT + r13*8], rax
-    mov [idata_buf + PE_IDATA_IAT + r13*8], rax
+    mov rdi, [pe_ilt]
+    lea rdi, [idata_buf + rdi + r13*8]
+    mov [rdi], rax
+    mov rdi, [pe_iat]
+    lea rdi, [idata_buf + rdi + r13*8]
+    mov [rdi], rax
     lea rdi, [idata_buf + r12 + 2]
 .nm:
     mov al, [rsi]
@@ -1635,7 +1712,7 @@ build_idata:
     push r15
     push rbp
     mov rbx, [pe_idata_rva]
-    mov r12d, PE_IDATA_NAMES
+    mov r12, [pe_names]
     xor r13d, r13d
     mov rsi, imp_names
     call idata_list
@@ -1690,41 +1767,52 @@ build_idata:
     sub r13, idata_buf
     sub r15, idata_buf
     ; descriptor 0: KERNEL32
-    lea rax, [rbx + PE_IDATA_ILT]
+    mov rax, [pe_ilt]
+    lea rax, [rbx + rax]
     mov [idata_buf], eax
     lea rax, [rbx + r14]
     mov [idata_buf + 12], eax
-    lea rax, [rbx + PE_IDATA_IAT]
+    mov rax, [pe_iat]
+    lea rax, [rbx + rax]
     mov [idata_buf + 16], eax
     ; descriptor 1: WS2_32 (its thunks start after the 8 kernel32 slots)
-    lea rax, [rbx + PE_IDATA_ILT + (IAT_K32+1)*8]
+    mov rax, [pe_ilt]
+    lea rax, [rbx + rax + (IAT_K32+1)*8]
     mov [idata_buf + 20], eax
     lea rax, [rbx + r13]
     mov [idata_buf + 32], eax
-    lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1)*8]
+    mov rax, [pe_iat]
+    lea rax, [rbx + rax + (IAT_K32+1)*8]
     mov [idata_buf + 36], eax
     ; descriptor 2: IPHLPAPI
-    lea rax, [rbx + PE_IDATA_ILT + (IAT_K32+1+20+1)*8]
+    mov rax, [pe_ilt]
+    lea rax, [rbx + rax + (IAT_K32+1+20+1)*8]
     mov [idata_buf + 40], eax
     lea rax, [rbx + r15]
     mov [idata_buf + 52], eax
-    lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1+20+1)*8]
+    mov rax, [pe_iat]
+    lea rax, [rbx + rax + (IAT_K32+1+20+1)*8]
     mov [idata_buf + 56], eax
     ; descriptor 3: ADVAPI32
-    lea rax, [rbx + PE_IDATA_ILT + (IAT_K32+1+20+1+8+1)*8]
+    mov rax, [pe_ilt]
+    lea rax, [rbx + rax + (IAT_K32+1+20+1+8+1)*8]
     mov [idata_buf + 60], eax
     lea rax, [rbx + rbp]
     mov [idata_buf + 72], eax
-    lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1+20+1+8+1)*8]
+    mov rax, [pe_iat]
+    lea rax, [rbx + rax + (IAT_K32+1+20+1+8+1)*8]
     mov [idata_buf + 76], eax
     ; descriptor 4: CRYPT32
-    lea rax, [rbx + PE_IDATA_ILT + (IAT_K32+1+20+1+8+1+1+1)*8]
+    mov rax, [pe_ilt]
+    lea rax, [rbx + rax + (IAT_K32+1+20+1+8+1+1+1)*8]
     mov [idata_buf + 80], eax
     mov eax, [crypt_name_off]
     add rax, rbx
     mov [idata_buf + 92], eax
-    lea rax, [rbx + PE_IDATA_IAT + (IAT_K32+1+20+1+8+1+1+1)*8]
+    mov rax, [pe_iat]
+    lea rax, [rbx + rax + (IAT_K32+1+20+1+8+1+1+1)*8]
     mov [idata_buf + 96], eax
+    call pe_user_idata                      ; the libraries of extern "library" declarations
     mov rax, r12
     pop rbp
     pop r15
@@ -2222,7 +2310,7 @@ field_tab:      resb FIELD_MAX * 32
 ptype_pool:     resq PTYPE_MAX
 file_table:     resb FILE_MAX * 64
 outbuf:         resb OUT_MAX
-idata_buf:      resb 8192
+idata_buf:      resb 524288
 strbuf:         resb 65536
 errbuf:         resb 512
 importbuf:      resb 1024
@@ -2315,6 +2403,25 @@ link_mode:      resd 1                  ; the inputs are object files
 ext_reloc_sym:  resd 1
 foreign_active: resd 1
 extern_decl:    resd 1
+elf_code_off:   resq 1
+c_ints:         resd 1                  ; inside extern "..." declarations: int means C's int (int32_t)
+lib_count:      resd 1                  ; libraries named by extern "library" (lib_off: offset of the name in lib_names)
+lib_off:        resd LIB_MAX
+lib_used:       resd LIB_MAX            ; (set when the output is built: the library has a used import)
+lib_names:      resb 8192
+lib_names_pos:  resd 1
+imp_count:      resd 1                  ; C imports: symbol index and library index of each
+imp_sym:        resd IMP_MAX
+imp_lib:        resd IMP_MAX
+imp_slot:       resd IMP_MAX            ; (set when the output is built: the import's slot number, -1 when unused)
+sym_cthunk:     resd SYM_MAX            ; F_CEXPORT function -> symbol of its C entry thunk
+cc_n:           resd 1                  ; the C call / thunk being emitted: number of arguments, of fixed ones,
+cc_nfixed:      resd 1                  ;   the result class and the class of each argument
+cc_ret:         resd 1
+cc_cls:         resb CC_MAXARG
+cc_loc:         resb CC_MAXARG          ; (cc_classify) where each argument goes: int register k, 0x40 + float register k,
+cc_nstack:      resd 1                  ;   0x80 + stack slot s; the number of stack slots and of float registers used
+cc_nfp:         resd 1
 opt_nobjs:      resd 1
 data_pos_f:     resq 1
 bss_pos_f:      resq 1

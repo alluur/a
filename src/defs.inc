@@ -167,6 +167,10 @@
 %define F_VIRTUAL       4096    ; a method that is called through the vtable of the object
 %define F_PROTECTED     8192
 %define F_EXTERN        16384   ; extern declaration: the storage is defined in another object
+%define F_CFUNC         32768   ; a C function (extern "lib" / extern "C" prototype): called with the C ABI through a pointer
+                                ;   slot; SYM_VAL = data offset of the slot (extern "C") or import index (F_CIMPORT)
+%define F_CIMPORT       65536   ; ... whose slot the dynamic linker / Windows loader fills (extern "library")
+%define F_CEXPORT       131072  ; an A function that C can call (extern "C" with a body): sym_cthunk = its C entry symbol
 %define F_BYREF         2048    ; a struct parameter: the slot holds the address of the caller's copy
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
@@ -232,6 +236,23 @@
 %define R_CODE          4       ; rel32 / adrp pair in code -> code address of function symbol (index) target
 %define R_CODE32        4       ; rel32 in code -> code + target (unused)
 %define R_CHKSTK        7       ; rel32 call of the Windows stack probe (only in objects: the linker patches it)
+%define R_IMPORT        8       ; rel32 / adrp pair in code -> the pointer slot of C import (index) target (made R_DATA / R_IAT
+                                ;   when the output is built)
+; argument / result classes of a C call (cc_cls, cc_ret)
+%define CC_INT          0       ; a 64-bit integer or pointer
+%define CC_DBL          1       ; double
+%define CC_FLT          2       ; float (binary32)
+%define CC_I32          3       ; a 32-bit integer (RISC-V and LoongArch pass it sign extended)
+%define CC_VOID         4       ; (result only)
+%define CC_MAXARG       32
+%define LIB_MAX         64
+%define IMP_MAX         4096
+%define DYN_STR_MAX     65536
+%define DYN_ENTRIES_FIXED 12
+%define R_X86_64_GLOB_DAT   6
+%define R_AARCH64_GLOB_DAT  1025
+%define R_RISCV_64          2
+%define R_LARCH_64          2
 %define FOREIGN_DATA_BASE 0x400000          ; in object mode the data of the built-in libraries is allocated up here and left out
 %define FOREIGN_BSS_BASE  0x10000000
 
@@ -395,6 +416,10 @@
     %1 ubias ; A ^= 1 << 63, B ^= 1 << 63: a signed comparison after it compares A and B as unsigned
     %1 utod ; A = (double)A, A unsigned
     %1 dtou ; A = (uint64)A, truncated toward zero
+    ; C calls (cc_n, cc_nfixed, cc_ret, cc_cls describe the call)
+    %1 ccall ; A = address of a C function; its cc_n arguments are on the stack (A's order): calls it with the C ABI
+             ;   of the target and leaves the result in A (a double as its bits, a float widened to a double)
+    %1 cthunk ; rdi = an A function: emits a C ABI entry point that passes its arguments to it and returns its result
 %endmacro
 
 %assign CGI_COUNT 0
