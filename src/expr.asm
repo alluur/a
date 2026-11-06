@@ -399,6 +399,8 @@ binop_emit:
     je .le
     cmp ebx, T_GE
     je .ge
+    cmp ebx, T_CMP3
+    je .cmp3
     ERR "internal error: unknown binary operator"
 .add:
     test r12d, 0xFF00
@@ -529,6 +531,29 @@ binop_emit:
 .cdone:
     mov rax, [code_pos]
     mov [cmp_end], rax
+    jmp .out
+; a <=> b : -1, 0 or 1  =  (a > b) - (a < b)
+.cmp3:
+    CG push_a
+    CG push_b
+    test r14d, r14d
+    jnz .c3u
+    CG cmp_gt
+    CG mov_d_a
+    CG pop_b
+    CG pop_a
+    CG cmp_lt
+    jmp .c3end
+.c3u:
+    CG cmp_ugt
+    CG mov_d_a
+    CG pop_b
+    CG pop_a
+    CG cmp_ult
+.c3end:
+    CG mov_b_a
+    CG mov_a_d
+    CG sub
     jmp .out
 .cmark:
     mov rax, [code_pos]
@@ -857,6 +882,121 @@ parse_type:
     add rsp, 128
     jmp .ret
 
+section .rodata
+w_count: db "count", 0
+w_name: db "name", 0
+w_parse: db "parse", 0
+w_has: db "has", 0
+fn_enum_name: db "__enum_name", 0
+fn_enum_has: db "__enum_has", 0
+fn_enum_parse: db "__enum_parse", 0
+section .text
+
+; tk_is_word: rdi = C string -> eax = 1 when the current identifier token is exactly that word
+tk_is_word:
+    mov rsi, rdi
+    xor ecx, ecx
+.l: cmp byte [rsi+rcx], 0
+    je .end
+    inc ecx
+    jmp .l
+.end:
+    cmp ecx, [tk_len]
+    jne .no
+    mov rdi, [tk_ptr]
+    repe cmpsb
+    jne .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+; enum_count: edi = enum symbol index -> eax = number of members
+enum_count:
+    xor eax, eax
+    mov ecx, [sym_count]
+.l: test ecx, ecx
+    jz .out
+    dec ecx
+    mov rdx, rcx
+    shl rdx, 6
+    add rdx, symtab
+    test dword [rdx+SYM_FLAGS], F_ENUMVAL
+    jz .l
+    cmp [rdx+SYM_OWNER], edi
+    jne .l
+    inc eax
+    jmp .l
+.out:
+    ret
+
+; enum_table: edi = enum symbol index -> eax = offset in the data section of its table  { count, (value, name)... }
+; (built the first time the enum is used by Enum.name / parse / has; the helpers __enum_* of the library read it)
+enum_table:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov ebx, edi
+    mov eax, [enum_tab_off + rbx*4]
+    test eax, eax
+    jz .build
+    dec eax
+    jmp .ret
+.build:
+    mov edi, ebx
+    call enum_count
+    mov r12d, eax
+    lea rdi, [rax*2+2]
+    shl rdi, 3
+    mov esi, 8
+    call data_alloc
+    mov r13, rax                        ; table offset
+    mov [data_buf + r13], r12
+    lea eax, [r13+1]
+    mov [enum_tab_off + rbx*4], eax
+    xor r14d, r14d                      ; entry number
+    xor ecx, ecx                        ; symbol index
+.sc:
+    cmp ecx, [sym_count]
+    jae .done
+    mov rdx, rcx
+    shl rdx, 6
+    add rdx, symtab
+    inc ecx
+    test dword [rdx+SYM_FLAGS], F_ENUMVAL
+    jz .sc
+    cmp [rdx+SYM_OWNER], ebx
+    jne .sc
+    push rcx
+    mov rax, [rdx+SYM_VAL]
+    lea rcx, [r13 + r14*8]
+    lea rcx, [rcx + r14*8 + 8]
+    mov [data_buf + rcx], rax           ; the value
+    push rcx
+    mov rsi, [rdx+SYM_NAME]
+    mov edx, [rdx+SYM_NLEN]
+    call data_add_string
+    pop rcx
+    add rcx, 8
+    mov [data_buf + rcx], rax           ; the offset of the name, relocated to its address
+    mov edi, ecx
+    mov esi, R_DATA64
+    xor edx, edx
+    call add_reloc
+    pop rcx
+    inc r14d
+    jmp .sc
+.done:
+    mov rax, r13
+.ret:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 ; enum_find: edi = enum symbol index, rsi = name, edx = len -> rax = const symbol / 0
 enum_find:
     mov r8d, edi
@@ -971,7 +1111,15 @@ gen_call:
     mov dword [force_direct], 0
     mov r12, rdi
     mov r13d, esi
+    mov r14d, [op_call]                 ; operator overloading: 1 = the one argument is already in A, 2 = no arguments
+    mov dword [op_call], 0
     xor ebx, ebx
+    test r14d, r14d
+    jz .parsed
+    cmp r14d, 2
+    je .args_done2
+    jmp .argconv
+.parsed:
     mov edi, '('
     call expect
     cmp qword [tk], ')'
@@ -979,6 +1127,7 @@ gen_call:
 .arg:
     call parse_assign
     call to_rvalue
+.argconv:
     ; int <-> double conversion to the declared parameter type
     mov rax, [r12+SYM_EXTRA]
     test rax, rax
@@ -1019,6 +1168,8 @@ gen_call:
 .pushit:
     CG push_a
     inc ebx
+    test r14d, r14d
+    jnz .args_done2
     cmp qword [tk], ','
     jne .args_done
     call next_token
@@ -1026,6 +1177,7 @@ gen_call:
 .args_done:
     mov edi, ')'
     call expect
+.args_done2:
     test dword [r12+SYM_FLAGS], F_VARIADIC
     jz .fixedargs
     ; variadic callee: after the arguments comes the number of extra ones
@@ -2038,12 +2190,90 @@ parse_primary:
     call enum_find
     test rax, rax
     jnz .en2
+    ; Color.count  Color.name(v)  Color.parse("Red", fallback)  Color.has(v)
+    mov rdi, w_count
+    call tk_is_word
+    test eax, eax
+    jnz .enr_count
+    mov rdi, w_name
+    call tk_is_word
+    test eax, eax
+    jnz .enr_name
+    mov rdi, w_parse
+    call tk_is_word
+    test eax, eax
+    jnz .enr_parse
+    mov rdi, w_has
+    call tk_is_word
+    test eax, eax
+    jnz .enr_has
     mov edi, msg_nomember
     call fatal_error_tok
 .en2:
     mov r12, rax
     call next_token
     jmp .const
+.enr_count:
+    mov edi, ebx
+    call enum_count
+    mov edi, eax
+    call gen_imm_a
+    mov qword [e_type], TY_INT
+    mov qword [e_lval], 0
+    call next_token
+    jmp .out
+.enr_name:
+    mov r13, fn_enum_name
+    mov r14d, 1
+    mov dword [enr_ret], TY_CHAR | TY_PTR1
+    jmp .enr_call
+.enr_has:
+    mov r13, fn_enum_has
+    mov r14d, 1
+    mov dword [enr_ret], TY_BOOL
+    jmp .enr_call
+.enr_parse:
+    mov r13, fn_enum_parse
+    mov r14d, 2
+    mov dword [enr_ret], TY_INT
+.enr_call:
+    call next_token
+    mov edi, '('
+    call expect
+    mov edi, ebx
+    call enum_table
+    mov edx, eax
+    mov esi, R_DATA
+    CG lea_global_a
+    CG push_a                           ; the table
+    call parse_assign
+    call to_rvalue
+    CG push_a                           ; the value, or the text for parse
+    cmp r14d, 2
+    jne .enr_close
+    xor edi, edi
+    dec rdi                             ; the fallback of parse is -1
+    cmp qword [tk], ','
+    jne .enr_fb
+    call next_token
+    call parse_assign
+    call to_rvalue
+    jmp .enr_fb2
+.enr_fb:
+    call gen_imm_a
+.enr_fb2:
+    CG push_a
+.enr_close:
+    mov edi, ')'
+    call expect
+    mov rdi, r13
+    call emit_call_named
+    lea edi, [r14+1]
+    CG drop
+    mov eax, [enr_ret]
+    mov [e_type], rax
+    mov qword [e_lval], 0
+    jmp .out
 
 .implicit_field:
     mov r12, rax
@@ -2160,7 +2390,33 @@ parse_postfix:
     mov rax, [e_type]
     test eax, 0xFF00
     jnz .ix1
+    cmp al, TY_STRUCT
+    je .ixop
     ERR "indexing a value that is not a pointer or array"
+; a[i] on a class value calls  operator[](i)
+.ixop:
+    mov edi, eax
+    shr edi, 16
+    and edi, 0xFFFF
+    mov edx, 10
+    mov rsi, [opn_index]
+    call struct_find_method
+    test rax, rax
+    jnz .ixop1
+    ERR "this class has no operator[]"
+.ixop1:
+    mov r12, rax
+    CG push_a
+    call next_token
+    call parse_expr
+    call to_rvalue
+    mov edi, ']'
+    call expect
+    mov rdi, r12
+    mov esi, 1
+    mov dword [op_call], 1
+    call gen_call
+    jmp .loop
 .ix1:
     mov rdi, [e_type]
     call type_pointee_size
@@ -2454,6 +2710,13 @@ parse_unary:
     call parse_unary
     call to_rvalue
     pop rax
+    push rax
+    mov rsi, op_neg_name
+    call op_unary                       ; -a  on a class value calls  operator-()  (stored as "operator neg")
+    mov edx, eax
+    pop rax
+    test edx, edx
+    jnz .negdone
     cmp qword [e_type], TY_DOUBLE
     je .negdbl
     cmp rax, [imm_pos]
@@ -2473,6 +2736,8 @@ parse_unary:
 .negreal:
     CG neg
     jmp unary_type
+.negdone:
+    ret
 .negdbl:
     cmp rax, [imm_pos]
     jne .negdbl_rt
@@ -2567,6 +2832,153 @@ parse_unary:
 
 ; ---- binary / logical / ternary / assignment ----------------------------------
 ; parse_binary: edi = minimum precedence (3..10)
+section .rodata
+opn_0: db "operator+", 0
+opn_1: db "operator-", 0
+opn_2: db "operator*", 0
+opn_3: db "operator/", 0
+opn_4: db "operator%", 0
+opn_5: db "operator&", 0
+opn_6: db "operator|", 0
+opn_7: db "operator^", 0
+opn_8: db "operator<<", 0
+opn_9: db "operator>>", 0
+opn_10: db "operator==", 0
+opn_11: db "operator!=", 0
+opn_12: db "operator<", 0
+opn_13: db "operator>", 0
+opn_14: db "operator<=", 0
+opn_15: db "operator>=", 0
+opn_16: db "operator[]", 0
+align 8
+; operator token, length of the method name, the name of the method that overloads it
+op_name_tab:
+    dq '+', 9, opn_0
+    dq '-', 9, opn_1
+    dq '*', 9, opn_2
+    dq '/', 9, opn_3
+    dq '%', 9, opn_4
+    dq '&', 9, opn_5
+    dq '|', 9, opn_6
+    dq '^', 9, opn_7
+    dq T_SHL, 10, opn_8
+    dq T_SHR, 10, opn_9
+    dq T_EQ, 10, opn_10
+    dq T_NE, 10, opn_11
+    dq '<', 9, opn_12
+    dq '>', 9, opn_13
+    dq T_LE, 10, opn_14
+    dq T_GE, 10, opn_15
+    dq '[', 10, opn_16
+    dq 0, 0, 0
+op_neg_name: db "operator neg", 0
+opn_index: dq opn_16
+section .text
+
+; op_name_for_token: edi = operator token -> rax = method name (0 if the token cannot be overloaded), edx = its length
+op_name_for_token:
+    mov rax, op_name_tab
+.l: mov rcx, [rax]
+    test rcx, rcx
+    jz .none
+    cmp ecx, edi
+    je .found
+    add rax, 24
+    jmp .l
+.found:
+    mov edx, [rax+8]
+    mov rax, [rax+16]
+    ret
+.none:
+    xor eax, eax
+    ret
+
+; op_overload: edi = operator token, rsi = type of the left operand (a class value).  The left operand's address is on the stack
+; (pushed as the first argument) and the right operand is in A. Calls the operator method if the class has one: eax = 1 and the
+; result is in A, else eax = 0 and nothing has been emitted.
+op_overload:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12, rsi
+    xor r13d, r13d
+    call op_name_for_token
+    test rax, rax
+    jz .no
+    mov rsi, rax
+    mov rax, r12
+    shr eax, 16
+    and eax, 0xFFFF
+    mov edi, eax
+    call struct_find_method
+    test rax, rax
+    jnz .have
+    cmp ebx, T_NE                       ; a != b  is  !(a == b)  when only operator== exists
+    jne .no
+    mov edi, T_EQ
+    call op_name_for_token
+    mov rsi, rax
+    mov rax, r12
+    shr eax, 16
+    and eax, 0xFFFF
+    mov edi, eax
+    call struct_find_method
+    test rax, rax
+    jz .no
+    mov r13d, 1
+.have:
+    mov rdi, rax
+    mov esi, 1
+    mov dword [op_call], 1
+    call gen_call
+    test r13d, r13d
+    jz .yes
+    CG lnot
+    mov qword [e_type], TY_BOOL
+.yes:
+    mov eax, 1
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.no:
+    xor eax, eax
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; op_unary: rsi = name of a method without parameters, A = the address of a class value (e_type is its type). Calls it if it exists
+; (eax = 1, result in A) else eax = 0.
+op_unary:
+    push rbx
+    mov rax, [e_type]
+    test eax, 0xFF00
+    jnz .no
+    cmp al, TY_STRUCT
+    jne .no
+    shr eax, 16
+    and eax, 0xFFFF
+    mov edi, eax
+    mov edx, 12
+    call struct_find_method
+    test rax, rax
+    jz .no
+    mov rbx, rax
+    CG push_a
+    mov rdi, rbx
+    mov esi, 1
+    mov dword [op_call], 2
+    call gen_call
+    mov eax, 1
+    pop rbx
+    ret
+.no:
+    xor eax, eax
+    pop rbx
+    ret
+
 parse_binary:
     push rbx
     push r12
@@ -2595,6 +3007,20 @@ parse_binary:
     lea edi, [r13+1]
     call parse_binary
     call to_rvalue
+    ; operator overloading: the left operand is a class value whose class has an  operator+  (etc.)  method
+    mov rax, [rsp+8]
+    test eax, 0xFF00
+    jnz .noovl
+    cmp al, TY_STRUCT
+    jne .noovl
+    mov edi, r12d
+    mov rsi, rax
+    call op_overload
+    test eax, eax
+    jz .noovl
+    add rsp, 16                         ; the position and type that were kept for the peephole
+    jmp .loop
+.noovl:
     ; a double on either side: the soft-float routines take over (left value is on the stack, right one in A)
     mov rax, [rsp+8]
     cmp rax, TY_DOUBLE
@@ -2660,9 +3086,35 @@ parse_logand:
     pop rbx
     ret
 
-parse_logor:
+; a ^^ b : logical exclusive or (both sides are evaluated); the result is a bool
+parse_logxor:
     push rbx
     call parse_logand
+    cmp qword [tk], T_XORXOR
+    jne .out
+.l:
+    call to_rvalue
+    call truth_value
+    CG tobool
+    CG push_a
+    call next_token
+    call parse_logand
+    call to_rvalue
+    call truth_value
+    CG tobool
+    CG mov_b_a
+    CG pop_a
+    CG xor
+    mov qword [e_type], TY_BOOL
+    cmp qword [tk], T_XORXOR
+    je .l
+.out:
+    pop rbx
+    ret
+
+parse_logor:
+    push rbx
+    call parse_logxor
     cmp qword [tk], T_OROR
     jne .out
     call to_rvalue
@@ -2671,7 +3123,7 @@ parse_logor:
     mov rdi, rsp
     call cond_jnz
     call next_token
-    call parse_logand
+    call parse_logxor
     call to_rvalue
     cmp qword [tk], T_OROR
     je .l
@@ -2697,6 +3149,8 @@ parse_logor:
 parse_ternary:
     push rbx
     call parse_logor
+    cmp qword [tk], T_QQ
+    je .coalesce
     cmp qword [tk], '?'
     jne .out
     call to_rvalue
@@ -2733,6 +3187,21 @@ parse_ternary:
     add rsp, 8
     mov [e_type], rbx
 .out:
+    pop rbx
+    ret
+; a ?? b : a when it is not 0 / null, else b (b is only evaluated then)
+.coalesce:
+    call to_rvalue
+    mov rbx, [e_type]
+    push 0
+    mov rdi, rsp
+    CG jnz_chain
+    call next_token
+    call parse_ternary
+    call to_rvalue
+    pop rdi
+    call patch_here
+    mov [e_type], rbx
     pop rbx
     ret
 
@@ -2880,7 +3349,45 @@ parse_assign:
     call type_ls
     test eax, eax
     jnz .c3
+    test ebx, 0xFF00
+    jnz .cbad
+    cmp bl, TY_STRUCT
+    je .cstruct
+.cbad:
     ERR "compound assignment needs a scalar variable"
+; a += b  on a class value:  a = a.operator+(b)
+.cstruct:
+    sub r12d, T_ADDEQ
+    movzx edi, byte [compound_map+r12]
+    call op_name_for_token
+    test rax, rax
+    jz .cnoop
+    mov rsi, rax
+    mov rdi, rbx
+    shr edi, 16
+    and edi, 0xFFFF
+    call struct_find_method
+    test rax, rax
+    jnz .cfound
+.cnoop:
+    ERR "this class has no operator for that compound assignment"
+.cfound:
+    mov r13, rax
+    CG push_a                           ; the destination
+    CG push_a                           ; this
+    call next_token
+    call parse_assign
+    call to_rvalue
+    mov rdi, r13
+    mov esi, 1
+    mov dword [op_call], 1
+    call gen_call
+    CG pop_b
+    mov rdi, rbx
+    call emit_store_type
+    mov [e_type], rbx
+    mov qword [e_lval], 0
+    jmp .ret
 .c3:
     mov rdi, [pk_end]
     call tail_is
@@ -3094,7 +3601,19 @@ const_apply:
     je .gt
     cmp edi, T_LE
     je .le
+    cmp edi, T_CMP3
+    je .cmp3
     jmp .ge
+.cmp3:
+    xor edx, edx
+    cmp rax, rcx
+    setg dl
+    setl cl
+    movzx ecx, cl
+    mov rax, rdx
+    sub rax, rcx
+    xor edx, edx
+    ret
 .add: add rax, rcx
     ret
 .sub: sub rax, rcx

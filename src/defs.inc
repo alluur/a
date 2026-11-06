@@ -68,6 +68,9 @@
 %define T_SHLEQ         147
 %define T_SHREQ         148
 %define T_SCOPE         149     ; ::
+%define T_XORXOR        150     ; ^^   logical exclusive or
+%define T_CMP3          151     ; <=>  three way comparison: -1, 0 or 1
+%define T_QQ            152     ; ??   a ?? b  is a unless it is 0 / null, else b
 ; keywords
 %define K_INT           160
 %define K_CHAR          161

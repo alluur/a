@@ -27,6 +27,7 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `wfb` | the Linux framebuffer + evdev (keyboard, mouse, touch) backend |
 | `gui` | the client library and the basic widgets, popups, tooltips |
 | `guix` | more widgets: menus, combo box, radio buttons, tabs, scroll view, spin box, splitter; dialogs (confirm, prompt, file, colour) |
+| `gchart` | data widgets: `Chart` (bar, line, area and pie charts with rolling data), `Gauge`, `Switch`, `Rating` |
 | `glock` | a screen locker (works with the server's `F_LOCK` windows) |
 | `wweb` | a web browser backend: the display in a canvas, mouse and keyboard back over a WebSocket |
 | `ghtml` | shows HTML and Markdown: parser, layout, links, images, scrolling (`HtmlView`) |
@@ -70,7 +71,9 @@ s->text(gfx.sans(), 20, 22, "Hello, Ä Ö Å", gfx.WHITE);     // UTF-8, Latin-1
 s->savePPM("out.ppm");                                       // or saveBMP
 ```
 
-* Shapes: `fill rect hline vline line circle fillCircle roundRect fillRoundRect gradientV shadow`; every function clips to the
+* Shapes: `fill rect hline vline line circle fillCircle roundRect fillRoundRect gradientV shadow`, and `fillPolygon(xs, ys, n, c)`,
+  `fillPie(cx, cy, r, a0, a1, c)`, `thickArc(cx, cy, r0, r1, a0, a1, c)` and `arc(...)` (angles in degrees, clockwise from the right;
+  `gfx.isin` / `gfx.icos` give sine and cosine times 1024); every function clips to the
   surface and to the clip rectangle (`setClip`, `resetClip`). A colour with alpha < 255 blends with what is there.
 * Images: `blit` (copy), `blitBlend` (alpha compositing), `pack` / `unpack` (4 bytes per pixel: blue, green, red, alpha).
 * Text: `text(font, x, y, utf8, colour)`, `textCentered`, `gfx.textWidth(font, s)`; fonts `gfx.sans()`, `gfx.sansBold()`,
@@ -83,6 +86,23 @@ s->savePPM("out.ppm");                                       // or saveBMP
   damaged file also falls back to DejaVu). The AOS project makes such fonts with a generator written in A (`fonts/fontgen.a`).
 * `checksum()` gives one number for the whole picture: the same program draws the same pixels on every target, which is how
   the tests compare Linux x64, ARM64, RISC-V, LoongArch and Windows.
+
+## Charts and gauges: `gchart`
+
+```c
+import gchart;
+gchart.Chart* c = new gchart.Chart(gchart.LINE);        // BAR, LINE, AREA or PIE
+int cpu = c->addSeries("CPU", 0);                       // colour 0 = the next colour of the palette
+c->setRange(0, 100);
+c->push(cpu, 42);                                       // one point per tick; the chart scrolls after c->maxPoints (60)
+gchart.Gauge* g = new gchart.Gauge(0, 100);   g->setValue(73);   g->caption = "CPU %";
+gchart.Switch* sw = new gchart.Switch(true);  sw->onChange = changed;       // int changed(int widget)
+gchart.Rating* r = new gchart.Rating(5, 3);
+```
+
+A `Chart` scales its y axis to 1, 2 or 5 times a power of ten unless `setRange` fixes it, draws a grid with labels, a title and a
+legend (`title`, `grid`, `legend`), stacks bars with `stacked = true`, and takes names for the x axis or the pie slices from
+`setLabels`. All of them are ordinary `gui.Widget`s: put them in a `Box`, give them `flex` or a size.
 
 ## Programs: `gui`
 

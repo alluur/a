@@ -53,9 +53,14 @@ kw_table:
     KW "long",     K_INTMOD
     KW "signed",   K_INTMOD
     KW "unsigned", K_INTMOD
+    KW "and",      T_ANDAND
+    KW "or",       T_OROR
+    KW "not",      '!'
+    KW "xor",      T_XORXOR
     db 0
 
 ops3:
+    db "<=>", T_CMP3
     db "<<=", T_SHLEQ
     db ">>=", T_SHREQ
     db 0
@@ -80,6 +85,8 @@ ops2:
     db "|=", T_OREQ
     db "^=", T_XOREQ
     db "::", T_SCOPE
+    db "^^", T_XORXOR
+    db "??", T_QQ
     db 0
 singles:
     db "(){}[];,.:?~=!<>&|^+-*/%", 0

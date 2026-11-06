@@ -9,6 +9,8 @@
 ;           functions and methods can be used before they are defined.
 ; =============================================================================
 section .rodata
+CSTR s_operator,    "operator"
+op_minus_name: db "operator-", 0
 CSTR msg_redef,    "redefinition of"
 CSTR msg_kindmix,  "name is already declared as something else:"
 CSTR msg_toplevel, "expected a declaration"
@@ -731,6 +733,35 @@ parse_aggregate:
     mov [agg_mname], rax
     mov eax, [tk_len]
     mov [agg_mnlen], eax
+    cmp eax, 8
+    jne .t2
+    mov rsi, [tk_ptr]
+    mov rdi, s_operator
+    mov ecx, 8
+    repe cmpsb
+    jne .t2
+    ; operator+ ... : the method gets the name that the expression parser looks for
+    call next_token
+    mov edi, [tk]
+    call op_name_for_token
+    test rax, rax
+    jnz .opname
+    ERR "this operator cannot be overloaded"
+.opname:
+    mov [agg_mname], rax
+    mov [agg_mnlen], edx
+    cmp qword [tk], '['
+    jne .opdone
+    call next_token
+    cmp qword [tk], ']'
+    je .opdone
+    ERR "expected ] after operator["
+.opdone:
+    call next_token
+    cmp qword [tk], '('
+    je .method
+    ERR "expected ( after the operator"
+.t2:
     call next_token
     cmp qword [tk], '('
     je .method
@@ -813,6 +844,19 @@ parse_aggregate:
 ; ---- method / constructor
 .method:
     call parse_params
+    ; a minus operator without a parameter is the unary one
+    cmp dword [agg_mnlen], 9
+    jne .nounary
+    cmp dword [ptmp_count], 0
+    jne .nounary
+    mov rsi, [agg_mname]
+    mov rdi, op_minus_name
+    mov ecx, 9
+    repe cmpsb
+    jne .nounary
+    mov qword [agg_mname], op_neg_name
+    mov dword [agg_mnlen], 12
+.nounary:
     mov r8d, F_METHOD
     cmp dword [agg_vis], 0
     je .mf1

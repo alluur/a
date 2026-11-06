@@ -1,0 +1,520 @@
+// =============================================================================
+//  gchart - data widgets for gui: charts, gauges, switches, rating stars                                       import gchart;
+//
+//    gchart.Chart* c = new gchart.Chart(gchart.LINE);       // gchart.BAR, gchart.LINE, gchart.AREA, gchart.PIE
+//    int cpu = c->addSeries("CPU", 0xFF3C78D8);              // returns the number of the series
+//    c->setValues(cpu, values, n);                           // or add points one at a time:
+//    c->push(cpu, 42);                                       // the oldest point drops out after c->maxPoints (default 60)
+//    c->setLabels(labels, n);                                // names for the x axis (bar charts) or the slices (pie charts)
+//    c->setRange(0, 100);  c->title = "Load";  c->legend = true;  c->grid = true;  c->stacked = false;
+//    col->add(c);
+//
+//    gchart.Gauge* g = new gchart.Gauge(0, 100);            // a dial with a needle and coloured zones
+//    g->setValue(73);  g->caption = "CPU %";  g->warn = 60;  g->critical = 85;  (percent of the range where yellow / red start)
+//
+//    gchart.Switch* sw = new gchart.Switch(false);          // an on / off toggle: click or Space;  sw->on;  sw->onChange = f;
+//    gchart.Rating* r = new gchart.Rating(5, 3);            // stars to click:  r->value  (0..max);  r->onChange = f;
+//
+//  onChange functions look like  int f(int widget)  (cast the argument to the widget type).
+// =============================================================================
+import gui;
+import gfx;
+import adp;
+import cstdlib;
+import cstring;
+module gchart;
+
+public const BAR = 0;
+public const LINE = 1;
+public const AREA = 2;
+public const PIE = 3;
+
+const MAX_SERIES = 8;
+
+int palette[8] = { 0xFF3C78D8, 0xFFE06666, 0xFF58A55C, 0xFFF0A030, 0xFF8E6CC3, 0xFF2AA3B0, 0xFFD6B030, 0xFFC0589A };
+
+// ---- Chart -------------------------------------------------------------------------------------------------------------------------------
+public class Chart : gui.Widget {
+    public int kind;
+    public char* title;
+    public bool legend;
+    public bool grid;
+    public bool stacked;               // bars of the series are piled up instead of side by side
+    public int maxPoints;
+    public char** labels;
+    public int nlabels;
+    private int nseries;
+    private char* names[8];
+    private int colors[8];
+    private int* values[8];
+    private int counts[8];
+    private int capacity[8];
+    private bool fixedRange;
+    private int lo;
+    private int hi;
+    private gfx.Font* font;
+
+    public Chart(int k) {
+        super();
+        kind = k;
+        legend = true;
+        grid = true;
+        maxPoints = 60;
+        w = 240;
+        h = 150;
+        font = gfx.sans();
+    }
+
+    public virtual int prefW() { return 240; }
+    public virtual int prefH() { return 150; }
+
+    // a new data series; returns its number (or -1 when there are 8 already)
+    public int addSeries(char* name, int color) {
+        if (nseries >= 8) { return -1; }
+        names[nseries] = strdup(name);
+        colors[nseries] = (color == 0) ? palette[nseries] : color;
+        values[nseries] = null;
+        counts[nseries] = 0;
+        capacity[nseries] = 0;
+        nseries++;
+        return nseries - 1;
+    }
+
+    public int seriesCount() { return nseries; }
+    public int pointCount(int s) { return (s >= 0 && s < nseries) ? counts[s] : 0; }
+    public int valueAt(int s, int i) {
+        if (s < 0 || s >= nseries || i < 0 || i >= counts[s]) { return 0; }
+        return values[s][i];
+    }
+
+    private void room(int s, int n) {
+        if (capacity[s] < n) {
+            int cap = (capacity[s] == 0) ? 16 : capacity[s];
+            while (cap < n) { cap = cap * 2; }
+            values[s] = (int*) realloc((char*) values[s], cap * 8);
+            capacity[s] = cap;
+        }
+    }
+
+    public void setValues(int s, int* v, int n) {
+        if (s < 0 || s >= nseries) { return; }
+        room(s, n);
+        for (int i = 0; i < n; i++) { values[s][i] = v[i]; }
+        counts[s] = n;
+        invalidate();
+    }
+
+    // adds one point at the right end; a series longer than maxPoints scrolls
+    public void push(int s, int v) {
+        if (s < 0 || s >= nseries) { return; }
+        if (maxPoints > 0 && counts[s] >= maxPoints) {
+            int drop = counts[s] - maxPoints + 1;        // also trims a series that is longer than a lowered maxPoints
+            for (int i = drop; i < counts[s]; i++) { values[s][i - drop] = values[s][i]; }
+            counts[s] = counts[s] - drop;
+        }
+        room(s, counts[s] + 1);
+        values[s][counts[s]] = v;
+        counts[s]++;
+        invalidate();
+    }
+
+    public void clearData() {
+        for (int s = 0; s < nseries; s++) { counts[s] = 0; }
+        invalidate();
+    }
+
+    public void setLabels(char** l, int n) {
+        labels = l;
+        nlabels = n;
+        invalidate();
+    }
+
+    // a fixed value range for the y axis (default: from 0 or the smallest value up to the largest, rounded)
+    public void setRange(int a, int b) {
+        lo = a;
+        hi = b;
+        fixedRange = (b > a);
+        invalidate();
+    }
+
+    private int longest() {
+        int m = 0;
+        for (int s = 0; s < nseries; s++) { if (counts[s] > m) { m = counts[s]; } }
+        return m;
+    }
+
+    // the scale of the y axis: nice round limits
+    private void scale(int* outLo, int* outHi) {
+        if (fixedRange) { *outLo = lo; *outHi = hi; return; }
+        int mn = 0;
+        int mx = 1;
+        int n = longest();
+        for (int i = 0; i < n; i++) {
+            int total = 0;
+            for (int s = 0; s < nseries; s++) {
+                if (i < counts[s]) {
+                    int v = values[s][i];
+                    total = total + v;
+                    if (!stacked || kind == LINE) {
+                        if (v > mx) { mx = v; }
+                        if (v < mn) { mn = v; }
+                    }
+                }
+            }
+            if (stacked && kind != LINE && total > mx) { mx = total; }
+        }
+        // round the top up to 1, 2, 5 times a power of ten
+        int step = 1;
+        while (step * 10 <= mx) { step = step * 10; }
+        int top = step;
+        if (mx > top) { top = step * 2; }
+        if (mx > top) { top = step * 5; }
+        if (mx > top) { top = step * 10; }
+        *outLo = mn;
+        *outHi = top;
+    }
+
+    private int yFor(int v, int vlo, int vhi, int top, int bottom) {
+        if (vhi <= vlo) { return bottom; }
+        return bottom - (bottom - top) * (v - vlo) / (vhi - vlo);
+    }
+
+    private void drawLegend(gfx.Surface* s, int x, int y, int maxw) {
+        int cx = x;
+        for (int i = 0; i < nseries; i++) {
+            char* name = (kind == PIE && labels != null && i < nlabels) ? labels[i] : names[i];
+            int tw = gfx.textWidth(font, name);
+            if (cx + tw + 20 > x + maxw && cx > x) { break; }
+            s->fill(cx, y + 3, 9, 9, colors[i]);
+            s->text(font, cx + 13, y, name, gui.cText);
+            cx = cx + tw + 24;
+        }
+    }
+
+    private void paintPie(gfx.Surface* s, int ox, int oy, int top) {
+        // the slices are the points of the first series
+        if (nseries == 0 || counts[0] == 0) { return; }
+        int n = counts[0];
+        int total = 0;
+        for (int i = 0; i < n; i++) { if (values[0][i] > 0) { total = total + values[0][i]; } }
+        if (total == 0) { return; }
+        int size = (w < h - top) ? w : h - top;
+        int r = size / 2 - 14;
+        if (legend) { r = (w - 90 < h - top - 8) ? (w - 90) / 2 : (h - top - 8) / 2; }
+        if (r < 10) { r = 10; }
+        int cx = ox + r + 8;
+        int cy = oy + top + (h - top) / 2;
+        int a = -90;
+        int acc = 0;
+        for (int i = 0; i < n; i++) {
+            if (values[0][i] <= 0) { continue; }
+            acc = acc + values[0][i];
+            int next = -90 + 360 * acc / total;
+            int col = palette[i % 8];
+            s->fillPie(cx, cy, r, a, next, col);
+            a = next;
+        }
+        s->circle(cx, cy, r, gui.cBorder);
+        if (legend) {
+            int lx = cx + r + 14;
+            int ly = cy - n * 8;
+            if (ly < oy + top) { ly = oy + top; }
+            for (int i = 0; i < n && ly + 14 < oy + h; i++) {
+                s->fill(lx, ly + 3, 9, 9, palette[i % 8]);
+                char num[24];
+                intToStr(values[0][i], &num[0]);
+                char* name = (labels != null && i < nlabels) ? labels[i] : &num[0];
+                s->text(font, lx + 13, ly, name, gui.cText);
+                ly = ly + 15;
+            }
+        }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        s->fillRoundRect(ox, oy, w, h, 4, gui.cField);
+        s->roundRect(ox, oy, w, h, 4, gui.cBorder);
+        int top = 6;
+        if (title != null) {
+            s->text(font, ox + 8, oy + 5, title, gui.cText);
+            top = font->height + 10;
+        }
+        if (kind == PIE) {
+            paintPie(s, ox, oy, top);
+            return;
+        }
+        int bottom = oy + h - 6;
+        if (legend && nseries > 0) { bottom = bottom - 16; }
+        int labelRoom = (nlabels > 0 && labels != null) ? font->height + 3 : 0;
+        bottom = bottom - labelRoom;
+        int left = ox + 36;
+        int right = ox + w - 8;
+        int ptop = oy + top;
+        if (bottom - ptop < 10 || right - left < 10) { return; }
+        int vlo;
+        int vhi;
+        scale(&vlo, &vhi);
+        // the grid and the y axis labels
+        for (int g = 0; g <= 4; g++) {
+            int v = vlo + (vhi - vlo) * g / 4;
+            int gy = yFor(v, vlo, vhi, ptop, bottom);
+            if (grid) { s->hline(left, gy, right - left, gfx.mix(gui.cBorder, gui.cField, 60)); }
+            char num[24];
+            intToStr(v, &num[0]);
+            int tw = gfx.textWidth(font, &num[0]);
+            s->text(font, left - tw - 4, gy - font->height / 2, &num[0], gui.cTextDim);
+        }
+        int zeroY = yFor(0, vlo, vhi, ptop, bottom);
+        if (vlo < 0 && vhi > 0) { s->hline(left, zeroY, right - left, gui.cBorder); }
+        int n = longest();
+        if (n > 0) {
+            if (kind == BAR) {
+                int slot = (right - left) / n;
+                int inner = slot - 4;
+                if (inner < 2) { inner = 2; }
+                int bw = stacked ? inner : inner / ((nseries > 0) ? nseries : 1);
+                if (bw < 1) { bw = 1; }
+                for (int i = 0; i < n; i++) {
+                    int bx = left + i * slot + 2;
+                    int base = 0;
+                    for (int sr = 0; sr < nseries; sr++) {
+                        if (i >= counts[sr]) { continue; }
+                        int v = values[sr][i];
+                        int y1;
+                        int y0;
+                        int x0 = stacked ? bx : bx + sr * bw;
+                        if (stacked) {
+                            y0 = yFor(base, vlo, vhi, ptop, bottom);
+                            base = base + v;
+                            y1 = yFor(base, vlo, vhi, ptop, bottom);
+                        } else {
+                            y0 = (vlo < 0) ? zeroY : bottom;
+                            y1 = yFor(v, vlo, vhi, ptop, bottom);
+                        }
+                        int ry = (y1 < y0) ? y1 : y0;
+                        int rh = (y1 < y0) ? y0 - y1 : y1 - y0;
+                        if (rh < 1 && v != 0) { rh = 1; }
+                        s->fill(x0, ry, bw - 1, rh, colors[sr]);
+                    }
+                }
+            } else {
+                int stepx = (n > 1) ? (right - left) / (n - 1) : 0;
+                for (int sr = 0; sr < nseries; sr++) {
+                    int px = 0;
+                    int py = 0;
+                    for (int i = 0; i < counts[sr]; i++) {
+                        int x = left + ((n > 1) ? (right - left) * i / (n - 1) : (right - left) / 2);
+                        int y = yFor(values[sr][i], vlo, vhi, ptop, bottom);
+                        if (kind == AREA) {
+                            int fy = (vlo < 0) ? zeroY : bottom;
+                            if (i > 0) {
+                                int xs[4];
+                                int ys[4];
+                                xs[0] = px; ys[0] = py;
+                                xs[1] = x;  ys[1] = y;
+                                xs[2] = x;  ys[2] = fy;
+                                xs[3] = px; ys[3] = fy;
+                                s->fillPolygon(xs, ys, 4, gfx.mix(colors[sr], gui.cField, 70));
+                            }
+                        }
+                        if (i > 0) {
+                            s->line(px, py, x, y, colors[sr]);
+                            s->line(px, py + 1, x, y + 1, colors[sr]);
+                        }
+                        if (counts[sr] <= 30) { s->fillCircle(x, y, 2, colors[sr]); }
+                        px = x;
+                        py = y;
+                    }
+                }
+            }
+            // the labels of the x axis
+            if (labelRoom > 0) {
+                int slot = (kind == BAR) ? (right - left) / n : ((n > 1) ? (right - left) / (n - 1) : 0);
+                for (int i = 0; i < n && i < nlabels; i++) {
+                    int tw = gfx.textWidth(font, labels[i]);
+                    int cx = (kind == BAR) ? left + i * slot + slot / 2 : left + slot * i;
+                    if (slot > 0 && tw > slot + slot / 2) { continue; }
+                    s->text(font, cx - tw / 2, bottom + 3, labels[i], gui.cTextDim);
+                }
+            }
+        }
+        s->hline(left, bottom, right - left, gui.cBorder);
+        s->vline(left, ptop, bottom - ptop, gui.cBorder);
+        if (legend && nseries > 0) { drawLegend(s, ox + 8, oy + h - 17, w - 16); }
+    }
+}
+
+// ---- Gauge -------------------------------------------------------------------------------------------------------------------------------
+public class Gauge : gui.Widget {
+    public int min;
+    public int max;
+    public int value;
+    public char* caption;
+    public int warn;                   // percent of the range where the yellow zone starts (default 60)
+    public int critical;               // ... where the red zone starts (default 85); set both to 100 for a single colour
+    private gfx.Font* font;
+
+    public Gauge(int lo, int hi) {
+        super();
+        min = lo;
+        max = hi;
+        value = lo;
+        warn = 60;
+        critical = 85;
+        w = 140;
+        h = 100;
+        font = gfx.sans();
+    }
+
+    public virtual int prefW() { return 140; }
+    public virtual int prefH() { return 100; }
+
+    public void setValue(int v) {
+        if (v < min) { v = min; }
+        if (v > max) { v = max; }
+        value = v;
+        invalidate();
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        int r = (w / 2 < h - 22) ? w / 2 - 6 : h - 28;
+        if (r < 12) { r = 12; }
+        int cx = ox + w / 2;
+        int cy = oy + r + 10;
+        int ri = r - r / 4;
+        // the track and the three zones: a 240 degree sweep from 150 to 390 degrees
+        int a0 = 150;
+        int span = 240;
+        s->thickArc(cx, cy, ri, r, a0, a0 + span, gfx.mix(gui.cBorder, gui.cField, 40));
+        int pct = (max > min) ? (value - min) * 100 / (max - min) : 0;
+        int fillTo = a0 + span * pct / 100;
+        int wA = a0 + span * warn / 100;
+        int cA = a0 + span * critical / 100;
+        int green = 0xFF58A55C;
+        int amber = 0xFFF0A030;
+        int red = 0xFFE05050;
+        if (fillTo > a0) { s->thickArc(cx, cy, ri, r, a0, (fillTo < wA) ? fillTo : wA, green); }
+        if (fillTo > wA) { s->thickArc(cx, cy, ri, r, wA, (fillTo < cA) ? fillTo : cA, amber); }
+        if (fillTo > cA) { s->thickArc(cx, cy, ri, r, cA, fillTo, red); }
+        // the needle
+        int na = a0 + span * pct / 100;
+        int nx = cx + (ri - 3) * gfx.icos(na) / 1024;
+        int ny = cy + (ri - 3) * gfx.isin(na) / 1024;
+        s->line(cx, cy, nx, ny, gui.cText);
+        s->line(cx + 1, cy, nx + 1, ny, gui.cText);
+        s->fillCircle(cx, cy, 4, gui.cText);
+        char num[24];
+        intToStr(value, &num[0]);
+        int tw = gfx.textWidth(font, &num[0]);
+        s->text(font, cx - tw / 2, cy + 8, &num[0], gui.cText);
+        if (caption != null) {
+            int cw = gfx.textWidth(font, caption);
+            s->text(font, cx - cw / 2, cy + 8 + font->height, caption, gui.cTextDim);
+        }
+    }
+}
+
+// ---- Switch ------------------------------------------------------------------------------------------------------------------------------
+public class Switch : gui.Widget {
+    public bool on;
+    public func onChange;
+
+    public Switch(bool initial) {
+        super();
+        on = initial;
+        focusable = true;
+        w = 42;
+        h = 24;
+    }
+
+    public virtual int prefW() { return 42; }
+    public virtual int prefH() { return 24; }
+
+    public void set(bool v) {
+        if (v == on) { return; }
+        on = v;
+        invalidate();
+        if (onChange != null) { onChange(this); }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        int track = on ? gui.cAccent : gfx.mix(gui.cBorder, gui.cField, 30);
+        if (!enabled) { track = gfx.mix(track, gui.cField, 50); }
+        s->fillRoundRect(ox, oy + 2, w, h - 4, (h - 4) / 2, track);
+        int kr = (h - 8) / 2;
+        int kx = on ? ox + w - kr - 4 : ox + kr + 4;
+        s->fillCircle(kx, oy + h / 2, kr, 0xFFFFFFFF);
+        if (win != null && win->focusWidget == this) { s->roundRect(ox - 1, oy + 1, w + 2, h - 2, h / 2, gui.cAccent); }
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (enabled && kind == adp.M_DOWN && button == 1) { set(!on); }
+        return true;
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn == 1 && uni == ' ') { set(!on); return true; }
+        return false;
+    }
+
+    public virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// ---- Rating ------------------------------------------------------------------------------------------------------------------------------
+public class Rating : gui.Widget {
+    public int max;
+    public int value;
+    public func onChange;
+    private int hover;
+
+    public Rating(int stars, int initial) {
+        super();
+        max = stars;
+        value = initial;
+        w = stars * 22 + 4;
+        h = 24;
+    }
+
+    public virtual int prefW() { return max * 22 + 4; }
+    public virtual int prefH() { return 24; }
+
+    public void set(int v) {
+        if (v < 0) { v = 0; }
+        if (v > max) { v = max; }
+        if (v == value) { return; }
+        value = v;
+        invalidate();
+        if (onChange != null) { onChange(this); }
+    }
+
+    private void star(gfx.Surface* s, int cx, int cy, int r, int color) {
+        int xs[10];
+        int ys[10];
+        for (int i = 0; i < 10; i++) {
+            int rad = (i % 2 == 0) ? r : r * 2 / 5;
+            int a = -90 + i * 36;
+            xs[i] = cx + rad * gfx.icos(a) / 1024;
+            ys[i] = cy + rad * gfx.isin(a) / 1024;
+        }
+        s->fillPolygon(xs, ys, 10, color);
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        int shown = (hover > 0) ? hover : value;
+        for (int i = 0; i < max; i++) {
+            int col = (i < shown) ? 0xFFF0B020 : gfx.mix(gui.cBorder, gui.cField, 40);
+            star(s, ox + 13 + i * 22, oy + 13, 10, col);
+        }
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        int idx = mx / 22 + 1;
+        if (idx < 1) { idx = 1; }
+        if (idx > max) { idx = max; }
+        if (kind == adp.M_MOVE) {
+            if (hover != idx) { hover = idx; invalidate(); }
+        } else if (kind == adp.M_DOWN && button == 1 && enabled) {
+            set((idx == value) ? 0 : idx);
+        }
+        return true;
+    }
+}

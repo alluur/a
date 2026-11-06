@@ -163,6 +163,9 @@ EMB "tar",         "lib/tar.a"
 EMB "ini",         "lib/ini.a"
 EMB "bits",        "lib/bits.a"
 EMB "bytebuf",     "lib/bytebuf.a"
+EMB "algo",        "lib/algo.a"
+EMB "arith",       "lib/arith.a"
+EMB "gchart",      "lib/gchart.a"
 EMB "secure",        "lib/secure.a"
 EMB "des",           "lib/des.a"
 EMB "bn",            "lib/bn.a"
@@ -1204,6 +1207,10 @@ emit_call_named:
 
 ; begin_codegen_pass: resets the output state before a code generating pass
 begin_codegen_pass:
+    mov rdi, enum_tab_off               ; the enum tables live in the data section, which is rewound for every pass
+    xor eax, eax
+    mov ecx, SYM_MAX
+    rep stosd
     mov qword [code_pos], 0
     mov eax, [rel_base]
     mov [rel_count], eax
@@ -2152,6 +2159,7 @@ init_tables:
     mov byte [binprec + T_NE], 6
     mov byte [binprec + '<'], 7
     mov byte [binprec + '>'], 7
+    mov byte [binprec + T_CMP3], 7
     mov byte [binprec + T_LE], 7
     mov byte [binprec + T_GE], 7
     mov byte [binprec + T_SHL], 8
@@ -2389,6 +2397,9 @@ str_term:       resd 1
 last_file_id:   resd 1
 selbuf:         resb 1024
 force_direct:   resd 1
+op_call:        resd 1
+enum_tab_off:   resd SYM_MAX
+enr_ret:        resd 1
 agg_base:       resd 1
 st_base:        resd STRUCT_MAX         ; index of the base class + 1 (0 = none)
 st_vptr:        resd STRUCT_MAX         ; offset of the vtable pointer in the object + 1 (0 = none)

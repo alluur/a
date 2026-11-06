@@ -141,15 +141,18 @@ From highest to lowest precedence:
 | 3 | `*`  `/`  `%` | signed; truncating division like C |
 | 4 | `+`  `-` | pointer ± integer scales by the element size |
 | 5 | `<<`  `>>` | `>>` is an arithmetic shift |
-| 6 | `<`  `<=`  `>`  `>=` | result is 0 or 1 |
+| 6 | `<`  `<=`  `>`  `>=`  `<=>` | result is 0 or 1; `a <=> b` is -1, 0 or 1 (unsigned for a `uint64`) |
 | 7 | `==`  `!=` | |
 | 8 | `&` | bitwise and |
 | 9 | `^` | bitwise xor |
 | 10 | `\|` | bitwise or |
 | 11 | `&&` | short-circuit |
 | 12 | `\|\|` | short-circuit |
-| 13 | `c ? a : b` | right to left |
+| 12a | `^^`  `xor` | logical exclusive or: both sides run, the result is 0 or 1 (between `&&` and `\|\|`) |
+| 13 | `c ? a : b`  `a ?? b` | right to left; `a ?? b` is `a` unless it is 0 / `null`, then `b` (which is only evaluated in that case) |
 | 14 | `=  +=  -=  *=  /=  %=  &=  \|=  ^=  <<=  >>=` | right to left |
+
+The words `and`, `or`, `not` and `xor` mean `&&`, `||`, `!` and `^^`, so `if (a > 1 and not done or retry)` works.
 
 `!`, `&&`, `||` and the comparison operators always produce 0 or 1. Any integer or pointer can be
 used as a condition: zero / `null` is false, everything else is true.
@@ -600,6 +603,27 @@ private:
   error: `error: member is private to its class 'balance'`.
 * Structs can be copied with `=` and initialisers (`Point q = p;`), and compared field by field by hand.
 
+### Operator overloading
+
+A class (or struct) can define what the operators do for its values by declaring methods named `operator` followed by the operator:
+
+```c
+struct Vec {
+    int x; int y;
+    Vec operator+(Vec o) { return mk(x + o.x, y + o.y); }     // a + b
+    Vec operator-() { return mk(-x, -y); }                    // -a  (no parameter)
+    Vec operator*(int k) { return mk(x * k, y * k); }         // a * 3
+    bool operator==(Vec o) { return x == o.x && y == o.y; }   // a == b  (and  a != b  when there is no operator!=)
+    bool operator<(Vec o) { return x * x + y * y < o.x * o.x + o.y * o.y; }
+    int operator[](int i) { return i == 0 ? x : y; }          // a[i]
+}
+Vec c = a + b + a;      Vec d = -a * 2;      if (a < b) { ... }      c += a;      // += calls operator+ and stores the result
+```
+
+The operators are `+ - * / % & | ^ << >> == != < > <= >= []` and unary `-`. The left operand must be a class *value*
+(`a + b`, not pointers); the right operand is whatever the method takes. A class has one method per operator (no overloading by
+parameter type), and `&&`, `||`, `!`, `++`, `--` and `=` cannot be overloaded. Results that are classes are returned by value.
+
 ### Inheritance and virtual methods
 
 A class can extend one base class: `class Dog : Animal { ... }`. The base class must be defined first.
@@ -646,6 +670,10 @@ Color d = Red;                              // unqualified also works
 
 Enum constants are `int` constants usable in `switch` labels, array sizes and other constant
 expressions. A trailing comma is allowed.
+
+Enums know their members: `Color.count` is the number of members, `Color.name(v)` the name of the member with value `v` (`"?"` if
+there is none), `Color.parse("Green")` the value of a name (`Color.parse("Green", fallback)` returns `fallback` instead of -1 when
+the name is unknown) and `Color.has(v)` tells whether `v` is a member.
 
 An enum can be stored in fewer bytes with a base type (handy in structures that are sent over a wire or written to a file):
 
@@ -963,6 +991,9 @@ code only to programs that import them, and a file of the same name next to your
 | `zlib` | `gzip gunzip compress decompress deflate inflate` (DEFLATE with hash chains, zlib and gzip containers, checksums verified) |
 | `bits` | `popcount clz ctz log2 isPow2 nextPow2 mask rotl32 rotr32 rotl64 rotr64 bswap16/32/64 rev8..rev64 get set clear flip field insert signExtend fitsSigned fitsUnsigned udiv umod ucmp` |
 | `bytebuf` | `getU16le getU32be getU64le ... putU32be ...`, classes `Buf` (`u8 u16be u32le u64be varint svarint cstr text bytes align patch32be`) and `Reader` (range checked, `bad` flag), `humanSize parseSize hex fromHex hexdump` |
+| `algo` | `sortBy sortDesc lowerBound upperBound unique rotate nextPermutation kthSmallest partition maxSubarray lis editDistance lcsLength kmpFind sieve knapsack`, classes `UnionFind` and `Graph` (`bfs dfs dijkstra topological components`) |
+| `arith` | `addOverflows checkedAdd satAdd clampBits ceilDiv roundDiv isqrt iroot gcd lcm extGcd modInverse mulMod powMod isPrime factorize totient binomial`, and the fraction struct `Rational` (`rat(1, 3) + rat(1, 6)` with operators) |
+| `gchart` | GUI widgets `Chart` (bar, line, area, pie), `Gauge`, `Switch`, `Rating` |
 | `tar` | `Writer` (`add addDir finish`) and `Reader` (`next`, `name size isDir data`): POSIX ustar archives in memory |
 | `ini` | `parse(text)`, `load(path)`; `Ini` has `get getInt getBool set remove has toString` |
 | `cli` | class `ArgParser`: `addFlag addOption parse flag option optionInt positional positionalCount printHelp` (short, long, `--x=value`, combined `-abc`) |
