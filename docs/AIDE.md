@@ -329,7 +329,9 @@ Missing in AOS, and what asys does:
   extra line on the console, the kernel's note about the unimplemented `fchmod` that the compiler `ac` calls, and `t202` the AOS
   shell's complaint about `exec 0<&-`; both are not part of the test's standard output, which equals the `.out` file), 20 000
   cycles of `alloc(300000)` + `free` fit in 2 MB, and file names of 38 to 55 bytes are saved atomically. The libraries do not
-  have a front end on AOS yet (`aide` / `aide-gui` do not exist), so no interactive session was run.
+  have a front end on AOS yet (`aide` / `aide-gui` do not exist), so no interactive session was run. The whole AOS image was also built
+  with this compiler and its own boot tests `boot`, `shell`, `coreutils`, `processes` and `torture` pass (the `grep` of the AOS shell
+  was checked by hand: `grep 'main()'` finds `main()` only, `grep 'a|b'` finds the text `a|b`, `^b$` and `ma.n` work).
 
 ## 11. Tests and measurements
 
