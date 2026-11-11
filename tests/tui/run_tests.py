@@ -87,8 +87,10 @@ def start_and_quit():
 def title_and_clipboard():
     s = start(GALLERY, ready="Inputs")
     check(s.emu.title == "tui gallery", "window title not set: %r" % s.emu.title)
+    check(len(s.emu.title_stack) == 1, "the old title was not saved")
     s.key("\x11")
     s.wait_exit(3)
+    check(len(s.emu.title_stack) == 0 and s.emu.title != "tui gallery", "the old window title was not restored: %r" % s.emu.title)
     s.close()
 
 
@@ -305,34 +307,27 @@ def resize_follows_the_window():
 
 
 @test
-def size_from_environment_and_probe():
-    s = Session([PROBE], cols=80, rows=24, env={"LINES": "33", "COLUMNS": "77"})
-    s._set_size(s.master, 0, 0)       # the system does not know the size (like a serial console) ...
-    # (the program already started and read 80x24; start another one with an unknown size from the beginning)
+def size_from_environment_when_the_system_does_not_know():
+    s = Session([PROBE], cols=100, rows=40, env={"LINES": "33", "COLUMNS": "77"}, kernel_size=(0, 0))
+    check(s.wait_for("size:", 5), "no start")
+    s.wait_idle()
+    check("size: 77x33" in s.screen_text(), "LINES/COLUMNS were not used when the system gives no size:\n" + s.screen_text())
+    s.key("\x11")
+    s.wait_exit(3)
     s.close()
-    import fcntl, pty, struct, subprocess, termios
-    master, slave = pty.openpty()
-    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 0, 0, 0, 0))
-    from ptyterm import Emu
-    emu = Emu(100, 40)
-    env = dict(os.environ, TERM="xterm-256color", LANG="C.UTF-8", LINES="33", COLUMNS="77")
 
-    def setup():
-        os.setsid()
-        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
-    p = subprocess.Popen([PROBE], stdin=slave, stdout=slave, stderr=slave, env=env, preexec_fn=setup)
-    os.close(slave)
-    end = time.time() + 4
-    import select
-    while time.time() < end and emu.find("size:") is None:
-        r, _, _ = select.select([master], [], [], 0.1)
-        if r:
-            emu.feed(os.read(master, 65536))
-    check(emu.find("size: 77x33"), "LINES/COLUMNS were not used when the system gives no size:\n" + emu.text())
-    os.write(master, b"\x11")
-    p.wait(3)
-    os.close(master)
+@test
+def size_asked_from_the_terminal():
+    # no size from the system and none from the environment: TUI_PROBE=1 asks the terminal (CSI 18 t, answered by the emulator)
+    s = Session([PROBE], cols=91, rows=37, env={"TUI_PROBE": "1", "LINES": None, "COLUMNS": None}, kernel_size=(0, 0))
+    check(s.wait_for("size:", 5), "no start")
+    s.wait_idle()
+    check("size: 91x37" in s.screen_text(), "the size query was not answered or not used:\n" + s.screen_text())
+    check(b"\x1b[18t" in bytes(s.raw_output), "the program did not ask for the size")
+    s.key("\x11")
+    s.wait_exit(3)
+    s.close()
 
 
 # ---- suspend to a shell and come back ----------------------------------------------------------------------------------------------------------
@@ -529,7 +524,7 @@ def gallery_run_program_output():
 def gallery_colour_dialog_and_file_dialog():
     s = start(GALLERY, ready="Inputs")
     s.key("\x1bc")                                  # Alt+C: Colour button
-    check("palette colour" in s.screen_text() or "24 bit colour" in s.screen_text(), "colour dialog:\n" + s.screen_text())
+    check("rgb 200,100,50" in s.screen_text(), "colour dialog:\n" + s.screen_text())
     check("#C86432" in s.screen_text().upper(), "hex of the initial colour:\n" + s.screen_text())
     s.key("\x1b[Z")
     s.key("\r")

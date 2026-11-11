@@ -1,0 +1,153 @@
+// term: Process - a child program whose output comes through a pipe, polled together with other descriptors, finished and killed (Linux only)
+import term;
+
+int nr(int x, int g) { if (__ARCH == 0) { return x; } return g; }
+
+void drainFd(term.Process* p, char* label) {
+    char buf[256];
+    int total = 0;
+    for (int guard = 0; guard < 200; guard++) {
+        if (!p->ready()) {
+            int ts[2];
+            ts[0] = 0;
+            ts[1] = 20000000;
+            // wait a little through poll on the pipe
+            char pf[8];
+            pf[0] = p->fd; pf[1] = 0; pf[2] = 0; pf[3] = 0; pf[4] = 1; pf[5] = 0; pf[6] = 0; pf[7] = 0;
+            __syscall(nr(271, 73), (int) &pf[0], 1, (int) &ts[0], 0, 0, 0);
+            if (!p->ready()) { continue; }
+        }
+        int n = p->read(&buf[0], 255);
+        if (n <= 0) { break; }
+        buf[n] = 0;
+        printf("%s: %d bytes: ", label, n);
+        for (int i = 0; i < n; i++) { if (buf[i] == 10) { print("\\n"); } else { printChar(buf[i]); } }
+        println("");
+        total = total + n;
+    }
+}
+
+int main() {
+    if (__OS == 1) {
+        println("skipped: no child processes with pipes on Windows");
+        return 0;
+    }
+    println("-- a shell command: output of stdout and stderr arrive in one pipe");
+    term.Process* p = new term.Process();
+    bool started = p->startShell("echo out; echo err 1>&2; exit 3");
+    printf("started %d, running %d, a pipe %d\n", started, p->running, p->fd >= 0);
+    // wait for everything the child writes (until the pipe is closed)
+    char all[512];
+    int len = 0;
+    for (int guard = 0; guard < 400; guard++) {
+        char pf[8];
+        pf[0] = p->fd; pf[1] = 0; pf[2] = 0; pf[3] = 0; pf[4] = 1; pf[5] = 0; pf[6] = 0; pf[7] = 0;
+        int ts[2];
+        ts[0] = 0;
+        ts[1] = 25000000;
+        __syscall(nr(271, 73), (int) &pf[0], 1, (int) &ts[0], 0, 0, 0);
+        if (p->ready()) {
+            int n = p->read(&all[len], 500 - len);
+            if (n <= 0) { break; }
+            len = len + n;
+        }
+    }
+    all[len] = 0;
+    printf("received %d bytes: ", len);
+    for (int i = 0; i < len; i++) { if (all[i] == 10) { print("|"); } else { printChar(all[i]); } }
+    println("");
+    int st = p->finish();
+    printf("exit status %d, running %d, pipe closed %d\n", st, p->running, p->fd < 0);
+
+    println("-- the exit status of a program that does not exist");
+    term.Process* q = new term.Process();
+    q->startShell("exec /nonexistent/program 2>/dev/null");
+    st = q->finish();
+    printf("status %d\n", st);
+    term.Process* r = new term.Process();
+    char* argv[3];
+    argv[0] = "/nonexistent/program";
+    argv[1] = null;
+    r->start(&argv[0]);
+    printf("exec of a missing file: status %d\n", r->finish());
+
+    println("-- poll() tells whether the child has ended, without waiting");
+    term.Process* s = new term.Process();
+    s->startShell("sleep 1; echo late");
+    printf("right after the start: ended %d\n", s->poll());
+    s->kill(15);
+    for (int i = 0; i < 100 && !s->poll(); i++) {
+        int ts[2];
+        ts[0] = 0;
+        ts[1] = 20000000;
+        __syscall(nr(35, 101), (int) &ts[0], 0, 0, 0, 0, 0);
+    }
+    printf("after kill(SIGTERM): ended %d, status %d (128 + 15)\n", s->poll(), s->status);
+    s->finish();
+
+    println("-- killing the whole process group stops a shell and its children");
+    term.Process* g = new term.Process();
+    g->startShell("sleep 30 & sleep 30 & wait");
+    for (int i = 0; i < 5; i++) {
+        int ts[2];
+        ts[0] = 0;
+        ts[1] = 20000000;
+        __syscall(nr(35, 101), (int) &ts[0], 0, 0, 0, 0, 0);
+    }
+    g->kill(9);
+    int status = g->finish();
+    printf("status %d (128 + 9)\n", status);
+
+    println("-- several children at once, read in the order their output arrives");
+    term.Process* a = new term.Process();
+    term.Process* b = new term.Process();
+    a->startShell("sleep 0.3; echo slow");
+    b->startShell("echo fast");
+    char pf[16];
+    int seen = 0;
+    char first[16];
+    first[0] = 0;
+    for (int guard = 0; guard < 300 && seen < 2; guard++) {
+        pf[0] = a->fd; pf[1] = 0; pf[2] = 0; pf[3] = 0; pf[4] = 1; pf[5] = 0; pf[6] = 0; pf[7] = 0;
+        pf[8] = b->fd; pf[9] = 0; pf[10] = 0; pf[11] = 0; pf[12] = 1; pf[13] = 0; pf[14] = 0; pf[15] = 0;
+        int ts[2];
+        ts[0] = 0;
+        ts[1] = 20000000;
+        __syscall(nr(271, 73), (int) &pf[0], 2, (int) &ts[0], 0, 0, 0);
+        char buf[64];
+        if (b->fd >= 0 && b->ready()) {
+            int n = b->read(&buf[0], 60);
+            if (n > 0) { buf[n - 1] = 0; if (first[0] == 0) { format(&first[0], 16, "%s", &buf[0], 0, 0, 0); } seen++; }
+            else { b->finish(); }
+            if (n > 0) { printf("from the fast one: %s\n", &buf[0]); b->finish(); }
+        }
+        if (a->fd >= 0 && a->ready()) {
+            int n = a->read(&buf[0], 60);
+            if (n > 0) { buf[n - 1] = 0; printf("from the slow one: %s\n", &buf[0]); seen++; a->finish(); }
+        }
+    }
+    printf("the fast one came first: %d\n", streq(&first[0], "fast"));
+    println("-- the environment of the child");
+    term.Process* e = new term.Process();
+    e->startShell("echo \"HOME is set: ${HOME:+yes}\"; echo \"cwd: $(pwd | wc -c | tr -d ' ') bytes\" > /dev/null");
+    char eb[128];
+    int el = 0;
+    for (int guard = 0; guard < 200; guard++) {
+        char pf1[8];
+        pf1[0] = e->fd; pf1[1] = 0; pf1[2] = 0; pf1[3] = 0; pf1[4] = 1; pf1[5] = 0; pf1[6] = 0; pf1[7] = 0;
+        int ts[2];
+        ts[0] = 0;
+        ts[1] = 20000000;
+        __syscall(nr(271, 73), (int) &pf1[0], 1, (int) &ts[0], 0, 0, 0);
+        if (e->ready()) {
+            int n = e->read(&eb[el], 120 - el);
+            if (n <= 0) { break; }
+            el = el + n;
+        }
+    }
+    eb[el] = 0;
+    printf("%s", &eb[0]);
+    e->finish();
+    printf("PATH was passed on: %d\n", term.env("PATH") != null);
+    return 0;
+}

@@ -71,6 +71,7 @@ class Emu:
         self.wrap_pending = False
         self.modes = {}              # private mode number -> bool (what the program switched on)
         self.title = None
+        self.title_stack = []
         self.clipboard = None        # decoded OSC 52 payload (bytes)
         self.cursor_shape = 0
         self.replies = bytearray()   # what the terminal answers to queries
@@ -312,6 +313,10 @@ class Emu:
         elif f == "t":
             if p[0] == 18:
                 self.replies += ("\x1b[8;%d;%dt" % (self.rows, self.cols)).encode()
+            elif p[0] == 22:
+                self.title_stack.append(self.title)
+            elif p[0] == 23 and self.title_stack:
+                self.title = self.title_stack.pop()
         elif f == "s":
             self.saved = (self.x, self.y)
         elif f == "u":
@@ -418,12 +423,14 @@ class Emu:
 
 
 class Session:
-    def __init__(self, argv, cols=80, rows=24, env=None, cwd=None):
+    def __init__(self, argv, cols=80, rows=24, env=None, cwd=None, kernel_size=None):
+        """kernel_size: what the system reports as the window size, (0, 0) for "unknown" (like a serial console); default: cols x rows."""
         self.cols, self.rows = cols, rows
         self.emu = Emu(cols, rows)
         self.raw_output = bytearray()
         master, slave = pty.openpty()
-        self._set_size(slave, cols, rows)
+        kc, kr = kernel_size if kernel_size is not None else (cols, rows)
+        self._set_size(slave, kc, kr)
         e = dict(os.environ)
         for k in ("TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "NO_COLOR", "TUI_COLORS", "TUI_MOUSE", "TUI_ASCII", "TUI_PROBE", "TUI_MOTION", "TUI_SYNC", "LINES", "COLUMNS"):
             e.pop(k, None)
