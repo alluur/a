@@ -30,6 +30,7 @@ void settle() {
 
 // the display has the given size (windows that are taller than the screen cannot be clicked everywhere)
 void startServerSized(int port, char* name, int screenW, int screenH) {
+    gui.caretBlinks = false;       // a blinking caret would make window checksums depend on the speed of the machine
     hb = new wsrv.Headless(screenW, screenH);
     srv = new wsrv.Server(hb, port);
     srv->allowScreenshots = true;
