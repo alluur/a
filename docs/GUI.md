@@ -153,7 +153,9 @@ text widgets use Ctrl+A / C / X / V. `gui.messageBox(d, title, text)` shows a sm
 
 **Small extras**: `d->ping(n)` asks the server to answer with the same number (`d->lastPong`): when it arrives the server has handled everything
 the client sent before (the gcode tests use it to wait for big windows); a `TextBox` has optional colours (`colBack colText colSel colBorder
-colAccent colDim`, 0 = the standard theme) and inserts any Unicode code point.
+colAccent colDim`, 0 = the standard theme) and inserts any Unicode code point. The caret of a `TextBox` / `TextArea` blinks
+every 500 ms; set `gui.caretBlinks = false` to keep it solid (no timer: the gcode tests do this so that window checksums do not depend on the
+speed of the machine).
 
 ## More widgets: `guix`
 
