@@ -7,7 +7,7 @@ libraries (they are part of the A standard library, in `lib/`) and how the two f
 **State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`). The two front ends
 (`user/aide.a` and `user/gui/aide-gui.a` in the AOS repository) do not exist yet. The libraries contain no user interface code:
 everything that draws or reads the keyboard is the front end's job. The widgets of the GUI front end are the module `gcode` (section 13;
-tests `t240` ... `t259`), and `examples/gui/codedemo.a` assembles them into a small working editor.
+tests `t240` ... `t267`), and `examples/gui/codedemo.a` assembles them into a small working editor.
 
 Contents
 
@@ -447,7 +447,11 @@ guides, two themes), `t243` 100 000 lines and a 100 000 character line, `t244` c
 `t246` file tree on a temporary project, `t247` tab bar, `t248` find / replace / go to line, `t249` status bar and outline, `t250` output pane
 and a real build job, `t251` terminal pane, `t252` colour picker, `t253` theme editor, `t254` settings dialog, `t255` dock, `t256` commands and
 palette, `t257` the whole `codedemo` application driven like a user (open, edit, save, find, palette, build with errors, jump, close with a
-question), `t258` random input with invariants and undo, `t259` columns of odd characters against `acode`, shared documents, CRLF saving.
+question), `t258` random input with invariants and undo, `t259` columns of odd characters against `acode`, shared documents, CRLF saving. Added after the review: `t260` the find bar follows a tab
+switch / a closed tab, `t261` fonts that cannot be used (no height, damaged) and odd fonts, `t262` completion in big files (linear time, the
+rescan rule, duplicates, order), `t263` dialogs that are opened and closed leave nothing behind (documents, Look users, `onClosed`),
+`t264` escape sequences and colour runs after UTF-8 in the output view, `t265` key values that are not text, the tab wheel, multi-letter
+type-ahead, `t266` the terminal pane collects its programs (no zombies), `t267` small windows (the dock, the find bar, the demo).
 All of them run the display server inside the test (Headless backend), type and click through it, and compare pixels and checksums; they pass on
 the five targets (the ones that start processes print "processes can be started: 0" on Windows: `.out.windows`).
 
