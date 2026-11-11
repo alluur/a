@@ -287,7 +287,9 @@ Both front ends do the same things; only drawing and input differ.
    destructors): call `dispose()` on everything you are done with.
 2. Draw: for each visible line `i` get the text with `b.linePtr(i, &len)` and the spans with `h.tokens(i, tok, 256)`; colours
    from `t->tokenColor(kind)`. Selections and carets are `e.cur[k].anchor/.pos`; columns with `b.visualCol(i, offset, e.tabWidth)`
-   (and `offsetAtCol` for mouse clicks). Bracket highlight: `e.matchNearCaret(&at)`.
+   (and `offsetAtCol` for mouse clicks). `visualCol` remembers the answer for the last offset of a line, so asking for the caret's column
+   after every key stays O(1) at the end of a long line (and while typing in its middle); a scan from the line start is only needed after
+   an edit before the remembered offset (test `t273`). Bracket highlight: `e.matchNearCaret(&at)`.
 3. Keys call `Editor` commands (`typeChar`, `newline`, `backspace`, `moveLeft(shift)`, `undo`, ...). To know when to redraw compare
    `b.version` (or register a listener: the `Change` says which lines moved).
 4. Files: `b.checkExternal()` on focus, `e.saveFile(path, flags, s.trimOnSave, s.finalNewline)`.
@@ -372,6 +374,7 @@ Missing in AOS, and what asys does:
 | `t218_regressions` | temp file permissions and names (also at the name limit), extreme tab widths, `dispose()` of every class, 24 MB cycles, bounded walks; exact undo / redo after the history was trimmed (model based), whole-line paste into several cursors, out-of-range line numbers, glob worst cases, find in files `exceeded`, the old regex dialect |
 | `t219_aide_session` | a whole session through all modules: project, ignore rules, tree, quick open, find in files, buffer, editor, highlighter, symbols, completion, rename with undo, save, external change, watcher, settings, a real build with an error, the fix, the run |
 | `t270_asys_identity` | `AtomicFile` keeps hard links together and the owner, group and set-user-id bits of the file it replaces; a second user (the test forks and calls `setuid`) overwrites a foreign file in place and gets `-EACCES` for one it may not write; a new file is made as before (needs root for the owner checks) |
+| `t273_acode_visualcol` | `visualCol` against a plain scan after 4000 random edits (tabs, wide, combining, newlines, undo), set text, and typing 60000 characters into one line with a column query after every key |
 
 All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine) and, as
 plain x86-64 executables, in an AOS image (see section 10; `t202` and `t213` use other shell commands there: `seq` instead of
