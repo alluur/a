@@ -1,0 +1,2791 @@
+// =============================================================================
+//  asyntax - syntax highlighting, language detection, symbols and completion                         import asyntax;
+//
+//  Line based lexers with a small state per line. A Highlighter listens to a Buffer, keeps the state at the start of every
+//  line and, after an edit, lexes again only until the state at a line start equals the one it had before (so typing in a
+//  line of code re-lexes that line only; opening a block comment re-lexes down to the closing */).
+//
+//    asyntax.Highlighter* h = new asyntax.Highlighter(&buffer, asyntax.detectLanguage("main.a", null));
+//    asyntax.Token tok[256];
+//    int n = h->tokens(lineIndex, &tok[0], 256);      // spans that cover the line without gaps: start, len, kind
+//    for (int i = 0; i < n; i++) paint(tok[i].start, tok[i].len, theme.tokenColor(tok[i].kind));
+//
+//  Token kinds (the enum Tok, fixed): Plain Keyword Type Builtin Constant Number String Char Escape Comment DocComment
+//  Preproc Operator Punct Function Variable Tag Attribute Heading Emphasis Link Code Quote Error.
+//  Languages (the enum Lang): Text A C Cpp Python Shell Json Markdown Ini Toml Html Xml Makefile.
+//
+//  Also: detectLanguage(fileName, firstLine) (extension, special names, #! lines), languageName(lang) ("a", "python", ... the
+//  names Editor.setLanguage understands), symbols(buffer, lang, SymbolList*) (functions, methods, classes, structs, enums,
+//  constants, modules, typedefs of A and C; def / class of Python; headings of Markdown; functions of shell scripts; targets
+//  of Makefiles) and class Completer (keywords + symbols + words of the open buffers, ranked).
+//  lexLine(lang, state, text, len, out, max, &endState) is the pure function underneath (no buffer needed).
+// =============================================================================
+import asys;
+import acode;
+module asyntax;
+
+public enum Tok : uint8 {
+    Plain, Keyword, Type, Builtin, Constant, Number, String, Char, Escape, Comment, DocComment, Preproc, Operator, Punct,
+    Function, Variable, Tag, Attribute, Heading, Emphasis, Link, Code, Quote, Error
+}
+
+public enum Lang : uint8 { Text, A, C, Cpp, Python, Shell, Json, Markdown, Ini, Toml, Html, Xml, Makefile }
+
+// a span of one line: byte offsets inside the line text
+public struct Token {
+    int start;
+    int len;
+    int kind;               // a Tok value
+}
+
+private int imin(int a, int b) {
+    if (a < b) { return a; }
+    return b;
+}
+
+// ---- word sets --------------------------------------------------------------------------------------------------------------------------
+class WordSet {
+    public char** words;
+    public int* kinds;
+    public int cap;
+
+    public WordSet() {
+        cap = 1024;
+        words = (char**) asys.alloc(cap * 8);
+        kinds = (int*) asys.alloc(cap * 8);
+    }
+
+    private int hashOf(char* p, int len) {
+        int h = 2166136261;
+        for (int i = 0; i < len; i++) {
+            h = (h ^ p[i]) * 16777619;
+            h = h & 0xFFFFFFFF;
+        }
+        return h;
+    }
+
+    public void add(char* w, int kind) {
+        int len = strlen(w);
+        int slot = hashOf(w, len) & (cap - 1);
+        while (words[slot] != null) {
+            slot = (slot + 1) & (cap - 1);
+        }
+        words[slot] = w;
+        kinds[slot] = kind;
+    }
+
+    // adds the words of a space separated list (the list must stay alive; it is a string literal in practice)
+    public void addList(char* list, int kind) {
+        int n = strlen(list);
+        int s = 0;
+        for (int i = 0; i <= n; i++) {
+            if (i == n || list[i] == ' ') {
+                if (i > s) {
+                    add(asys.strDupN(&list[s], i - s), kind);
+                }
+                s = i + 1;
+            }
+        }
+    }
+
+    // the kind of the word p[0..len) or -1
+    public int lookup(char* p, int len) {
+        int slot = hashOf(p, len) & (cap - 1);
+        while (words[slot] != null) {
+            char* w = words[slot];
+            if (w[len] == 0) {
+                bool same = true;
+                for (int i = 0; i < len; i++) {
+                    if (w[i] != p[i]) { same = false; break; }
+                }
+                if (same) { return kinds[slot]; }
+            }
+            slot = (slot + 1) & (cap - 1);
+        }
+        return -1;
+    }
+}
+
+WordSet* setA;
+WordSet* setC;
+WordSet* setCpp;
+WordSet* setPy;
+WordSet* setSh;
+WordSet* setMk;
+
+private WordSet* wordsFor(int lang) {
+    if (lang == Lang.A) {
+        if (setA == null) {
+            setA = new WordSet();
+            setA->addList("if else while do for break continue return switch case default class struct enum union typedef static const extern private public protected virtual new import module a_module a_import defer goto sizeof asm this super and or not xor", Tok.Keyword);
+            setA->addList("int char bool void double float uint8 uint16 uint32 uint64 int8 int16 int32 int64 size_t ssize_t intptr_t uintptr_t ptrdiff_t long short signed unsigned byte func", Tok.Type);
+            setA->addList("true false null", Tok.Constant);
+            setA->addList("print println printInt printlnInt printChar printBool printHex eprint eprintln printf format vformat readChar readLine input askInt confirm readAll parseInt atoi abs min max srand rand strlen streq strcmp strcpy strcat strdup memcpy memset indexOf startsWith endsWith find contains substr trim intToStr isDigit isAlpha isUpper isLower isSpace toUpper toLower alloc exit millis sleepMs fileOpen fileRead fileWrite fileClose readFile writeFile fileExists fileDelete makeDir getEnv hasArg argValue argIndex va_arg va_count setjmp longjmp", Tok.Builtin);
+        }
+        return setA;
+    }
+    if (lang == Lang.C || lang == Lang.Cpp) {
+        if (setC == null) {
+            setC = new WordSet();
+            setC->addList("auto break case const continue default do else enum extern for goto if inline register restrict return sizeof static struct switch typedef union volatile while _Bool _Complex", Tok.Keyword);
+            setC->addList("char double float int long short signed unsigned void size_t ssize_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t bool FILE wchar_t ptrdiff_t intptr_t uintptr_t", Tok.Type);
+            setC->addList("NULL true false EOF", Tok.Constant);
+            setC->addList("printf fprintf sprintf snprintf scanf malloc calloc realloc free memcpy memset strlen strcmp strcpy strncpy fopen fclose fread fwrite puts putchar getchar exit abort assert", Tok.Builtin);
+            setCpp = new WordSet();
+            setCpp->addList("auto break case const continue default do else enum extern for goto if inline register restrict return sizeof static struct switch typedef union volatile while alignas alignof and asm bitand bitor catch class compl concept consteval constexpr constinit const_cast decltype delete dynamic_cast explicit export final friend mutable namespace new noexcept not or override private protected public reinterpret_cast requires static_assert static_cast template this thread_local throw try typeid typename using virtual xor", Tok.Keyword);
+            setCpp->addList("char double float int long short signed unsigned void size_t ssize_t int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t bool wchar_t ptrdiff_t string vector map set unique_ptr shared_ptr nullptr_t char16_t char32_t", Tok.Type);
+            setCpp->addList("NULL true false nullptr EOF", Tok.Constant);
+            setCpp->addList("printf fprintf sprintf snprintf malloc calloc realloc free memcpy memset strlen strcmp std cout cin cerr endl move forward make_unique make_shared", Tok.Builtin);
+        }
+        return (lang == Lang.Cpp) ? setCpp : setC;
+    }
+    if (lang == Lang.Python) {
+        if (setPy == null) {
+            setPy = new WordSet();
+            setPy->addList("and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield", Tok.Keyword);
+            setPy->addList("True False None", Tok.Constant);
+            setPy->addList("print len range int str float list dict set tuple bool open input type isinstance issubclass enumerate zip map filter sorted reversed sum min max abs all any ord chr hex bin oct round id hash iter next super object property staticmethod classmethod getattr setattr hasattr callable format repr vars dir exit quit Exception ValueError TypeError KeyError IndexError RuntimeError OSError StopIteration self cls", Tok.Builtin);
+        }
+        return setPy;
+    }
+    if (lang == Lang.Shell) {
+        if (setSh == null) {
+            setSh = new WordSet();
+            setSh->addList("if then else elif fi for while until do done case esac in function select time coproc", Tok.Keyword);
+            setSh->addList("echo printf read cd pwd exit return shift test export unset set eval exec source alias unalias trap wait kill let local declare typeset readonly type hash umask ulimit jobs fg bg true false", Tok.Builtin);
+        }
+        return setSh;
+    }
+    if (lang == Lang.Makefile) {
+        if (setMk == null) {
+            setMk = new WordSet();
+            setMk->addList("include sinclude -include ifeq ifneq ifdef ifndef else endif define endef export unexport override vpath private undefine", Tok.Keyword);
+            setMk->addList("subst patsubst strip findstring filter filter-out sort word wordlist words firstword lastword dir notdir suffix basename addsuffix addprefix join wildcard realpath abspath if or and foreach call value eval origin flavor shell error warning info", Tok.Builtin);
+        }
+        return setMk;
+    }
+    return null;
+}
+
+// ---- lexer context ----------------------------------------------------------------------------------------------------------------------
+struct Lx {
+    char* t;
+    int n;
+    Token* out;
+    int max;
+    int cnt;
+    int last;            // end of the last token that was emitted
+}
+
+// adds the span [s, e) with a kind; gaps become Plain, neighbours of the same kind merge
+private void emit(Lx* x, int kind, int s, int e) {
+    if (e <= s || s < x->last) {
+        if (s < x->last && e > x->last) {
+            s = x->last;
+        } else {
+            return;
+        }
+    }
+    if (s > x->last) {
+        put(x, Tok.Plain, x->last, s);
+    }
+    put(x, kind, s, e);
+}
+
+private void put(Lx* x, int kind, int s, int e) {
+    if (x->cnt > 0 && x->out[x->cnt - 1].kind == kind && x->out[x->cnt - 1].start + x->out[x->cnt - 1].len == s) {
+        x->out[x->cnt - 1].len = x->out[x->cnt - 1].len + (e - s);
+    } else if (x->cnt < x->max - 1) {
+        x->out[x->cnt].start = s;
+        x->out[x->cnt].len = e - s;
+        x->out[x->cnt].kind = kind;
+        x->cnt++;
+    } else {
+        return;                                // full: the rest is covered by finish()
+    }
+    x->last = e;
+}
+
+private int finish(Lx* x) {
+    if (x->last < x->n) {
+        if (x->cnt > 0 && x->out[x->cnt - 1].kind == Tok.Plain) {
+            x->out[x->cnt - 1].len = x->n - x->out[x->cnt - 1].start;
+        } else if (x->cnt < x->max) {
+            x->out[x->cnt].start = x->last;
+            x->out[x->cnt].len = x->n - x->last;
+            x->out[x->cnt].kind = Tok.Plain;
+            x->cnt++;
+        } else {
+            x->out[x->cnt - 1].len = x->n - x->out[x->cnt - 1].start;
+        }
+        x->last = x->n;
+    }
+    return x->cnt;
+}
+
+private bool isIdStart(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 128;
+}
+
+private bool isIdChar(int c) {
+    return isIdStart(c) || (c >= '0' && c <= '9');
+}
+
+private bool isDigitC(int c) {
+    return c >= '0' && c <= '9';
+}
+
+private bool isHexC(int c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+private bool startsAt(char* t, int n, int i, char* s) {
+    int l = strlen(s);
+    if (i + l > n) { return false; }
+    for (int k = 0; k < l; k++) {
+        if (t[i + k] != s[k]) { return false; }
+    }
+    return true;
+}
+
+// index of the first non-blank character
+private int firstNonBlank(char* t, int n) {
+    int i = 0;
+    while (i < n && (t[i] == ' ' || t[i] == 9)) { i++; }
+    return i;
+}
+
+// the next non-blank character at or after i (0 at the end)
+private int nextNonBlank(char* t, int n, int i) {
+    while (i < n && (t[i] == ' ' || t[i] == 9)) { i++; }
+    if (i >= n) { return 0; }
+    return t[i];
+}
+
+// ---- numbers ---------------------------------------------------------------------------------------------------------------------------
+// the end of the number that starts at i: 0x.. 0b.. 0o.., decimals with '_' (and C++ ' separators when sep is true), fractions, exponents, suffixes
+private int numberEnd(char* t, int n, int i, bool sep) {
+    int p = i;
+    if (t[p] == '0' && p + 1 < n && (t[p + 1] == 'x' || t[p + 1] == 'X')) {
+        p = p + 2;
+        while (p < n && (isHexC(t[p]) || t[p] == '_' || (sep && t[p] == 39 && p + 1 < n && isHexC(t[p + 1])))) { p++; }
+    } else if (t[p] == '0' && p + 1 < n && (t[p + 1] == 'b' || t[p + 1] == 'B' || t[p + 1] == 'o' || t[p + 1] == 'O')) {
+        p = p + 2;
+        while (p < n && (isDigitC(t[p]) || t[p] == '_' || (sep && t[p] == 39 && p + 1 < n && isDigitC(t[p + 1])))) { p++; }
+    } else {
+        while (p < n && (isDigitC(t[p]) || t[p] == '_' || (sep && t[p] == 39 && p + 1 < n && isDigitC(t[p + 1])))) { p++; }
+        if (p < n && t[p] == '.' && p + 1 < n && isDigitC(t[p + 1])) {
+            p++;
+            while (p < n && (isDigitC(t[p]) || t[p] == '_')) { p++; }
+        } else if (p < n && t[p] == '.' && !(p + 1 < n && (isIdStart(t[p + 1]) || t[p + 1] == '.'))) {
+            p++;                                                // "1." is a number
+        }
+        if (p < n && (t[p] == 'e' || t[p] == 'E')) {
+            int q = p + 1;
+            if (q < n && (t[q] == '+' || t[q] == '-')) { q++; }
+            if (q < n && isDigitC(t[q])) {
+                p = q;
+                while (p < n && (isDigitC(t[p]) || t[p] == '_')) { p++; }
+            }
+        }
+    }
+    // suffixes: u l ul ull f j and friends
+    while (p < n && (t[p] == 'u' || t[p] == 'U' || t[p] == 'l' || t[p] == 'L' || t[p] == 'f' || t[p] == 'F' || t[p] == 'j' || t[p] == 'J' || t[p] == 'z' || t[p] == 'Z')) { p++; }
+    return p;
+}
+
+// ---- strings -----------------------------------------------------------------------------------------------------------------------------
+// emits a quoted literal that starts at i (the quote character is t[i]); escapes get their own kind. Returns the position after
+// the closing quote, or n when the line ends first (*closed tells which). raw: no escapes.
+private int lexQuoted(Lx* x, int i, int kind, bool raw, bool* closed) {
+    char* t = x->t;
+    int n = x->n;
+    int q = t[i];
+    int p = i + 1;
+    int runStart = i;
+    *closed = false;
+    while (p < n) {
+        int c = t[p];
+        if (c == 92 && !raw && p + 1 < n) {
+            emit(x, kind, runStart, p);
+            int e = p + 2;
+            int d = t[p + 1];
+            if (d == 'x' || d == 'X') {
+                while (e < n && e < p + 4 && isHexC(t[e])) { e++; }
+            } else if (d == 'u' || d == 'U') {
+                int lim = (d == 'u') ? 4 : 8;
+                while (e < n && e < p + 2 + lim && isHexC(t[e])) { e++; }
+            } else if (d >= '0' && d <= '7') {
+                while (e < n && e < p + 4 && t[e] >= '0' && t[e] <= '7') { e++; }
+            }
+            emit(x, Tok.Escape, p, e);
+            p = e;
+            runStart = p;
+            continue;
+        }
+        if (c == 92 && raw && p + 1 < n) {
+            p = p + 2;
+            continue;
+        }
+        if (c == q) {
+            p++;
+            emit(x, kind, runStart, p);
+            *closed = true;
+            return p;
+        }
+        p++;
+    }
+    emit(x, kind, runStart, n);
+    return n;
+}
+
+// ---- operators -----------------------------------------------------------------------------------------------------------------------------
+private bool isOpChar(int c) {
+    return c == '+' || c == '-' || c == '*' || c == '/' || c == '%' || c == '=' || c == '<' || c == '>' || c == '!' || c == '&' ||
+           c == '|' || c == '^' || c == '~' || c == '?' || c == ':' || c == '.' || c == '@' || c == '\\';
+}
+
+private bool isPunctChar(int c) {
+    return c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}' || c == ',' || c == ';';
+}
+
+// a run of operator characters (at most 3: <<= <=> ...)
+private int opEnd(char* t, int n, int i) {
+    int p = i;
+    while (p < n && p < i + 3 && isOpChar(t[p])) {
+        // do not swallow a comment start into an operator
+        if (p > i && t[p - 1] == '/' && (t[p] == '/' || t[p] == '*')) { break; }
+        p++;
+    }
+    return p;
+}
+
+// ---- C family: A, C, C++ ---------------------------------------------------------------------------------------------------------------------
+const M_BLOCK = 1;                // inside /* ... */
+const M_BLOCKDOC = 2;             // inside /** ... */
+const M_PPCONT = 3;               // a preprocessor line continues after a backslash
+
+private int lexCLike(int lang, int state, Lx* x) {
+    char* t = x->t;
+    int n = x->n;
+    int mode = state & 0xFF;
+    int i = 0;
+    WordSet* ws = wordsFor(lang);
+    bool inPre = false;
+    if (mode == M_BLOCK || mode == M_BLOCKDOC) {
+        int kind = (mode == M_BLOCKDOC) ? Tok.DocComment : Tok.Comment;
+        int e = -1;
+        for (int k = 0; k + 1 < n; k++) {
+            if (t[k] == '*' && t[k + 1] == '/') { e = k + 2; break; }
+        }
+        if (e < 0) {
+            emit(x, kind, 0, n);
+            return state;
+        }
+        emit(x, kind, 0, e);
+        i = e;
+        mode = 0;
+    } else if (mode == M_PPCONT) {
+        inPre = true;
+    }
+    int ind = firstNonBlank(t, n);
+    bool lineStart = (i == 0 && mode == 0);
+    while (i < n) {
+        int c = t[i];
+        if (c == ' ' || c == 9) {
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && t[i + 1] == '/') {
+            bool doc = (i + 2 < n && (t[i + 2] == '/' || t[i + 2] == '!'));
+            emit(x, doc ? Tok.DocComment : Tok.Comment, i, n);
+            i = n;
+            break;
+        }
+        if (c == '/' && i + 1 < n && t[i + 1] == '*') {
+            bool doc = (i + 2 < n && t[i + 2] == '*' && !(i + 3 < n && t[i + 3] == '/'));
+            int e = -1;
+            for (int k = i + 2; k + 1 < n; k++) {
+                if (t[k] == '*' && t[k + 1] == '/') { e = k + 2; break; }
+            }
+            if (e < 0) {
+                emit(x, doc ? Tok.DocComment : Tok.Comment, i, n);
+                return doc ? M_BLOCKDOC : M_BLOCK;
+            }
+            emit(x, doc ? Tok.DocComment : Tok.Comment, i, e);
+            i = e;
+            continue;
+        }
+        if (c == '#' && i == ind && lineStart && !inPre) {
+            inPre = true;
+            // the directive name
+            int e = i + 1;
+            while (e < n && (t[e] == ' ' || t[e] == 9)) { e++; }
+            while (e < n && isIdChar(t[e])) { e++; }
+            emit(x, Tok.Preproc, i, e);
+            i = e;
+            // #include <file>: the file name is a string
+            int w = e;
+            while (w < n && (t[w] == ' ' || t[w] == 9)) { w++; }
+            int d0 = ind + 1;
+            while (d0 < n && (t[d0] == ' ' || t[d0] == 9)) { d0++; }
+            bool incl = startsAt(t, n, d0, "include") || startsAt(t, n, d0, "import");
+            if (incl && w < n && t[w] == '<') {
+                int close = -1;
+                for (int k = w + 1; k < n; k++) { if (t[k] == '>') { close = k; break; } }
+                if (close > 0) {
+                    emit(x, Tok.String, w, close + 1);
+                    i = close + 1;
+                }
+            }
+            continue;
+        }
+        if (c == '"') {
+            bool closed = false;
+            i = lexQuoted(x, i, Tok.String, false, &closed);
+            continue;
+        }
+        if (c == 39) {
+            bool closed = false;
+            i = lexQuoted(x, i, Tok.Char, false, &closed);
+            continue;
+        }
+        if (isDigitC(c) || (c == '.' && i + 1 < n && isDigitC(t[i + 1]))) {
+            int e = numberEnd(t, n, i, lang == Lang.Cpp || lang == Lang.C);
+            emit(x, Tok.Number, i, e);
+            i = e;
+            continue;
+        }
+        if (isIdStart(c)) {
+            int e = i;
+            while (e < n && isIdChar(t[e])) { e++; }
+            int kind = -1;
+            if (ws != null) { kind = ws->lookup(&t[i], e - i); }
+            if (kind < 0 && lang == Lang.A && e - i > 2 && t[i] == '_' && t[i + 1] == '_') { kind = Tok.Builtin; }
+            if (kind < 0 && nextNonBlank(t, n, e) == '(' && !inPre) { kind = Tok.Function; }
+            if (kind >= 0) {
+                emit(x, kind, i, e);
+            }
+            i = e;
+            continue;
+        }
+        if (c == 92 && inPre && nextNonBlank(t, n, i + 1) == 0) {
+            emit(x, Tok.Preproc, i, i + 1);
+            i++;
+            continue;
+        }
+        if (isPunctChar(c)) {
+            emit(x, Tok.Punct, i, i + 1);
+            i++;
+            continue;
+        }
+        if (isOpChar(c)) {
+            int e = opEnd(t, n, i);
+            emit(x, Tok.Operator, i, e);
+            i = e;
+            continue;
+        }
+        i++;
+    }
+    // a preprocessor line continues when the last character is a backslash
+    if (inPre) {
+        int e = n;
+        while (e > 0 && (t[e - 1] == ' ' || t[e - 1] == 9)) { e--; }
+        if (e > 0 && t[e - 1] == 92) {
+            return M_PPCONT;
+        }
+    }
+    return 0;
+}
+
+// ---- Python -----------------------------------------------------------------------------------------------------------------------------
+const P_TDQ = 1;                  // inside """ ... """
+const P_TSQ = 2;                  // inside ''' ... '''
+
+private int lexPython(int state, Lx* x) {
+    char* t = x->t;
+    int n = x->n;
+    int mode = state & 0xFF;
+    int i = 0;
+    WordSet* ws = wordsFor(Lang.Python);
+    if (mode == P_TDQ || mode == P_TSQ) {
+        char* close = (mode == P_TDQ) ? "\"\"\"" : "'''";
+        int e = -1;
+        for (int k = 0; k + 2 < n; k++) {
+            if (t[k] == 92) { k++; continue; }
+            if (startsAt(t, n, k, close)) { e = k + 3; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.String, 0, n);
+            return state;
+        }
+        emit(x, Tok.String, 0, e);
+        i = e;
+    }
+    int ind = firstNonBlank(t, n);
+    int prevKw = 0;
+    while (i < n) {
+        int c = t[i];
+        if (c == ' ' || c == 9) {
+            i++;
+            continue;
+        }
+        if (c == '#') {
+            emit(x, Tok.Comment, i, n);
+            i = n;
+            break;
+        }
+        if (c == '@' && i == ind) {
+            int e = i + 1;
+            while (e < n && (isIdChar(t[e]) || t[e] == '.')) { e++; }
+            emit(x, Tok.Preproc, i, e);
+            i = e;
+            continue;
+        }
+        if (isIdStart(c)) {
+            int e = i;
+            while (e < n && isIdChar(t[e])) { e++; }
+            // string prefixes: r b f u rb br fr rf (any case) right before a quote
+            if (e < n && (t[e] == '"' || t[e] == 39) && e - i <= 2) {
+                bool prefix = true;
+                bool raw = false;
+                for (int k = i; k < e; k++) {
+                    int d = t[k] | 32;
+                    if (d == 'r') { raw = true; }
+                    else if (d != 'b' && d != 'f' && d != 'u') { prefix = false; }
+                }
+                if (prefix) {
+                    i = lexPyString(x, e, raw, i);
+                    if (i < 0) { return -(i + 1); }
+                    continue;
+                }
+            }
+            int kind = ws->lookup(&t[i], e - i);
+            if (kind < 0 && (prevKw == 1 || prevKw == 2)) {
+                kind = (prevKw == 1) ? Tok.Function : Tok.Type;
+            }
+            prevKw = 0;
+            if (e - i == 3 && t[i] == 'd' && t[i + 1] == 'e' && t[i + 2] == 'f') { prevKw = 1; }
+            if (e - i == 5 && startsAt(t, n, i, "class")) { prevKw = 2; }
+            if (kind < 0 && nextNonBlank(t, n, e) == '(') { kind = Tok.Function; }
+            if (kind >= 0) {
+                emit(x, kind, i, e);
+            }
+            i = e;
+            continue;
+        }
+        if (c == '"' || c == 39) {
+            i = lexPyString(x, i, false, i);
+            if (i < 0) { return -(i + 1); }
+            continue;
+        }
+        if (isDigitC(c) || (c == '.' && i + 1 < n && isDigitC(t[i + 1]))) {
+            int e = numberEnd(t, n, i, false);
+            emit(x, Tok.Number, i, e);
+            i = e;
+            continue;
+        }
+        if (isPunctChar(c)) {
+            emit(x, Tok.Punct, i, i + 1);
+            i++;
+            continue;
+        }
+        if (isOpChar(c)) {
+            int e = opEnd(t, n, i);
+            emit(x, Tok.Operator, i, e);
+            i = e;
+            continue;
+        }
+        i++;
+    }
+    return 0;
+}
+
+// a Python string starting with its quote at q (the prefix, if any, starts at ps). Returns the position after it, or
+// -(newState + 1) when a triple quoted string stays open at the end of the line.
+private int lexPyString(Lx* x, int q, bool raw, int ps) {
+    char* t = x->t;
+    int n = x->n;
+    int qc = t[q];
+    bool triple = q + 2 < n && t[q + 1] == qc && t[q + 2] == qc;
+    if (!triple) {
+        // the prefix belongs to the string
+        bool closed = false;
+        if (ps < q) {
+            emit(x, Tok.String, ps, q);
+        }
+        return lexQuoted(x, q, Tok.String, raw, &closed);
+    }
+    char* close = (qc == '"') ? "\"\"\"" : "'''";
+    int e = -1;
+    for (int k = q + 3; k + 3 <= n; k++) {
+        if (t[k] == 92 && !raw) { k++; continue; }
+        if (startsAt(t, n, k, close)) { e = k + 3; break; }
+    }
+    if (e < 0) {
+        emit(x, Tok.String, ps, n);
+        return -((qc == '"' ? P_TDQ : P_TSQ) + 1);
+    }
+    emit(x, Tok.String, ps, e);
+    return e;
+}
+
+// ---- shell -----------------------------------------------------------------------------------------------------------------------------------
+const SH_DQ = 1;                  // inside "..." that continues over lines
+const SH_SQ = 2;                  // inside '...'
+const SH_HEREDOC = 3;             // inside a here document; the state carries a hash of the end word and whether <<- was used
+
+private int hashWord(char* p, int len) {
+    int h = 5381;
+    for (int i = 0; i < len; i++) {
+        h = ((h * 33) + p[i]) & 0xFFFFFFFFFF;
+    }
+    return h;
+}
+
+private int lexShell(int state, Lx* x) {
+    char* t = x->t;
+    int n = x->n;
+    int mode = state & 0xFF;
+    int i = 0;
+    WordSet* ws = wordsFor(Lang.Shell);
+    if (mode == SH_HEREDOC) {
+        int h = state >> 16;
+        bool strip = ((state >> 8) & 1) != 0;
+        int s = 0;
+        if (strip) {
+            while (s < n && t[s] == 9) { s++; }
+        }
+        int e = n;
+        // the end word is the whole line
+        if (hashWord(&t[s], e - s) == h) {
+            emit(x, Tok.Keyword, 0, n);
+            return 0;
+        }
+        emit(x, Tok.String, 0, n);
+        return state;
+    }
+    if (mode == SH_DQ || mode == SH_SQ) {
+        int q = (mode == SH_DQ) ? '"' : 39;
+        int e = -1;
+        for (int k = 0; k < n; k++) {
+            if (t[k] == 92 && q == '"') { k++; continue; }
+            if (t[k] == q) { e = k + 1; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.String, 0, n);
+            return state;
+        }
+        emit(x, Tok.String, 0, e);
+        i = e;
+    }
+    if (n >= 2 && t[0] == '#' && t[1] == '!' && i == 0) {
+        emit(x, Tok.Preproc, 0, n);
+        return 0;
+    }
+    int hereHash = 0;
+    int hereStrip = 0;
+    bool hereSet = false;
+    while (i < n) {
+        int c = t[i];
+        if (c == ' ' || c == 9) {
+            i++;
+            continue;
+        }
+        if (c == '#' && (i == 0 || t[i - 1] == ' ' || t[i - 1] == 9 || t[i - 1] == ';' || t[i - 1] == '(' || t[i - 1] == '|' || t[i - 1] == '&')) {
+            emit(x, Tok.Comment, i, n);
+            i = n;
+            break;
+        }
+        if (c == 39 || c == '"') {
+            int e = -1;
+            for (int k = i + 1; k < n; k++) {
+                if (t[k] == 92 && c == '"') { k++; continue; }
+                if (t[k] == c) { e = k + 1; break; }
+            }
+            if (e < 0) {
+                emit(x, Tok.String, i, n);
+                return (c == '"') ? SH_DQ : SH_SQ;
+            }
+            if (c == '"') {
+                // variables inside double quotes are highlighted
+                int run = i;
+                int k = i + 1;
+                while (k < e - 1) {
+                    if (t[k] == 92) { k = k + 2; continue; }
+                    if (t[k] == '$' && k + 1 < e - 1) {
+                        int ve = shellVarEnd(t, e - 1, k);
+                        if (ve > k + 1) {
+                            emit(x, Tok.String, run, k);
+                            emit(x, Tok.Variable, k, ve);
+                            run = ve;
+                            k = ve;
+                            continue;
+                        }
+                    }
+                    k++;
+                }
+                emit(x, Tok.String, run, e);
+            } else {
+                emit(x, Tok.String, i, e);
+            }
+            i = e;
+            continue;
+        }
+        if (c == '$') {
+            int e = shellVarEnd(t, n, i);
+            if (e > i + 1) {
+                emit(x, Tok.Variable, i, e);
+                i = e;
+                continue;
+            }
+            i++;
+            continue;
+        }
+        if (c == '<' && i + 1 < n && t[i + 1] == '<' && !(i + 2 < n && t[i + 2] == '<')) {
+            int p = i + 2;
+            int strip = 0;
+            if (p < n && t[p] == '-') { strip = 1; p++; }
+            while (p < n && (t[p] == ' ' || t[p] == 9)) { p++; }
+            int ws0 = p;
+            int quoted = 0;
+            if (p < n && (t[p] == 39 || t[p] == '"')) { quoted = t[p]; p++; ws0 = p; }
+            while (p < n && isIdChar(t[p])) { p++; }
+            if (p > ws0) {
+                hereHash = hashWord(&t[ws0], p - ws0);
+                hereStrip = strip;
+                hereSet = true;
+            }
+            emit(x, Tok.Operator, i, i + 2 + strip);
+            i = i + 2 + strip;
+            continue;
+        }
+        if (isDigitC(c) && (i == 0 || !isIdChar(t[i - 1]))) {
+            int e = i;
+            while (e < n && isDigitC(t[e])) { e++; }
+            if (e >= n || !isIdChar(t[e])) {
+                emit(x, Tok.Number, i, e);
+                i = e;
+                continue;
+            }
+        }
+        if (isIdStart(c)) {
+            int e = i;
+            while (e < n && isIdChar(t[e])) { e++; }
+            int kind = ws->lookup(&t[i], e - i);
+            if (kind < 0 && e < n && t[e] == '=' && !(e + 1 < n && t[e + 1] == '=') && (i == 0 || t[i - 1] == ' ' || t[i - 1] == 9 || t[i - 1] == ';' || t[i - 1] == '(')) {
+                kind = Tok.Variable;
+            }
+            // keywords only count at the start of a command
+            if (kind == Tok.Keyword) {
+                int p = i;
+                while (p > 0 && (t[p - 1] == ' ' || t[p - 1] == 9)) { p--; }
+                if (p > 0 && !(t[p - 1] == ';' || t[p - 1] == '|' || t[p - 1] == '&' || t[p - 1] == '(' || t[p - 1] == '{' || t[p - 1] == '`')) {
+                    // "in" after a "for x" and "do" after ";" are keywords as well; everything else mid-command is plain
+                    if (!(e - i == 2 && t[i] == 'i' && t[i + 1] == 'n') && !(e - i == 4 && startsAt(t, n, i, "then")) && !(e - i == 2 && startsAt(t, n, i, "do"))) {
+                        kind = -1;
+                    }
+                }
+            }
+            if (kind >= 0) {
+                emit(x, kind, i, e);
+            }
+            i = e;
+            continue;
+        }
+        if (isPunctChar(c)) {
+            emit(x, Tok.Punct, i, i + 1);
+            i++;
+            continue;
+        }
+        if (c == '|' || c == '&' || c == '<' || c == '>' || c == '=' || c == '!' || c == '`') {
+            int e = i + 1;
+            while (e < n && e < i + 2 && (t[e] == '|' || t[e] == '&' || t[e] == '>' || t[e] == '<')) { e++; }
+            emit(x, Tok.Operator, i, e);
+            i = e;
+            continue;
+        }
+        i++;
+    }
+    if (hereSet) {
+        return SH_HEREDOC | (hereStrip << 8) | (hereHash << 16);
+    }
+    return 0;
+}
+
+// the end of the variable reference that starts with $ at i: $name ${...} $(...) $((...)) $1 $? ...
+private int shellVarEnd(char* t, int n, int i) {
+    int p = i + 1;
+    if (p >= n) { return i + 1; }
+    int c = t[p];
+    if (c == '{') {
+        int k = p + 1;
+        while (k < n && t[k] != '}') { k++; }
+        return (k < n) ? k + 1 : n;
+    }
+    if (c == '(') {
+        int depth = 0;
+        int k = p;
+        while (k < n) {
+            if (t[k] == '(') { depth++; }
+            if (t[k] == ')') { depth--; if (depth == 0) { return k + 1; } }
+            k++;
+        }
+        return n;
+    }
+    if (isIdStart(c)) {
+        while (p < n && isIdChar(t[p])) { p++; }
+        return p;
+    }
+    if (isDigitC(c) || c == '?' || c == '$' || c == '!' || c == '@' || c == '*' || c == '#' || c == '-') {
+        return p + 1;
+    }
+    return i + 1;
+}
+
+// ---- JSON --------------------------------------------------------------------------------------------------------------------------------
+private int lexJson(int state, Lx* x) {
+    char* t = x->t;
+    int n = x->n;
+    int i = 0;
+    if ((state & 0xFF) == M_BLOCK) {
+        int e = -1;
+        for (int k = 0; k + 1 < n; k++) {
+            if (t[k] == '*' && t[k + 1] == '/') { e = k + 2; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.Comment, 0, n);
+            return state;
+        }
+        emit(x, Tok.Comment, 0, e);
+        i = e;
+    }
+    while (i < n) {
+        int c = t[i];
+        if (c == ' ' || c == 9) {
+            i++;
+            continue;
+        }
+        if (c == '/' && i + 1 < n && t[i + 1] == '/') {
+            emit(x, Tok.Comment, i, n);
+            return 0;
+        }
+        if (c == '/' && i + 1 < n && t[i + 1] == '*') {
+            int e = -1;
+            for (int k = i + 2; k + 1 < n; k++) {
+                if (t[k] == '*' && t[k + 1] == '/') { e = k + 2; break; }
+            }
+            if (e < 0) {
+                emit(x, Tok.Comment, i, n);
+                return M_BLOCK;
+            }
+            emit(x, Tok.Comment, i, e);
+            i = e;
+            continue;
+        }
+        if (c == '"') {
+            // is it a key? look behind the closing quote for ':'
+            int e = i + 1;
+            while (e < n && t[e] != '"') {
+                if (t[e] == 92) { e++; }
+                e++;
+            }
+            int after = (e < n) ? e + 1 : n;
+            bool isKey = nextNonBlank(t, n, after) == ':';
+            bool closed = false;
+            i = lexQuoted(x, i, isKey ? Tok.Attribute : Tok.String, false, &closed);
+            continue;
+        }
+        if (isDigitC(c) || (c == '-' && i + 1 < n && isDigitC(t[i + 1]))) {
+            int e = i + 1;
+            while (e < n && (isDigitC(t[e]) || t[e] == '.' || t[e] == 'e' || t[e] == 'E' || t[e] == '+' || t[e] == '-')) { e++; }
+            emit(x, Tok.Number, i, e);
+            i = e;
+            continue;
+        }
+        if (isIdStart(c)) {
+            int e = i;
+            while (e < n && isIdChar(t[e])) { e++; }
+            int len = e - i;
+            if ((len == 4 && (startsAt(t, n, i, "true") || startsAt(t, n, i, "null"))) || (len == 5 && startsAt(t, n, i, "false"))) {
+                emit(x, Tok.Constant, i, e);
+            } else {
+                emit(x, Tok.Error, i, e);
+            }
+            i = e;
+            continue;
+        }
+        if (isPunctChar(c) || c == ':') {
+            emit(x, Tok.Punct, i, i + 1);
+            i++;
+            continue;
+        }
+        emit(x, Tok.Error, i, i + 1);
+        i++;
+    }
+    return 0;
+}
+
+// ---- Markdown -----------------------------------------------------------------------------------------------------------------------------
+const MD_FENCE = 1;               // inside a fenced code block: bits 8..15 the fence character, bits 16.. its length
+const MD_COMMENT = 2;             // inside <!-- ... -->
+
+private int lexMarkdown(int state, Lx* x) {
+    char* t = x->t;
+    int n = x->n;
+    int mode = state & 0xFF;
+    int i = 0;
+    if (mode == MD_FENCE) {
+        int fc = (state >> 8) & 0xFF;
+        int fl = state >> 16;
+        int s = firstNonBlank(t, n);
+        int k = s;
+        while (k < n && t[k] == fc) { k++; }
+        if (k - s >= fl && nextNonBlank(t, n, k) == 0) {
+            emit(x, Tok.Code, 0, n);
+            return 0;
+        }
+        emit(x, Tok.Code, 0, n);
+        return state;
+    }
+    if (mode == MD_COMMENT) {
+        int e = -1;
+        for (int k = 0; k + 2 < n; k++) {
+            if (t[k] == '-' && t[k + 1] == '-' && t[k + 2] == '>') { e = k + 3; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.Comment, 0, n);
+            return state;
+        }
+        emit(x, Tok.Comment, 0, e);
+        i = e;
+    }
+    int s = firstNonBlank(t, n);
+    if (i == 0 && s < 4 && s < n) {
+        int c = t[s];
+        // fenced code
+        if (c == '`' || c == '~') {
+            int k = s;
+            while (k < n && t[k] == c) { k++; }
+            if (k - s >= 3) {
+                emit(x, Tok.Code, 0, n);
+                return MD_FENCE | (c << 8) | ((k - s) << 16);
+            }
+        }
+        // heading
+        if (c == '#') {
+            int k = s;
+            while (k < n && t[k] == '#') { k++; }
+            if (k - s <= 6 && (k >= n || t[k] == ' ' || t[k] == 9)) {
+                emit(x, Tok.Heading, 0, n);
+                return 0;
+            }
+        }
+        // horizontal rule
+        if (c == '-' || c == '*' || c == '_') {
+            int k = s;
+            int cnt = 0;
+            bool only = true;
+            while (k < n) {
+                if (t[k] == c) { cnt++; }
+                else if (t[k] != ' ') { only = false; }
+                k++;
+            }
+            if (only && cnt >= 3) {
+                emit(x, Tok.Operator, 0, n);
+                return 0;
+            }
+        }
+        // block quote
+        if (c == '>') {
+            emit(x, Tok.Quote, 0, n);
+            return 0;
+        }
+        // list markers
+        if ((c == '-' || c == '*' || c == '+') && s + 1 < n && t[s + 1] == ' ') {
+            emit(x, Tok.Operator, s, s + 1);
+            i = s + 1;
+        } else if (isDigitC(c)) {
+            int k = s;
+            while (k < n && isDigitC(t[k])) { k++; }
+            if (k < n && (t[k] == '.' || t[k] == ')') && k + 1 < n && t[k + 1] == ' ') {
+                emit(x, Tok.Operator, s, k + 1);
+                i = k + 1;
+            }
+        }
+    }
+    while (i < n) {
+        int c = t[i];
+        if (c == 92 && i + 1 < n) {
+            emit(x, Tok.Escape, i, i + 2);
+            i = i + 2;
+            continue;
+        }
+        if (c == '`') {
+            int k = i;
+            while (k < n && t[k] == '`') { k++; }
+            int ticks = k - i;
+            int e = -1;
+            int j = k;
+            while (j < n) {
+                if (t[j] == '`') {
+                    int m = j;
+                    while (m < n && t[m] == '`') { m++; }
+                    if (m - j == ticks) { e = m; break; }
+                    j = m;
+                } else {
+                    j++;
+                }
+            }
+            if (e > 0) {
+                emit(x, Tok.Code, i, e);
+                i = e;
+                continue;
+            }
+            i = k;
+            continue;
+        }
+        if (c == '<' && startsAt(t, n, i, "<!--")) {
+            int e = -1;
+            for (int k = i + 4; k + 2 < n; k++) {
+                if (t[k] == '-' && t[k + 1] == '-' && t[k + 2] == '>') { e = k + 3; break; }
+            }
+            if (e < 0) {
+                emit(x, Tok.Comment, i, n);
+                return MD_COMMENT;
+            }
+            emit(x, Tok.Comment, i, e);
+            i = e;
+            continue;
+        }
+        if (c == '*' || c == '_') {
+            int k = i;
+            while (k < n && t[k] == c) { k++; }
+            int marks = k - i;
+            if (marks <= 3 && k < n && t[k] != ' ' && (c == '*' || i == 0 || !isIdChar(t[i - 1]))) {
+                int e = -1;
+                for (int j = k; j < n; j++) {
+                    if (t[j] == c) {
+                        int m = j;
+                        while (m < n && t[m] == c) { m++; }
+                        if (m - j >= marks && t[j - 1] != ' ') { e = j + marks; break; }
+                        j = m - 1;
+                    }
+                }
+                if (e > 0) {
+                    emit(x, Tok.Emphasis, i, e);
+                    i = e;
+                    continue;
+                }
+            }
+            i = k;
+            continue;
+        }
+        if (c == '[' || (c == '!' && i + 1 < n && t[i + 1] == '[')) {
+            int b = (c == '!') ? i + 1 : i;
+            int close = -1;
+            for (int k = b + 1; k < n; k++) {
+                if (t[k] == ']') { close = k; break; }
+            }
+            if (close > 0 && close + 1 < n && t[close + 1] == '(') {
+                int pe = -1;
+                for (int k = close + 2; k < n; k++) {
+                    if (t[k] == ')') { pe = k; break; }
+                }
+                if (pe > 0) {
+                    emit(x, Tok.Link, i, pe + 1);
+                    i = pe + 1;
+                    continue;
+                }
+            }
+            i++;
+            continue;
+        }
+        if ((c == 'h' || c == 'H') && (startsAt(t, n, i, "http://") || startsAt(t, n, i, "https://")) && (i == 0 || !isIdChar(t[i - 1]))) {
+            int e = i;
+            while (e < n && t[e] != ' ' && t[e] != ')' && t[e] != '>' && t[e] != '"') { e++; }
+            emit(x, Tok.Link, i, e);
+            i = e;
+            continue;
+        }
+        if (c == '<') {
+            int e = -1;
+            for (int k = i + 1; k < n; k++) {
+                if (t[k] == '>') { e = k + 1; break; }
+                if (t[k] == ' ' && !(k > i + 1)) { break; }
+            }
+            if (e > 0 && e - i > 2 && (isIdStart(t[i + 1]) || t[i + 1] == '/')) {
+                emit(x, Tok.Tag, i, e);
+                i = e;
+                continue;
+            }
+        }
+        if (c == '|') {
+            emit(x, Tok.Punct, i, i + 1);
+            i++;
+            continue;
+        }
+        i++;
+    }
+    return 0;
+}
+
+// ---- INI and TOML ------------------------------------------------------------------------------------------------------------------------
+const I_TDQ = 1;                  // TOML: inside """ ... """
+const I_TSQ = 2;                  // TOML: inside ''' ... '''
+
+private int lexIni(int lang, int state, Lx* x) {
+    char* t = x->t;
+    int n = x->n;
+    int mode = state & 0xFF;
+    int i = 0;
+    bool toml = (lang == Lang.Toml);
+    if (mode == I_TDQ || mode == I_TSQ) {
+        char* close = (mode == I_TDQ) ? "\"\"\"" : "'''";
+        int e = -1;
+        for (int k = 0; k + 2 < n; k++) {
+            if (startsAt(t, n, k, close)) { e = k + 3; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.String, 0, n);
+            return state;
+        }
+        emit(x, Tok.String, 0, e);
+        i = e;
+    }
+    int s = firstNonBlank(t, n);
+    bool haveKey = toml;
+    if (i == 0 && s < n) {
+        int c = t[s];
+        if (c == ';' || c == '#') {
+            emit(x, Tok.Comment, s, n);
+            return 0;
+        }
+        if (c == '[') {
+            int e = s;
+            while (e < n && t[e] != ']') { e++; }
+            if (e < n) {
+                e++;
+                if (toml && e < n && t[e] == ']') { e++; }
+                emit(x, Tok.Heading, s, e);
+                i = e;
+            }
+        } else {
+            // key = value
+            int eq = -1;
+            for (int k = s; k < n; k++) {
+                if (t[k] == '=' || (!toml && t[k] == ':')) { eq = k; break; }
+                if (t[k] == '"' && toml) {
+                    // a quoted key
+                    int q = k + 1;
+                    while (q < n && t[q] != '"') { q++; }
+                    k = q;
+                }
+            }
+            if (eq > s) {
+                int ke = eq;
+                while (ke > s && (t[ke - 1] == ' ' || t[ke - 1] == 9)) { ke--; }
+                emit(x, Tok.Attribute, s, ke);
+                emit(x, Tok.Operator, eq, eq + 1);
+                i = eq + 1;
+                haveKey = true;
+            }
+        }
+    }
+    while (i < n) {
+        int c = t[i];
+        if (c == ' ' || c == 9) {
+            i++;
+            continue;
+        }
+        if ((c == '#' || (c == ';' && !toml)) && (i == 0 || t[i - 1] == ' ' || t[i - 1] == 9)) {
+            emit(x, Tok.Comment, i, n);
+            return 0;
+        }
+        if (c == '"' || c == 39) {
+            if (toml && startsAt(t, n, i, (c == '"') ? "\"\"\"" : "'''")) {
+                char* close = (c == '"') ? "\"\"\"" : "'''";
+                int e = -1;
+                for (int k = i + 3; k + 3 <= n; k++) {
+                    if (startsAt(t, n, k, close)) { e = k + 3; break; }
+                }
+                if (e < 0) {
+                    emit(x, Tok.String, i, n);
+                    return (c == '"') ? I_TDQ : I_TSQ;
+                }
+                emit(x, Tok.String, i, e);
+                i = e;
+                continue;
+            }
+            bool closed = false;
+            i = lexQuoted(x, i, Tok.String, c == 39, &closed);
+            continue;
+        }
+        if (!haveKey && c != '"' && c != 39 && c != '#' && c != ';') {
+            i++;
+            continue;
+        }
+        if (isDigitC(c) || ((c == '-' || c == '+') && i + 1 < n && isDigitC(t[i + 1]))) {
+            int e = i + 1;
+            bool hexNum = t[i] == '0' && i + 1 < n && t[i + 1] == 'x';
+            // numbers and TOML dates / times: digits . - : T Z _ +
+            while (e < n && (isDigitC(t[e]) || t[e] == '.' || t[e] == '_' || t[e] == '-' || t[e] == ':' || t[e] == 'T' || t[e] == 'Z' || t[e] == 'e' || t[e] == 'E' || t[e] == '+' || (hexNum && (t[e] == 'x' || isHexC(t[e]))))) { e++; }
+            if (e < n && isIdChar(t[e]) && !(t[e] == ' ')) {
+                // not a number (a word like 1st): plain
+                while (e < n && isIdChar(t[e])) { e++; }
+                i = e;
+                continue;
+            }
+            emit(x, Tok.Number, i, e);
+            i = e;
+            continue;
+        }
+        if (isIdStart(c)) {
+            int e = i;
+            while (e < n && (isIdChar(t[e]) || t[e] == '-')) { e++; }
+            int len = e - i;
+            bool word = (len == 4 && startsAt(t, n, i, "true")) || (len == 5 && startsAt(t, n, i, "false"));
+            if (!toml) {
+                word = word || (len == 3 && (startsAt(t, n, i, "yes") || startsAt(t, n, i, "off"))) || (len == 2 && (startsAt(t, n, i, "no") || startsAt(t, n, i, "on")));
+            }
+            if (word) {
+                emit(x, Tok.Constant, i, e);
+            }
+            i = e;
+            continue;
+        }
+        if (c == '[' || c == ']' || c == '{' || c == '}' || c == ',') {
+            emit(x, Tok.Punct, i, i + 1);
+            i++;
+            continue;
+        }
+        i++;
+    }
+    return 0;
+}
+
+// ---- HTML and XML -------------------------------------------------------------------------------------------------------------------------
+const H_COMMENT = 1;
+const H_TAG = 2;                  // inside a tag (bit 8: it is a <script> tag, bit 9: <style>)
+const H_ATTR_DQ = 3;              // inside a "..." attribute value that continues over lines
+const H_ATTR_SQ = 4;
+const H_SCRIPT = 5;
+const H_STYLE = 6;
+const H_CDATA = 7;
+const H_PI = 8;
+
+private bool eqNoCase(char* t, int n, int i, char* word) {
+    int l = strlen(word);
+    if (i + l > n) { return false; }
+    for (int k = 0; k < l; k++) {
+        if ((t[i + k] | 32) != word[k]) { return false; }
+    }
+    return true;
+}
+
+private int lexHtml(int lang, int state, Lx* x) {
+    char* t = x->t;
+    int n = x->n;
+    int mode = state & 0xFF;
+    int i = 0;
+    bool xml = (lang == Lang.Xml);
+    int tagFlags = state & 0x300;
+    if (mode == H_COMMENT) {
+        int e = -1;
+        for (int k = 0; k + 2 < n; k++) {
+            if (t[k] == '-' && t[k + 1] == '-' && t[k + 2] == '>') { e = k + 3; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.Comment, 0, n);
+            return state;
+        }
+        emit(x, Tok.Comment, 0, e);
+        i = e;
+        mode = 0;
+    } else if (mode == H_CDATA) {
+        int e = -1;
+        for (int k = 0; k + 2 < n; k++) {
+            if (t[k] == ']' && t[k + 1] == ']' && t[k + 2] == '>') { e = k + 3; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.String, 0, n);
+            return state;
+        }
+        emit(x, Tok.String, 0, e);
+        i = e;
+        mode = 0;
+    } else if (mode == H_PI) {
+        int e = -1;
+        for (int k = 0; k + 1 < n; k++) {
+            if (t[k] == '?' && t[k + 1] == '>') { e = k + 2; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.Preproc, 0, n);
+            return state;
+        }
+        emit(x, Tok.Preproc, 0, e);
+        i = e;
+        mode = 0;
+    } else if (mode == H_SCRIPT || mode == H_STYLE) {
+        char* endTag = (mode == H_SCRIPT) ? "</script" : "</style";
+        int e = -1;
+        for (int k = 0; k < n; k++) {
+            if (t[k] == '<' && eqNoCase(t, n, k, endTag)) { e = k; break; }
+        }
+        if (e < 0) {
+            return state;                                   // the content is plain text
+        }
+        i = e;
+        mode = 0;
+    } else if (mode == H_ATTR_DQ || mode == H_ATTR_SQ) {
+        int q = (mode == H_ATTR_DQ) ? '"' : 39;
+        int e = -1;
+        for (int k = 0; k < n; k++) {
+            if (t[k] == q) { e = k + 1; break; }
+        }
+        if (e < 0) {
+            emit(x, Tok.String, 0, n);
+            return state;
+        }
+        emit(x, Tok.String, 0, e);
+        i = e;
+        mode = H_TAG;
+    }
+    while (i < n) {
+        int c = t[i];
+        if (mode == H_TAG) {
+            // attributes
+            if (c == ' ' || c == 9) {
+                i++;
+                continue;
+            }
+            if (c == '>' || (c == '/' && i + 1 < n && t[i + 1] == '>') || (c == '?' && i + 1 < n && t[i + 1] == '>')) {
+                int e = (c == '>') ? i + 1 : i + 2;
+                emit(x, Tok.Punct, i, e);
+                i = e;
+                bool selfClose = (c != '>');
+                mode = 0;
+                if (!xml && !selfClose && tagFlags == 0x100) {
+                    return H_SCRIPT;
+                }
+                if (!xml && !selfClose && tagFlags == 0x200) {
+                    return H_STYLE;
+                }
+                tagFlags = 0;
+                continue;
+            }
+            if (c == '=') {
+                emit(x, Tok.Operator, i, i + 1);
+                i++;
+                // an unquoted value
+                while (i < n && (t[i] == ' ' || t[i] == 9)) { i++; }
+                if (i < n && t[i] != '"' && t[i] != 39 && t[i] != '>') {
+                    int ve = i;
+                    while (ve < n && t[ve] != ' ' && t[ve] != 9 && t[ve] != '>' && !(t[ve] == '/' && ve + 1 < n && t[ve + 1] == '>')) { ve++; }
+                    emit(x, Tok.String, i, ve);
+                    i = ve;
+                }
+                continue;
+            }
+            if (c == '"' || c == 39) {
+                int e = -1;
+                for (int k = i + 1; k < n; k++) {
+                    if (t[k] == c) { e = k + 1; break; }
+                }
+                if (e < 0) {
+                    emit(x, Tok.String, i, n);
+                    return ((c == '"') ? H_ATTR_DQ : H_ATTR_SQ) | tagFlags;
+                }
+                emit(x, Tok.String, i, e);
+                i = e;
+                continue;
+            }
+            if (isIdStart(c) || c == ':' || c == '@') {
+                int e = i;
+                while (e < n && (isIdChar(t[e]) || t[e] == '-' || t[e] == ':' || t[e] == '.' || t[e] == '@')) { e++; }
+                emit(x, Tok.Attribute, i, e);
+                i = e;
+                continue;
+            }
+            // an unquoted value or junk
+            int e = i;
+            while (e < n && t[e] != ' ' && t[e] != '>' && t[e] != 9) { e++; }
+            emit(x, Tok.String, i, (e > i) ? e : i + 1);
+            i = (e > i) ? e : i + 1;
+            continue;
+        }
+        if (c == '<') {
+            if (startsAt(t, n, i, "<!--")) {
+                int e = -1;
+                for (int k = i + 4; k + 2 < n; k++) {
+                    if (t[k] == '-' && t[k + 1] == '-' && t[k + 2] == '>') { e = k + 3; break; }
+                }
+                if (e < 0) {
+                    emit(x, Tok.Comment, i, n);
+                    return H_COMMENT;
+                }
+                emit(x, Tok.Comment, i, e);
+                i = e;
+                continue;
+            }
+            if (startsAt(t, n, i, "<![CDATA[")) {
+                int e = -1;
+                for (int k = i + 9; k + 2 < n; k++) {
+                    if (t[k] == ']' && t[k + 1] == ']' && t[k + 2] == '>') { e = k + 3; break; }
+                }
+                if (e < 0) {
+                    emit(x, Tok.String, i, n);
+                    return H_CDATA;
+                }
+                emit(x, Tok.String, i, e);
+                i = e;
+                continue;
+            }
+            if (startsAt(t, n, i, "<?")) {
+                int e = -1;
+                for (int k = i + 2; k + 1 < n; k++) {
+                    if (t[k] == '?' && t[k + 1] == '>') { e = k + 2; break; }
+                }
+                if (e < 0) {
+                    emit(x, Tok.Preproc, i, n);
+                    return H_PI;
+                }
+                emit(x, Tok.Preproc, i, e);
+                i = e;
+                continue;
+            }
+            if (startsAt(t, n, i, "<!")) {
+                int e = i;
+                while (e < n && t[e] != '>') { e++; }
+                if (e < n) { e++; }
+                emit(x, Tok.Preproc, i, e);
+                i = e;
+                continue;
+            }
+            int p = i + 1;
+            bool closing = false;
+            if (p < n && t[p] == '/') { closing = true; p++; }
+            if (p < n && (isIdStart(t[p]) || t[p] == ':')) {
+                int e = p;
+                while (e < n && (isIdChar(t[e]) || t[e] == '-' || t[e] == ':' || t[e] == '.')) { e++; }
+                emit(x, Tok.Punct, i, p);
+                emit(x, Tok.Tag, p, e);
+                tagFlags = 0;
+                if (!closing && !xml) {
+                    if (e - p == 6 && eqNoCase(t, n, p, "script")) { tagFlags = 0x100; }
+                    if (e - p == 5 && eqNoCase(t, n, p, "style")) { tagFlags = 0x200; }
+                }
+                i = e;
+                mode = H_TAG;
+                if (closing) {
+                    tagFlags = 0;
+                }
+                continue;
+            }
+            emit(x, Tok.Punct, i, i + 1);
+            i++;
+            continue;
+        }
+        if (c == '&') {
+            int e = i + 1;
+            if (e < n && t[e] == '#') { e++; }
+            while (e < n && isIdChar(t[e]) && e - i < 12) { e++; }
+            if (e < n && t[e] == ';' && e > i + 1) {
+                emit(x, Tok.Escape, i, e + 1);
+                i = e + 1;
+                continue;
+            }
+        }
+        i++;
+    }
+    if (mode == H_TAG) {
+        return H_TAG | tagFlags;
+    }
+    return 0;
+}
+
+// ---- Makefile ---------------------------------------------------------------------------------------------------------------------------------
+const MK_CONT = 1;                // the previous line ended with a backslash
+const MK_DEFINE = 2;              // inside define ... endef
+
+// the end of the make variable reference that starts with $ at i (i + 1 when it is not one)
+private int makeRefEnd(char* t, int to, int i) {
+    if (t[i] != '$' || i + 1 >= to) {
+        return i + 1;
+    }
+    int c = t[i + 1];
+    if (c == '(' || c == '{') {
+        int close = (c == '(') ? ')' : '}';
+        int depth = 0;
+        for (int k = i + 1; k < to; k++) {
+            if (t[k] == c) { depth++; }
+            if (t[k] == close) {
+                depth--;
+                if (depth == 0) { return k + 1; }
+            }
+        }
+        return to;
+    }
+    if (c == '@' || c == '<' || c == '^' || c == '*' || c == '?' || c == '%' || c == '+' || c == '$' || isIdStart(c) || isDigitC(c)) {
+        return i + 2;
+    }
+    return i + 1;
+}
+
+// highlights the references $(NAME) ${NAME} $@ $< $^ ... in [from, to)
+private void lexMakeRefs(Lx* x, int from, int to) {
+    char* t = x->t;
+    int i = from;
+    while (i < to) {
+        if (t[i] == '$') {
+            int e = makeRefEnd(t, to, i);
+            if (e > i + 1) {
+                emit(x, Tok.Variable, i, e);
+            }
+            i = e;
+            continue;
+        }
+        i++;
+    }
+}
+
+private int lexMake(int state, Lx* x) {
+    char* t = x->t;
+    int n = x->n;
+    int mode = state & 0xFF;
+    int endState = 0;
+    int e = n;
+    while (e > 0 && (t[e - 1] == ' ' || t[e - 1] == 9)) { e--; }
+    bool cont = e > 0 && t[e - 1] == 92;
+    int s = firstNonBlank(t, n);
+    if (mode == MK_DEFINE) {
+        if (startsAt(t, n, s, "endef")) {
+            emit(x, Tok.Keyword, s, s + 5);
+            return 0;
+        }
+        lexMakeRefs(x, 0, n);
+        return MK_DEFINE;
+    }
+    if (n > 0 && t[0] == 9 && mode != MK_CONT) {
+        // a recipe line: prefixes @ - + then shell text
+        int i = 1;
+        while (i < n && (t[i] == '@' || t[i] == '-' || t[i] == '+' || t[i] == ' ')) { i++; }
+        emit(x, Tok.Operator, 1, i);
+        int p = i;
+        while (p < n) {
+            int c = t[p];
+            if (c == '#') {
+                emit(x, Tok.Comment, p, n);
+                break;
+            }
+            if (c == '"' || c == 39) {
+                int q = p + 1;
+                while (q < n && t[q] != c) { if (t[q] == 92) { q++; } q++; }
+                int qe = (q < n) ? q + 1 : n;
+                emit(x, Tok.String, p, qe);
+                p = qe;
+                continue;
+            }
+            if (c == '$') {
+                int ve = makeRefEnd(t, n, p);
+                if (ve > p + 1) {
+                    emit(x, Tok.Variable, p, ve);
+                }
+                p = ve;
+                continue;
+            }
+            p++;
+        }
+        return cont ? MK_CONT : 0;
+    }
+    if (s < n && t[s] == '#') {
+        emit(x, Tok.Comment, s, n);
+        return cont ? MK_CONT : 0;
+    }
+    if (mode == MK_CONT) {
+        lexMakeRefs(x, 0, n);
+        return cont ? MK_CONT : 0;
+    }
+    WordSet* ws = wordsFor(Lang.Makefile);
+    // a directive?
+    int we = s;
+    while (we < n && (isIdChar(t[we]) || t[we] == '-')) { we++; }
+    int kind = (we > s) ? ws->lookup(&t[s], we - s) : -1;
+    if (kind == Tok.Keyword && (we >= n || t[we] == ' ' || t[we] == 9 || t[we] == '(')) {
+        emit(x, Tok.Keyword, s, we);
+        lexMakeRefs(x, we, n);
+        if (we - s == 6 && startsAt(t, n, s, "define")) {
+            return MK_DEFINE;
+        }
+        return cont ? MK_CONT : 0;
+    }
+    // an assignment: NAME op value
+    int ne = s;
+    while (ne < n && (isIdChar(t[ne]) || t[ne] == '.' || t[ne] == '-' || t[ne] == '$' || t[ne] == '(' || t[ne] == ')' || t[ne] == '{' || t[ne] == '}')) { ne++; }
+    int op = ne;
+    while (op < n && (t[op] == ' ' || t[op] == 9)) { op++; }
+    int ol = 0;
+    if (op < n) {
+        if (startsAt(t, n, op, "::=") || startsAt(t, n, op, ":::=")) { ol = (t[op + 2] == '=') ? 3 : 4; }
+        else if (startsAt(t, n, op, ":=") || startsAt(t, n, op, "+=") || startsAt(t, n, op, "?=") || startsAt(t, n, op, "!=")) { ol = 2; }
+        else if (t[op] == '=') { ol = 1; }
+    }
+    if (ol > 0 && ne > s) {
+        emit(x, Tok.Variable, s, ne);
+        emit(x, Tok.Operator, op, op + ol);
+        lexMakeRefs(x, op + ol, n);
+        // a trailing comment
+        for (int k = op + ol; k < n; k++) {
+            if (t[k] == '#' && (k == 0 || t[k - 1] != 92)) { emit(x, Tok.Comment, k, n); break; }
+        }
+        return cont ? MK_CONT : 0;
+    }
+    // a rule: targets : prerequisites
+    int colon = -1;
+    int depth = 0;
+    for (int k = s; k < n; k++) {
+        if (t[k] == '$' && k + 1 < n && (t[k + 1] == '(' || t[k + 1] == '{')) { depth++; k++; continue; }
+        if ((t[k] == ')' || t[k] == '}') && depth > 0) { depth--; continue; }
+        if (t[k] == ':' && depth == 0) { colon = k; break; }
+    }
+    if (colon > s) {
+        int k = s;
+        while (k < colon) {
+            if (t[k] == ' ' || t[k] == 9) { k++; continue; }
+            int q = k;
+            while (q < colon && t[q] != ' ' && t[q] != 9) { q++; }
+            if (t[k] == '$') {
+                lexMakeRefs(x, k, q);
+            } else if (t[k] == '.' && q - k > 1 && t[k + 1] >= 'A' && t[k + 1] <= 'Z') {
+                emit(x, Tok.Keyword, k, q);
+            } else {
+                emit(x, Tok.Function, k, q);
+            }
+            k = q;
+        }
+        int ce = colon + 1;
+        while (ce < n && t[ce] == ':') { ce++; }
+        emit(x, Tok.Operator, colon, ce);
+        lexMakeRefs(x, ce, n);
+        for (int q = ce; q < n; q++) {
+            if (t[q] == '#' && (q == 0 || t[q - 1] != 92)) { emit(x, Tok.Comment, q, n); break; }
+        }
+        return cont ? MK_CONT : 0;
+    }
+    lexMakeRefs(x, s, n);
+    return cont ? MK_CONT : 0;
+}
+
+// ---- the public lexer ---------------------------------------------------------------------------------------------------------------------
+// Lexes one line. state: the state at the start of the line (0 for the first line); text / len: the line without its line
+// break; out / max: room for tokens (max >= 2). The tokens cover [0, len) without gaps. Returns the number of tokens; the state
+// for the next line goes to *endState.
+public int lexLine(int lang, int state, char* text, int len, Token* out, int max, int* endState) {
+    Lx x;
+    x.t = text;
+    x.n = len;
+    x.out = out;
+    x.max = (max < 2) ? 2 : max;
+    x.cnt = 0;
+    x.last = 0;
+    int es = 0;
+    switch (lang) {
+        case Lang.A: case Lang.C: case Lang.Cpp: es = lexCLike(lang, state, &x); break;
+        case Lang.Python: es = lexPython(state, &x); break;
+        case Lang.Shell: es = lexShell(state, &x); break;
+        case Lang.Json: es = lexJson(state, &x); break;
+        case Lang.Markdown: es = lexMarkdown(state, &x); break;
+        case Lang.Ini: case Lang.Toml: es = lexIni(lang, state, &x); break;
+        case Lang.Html: case Lang.Xml: es = lexHtml(lang, state, &x); break;
+        case Lang.Makefile: es = lexMake(state, &x); break;
+        default: es = 0; break;
+    }
+    if (len == 0) {
+        x.cnt = 0;
+    }
+    int n = finish(&x);
+    if (len == 0) {
+        n = 0;
+    }
+    *endState = es;
+    return n;
+}
+
+// ---- language detection ------------------------------------------------------------------------------------------------------------------
+// the name that Editor.setLanguage and the themes use for a language
+public char* languageName(int lang) {
+    switch (lang) {
+        case Lang.A: return "a";
+        case Lang.C: return "c";
+        case Lang.Cpp: return "cpp";
+        case Lang.Python: return "python";
+        case Lang.Shell: return "shell";
+        case Lang.Json: return "json";
+        case Lang.Markdown: return "markdown";
+        case Lang.Ini: return "ini";
+        case Lang.Toml: return "toml";
+        case Lang.Html: return "html";
+        case Lang.Xml: return "xml";
+        case Lang.Makefile: return "makefile";
+    }
+    return "text";
+}
+
+// the language with this name (as languageName returns it, also a few common aliases); Lang.Text when unknown
+public int languageFromName(char* name) {
+    for (int l = 0; l < Lang.count; l++) {
+        if (streq(languageName(l), name)) { return l; }
+    }
+    if (streq(name, "sh") || streq(name, "bash") || streq(name, "zsh")) { return Lang.Shell; }
+    if (streq(name, "py") || streq(name, "python3")) { return Lang.Python; }
+    if (streq(name, "c++") || streq(name, "cc")) { return Lang.Cpp; }
+    if (streq(name, "md")) { return Lang.Markdown; }
+    if (streq(name, "make")) { return Lang.Makefile; }
+    return Lang.Text;
+}
+
+private bool endsWithNoCase(char* s, char* suffix) {
+    int n = strlen(s);
+    int m = strlen(suffix);
+    if (m > n) { return false; }
+    for (int i = 0; i < m; i++) {
+        int a = s[n - m + i];
+        int b = suffix[i];
+        if (a >= 'A' && a <= 'Z') { a = a + 32; }
+        if (a != b) { return false; }
+    }
+    return true;
+}
+
+private bool sameNoCase(char* a, char* b) {
+    return strlen(a) == strlen(b) && endsWithNoCase(a, b);
+}
+
+// Finds the language of a file from its name (the part after the last '/'): extensions, Makefile, and the interpreter in a
+// first line that starts with #! (firstLine may be null). Lang.Text when nothing matches.
+public int detectLanguage(char* fileName, char* firstLine) {
+    char* base = fileName;
+    if (fileName != null) {
+        for (int i = 0; fileName[i] != 0; i++) {
+            if (fileName[i] == '/' || fileName[i] == 92) { base = &fileName[i + 1]; }
+        }
+        if (sameNoCase(base, "makefile") || sameNoCase(base, "gnumakefile") || endsWithNoCase(base, ".mk") || endsWithNoCase(base, ".mak")) { return Lang.Makefile; }
+        if (endsWithNoCase(base, ".a") || endsWithNoCase(base, ".am")) { return Lang.A; }
+        if (endsWithNoCase(base, ".c") || endsWithNoCase(base, ".h")) { return Lang.C; }
+        if (endsWithNoCase(base, ".cpp") || endsWithNoCase(base, ".cc") || endsWithNoCase(base, ".cxx") || endsWithNoCase(base, ".hpp") || endsWithNoCase(base, ".hh") || endsWithNoCase(base, ".hxx")) { return Lang.Cpp; }
+        if (endsWithNoCase(base, ".py") || endsWithNoCase(base, ".pyw") || endsWithNoCase(base, ".pyi")) { return Lang.Python; }
+        if (endsWithNoCase(base, ".sh") || endsWithNoCase(base, ".bash") || endsWithNoCase(base, ".zsh") || endsWithNoCase(base, ".ksh") || sameNoCase(base, ".bashrc") || sameNoCase(base, ".profile") || sameNoCase(base, ".zshrc")) { return Lang.Shell; }
+        if (endsWithNoCase(base, ".json") || endsWithNoCase(base, ".jsonc") || endsWithNoCase(base, ".json5")) { return Lang.Json; }
+        if (endsWithNoCase(base, ".md") || endsWithNoCase(base, ".markdown")) { return Lang.Markdown; }
+        if (endsWithNoCase(base, ".toml")) { return Lang.Toml; }
+        if (endsWithNoCase(base, ".ini") || endsWithNoCase(base, ".conf") || endsWithNoCase(base, ".cfg") || endsWithNoCase(base, ".desktop") || sameNoCase(base, ".gitconfig")) { return Lang.Ini; }
+        if (endsWithNoCase(base, ".html") || endsWithNoCase(base, ".htm") || endsWithNoCase(base, ".xhtml")) { return Lang.Html; }
+        if (endsWithNoCase(base, ".xml") || endsWithNoCase(base, ".svg") || endsWithNoCase(base, ".xsl") || endsWithNoCase(base, ".plist") || endsWithNoCase(base, ".rss")) { return Lang.Xml; }
+        if (endsWithNoCase(base, ".txt") || endsWithNoCase(base, ".text")) { return Lang.Text; }
+    }
+    if (firstLine != null && firstLine[0] == '#' && firstLine[1] == '!') {
+        if (contains(firstLine, "python")) { return Lang.Python; }
+        if (contains(firstLine, "bash") || contains(firstLine, "/sh") || contains(firstLine, " sh") || contains(firstLine, "zsh") || contains(firstLine, "ksh") || contains(firstLine, "dash")) { return Lang.Shell; }
+        if (contains(firstLine, "make")) { return Lang.Makefile; }
+    }
+    if (firstLine != null && startsWith(firstLine, "<?xml")) { return Lang.Xml; }
+    return Lang.Text;
+}
+
+// ---- the incremental highlighter ----------------------------------------------------------------------------------------------------------
+// Keeps the lexer state at the start of every line of a Buffer. The table is updated when the buffer changes (through a change
+// listener): the lines of the edit are lexed again at once, and the work stops as soon as the state at a following line start
+// equals the one that was stored before (so typing in a line of code costs one line; opening a block comment costs the lines
+// down to its end, at most 120 per edit, the rest is left for the next request). Lines that nobody asks about are not lexed.
+int hlOnChange(int user, acode.Change* c) {
+    Highlighter* h = (Highlighter*) user;
+    h->onChange(c);
+    return 0;
+}
+
+public class Highlighter {
+    public acode.Buffer* buf;
+    public int lang;
+    public int linesLexed;              // how many lines were lexed so far (for tests and statistics)
+    public int eagerBudget;             // lines one edit may re-lex at once (default 120)
+
+    private int* st;                    // st[i]: the lexer state at the start of line i (i == lineCount: after the last line)
+    private int stCap;
+    private int nst;
+    private int valid;                  // st[0 .. valid) are certain, the rest is unknown
+    private int pending;                // edits since the table was last refilled
+    private bool rebuild;
+    private int rebuildFrom;
+    private int listenerId;
+
+    public Highlighter(acode.Buffer* b, int language) {
+        buf = b;
+        lang = language;
+        eagerBudget = 120;
+        stCap = 1024;
+        st = (int*) asys.alloc(stCap * 8);
+        listenerId = buf->addListener(hlOnChange, (int) this);
+        invalidate();
+    }
+
+    // detaches from the buffer and frees the table
+    public void dispose() {
+        if (buf != null) {
+            buf->removeListener(listenerId);
+        }
+        asys.free((char*) st);
+        st = null;
+        stCap = 0;
+        nst = 0;
+        buf = null;
+    }
+
+    public void setLanguage(int language) {
+        lang = language;
+        invalidate();
+    }
+
+    // forgets every state (they are computed again on demand)
+    public void invalidate() {
+        rebuild = true;
+        rebuildFrom = 0;
+        pending = 0;
+        valid = 1;
+        nst = 0;
+    }
+
+    // how many line starts have a known state (a statistic)
+    public int validLines() {
+        if (rebuild) { return 0; }
+        return valid;
+    }
+
+    private void doRebuild() {
+        int want = buf->lineCount() + 1;
+        if (want > stCap || (stCap > 8192 && want * 4 < stCap)) {
+            int nc = want + want / 4 + 64;
+            asys.free((char*) st);
+            st = (int*) asys.alloc(nc * 8);
+            stCap = nc;
+            valid = 1;
+        }
+        int keep = rebuildFrom + 1;
+        if (nst == 0 || keep > valid) { keep = valid; }
+        nst = want;
+        st[0] = 0;
+        valid = (keep < 1) ? 1 : keep;
+        if (valid > nst) { valid = nst; }
+        rebuild = false;
+        pending = 0;
+    }
+
+    public void onChange(acode.Change* c) {
+        if (rebuild) {
+            if (c->line < rebuildFrom) { rebuildFrom = c->line; }
+            if (c->kind == acode.CH_RESET) { rebuildFrom = 0; }
+            return;
+        }
+        if (c->kind == acode.CH_RESET) {
+            invalidate();
+            return;
+        }
+        pending++;
+        int L = c->line;
+        int d = c->delLines;
+        int ins = c->insLines;
+        if (pending > 64) {
+            // a burst of edits: do not keep up one by one, start over lazily
+            rebuild = true;
+            rebuildFrom = (L < valid - 1) ? L : valid - 1;
+            if (rebuildFrom < 0) { rebuildFrom = 0; }
+            return;
+        }
+        int oldValid = valid;
+        if (d != 0 || ins != 0) {
+            int newN = nst - d + ins;
+            if (newN > stCap) {
+                int nc = newN + newN / 2 + 64;
+                char* nb = asys.realloc((char*) st, nc * 8);
+                if (nb == null) {
+                    invalidate();
+                    return;
+                }
+                st = (int*) nb;
+                stCap = nc;
+            }
+            int from = L + 1 + d;
+            if (from > nst) { from = nst; }
+            asys.moveBytes((char*) &st[L + 1 + ins], (char*) &st[from], (nst - from) * 8);
+            for (int k = 0; k < ins; k++) { st[L + 1 + k] = 0; }
+            nst = newN;
+        }
+        if (oldValid <= L) {
+            return;                                    // the state at the start of the changed line is not known: nothing to repair
+        }
+        // old entries up to this index (new numbering) were certain for the old text
+        int oldCertainEnd = (oldValid > L + d + 1) ? oldValid - d + ins : ((oldValid > L) ? L + ins + 1 : oldValid);
+        if (oldCertainEnd > nst) { oldCertainEnd = nst; }
+        // re-lex from the changed line until the state agrees with the old one behind the changed lines
+        int k = L;
+        int budget = eagerBudget;
+        valid = L + 1;
+        while (k < nst - 1) {
+            int e = lexOne(k, st[k]);
+            int idx = k + 1;
+            if (idx > L + ins && idx < oldCertainEnd && st[idx] == e) {
+                valid = oldCertainEnd;                 // converged: everything we knew behind it is certain again
+                return;
+            }
+            st[idx] = e;
+            valid = idx + 1;
+            if (idx >= oldCertainEnd) {
+                return;                                // nothing left to compare with: the rest is computed on demand
+            }
+            k++;
+            budget--;
+            if (budget <= 0) {
+                return;
+            }
+        }
+    }
+
+    private int lexOne(int line, int state) {
+        int len = 0;
+        char* p = buf->linePtr(line, &len);
+        Token tmp[48];
+        int es = 0;
+        lexLine(lang, state, p, len, &tmp[0], 48, &es);
+        linesLexed++;
+        return es;
+    }
+
+    // brings the states up to date so that st[line] is certain
+    private void ensure(int line) {
+        if (rebuild) {
+            doRebuild();
+        }
+        while (valid <= line && valid < nst) {
+            int k = valid - 1;
+            st[valid] = lexOne(k, st[k]);
+            valid++;
+        }
+    }
+
+    // the lexer state at the start of line (certain)
+    public int stateAt(int line) {
+        if (line < 0 || line >= buf->lineCount()) { return 0; }
+        ensure(line);
+        return st[line];
+    }
+
+    // the tokens of one line: spans that cover it without gaps. Returns the count (0 for an empty line).
+    public int tokens(int line, Token* out, int max) {
+        if (line < 0 || line >= buf->lineCount()) { return 0; }
+        ensure(line);
+        int len = 0;
+        char* p = buf->linePtr(line, &len);
+        int es = 0;
+        int n = lexLine(lang, st[line], p, len, out, max, &es);
+        linesLexed++;
+        // the end state of this line is the state of the next one: keep it
+        if (valid == line + 1 && line + 1 < nst) {
+            st[line + 1] = es;
+            valid++;
+        }
+        return n;
+    }
+}
+
+// ---- symbols ---------------------------------------------------------------------------------------------------------------------------------
+public enum SymKind : uint8 { Function, Method, Class, Struct, Enum, Union, Const, Module, Typedef, Heading, Target, Variable }
+
+public struct Symbol {
+    int kind;                // a SymKind
+    int line;                // 0 based
+    int col;                 // byte offset in the line
+    int level;               // nesting (headings: 1..6; members: 1)
+    char* name;              // asys string
+    char* parent;            // the class a method belongs to, or null (asys string)
+}
+
+public class SymbolList {
+    public Symbol* items;
+    public int count;
+    private int cap;
+
+    public SymbolList() {
+    }
+
+    public int add(int kind, int line, int col, int level, char* name, int nameLen, char* parent) {
+        if (count == cap) {
+            int nc = (cap == 0) ? 64 : cap * 2;
+            char* nb = asys.realloc((char*) items, nc * sizeof(Symbol));
+            if (nb == null) { return -1; }
+            items = (Symbol*) nb;
+            cap = nc;
+        }
+        items[count].kind = kind;
+        items[count].line = line;
+        items[count].col = col;
+        items[count].level = level;
+        items[count].name = asys.strDupN(name, nameLen);
+        items[count].parent = (parent != null) ? asys.strDup(parent) : null;
+        count++;
+        return count - 1;
+    }
+
+    // frees the names and the table; the list can be reused
+    public void dispose() {
+        for (int i = 0; i < count; i++) {
+            asys.free(items[i].name);
+            asys.free(items[i].parent);
+        }
+        asys.free((char*) items);
+        items = null;
+        count = 0;
+        cap = 0;
+    }
+
+    // the index of the first symbol with this name, or -1
+    public int find(char* name) {
+        for (int i = 0; i < count; i++) {
+            if (streq(items[i].name, name)) { return i; }
+        }
+        return -1;
+    }
+}
+
+public char* symKindName(int kind) {
+    return SymKind.name(kind);
+}
+
+// a small event of the symbol scanner
+struct SymEv {
+    int type;                // 1 identifier, 2 keyword-like identifier, 3 punctuation, 4 operator character
+    int pos;                 // offset in the line
+    int len;
+    int ch;
+}
+
+// ident events of one line made from the lexer's tokens
+private int symEvents(char* text, int len, Token* tk, int nt, SymEv* ev, int maxEv) {
+    int ne = 0;
+    for (int k = 0; k < nt; k++) {
+        int kind = tk[k].kind;
+        int s = tk[k].start;
+        int e = s + tk[k].len;
+        if (kind == Tok.Comment || kind == Tok.DocComment || kind == Tok.String || kind == Tok.Char || kind == Tok.Escape || kind == Tok.Preproc) {
+            continue;
+        }
+        int p = s;
+        while (p < e && ne < maxEv - 1) {
+            int c = text[p];
+            if (isIdStart(c)) {
+                int q = p;
+                while (q < e && isIdChar(text[q])) { q++; }
+                ev[ne].type = (kind == Tok.Keyword || kind == Tok.Type) ? 2 : 1;
+                ev[ne].pos = p;
+                ev[ne].len = q - p;
+                ev[ne].ch = 0;
+                ne++;
+                p = q;
+                continue;
+            }
+            if (c == '{' || c == '}' || c == '(' || c == ')' || c == ';' || c == ',' || c == '[' || c == ']') {
+                ev[ne].type = 3;
+                ev[ne].pos = p;
+                ev[ne].len = 1;
+                ev[ne].ch = c;
+                ne++;
+            } else if (c == '=' || c == '*' || c == ':' || c == '&' || c == '.' || c == '<' || c == '>' || c == '-') {
+                ev[ne].type = 4;
+                ev[ne].pos = p;
+                ev[ne].len = 1;
+                ev[ne].ch = c;
+                ne++;
+            }
+            p++;
+        }
+    }
+    return ne;
+}
+
+private bool wordIs(char* t, int pos, int len, char* w) {
+    return strlen(w) == len && startsAt(t, pos + len, pos, w);
+}
+
+// symbols of C-like text (A, C, C++): structs, classes, enums, unions, constants, typedefs, modules, functions and methods
+private void symbolsCLike(acode.Buffer* b, int lang, SymbolList* out) {
+    int nlines = b->lineCount();
+    int state = 0;
+    int depth = 0;
+    int paren = 0;
+    int classStack[32];
+    char* classNames[32];
+    int classDepthOf[32];
+    int nclass = 0;
+    // statement state
+    int stmtCount = 0;
+    bool sawEq = false;
+    bool constStmt = false;
+    bool typedefStmt = false;
+    int typedefDepth = 0;
+    int typedefNameLine = -1;
+    int typedefNameCol = 0;
+    int typedefNameLen = 0;
+    char* typedefText = null;
+    int lastIdentLine = -1;
+    int lastIdentCol = 0;
+    int lastIdentLen = 0;
+    char* lastIdentText = null;
+    // a type declaration waiting for its '{'
+    int candKind = -1;
+    int candLine = 0;
+    int candCol = 0;
+    char* candName = null;
+    int candLen = 0;
+    bool afterType = false;                 // the keyword class / struct / enum / union was just seen
+    int afterTypeKind = 0;
+    bool moduleNext = false;
+    int moduleKw = 0;
+    Token tk[256];
+    SymEv ev[256];
+    int prevType = 0;
+    int prevCh = 0;
+    for (int line = 0; line < nlines; line++) {
+        int len = 0;
+        char* text = b->linePtr(line, &len);
+        // linePtr may use its scratch area: copy the line before the highlighter calls
+        char* copy = asys.alloc(len + 1);
+        memcpy(copy, text, len);
+        int es = 0;
+        int nt = lexLine(lang, state, copy, len, &tk[0], 256, &es);
+        state = es;
+        // #define NAME
+        int ind = firstNonBlank(copy, len);
+        if (len > ind && copy[ind] == '#') {
+            int w = ind + 1;
+            while (w < len && (copy[w] == ' ' || copy[w] == 9)) { w++; }
+            if (startsAt(copy, len, w, "define") && !(w + 6 < len && isIdChar(copy[w + 6]))) {
+                int q = w + 6;
+                while (q < len && (copy[q] == ' ' || copy[q] == 9)) { q++; }
+                int r = q;
+                while (r < len && isIdChar(copy[r])) { r++; }
+                if (r > q) {
+                    out->add(SymKind.Const, line, q, 0, &copy[q], r - q, null);
+                }
+            }
+            asys.free(copy);
+            continue;
+        }
+        int ne = symEvents(copy, len, &tk[0], nt, &ev[0], 256);
+        for (int k = 0; k < ne; k++) {
+            int type = ev[k].type;
+            int pos = ev[k].pos;
+            int tlen = ev[k].len;
+            char* word = &copy[pos];
+            if (type == 3) {
+                int c = ev[k].ch;
+                if (c == '(') {
+                    paren++;
+                } else if (c == ')') {
+                    if (paren > 0) { paren--; }
+                } else if (c == '{') {
+                    if (candKind >= 0) {
+                        out->add(candKind, candLine, candCol, nclass + 1 - 1, candName, candLen, (nclass > 0) ? classNames[nclass - 1] : null);
+                        if (nclass < 32 && candKind != SymKind.Enum) {
+                            classNames[nclass] = asys.strDupN(candName, candLen);
+                            classDepthOf[nclass] = depth + 1;
+                            nclass++;
+                        }
+                        candKind = -1;
+                        asys.free(candName);
+                        candName = null;
+                    }
+                    depth++;
+                    if (!(typedefStmt)) {
+                        stmtCount = 0;
+                        sawEq = false;
+                        constStmt = false;
+                    }
+                } else if (c == '}') {
+                    depth--;
+                    if (nclass > 0 && depth < classDepthOf[nclass - 1]) {
+                        nclass--;
+                        asys.free(classNames[nclass]);
+                    }
+                    if (!typedefStmt) {
+                        stmtCount = 0;
+                        sawEq = false;
+                        constStmt = false;
+                    }
+                } else if (c == ';') {
+                    if (candKind >= 0) {
+                        candKind = -1;
+                        asys.free(candName);
+                        candName = null;
+                    }
+                    if (typedefStmt && depth == typedefDepth && paren == 0) {
+                        if (lastIdentLine >= 0 && lastIdentText != null) {
+                            out->add(SymKind.Typedef, lastIdentLine, lastIdentCol, 0, lastIdentText, lastIdentLen, null);
+                        }
+                        typedefStmt = false;
+                    }
+                    if (paren == 0) {
+                        stmtCount = 0;
+                        sawEq = false;
+                        constStmt = false;
+                    }
+                }
+                prevType = 3;
+                prevCh = c;
+                afterType = false;
+                continue;
+            }
+            if (type == 4) {
+                int c = ev[k].ch;
+                if (c == '=' && paren == 0 && depth == classBodyDepth(nclass, classDepthOf)) {
+                    if (constStmt && lastIdentLine >= 0 && lastIdentText != null) {
+                        out->add(SymKind.Const, lastIdentLine, lastIdentCol, 0, lastIdentText, lastIdentLen, (nclass > 0) ? classNames[nclass - 1] : null);
+                    }
+                    constStmt = false;
+                    sawEq = true;
+                }
+                if (c == ':' && candKind >= 0) {
+                    // class Dog : Animal {  the definition continues: keep the candidate
+                }
+                if (c == '*' || c == '&') { stmtCount++; }
+                prevType = 4;
+                prevCh = c;
+                afterType = false;
+                continue;
+            }
+            // an identifier or keyword
+            bool atDecl = (depth == classBodyDepth(nclass, classDepthOf)) && paren == 0;
+            if (afterType) {
+                // the name of a struct / class / enum / union (not "class" in "enum class")
+                if (!(wordIs(copy, pos, tlen, "class") || wordIs(copy, pos, tlen, "struct"))) {
+                    candKind = afterTypeKind;
+                    candLine = line;
+                    candCol = pos;
+                    asys.free(candName);
+                    candName = asys.strDupN(word, tlen);
+                    candLen = tlen;
+                    afterType = false;
+                    prevType = 1;
+                    lastIdentLine = line; lastIdentCol = pos; lastIdentLen = tlen;
+                    asys.free(lastIdentText);
+                    lastIdentText = asys.strDupN(word, tlen);
+                    stmtCount++;
+                    continue;
+                }
+            }
+            if (moduleNext) {
+                out->add(SymKind.Module, line, pos, 0, word, tlen, null);
+                moduleNext = false;
+                continue;
+            }
+            if (type == 2 || type == 1) {
+                if (wordIs(copy, pos, tlen, "class") && lang != Lang.C) { afterType = true; afterTypeKind = SymKind.Class; }
+                else if (wordIs(copy, pos, tlen, "struct")) { afterType = true; afterTypeKind = SymKind.Struct; }
+                else if (wordIs(copy, pos, tlen, "enum")) { afterType = true; afterTypeKind = SymKind.Enum; }
+                else if (wordIs(copy, pos, tlen, "union")) { afterType = true; afterTypeKind = SymKind.Union; }
+                else if (wordIs(copy, pos, tlen, "const") && stmtCount == 0 && atDecl) { constStmt = true; }
+                else if (wordIs(copy, pos, tlen, "typedef") && atDecl) { typedefStmt = true; typedefDepth = depth; lastIdentLine = -1; }
+                else if ((wordIs(copy, pos, tlen, "module") || wordIs(copy, pos, tlen, "a_module") || wordIs(copy, pos, tlen, "namespace")) && stmtCount == 0 && atDecl) { moduleNext = true; }
+                else if (type == 1 && wordIs(copy, pos, tlen, "operator") && false) { }
+            }
+            // a function: identifier followed by '(' at declaration level
+            bool nextParen = false;
+            if (k + 1 < ne && ev[k + 1].type == 3 && ev[k + 1].ch == '(') { nextParen = true; }
+            if (nextParen && type == 1 && atDecl && !sawEq && !typedefStmt && !constStmt) {
+                bool isCtor = nclass > 0 && tlen == strlen(classNames[nclass - 1]) && startsAt(copy, len, pos, classNames[nclass - 1]);
+                if (stmtCount >= 1 || isCtor) {
+                    bool method = nclass > 0;
+                    out->add(method ? SymKind.Method : SymKind.Function, line, pos, method ? 1 : 0, word, tlen, method ? classNames[nclass - 1] : null);
+                }
+            }
+            if (type == 1 || type == 2) {
+                stmtCount++;
+                if (type == 1) {
+                    lastIdentLine = line;
+                    lastIdentCol = pos;
+                    lastIdentLen = tlen;
+                    asys.free(lastIdentText);
+                    lastIdentText = asys.strDupN(word, tlen);
+                }
+            }
+            prevType = type;
+        }
+        asys.free(copy);
+    }
+    asys.free(candName);
+    asys.free(lastIdentText);
+    asys.free(typedefText);
+    for (int i = 0; i < nclass; i++) { asys.free(classNames[i]); }
+    moduleKw = moduleKw;
+    typedefNameLine = typedefNameLine;
+    typedefNameCol = typedefNameCol;
+    typedefNameLen = typedefNameLen;
+    prevType = prevType;
+    prevCh = prevCh;
+}
+
+// the brace depth at which declarations of the innermost class body (or the file) live
+private int classBodyDepth(int nclass, int* classDepthOf) {
+    if (nclass == 0) { return 0; }
+    return classDepthOf[nclass - 1];
+}
+
+private void symbolsPython(acode.Buffer* b, SymbolList* out) {
+    int nlines = b->lineCount();
+    int classIndent = -1;
+    char* className = null;
+    int state = 0;
+    for (int line = 0; line < nlines; line++) {
+        int len = 0;
+        char* text = b->linePtr(line, &len);
+        char* copy = asys.alloc(len + 1);
+        memcpy(copy, text, len);
+        Token tk[16];
+        int es = 0;
+        lexLine(Lang.Python, state, copy, len, &tk[0], 16, &es);
+        bool inString = (state & 0xFF) != 0;
+        state = es;
+        int ind = firstNonBlank(copy, len);
+        if (inString || ind >= len) {
+            asys.free(copy);
+            continue;
+        }
+        if (classIndent >= 0 && ind <= classIndent) {
+            classIndent = -1;
+            asys.free(className);
+            className = null;
+        }
+        int p = ind;
+        if (startsAt(copy, len, p, "async ")) { p = p + 6; }
+        int kind = -1;
+        if (startsAt(copy, len, p, "def ")) { kind = SymKind.Function; p = p + 4; }
+        else if (startsAt(copy, len, p, "class ")) { kind = SymKind.Class; p = p + 6; }
+        if (kind >= 0) {
+            while (p < len && copy[p] == ' ') { p++; }
+            int q = p;
+            while (q < len && isIdChar(copy[q])) { q++; }
+            if (q > p) {
+                if (kind == SymKind.Function && classIndent >= 0 && ind > classIndent) {
+                    out->add(SymKind.Method, line, p, 1, &copy[p], q - p, className);
+                } else {
+                    out->add(kind, line, p, (ind > 0) ? 1 : 0, &copy[p], q - p, null);
+                }
+                if (kind == SymKind.Class) {
+                    classIndent = ind;
+                    asys.free(className);
+                    className = asys.strDupN(&copy[p], q - p);
+                }
+            }
+        } else if (ind == 0 && isIdStart(copy[0])) {
+            // NAME = value with an upper case name: a constant
+            int q = 0;
+            bool upper = true;
+            while (q < len && isIdChar(copy[q])) {
+                if (copy[q] >= 'a' && copy[q] <= 'z') { upper = false; }
+                q++;
+            }
+            int r = q;
+            while (r < len && copy[r] == ' ') { r++; }
+            if (upper && q > 1 && r < len && copy[r] == '=' && !(r + 1 < len && copy[r + 1] == '=')) {
+                out->add(SymKind.Const, line, 0, 0, copy, q, null);
+            }
+        }
+        asys.free(copy);
+    }
+    asys.free(className);
+}
+
+private void symbolsMarkdown(acode.Buffer* b, SymbolList* out) {
+    int nlines = b->lineCount();
+    int state = 0;
+    for (int line = 0; line < nlines; line++) {
+        int len = 0;
+        char* text = b->linePtr(line, &len);
+        bool inFence = (state & 0xFF) == MD_FENCE;
+        char* copy = asys.alloc(len + 1);
+        memcpy(copy, text, len);
+        Token tk[16];
+        int es = 0;
+        lexLine(Lang.Markdown, state, copy, len, &tk[0], 16, &es);
+        state = es;
+        if (!inFence && len > 0 && copy[0] == '#') {
+            int k = 0;
+            while (k < len && copy[k] == '#') { k++; }
+            if (k <= 6 && (k >= len || copy[k] == ' ')) {
+                int s = k;
+                while (s < len && copy[s] == ' ') { s++; }
+                int e = len;
+                while (e > s && (copy[e - 1] == ' ' || copy[e - 1] == '#')) { e--; }
+                out->add(SymKind.Heading, line, s, k, &copy[s], e - s, null);
+            }
+        }
+        asys.free(copy);
+    }
+}
+
+private void symbolsShell(acode.Buffer* b, SymbolList* out) {
+    int nlines = b->lineCount();
+    for (int line = 0; line < nlines; line++) {
+        int len = 0;
+        char* text = b->linePtr(line, &len);
+        char* copy = asys.alloc(len + 1);
+        memcpy(copy, text, len);
+        int p = firstNonBlank(copy, len);
+        if (startsAt(copy, len, p, "function ")) {
+            p = p + 9;
+            while (p < len && copy[p] == ' ') { p++; }
+            int q = p;
+            while (q < len && (isIdChar(copy[q]) || copy[q] == '-' || copy[q] == ':' || copy[q] == '.')) { q++; }
+            if (q > p) { out->add(SymKind.Function, line, p, 0, &copy[p], q - p, null); }
+        } else if (isIdStart(copy[p])) {
+            int q = p;
+            while (q < len && (isIdChar(copy[q]) || copy[q] == '-' || copy[q] == ':' || copy[q] == '.')) { q++; }
+            int r = q;
+            while (r < len && copy[r] == ' ') { r++; }
+            if (r + 1 < len && copy[r] == '(' && copy[r + 1] == ')') {
+                out->add(SymKind.Function, line, p, 0, &copy[p], q - p, null);
+            }
+        }
+        asys.free(copy);
+    }
+}
+
+private void symbolsMake(acode.Buffer* b, SymbolList* out) {
+    int nlines = b->lineCount();
+    for (int line = 0; line < nlines; line++) {
+        int len = 0;
+        char* text = b->linePtr(line, &len);
+        if (len == 0 || text[0] == 9 || text[0] == '#' || text[0] == ' ') { continue; }
+        char* copy = asys.alloc(len + 1);
+        memcpy(copy, text, len);
+        int colon = -1;
+        for (int k = 0; k < len; k++) {
+            if (copy[k] == '=' ) { break; }
+            if (copy[k] == ':' && !(k + 1 < len && copy[k + 1] == '=')) { colon = k; break; }
+        }
+        if (colon > 0) {
+            int e = colon;
+            while (e > 0 && copy[e - 1] == ' ') { e--; }
+            if (e > 0 && copy[0] != '.' && !startsAt(copy, len, 0, "$(")) {
+                // a rule with several targets: the first one names the symbol
+                int q = 0;
+                while (q < e && copy[q] != ' ') { q++; }
+                out->add(SymKind.Target, line, 0, 0, copy, q, null);
+            }
+        }
+        asys.free(copy);
+    }
+}
+
+// Finds the symbols of a buffer. A and C / C++: classes, structs, enums, unions, typedefs, constants, modules, functions and
+// methods (with the class as parent). Python: classes, functions, methods and UPPER_CASE constants. Markdown: headings (level
+// 1..6). Shell: functions. Makefile: rule targets. Other languages: none. The symbols come in file order.
+public void symbols(acode.Buffer* b, int lang, SymbolList* out) {
+    switch (lang) {
+        case Lang.A: case Lang.C: case Lang.Cpp: symbolsCLike(b, lang, out); break;
+        case Lang.Python: symbolsPython(b, out); break;
+        case Lang.Markdown: symbolsMarkdown(b, out); break;
+        case Lang.Shell: symbolsShell(b, out); break;
+        case Lang.Makefile: symbolsMake(b, out); break;
+        default: break;
+    }
+}
+
+// ---- completion ---------------------------------------------------------------------------------------------------------------------------------
+public struct Candidate {
+    char* text;              // owned by the Completer until the next call of complete() or dispose()
+    int kind;                // 0 symbol, 1 keyword, 2 word of an open buffer
+    int score;               // higher is better
+}
+
+// the identifier characters directly before offset off in the buffer: returns the start of that prefix
+public int prefixStart(acode.Buffer* b, int off) {
+    int p = off;
+    while (p > 0 && isIdChar(b->byteAt(p - 1))) {
+        p--;
+    }
+    return p;
+}
+
+class BufInfo {
+    public acode.Buffer* buf;
+    public int lang;
+    public int version;
+    public SymbolList* syms;
+    public char** words;
+    public int nwords;
+    public int wcap;
+}
+
+// Candidates for what is being typed: keywords of the language, symbols and the words found in the registered buffers.
+public class Completer {
+    public int maxScan;                 // bytes of each buffer that are scanned for words (default 4 MB)
+    private BufInfo** infos;
+    private int ninfo;
+    private int icap;
+    private char** results;
+    private int nres;
+
+    public Completer() {
+        maxScan = 4194304;
+    }
+
+    public void addBuffer(acode.Buffer* b, int lang) {
+        for (int i = 0; i < ninfo; i++) {
+            if (infos[i]->buf == b) {
+                infos[i]->lang = lang;
+                infos[i]->version = -1;
+                return;
+            }
+        }
+        if (ninfo == icap) {
+            icap = (icap == 0) ? 8 : icap * 2;
+            infos = (BufInfo**) asys.realloc((char*) infos, icap * 8);
+        }
+        BufInfo* bi = new BufInfo();
+        bi->buf = b;
+        bi->lang = lang;
+        bi->version = -1;
+        infos[ninfo] = bi;
+        ninfo++;
+    }
+
+    private void freeInfo(BufInfo* bi) {
+        if (bi->syms != null) {
+            bi->syms->dispose();
+        }
+        for (int i = 0; i < bi->nwords; i++) { asys.free(bi->words[i]); }
+        asys.free((char*) bi->words);
+        bi->words = null;
+        bi->nwords = 0;
+        bi->wcap = 0;
+    }
+
+    public void removeBuffer(acode.Buffer* b) {
+        for (int i = 0; i < ninfo; i++) {
+            if (infos[i]->buf == b) {
+                freeInfo(infos[i]);
+                for (int j = i; j + 1 < ninfo; j++) { infos[j] = infos[j + 1]; }
+                ninfo--;
+                return;
+            }
+        }
+    }
+
+    private void refresh(BufInfo* bi) {
+        if (bi->version == bi->buf->version) {
+            return;
+        }
+        freeInfo(bi);
+        bi->version = bi->buf->version;
+        bi->syms = new SymbolList();
+        symbols(bi->buf, bi->lang, bi->syms);
+        // words: identifiers of at least 3 characters, unique, from the first maxScan bytes
+        int n = imin(bi->buf->length(), maxScan);
+        char* text = bi->buf->getText(0, n);
+        int cap = 1024;
+        char** table = (char**) asys.alloc(cap * 8);
+        int count = 0;
+        int p = 0;
+        while (p < n) {
+            if (isIdStart(text[p]) && (p == 0 || !isIdChar(text[p - 1]))) {
+                int q = p;
+                while (q < n && isIdChar(text[q])) { q++; }
+                if (q - p >= 3 && q - p < 64) {
+                    // an open addressing table of the words found so far
+                    if (count * 2 >= cap) {
+                        int nc = cap * 2;
+                        char** nt = (char**) asys.alloc(nc * 8);
+                        for (int i = 0; i < cap; i++) {
+                            if (table[i] != null) {
+                                int h = hashWord(table[i], strlen(table[i])) & (nc - 1);
+                                while (nt[h] != null) { h = (h + 1) & (nc - 1); }
+                                nt[h] = table[i];
+                            }
+                        }
+                        asys.free((char*) table);
+                        table = nt;
+                        cap = nc;
+                    }
+                    int h = hashWord(&text[p], q - p) & (cap - 1);
+                    bool found = false;
+                    while (table[h] != null) {
+                        char* w = table[h];
+                        if (strlen(w) == q - p && startsAt(text, n, p, w)) { found = true; break; }
+                        h = (h + 1) & (cap - 1);
+                    }
+                    if (!found) {
+                        table[h] = asys.strDupN(&text[p], q - p);
+                        count++;
+                    }
+                }
+                p = q;
+            } else {
+                p++;
+            }
+        }
+        asys.free(text);
+        bi->words = (char**) asys.alloc((count + 1) * 8);
+        int w = 0;
+        for (int i = 0; i < cap; i++) {
+            if (table[i] != null) {
+                bi->words[w] = table[i];
+                w++;
+            }
+        }
+        bi->nwords = w;
+        bi->wcap = count + 1;
+        asys.free((char*) table);
+    }
+
+    private int matchScore(char* prefix, int plen, char* cand) {
+        int cl = strlen(cand);
+        if (cl < plen) { return -1; }
+        bool exact = true;
+        bool fold = true;
+        for (int i = 0; i < plen; i++) {
+            int a = prefix[i];
+            int c = cand[i];
+            if (a != c) { exact = false; }
+            if ((a | 32) != (c | 32) && a != c) { fold = false; }
+        }
+        if (exact) { return 100; }
+        if (fold) { return 50; }
+        return -1;
+    }
+
+    private void clearResults() {
+        for (int i = 0; i < nres; i++) { asys.free(results[i]); }
+        nres = 0;
+    }
+
+    // Fills out with at most max candidates for the typed prefix, best first: exact-case prefix matches before case-insensitive
+    // ones, then symbols, keywords, words; shorter names first, then alphabetical. A candidate equal to the prefix itself is left
+    // out. lang selects the keywords.
+    public int complete(char* prefix, int lang, Candidate* out, int max) {
+        clearResults();
+        int plen = strlen(prefix);
+        int cap = 256;
+        Candidate* all = (Candidate*) asys.alloc(cap * sizeof(Candidate));
+        int n = 0;
+        // keywords
+        WordSet* ws = wordsFor(lang);
+        if (ws != null) {
+            for (int i = 0; i < ws->cap; i++) {
+                if (ws->words[i] != null) {
+                    int sc = matchScore(prefix, plen, ws->words[i]);
+                    if (sc >= 0 && !streq(ws->words[i], prefix)) {
+                        if (n == cap) { cap = cap * 2; all = (Candidate*) asys.realloc((char*) all, cap * sizeof(Candidate)); }
+                        all[n].text = asys.strDup(ws->words[i]);
+                        all[n].kind = 1;
+                        all[n].score = sc + 20;
+                        n++;
+                    }
+                }
+            }
+        }
+        for (int b = 0; b < ninfo; b++) {
+            BufInfo* bi = infos[b];
+            refresh(bi);
+            for (int i = 0; i < bi->syms->count; i++) {
+                char* nm = bi->syms->items[i].name;
+                int sc = matchScore(prefix, plen, nm);
+                if (sc >= 0 && !streq(nm, prefix)) {
+                    if (n == cap) { cap = cap * 2; all = (Candidate*) asys.realloc((char*) all, cap * sizeof(Candidate)); }
+                    all[n].text = asys.strDup(nm);
+                    all[n].kind = 0;
+                    all[n].score = sc + 30;
+                    n++;
+                }
+            }
+            for (int i = 0; i < bi->nwords; i++) {
+                char* nm = bi->words[i];
+                int sc = matchScore(prefix, plen, nm);
+                if (sc >= 0 && !streq(nm, prefix)) {
+                    if (n == cap) { cap = cap * 2; all = (Candidate*) asys.realloc((char*) all, cap * sizeof(Candidate)); }
+                    all[n].text = asys.strDup(nm);
+                    all[n].kind = 2;
+                    all[n].score = sc;
+                    n++;
+                }
+            }
+        }
+        // remove duplicates (keep the best score), then sort
+        for (int i = 0; i < n; i++) {
+            if (all[i].text == null) { continue; }
+            for (int j = i + 1; j < n; j++) {
+                if (all[j].text != null && streq(all[i].text, all[j].text)) {
+                    if (all[j].score > all[i].score) {
+                        all[i].score = all[j].score;
+                        all[i].kind = all[j].kind;
+                    }
+                    asys.free(all[j].text);
+                    all[j].text = null;
+                }
+            }
+        }
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            if (all[i].text != null) {
+                all[w] = all[i];
+                w++;
+            }
+        }
+        n = w;
+        // insertion sort is fine for the few hundred candidates
+        for (int i = 1; i < n; i++) {
+            Candidate c = all[i];
+            int j = i - 1;
+            while (j >= 0 && better(&c, &all[j])) {
+                all[j + 1] = all[j];
+                j--;
+            }
+            all[j + 1] = c;
+        }
+        int give = imin(n, max);
+        if (results == null || nres < 0) {
+            results = (char**) asys.alloc(1024 * 8);
+        }
+        for (int i = 0; i < give; i++) {
+            out[i] = all[i];
+        }
+        for (int i = 0; i < n; i++) {
+            if (i < give && i < 1024) {
+                results[nres] = all[i].text;
+                nres++;
+            } else {
+                asys.free(all[i].text);
+            }
+        }
+        asys.free((char*) all);
+        return give;
+    }
+
+    // a before b?
+    private bool better(Candidate* a, Candidate* b) {
+        if (a->score != b->score) { return a->score > b->score; }
+        int la = strlen(a->text);
+        int lb = strlen(b->text);
+        if (la != lb) { return la < lb; }
+        return strcmp(a->text, b->text) < 0;
+    }
+
+    // frees everything the completer holds
+    public void dispose() {
+        clearResults();
+        asys.free((char*) results);
+        results = null;
+        for (int i = 0; i < ninfo; i++) { freeInfo(infos[i]); }
+        asys.free((char*) infos);
+        infos = null;
+        ninfo = 0;
+        icap = 0;
+    }
+}

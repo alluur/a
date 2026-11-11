@@ -1,0 +1,343 @@
+// asyntax.Highlighter: incremental highlighting equals a fresh lex after random edits in every language; the work after an edit
+// stops where the lexer state settles; symbols of A, C, Python, Markdown, shell and Makefiles; completion
+import asyntax;
+import acode;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (!streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got, want);
+    }
+}
+
+int seed = 4242;
+int rnd(int n) {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return ((seed >> 8) & 0xFFFFFF) % n;
+}
+
+char* frags[16];
+
+void fragsFor(int lang) {
+    for (int i = 0; i < 16; i++) { frags[i] = null; }
+    if (lang == asyntax.Lang.C || lang == asyntax.Lang.A) {
+        frags[0] = "/*"; frags[1] = "*/"; frags[2] = "\""; frags[3] = "'"; frags[4] = "//"; frags[5] = "\n"; frags[6] = "#define X \\\n"; frags[7] = "int x = 1;"; frags[8] = " "; frags[9] = "/**"; frags[10] = "\\"; frags[11] = "(f)"; frags[12] = "\n"; frags[13] = "0x1F"; frags[14] = "return"; frags[15] = "#";
+    } else if (lang == asyntax.Lang.Python) {
+        frags[0] = "\"\"\""; frags[1] = "'''"; frags[2] = "\""; frags[3] = "'"; frags[4] = "#"; frags[5] = "\n"; frags[6] = "def f():"; frags[7] = "x = 1"; frags[8] = " "; frags[9] = "\\"; frags[10] = "@dec"; frags[11] = "\n"; frags[12] = "r'"; frags[13] = "class A:"; frags[14] = "if"; frags[15] = "\"\"\"\n";
+    } else if (lang == asyntax.Lang.Shell) {
+        frags[0] = "<<EOF\n"; frags[1] = "EOF\n"; frags[2] = "\""; frags[3] = "'"; frags[4] = "#"; frags[5] = "\n"; frags[6] = "$x"; frags[7] = "echo"; frags[8] = " "; frags[9] = "<<-X\n"; frags[10] = "X\n"; frags[11] = "\n"; frags[12] = "if"; frags[13] = "$(a)"; frags[14] = "fi"; frags[15] = "${v}";
+    } else if (lang == asyntax.Lang.Markdown) {
+        frags[0] = "```\n"; frags[1] = "~~~\n"; frags[2] = "<!--"; frags[3] = "-->"; frags[4] = "*"; frags[5] = "\n"; frags[6] = "`"; frags[7] = "# "; frags[8] = " "; frags[9] = "[a](b)"; frags[10] = "```c\n"; frags[11] = "\n"; frags[12] = "- "; frags[13] = "> "; frags[14] = "_"; frags[15] = "text";
+    } else if (lang == asyntax.Lang.Html || lang == asyntax.Lang.Xml) {
+        frags[0] = "<script>"; frags[1] = "</script>"; frags[2] = "<!--"; frags[3] = "-->"; frags[4] = "<"; frags[5] = "\n"; frags[6] = ">"; frags[7] = "\""; frags[8] = " "; frags[9] = "<b "; frags[10] = "'"; frags[11] = "="; frags[12] = "<style>"; frags[13] = "</style>"; frags[14] = "<![CDATA["; frags[15] = "]]>";
+    } else if (lang == asyntax.Lang.Makefile) {
+        frags[0] = "define X\n"; frags[1] = "endef\n"; frags[2] = "\\\n"; frags[3] = "\t"; frags[4] = ":"; frags[5] = "\n"; frags[6] = "$("; frags[7] = ")"; frags[8] = " "; frags[9] = "="; frags[10] = "#"; frags[11] = "all"; frags[12] = "ifdef Y\n"; frags[13] = "@"; frags[14] = "\n"; frags[15] = "x";
+    } else if (lang == asyntax.Lang.Json) {
+        frags[0] = "/*"; frags[1] = "*/"; frags[2] = "\""; frags[3] = ":"; frags[4] = "//"; frags[5] = "\n"; frags[6] = "{"; frags[7] = "}"; frags[8] = " "; frags[9] = "true"; frags[10] = "12"; frags[11] = ","; frags[12] = "["; frags[13] = "]"; frags[14] = "\n"; frags[15] = "x";
+    } else {
+        frags[0] = "\"\"\""; frags[1] = "'''"; frags[2] = "\""; frags[3] = "'"; frags[4] = "#"; frags[5] = "\n"; frags[6] = "["; frags[7] = "]"; frags[8] = " "; frags[9] = "="; frags[10] = ";"; frags[11] = "key"; frags[12] = "12"; frags[13] = "true"; frags[14] = "\n"; frags[15] = ",";
+    }
+}
+
+// the reference: lex every line in order, carrying the state; compares one line with what the highlighter says
+bool sameAsFresh(acode.Buffer* b, asyntax.Highlighter* h, int lang) {
+    int state = 0;
+    asyntax.Token ref[64];
+    asyntax.Token got[64];
+    for (int line = 0; line < b->lineCount(); line++) {
+        int len = 0;
+        char* p = b->linePtr(line, &len);
+        char* copy = asys.strDupN(p, len);
+        int es = 0;
+        int nr = asyntax.lexLine(lang, state, copy, len, &ref[0], 64, &es);
+        asys.free(copy);
+        int ng = h->tokens(line, &got[0], 64);
+        if (nr != ng) { return false; }
+        for (int i = 0; i < nr; i++) {
+            if (ref[i].start != got[i].start || ref[i].len != got[i].len || ref[i].kind != got[i].kind) { return false; }
+        }
+        if (h->stateAt(line) != state) { return false; }
+        state = es;
+    }
+    return true;
+}
+
+int main() {
+    // ---- random edits in every language: the incremental result equals a fresh lex
+    int langs[10];
+    langs[0] = asyntax.Lang.C; langs[1] = asyntax.Lang.A; langs[2] = asyntax.Lang.Python; langs[3] = asyntax.Lang.Shell; langs[4] = asyntax.Lang.Markdown;
+    langs[5] = asyntax.Lang.Html; langs[6] = asyntax.Lang.Makefile; langs[7] = asyntax.Lang.Json; langs[8] = asyntax.Lang.Toml; langs[9] = asyntax.Lang.Xml;
+    for (int li = 0; li < 10; li++) {
+        int lang = langs[li];
+        fragsFor(lang);
+        acode.Buffer b();
+        asyntax.Highlighter* h = new asyntax.Highlighter(&b, lang);
+        bool ok = true;
+        int rounds = 0;
+        for (int round = 0; round < 60 && ok; round++) {
+            int edits = 1 + rnd(6);
+            if (round % 15 == 14) { edits = 90; }                  // a burst: more edits than the highlighter tracks one by one
+            for (int e = 0; e < edits; e++) {
+                int len = b.length();
+                int off = rnd(len + 1);
+                int del = 0;
+                if (rnd(3) == 0 && len > 0) { del = rnd(imin2(len - off, 8) + 1); }
+                char* f = frags[rnd(16)];
+                int fl = (rnd(4) == 0) ? 0 : strlen(f);
+                off = b.charStart(off);
+                b.edit(off, del, f, fl);
+            }
+            // look at a few lines only (lazy), every few rounds at all of them
+            if (round % 4 == 3) {
+                ok = sameAsFresh(&b, h, lang);
+                rounds++;
+            } else if (b.lineCount() > 0) {
+                asyntax.Token t[32];
+                h->tokens(rnd(b.lineCount()), &t[0], 32);
+            }
+            if (round == 30) {
+                int s[8];
+                b.undo(&s[0], 8);
+                b.undo(&s[0], 8);
+                b.redo(&s[0], 8);
+            }
+        }
+        check(ok, "incremental highlighting equals a fresh lex after random edits");
+        check(sameAsFresh(&b, h, lang), "and at the end");
+        h->dispose();
+        check(b.listenerCount() == 0, "dispose removes the listener");
+    }
+
+    // ---- the work after an edit stops where the state settles
+    {
+        acode.Buffer b();
+        char* text = asys.alloc(60000);
+        int n = 0;
+        for (int l = 0; l < 1000; l++) {
+            char line[64];
+            int k = format(&line[0], 64, "int v%d = %d; // line %d\n", l, l, l);
+            memcpy(&text[n], &line[0], k);
+            n = n + k;
+        }
+        b.setText(text, n);
+        asyntax.Highlighter* h = new asyntax.Highlighter(&b, asyntax.Lang.C);
+        asyntax.Token t[64];
+        h->tokens(999, &t[0], 64);
+        int base = h->linesLexed;
+        check(base >= 1000, "all 1000 lines were lexed once to reach the last line");
+        // an edit inside a line that changes no state
+        b.edit(b.lineStart(500) + 4, 0, "x", 1);
+        h->tokens(999, &t[0], 64);
+        int cost = h->linesLexed - base;
+        check(cost <= 4, "an ordinary edit re-lexes about one line (not the file)");
+        // open a comment on line 100 and close it on line 120: only lines 100..120 change state
+        b.edit(b.lineStart(120) + 0, 0, "*/ ", 3);
+        h->tokens(999, &t[0], 64);
+        base = h->linesLexed;
+        b.edit(b.lineStart(100), 0, "/* ", 3);
+        h->tokens(999, &t[0], 64);
+        cost = h->linesLexed - base;
+        check(cost >= 20 && cost <= 30, "opening a comment re-lexes down to the line that closes it");
+        base = h->linesLexed;
+        b.edit(b.lineStart(100), 3, null, 0);
+        h->tokens(999, &t[0], 64);
+        cost = h->linesLexed - base;
+        check(cost >= 20 && cost <= 30, "removing it re-lexes the same lines");
+        check(h->stateAt(110) == 0, "state after the removal is normal again");
+        // inserting lines shifts the table without re-lexing the lines below
+        base = h->linesLexed;
+        b.edit(b.lineStart(300), 0, "a\nb\nc\n", 6);
+        h->tokens(999, &t[0], 64);
+        cost = h->linesLexed - base;
+        check(cost <= 8, "inserting three lines re-lexes only them");
+        checkEq(b.lineCount(), 1004, "line count");
+        base = h->linesLexed;
+        b.edit(b.lineStart(300), 6, null, 0);
+        h->tokens(1000, &t[0], 64);
+        cost = h->linesLexed - base;
+        check(cost <= 4, "removing them again");
+        // asking for early lines does not lex the later ones
+        b.edit(b.lineStart(10), 0, "/* ", 3);
+        base = h->linesLexed;
+        h->tokens(12, &t[0], 64);
+        cost = h->linesLexed - base;
+        check(cost <= 5, "only the lines up to the requested one are brought up to date");
+        h->dispose();
+        asys.free(text);
+    }
+
+    // ---- setLanguage and invalidate
+    {
+        acode.Buffer b();
+        b.setText("# comment\nx = 1\n", 16);
+        asyntax.Highlighter* h = new asyntax.Highlighter(&b, asyntax.Lang.C);
+        asyntax.Token t[16];
+        int n = h->tokens(0, &t[0], 16);
+        check(n == 1 && t[0].kind == asyntax.Tok.Preproc, "as C a # line is a preprocessor line");
+        h->setLanguage(asyntax.Lang.Python);
+        n = h->tokens(0, &t[0], 16);
+        check(n == 1 && t[0].kind == asyntax.Tok.Comment, "as Python it is a comment");
+        b.setText("/* c\n", 5);
+        h->setLanguage(asyntax.Lang.C);
+        check(h->stateAt(1) != 0, "stateAt after a replaced text");
+        h->dispose();
+    }
+
+    // ---- symbols
+    {
+        acode.Buffer b();
+        char* src = "module demo;\nimport gui;\nconst MAX = 10;\nconst int LIMIT = 5;\nstruct Point { int x; int y; }\nclass Account : Base {\n    private int balance;\n    public Account(int a) { balance = a; }\n    public int get() { return balance; }\n    public virtual int speak() { return 1; }\n}\nenum Color { Red, Green = 5 }\nunion Value { int i; char* s; }\ntypedef int Number;\nint add(int a, int b) {\n    int r = a + b;\n    helper(r);\n    return r;\n}\n// int commented(int x) {}\nchar* s = \"int fake(int x) { }\";\nint main(int argc, char** argv) { return add(1, 2); }\nstatic int helper(int x);\n";
+        b.setText(src, strlen(src));
+        asyntax.SymbolList sl();
+        asyntax.symbols(&b, asyntax.Lang.A, &sl);
+        char got[2048];
+        int w = 0;
+        for (int i = 0; i < sl.count; i++) {
+            w = w + format(&got[w], 2048 - w, "%s %s@%d%s%s;", asyntax.symKindName(sl.items[i].kind), sl.items[i].name, sl.items[i].line + 1, sl.items[i].parent == null ? "" : " in ", sl.items[i].parent == null ? "" : sl.items[i].parent);
+        }
+        checkStr(&got[0], "Module demo@1;Const MAX@3;Const LIMIT@4;Struct Point@5;Class Account@6;Method Account@8 in Account;Method get@9 in Account;Method speak@10 in Account;Enum Color@12;Union Value@13;Typedef Number@14;Function add@15;Function main@22;Function helper@23;", "symbols of an A program");
+        sl.dispose();
+        int before = asys.memInUse();
+        asyntax.symbols(&b, asyntax.Lang.A, &sl);
+        sl.dispose();
+        checkEq(asys.memInUse(), before, "symbol lists free everything");
+    }
+    {
+        acode.Buffer b();
+        char* src = "#define MAXN 10\ntypedef struct Node { int val; struct Node* next; } Node;\nstatic int counter = 0;\nint main(void) {\n    return 0;\n}\nvoid helper(int x) {}\n";
+        b.setText(src, strlen(src));
+        asyntax.SymbolList sl();
+        asyntax.symbols(&b, asyntax.Lang.C, &sl);
+        char got[1024];
+        int w = 0;
+        for (int i = 0; i < sl.count; i++) {
+            w = w + format(&got[w], 1024 - w, "%s %s@%d;", asyntax.symKindName(sl.items[i].kind), sl.items[i].name, sl.items[i].line + 1);
+        }
+        checkStr(&got[0], "Const MAXN@1;Struct Node@2;Typedef Node@2;Function main@4;Function helper@7;", "symbols of a C file");
+        sl.dispose();
+    }
+    {
+        acode.Buffer b();
+        char* src = "MAX = 3\nclass Foo(Base):\n    X = 1\n    def method(self):\n        pass\n    async def other(self): pass\ndef top(a, b):\n    \"\"\"\n    def not_a_symbol():\n    \"\"\"\n    return 1\nclass Bar: pass\ndef last(): pass\n";
+        b.setText(src, strlen(src));
+        asyntax.SymbolList sl();
+        asyntax.symbols(&b, asyntax.Lang.Python, &sl);
+        char got[1024];
+        int w = 0;
+        for (int i = 0; i < sl.count; i++) {
+            w = w + format(&got[w], 1024 - w, "%s %s@%d%s%s;", asyntax.symKindName(sl.items[i].kind), sl.items[i].name, sl.items[i].line + 1, sl.items[i].parent == null ? "" : " in ", sl.items[i].parent == null ? "" : sl.items[i].parent);
+        }
+        checkStr(&got[0], "Const MAX@1;Class Foo@2;Method method@4 in Foo;Method other@6 in Foo;Function top@7;Class Bar@12;Function last@13;", "symbols of Python");
+        sl.dispose();
+    }
+    {
+        acode.Buffer b();
+        char* src = "# Title\ntext\n## Part *one*\n```\n# not a heading\n```\n### Deep ###\n####### seven\n";
+        b.setText(src, strlen(src));
+        asyntax.SymbolList sl();
+        asyntax.symbols(&b, asyntax.Lang.Markdown, &sl);
+        char got[512];
+        int w = 0;
+        for (int i = 0; i < sl.count; i++) {
+            w = w + format(&got[w], 512 - w, "%d:%s@%d;", sl.items[i].level, sl.items[i].name, sl.items[i].line + 1);
+        }
+        checkStr(&got[0], "1:Title@1;2:Part *one*@3;3:Deep@7;", "headings of Markdown (not inside a fence)");
+        sl.dispose();
+    }
+    {
+        acode.Buffer b();
+        char* src = "#!/bin/sh\nfunction deploy {\n  echo\n}\nbuild() {\n  make\n}\nx=1\n";
+        b.setText(src, strlen(src));
+        asyntax.SymbolList sl();
+        asyntax.symbols(&b, asyntax.Lang.Shell, &sl);
+        check(sl.count == 2 && streq(sl.items[0].name, "deploy") && streq(sl.items[1].name, "build"), "shell functions");
+        sl.dispose();
+        char* mk = "CC = gcc\nall: build/ac\nbuild/ac: $(SRC)\n\t$(CC) -o $@ $^\n.PHONY: all\nclean:\n\trm -f x\n";
+        b.setText(mk, strlen(mk));
+        asyntax.symbols(&b, asyntax.Lang.Makefile, &sl);
+        check(sl.count == 3 && streq(sl.items[0].name, "all") && streq(sl.items[1].name, "build/ac") && streq(sl.items[2].name, "clean"), "Makefile targets");
+        sl.dispose();
+        asyntax.symbols(&b, asyntax.Lang.Text, &sl);
+        checkEq(sl.count, 0, "no symbols for plain text");
+        check(sl.find("x") < 0, "find in an empty list");
+    }
+
+    // ---- completion
+    {
+        acode.Buffer a();
+        acode.Buffer c();
+        char* sa = "int compute(int x) { return x; }\nint computeMore(int y) { return y; }\nconst COUNT = 3;\nint counter = 0;\n";
+        char* sc = "int main() { cons; zq; computeMore(1); wibble wobble wibble; }\n";
+        a.setText(sa, strlen(sa));
+        c.setText(sc, strlen(sc));
+        asyntax.Completer comp();
+        comp.addBuffer(&a, asyntax.Lang.A);
+        comp.addBuffer(&c, asyntax.Lang.A);
+        asyntax.Candidate cands[20];
+        int n = comp.complete("comp", asyntax.Lang.A, &cands[0], 20);
+        check(n == 2 && streq(cands[0].text, "compute") && streq(cands[1].text, "computeMore"), "symbols matching a prefix, shorter first");
+        check(cands[0].kind == 0, "they are symbols");
+        n = comp.complete("co", asyntax.Lang.A, &cands[0], 20);
+        bool hasConst = false;
+        bool hasCount = false;
+        bool hasCompute = false;
+        bool firstIsSymbol = cands[0].kind == 0;
+        for (int i = 0; i < n; i++) {
+            if (streq(cands[i].text, "const")) { hasConst = true; }
+            if (streq(cands[i].text, "COUNT")) { hasCount = true; }
+            if (streq(cands[i].text, "compute")) { hasCompute = true; }
+        }
+        check(hasConst && hasCount && hasCompute, "keywords, symbols and words together");
+        check(firstIsSymbol, "symbols come first");
+        n = comp.complete("wib", asyntax.Lang.A, &cands[0], 20);
+        check(n == 1 && streq(cands[0].text, "wibble") && cands[0].kind == 2, "words of other buffers");
+        n = comp.complete("CO", asyntax.Lang.A, &cands[0], 20);
+        check(n >= 1 && streq(cands[0].text, "COUNT"), "exact-case matches first");
+        bool ci = false;
+        for (int i = 0; i < n; i++) { if (streq(cands[i].text, "const")) { ci = true; } }
+        check(ci, "then case-insensitive matches");
+        n = comp.complete("compute", asyntax.Lang.A, &cands[0], 20);
+        check(n == 1 && streq(cands[0].text, "computeMore"), "the prefix itself is not offered");
+        n = comp.complete("zzz", asyntax.Lang.A, &cands[0], 20);
+        checkEq(n, 0, "nothing matches");
+        n = comp.complete("com", asyntax.Lang.A, &cands[0], 1);
+        checkEq(n, 1, "the limit is honoured");
+        // buffers changing: the caches follow
+        c.edit(0, 0, "uniqueword ", 11);
+        n = comp.complete("uniq", asyntax.Lang.A, &cands[0], 20);
+        check(n == 1 && streq(cands[0].text, "uniqueword"), "a new word shows up after an edit");
+        comp.removeBuffer(&c);
+        n = comp.complete("uniq", asyntax.Lang.A, &cands[0], 20);
+        checkEq(n, 0, "and disappears with its buffer");
+        checkEq(asyntax.prefixStart(&a, 7), 4, "prefixStart finds the start of the identifier before the caret");
+        comp.dispose();
+    }
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
+
+int imin2(int a, int b) {
+    if (a < b) { return a; }
+    return b;
+}
