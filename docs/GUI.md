@@ -403,7 +403,8 @@ t->start(display, null);             // runs $SHELL; start(display, "ls -l") run
 runs a command and closes when it ends. Ctrl+Shift+N opens another window, Ctrl+Shift+W closes one.
 
 * **What it understands**: UTF-8 (Latin-1 characters are drawn with the built-in font, the box-drawing and block characters
-  are drawn as lines and rectangles, other characters show as `?`), colours with 16, 256 and 24-bit values, bold, dim,
+  are drawn as lines and rectangles, arrows and triangles (`▸ ▾ ◂ ▴ ▶ → ...`) as small solid shapes, a few punctuation and symbol characters
+  by plain ASCII stand-ins (`…` is `.`, `–` is `-`, `✓` is `*`; test `t272`), other characters show as `?`), colours with 16, 256 and 24-bit values, bold, dim,
   underline, reverse; cursor movement, erasing, inserting and deleting characters and lines, scroll regions, tabs; the
   alternate screen (vim, less, top, nano, mc work); application cursor keys, bracketed paste, cursor reports and device
   attributes, the size report (`CSI 18 t`), window titles (`OSC 0` and `OSC 2`; the window title follows unless `onTitle` is set),

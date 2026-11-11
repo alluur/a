@@ -98,10 +98,15 @@ The temp name must fit the file system: if `.NAME.tmp-<12 hex>` would be longer 
 whole path must also stay within 255) the NAME part is cut, at a character boundary and never the random part (an earlier version cut
 the end, so for a 255 byte name every save used the same temp name and one stale file of that name made all saves fail with `-EEXIST`,
 and on AOS every name of 38 to 55 bytes failed with `-ENOSPC`).
-What a rename based save does that an in-place write would not (it is the same as `mv` and most editors' default): **hard links
-are broken** (the other names keep the old content), the **owner and group** of the new file are those of the process, and the
-**write permission bit does not protect** a file (a 0444 file is replaced and stays 0444; a front end that wants to protect read-only
-files must look at the mode itself).
+**The identity of the file is kept** (Linux; `Stat` has `gid` for this): the temp file is given the owner and group of the old file
+(`fchown`, then the permissions are put back, because `fchown` clears set-user-id bits). When the process may not give a file away
+(a normal user saving a file of somebody else that it may write) or when the file has **several hard links**, the old file is
+**overwritten in place** instead of replaced: the owner, the group and every hard link name keep working, but the save is not atomic
+(a crash in the middle leaves a short file) and the permissions of the old file decide (`-EACCES` when it is not writable: then nothing
+is changed and no temp file stays). A file with one link and the owner of the process is still replaced by rename. What stays as it
+was: the **write permission bit does not protect** such a file (a 0444 file is replaced and stays 0444; a front end that wants to
+protect read-only files must look at the mode itself). Extended attributes and ACLs are not copied. (Before this, a save changed the
+owner and group to those of the process and broke hard links. Test `t270`.)
 
 **Processes.** `Process.start` forks, sets up the pipes (all `O_CLOEXEC`, parent ends non-blocking, descriptors below 3 are moved
 away before `dup2`), searches `PATH` itself, and reports a failing `exec` *synchronously* (`-ENOENT`, `-EACCES`) through a
@@ -366,6 +371,7 @@ Missing in AOS, and what asys does:
 | `t217_acode_perf` | 100 000 lines inserted at the end / start / random places, 50 000 typed characters, 2000 cursors, a 3 MB file |
 | `t218_regressions` | temp file permissions and names (also at the name limit), extreme tab widths, `dispose()` of every class, 24 MB cycles, bounded walks; exact undo / redo after the history was trimmed (model based), whole-line paste into several cursors, out-of-range line numbers, glob worst cases, find in files `exceeded`, the old regex dialect |
 | `t219_aide_session` | a whole session through all modules: project, ignore rules, tree, quick open, find in files, buffer, editor, highlighter, symbols, completion, rename with undo, save, external change, watcher, settings, a real build with an error, the fix, the run |
+| `t270_asys_identity` | `AtomicFile` keeps hard links together and the owner, group and set-user-id bits of the file it replaces; a second user (the test forks and calls `setuid`) overwrites a foreign file in place and gets `-EACCES` for one it may not write; a new file is made as before (needs root for the owner checks) |
 
 All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine) and, as
 plain x86-64 executables, in an AOS image (see section 10; `t202` and `t213` use other shell commands there: `seq` instead of

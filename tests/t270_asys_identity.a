@@ -1,0 +1,174 @@
+// asys.AtomicFile keeps the identity of a file it replaces: hard links stay together, the owner and group stay, set-user-id bits stay,
+// and a process that may not give a file away overwrites it in place instead of taking it over (Linux; the checks that need root or a
+// second user pass trivially elsewhere, so every target runs the same number of checks)
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (got == null || !streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got == null ? "(null)" : got, want);
+    }
+}
+
+int sys(int x86, int gen, int a, int b, int c, int d) {
+    return __syscall(__ARCH == 0 ? x86 : gen, a, b, c, d, 0, 0);
+}
+
+bool linuxOk;       // links and owners exist
+bool rootOk;        // running as root: files can be given to other users, and the process can become another user
+
+void checkL(bool ok, char* what) { check(!linuxOk || ok, what); }
+void checkR(bool ok, char* what) { check(!rootOk || ok, what); }
+
+int hardLink(char* from, char* to) {
+    if (__ARCH == 0) { return __syscall(86, (int) from, (int) to, 0, 0, 0, 0); }
+    return __syscall(37, -100, (int) from, -100, (int) to, 0, 0);               // linkat
+}
+
+int chownPath(char* path, int uid, int gid) {
+    if (__ARCH == 0) { return __syscall(92, (int) path, uid, gid, 0, 0, 0); }
+    return __syscall(54, -100, (int) path, uid, gid, 0, 0);                     // fchownat
+}
+
+char* slurp(char* path) {
+    int len = 0;
+    int e = 0;
+    char* d = asys.readFile(path, &len, -1, &e);
+    if (d == null) { return ""; }
+    return d;
+}
+
+asys.Stat st;
+
+void clean(char* dir) {
+    asys.DirList dl();
+    if (asys.isDir(dir)) {
+        asys.listDir(dir, &dl);
+        for (int i = 0; i < dl.count; i++) {
+            char* p = asys.join(dir, dl.name(i));
+            asys.unlink(p);
+            asys.free(p);
+        }
+        dl.dispose();
+        asys.rmdir(dir);
+    }
+}
+
+// runs the save as another user in a child process (setgid, setuid, then writeFileAtomic): the status of the save, 0 or -errno
+int saveAs(int uid, char* path, char* text) {
+    int pid = (__ARCH == 0) ? sys(57, 0, 0, 0, 0, 0) : sys(0, 220, 17, 0, 0, 0);
+    if (pid == 0) {
+        sys(106, 144, uid, 0, 0, 0);                                            // setgid
+        sys(105, 146, uid, 0, 0, 0);                                            // setuid
+        int r = asys.writeFileAtomic(path, text, strlen(text), 420, asys.W_NOSYNC);
+        __exit(r < 0 ? -r : 0);
+    }
+    int status = 0;
+    sys(61, 260, pid, (int) &status, 0, 0);
+    return -((status >> 8) & 255);
+}
+
+int main() {
+    linuxOk = asys.hasLinks();
+    int myUid = linuxOk ? sys(107, 175, 0, 0, 0, 0) : 0;
+    rootOk = linuxOk && myUid == 0;
+    char* dir = "build/tests/t270_work";
+    clean(dir);
+    asys.mkdirs(dir);
+    asys.chmod(dir, 511);                                                       // 0777: the other user of the last part may create files here
+    char* f1 = "build/tests/t270_work/one.txt";
+    char* f2 = "build/tests/t270_work/two.txt";
+
+    // ---- hard links: the new content is visible under every name, the names stay linked
+    asys.writeFile(f1, "old content", 11);
+    if (linuxOk) { hardLink(f1, f2); }
+    check(asys.writeFileAtomic(f1, "new content", 11, 420, asys.W_NOSYNC) == 11, "save through one of two names");
+    checkStr(slurp(f1), "new content", "the saved name has the new content");
+    checkL(streq(slurp(f2), "new content"), "the other name has the new content too");
+    asys.stat(f1, &st);
+    checkL(st.nlink == 2, "still two links");
+    int ino1 = st.ino;
+    asys.stat(f2, &st);
+    checkL(st.ino == ino1, "both names are still the same file");
+    asys.unlink(f2);
+    asys.stat(f1, &st);
+    checkL(st.nlink == 1, "one link after the other name is removed");
+    // a file with one link is still replaced by rename (readers never see half a file): it is a new inode
+    asys.stat(f1, &st);
+    ino1 = st.ino;
+    check(asys.writeFileAtomic(f1, "third", 5, 420, asys.W_NOSYNC) == 5, "save of a file with one link");
+    asys.stat(f1, &st);
+    checkL(st.ino != ino1, "a file with one link is replaced by rename (a new inode)");
+    checkStr(slurp(f1), "third", "content");
+
+    // ---- the owner and group of the old file stay (root can give files to any user)
+    asys.unlink(f1);
+    asys.writeFile(f1, "mine", 4);
+    int c = chownPath(f1, 12345, 54321);
+    checkR(c == 0, "chown to another user and group");
+    asys.chmod(f1, 2541);                                                       // 04755: set-user-id
+    check(asys.writeFileAtomic(f1, "kept owner", 10, 420, asys.W_NOSYNC) == 10, "save of a file that belongs to somebody else");
+    asys.stat(f1, &st);
+    checkR(st.uid == 12345, "the owner is kept");
+    checkR(st.gid == 54321, "the group is kept");
+    checkR(st.perm() == 2541, "the permissions (with the set-user-id bit) are kept");
+    checkStr(slurp(f1), "kept owner", "content");
+    asys.unlink(f1);
+
+    // ---- another user may not give a file away: the file is overwritten in place, so it keeps its owner (and its inode)
+    asys.writeFile(f1, "owned by 1000", 13);
+    chownPath(f1, 1000, 1000);
+    asys.chmod(f1, 438);                                                        // 0666: anybody may write it
+    asys.stat(f1, &st);
+    int inoBefore = st.ino;
+    if (rootOk) {
+        int r = saveAs(2000, f1, "written by 2000");
+        check(r == 0, "the other user can save a file it may write");
+        asys.stat(f1, &st);
+        check(st.uid == 1000 && st.gid == 1000, "owner and group are still 1000");
+        check(st.ino == inoBefore, "the file was overwritten in place");
+        checkStr(slurp(f1), "written by 2000", "content written in place");
+        // a file that user may not write: the save fails and nothing changes (no new file takes its place)
+        asys.chmod(f1, 420);                                                    // 0644
+        r = saveAs(2000, f1, "must not appear");
+        check(r == -asys.EACCES, "a foreign read-only file cannot be replaced");
+        checkStr(slurp(f1), "written by 2000", "content unchanged after the refusal");
+        asys.stat(f1, &st);
+        check(st.uid == 1000, "owner unchanged after the refusal");
+        asys.DirList dl();
+        asys.listDir(dir, &dl);
+        check(dl.count == 1, "no temp file is left behind");
+        dl.dispose();
+    } else {
+        check(true, "(skipped: not root)");
+        check(true, "(skipped: not root)");
+        check(true, "(skipped: not root)");
+        check(true, "(skipped: not root)");
+        check(true, "(skipped: not root)");
+        check(true, "(skipped: not root)");
+        check(true, "(skipped: not root)");
+        check(true, "(skipped: not root)");
+    }
+
+    // ---- the temp file's mode, a missing file and a new file are as before
+    asys.unlink(f1);
+    check(asys.writeFileAtomic(f1, "brand new", 9, 384, asys.W_NOSYNC) == 9, "a new file is created");
+    asys.stat(f1, &st);
+    check(asys.platform() == asys.OS_WINDOWS || st.perm() == 384, "with the requested mode");
+    checkL(st.uid == myUid, "owned by this process");
+    clean(dir);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
