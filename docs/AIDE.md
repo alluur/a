@@ -338,7 +338,7 @@ Missing in AOS, and what asys does:
 | `t200_asys_mem` | allocator: zeroing, classes, big blocks, realloc, counters, double free, `moveBytes` |
 | `t201_asys_files` | files, atomic writes (permissions, backup, streaming, links, loops), listing, FIFOs, names, time, random |
 | `t202_asys_proc` | pipes, exit codes, environment, cwd, exec errors, 1 MB through `cat`, full pipes, `EPIPE`, floods, group kill |
-| `t203_asys_fuzz` | 6000 random alloc / realloc / free operations (1 byte to 3 MB) checked against block patterns, zeroing, overlap and the counters, run twice (also with freed big blocks kept, as on AOS); 5000 `alloc(300000)` + `free` cycles map one block |
+| `t203_asys_fuzz` | 6000 random alloc / realloc / free operations (1 byte to 3 MB) checked against block patterns, zeroing, overlap and the counters, run twice (also with freed big blocks kept, as on AOS); 200 `alloc(300000)` + `free` cycles and 4 cycles of a 12 MB block map one block each (small on purpose: reuse zeroes the block, and qemu-user is slow) |
 | `t204_acode_diff` | 10 000 random edits + grouped undo / redo with cursor snapshots against a reference model; line index; UTF-8 |
 | `t205_acode_cursor` | exact cursor restoration (merged typing, backspace, delete, backwards selections, 4 cursors), motions, UTF-8, tab width 0 |
 | `t206_acode_lineops` | move / duplicate / join / delete lines, indentation, comments, auto-indent, brackets, clipboard, clean-ups |
@@ -359,7 +359,8 @@ Missing in AOS, and what asys does:
 All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine) and, as
 plain x86-64 executables, in an AOS image (see section 10; `t202` and `t213` use other shell commands there: `seq` instead of
 `yes | head -c`, whole second sleeps, no `trap`, so a few numbers differ, the checks do not). On Windows
-`t202` and `t213` print that processes are not supported (`.out.windows`); the other tests run unchanged.
+`t202` and `t213` print that processes are not supported (`.out.windows`), and `t218` skips its block about file names at the name
+limit there (Windows has `MAX_PATH` instead; `.out.windows` has 92 checks instead of 103); the other tests run unchanged.
 
 Measured natively on one core of the development machine (x86-64, a virtual machine; the numbers vary by 30 % from run to
 run; the ARM64, RISC-V and LoongArch64 runs go through qemu-user and are 10 to 30 times slower, which the tests allow for):
