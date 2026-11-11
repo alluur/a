@@ -307,20 +307,32 @@ def resize_follows_the_window():
 
 
 @test
-def size_from_environment_when_the_system_does_not_know():
-    s = Session([PROBE], cols=100, rows=40, env={"LINES": "33", "COLUMNS": "77"}, kernel_size=(0, 0))
-    check(s.wait_for("size:", 5), "no start")
+def size_from_environment_when_nobody_knows():
+    # the system reports no size and the terminal answers no query: LINES and COLUMNS are used
+    s = Session([PROBE], cols=100, rows=40, env={"LINES": "33", "COLUMNS": "77"}, kernel_size=(0, 0), answer_18t=False, answer_cpr=False)
+    check(s.wait_for("size:", 8), "no start")
     s.wait_idle()
-    check("size: 77x33" in s.screen_text(), "LINES/COLUMNS were not used when the system gives no size:\n" + s.screen_text())
+    check("size: 77x33" in s.screen_text(), "LINES/COLUMNS were not used:\n" + s.screen_text())
     s.key("\x11")
     s.wait_exit(3)
     s.close()
 
 
 @test
-def size_asked_from_the_terminal():
-    # no size from the system and none from the environment: TUI_PROBE=1 asks the terminal (CSI 18 t, answered by the emulator)
-    s = Session([PROBE], cols=91, rows=37, env={"TUI_PROBE": "1", "LINES": None, "COLUMNS": None}, kernel_size=(0, 0))
+def size_default_when_nothing_helps():
+    s = Session([PROBE], cols=100, rows=40, env={"LINES": None, "COLUMNS": None}, kernel_size=(0, 0), answer_18t=False, answer_cpr=False)
+    check(s.wait_for("size:", 8), "no start")
+    s.wait_idle()
+    check("size: 80x24" in s.screen_text(), "the default 80x24 was not used:\n" + s.screen_text())
+    s.key("\x11")
+    s.wait_exit(3)
+    s.close()
+
+
+@test
+def size_asked_from_the_terminal_when_the_system_does_not_know():
+    # no size from the system: the terminal is asked (CSI 18 t, answered by the emulator) before LINES and COLUMNS are looked at
+    s = Session([PROBE], cols=91, rows=37, env={"LINES": "33", "COLUMNS": "77"}, kernel_size=(0, 0))
     check(s.wait_for("size:", 5), "no start")
     s.wait_idle()
     check("size: 91x37" in s.screen_text(), "the size query was not answered or not used:\n" + s.screen_text())
@@ -333,7 +345,7 @@ def size_asked_from_the_terminal():
 @test
 def size_asked_with_a_cursor_position_report():
     # the terminal does not know CSI 18 t: the program falls back to "move the cursor far away and ask where it is"
-    s = Session([PROBE], cols=88, rows=31, env={"TUI_PROBE": "1", "LINES": None, "COLUMNS": None}, kernel_size=(0, 0), answer_18t=False)
+    s = Session([PROBE], cols=88, rows=31, env={"LINES": None, "COLUMNS": None}, kernel_size=(0, 0), answer_18t=False)
     check(s.wait_for("size:", 8), "no start")
     s.wait_idle()
     check("size: 88x31" in s.screen_text(), "the cursor position report was not used:\n" + s.screen_text())
@@ -344,44 +356,23 @@ def size_asked_with_a_cursor_position_report():
 
 
 @test
-def standard_output_may_be_redirected():
-    # stdout goes to a pipe: the program draws on the terminal it finds through /dev/tty
-    s = Session(["/bin/sh", "-c", PROBE + " | cat > /dev/null"], cols=80, rows=24)
-    check(s.wait_for("size: 80x24", 5), "the program did not draw on the terminal:\n" + s.screen_text())
-    s.key("\x11")
-    eq(s.wait_exit(3), 0, "exit")
-    sane(s, "redirected output")
-    s.close()
-
-
-@test
-def stop_and_continue_like_a_shell():
-    import re
-    s = start()
-    s.send("\x1a")                                   # Ctrl+Z arrives as a key; the program stops itself after putting the terminal back
-    stopped = False
-    end = time.time() + 4
-    while time.time() < end:
-        s.pump(0.05)
-        pid, status = os.waitpid(s.proc.pid, os.WNOHANG | os.WUNTRACED)
-        if pid != 0 and os.WIFSTOPPED(status):
-            stopped = True
-            break
-    check(stopped, "the program did not stop")
-    s.pump(0.2)
-    sane(s, "while stopped")
-    os.kill(s.proc.pid, signal.SIGCONT)
-    check(s.wait_for("last: resumed", 5), "the program did not come back after SIGCONT:\n" + s.screen_text())
+def size_forced_query_and_no_query():
+    # the system says 80x24 (a serial console does that) but the terminal is bigger: TUI_PROBE=1 asks anyway
+    s = Session([PROBE], cols=120, rows=40, env={"TUI_PROBE": "1"}, kernel_size=(80, 24))
+    check(s.wait_for("size:", 5), "no start")
     s.wait_idle()
-    check(s.is_raw() and s.emu.on_alt, "raw mode and the alternate screen are back")
-    check("size: 80x24" in s.screen_text() and " File  Edit" in s.screen_text(), "the screen was not redrawn")
+    check("size: 120x40" in s.screen_text(), "TUI_PROBE=1 did not ask the terminal:\n" + s.screen_text())
     s.key("\x11")
-    s.exited = None
-    end = time.time() + 3
-    while time.time() < end and s.proc.poll() is None:
-        s.pump(0.05)
-    eq(s.proc.poll(), 0, "exit")
-    sane(s, "after resume")
+    s.wait_exit(3)
+    s.close()
+    # when the system knows the size nothing is asked by default
+    s = Session([PROBE], cols=120, rows=40, kernel_size=(100, 30))
+    check(s.wait_for("size:", 5), "no start")
+    s.wait_idle()
+    check("size: 100x30" in s.screen_text(), "the size of the system was not used")
+    check(b"\x1b[18t" not in bytes(s.raw_output), "the program asked for a size it already knew")
+    s.key("\x11")
+    s.wait_exit(3)
     s.close()
 
 

@@ -88,10 +88,11 @@ A stack overflow cannot run a handler (A does not use `sigaltstack`): after such
 supports (`Caps`); `useAlt`, `useMouse`, `usePaste` switch parts off, `caps.mouseMotion` asks for all mouse motion (1003), `caps.focusEvents`
 for focus in / out reports (1004). `leave()` writes the inverse (and clears the screen when there is no alternate screen).
 
-**Window size** (`updateSize()`): `ioctl(TIOCGWINSZ)`, then `LINES` / `COLUMNS`, then 80x24. When the system does not know (a serial console) call
-`probeSize(ms)` (or set `TUI_PROBE=1`, or `App.probeSize = true`): the terminal is asked with `CSI 18 t` and, when that gets no answer, with a cursor
-position report (`ESC 7 CSI 9999;9999 H CSI 6 n ESC 8`). Changes arrive as `EV_RESIZE` events: from SIGWINCH where it works, and by polling the
-size every 200 ms where it does not (AOS, see below).
+**Window size.** The order is: `ioctl(TIOCGWINSZ)`; when the system reports no size (zeros: a serial console on Linux, a pipe to `/dev/tty`) `App.start()` **asks the
+terminal** with `CSI 18 t` and, when that gets no answer within 250 ms, with a cursor position report (`ESC 7 CSI 9999;9999 H CSI 6 n ESC 8`); when that fails too, `LINES` and
+`COLUMNS`; then 80x24. `Terminal.updateSize()` does the first, third and fourth step (and sets `sizeFromIoctl`), `Terminal.probeSize(ms)` the second. Set `TUI_PROBE=1` (or
+`App.probeSize = true`) to ask the terminal even when the system reports a size (AOS' serial console always says 24x80), `TUI_PROBE=0` never to ask. Changes arrive as
+`EV_RESIZE` events: from SIGWINCH where it works, and by polling the size every 200 ms where it does not (AOS, see below).
 
 **Waiting.** `wait(ms)` blocks for at most `ms` milliseconds (-1: for ever, 0: only look) and returns the number of queued events. It reads with
 `ppoll`, never with a blocking `read`, so a time out or a signal always returns. A lone Esc is resolved by a timeout (`dec.escMs`, 40 ms by
@@ -385,15 +386,20 @@ file manager working on real files. Run one test with `tests/tui.sh name`.
 
 ## AOS and the AOS terminals
 
-The toolkit was run on AOS in QEMU (the serial console, `TERM=linux` and `TERM=xterm-256color`; the probe, the gallery and the file manager, and the
-pseudo terminal and process tests `t237` / `t238` inside AOS). Differences from Linux that the toolkit works around, from reading `kernel/tty.a`,
-`kernel/sys.a` and `kernel/devio.a`:
+The toolkit was run on AOS in QEMU (without KVM): the serial console with `TERM=linux` (the default there, 16 colours) and `TERM=xterm-256color` (the probe program: modes, raw
+mode, keys, the lone Esc, the menu, Ctrl+Q and the shell working again afterwards), the widget gallery and the file manager (listing real AOS directories, `getdents` with file
+types), and the pseudo terminal test `t237` (`tests/t237_term_pty.a`, which makes a pty with `/dev/ptmx`, forks a child that uses the toolkit on it and drives it) and the
+process test `t238`: `t237` prints exactly the same on AOS as on Linux (also compiled with `-DNO_SIGWINCH`, which proves that the size polling alone notices a window size
+change), `t238` differs only where AOS's own `sh` differs (exit status 126 for a missing program, no `${VAR:+x}`). No unknown system call was logged on the console.
+To try it, build the programs with `ac` and put them into the RAM disk: `AC=ac tools/mkroot.sh --add /bin/gallery=gallery:755 --add /bin/files=files:755`, then pack the image
+as the AOS `Makefile` does (`tools/mkimage.py ...`) and run them on the console (`export TERM=xterm-256color; gallery`).
+Differences from Linux that the toolkit works around, from reading `kernel/tty.a`, `kernel/sys.a` and `kernel/devio.a`:
 
 | AOS | What the toolkit does |
 |---|---|
 | `VMIN` / `VTIME` are ignored by the tty; a `read` with no data blocks | never reads without `ppoll` saying that data is there; timeouts come from `ppoll` |
 | `SIGWINCH` is only sent by `TIOCSWINSZ` to the tty's process group; a process blocked in `ppoll` is restarted after the handler, so the signal does not wake it | the handler is installed, and on AOS (detected with `uname`: release or version contains "aos") the size is polled every 200 ms |
-| the serial console has no size (the kernel keeps 24x80) and no way to learn it | `TUI_PROBE=1` / `App.probeSize` asks the terminal with `CSI 18 t`, then with a cursor position report |
+| the serial console reports 24x80 whatever the real terminal is | `TUI_PROBE=1` / `App.probeSize` asks the terminal with `CSI 18 t`, then with a cursor position report (only a terminal emulator at the other end can answer) |
 | no `sigaltstack` | not used (it would be logged as an unknown system call); also on Linux |
 | no job control: SIGSTOP / SIGTSTP / SIGCONT are ignored | `suspendProcess()` returns at once: use `runShell` (suspend to a shell) |
 | `rt_sigprocmask` does nothing | no signal masks are used |
