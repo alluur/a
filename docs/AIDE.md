@@ -4,7 +4,7 @@ AIDE is the integrated development environment of the A language. It will run as
 program (`aide-gui`), both on Linux and on AOS, and both are built on the same libraries. This document describes those
 libraries (they are part of the A standard library, in `lib/`) and how the two front ends are meant to use them.
 
-**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t218`). The two front ends
+**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`). The two front ends
 (`user/aide.a` and `user/gui/aide-gui.a` in the AOS repository) do not exist yet. The libraries contain no user interface code:
 everything that draws or reads the keyboard is the front end's job.
 
@@ -56,7 +56,8 @@ Contents
 ## 2. asys - the system layer
 
 `import asys;` - a small layer that works on Linux (x86-64, ARM64, RISC-V 64, LoongArch64) **and on AOS**, using only system calls
-that both have (see [section 10](#10-aos-notes)). On Windows everything except processes works.
+that both have (see [section 10](#10-aos-notes)). On Windows memory, files, directories, time and random bytes work; child
+processes, symbolic links, FIFOs and permission bits do not (those calls return `-ENOSYS`, `canSpawn()` and `hasLinks()` say so).
 
 | Group | Functions |
 |---|---|
@@ -177,7 +178,8 @@ work on all cursors from the last to the first, inside one undo group. Highlight
 `import aproject;`
 
 * **Ignore**: `.gitignore` rules (`*  ?  [a-z]  **  !  /anchor  dir/`), rules from nested files carry their directory, plus a
-  built-in list (`.git .hg .svn node_modules __pycache__ *.o *.obj *.pyc *.swp *~ ...`; `.a` files are *not* ignored).
+  built-in list (`.git/ .hg/ .svn/ .bzr/ node_modules/ __pycache__/ *.pyc *.pyo *.o *.obj *.so *.dll *.dylib *.class .DS_Store
+  Thumbs.db *.swp *.swo *~ #*#`; `.a` files are *not* ignored, and neither is `.gitignore`).
 * **FileTree**: lazy; sorted folders first; ignore rules applied; symbolic links are entries of kind `K_LINK` and are **not
   followed** unless `followLinks` is set, then a directory whose (device, inode) equals an ancestor's is marked `loop` and not
   entered; `maxEntries` (200 000) and `maxDepth` (64) bound the walk (`truncated` says so); `create` / `rename` / `remove` validate
@@ -257,7 +259,7 @@ Missing in AOS, and what asys does:
 
 * `fchmod`, `chmod`, `fsync`, `mremap`, `ftruncate`, `utimensat`, `link`, `symlink`: never called on AOS (asys asks `uname` once);
   `fsync` becomes `sync`, permissions are given when the file is created, `symlink` / `setMtime` return `-ENOSYS` and `hasLinks()` is false.
-* `statx` (not needed on x86-64), `pipe` with flags other than `O_NONBLOCK | O_CLOEXEC` (not used).
+* `statx` and `clock_nanosleep` do not exist in the kernel; asys does not use them (it uses `stat` and `nanosleep`).
 * File names are limited to 55 bytes and paths to 255 bytes by the AOS file system; `validName` enforces the Linux limit of 255
   and the file system reports longer names as an error.
 * `execve` runs ELF files and `#!` scripts only (no fallback to the shell for a script without `#!`); `Job.startShell` needs
@@ -278,7 +280,7 @@ Missing in AOS, and what asys does:
 | `t204_acode_diff` | 10 000 random edits + grouped undo / redo with cursor snapshots against a reference model; line index; UTF-8 |
 | `t205_acode_cursor` | exact cursor restoration (merged typing, backspace, delete, backwards selections, 4 cursors), motions, UTF-8, tab width 0 |
 | `t206_acode_lineops` | move / duplicate / join / delete lines, indentation, comments, auto-indent, brackets, clipboard, clean-ups |
-| `t207_acode_file` | LF / CRLF / CR / mixed / BOM / binary / UTF-16 round trips, external changes, FIFO, listeners, 9 MB memory cycles |
+| `t207_acode_file` | LF / CRLF / CR / mixed / BOM / binary / UTF-16 round trips, external changes, FIFO, listeners, memory cycles of big texts |
 | `t208_asyntax_lex` | token dumps of 13 languages, language detection |
 | `t209_asyntax_inc` | incremental = fresh after random edits in 10 languages; work after an edit; symbols; completion |
 | `t210_atheme` | colour conversions and WCAG values, 9 themes validated, theme / settings round trips, corrupt files |
