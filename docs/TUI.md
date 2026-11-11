@@ -142,7 +142,8 @@ Understood: UTF-8; Ctrl+letters; Alt+key as an Esc prefix (`ESC ESC [ A` is Alt+
 `CSI 1 ; m A`, `CSI n ; m ~`; Shift+Tab (`CSI Z`); the keypad in application mode; the fixterms / kitty `CSI code ; m u` and xterm
 `modifyOtherKeys` (`CSI 27 ; m ; code ~`) forms. Enter is CR; LF is reported as Enter with `MOD_CTRL` (`Event.isEnter()` is true for both);
 a NUL right after CR (telnet) is dropped. A terminal cannot tell some keys apart: **Ctrl+H is Backspace, Ctrl+I is Tab, Ctrl+M is Enter, Ctrl+[ is Esc,
-Ctrl+J is Enter, Ctrl+/ and Ctrl+_ are the same byte (reported as Ctrl+/)**. Do not give them different meanings.
+Ctrl+J is Enter, Ctrl+/ and Ctrl+_ are the same byte (reported as Ctrl+/)**. Do not give them different meanings. Raw mode switches the terminal's signal keys off (`ISIG`): **Ctrl+C, Ctrl+Z and Ctrl+\ arrive as ordinary keys**, nothing
+sends SIGINT / SIGTSTP / SIGQUIT any more. A program that wants Ctrl+C to quit must say so (`app->addShortcut("Ctrl+C", doQuit)`), and Ctrl+Z can call `app->suspendProcess()`.
 
 `keyName(key, mods, buf, cap)` writes `"Ctrl+Alt+Up"`; `parseKey("Ctrl+S", &mods)` goes back; `keyIs(&e, "Alt+F")` and
 `keyMatches(...)` compare (an upper case letter counts as Shift + the letter); `encodeKey(key, mods, buf)` makes the bytes a terminal would send (for tests).
