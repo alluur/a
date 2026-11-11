@@ -333,5 +333,7 @@ distances).
   with UTF-8 aware `.` and sets.
 * `afind` does not search across lines unless the pattern contains a line break; `^` and `$` are line anchors in the per-line mode.
 * The watcher polls (no inotify), so it is only as fast as the caller's loop and costs one `stat` per watched entry.
+* On Windows the allocator cannot give big blocks back (the compiler's import table has no `VirtualFree`): freed big blocks are
+  kept in size-class free lists and reused. After a 24 MB text was edited and dropped, about 90 MB stayed mapped (in use: 0).
 * Processes need `fork`/`execve`: not on Windows. `Job` merges standard error into standard output.
 * Not tested here: AOS (see section 10), terminals and GUIs (there is no front end yet), files over 2 GiB (`maxLoad` defaults to 1 GiB).
