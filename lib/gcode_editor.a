@@ -160,6 +160,11 @@ public class CodeEditor : gui.Widget {
     private int listenerId;
     private acode.Buffer* listenBuf;
     private int paintCount;
+    private int seenPrefs;
+    private int* drawnState;                // the lexer state at the start of each row that was drawn last (to see what an edit changes)
+    private int drawnFirst;
+    private int nDrawn;
+    private int drawnCap;
     private func* obsFn;
     private int* obsUser;
     private int nobs;
@@ -175,7 +180,6 @@ public class CodeEditor : gui.Widget {
     private int fmFrom;
     private int fmTo;
     private int fmGen;
-    private afind.Finder* wordF;
     private char* wordText;
     private afind.Match* wm;
     private int nwm;
@@ -273,7 +277,9 @@ public class CodeEditor : gui.Widget {
         if (listenBuf != null) {
             listenBuf->removeListener(listenerId);
         }
+        if (doc != null) { doc->removeView(this); }
         doc = d;
+        d->addView(this);
         buf = d->buf;
         ed = d->ed;
         listenBuf = buf;
@@ -281,7 +287,7 @@ public class CodeEditor : gui.Widget {
         topLine = d->topLine;
         topSub = d->topSub;
         leftCol = d->leftCol;
-        maxCols = 0;
+        maxCols = longestLine() + 1;
         cacheLine = -1;
         tokLine = -1;
         fmVer = -1;
@@ -320,7 +326,7 @@ public class CodeEditor : gui.Widget {
             topLine = 0;
             topSub = 0;
             leftCol = 0;
-            maxCols = 0;
+            maxCols = longestLine() + 1;
             invalidate();
         }
         return r;
@@ -331,8 +337,20 @@ public class CodeEditor : gui.Widget {
         topLine = 0;
         topSub = 0;
         leftCol = 0;
-        maxCols = 0;
+        maxCols = longestLine() + 1;
         invalidate();
+    }
+
+    // the length in bytes of the longest line (an estimate of the width in columns: tabs and wide characters make it larger,
+    // and drawing corrects maxCols when it meets them)
+    private int longestLine() {
+        int best = 0;
+        int n = buf->lineCount();
+        for (int i = 0; i < n; i++) {
+            int l = buf->lineLength(i);
+            if (l > best) { best = l; }
+        }
+        return best;
     }
 
     // the whole text as an asys string (free it with asys.free)
@@ -353,6 +371,7 @@ public class CodeEditor : gui.Widget {
 
     // copies the preferences of the Look
     public void pullPrefs() {
+        seenPrefs = look->prefsVersion;
         lineNumbers = look->lineNumbers;
         wordWrap = look->wordWrap;
         showWhitespace = look->showWhitespace;
@@ -366,7 +385,7 @@ public class CodeEditor : gui.Widget {
     }
 
     public void lookChanged() {
-        pullPrefs();
+        if (look->prefsVersion != seenPrefs) { pullPrefs(); }
         if (!blink) {
             stopBlink();
             caretOn = true;
@@ -521,8 +540,9 @@ public class CodeEditor : gui.Widget {
 
     public void setFirstCol(int col) {
         if (wordWrap) { return; }
+        updateGeometry();
         int before = leftCol;
-        leftCol = imax(0, col);
+        leftCol = imax(0, imin(col, maxCols - pageCols));
         if (leftCol != before) {
             invalidate();
             fire(EV_SCROLL);
@@ -569,6 +589,7 @@ public class CodeEditor : gui.Widget {
         }
         if (!wordWrap) {
             int margin = imin(4, pageCols / 4);
+            if (col + 1 > maxCols) { maxCols = col + 1; }
             if (col < leftCol) {
                 leftCol = imax(0, col - margin);
             } else if (col + 1 > leftCol + pageCols) {
@@ -682,6 +703,93 @@ public class CodeEditor : gui.Widget {
     }
 
     // ---- change notification -----------------------------------------------------------------------------------------------------------
+    // Repaints only the rows that show lines la .. lb (the whole width), when they are in view.
+    private void damageLines(int la, int lb) {
+        if (win == null) { return; }
+        updateGeometry();
+        int lh = look->lineH;
+        int l = topLine;
+        int s = topSub;
+        int y0 = -1;
+        int y1 = -1;
+        for (int i = 0; i < visRows; i++) {
+            if (l >= la && l <= lb) {
+                if (y0 < 0) { y0 = i * lh; }
+                y1 = (i + 1) * lh;
+            }
+            if (l > lb) { break; }
+            if (!stepDown(&l, &s)) { break; }
+        }
+        if (y0 >= 0) { win->invalidate(absX(), absY() + y0, w, y1 - y0); }
+    }
+
+    // the word (identifier characters) around a caret, or the selection when it is a word: returns its length (0: none)
+    private int wordKey(int caret, int anchor, int* ws, int* we) {
+        int a = imin(caret, anchor);
+        int b = imax(caret, anchor);
+        *ws = a;
+        *we = b;
+        if (a == b) {
+            while (*ws > 0 && isIdByte(buf->byteAt(*ws - 1))) { *ws = *ws - 1; }
+            while (*we < buf->length() && isIdByte(buf->byteAt(*we))) { *we = *we + 1; }
+        } else {
+            for (int p = a; p < b; p++) {
+                if (!isIdByte(buf->byteAt(p))) { *ws = 0; *we = 0; return 0; }
+            }
+        }
+        return *we - *ws;
+    }
+
+    // true when the word at the caret occurs in the visible lines outside the lines la .. lb
+    private bool wordElsewhere(int la, int lb) {
+        if (!highlightWord || ed->ncur != 1) { return false; }
+        int ws = 0;
+        int we = 0;
+        int n = wordKey(ed->caret(), ed->cur[ed->primary].anchor, &ws, &we);
+        if (n < 2 || n >= 200) { return false; }
+        char* word = buf->getText(ws, we);
+        int first = word[0];
+        int lastRow = lastLine();
+        bool found = false;
+        for (int l = topLine; l <= lastRow && !found; l++) {
+            if (l >= la && l <= lb) { continue; }
+            int len = 0;
+            char* t = buf->linePtr(l, &len);
+            for (int i = 0; i + n <= len && !found; i++) {
+                if (t[i] != first) { continue; }
+                bool same = true;
+                for (int k = 1; k < n; k++) {
+                    if (t[i + k] != word[k]) { same = false; break; }
+                }
+                if (same && !(i > 0 && isIdByte(t[i - 1] & 255)) && !(i + n < len && isIdByte(t[i + n] & 255))) { found = true; }
+            }
+        }
+        asys.free(word);
+        return found;
+    }
+
+    private bool isBracket(int c) {
+        return c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}';
+    }
+
+    // true when moving the caret changes something outside the rows of the old and the new caret (other uses of the word,
+    // the matching bracket)
+    private bool highlightsReach(int oldCaret, int oldAnchor, int caret, int anchor) {
+        if (highlightWord) {
+            int os = 0; int oe = 0; int ns = 0; int ne = 0;
+            int ol = wordKey(oldCaret, oldAnchor, &os, &oe);
+            int nl = wordKey(caret, anchor, &ns, &ne);
+            if ((ol >= 2 || nl >= 2) && (os != ns || oe != ne)) { return true; }
+        }
+        if (matchBrackets) {
+            if (brB >= 0) { return true; }
+            int len = buf->length();
+            if (caret < len && isBracket(buf->byteAt(caret))) { return true; }
+            if (caret > 0 && isBracket(buf->byteAt(caret - 1))) { return true; }
+        }
+        return false;
+    }
+
     public void bufferChanged(acode.Change* c) {
         cacheLine = -1;
         tokLine = -1;
@@ -689,10 +797,24 @@ public class CodeEditor : gui.Widget {
         wmVer = -1;
         brValid = false;
         if (c->kind == acode.CH_RESET) {
-            maxCols = 0;
+            maxCols = longestLine() + 1;
             popOn = false;
         }
-        invalidate();
+        bool partial = (c->kind == acode.CH_EDIT && c->delLines == 0 && c->insLines == 0 && !wordWrap && !popOn && ed->ncur == 1);
+        if (partial) {
+            // the lines below keep their colours when the lexer state at their start is the one that was drawn
+            int l = c->line;
+            int last = l;
+            int k = l + 1 - drawnFirst;
+            if (k >= 0 && k < nDrawn) {
+                if (doc->hl->stateAt(l + 1) != drawnState[k]) { last = buf->lineCount() - 1; }
+            }
+            // highlights on other lines (uses of the word, find matches, brackets) have to be drawn again too
+            if (hlMinLine >= 0 && (hlMinLine < l || hlMaxLine > last)) { partial = false; }
+            else if (wordElsewhere(l, last)) { partial = false; }
+            if (partial) { damageLines(l, last); }
+        }
+        if (!partial) { invalidate(); }
         fire(EV_CHANGE);
     }
 
@@ -703,6 +825,10 @@ public class CodeEditor : gui.Widget {
         bool moved = (p != lastCaret || a != lastAnchor || ed->ncur != lastNcur);
         bool edited = (buf->version != lastVersion);
         if (moved || edited) {
+            int oldCaret = lastCaret;
+            int oldAnchor = lastAnchor;
+            int oldN = lastNcur;
+            int oldView = topLine * 100000 + topSub + leftCol;
             lastCaret = p;
             lastAnchor = a;
             lastNcur = ed->ncur;
@@ -710,7 +836,14 @@ public class CodeEditor : gui.Widget {
             caretOn = true;
             restartBlink();
             if (reveal) { revealCaret(); }
-            invalidate();
+            bool scrolled = (topLine * 100000 + topSub + leftCol != oldView);
+            if (scrolled || popOn || ed->ncur != 1 || oldN != 1 || wordWrap || highlightsReach(oldCaret, oldAnchor, p, a)) {
+                invalidate();
+            } else {
+                int l0 = imin(imin(buf->lineAt(oldCaret), buf->lineAt(oldAnchor)), imin(buf->lineAt(p), buf->lineAt(a)));
+                int l1 = imax(imax(buf->lineAt(oldCaret), buf->lineAt(oldAnchor)), imax(buf->lineAt(p), buf->lineAt(a)));
+                damageLines(l0, l1);
+            }
             fire(EV_CURSOR);
         }
     }
@@ -738,7 +871,12 @@ public class CodeEditor : gui.Widget {
         blinkTimer = 0;
         if (!focusedView || !blink || win == null) { return; }
         caretOn = !caretOn;
-        invalidate();
+        if (ed->ncur == 1 && !wordWrap) {
+            int cl = buf->lineAt(ed->caret());
+            damageLines(cl, cl);
+        } else {
+            invalidate();
+        }
         armBlink();
     }
 
@@ -896,10 +1034,7 @@ public class CodeEditor : gui.Widget {
                 if (wmVer != buf->version || wmFrom != from || wmTo != to || wmStart != ws || wordText == null) {
                     asys.free(wordText);
                     wordText = buf->getText(ws, we);
-                    if (wordF == null || wordF->buf != buf) { wordF = new afind.Finder(buf); }
-                    wordF->setPattern(wordText, afind.OPT_WORD);
-                    wordF->setRange(from, to);
-                    nwm = wordF->matches(wm, MAXHL);
+                    nwm = scanWord(wordText, we - ws, from, to);
                     wmVer = buf->version;
                     wmFrom = from;
                     wmTo = to;
@@ -917,7 +1052,10 @@ public class CodeEditor : gui.Widget {
             int p = ed->caret();
             if (!brValid || brVer != buf->version || brPos != p) {
                 int at = -1;
-                int m = ed->matchNearCaret(&at);
+                int m = -1;
+                // matching allocates and scans: only when a bracket is next to the caret
+                bool near = (p < buf->length() && isBracket(buf->byteAt(p))) || (p > 0 && isBracket(buf->byteAt(p - 1)));
+                if (near) { m = ed->matchNearCaret(&at); }
                 brCacheA = (m >= 0) ? at : -1;
                 brCacheB = m;
                 brVer = buf->version;
@@ -927,11 +1065,56 @@ public class CodeEditor : gui.Widget {
             brA = brCacheA;
             brB = brCacheB;
         }
+        // the lines that carry highlights (for partial repainting after an edit)
+        hlMinLine = -1;
+        hlMaxLine = -1;
+        if (nwm > 0) { noteLine(wm[0].start); noteLine(wm[nwm - 1].start); }
+        if (nfm > 0) { noteLine(fm[0].start); noteLine(fm[nfm - 1].start); }
+        if (brA >= 0) { noteLine(brA); }
+        if (brB >= 0) { noteLine(brB); }
+    }
+
+    private void noteLine(int off) {
+        int l = buf->lineAt(off);
+        if (hlMinLine < 0 || l < hlMinLine) { hlMinLine = l; }
+        if (l > hlMaxLine) { hlMaxLine = l; }
     }
 
     private int wmCount;
+    private int hlMinLine;
+    private int hlMaxLine;
     private int brCacheA;
     private int brCacheB;
+
+    // Fills wm with the places where the word occurs as a whole word between the offsets from and to (a plain scan of the visible
+    // lines: cheap enough to run after every key). Returns how many.
+    private int scanWord(char* word, int wl, int from, int to) {
+        int n = 0;
+        int l0 = buf->lineAt(from);
+        int l1 = buf->lineAt(to);
+        for (int l = l0; l <= l1 && n < MAXHL; l++) {
+            int len = 0;
+            char* t = buf->linePtr(l, &len);
+            int ls = buf->lineStart(l);
+            int first = word[0];
+            for (int i = 0; i + wl <= len; i++) {
+                if (t[i] != first) { continue; }
+                bool same = true;
+                for (int k = 1; k < wl; k++) {
+                    if (t[i + k] != word[k]) { same = false; break; }
+                }
+                if (!same) { continue; }
+                if (i > 0 && isIdByte(t[i - 1] & 255)) { continue; }
+                if (i + wl < len && isIdByte(t[i + wl] & 255)) { continue; }
+                wm[n].start = ls + i;
+                wm[n].end = ls + i + wl;
+                n++;
+                if (n >= MAXHL) { break; }
+                i = i + wl - 1;
+            }
+        }
+        return n;
+    }
 
     // ---- painting ---------------------------------------------------------------------------------------------------------------------
     // x of display column `col` in a row whose first column is colLo
@@ -1354,15 +1537,28 @@ public class CodeEditor : gui.Widget {
         int sx0 = (tx0 > c0) ? tx0 : c0;
         int sx1 = (ox + textRight < c2) ? ox + textRight : c2;
         int sy1 = (ty1 < c3) ? ty1 : c3;
+        if (visRows + 2 > drawnCap) {
+            drawnCap = visRows + 16;
+            drawnState = (int*) realloc((char*) drawnState, drawnCap * 8);
+        }
+        drawnFirst = topLine;
+        nDrawn = 0;
         for (int i = 0; i < visRows; i++) {
-            s->clipX0 = sx0;
-            s->clipX1 = sx1;
-            s->clipY1 = sy1;
-            paintRow(s, ox, oy, l, sb, ry, caretLine, multiLineSel);
-            s->clipX0 = c0;
-            s->clipX1 = c2;
-            s->clipY1 = sy1;
-            paintGutterRow(s, ox, oy, l, sb, ry, caretLine);
+            if (!wordWrap && nDrawn < drawnCap) {
+                drawnState[nDrawn] = doc->hl->stateAt(l);
+                nDrawn++;
+            }
+            // rows outside the area that has to be repainted are skipped
+            if (oy + ry + lh > c1 && oy + ry < c3) {
+                s->clipX0 = sx0;
+                s->clipX1 = sx1;
+                s->clipY1 = sy1;
+                paintRow(s, ox, oy, l, sb, ry, caretLine, multiLineSel);
+                s->clipX0 = c0;
+                s->clipX1 = c2;
+                s->clipY1 = sy1;
+                paintGutterRow(s, ox, oy, l, sb, ry, caretLine);
+            }
             ry = ry + lh;
             if (!stepDown(&l, &sb)) { break; }
         }
