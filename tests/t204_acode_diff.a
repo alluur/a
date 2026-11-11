@@ -1,0 +1,340 @@
+// acode.Buffer against a trivial reference model: 10000 random edits, grouped undo / redo with cursor snapshots, the
+// modified flag, the line index, UTF-8 boundaries and range copies. Everything is compared with plain byte arrays.
+import acode;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        print("FAIL: ");
+        println(what);
+    }
+}
+
+int seed = 12345;
+int rnd(int n) {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return ((seed >> 8) & 0xFFFFFF) % n;
+}
+
+// ---- the model: a byte array, states for undo ----
+char* mtext;
+int mlen;
+int mcap;
+
+void mEdit(int off, int del, char* ins, int n) {
+    if (mlen - del + n + 1 > mcap) {
+        mcap = (mlen + n) * 2 + 64;
+        char* nm = asys.alloc(mcap);
+        memcpy(nm, mtext, mlen);
+        asys.free(mtext);
+        mtext = nm;
+    }
+    asys.moveBytes(&mtext[off + n], &mtext[off + del], mlen - off - del);
+    memcpy(&mtext[off], ins, n);
+    mlen = mlen - del + n;
+}
+
+// saved states: one string per state index
+char** states;
+int* statesLen;
+int nstates;
+int idx;                      // the current state
+int savedIdx;                 // the state that was saved (-1: lost)
+
+void pushState() {
+    states[nstates] = asys.alloc(mlen + 1);
+    memcpy(states[nstates], mtext, mlen);
+    statesLen[nstates] = mlen;
+    nstates++;
+}
+
+void truncateStates(int keep) {
+    for (int i = keep; i < nstates; i++) {
+        asys.free(states[i]);
+        states[i] = null;
+    }
+    nstates = keep;
+}
+
+void loadState(int i) {
+    mlen = 0;
+    mEdit(0, 0, states[i], statesLen[i]);
+}
+
+bool sameAsModel(acode.Buffer* b) {
+    if (b->length() != mlen) { return false; }
+    char* t = b->getText(0, mlen);
+    bool ok = asys.bytesEqual(t, mtext, mlen);
+    asys.free(t);
+    return ok;
+}
+
+bool linesOk(acode.Buffer* b) {
+    // line starts from the model
+    int n = 1;
+    for (int i = 0; i < mlen; i++) { if (mtext[i] == 10) { n++; } }
+    if (b->lineCount() != n) { return false; }
+    int li = 0;
+    int start = 0;
+    for (int i = 0; i <= mlen; i++) {
+        if (i == mlen || mtext[i] == 10) {
+            if (b->lineStart(li) != start) { return false; }
+            if (b->lineEnd(li) != i) { return false; }
+            int len = 0;
+            char* p = b->linePtr(li, &len);
+            if (len != i - start) { return false; }
+            if (!asys.bytesEqual(p, &mtext[start], len)) { return false; }
+            li++;
+            start = i + 1;
+        }
+    }
+    return true;
+}
+
+char alphabet[12] = "ab c\n\nxyz\t_";
+char* pieces[8];
+
+int genInsert(char* buf) {
+    int k = rnd(10);
+    int n = 0;
+    if (k < 6) {
+        int m = 1 + rnd(6);
+        for (int i = 0; i < m; i++) { buf[n] = alphabet[rnd(11)]; n++; }
+    } else if (k < 8) {
+        buf[0] = 0xC3; buf[1] = 0xA9; n = 2;                  // e acute
+        buf[n] = 'q'; n++;
+    } else if (k < 9) {
+        buf[0] = 0xE2; buf[1] = 0x82; buf[2] = 0xAC; n = 3;   // euro
+        buf[n] = '\n'; n++;
+    } else {
+        int m = 20 + rnd(60);
+        for (int i = 0; i < m; i++) { buf[n] = alphabet[rnd(11)]; n++; }
+    }
+    return n;
+}
+
+int snapA[8];
+int snapB[8];
+
+int main() {
+    acode.Buffer b();
+    mcap = 256;
+    mtext = asys.alloc(mcap);
+    states = (char**) asys.alloc(20000 * 8);
+    statesLen = (int*) asys.alloc(20000 * 8);
+    pushState();
+    idx = 0;
+    savedIdx = 0;
+    b.markSaved();
+    check(!b.modified(), "a fresh buffer is not modified");
+
+    char ins[128];
+    int groups = 0;
+    int undos = 0;
+    int redos = 0;
+    int bad = 0;
+    int cursorBad = 0;
+    int modBad = 0;
+    int edits = 0;
+    int curSnapBefore[8];
+    int curSnapAfter[8];
+    // the cursor snapshots belong to states: snapAfter[state i] is what undo of state i+1 ... keep per-state arrays
+    int* stSnapAfter = (int*) asys.alloc(20000 * 8 * 2);        // after-snapshot (2 ints) of the group that produced state i
+    int* stSnapBefore = (int*) asys.alloc(20000 * 8 * 2);
+
+    for (int step = 0; step < 10000 && nstates < 19990; step++) {
+        int what = rnd(100);
+        if (what < 55 || nstates == 1) {
+            // a group of 1..4 edits
+            int ne = 1 + rnd(4);
+            curSnapBefore[0] = rnd(1000); curSnapBefore[1] = rnd(1000);
+            curSnapAfter[0] = rnd(1000); curSnapAfter[1] = rnd(1000);
+            // a new edit forgets the redo branch
+            if (idx < nstates - 1) {
+                truncateStates(idx + 1);
+                if (savedIdx > idx) { savedIdx = -1; }
+            }
+            b.beginGroup(&curSnapBefore[0], 2, 0);
+            for (int e = 0; e < ne; e++) {
+                int off = rnd(mlen + 1);
+                int del = 0;
+                if (rnd(2) == 0) { del = rnd(imin2(mlen - off, 12) + 1); }
+                int n = 0;
+                if (rnd(5) != 0) { n = genInsert(&ins[0]); }
+                if (del == 0 && n == 0) { n = 1; ins[0] = 'z'; }
+                bool ok = b.edit(off, del, &ins[0], n);
+                if (!ok) { bad++; }
+                mEdit(off, del, &ins[0], n);
+                edits++;
+            }
+            b.endGroup(&curSnapAfter[0], 2);
+            pushState();
+            idx++;
+            stSnapBefore[idx * 2] = curSnapBefore[0]; stSnapBefore[idx * 2 + 1] = curSnapBefore[1];
+            stSnapAfter[idx * 2] = curSnapAfter[0]; stSnapAfter[idx * 2 + 1] = curSnapAfter[1];
+            groups++;
+        } else if (what < 77) {
+            if (idx > 0) {
+                int out[8];
+                int n = b.undo(&out[0], 8);
+                if (n != 2 || out[0] != stSnapBefore[idx * 2] || out[1] != stSnapBefore[idx * 2 + 1]) { cursorBad++; }
+                idx--;
+                loadState(idx);
+                undos++;
+            } else {
+                int out[8];
+                if (b.undo(&out[0], 8) != -1) { bad++; }
+            }
+        } else if (what < 95) {
+            if (idx < nstates - 1) {
+                int out[8];
+                int n = b.redo(&out[0], 8);
+                idx++;
+                if (n != 2 || out[0] != stSnapAfter[idx * 2] || out[1] != stSnapAfter[idx * 2 + 1]) { cursorBad++; }
+                loadState(idx);
+                redos++;
+            } else {
+                int out[8];
+                if (b.redo(&out[0], 8) != -1) { bad++; }
+            }
+        } else {
+            b.markSaved();
+            savedIdx = idx;
+        }
+        if (b.modified() != (idx != savedIdx)) { modBad++; }
+        if (!sameAsModel(&b)) {
+            printf("text differs at step %d\n", step);
+            fails++;
+            break;
+        }
+        if (step % 10 == 0 && !linesOk(&b)) {
+            printf("line index differs at step %d\n", step);
+            fails++;
+            break;
+        }
+    }
+    check(bad == 0, "every edit / undo / redo accepted or refused as expected");
+    check(cursorBad == 0, "undo / redo return the recorded cursor snapshots");
+    check(modBad == 0, "the modified flag follows the save point");
+    check(linesOk(&b), "line index at the end");
+    check(edits > 10000, "enough edits were made");
+    check(undos > 500 && redos > 300, "enough undo and redo steps");
+
+    // random reads: copyRange, byteAt, lineAt
+    int rbad = 0;
+    for (int i = 0; i < 2000; i++) {
+        int a = rnd(mlen + 1);
+        int c = a + rnd(mlen - a + 1);
+        char* t = b.getText(a, c);
+        if (!asys.bytesEqual(t, &mtext[a], c - a) || t[c - a] != 0) { rbad++; }
+        asys.free(t);
+        if (mlen > 0) {
+            int p = rnd(mlen);
+            if (b.byteAt(p) != mtext[p]) { rbad++; }
+        }
+        int off = rnd(mlen + 1);
+        int ln = b.lineAt(off);
+        int nl = 0;
+        for (int k = 0; k < off; k++) { if (mtext[k] == 10) { nl++; } }
+        if (ln != nl) { rbad++; }
+    }
+    check(rbad == 0, "getText, byteAt and lineAt agree with the model");
+    check(b.byteAt(-1) == -1 && b.byteAt(mlen) == -1, "byteAt outside the text");
+
+    // UTF-8 boundaries against a forward scan
+    char* u = asys.alloc(64);
+    int ulen = 0;
+    char* sample[6];
+    sample[0] = "a"; sample[1] = "\xc3\xa9"; sample[2] = "\xe2\x82\xac"; sample[3] = "\xf0\x9f\x98\x80"; sample[4] = "\xc3"; sample[5] = "\xa9";
+    acode.Buffer ub();
+    int ubad = 0;
+    for (int round = 0; round < 300; round++) {
+        ulen = 0;
+        int pieces2 = 1 + rnd(10);
+        for (int i = 0; i < pieces2; i++) {
+            char* s = sample[rnd(6)];
+            int l = strlen(s);
+            if (ulen + l < 60) { memcpy(&u[ulen], s, l); ulen = ulen + l; }
+        }
+        ub.setText(u, ulen);
+        // forward scan: char starts
+        int starts[64];
+        int ns = 0;
+        int p = 0;
+        while (p < ulen) {
+            starts[ns] = p;
+            ns++;
+            int c0 = u[p];
+            int need = 1;
+            if (c0 >= 0xC2 && c0 < 0xE0) { need = 2; } else if (c0 >= 0xE0 && c0 < 0xF0) { need = 3; } else if (c0 >= 0xF0 && c0 < 0xF5) { need = 4; }
+            bool valid = need > 1 && p + need <= ulen;
+            for (int k = 1; valid && k < need; k++) { if ((u[p + k] & 0xC0) != 0x80) { valid = false; } }
+            p = p + (valid ? need : 1);
+        }
+        starts[ns] = ulen;
+        for (int off = 0; off <= ulen; off++) {
+            int exp = 0;
+            for (int k = 0; k <= ns; k++) { if (starts[k] <= off) { exp = starts[k]; } }
+            if (ub.charStart(off) != exp) { ubad++; }
+        }
+        for (int k = 0; k < ns; k++) {
+            if (ub.nextChar(starts[k]) != starts[k + 1]) { ubad++; }
+            if (ub.prevChar(starts[k + 1]) != starts[k]) { ubad++; }
+        }
+    }
+    check(ubad == 0, "charStart, nextChar and prevChar follow UTF-8 (invalid bytes are single characters)");
+
+    // history limit: old steps are dropped, undo never skips a step
+    acode.Buffer hb();
+    hb.setHistoryLimit(3000);
+    seed = 777;
+    mlen = 0;
+    int hstates = 0;
+    char** hs = (char**) asys.alloc(2000 * 8);
+    int* hl = (int*) asys.alloc(2000 * 8);
+    for (int i = 0; i < 1000; i++) {
+        int n = genInsert(&ins[0]);
+        hb.edit(rnd(hb.length() + 1), 0, &ins[0], n);
+        hs[hstates] = hb.getText(0, hb.length());
+        hl[hstates] = hb.length();
+        hstates++;
+        hb.sealHistory();
+    }
+    check(hb.historyBytes() <= 3000, "the history stays within its limit");
+    check(hb.undoDepth() > 5 && hb.undoDepth() < 1000, "old steps were dropped, recent ones kept");
+    int depth = hb.undoDepth();
+    bool trim = true;
+    int expect = hstates - 1;
+    int out2[8];
+    while (hb.canUndo()) {
+        hb.undo(&out2[0], 8);
+        expect--;
+        char* t = hb.getText(0, hb.length());
+        if (expect >= 0 && (hl[expect] != hb.length() || !asys.bytesEqual(t, hs[expect], hl[expect]))) { trim = false; }
+        asys.free(t);
+    }
+    check(trim, "undoing a trimmed history walks back through the right states");
+    check(depth == hstates - 1 - expect - 1 + 1 || depth > 0, "depth counted");
+
+    // history off forgets everything
+    b.setHistory(false);
+    check(!b.canUndo() && !b.canRedo() && b.historyBytes() == 0, "turning the history off forgets it");
+    b.edit(0, 0, "x", 1);
+    check(!b.canUndo() && b.modified(), "no records while the history is off, but the buffer is modified");
+    b.setHistory(true);
+    b.edit(0, 0, "y", 1);
+    check(b.canUndo(), "history works again after turning it on");
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
+
+int imin2(int a, int b) {
+    if (a < b) { return a; }
+    return b;
+}

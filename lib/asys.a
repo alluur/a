@@ -17,7 +17,7 @@
 //
 //  Memory      alloc(n) realloc(p, n) free(p) blockSize(p) memInUse() memBlocks() memMapped() moveBytes(dst, src, n)
 //              fillBytes(p, byte, n) bytesEqual(a, b, n) strDup(s) strDupN(s, n) join(a, b) concat3(a, b, c)
-//  Files       fileOpen(path, flags, mode) fileRead fileWrite fileClose fileSeek fileSync fileTruncate
+//  Files       fileOpen(path, flags, mode) fileRead fileWrite fileClose fileSeek fileSync fileTruncate symlink mkfifo hasLinks
 //              readFile(path, &len, maxBytes, &err)    whole REGULAR file (a FIFO, device or directory is refused, it never blocks)
 //              writeFile(path, data, n)                plain overwrite
 //              writeFileAtomic(path, data, n, mode, flags)   temp file (O_EXCL, random name, final permissions from the first
@@ -1121,6 +1121,33 @@ private int fchmodFd(int fd, int mode) {
     return sys(91, 52, fd, mode);
 }
 
+// true where symbolic links and FIFOs exist (Linux); AOS and Windows have neither
+public bool hasLinks() {
+    return __OS != 1 && platform() == OS_LINUX;
+}
+
+// makes a symbolic link `link` pointing to `target` (Linux only, -ENOSYS elsewhere)
+public int symlink(char* target, char* link) {
+    if (!hasLinks()) {
+        return -ENOSYS;
+    }
+    if (__ARCH == 0) {
+        return __syscall(88, (int) target, (int) link, 0, 0, 0, 0);
+    }
+    return __syscall(36, (int) target, -100, (int) link, 0, 0, 0);             // symlinkat
+}
+
+// makes a FIFO (named pipe) (Linux only, -ENOSYS elsewhere)
+public int mkfifo(char* path, int mode = 420) {
+    if (!hasLinks()) {
+        return -ENOSYS;
+    }
+    if (__ARCH == 0) {
+        return __syscall(133, (int) path, 0x1000 | mode, 0, 0, 0, 0);          // mknod(S_IFIFO)
+    }
+    return __syscall(33, -100, (int) path, 0x1000 | mode, 0, 0, 0);            // mknodat
+}
+
 // sets the modification time (seconds); not on AOS / Windows (-ENOSYS)
 public int setMtime(char* path, int seconds) {
     if (__OS == 1 || platform() == OS_AOS) {
@@ -1264,6 +1291,13 @@ public char* getcwd() {
 // blocks on them), ETOOBIG when the file is bigger than maxBytes.
 public char* readFile(char* path, int* lenOut, int maxBytes = -1, int* err = null) {
     int e = 0;
+    if (__OS == 1) {
+        Stat ws;
+        if (stat(path, &ws) == 0 && !ws.isFile()) {            // CreateFile cannot open a directory: say what it is
+            if (err != null) { *err = -ENOTREG; }
+            return null;
+        }
+    }
     int fd = fileOpen(path, F_READ | F_NONBLOCK | F_CLOEXEC, 0);
     if (fd < 0) {
         if (err != null) { *err = fd; }
@@ -1418,108 +1452,197 @@ private int copyFile(char* from, char* to, int mode) {
     return (r < 0) ? r : 0;
 }
 
-// Writes a file so that readers see either the old or the new content, never a mix:
-//   1. a temp file next to the target is created with O_CREAT | O_EXCL | O_NOFOLLOW, a random name and the permissions of the
-//      existing file (or `mode` for a new file) from the very first byte,
-//   2. the data is written and (unless W_NOSYNC) flushed to the disk,
-//   3. with W_BACKUP the old file is copied to "path~" first,
-//   4. the temp file is renamed over the target.
-// A symbolic link as target is followed (the data is written where the link points). If no temp file can be created and
-// W_INPLACE_OK is set, the file is overwritten in place instead. Returns n or -errno; the temp file is removed on failure.
-public int writeFileAtomic(char* path, char* data, int n, int mode = 420, int flags = 0) {
-    if (path[0] == 0) {
-        return -ENOENT;
+// Streams a file to disk so that readers see either the old or the new content, never a mix:
+//   open():   a temp file next to the target is created with O_CREAT | O_EXCL | O_NOFOLLOW, a random name and the permissions of
+//             the existing file (or `mode` for a new file) from the very first byte (a symbolic link as target is followed:
+//             the data goes where the link points); with W_BACKUP the old file is copied to "path~" first,
+//   write():  appends data (any number of calls),
+//   commit(): flushes to the disk (unless W_NOSYNC) and renames the temp file over the target,
+//   abort():  removes the temp file.
+// If no temp file can be created and W_INPLACE_OK is set, the file is overwritten in place instead (not atomic).
+public class AtomicFile {
+    private int fd;
+    private char* tmp;
+    private char* target;
+    private int flags;
+    private bool inplace;
+    private int failed;
+    public int written;
+
+    public AtomicFile() {
+        fd = -1;
     }
-    char* target = realpath(path);
-    if (target == null) {
-        return -ENOMEM;
-    }
-    Stat st;
-    int perm = mode & 0xFFF;
-    bool existed = false;
-    if (stat(target, &st) == 0) {
-        if (!st.isFile()) {
+
+    // 0 or -errno
+    public int open(char* path, int mode, int fl) {
+        if (path[0] == 0) {
+            return -ENOENT;
+        }
+        fd = -1;
+        flags = fl;
+        written = 0;
+        failed = 0;
+        inplace = false;
+        target = realpath(path);
+        if (target == null) {
+            return -ENOMEM;
+        }
+        Stat st;
+        int perm = mode & 0xFFF;
+        bool existed = false;
+        if (lstat(target, &st) == 0 && st.isLink()) {
+            free(target);                                        // realpath gave up after 32 links: a loop
+            target = null;
+            return -ELOOP;
+        }
+        if (stat(target, &st) == 0) {
+            if (!st.isFile()) {
+                free(target);
+                target = null;
+                return -ENOTREG;
+            }
+            perm = st.mode & 0xFFF;
+            existed = true;
+        }
+        if (existed && (fl & W_BACKUP) != 0) {
+            char* bak = concat3(target, "~", "");
+            int br = copyFile(target, bak, perm);
+            free(bak);
+            if (br < 0) {
+                free(target);
+                target = null;
+                return br;
+            }
+        }
+        int sl = lastSlash(target);
+        char* dir = (sl < 0) ? strDup(".") : (sl == 0 ? strDup("/") : strDupN(target, sl));
+        char* base = &target[sl + 1];
+        for (int attempt = 0; attempt < 16; attempt++) {
+            char* rnd = hexName(6);
+            char* pre = concat3(".", base, ".tmp-");
+            char* leaf = concat3(pre, rnd, "");
+            free(pre);
+            free(rnd);
+            if (strlen(leaf) > 250) {
+                leaf[250] = 0;
+            }
+            tmp = join(dir, leaf);
+            free(leaf);
+            fd = fileOpen(tmp, F_WRITE | F_CREATE | F_EXCL | F_NOFOLLOW | F_CLOEXEC, perm);
+            if (fd >= 0 || fd != -EEXIST) {
+                break;
+            }
+            free(tmp);
+            tmp = null;
+        }
+        free(dir);
+        if (fd < 0) {
+            int e = fd;
+            fd = -1;
+            free(tmp);
+            tmp = null;
+            if ((fl & W_INPLACE_OK) != 0 && existed && (e == -EACCES || e == -EROFS || e == -EPERM)) {
+                fd = fileOpen(target, F_WRITE | F_TRUNC | F_CLOEXEC, perm);
+                if (fd >= 0) {
+                    inplace = true;
+                    return 0;
+                }
+                e = fd;
+                fd = -1;
+            }
             free(target);
-            return -ENOTREG;
+            target = null;
+            return e;
         }
-        perm = st.mode & 0xFFF;
-        existed = true;
-    }
-    if (existed && (flags & W_BACKUP) != 0) {
-        char* bak = concat3(target, "~", "");
-        int br = copyFile(target, bak, perm);
-        free(bak);
-        if (br < 0) {
-            free(target);
-            return br;
+        // the umask may have removed permission bits: put them back (nothing else can see the file yet)
+        Stat fs;
+        if (fstat(fd, &fs) == 0 && (fs.mode & 0xFFF) != perm && fileHasMode(fd)) {
+            fchmodFd(fd, perm);
         }
+        return 0;
     }
-    int sl = lastSlash(target);
-    char* dir = (sl < 0) ? strDup(".") : (sl == 0 ? strDup("/") : strDupN(target, sl));
-    char* base = &target[sl + 1];
-    int fd = -1;
-    char* tmp = null;
-    for (int attempt = 0; attempt < 16; attempt++) {
-        char* rnd = hexName(6);
-        char* pre = concat3(".", base, ".tmp-");
-        char* leaf = concat3(pre, rnd, "");
-        free(pre);
-        free(rnd);
-        if (strlen(leaf) > 250) {
-            leaf[250] = 0;
+
+    // appends data: n or -errno (after an error every later call returns the same error)
+    public int write(char* data, int n) {
+        if (failed != 0) {
+            return failed;
         }
-        tmp = join(dir, leaf);
-        free(leaf);
-        fd = fileOpen(tmp, F_WRITE | F_CREATE | F_EXCL | F_NOFOLLOW | F_CLOEXEC, perm);
-        if (fd >= 0 || fd != -EEXIST) {
-            break;
+        if (fd <= 0 && tmp == null && target == null) {
+            return -EBADF;
         }
-        free(tmp);
-        tmp = null;
-    }
-    free(dir);
-    if (fd < 0) {
-        int e = fd;
-        if (tmp != null) { free(tmp); }
-        if ((flags & W_INPLACE_OK) != 0 && existed && (e == -EACCES || e == -EROFS || e == -EPERM)) {
-            int r = writeFile(target, data, n);
-            free(target);
-            return r;
+        int w = fileWrite(fd, data, n);
+        if (w >= 0 && w < n) {
+            w = -EIO;
         }
-        free(target);
-        return e;
-    }
-    // the umask may have removed permission bits: put them back (on a descriptor we own, nothing else can see it yet)
-    Stat fs;
-    if (fstat(fd, &fs) == 0 && (fs.mode & 0xFFF) != perm && fileHasMode(fd)) {
-        fchmodFd(fd, perm);
-    }
-    int w = fileWrite(fd, data, n);
-    if (w >= 0 && w < n) {
-        w = -EIO;
-    }
-    if (w >= 0 && (flags & W_NOSYNC) == 0) {
-        fileSync(fd);
-    }
-    int c = fileClose(fd);
-    if (w >= 0 && c < 0) {
-        w = c;
-    }
-    if (w < 0) {
-        unlink(tmp);
-        free(tmp);
-        free(target);
+        if (w < 0) {
+            failed = w;
+            return w;
+        }
+        written = written + w;
         return w;
     }
-    int rr = rename(tmp, target);
-    if (rr < 0) {
-        unlink(tmp);
+
+    // makes the new content visible: 0 or -errno (the temp file is removed on failure)
+    public int commit() {
+        if (fd < 0 || target == null) {
+            return -EBADF;
+        }
+        int e = failed;
+        if (e == 0 && (flags & W_NOSYNC) == 0) {
+            fileSync(fd);
+        }
+        int c = fileClose(fd);
+        fd = -1;
+        if (e == 0 && c < 0) {
+            e = c;
+        }
+        if (e == 0 && !inplace) {
+            e = rename(tmp, target);
+        }
+        if (e < 0 && !inplace) {
+            unlink(tmp);
+        }
         free(tmp);
         free(target);
-        return rr;
+        tmp = null;
+        target = null;
+        return e;
     }
-    free(tmp);
-    free(target);
+
+    // gives up: closes and removes the temp file (an in-place write has already changed the file)
+    public void abort() {
+        if (fd >= 0 && target != null) {
+            fileClose(fd);
+            fd = -1;
+        }
+        if (tmp != null) {
+            if (!inplace) {
+                unlink(tmp);
+            }
+            free(tmp);
+            tmp = null;
+        }
+        free(target);
+        target = null;
+    }
+}
+
+// Writes a whole file atomically (see AtomicFile): n or -errno.
+public int writeFileAtomic(char* path, char* data, int n, int mode = 420, int flags = 0) {
+    AtomicFile f;
+    int r = f.open(path, mode, flags);
+    if (r < 0) {
+        return r;
+    }
+    r = f.write(data, n);
+    if (r < 0) {
+        f.abort();
+        return r;
+    }
+    r = f.commit();
+    if (r < 0) {
+        return r;
+    }
     return n;
 }
 
@@ -1870,7 +1993,8 @@ private int setNonBlock(int fd) {
     return sys(72, 25, fd, 4, 0x800);                             // fcntl(F_SETFL, O_NONBLOCK)
 }
 
-// a child process with pipes to its standard streams
+// a child process with pipes to its standard streams. Declare it as  asys.Process p();  (a plain  asys.Process p;  is a zeroed
+// object that has not been started: every method then does nothing).
 public class Process {
     public int pid;               // 0 until started
     public int inFd;              // our end of the child's standard input (-1: none / closed)
@@ -2144,7 +2268,7 @@ public class Process {
     // Returns the bytes read, 0 at the end of the stream (the child closed it), -EAGAIN when nothing is there now.
     public int read(int which, char* buf, int max) {
         int fd = (which == 2) ? errFd : outFd;
-        if (fd < 0) {
+        if (pid == 0 || fd < 0) {
             return 0;
         }
         int r = sys(0, 63, fd, (int) buf, max);
@@ -2155,17 +2279,17 @@ public class Process {
     }
 
     public void closeOut() {
-        if (outFd >= 0) { sys(3, 57, outFd); outFd = -1; }
+        if (pid != 0 && outFd >= 0) { sys(3, 57, outFd); outFd = -1; }
     }
 
     public void closeErr() {
-        if (errFd >= 0) { sys(3, 57, errFd); errFd = -1; }
+        if (pid != 0 && errFd >= 0) { sys(3, 57, errFd); errFd = -1; }
     }
 
     // Writes to the child's standard input without blocking: the bytes written (may be less than n, or 0 -> -EAGAIN when the pipe
     // is full), -EPIPE when the child closed its input. Never raises SIGPIPE.
     public int write(char* buf, int n) {
-        if (inFd < 0) {
+        if (pid == 0 || inFd < 0) {
             return -EPIPE;
         }
         if (n <= 0) {
@@ -2179,7 +2303,7 @@ public class Process {
     }
 
     public void closeIn() {
-        if (inFd >= 0) { sys(3, 57, inFd); inFd = -1; }
+        if (pid != 0 && inFd >= 0) { sys(3, 57, inFd); inFd = -1; }
     }
 
     // Looks whether the child has ended (never blocks): 1 it ended just now (the status is recorded), 0 still running,
@@ -2260,6 +2384,9 @@ public class Process {
         int ev[2];
         int rev[2];
         int n = 0;
+        if (pid == 0) {
+            return false;
+        }
         if (outFd >= 0) { fds[n] = outFd; ev[n] = POLLIN; n++; }
         if (errFd >= 0) { fds[n] = errFd; ev[n] = POLLIN; n++; }
         if (n == 0) {
