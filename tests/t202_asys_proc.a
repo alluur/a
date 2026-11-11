@@ -1,0 +1,302 @@
+// asys.Process: pipes, exit codes, environment, working directory, stdin that never blocks, SIGPIPE, kill, floods
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (!streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got, want);
+    }
+}
+
+// runs sh -c script, collects stdout and stderr (up to 4000 bytes each) until the process ended
+char outBuf[4096];
+char errBuf[4096];
+int outLen;
+int errLen;
+int exitCode;
+int termSig;
+
+int runSh(char* script, int flags, char* cwd, char** env) {
+    asys.Process p();
+    char* argv[4];
+    argv[0] = "/bin/sh"; argv[1] = "-c"; argv[2] = script; argv[3] = null;
+    outLen = 0; errLen = 0;
+    int r = p.start(&argv[0], cwd, env, flags);
+    if (r < 0) { return r; }
+    int idle = 0;
+    while (p.running || p.outFd >= 0 || p.errFd >= 0) {
+        p.waitReadable(50);
+        char tmp[1024];
+        bool any = false;
+        int n = p.read(1, &tmp[0], 1024);
+        if (n > 0) { any = true; if (outLen + n < 4000) { memcpy(&outBuf[outLen], &tmp[0], n); outLen = outLen + n; } }
+        if (n == 0) { p.closeOut(); }
+        n = p.read(2, &tmp[0], 1024);
+        if (n > 0) { any = true; if (errLen + n < 4000) { memcpy(&errBuf[errLen], &tmp[0], n); errLen = errLen + n; } }
+        if (n == 0) { p.closeErr(); }
+        if (p.running) { p.tryWait(); }
+        if (!any) { idle++; if (idle > 400) { break; } } else { idle = 0; }
+    }
+    outBuf[outLen] = 0;
+    errBuf[errLen] = 0;
+    p.wait(2000);
+    exitCode = p.exitCode;
+    termSig = p.termSignal;
+    p.dispose();
+    return 0;
+}
+
+int countFds() {
+    asys.DirList dl();
+    int n = asys.listDir("/proc/self/fd", &dl);
+    dl.dispose();
+    return n;
+}
+
+int main() {
+    if (!asys.canSpawn()) {
+        println("processes are not supported on this system");
+        return 0;
+    }
+    int fds0 = countFds();
+
+    // ---- output, exit codes, stderr
+    check(runSh("echo hello; echo there", asys.P_STDOUT, null, null) == 0, "start");
+    checkStr(&outBuf[0], "hello\nthere\n", "standard output");
+    checkEq(exitCode, 0, "exit code 0");
+    runSh("echo out; echo err 1>&2; exit 3", asys.P_STDOUT | asys.P_STDERR, null, null);
+    checkStr(&outBuf[0], "out\n", "stdout of a two stream program");
+    checkStr(&errBuf[0], "err\n", "stderr separately");
+    checkEq(exitCode, 3, "exit code 3");
+    runSh("echo out; echo err 1>&2", asys.P_STDOUT | asys.P_MERGE, null, null);
+    checkStr(&outBuf[0], "out\nerr\n", "stderr merged into stdout");
+    runSh("exit 200", asys.P_STDOUT, null, null);
+    checkEq(exitCode, 200, "exit code 200");
+    runSh("kill -9 $$", asys.P_STDOUT, null, null);
+    checkEq(termSig, 9, "a process killed by a signal reports the signal");
+    checkEq(exitCode, -1, "and no exit code");
+
+    // ---- environment and working directory
+    char* env[3];
+    env[0] = "ASYS_TEST_VAR=bar baz";
+    env[1] = null;
+    runSh("echo \"[$ASYS_TEST_VAR]\"", asys.P_STDOUT, null, &env[0]);
+    checkStr(&outBuf[0], "[bar baz]\n", "an extra environment variable reaches the child");
+    asys.mkdirs("build/tests/t202_cwd");
+    runSh("basename \"$(pwd)\"", asys.P_STDOUT, "build/tests/t202_cwd", null);
+    checkStr(&outBuf[0], "t202_cwd\n", "the child runs in the given directory");
+    check(runSh("echo x", asys.P_STDOUT, "build/tests/no_such_dir", null) < 0, "a missing working directory fails the start");
+    asys.rmdir("build/tests/t202_cwd");
+
+    // ---- failing to start is reported by start()
+    {
+        asys.Process p();
+        char* argv[2];
+        argv[0] = "/no/such/program"; argv[1] = null;
+        checkEq(p.start(&argv[0], null, null, 0), -asys.ENOENT, "a missing program is ENOENT");
+        check(!p.running, "and nothing runs");
+        argv[0] = "no-such-program-anywhere"; 
+        checkEq(p.start(&argv[0], null, null, 0), -asys.ENOENT, "a missing program in PATH is ENOENT");
+        asys.writeFile("build/tests/t202_notexec", "x", 1);
+        argv[0] = "build/tests/t202_notexec";
+        int r = p.start(&argv[0], null, null, 0);
+        check(r == -asys.EACCES || r == -asys.ENOEXEC, "a file that is not executable is refused");
+        asys.unlink("build/tests/t202_notexec");
+        argv[0] = "sh";
+        char* a2[4];
+        a2[0] = "sh"; a2[1] = "-c"; a2[2] = "exit 5"; a2[3] = null;
+        checkEq(p.start(&a2[0], null, null, 0), 0, "a name without a slash is searched in PATH");
+        p.wait(2000);
+        checkEq(p.exitCode, 5, "it ran");
+    }
+
+    // ---- standard input never blocks
+    {
+        asys.Process p();
+        char* argv[2];
+        argv[0] = "cat"; argv[1] = null;
+        checkEq(p.start(&argv[0], null, null, asys.P_STDIN | asys.P_STDOUT), 0, "start cat");
+        // send 1 MB in 4 KB pieces while reading what comes back: no deadlock, nothing lost
+        char chunk[4096];
+        for (int i = 0; i < 4096; i++) { chunk[i] = 'a' + (i % 26); }
+        int sent = 0;
+        int off = 0;
+        int got = 0;
+        int sum = 0;
+        int guard = 0;
+        char rbuf[8192];
+        bool closed = false;
+        while (got < 1048576 && guard < 200000) {
+            guard++;
+            if (sent < 1048576) {
+                int w = p.write(&chunk[off], 4096 - off);
+                if (w > 0) {
+                    sent = sent + w;
+                    off = off + w;
+                    if (off == 4096) { off = 0; }
+                }
+            }
+            int n = p.read(1, &rbuf[0], 8192);
+            if (n > 0) {
+                got = got + n;
+                for (int i = 0; i < n; i++) { sum = sum + rbuf[i]; }
+            } else if (n == -asys.EAGAIN) {
+                p.waitReadable(5);
+            } else if (n == 0) {
+                break;
+            }
+            if (sent >= 1048576 && !closed) { p.closeIn(); closed = true; }
+        }
+        check(got >= 1000000, "about 1 MB came back through cat");
+        p.dispose();
+    }
+    {
+        // a program that does not read: write returns what fits and then EAGAIN, instantly
+        asys.Process p();
+        char* a[4];
+        a[0] = "sleep"; a[1] = "5"; a[2] = null;
+        p.start(&a[0], null, null, asys.P_STDIN);
+        char* big = asys.alloc(1048576);
+        int t0 = asys.monoMs();
+        int total = 0;
+        int w = 1;
+        int tries = 0;
+        while (w > 0 && tries < 100) {
+            w = p.write(big, 1048576);
+            if (w > 0) { total = total + w; }
+            tries++;
+        }
+        check(w == -asys.EAGAIN, "a full pipe gives EAGAIN, not a hang");
+        check(total > 0 && total < 1048576 * 4, "some bytes fit into the pipe");
+        check(asys.monoMs() - t0 < 2000, "and it took no time");
+        p.signalGroup(asys.SIGKILL);
+        p.wait(2000);
+        p.dispose();
+        asys.free(big);
+    }
+    {
+        // writing to a program that closed its input: -EPIPE and the test program survives (no SIGPIPE)
+        asys.Process p();
+        char* a[4];
+        a[0] = "/bin/sh"; a[1] = "-c"; a[2] = "exec 0<&-; sleep 1"; a[3] = null;
+        p.start(&a[0], null, null, asys.P_STDIN);
+        asys.sleepMs(300);
+        int w = 0;
+        int tries = 0;
+        while (w >= 0 && tries < 100) {
+            w = p.write("data data data\n", 15);
+            tries++;
+            asys.sleepMs(10);
+        }
+        checkEq(w, -asys.EPIPE, "writing to a closed pipe gives EPIPE");
+        check(true, "no SIGPIPE killed us");
+        p.dispose();
+    }
+
+    // ---- floods
+    {
+        // (seq and wc -c: the AOS shell tools read all of their input first, so `yes | head` cannot work there, and they stop at 1 MiB;
+        // seq 1 100000 is 588895 bytes: 488895 digits and 100000 line breaks)
+        runSh("seq 1 100000 | wc -c", asys.P_STDOUT, null, null);
+        char* counted = &outBuf[0];
+        while (counted[0] == ' ') { counted++; }                  // (the AOS wc pads the number with a blank)
+        checkStr(counted, "588895\n", "the shell counts what the child wrote");
+        asys.Process p();
+        char* a[8];
+        a[0] = "/bin/sh"; a[1] = "-c"; a[2] = "seq 1 300000"; a[3] = null;
+        p.start(&a[0], null, null, asys.P_STDOUT);
+        int total = 0;
+        char rbuf[65536];
+        int guard = 0;
+        while (guard < 100000) {
+            guard++;
+            int n = p.read(1, &rbuf[0], 65536);
+            if (n > 0) { total = total + n; }
+            else if (n == 0) { break; }
+            else { p.waitReadable(10); }
+        }
+        checkEq(total, 1988895, "2 MB of output arrive complete");
+        p.wait(2000);
+        p.dispose();
+    }
+
+    // ---- kill and wait
+    {
+        asys.Process p();
+        char* a[4];
+        a[0] = "sleep"; a[1] = "30"; a[2] = null;
+        p.start(&a[0], null, null, asys.P_GROUP);
+        checkEq(p.tryWait(), 0, "a running process: tryWait says 0");
+        check(!p.wait(100), "wait with a time limit returns false");
+        checkEq(p.signalGroup(asys.SIGKILL), 0, "signal the process group");
+        check(p.wait(3000), "it is gone");
+        checkEq(p.termSignal, 9, "killed by signal 9");
+        checkEq(p.tryWait(), 2, "tryWait after the end says: already reaped");
+        checkEq(p.signal(asys.SIGKILL), -asys.ESRCH, "signalling a finished child fails");
+        checkEq(p.termSignal, 9, "and does not change its status");
+        p.dispose();
+    }
+    {
+        // the group kill reaches grandchildren
+        asys.Process p();
+        char* a[4];
+        a[0] = "/bin/sh"; a[1] = "-c"; a[2] = "sleep 30 & sleep 30 & wait"; a[3] = null;
+        p.start(&a[0], null, null, asys.P_GROUP | asys.P_STDOUT);
+        asys.sleepMs(200);
+        int t0 = asys.monoMs();
+        p.signalGroup(asys.SIGTERM);
+        check(p.wait(3000), "the shell ended");
+        // the grandchildren held our stdout open: when they are dead the stream ends
+        char rbuf[100];
+        int n = 1;
+        int guard = 0;
+        while (n != 0 && guard < 300) {
+            n = p.read(1, &rbuf[0], 100);
+            if (n == -asys.EAGAIN) { asys.sleepMs(10); }
+            guard++;
+        }
+        check(n == 0 && asys.monoMs() - t0 < 5000, "the whole tree is dead: the output stream ended");
+        p.dispose();
+    }
+    {
+        // a process that exits by itself: exit status kept
+        asys.Process p();
+        char* a[4];
+        a[0] = "/bin/sh"; a[1] = "-c"; a[2] = "exit 7"; a[3] = null;
+        p.start(&a[0], null, null, 0);
+        p.wait(3000);
+        checkEq(p.exitCode, 7, "exit code");
+        p.signalGroup(asys.SIGKILL);
+        p.dispose();
+        checkEq(p.exitCode, 7, "kill after the end does not overwrite the exit code");
+    }
+
+    // ---- descriptors do not leak
+    for (int i = 0; i < 30; i++) {
+        runSh("echo x", asys.P_STDOUT | asys.P_STDERR | asys.P_STDIN, null, null);
+    }
+    int fds1 = countFds();
+    check(fds0 < 0 || fds1 == fds0, "30 runs leave no descriptor open");
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

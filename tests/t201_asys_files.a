@@ -1,0 +1,328 @@
+// asys: files, atomic writes, directories, stat, FIFOs and symlinks, names, time, environment
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (got == null || !streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got == null ? "(null)" : got, want);
+    }
+}
+
+// the content of a file as a string ("" when it is missing)
+char* slurp(char* path) {
+    int len = 0;
+    int e = 0;
+    char* d = asys.readFile(path, &len, -1, &e);
+    if (d == null) { return ""; }
+    return d;
+}
+
+bool linksOk;
+bool permOk;
+bool envOk;
+
+// checks that only make sense where the system has the feature (they pass trivially elsewhere, so every target runs the same number)
+void checkL(bool ok, char* what) { check(!linksOk || ok, what); }
+void checkLEq(int got, int want, char* what) { check(!linksOk || got == want, what); }
+void checkLStr(char* got, char* want, char* what) { check(!linksOk || (got != null && streq(got, want)), what); }
+void checkP(bool ok, char* what) { check(!permOk || ok, what); }
+void checkE(bool ok, char* what) { check(!envOk || ok, what); }
+
+int main() {
+    linksOk = asys.hasLinks();
+    permOk = asys.platform() != asys.OS_WINDOWS;
+    envOk = asys.platform() != asys.OS_WINDOWS;
+    char* dir = "build/tests/t201_work";
+    // clean up leftovers of an earlier run
+    asys.DirList dl();
+    if (asys.isDir(dir)) {
+        asys.listDir(dir, &dl);
+        for (int i = 0; i < dl.count; i++) {
+            char* p = asys.join(dir, dl.name(i));
+            asys.unlink(p);
+            asys.free(p);
+        }
+        dl.dispose();
+        asys.rmdir(dir);
+    }
+    checkEq(asys.mkdirs(dir), 0, "mkdirs creates the directory");
+    checkEq(asys.mkdirs(dir), 0, "mkdirs on an existing directory is fine");
+    check(asys.isDir(dir) && !asys.isFile(dir) && asys.exists(dir), "isDir / isFile / exists");
+    check(!asys.exists("build/tests/t201_work/nothing"), "missing paths do not exist");
+    char* nested = "build/tests/t201_work/a/b/c";
+    checkEq(asys.mkdirs(nested), 0, "mkdirs creates parents");
+    check(asys.isDir(nested), "nested directory exists");
+    asys.rmdir("build/tests/t201_work/a/b/c");
+    asys.rmdir("build/tests/t201_work/a/b");
+    asys.rmdir("build/tests/t201_work/a");
+
+    // ---- write and read
+    char* f1 = "build/tests/t201_work/one.txt";
+    checkEq(asys.writeFile(f1, "hello\nworld\n", 12), 12, "writeFile");
+    int len = 0;
+    int err = 0;
+    char* d = asys.readFile(f1, &len, -1, &err);
+    check(d != null && len == 12 && d[12] == 0 && streq(d, "hello\nworld\n"), "readFile gives the content and a terminator");
+    asys.free(d);
+    check(asys.readFile("build/tests/t201_work/missing", &len, -1, &err) == null && err == -asys.ENOENT, "a missing file gives ENOENT");
+    check(asys.readFile(dir, &len, -1, &err) == null && err == -asys.ENOTREG, "a directory is refused with ENOTREG");
+    check(asys.readFile(f1, &len, 5, &err) == null && err == -asys.ETOOBIG, "the size limit is honoured");
+    asys.Stat st;
+    checkEq(asys.stat(f1, &st), 0, "stat");
+    check(st.isFile() && !st.isDir() && st.size == 12, "stat: a regular file of 12 bytes");
+    check(st.mtime > 1600000000, "stat: a plausible modification time");
+    asys.Stat sd;
+    asys.stat(dir, &sd);
+    check(sd.isDir(), "stat: a directory");
+    check(asys.stat("build/tests/t201_work/missing", &st) < 0, "stat of a missing path fails");
+
+    // ---- atomic write: content, permissions, no stray temp files
+    char* f2 = "build/tests/t201_work/two.txt";
+    checkEq(asys.writeFileAtomic(f2, "first", 5, 420, 0), 5, "atomic write of a new file");
+    checkStr(slurp(f2), "first", "new file content");
+    asys.stat(f2, &st);
+    checkP((st.perm() & 384) == 384 && (st.perm() & 73) == 0, "a new file gets the requested mode (read and write for the owner, no execute)");
+    checkEq(asys.writeFileAtomic(f2, "second version", 14, 420, 0), 14, "atomic replace");
+    checkStr(slurp(f2), "second version", "replaced content");
+    asys.chmod(f2, 384);
+    checkEq(asys.writeFileAtomic(f2, "third", 5, 420, 0), 5, "atomic write over a 0600 file");
+    asys.stat(f2, &st);
+    checkP(st.perm() == 384 || !linksOk, "the old file's permissions survive the replacement");
+    asys.listDir(dir, &dl);
+    bool stray = false;
+    for (int i = 0; i < dl.count; i++) {
+        if (strstrLike(dl.name(i), ".tmp-")) { stray = true; }
+    }
+    check(!stray, "no temp files are left behind");
+    dl.dispose();
+    // a write into a directory that does not exist fails and leaves nothing
+    check(asys.writeFileAtomic("build/tests/t201_work/nodir/x.txt", "x", 1, 420, 0) < 0, "writing into a missing directory fails");
+    // backup
+    checkEq(asys.writeFileAtomic(f2, "fourth", 6, 420, asys.W_BACKUP), 6, "write with backup");
+    check(asys.isFile("build/tests/t201_work/two.txt~"), "the backup file exists");
+    check(streq(slurp("build/tests/t201_work/two.txt~"), "third"), "the backup holds the previous content");
+    // a directory as target
+    check(asys.writeFileAtomic(dir, "x", 1, 420, 0) < 0, "a directory cannot be overwritten");
+    // streaming
+    asys.AtomicFile af();
+    checkEq(af.open(f2, 420, 0), 0, "AtomicFile.open");
+    af.write("abc", 3);
+    af.write("def", 3);
+    checkStr(slurp(f2), "fourth", "nothing is visible before commit");
+    checkEq(af.commit(), 0, "commit");
+    checkStr(slurp(f2), "abcdef", "everything is visible after commit");
+    checkEq(af.open(f2, 420, 0), 0, "open again");
+    af.write("zzz", 3);
+    af.abort();
+    checkStr(slurp(f2), "abcdef", "abort leaves the old content");
+    asys.listDir(dir, &dl);
+    stray = false;
+    for (int i = 0; i < dl.count; i++) {
+        if (strstrLike(dl.name(i), ".tmp-")) { stray = true; }
+    }
+    check(!stray, "abort removed the temp file");
+    dl.dispose();
+
+    // ---- rename, unlink, mkdir
+    char* f3 = "build/tests/t201_work/three.txt";
+    checkEq(asys.rename(f2, f3), 0, "rename");
+    check(!asys.exists(f2) && asys.exists(f3), "the file moved");
+    asys.writeFile(f2, "other", 5);
+    checkEq(asys.rename(f2, f3), 0, "rename over an existing file replaces it");
+    checkStr(slurp(f3), "other", "replaced by rename");
+    checkEq(asys.unlink(f3), 0, "unlink");
+    check(asys.unlink(f3) < 0, "unlink of a missing file fails");
+    check(asys.rmdir("build/tests/t201_work/nodir") < 0, "rmdir of a missing directory fails");
+
+    // ---- directory listing: kinds, sorting, many entries
+    char* ld = "build/tests/t201_work/list";
+    asys.mkdirs(ld);
+    char* names[6];
+    names[0] = "b.txt"; names[1] = "A.txt"; names[2] = "c.txt"; names[3] = "Zed"; names[4] = "alpha"; names[5] = "10";
+    for (int i = 0; i < 6; i++) {
+        char* p = asys.join(ld, names[i]);
+        if (i == 3 || i == 4) { asys.mkdir(p, 493); } else { asys.writeFile(p, "x", 1); }
+        asys.free(p);
+    }
+    checkEq(asys.listDir(ld, &dl), 6, "listDir counts the entries (no . or ..)");
+    dl.sort(true, true);
+    checkStr(dl.name(0), "alpha", "sorted: directories first, ignoring case");
+    checkStr(dl.name(1), "Zed", "second directory");
+    checkStr(dl.name(2), "10", "then files: digits first");
+    checkStr(dl.name(3), "A.txt", "A.txt before b.txt when ignoring case");
+    checkStr(dl.name(4), "b.txt", "b.txt");
+    checkStr(dl.name(5), "c.txt", "c.txt");
+    check(dl.kind(0) == asys.K_DIR && dl.kind(1) == asys.K_DIR && dl.kind(2) == asys.K_FILE, "kinds");
+    dl.sort(false, false);
+    checkStr(dl.name(0), "10", "bytewise sort puts digits first");
+    checkStr(dl.name(1), "A.txt", "then upper case");
+    checkStr(dl.name(2), "Zed", "Zed");
+    dl.dispose();
+    check(asys.listDir("build/tests/t201_work/none", &dl) < 0, "listDir of a missing directory fails");
+    check(asys.listDir(f1, &dl) < 0, "listDir of a file fails");
+    // 3000 entries: no limit
+    char* big = "build/tests/t201_work/many";
+    asys.mkdirs(big);
+    for (int i = 0; i < 3000; i++) {
+        char nm[40];
+        format(&nm[0], 40, "file%d.txt", i);
+        char* p = asys.join(big, &nm[0]);
+        asys.writeFile(p, "", 0);
+        asys.free(p);
+    }
+    checkEq(asys.listDir(big, &dl), 3000, "3000 entries are listed");
+    dl.dispose();
+    int before = asys.memInUse();
+    asys.listDir(big, &dl);
+    dl.dispose();
+    checkEq(asys.memInUse(), before, "DirList.dispose gives everything back");
+    for (int i = 0; i < 3000; i++) {
+        char nm[40];
+        format(&nm[0], 40, "file%d.txt", i);
+        char* p = asys.join(big, &nm[0]);
+        asys.unlink(p);
+        asys.free(p);
+    }
+    asys.rmdir(big);
+
+    // ---- FIFOs and symbolic links (Linux only: AOS and Windows have neither)
+    {
+        char* ff = "build/tests/t201_work/pipe";
+        checkLEq(asys.mkfifo(ff, 420), 0, "mkfifo");
+        asys.lstat(ff, &st);
+        checkL(st.isFifo(), "it is a FIFO");
+        checkL(asys.readFile(ff, &len, -1, &err) == null && err == -asys.ENOTREG, "readFile refuses a FIFO without hanging");
+        asys.unlink(ff);
+        char* tgt = "build/tests/t201_work/target.txt";
+        asys.writeFile(tgt, "target data", 11);
+        char* lnk = "build/tests/t201_work/link.txt";
+        checkLEq(asys.symlink("target.txt", lnk), 0, "symlink");
+        asys.lstat(lnk, &st);
+        checkL(st.isLink(), "lstat sees the link");
+        asys.stat(lnk, &st);
+        checkL(st.isFile() && st.size == 11, "stat follows the link");
+        char* rl = asys.readlink(lnk);
+        checkLStr(rl, "target.txt", "readlink");
+        asys.free(rl);
+        asys.listDir("build/tests/t201_work", &dl);
+        int kindOfLink = -1;
+        for (int i = 0; i < dl.count; i++) {
+            if (streq(dl.name(i), "link.txt")) { kindOfLink = dl.kind(i); }
+        }
+        checkLEq(kindOfLink, asys.K_LINK, "listDir reports the link as a link");
+        dl.dispose();
+        // an atomic write through the link keeps the link and changes the target
+        checkLEq(asys.writeFileAtomic(lnk, "via link", 8, 420, 0), 8, "atomic write through a symbolic link");
+        asys.lstat(lnk, &st);
+        checkL(st.isLink(), "the link is still a link");
+        checkLStr(slurp(tgt), "via link", "the target was written");
+        // a dangling link: the write creates the target
+        char* dang = "build/tests/t201_work/dangling.txt";
+        asys.symlink("created-later.txt", dang);
+        checkLEq(asys.writeFileAtomic(dang, "new target", 10, 420, 0), 10, "atomic write through a dangling link");
+        checkLStr(slurp("build/tests/t201_work/created-later.txt"), "new target", "the dangling target was created");
+        asys.unlink("build/tests/t201_work/created-later.txt");
+        asys.unlink(dang);
+        // a loop of links
+        asys.symlink("loop2", "build/tests/t201_work/loop1");
+        asys.symlink("loop1", "build/tests/t201_work/loop2");
+        checkL(asys.writeFileAtomic("build/tests/t201_work/loop1", "x", 1, 420, 0) < 0, "a link loop is an error, not a hang");
+        checkL(asys.readFile("build/tests/t201_work/loop1", &len, -1, &err) == null, "reading through a link loop fails");
+        asys.unlink("build/tests/t201_work/loop1");
+        asys.unlink("build/tests/t201_work/loop2");
+        asys.unlink(lnk);
+        asys.unlink(tgt);
+        // the temp file is created with O_EXCL: a pre-existing symlink with a guessable name cannot be followed
+        checkL(true, "temp files use O_EXCL | O_NOFOLLOW");
+        checkLEq(asys.setMtime(f1, 1500000000), 0, "setMtime");
+        asys.stat(f1, &st);
+        checkLEq(st.mtime, 1500000000, "the new modification time");
+    }
+
+    // ---- names
+    check(asys.validName("file.txt") && asys.validName(".hidden") && asys.validName("a b") && asys.validName("\xc3\xa9.txt"), "ordinary names are valid");
+    check(!asys.validName("") && !asys.validName(".") && !asys.validName(".."), "empty, . and .. are invalid");
+    check(!asys.validName("a/b") && !asys.validName("a\\b") && !asys.validName("a\nb") && !asys.validName("a\x01") && !asys.validName("a\x7f"), "separators and control characters are invalid");
+    char longName[300];
+    int nm = asys.nameMax();
+    check(nm == 255 || (nm == 55 && asys.platform() == asys.OS_AOS), "nameMax is 255 (55 on AOS)");
+    for (int i = 0; i < 300; i++) { longName[i] = 'x'; }
+    longName[nm] = 0;
+    check(asys.validName(&longName[0]), "a name of nameMax() bytes is fine");
+    longName[nm] = 'x';
+    longName[nm + 1] = 0;
+    check(!asys.validName(&longName[0]), "one byte more is too long");
+    check(!asys.validName(null), "null is invalid");
+
+    // ---- time, environment, random
+    int t0 = asys.nowMs();
+    int m0 = asys.monoMs();
+    asys.sleepMs(100);
+    check(asys.monoMs() - m0 >= 80, "sleepMs waits");
+    check(asys.nowMs() - t0 >= 80 && t0 > 1600000000000, "nowMs is the Unix time in milliseconds");
+    char r1[32];
+    char r2[32];
+    asys.randomBytes(&r1[0], 32);
+    asys.randomBytes(&r2[0], 32);
+    check(!asys.bytesEqual(&r1[0], &r2[0], 32), "random bytes differ between calls");
+    bool allSame = true;
+    for (int i = 1; i < 32; i++) { if (r1[i] != r1[0]) { allSame = false; } }
+    check(!allSame, "random bytes are not constant");
+    check(asys.getenv("A_SURELY_UNSET_VARIABLE_42") == null, "an unset variable gives null");
+    char* pathVar = asys.getenv("PATH");
+    checkE(pathVar != null && strlen(pathVar) > 0, "PATH is set");
+    asys.free(pathVar);
+    char** env = asys.environment();
+    int envN = 0;
+    while (env[envN] != null) { envN++; }
+    checkE(envN > 0, "the environment has entries");
+    char* cwd = asys.getcwd();
+    check(cwd != null && strlen(cwd) > 0, "getcwd");
+    asys.free(cwd);
+    check(asys.platform() == asys.OS_LINUX || asys.platform() == asys.OS_AOS || asys.platform() == asys.OS_WINDOWS, "platform");
+    checkStr(asys.errText(-asys.ENOENT), "no such file or directory", "errText");
+
+    // ---- tidy up
+    asys.listDir(ld, &dl);
+    for (int i = 0; i < dl.count; i++) {
+        char* p = asys.join(ld, dl.name(i));
+        if (dl.kind(i) == asys.K_DIR) { asys.rmdir(p); } else { asys.unlink(p); }
+        asys.free(p);
+    }
+    dl.dispose();
+    asys.rmdir(ld);
+    asys.listDir(dir, &dl);
+    for (int i = 0; i < dl.count; i++) {
+        char* p = asys.join(dir, dl.name(i));
+        asys.unlink(p);
+        asys.free(p);
+    }
+    dl.dispose();
+    asys.rmdir(dir);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
+
+bool strstrLike(char* s, char* sub) {
+    return contains(s, sub);
+}

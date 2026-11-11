@@ -1,0 +1,313 @@
+// An editing session the way the AIDE front ends will drive the libraries, all modules together: open a project (ignore rules, file
+// tree, quick open, recent files, settings), search it, open a file (buffer, editor, highlighter, symbols, completion), rename with
+// find / replace (one undo step), save, notice an external change, build with the real compiler (the error shows up as a problem
+// at the right line), fix it in the editor, build again and run the program. Everything is torn down at the end and the memory
+// must be back. Processes are skipped on Windows (the number of checks stays the same).
+import acode;
+import asyntax;
+import atheme;
+import aproject;
+import afind;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (got == null || !streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got == null ? "(null)" : got, want);
+    }
+}
+
+char* root = "build/tests/t219_proj";
+
+void mkdirp(char* rel) {
+    char* p = asys.join(root, rel);
+    asys.mkdirs(p);
+    asys.free(p);
+}
+
+void mkn(char* rel, char* text, int n) {
+    char* p = asys.join(root, rel);
+    asys.writeFile(p, text, n);
+    asys.free(p);
+}
+
+void mk(char* rel, char* text) {
+    mkn(rel, text, strlen(text));
+}
+
+// the program of the project: the semicolon after helper(1) is missing
+char* brokenMain = "// demo program\nint helper(int x) {\n    return x * 2;\n}\n\nint main() {\n    int total = helper(20) + helper(1)\n    printf(\"%d\\n\", total);\n    return 0;\n}\n";
+
+// removes a directory tree (files first), no links are followed
+void removeTree(char* dir) {
+    asys.DirList dl();
+    if (asys.listDir(dir, &dl) < 0) {
+        return;
+    }
+    for (int i = 0; i < dl.count; i++) {
+        char* full = asys.join(dir, dl.name(i));
+        if (dl.kind(i) == asys.K_DIR) {
+            removeTree(full);
+        } else {
+            asys.unlink(full);
+        }
+        asys.free(full);
+    }
+    dl.dispose();
+    asys.rmdir(dir);
+}
+
+// does the line have a token of this kind? (the spans cover the whole line, white space included)
+bool hasKind(asyntax.Token* tok, int n, int kind) {
+    for (int i = 0; i < n; i++) {
+        if (tok[i].kind == kind) { return true; }
+    }
+    return false;
+}
+
+char* mainPath() {
+    return asys.join(root, "src/main.a");
+}
+
+// the part of the session that needs no processes; run twice to see that nothing accumulates
+void session() {
+    char* mp = mainPath();
+    // ---- project, ignore rules, tree
+    aproject.Ignore ign();
+    ign.addBuiltin();
+    char* gi = asys.join(root, ".gitignore");
+    ign.loadFile(gi, "");
+    asys.free(gi);
+    check(ign.ignored("trace.log", false) && ign.ignored("build/x.o", false) && ign.ignored("node_modules", true), ".gitignore and built-in rules");
+    check(!ign.ignored("src/main.a", false) && !ign.ignored("docs/notes.md", false), "sources are not ignored");
+    aproject.FileTree* tree = new aproject.FileTree(root, &ign);
+    checkEq(tree->load(tree->root), 0, "load the project root");
+    tree->expand(tree->find("src"));
+    aproject.TreeNode* rows[40];
+    int nrows = tree->flatten(&rows[0], 40);
+    checkEq(nrows, 7, "rows: docs src main.a util.a .gitignore blob.bin README.md");
+    check(tree->find("node_modules") == null && tree->find("build") == null, "ignored folders are not in the tree");
+
+    // ---- quick open and recent files
+    aproject.Recent recent();
+    recent.add("src/util.a");
+    aproject.QuickOpen qo();
+    qo.recent = &recent;
+    int nfiles = qo.index(root, &ign);
+    checkEq(nfiles, 6, "six files are indexed (not the ignored ones)");
+    aproject.QuickMatch qm[10];
+    int nq = qo.query("mn", &qm[0], 10);
+    check(nq >= 1 && streq(qm[0].path, "src/main.a"), "mn finds src/main.a first");
+    nq = qo.query("ut", &qm[0], 10);
+    check(nq >= 1 && streq(qm[0].path, "src/util.a"), "ut finds src/util.a");
+    qo.dispose();
+
+    // ---- find in files
+    aproject.FindJob* fj = new aproject.FindJob();
+    checkEq(fj->start(root, "helper", aproject.FIND_WORD, &ign, 0), 0, "start find in files");
+    int guard = 0;
+    while (fj->step(20) == aproject.FIND_RUNNING && guard < 100000) { guard++; }
+    checkEq(fj->count, 4, "3 hits in main.a and 1 in notes.md; no hit in ignored, log or binary files");
+    check(fj->filesSkipped >= 1, "the binary file was skipped");
+    bool allKnown = true;
+    for (int i = 0; i < fj->count; i++) {
+        if (!(contains(fj->results[i].path, "main.a") || contains(fj->results[i].path, "notes.md"))) { allKnown = false; }
+    }
+    check(allKnown, "hits are in the expected files only");
+    fj->dispose();
+
+    // ---- open the file: buffer, editor, highlighter, theme
+    acode.Buffer b();
+    checkEq(b.load(mp), 0, "load src/main.a");
+    int lang = asyntax.detectLanguage("main.a", null);
+    check(lang == asyntax.Lang.A, "language from the file name");
+    acode.Editor e(&b);
+    e.setLanguage(asyntax.languageName(lang));
+    asyntax.Highlighter* hl = new asyntax.Highlighter(&b, lang);
+    atheme.Theme* th = atheme.builtin("dark");
+    asyntax.Token tok[32];
+    int nt = hl->tokens(0, &tok[0], 32);
+    check(nt == 1 && tok[0].kind == asyntax.Tok.Comment, "line 1 is one comment token");
+    nt = hl->tokens(1, &tok[0], 32);
+    check(nt >= 3 && tok[0].kind == asyntax.Tok.Type && hasKind(&tok[0], nt, asyntax.Tok.Function), "int helper: type, then function name");
+    check(th->tokenColor(asyntax.Tok.Comment) != th->tokenColor(asyntax.Tok.Keyword), "the theme paints comments and keywords differently");
+    // symbols and completion
+    asyntax.SymbolList sl();
+    asyntax.symbols(&b, lang, &sl);
+    check(sl.find("helper") >= 0 && sl.find("main") >= 0 && sl.count == 2, "two functions found");
+    asyntax.Completer comp();
+    comp.addBuffer(&b, lang);
+    asyntax.Candidate cands[10];
+    int nc = comp.complete("hel", lang, &cands[0], 10);
+    check(nc >= 1 && streq(cands[0].text, "helper"), "completion offers helper");
+    comp.dispose();
+    sl.dispose();
+
+    // ---- rename with find / replace: one undo step
+    int len0 = b.length();
+    char* before = b.getText(0, len0);
+    afind.Finder f(&b);
+    check(f.setPattern("helper", afind.OPT_WORD), "pattern");
+    checkEq(f.count(100), 3, "three occurrences");
+    int undoBefore = b.undoDepth();
+    checkEq(f.replaceAll(&e, "double_it"), 3, "replaced three");
+    checkEq(b.undoDepth(), undoBefore + 1, "one undo step for replace all");
+    check(f.setPattern("double_it", 0), "pattern 2");
+    checkEq(f.count(100), 3, "the new name appears three times");
+    nt = hl->tokens(1, &tok[0], 32);
+    check(nt >= 3 && hasKind(&tok[0], nt, asyntax.Tok.Function), "the highlighter follows the edit");
+    e.undo();
+    char* undone = b.getText(0, b.length());
+    checkStr(undone, before, "undo restores the text exactly");
+    e.redo();
+    checkEq(f.count(100), 3, "redo brings the new name back");
+    e.undo();
+    check(!b.modified(), "after undo the buffer is not modified");
+    f.dispose();
+    asys.free(undone);
+
+    // ---- type the missing semicolon (line 7, end of line), save, see an external change
+    e.setCursor(b.lineEnd(6));
+    e.typeString(";");
+    check(b.modified(), "modified after typing");
+    checkEq(b.save(null, asys.W_NOSYNC), 0, "save");
+    check(!b.modified() && b.checkExternal() == acode.EXT_NONE, "saved and in sync with the disk");
+    asys.sleepMs(100);
+    asys.writeFile(mp, "// changed outside\n", 19);
+    check(b.checkExternal() == acode.EXT_CHANGED, "an external change is noticed");
+    checkEq(b.reload(), 0, "reload");
+    checkEq(b.lineCount(), 2, "the reloaded file has two lines");
+    check(b.checkExternal() == acode.EXT_NONE, "in sync again");
+    mk("src/main.a", brokenMain);                       // the project as it was
+    asys.free(before);
+
+    // ---- watcher
+    aproject.Watcher w();
+    char* srcDir = asys.join(root, "src");
+    w.watch(srcDir);
+    aproject.WatchEvent ev[10];
+    checkEq(w.poll(&ev[0], 10), 0, "nothing changed yet");
+    mk("src/new.a", "x");
+    int ne = w.poll(&ev[0], 10);
+    check(ne == 1 && ev[0].kind == aproject.WATCH_CREATED, "a new file is reported");
+    asys.unlink("build/tests/t219_proj/src/new.a");
+    w.dispose();
+    asys.free(srcDir);
+
+    // ---- settings round trip
+    atheme.Settings s();
+    s.tabWidth = 3;
+    s.addRecentFile("src/main.a");
+    s.addRecentProject(root);
+    char* sp = asys.join(root, "settings.ini");
+    checkEq(s.save(sp), 0, "save settings");
+    atheme.Settings s2();
+    checkEq(s2.load(sp), 0, "load settings");
+    check(s2.tabWidth == 3 && s2.nFiles == 1 && streq(s2.recentFiles[0], "src/main.a") && s2.nProjects == 1, "settings round trip");
+    e.tabWidth = s2.tabWidth;
+    checkEq(e.tabWidth, 3, "the editor takes the setting");
+    s2.dispose();
+    s.dispose();
+    asys.unlink(sp);
+    asys.free(sp);
+
+    // ---- tear down
+    recent.dispose();
+    tree->dispose();
+    ign.dispose();
+    hl->dispose();
+    th->dispose();
+    e.dispose();
+    b.dispose();
+    asys.free(mp);
+}
+
+int main() {
+    asys.mkdirs("build/tests");
+    removeTree(root);
+    mkdirp("src");
+    mkdirp("docs");
+    mkdirp("build");
+    mkdirp("node_modules");
+    mk(".gitignore", "*.log\nbuild/\n");
+    mk("README.md", "# demo\n");
+    mk("docs/notes.md", "the helper functions are small\n");
+    mk("src/util.a", "int twice(int x) { return x * 2; }\n");
+    mk("src/main.a", brokenMain);
+    mk("trace.log", "helper helper\n");
+    mk("build/junk.txt", "helper\n");
+    mk("node_modules/x.js", "helper\n");
+    mkn("blob.bin", "helper\x00\x01\x02helper\n", 15);
+    int base = asys.memInUse();
+
+    session();
+    int afterFirst = asys.memInUse();
+    session();
+    int afterSecond = asys.memInUse();
+    check(afterSecond - afterFirst < 16384, "a second session leaves no memory behind (the first one warms up the lazy tables)");
+    check(afterFirst - base < 262144, "and the first one leaves only the lazy tables");
+
+    // ---- build with the real compiler, fix the error in the editor, build again, run
+    if (asys.canSpawn() && asys.isFile("build/ac")) {
+        char* mp = mainPath();
+        char* outp = asys.join(root, "main.out");
+        acode.Buffer b();
+        b.load(mp);
+        acode.Editor e(&b);
+        aproject.BuildJob* bj = new aproject.BuildJob();
+        char* argv[6];
+        argv[0] = "build/ac"; argv[1] = mp; argv[2] = "-o"; argv[3] = outp; argv[4] = null;
+        checkEq(bj->startCommand(&argv[0], null), 0, "start the compiler");
+        check(bj->wait(30000) && bj->exitCode == 1, "the compiler fails");
+        check(bj->problemCount == 1 && bj->problems[0].severity == aproject.SEV_ERROR && streq(bj->problems[0].message, "expected ';'"), "one problem: expected ';'");
+        int pl = (bj->problemCount == 1) ? bj->problems[0].line : 0;
+        checkEq(pl, 8, "reported at line 8 (the line after the missing semicolon)");
+        // jump to the line before the reported one and add the semicolon, as a user would
+        e.gotoLine(pl - 2, 0);
+        e.moveEnd(false);
+        e.typeString(";");
+        char* fixedLine = b.getLine(6);
+        checkStr(fixedLine, "    int total = helper(20) + helper(1);", "the line was fixed");
+        asys.free(fixedLine);
+        checkEq(b.save(null, asys.W_NOSYNC), 0, "save the fix");
+        checkEq(bj->startCommand(&argv[0], null), 0, "start the compiler again");
+        check(bj->wait(30000) && bj->exitCode == 0 && bj->problemCount == 0, "now it compiles without problems");
+        aproject.RunJob* rj = new aproject.RunJob();
+        checkEq(rj->startProgram(outp, null, null), 0, "run the program");
+        check(rj->wait(10000) && rj->exited && rj->exitCode == 0, "it exits normally");
+        char* text = rj->readAll();
+        checkStr(text, "42\n", "it prints 42");
+        asys.free(text);
+        rj->dispose();
+        bj->dispose();
+        e.dispose();
+        b.dispose();
+        asys.free(mp);
+        asys.free(outp);
+    } else {
+        checks = checks + 11;
+    }
+    removeTree(root);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

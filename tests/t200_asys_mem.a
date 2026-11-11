@@ -1,0 +1,214 @@
+// asys memory: alloc / realloc / free, counters, zeroing, big blocks, moveBytes
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        print("FAIL: ");
+        println(what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+bool allZero(char* p, int n) {
+    for (int i = 0; i < n; i++) {
+        if (p[i] != 0) { return false; }
+    }
+    return true;
+}
+
+int main() {
+    int base = asys.memInUse();
+    int baseBlocks = asys.memBlocks();
+
+    // small blocks: zeroed, counted, reused after free
+    char* a = asys.alloc(1);
+    char* b = asys.alloc(100);
+    check(a != null && b != null && a != b, "alloc returns distinct blocks");
+    check(allZero(a, 1) && allZero(b, 100), "fresh blocks are zero");
+    checkEq(asys.memBlocks() - baseBlocks, 2, "two live blocks");
+    check(asys.blockSize(a) >= 1 && asys.blockSize(b) >= 100, "block sizes");
+    for (int i = 0; i < 100; i++) { b[i] = 0x55; }
+    asys.free(b);
+    char* c = asys.alloc(100);
+    check(allZero(c, 100), "a reused block is zeroed again");
+    asys.free(a);
+    asys.free(c);
+    checkEq(asys.memInUse(), base, "in-use returns to the base after free");
+    checkEq(asys.memBlocks(), baseBlocks, "no live blocks after free");
+
+    // every size from 1 to 600 and some larger ones give a usable block of at least that size
+    bool sizesOk = true;
+    for (int n = 1; n <= 600; n = n + 7) {
+        char* p = asys.alloc(n);
+        if (p == null || asys.blockSize(p) < n || !allZero(p, n)) { sizesOk = false; }
+        p[n - 1] = 7;
+        asys.free(p);
+    }
+    int sizes[10] = {1000, 4000, 4096, 5000, 20000, 65536, 100000, 131072, 131073, 300000};
+    for (int i = 0; i < 10; i++) {
+        char* p = asys.alloc(sizes[i]);
+        if (p == null || asys.blockSize(p) < sizes[i] || !allZero(p, sizes[i])) { sizesOk = false; }
+        p[sizes[i] - 1] = 7;
+        asys.free(p);
+    }
+    check(sizesOk, "sizes across the class boundaries");
+    checkEq(asys.memInUse(), base, "in-use after the size sweep");
+
+    // the waste is bounded: capacity <= 1.25 * request for blocks above 128 bytes
+    bool tight = true;
+    for (int n = 129; n < 100000; n = n + 997) {
+        char* p = asys.alloc(n);
+        if (asys.blockSize(p) * 4 > n * 5 + 16) { tight = false; }
+        asys.free(p);
+    }
+    check(tight, "size classes waste at most a quarter");
+
+    // realloc keeps the content and zeroes the new part
+    char* r = asys.alloc(10);
+    for (int i = 0; i < 10; i++) { r[i] = i + 1; }
+    r = asys.realloc(r, 5000);
+    bool keep = true;
+    for (int i = 0; i < 10; i++) { if (r[i] != i + 1) { keep = false; } }
+    check(keep, "realloc keeps the content");
+    check(allZero(&r[10], 4990), "realloc zeroes the new bytes");
+    r = asys.realloc(r, 3);
+    check(r[0] == 1 && r[2] == 3, "realloc to smaller keeps the head");
+    r = asys.realloc(r, 20);
+    check(allZero(&r[3], 17), "growing again after a shrink sees zeros, not old data");
+    r = asys.realloc(r, 0);
+    check(r == null, "realloc to 0 frees");
+    char* nn = asys.realloc(null, 64);
+    check(nn != null, "realloc(null) allocates");
+    asys.free(nn);
+    checkEq(asys.memInUse(), base, "in-use after realloc tests");
+
+    // big blocks go back to the system
+    int mapped0 = asys.memMapped();
+    char* big = asys.alloc(50 * 1024 * 1024);
+    check(big != null, "50 MB block");
+    big[0] = 1;
+    big[50 * 1024 * 1024 - 1] = 2;
+    check(asys.memInUse() - base >= 50 * 1024 * 1024, "50 MB counted");
+    big = asys.realloc(big, 120 * 1024 * 1024);
+    check(big != null && big[0] == 1 && big[50 * 1024 * 1024 - 1] == 2, "big realloc keeps content");
+    check(allZero(&big[50 * 1024 * 1024], 4096), "big realloc zero tail");
+    big = asys.realloc(big, 1000);
+    check(big != null && big[0] == 1, "shrinking a big block to a small one keeps the head");
+    check(asys.memInUse() - base < 1024 * 1024, "after the shrink nearly nothing is in use");
+    asys.free(big);
+    checkEq(asys.memInUse(), base, "in-use after the big cycle");
+    check(asys.keepsBigBlocks() || asys.memMapped() <= mapped0 + 2097152 * 2, "mapped memory went back to the system (not on Windows and AOS: the allocator keeps big blocks for reuse)");
+
+    // many small blocks, freed in another order, then reused: no growth of the mapped memory
+    char* ptrs[500];
+    for (int i = 0; i < 500; i++) { ptrs[i] = asys.alloc(24 + (i % 50) * 8); }
+    int mappedMid = asys.memMapped();
+    for (int i = 0; i < 500; i = i + 2) { asys.free(ptrs[i]); }
+    for (int i = 1; i < 500; i = i + 2) { asys.free(ptrs[i]); }
+    for (int i = 0; i < 500; i++) { ptrs[i] = asys.alloc(24 + (i % 50) * 8); }
+    checkEq(asys.memMapped(), mappedMid, "freed small blocks are reused");
+    for (int i = 0; i < 500; i++) { asys.free(ptrs[i]); }
+    checkEq(asys.memInUse(), base, "in-use after 500 blocks");
+
+    // a double free and a foreign pointer are ignored and counted
+    char* d = asys.alloc(40);
+    asys.free(d);
+    int bad0 = asys.memBadFrees();
+    asys.free(d);
+    char local[64];
+    asys.free(&local[16]);
+    check(asys.memBadFrees() == bad0 + 2, "double free and foreign pointer are detected");
+    checkEq(asys.memInUse(), base, "bad frees do not change the counters");
+
+    // moveBytes handles overlap in both directions
+    char* m = asys.alloc(200);
+    for (int i = 0; i < 100; i++) { m[i] = i + 1; }
+    asys.moveBytes(&m[7], &m[0], 100);               // dst above src, overlapping: backwards
+    bool fw = true;
+    for (int i = 0; i < 100; i++) { if (m[7 + i] != i + 1) { fw = false; } }
+    check(fw, "moveBytes overlapping upwards");
+    asys.moveBytes(&m[0], &m[7], 100);               // dst below src: forwards
+    bool bw = true;
+    for (int i = 0; i < 100; i++) { if (m[i] != i + 1) { bw = false; } }
+    check(bw, "moveBytes overlapping downwards");
+    for (int off = 1; off < 17; off++) {
+        for (int i = 0; i < 100; i++) { m[i] = (i * 3 + off) & 255; }
+        asys.moveBytes(&m[off], &m[0], 100);
+        bool ok = true;
+        for (int i = 0; i < 100; i++) { if (m[off + i] != ((i * 3 + off) & 255)) { ok = false; } }
+        check(ok, "moveBytes upwards at every alignment");
+    }
+    asys.free(m);
+
+    // overlapping moves upwards by many distances (the block copy of the gap moves of a big text buffer is used from 64 bytes up),
+    // sizes that are no multiple of the distance, odd offsets; the result is compared with the expected pattern
+    {
+        int total = 40000;
+        char* big = asys.alloc(total + 30000);
+        int sizes[6];
+        sizes[0] = 1; sizes[1] = 63; sizes[2] = 64; sizes[3] = 1000; sizes[4] = 12345; sizes[5] = 39999;
+        int dists[12];
+        dists[0] = 1; dists[1] = 7; dists[2] = 8; dists[3] = 9; dists[4] = 63; dists[5] = 64; dists[6] = 65; dists[7] = 100;
+        dists[8] = 255; dists[9] = 1000; dists[10] = 4099; dists[11] = 19999;
+        bool allOk = true;
+        for (int si = 0; si < 6; si++) {
+            for (int di = 0; di < 12; di++) {
+                int n = sizes[si];
+                int dist = dists[di];
+                for (int i = 0; i < total + 30000; i++) { big[i] = (i * 7 + 3) & 255; }
+                asys.moveBytes(&big[5 + dist], &big[5], n);
+                for (int i = 0; i < n; i++) {
+                    if (big[5 + dist + i] != (((5 + i) * 7 + 3) & 255)) { allOk = false; }
+                }
+                // bytes below the source and above the destination stay as they were
+                if (big[4] != ((4 * 7 + 3) & 255) || big[5 + dist + n] != (((5 + dist + n) * 7 + 3) & 255)) { allOk = false; }
+            }
+        }
+        check(allOk, "moveBytes upwards: 6 sizes x 12 distances, untouched neighbours");
+        asys.free(big);
+    }
+    {
+        // a text buffer's gap move: 3 MB moved up by 777 KB + 3 (not a multiple of 8): correct, and not a slow byte loop
+        int total = 4 << 20;
+        char* big = asys.alloc(total);
+        for (int i = 0; i < total; i++) { big[i] = (i * 13 + 1) & 255; }
+        int dist = 777 * 1024 + 3;
+        int n = 3 << 20;
+        int t0 = asys.monoMs();
+        asys.moveBytes(&big[dist], &big[0], n);
+        int took = asys.monoMs() - t0;
+        bool ok = true;
+        for (int i = 0; i < n; i = i + 997) {
+            if (big[dist + i] != ((i * 13 + 1) & 255)) { ok = false; }
+        }
+        check(ok && took < 500, "a 3 MB overlapping move by an odd distance is correct and fast");
+        asys.free(big);
+    }
+
+    // strings
+    char* s = asys.strDup("hello");
+    char* t = asys.strDupN("worldly", 5);
+    check(streq(s, "hello") && streq(t, "world"), "strDup, strDupN");
+    char* j = asys.join("a/b", "c");
+    char* j2 = asys.join("a/b/", "/c");
+    char* j3 = asys.join("", "c");
+    char* j4 = asys.concat3("x", "yy", "zzz");
+    check(streq(j, "a/b/c") && streq(j2, "a/b/c") && streq(j3, "c") && streq(j4, "xyyzzz"), "join and concat3");
+    asys.free(s); asys.free(t); asys.free(j); asys.free(j2); asys.free(j3); asys.free(j4);
+    checkEq(asys.memInUse(), base, "in-use at the end");
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

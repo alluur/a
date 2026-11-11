@@ -1,0 +1,435 @@
+// aproject: glob and ignore rules, the lazy file tree (sorting, ignoring, symlink and FIFO safety, bounds, create / rename / remove),
+// the polling watcher, recent files, quick open
+import aproject;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (got == null || !streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got == null ? "(null)" : got, want);
+    }
+}
+
+bool linksOk;
+void checkL(bool ok, char* what) { check(!linksOk || ok, what); }
+void checkLEq(int got, int want, char* what) { check(!linksOk || got == want, what); }
+
+char* root = "build/tests/t211_work";
+
+char* p(char* rel) {
+    return asys.join(root, rel);
+}
+
+void mk(char* rel, char* content) {
+    char* f = p(rel);
+    asys.writeFile(f, content, strlen(content));
+    asys.free(f);
+}
+
+void mkd(char* rel) {
+    char* f = p(rel);
+    asys.mkdirs(f);
+    asys.free(f);
+}
+
+void rmTree(char* path) {
+    asys.DirList dl();
+    if (asys.listDir(path, &dl) >= 0) {
+        for (int i = 0; i < dl.count; i++) {
+            char* c = asys.join(path, dl.name(i));
+            if (dl.kind(i) == asys.K_DIR) { rmTree(c); } else { asys.unlink(c); }
+            asys.free(c);
+        }
+    }
+    dl.dispose();
+    asys.rmdir(path);
+}
+
+// the names of the children of a node, joined with commas ("/" after directories)
+char names[2000];
+char* kidNames(aproject.TreeNode* n) {
+    int w = 0;
+    for (int i = 0; i < n->nkids; i++) {
+        if (i > 0) { names[w] = ','; w++; }
+        int l = strlen(n->kids[i]->name);
+        memcpy(&names[w], n->kids[i]->name, l);
+        w = w + l;
+        if (n->kids[i]->kind == asys.K_DIR) { names[w] = '/'; w++; }
+        else if (n->kids[i]->kind == asys.K_LINK) { names[w] = '@'; w++; }
+    }
+    names[w] = 0;
+    return &names[0];
+}
+
+bool ig(aproject.Ignore* r, char* path, bool dir) {
+    return r->ignored(path, dir);
+}
+
+int main() {
+    linksOk = asys.hasLinks();
+    rmTree(root);
+    asys.mkdirs(root);
+
+    // ---- glob patterns
+    check(aproject.globMatch("*.a", "main.a") && !aproject.globMatch("*.a", "main.ab") && !aproject.globMatch("*.a", "dir/main.a"), "* does not cross a slash");
+    check(aproject.globMatch("a?c", "abc") && !aproject.globMatch("a?c", "a/c") && !aproject.globMatch("a?c", "ac"), "?");
+    check(aproject.globMatch("[abc]x", "bx") && !aproject.globMatch("[abc]x", "dx") && aproject.globMatch("[a-c]x", "cx") && aproject.globMatch("[!a-c]x", "dx") && !aproject.globMatch("[^a-c]x", "bx"), "sets");
+    check(aproject.globMatch("**/foo", "foo") && aproject.globMatch("**/foo", "a/b/foo") && !aproject.globMatch("**/foo", "a/b/foox"), "**/ matches no or many directories");
+    check(aproject.globMatch("a/**/b", "a/b") && aproject.globMatch("a/**/b", "a/x/y/b") && !aproject.globMatch("a/**/b", "ab"), "a/**/b");
+    check(aproject.globMatch("foo/**", "foo/a/b") && aproject.globMatch("src/*.c", "src/x.c") && !aproject.globMatch("src/*.c", "src/d/x.c"), "foo/**");
+    check(aproject.globMatch("\\*literal", "*literal") && aproject.globMatch("a[b", "a[b"), "escapes and an unclosed set");
+    check(aproject.globMatch("", "") && !aproject.globMatch("", "x") && aproject.globMatch("*", "") && aproject.globMatch("**", "a/b/c"), "empty cases");
+
+    // ---- ignore rules
+    {
+        aproject.Ignore r();
+        r.addPattern("# a comment", "");
+        r.addPattern("", "");
+        r.addPattern("*.log", "");
+        r.addPattern("build/", "");
+        r.addPattern("/root-only.txt", "");
+        r.addPattern("docs/*.tmp", "");
+        r.addPattern("!keep.log", "");
+        r.addPattern("\\#hash", "");
+        r.addPattern("**/gen", "");
+        r.addPattern("trailing   ", "");
+        check(ig(&r, "a.log", false) && ig(&r, "x/y/a.log", false), "*.log matches at any depth");
+        check(!ig(&r, "keep.log", false) && !ig(&r, "sub/keep.log", false), "! re-includes");
+        check(ig(&r, "build", true) && ig(&r, "src/build", true) && !ig(&r, "build", false), "a rule with a trailing slash matches directories only");
+        check(ig(&r, "root-only.txt", false) && !ig(&r, "sub/root-only.txt", false), "a leading slash anchors to the root");
+        check(ig(&r, "docs/x.tmp", false) && !ig(&r, "other/docs/x.tmp", false) && !ig(&r, "docs/a/x.tmp", false), "a slash inside the pattern anchors it");
+        check(ig(&r, "#hash", false), "an escaped # is a pattern");
+        check(ig(&r, "gen", true) && ig(&r, "a/b/gen", false), "**/gen");
+        check(ig(&r, "trailing", false), "trailing white space is ignored");
+        check(!ig(&r, "main.a", false) && !ig(&r, "src/x.c", false), "other files are not ignored");
+        aproject.Ignore nested();
+        nested.addPattern("*.o", "sub");
+        nested.addPattern("secret", "sub/deep");
+        check(ig(&nested, "sub/x.o", false) && ig(&nested, "sub/a/x.o", false) && !ig(&nested, "x.o", false) && !ig(&nested, "other/x.o", false), "rules of a nested file apply below its directory only");
+        check(ig(&nested, "sub/deep/secret", false) && !ig(&nested, "sub/secret", false), "a deeper base");
+        aproject.Ignore b();
+        b.addBuiltin();
+        check(ig(&b, ".git", true) && ig(&b, "node_modules", true) && ig(&b, "src/x.o", false) && ig(&b, "x.pyc", false) && ig(&b, "a/b/.DS_Store", false) && ig(&b, "x.swp", false) && ig(&b, "notes~", false), "built-in rules");
+        check(!ig(&b, "main.a", false) && !ig(&b, "lib/regex.a", false) && !ig(&b, "build", true), ".a sources and build directories are kept");
+        // a .gitignore file
+        mk(".gitignore", "# project\n*.tmp\n!important.tmp\nout/\n");
+        aproject.Ignore f();
+        char* gi = p(".gitignore");
+        check(f.loadFile(gi, ""), "loadFile");
+        check(!f.loadFile("build/tests/t211_work/nope", ""), "a missing .gitignore is not an error");
+        asys.free(gi);
+        check(ig(&f, "a.tmp", false) && !ig(&f, "important.tmp", false) && ig(&f, "out", true), "rules from a file");
+        asys.unlink("build/tests/t211_work/.gitignore");
+        r.dispose();
+        check(r.count == 0, "dispose");
+    }
+
+    // ---- the tree: sorting, laziness, ignoring
+    mkd("src/deep/er");
+    mkd("docs");
+    mkd("build");
+    mkd(".git");
+    mk("README.md", "x");
+    mk("zeta.txt", "x");
+    mk("Alpha.txt", "x");
+    mk("src/main.a", "x");
+    mk("src/util.a", "x");
+    mk("src/skip.o", "x");
+    mk("src/deep/er/leaf.a", "x");
+    mk("docs/notes.md", "x");
+    mk("build/out.bin", "x");
+    mk(".git/config", "x");
+    {
+        aproject.Ignore ign();
+        ign.addBuiltin();
+        ign.addPattern("build/", "");
+        aproject.FileTree* t = new aproject.FileTree(root, &ign);
+        check(!t->root->loaded && t->root->nkids == 0, "nothing is read before load");
+        checkEq(t->load(t->root), 0, "load the root");
+        checkStr(kidNames(t->root), "docs/,src/,Alpha.txt,README.md,zeta.txt", "folders first, then files, ignoring case; .git and build are ignored");
+        aproject.TreeNode* src = t->find("src");
+        check(src != null && src->kind == asys.K_DIR && !src->loaded, "a subdirectory is not loaded until asked for");
+        t->expand(src);
+        checkStr(kidNames(src), "deep/,main.a,util.a", "src: the .o file is ignored");
+        check(src->expanded && src->depth == 1, "expanded, depth 1");
+        aproject.TreeNode* deep = t->find("src/deep");
+        check(deep != null && !deep->loaded, "its children are still unread");
+        check(t->find("src/deep/er") == null, "unloaded nodes cannot be found");
+        t->expand(deep);
+        t->expand(t->find("src/deep/er"));
+        check(t->find("src/deep/er/leaf.a") != null, "find a deep node");
+        checkStr(t->find("src/deep/er/leaf.a")->rel, "src/deep/er/leaf.a", "the relative path of a node");
+        checkStr(t->find("src/main.a")->path, "build/tests/t211_work/src/main.a", "the full path of a node");
+        check(t->find("") == t->root && t->find("nothing/here") == null, "find of the empty path is the root");
+        aproject.TreeNode* rows[50];
+        int n = t->flatten(&rows[0], 50);
+        checkEq(n, 10, "visible rows: docs src deep er leaf main util + 3 files");
+        check(streq(rows[0]->name, "docs") && streq(rows[1]->name, "src") && streq(rows[2]->name, "deep") && streq(rows[3]->name, "er") && streq(rows[4]->name, "leaf.a"), "depth first order");
+        t->collapse(src);
+        n = t->flatten(&rows[0], 50);
+        checkEq(n, 5, "collapsing hides the subtree");
+        t->expand(src);
+        // refresh keeps what is open
+        mk("src/new.a", "x");
+        checkEq(t->refresh(t->root), 0, "refresh");
+        src = t->find("src");
+        checkStr(kidNames(src), "deep/,main.a,new.a,util.a", "the new file shows up");
+        check(src->expanded && t->find("src/deep")->expanded, "the expanded directories stay expanded");
+        // unreadable / missing paths
+        aproject.FileTree* bad = new aproject.FileTree("build/tests/t211_work/missing", null);
+        check(bad->load(bad->root) < 0, "a missing directory fails to load");
+        // bounds
+        aproject.FileTree* small = new aproject.FileTree(root, null);
+        small->maxEntries = 5;
+        small->load(small->root);
+        check(small->truncated && small->root->nkids <= 5, "maxEntries stops the loading and says so");
+        aproject.FileTree* shallow = new aproject.FileTree(root, null);
+        shallow->maxDepth = 1;
+        shallow->load(shallow->root);
+        shallow->expand(shallow->find("src"));
+        check(shallow->find("src")->nkids == 0 && shallow->truncated, "maxDepth stops at the given depth");
+        // creating, renaming, removing
+        checkEq(t->create(t->root, "fresh.txt", false), 0, "create a file");
+        check(t->find("fresh.txt") != null, "it appears in the tree");
+        checkEq(t->create(t->root, "fresh.txt", false), -asys.EEXIST, "creating it again fails");
+        checkEq(t->create(t->root, "newdir", true), 0, "create a directory");
+        check(t->find("newdir") != null && t->find("newdir")->kind == asys.K_DIR, "a directory");
+        checkEq(t->create(t->root, "a/b", false), -asys.EBADNAME, "a slash in a name");
+        checkEq(t->create(t->root, "", false), -asys.EBADNAME, "an empty name");
+        checkEq(t->create(t->root, "..", true), -asys.EBADNAME, "..");
+        checkEq(t->create(t->root, ".", true), -asys.EBADNAME, ".");
+        checkEq(t->create(t->root, "bad\nname", false), -asys.EBADNAME, "a control character");
+        char longName[300];
+        for (int i = 0; i < 260; i++) { longName[i] = 'x'; }
+        longName[260] = 0;
+        checkEq(t->create(t->root, &longName[0], false), -asys.EBADNAME, "a name over 255 bytes (and over the 55 of AOS)");
+        checkEq(t->rename(t->find("fresh.txt"), "renamed.txt"), 0, "rename");
+        check(t->find("fresh.txt") == null && t->find("renamed.txt") != null, "the tree follows");
+        checkEq(t->rename(t->find("renamed.txt"), "zeta.txt"), -asys.EEXIST, "renaming onto an existing name fails");
+        checkEq(t->rename(t->find("renamed.txt"), "x/y"), -asys.EBADNAME, "rename with a slash");
+        checkEq(t->rename(t->find("renamed.txt"), ""), -asys.EBADNAME, "rename to nothing");
+        checkEq(t->rename(t->root, "x"), -asys.EINVAL, "the root cannot be renamed");
+        checkEq(t->remove(t->find("renamed.txt")), 0, "remove a file");
+        checkEq(t->remove(t->find("newdir")), 0, "remove an empty directory");
+        checkEq(t->remove(t->find("docs")), -asys.ENOTEMPTY, "a directory with content is not removed");
+        check(t->find("renamed.txt") == null && asys.isDir("build/tests/t211_work/docs"), "tree and disk agree");
+        int before = t->total;
+        t->dispose();
+        check(t->root == null, "dispose");
+        before = before;
+    }
+
+    // ---- symlinks and FIFOs
+    mkd("links/real/inner");
+    mk("links/real/inner/f.txt", "x");
+    char* l1 = p("links/to-real");
+    char* up = p("links/real/inner/up");
+    asys.symlink("real", l1);
+    asys.symlink("../..", up);
+    char* ff = p("links/fifo");
+    asys.mkfifo(ff, 420);
+    {
+        aproject.FileTree* t = new aproject.FileTree("build/tests/t211_work/links", null);
+        t->load(t->root);
+        checkStr(kidNames(t->root), linksOk ? "real/,fifo,to-real@" : "real/", "a link to a directory is a link entry (K_LINK), a FIFO an other entry");
+        aproject.TreeNode* lk = t->find("to-real");
+        checkL(lk != null && lk->kind == asys.K_LINK, "the link is a K_LINK node");
+        if (lk != null) {
+            t->expand(lk);
+            checkLEq(lk->nkids, 0, "links are never entered by default");
+        } else {
+            checks++;
+        }
+        t->dispose();
+        // following links: a loop is detected by device and inode
+        aproject.FileTree* f = new aproject.FileTree("build/tests/t211_work/links", null);
+        f->followLinks = true;
+        f->load(f->root);
+        aproject.TreeNode* lk2 = f->find("to-real");
+        checkL(lk2 != null && lk2->kind == asys.K_DIR && !lk2->loop, "with followLinks a link to a directory is a directory");
+        if (lk2 != null) { f->expand(lk2); }
+        aproject.TreeNode* real = f->find("real");
+        f->expand(real);
+        aproject.TreeNode* inner = f->find("real/inner");
+        f->expand(inner);
+        aproject.TreeNode* upn = f->find("real/inner/up");
+        checkL(upn != null && upn->loop, "a link back to an ancestor is marked as a loop");
+        if (upn != null) {
+            f->expand(upn);
+            checkLEq(upn->nkids, 0, "and is not entered");
+        } else {
+            checks++;
+        }
+        // walk everything that can be expanded: the walk ends (bounded by the loop check)
+        int guard = 0;
+        bool grew = true;
+        while (grew && guard < 50) {
+            grew = false;
+            aproject.TreeNode* rows[200];
+            int n = f->flatten(&rows[0], 200);
+            for (int i = 0; i < n; i++) {
+                if (rows[i]->kind == asys.K_DIR && !rows[i]->loaded) { f->expand(rows[i]); grew = true; }
+            }
+            guard++;
+        }
+        check(guard < 50, "expanding everything terminates in the presence of link loops");
+        f->dispose();
+    }
+    asys.unlink(l1);
+    asys.unlink(up);
+    asys.unlink(ff);
+    asys.free(l1);
+    asys.free(up);
+    asys.free(ff);
+
+    // ---- the watcher
+    {
+        mkd("watch");
+        mk("watch/a.txt", "one");
+        mk("watch/b.txt", "two");
+        char* dir = p("watch");
+        char* one = p("watch/a.txt");
+        aproject.Watcher w();
+        w.watch(dir);
+        w.watch(one);
+        w.watch(one);
+        checkEq(w.count(), 2, "watching a path twice counts once");
+        aproject.WatchEvent ev[20];
+        checkEq(w.poll(&ev[0], 20), 0, "nothing happened yet");
+        mk("watch/c.txt", "new file");
+        int n = w.poll(&ev[0], 20);
+        checkEq(n, 1, "one event for a new file");
+        check(n == 1 && ev[0].kind == aproject.WATCH_CREATED && contains(ev[0].path, "watch/c.txt"), "created, with the path");
+        mk("watch/b.txt", "two changed");
+        n = w.poll(&ev[0], 20);
+        check(n == 1 && ev[0].kind == aproject.WATCH_MODIFIED && contains(ev[0].path, "watch/b.txt"), "a changed file in a watched directory");
+        mk("watch/a.txt", "one changed!");
+        n = w.poll(&ev[0], 20);
+        bool fileEv = false;
+        bool dirEv = false;
+        for (int i = 0; i < n; i++) {
+            if (ev[i].kind == aproject.WATCH_MODIFIED && streq(ev[i].path, one)) { fileEv = true; }
+            if (ev[i].kind == aproject.WATCH_MODIFIED && contains(ev[i].path, "watch/a.txt") && !streq(ev[i].path, one)) { dirEv = true; }
+        }
+        check(n >= 1 && (fileEv || dirEv), "a file watched directly and through its directory");
+        asys.unlink("build/tests/t211_work/watch/c.txt");
+        n = w.poll(&ev[0], 20);
+        check(n == 1 && ev[0].kind == aproject.WATCH_DELETED && contains(ev[0].path, "watch/c.txt"), "deleted");
+        asys.unlink(one);
+        n = w.poll(&ev[0], 20);
+        bool del = false;
+        for (int i = 0; i < n; i++) { if (ev[i].kind == aproject.WATCH_DELETED && contains(ev[i].path, "watch/a.txt")) { del = true; } }
+        check(del, "a deleted watched file");
+        mk("watch/a.txt", "again");
+        n = w.poll(&ev[0], 20);
+        bool back = false;
+        for (int i = 0; i < n; i++) { if (ev[i].kind == aproject.WATCH_CREATED && contains(ev[i].path, "watch/a.txt")) { back = true; } }
+        check(back, "created again");
+        checkEq(w.poll(&ev[0], 20), 0, "quiet again");
+        w.unwatch(one);
+        checkEq(w.count(), 1, "unwatch");
+        w.dispose();
+        asys.free(dir);
+        asys.free(one);
+    }
+
+    // ---- recent files
+    {
+        aproject.Recent r();
+        r.setCapacity(3);
+        r.add("a"); r.add("b"); r.add("c");
+        checkStr(r.at(0), "c", "newest first");
+        r.add("a");
+        checkStr(r.at(0), "a", "an existing entry moves to the front");
+        checkEq(r.count, 3, "still three");
+        r.add("d");
+        check(r.count == 3 && r.indexOf("b") < 0 && streq(r.at(0), "d") && streq(r.at(2), "c"), "the oldest falls off");
+        r.remove("a");
+        checkEq(r.count, 2, "remove");
+        r.add("");
+        checkEq(r.count, 2, "empty paths are ignored");
+        char* t = r.toText();
+        checkStr(t, "d\nc\n", "toText");
+        aproject.Recent r2();
+        r2.fromText("one\ntwo\r\n\nthree\n");
+        checkEq(r2.count, 3, "fromText skips empty lines");
+        checkStr(r2.at(0), "one", "the first line is the newest");
+        checkStr(r2.at(2), "three", "the last line is the oldest");
+        char* f = p("recent.txt");
+        checkEq(r2.save(f), 0, "save");
+        aproject.Recent r3();
+        checkEq(r3.load(f), 0, "load");
+        check(r3.count == 3 && streq(r3.at(0), "one") && streq(r3.at(2), "three"), "the order survives a round trip");
+        check(r3.load("build/tests/t211_work/nothing") < 0, "a missing file");
+        asys.unlink(f);
+        asys.free(f);
+        asys.free(t);
+        r2.clear();
+        checkEq(r2.count, 0, "clear");
+    }
+
+    // ---- quick open
+    {
+        aproject.QuickOpen q();
+        aproject.Ignore ign();
+        ign.addBuiltin();
+        q.index(root, &ign);
+        check(q.count >= 8, "files were indexed");
+        bool hasMain = false;
+        bool hasGit = false;
+        for (int i = 0; i < q.count; i++) {
+            if (streq(q.files[i], "src/main.a")) { hasMain = true; }
+            if (contains(q.files[i], ".git/")) { hasGit = true; }
+        }
+        check(hasMain && !hasGit, "relative paths, ignored directories left out");
+        aproject.QuickMatch m[10];
+        int n = q.query("main", &m[0], 10);
+        check(n >= 1 && streq(m[0].path, "src/main.a"), "main finds src/main.a first");
+        n = q.query("sma", &m[0], 10);
+        check(n >= 1 && streq(m[0].path, "src/main.a"), "subsequence across the path: sma");
+        n = q.query("RDM", &m[0], 10);
+        check(n >= 1 && streq(m[0].path, "README.md"), "case insensitive subsequence");
+        n = q.query("zzzz", &m[0], 10);
+        checkEq(n, 0, "no match");
+        n = q.query("a", &m[0], 3);
+        checkEq(n, 3, "the limit");
+        check(m[0].score >= m[1].score && m[1].score >= m[2].score, "best first");
+        n = q.query("", &m[0], 5);
+        checkEq(n, 5, "an empty query lists files");
+        check(q.scoreOf("utl", "src/util.a") > 0 && q.scoreOf("lut", "src/util.a") < 0, "order of the characters matters");
+        check(q.scoreOf("util", "src/util.a") > q.scoreOf("util", "src/deep/er/xutilx.a"), "a file name match beats a scattered match");
+        check(q.scoreOf("fb", "foo/bar.a") > q.scoreOf("fb", "frobnicate/abc.a") , "component starts score higher");
+        aproject.Recent rec();
+        rec.add("zeta.txt");
+        q.recent = &rec;
+        int s1 = q.scoreOf("txt", "zeta.txt");
+        q.recent = null;
+        int s2 = q.scoreOf("txt", "zeta.txt");
+        check(s1 > s2, "recent files get a bonus");
+        q.dispose();
+        checkEq(q.count, 0, "dispose");
+    }
+    rmTree(root);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

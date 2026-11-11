@@ -1,0 +1,342 @@
+// afind: search and replace on buffers: plain, case insensitive, whole word, regex with groups, next / previous, counting without
+// disturbing the current match, groups of the replaced match, one undo step for replace all, ranges, multi-line patterns, UTF-8
+import afind;
+import acode;
+import asys;
+import regex;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (got == null || !streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got == null ? "(null)" : got, want);
+    }
+}
+
+char* text(acode.Buffer* b) {
+    return b->getText(0, b->length());
+}
+
+// replace all in a fresh buffer: the result text
+char result[600];
+char* subst(char* pattern, int opts, char* input, char* repl, int* count) {
+    acode.Buffer b();
+    acode.Editor e(&b);
+    b.setText(input, strlen(input));
+    afind.Finder f(&b);
+    if (!f.setPattern(pattern, opts)) { return "(bad pattern)"; }
+    *count = f.replaceAll(&e, repl);
+    char* t = text(&b);
+    strcpy(&result[0], t);
+    asys.free(t);
+    return &result[0];
+}
+
+// replace all with "[$0|$1]" against what Python's re.sub printed for the same pattern (the expected strings were made by Python 3)
+void checkSub(char* pattern, char* input, char* want, int wantCount) {
+    int n = 0;
+    char* got = subst(pattern, afind.OPT_REGEX, input, "[$0|$1]", &n);
+    checks++;
+    if (!streq(got, want) || n != wantCount) {
+        fails++;
+        printf("FAIL: replaceAll %s on %s: got '%s' (%d) want '%s' (%d)\n", pattern, input, got, n, want, wantCount);
+    }
+}
+
+int main() {
+    // ---- plain search, next and previous, wrapping
+    {
+        acode.Buffer b();
+        b.setText("foo bar foo\nbaz foo\nFOO", 23);
+        afind.Finder f(&b);
+        check(f.setPattern("foo", 0), "compile");
+        check(f.findNext(0) && f.curStart == 0 && f.curEnd == 3, "the first match");
+        check(f.findNext(1) && f.curStart == 8, "the next one");
+        check(f.findNext(9) && f.curStart == 16, "in the second line");
+        check(f.findNext(17) && f.curStart == 0, "no more (case matters): wraps around to the first");
+        check(f.findPrev(16) && f.curStart == 8, "previous");
+        check(f.findPrev(8) && f.curStart == 0, "previous again");
+        check(f.findPrev(0) && f.curStart == 16, "before the first: wraps to the last");
+        check(f.findPrev(17) && f.curStart == 16, "a match that starts just before the offset counts");
+        check(f.findNext(8) && f.curStart == 8, "findNext starts looking AT the offset");
+        checkEq(f.count(100), 3, "three matches");
+        f.setPattern("foo", afind.OPT_ICASE);
+        checkEq(f.count(100), 4, "case insensitive: four");
+        f.setPattern("zzz", 0);
+        check(!f.findNext(0) && !f.findPrev(5) && !f.currentValid(), "no match at all");
+        f.setPattern("foo", afind.OPT_NOWRAP);
+        check(f.findNext(17) == false, "without wrapping the search stops at the end");
+        check(f.findNext(9) && f.curStart == 16, "but finds what is ahead");
+        check(f.findPrev(1) && f.curStart == 0 && !f.findPrev(0), "and stops at the start going backwards");
+    }
+    // ---- whole words and special characters in plain text
+    {
+        acode.Buffer b();
+        b.setText("cat concat cat_x cat. (cat) a.b a+b [x]", 39);
+        afind.Finder f(&b);
+        f.setPattern("cat", afind.OPT_WORD);
+        checkEq(f.count(100), 3, "whole word: cat, cat. and (cat) (not concat, not cat_x)");
+        f.setPattern("cat", 0);
+        checkEq(f.count(100), 5, "without the word test: five");
+        f.setPattern("a.b", 0);
+        checkEq(f.count(100), 1, "a dot in plain text is a dot, not a wildcard");
+        f.setPattern("a+b", 0);
+        checkEq(f.count(100), 1, "plus is a plus");
+        f.setPattern("[x]", 0);
+        checkEq(f.count(100), 1, "brackets are plain");
+        f.setPattern("(cat)", 0);
+        checkEq(f.count(100), 1, "parentheses are plain");
+        f.setPattern("(cat)", afind.OPT_WORD);
+        checkEq(f.count(100), 1, "a pattern with non-word edges needs no boundary there");
+        f.setPattern("cat. (", afind.OPT_WORD);
+        checkEq(f.count(100), 1, "multi-word pattern");
+    }
+    // ---- regex: groups and the current match
+    {
+        acode.Buffer b();
+        acode.Editor e(&b);
+        b.setText("ab12 cd34 ef56", 14);
+        afind.Finder f(&b);
+        check(f.setPattern("([a-z]+)(\\d+)", afind.OPT_REGEX), "compile a regex with groups");
+        check(f.findNext(0) && f.curStart == 0 && f.curEnd == 4, "first");
+        check(f.findPrev(14) && f.curStart == 10 && f.curEnd == 14, "previous from the end finds the last one");
+        check(f.replaceCurrent(&e, "$2-$1"), "replace the match found BACKWARDS: its own groups");
+        char* t = text(&b);
+        checkStr(t, "ab12 cd34 56-ef", "$1 and $2 are those of the replaced match");
+        asys.free(t);
+        check(!f.currentValid(), "the current match is gone after a replace");
+        check(!f.replaceCurrent(&e, "x"), "and cannot be replaced twice");
+        f.setPattern("([a-z]+)(\\d+)", afind.OPT_REGEX);
+        f.findNext(5);
+        check(f.curStart == 5, "next from the middle");
+        int s = f.curStart;
+        int en = f.curEnd;
+        int c = f.count(100);
+        int m[1];
+        afind.Match ms[10];
+        int nm = f.matches(&ms[0], 10);
+        check(f.currentValid() && f.curStart == s && f.curEnd == en, "count and matches do not disturb the current match");
+        checkEq(c, 2, "two matches are left");
+        check(nm == 2 && ms[0].start == 0 && ms[0].end == 4 && ms[1].start == 5 && ms[1].end == 9, "the list of matches");
+        check(f.replaceCurrent(&e, "<$0|$1|$2|$3|${1}x|$$|\\t|\\n|\\\\>"), "all template forms");
+        t = text(&b);
+        checkStr(t, "ab12 <cd34|cd|34||cdx|$|\t|\n|\\> 56-ef", "template expansion");
+        asys.free(t);
+        e.undo();
+        t = text(&b);
+        checkStr(t, "ab12 cd34 56-ef", "one undo step for a replace");
+        asys.free(t);
+        // an edit makes the current match invalid
+        f.findNext(0);
+        check(f.currentValid(), "valid after a find");
+        b.edit(0, 0, "x", 1);
+        check(!f.currentValid(), "invalid after an edit of the buffer");
+        check(!f.replaceCurrent(&e, "y"), "a stale match is not replaced");
+        t = text(&b);
+        checkStr(t, "xab12 cd34 56-ef", "the buffer was not touched");
+        asys.free(t);
+        // a plain replacement is literal
+        f.setPattern("cd", 0);
+        f.findNext(0);
+        f.replaceCurrent(&e, "$1\\n");
+        t = text(&b);
+        checkStr(t, "xab12 $1\\n34 56-ef", "in plain mode the replacement is used as it is");
+        asys.free(t);
+    }
+    // ---- replace all against Python's re.sub
+    {
+        int n = 0;
+        checkStr(subst("x*", afind.OPT_REGEX, "abxd", "-", &n), "-a-b--d-", "x* on abxd");
+        checkEq(n, 5, "five replacements");
+        checkStr(subst("\\b", afind.OPT_REGEX, "ab cd", "|", &n), "|ab| |cd|", "word boundaries");
+        checkStr(subst("(a)|b", afind.OPT_REGEX, "abc", "[$1]", &n), "[a][]c", "an unset group is empty");
+        checkStr(subst("(\\w+)@(\\w+)", afind.OPT_REGEX, "x@y z@w", "$2 at $1", &n), "y at x w at z", "groups swapped");
+        checkEq(n, 2, "two");
+        checkStr(subst("a*?", afind.OPT_REGEX, "baac", "-", &n), "-b-----c-", "lazy empty matches");
+        checkStr(subst("a*", afind.OPT_REGEX, "baac", "<$0>", &n), "<>b<aa><>c<>", "a* with $0");
+        checkStr(subst("(\\d+)-(\\d+)", afind.OPT_REGEX, "10-20 30-40 x", "$2-$1", &n), "20-10 40-30 x", "numbers swapped");
+        checkStr(subst("\\s+", afind.OPT_REGEX, "a   b \t c", " ", &n), "a b c", "white space");
+        checkStr(subst("^\\s+|\\s+$", afind.OPT_REGEX, "  hi there  ", "", &n), "hi there", "trim with an alternation");
+        checkEq(n, 2, "two");
+        checkStr(subst("$", afind.OPT_REGEX, "a\nb", "!", &n), "a!\nb!", "$ at every line end");
+        checkStr(subst("^", afind.OPT_REGEX, "a\nb", ">", &n), ">a\n>b", "^ at every line start");
+        checkStr(subst("o", 0, "foo boo", "00", &n), "f0000 b0000", "plain");
+        checkEq(n, 4, "four");
+        checkStr(subst("Foo", afind.OPT_ICASE, "foo FOO fOo", "x", &n), "x x x", "case insensitive plain");
+        checkStr(subst("zzz", 0, "foo", "x", &n), "foo", "nothing to replace");
+        checkEq(n, 0, "zero");
+        checkStr(subst("a", 0, "aaa", "aa", &n), "aaaaaa", "the replacement contains the pattern: no endless loop");
+        checkEq(n, 3, "three");
+        checkStr(subst("(", afind.OPT_REGEX, "x", "y", &n), "(bad pattern)", "a bad pattern");
+        checkStr(subst("é", 0, "café é", "e", &n), "cafe e", "UTF-8 plain");
+        checkStr(subst("(é)+", afind.OPT_REGEX, "éé a é", "<$0>", &n), "<éé> a <é>", "UTF-8 regex");
+        checkStr(subst(".", afind.OPT_REGEX, "aé", "x", &n), "xx", ". takes a whole character");
+    }
+    // ---- replace all where an EMPTY match has priority over a longer one at the same place (lazy quantifiers, an empty first
+    // alternative): after an empty match the search finds the non-empty match at the same place, and its text and groups must
+    // come out in the replacement (an earlier version matched it again without that rule, got the empty match and deleted the text)
+    {
+        checkSub("a*?", "aab", "[|][a|][|][a|][|]b[|]", 6);
+        checkSub("x*|b", "ab", "[|]a[|][b|][|]", 4);
+        checkSub("a??", "aab", "[|][a|][|][a|][|]b[|]", 6);
+        checkSub("(?:|a)", "aab", "[|][a|][|][a|][|]b[|]", 6);
+        checkSub("(a)|", "ab", "[a|a][|]b[|]", 3);
+        checkSub("(?:)|a", "aab", "[|][a|][|][a|][|]b[|]", 6);
+        checkSub("a*?b?", "aabb", "[|][a|][|][ab|][b|][|]", 6);
+        checkSub("(a*?)(b?)", "aabb", "[|][a|a][|][ab|a][b|][|]", 6);
+        checkSub("\\d*|b", "ab", "[|]a[|][b|][|]", 4);
+        checkSub("(a|ab)*?", "abab", "[|][a|a][|]b[|][a|a][|]b[|]", 7);
+        checkSub("b*?|a", "baa", "[|][b|][|][a|][|][a|][|]", 7);
+        checkSub("(?:b?|xb){1,3}b", "xbbb", "[xbbb|]", 1);
+        checkSub("(c{0,2}a??){1,3}.b", "caabcbcc", "[caab|][cb|]cc", 2);
+        checkSub("(|b){2,3}c", "bbc", "[bbc|b]", 1);
+        checkSub("^|a", "aa", "[|][a|][a|]", 3);
+        // the same in a multi-line pattern (the whole text is searched at once) and through the library function
+        int n = 0;
+        checkStr(subst("a*?\\n?", afind.OPT_REGEX, "a\naa", "[$0]", &n), "[][a\n][][a][][a][]", "multi-line: a*?\\n? keeps the matched text (Python: the same)");
+        char* viaRegex = regex.replaceGroups("a*?", "aab", "[$0]");
+        checkStr(viaRegex, "[][a][][a][]b[]", "regex.replaceGroups agrees");
+        asys.free(viaRegex);
+    }
+    // ---- replace all is ONE undo step and keeps the cursors consistent
+    {
+        acode.Buffer b();
+        acode.Editor e(&b);
+        b.setText("one two one\nthree one\n", 22);
+        e.setCursor(8);
+        afind.Finder f(&b);
+        f.setPattern("one", 0);
+        int n = f.replaceAll(&e, "1");
+        checkEq(n, 3, "three replaced");
+        char* t = text(&b);
+        checkStr(t, "1 two 1\nthree 1\n", "text");
+        asys.free(t);
+        check(b.undoDepth() == 1, "ONE undo step for three replacements");
+        check(e.undo(), "undo");
+        t = text(&b);
+        checkStr(t, "one two one\nthree one\n", "everything is back");
+        asys.free(t);
+        checkEq(e.caret(), 8, "and the cursor is where it was");
+        e.redo();
+        t = text(&b);
+        checkStr(t, "1 two 1\nthree 1\n", "redo");
+        asys.free(t);
+        checkEq(f.replaceAll(&e, "x"), 0, "nothing left to replace");
+        check(b.undoDepth() == 1, "and no empty undo step was added");
+        b.readOnly = true;
+        f.setPattern("1", 0);
+        checkEq(f.replaceAll(&e, "x"), 0, "a read-only buffer is not changed");
+    }
+    // ---- ranges
+    {
+        acode.Buffer b();
+        acode.Editor e(&b);
+        b.setText("ab ab ab ab", 11);
+        afind.Finder f(&b);
+        f.setPattern("ab", 0);
+        f.setRange(3, 7);
+        checkEq(f.count(100), 1, "only the match inside [3, 7) is counted (the match at 6 would end at 8)");
+        f.setRange(3, 9);
+        checkEq(f.count(100), 2, "two with a larger range");
+        check(f.findNext(0) && f.curStart == 3, "findNext starts at the range");
+        check(f.findNext(7) && f.curStart == 3, "and wraps inside the range");
+        f.setRange(3, 9);
+        check(f.findNext(4) && f.curStart == 6, "the next match in the range");
+        checkEq(f.replaceAll(&e, "X"), 2, "replace inside the range only");
+        char* t = text(&b);
+        checkStr(t, "ab X X ab", "text");
+        asys.free(t);
+        f.setRange(-1, -1);
+        checkEq(f.count(100), 2, "the whole text again");
+    }
+    // ---- multi-line patterns
+    {
+        acode.Buffer b();
+        acode.Editor e(&b);
+        b.setText("foo\nbar\nfoo\nbaz\nfoo\nbar", 23);
+        afind.Finder f(&b);
+        f.setPattern("foo\nbar", 0);
+        checkEq(f.count(100), 2, "a plain pattern with a line break spans lines");
+        check(f.findNext(1) && f.curStart == 16, "found across lines");
+        f.setPattern("foo\\nba.", afind.OPT_REGEX);
+        checkEq(f.count(100), 3, "a regex with \\n too (foo\\nbaz matches ba.)");
+        checkEq(f.replaceAll(&e, "X"), 3, "replace across lines");
+        char* t = text(&b);
+        checkStr(t, "X\nX\nX", "result");
+        asys.free(t);
+        e.undo();
+        t = text(&b);
+        checkStr(t, "foo\nbar\nfoo\nbaz\nfoo\nbar", "one undo step");
+        asys.free(t);
+        f.setPattern("^foo$", afind.OPT_REGEX | afind.OPT_NOWRAP);
+        checkEq(f.count(100), 3, "^ and $ per line");
+    }
+    // ---- errors and flags
+    {
+        acode.Buffer b();
+        b.setText("x", 1);
+        afind.Finder f(&b);
+        check(!f.setPattern("(unclosed", afind.OPT_REGEX) && !f.ok && f.error[0] != 0, "a bad regex: ok is false and the error text is set");
+        check(!f.findNext(0) && f.count(10) == 0, "nothing is found with a bad pattern");
+        check(!f.setPattern("", 0) && !f.ok, "an empty pattern");
+        check(f.setPattern("x", afind.OPT_REGEX | afind.OPT_WORD), "a regex with the word flag");
+        checkEq(f.count(10), 1, "x as a word");
+        check(f.setPattern("a\\1", afind.OPT_REGEX) == false, "a back reference to a missing group is an error");
+        // a catastrophic pattern does not hang
+        acode.Buffer c();
+        char* aaa = asys.alloc(40);
+        for (int i = 0; i < 39; i++) { aaa[i] = 'a'; }
+        aaa[39] = 'c';
+        c.setText(aaa, 40);
+        afind.Finder g(&c);
+        g.setPattern("(a+)+b", afind.OPT_REGEX);
+        check(!g.findNext(0) && g.exceeded, "(a+)+b on aaaa...c gives up (step limit) instead of hanging");
+        // count, matches and replace all say so too (they used to give 0 matches and no flag: a silent no-op)
+        checkEq(g.count(10), 0, "count gives up too");
+        check(g.exceeded, "and says so (exceeded)");
+        acode.Editor ec(&c);
+        checkEq(g.replaceAll(&ec, "X"), 0, "replaceAll replaces nothing");
+        check(g.exceeded, "and says so (exceeded)");
+        g.setPattern("a+c", afind.OPT_REGEX);
+        check(g.count(10) == 1 && !g.exceeded, "a pattern that finishes does not set the flag");
+        // a first match, then the search gives up: the match is replaced and the flag says that the rest was not looked at
+        acode.Buffer d();
+        char* xa = asys.alloc(42);
+        xa[0] = 'x';
+        for (int i = 1; i < 40; i++) { xa[i] = 'a'; }
+        xa[40] = 'd';
+        d.setText(xa, 41);
+        acode.Editor ed(&d);
+        afind.Finder h(&d);
+        h.setPattern("(a+)+c|x", afind.OPT_REGEX);
+        check(h.count(10) == 1 && h.exceeded, "one match, then the step limit: count says so");
+        checkEq(h.replaceAll(&ed, "Y"), 1, "replaceAll replaces the one match it found");
+        check(h.exceeded, "and says that the search was cut short");
+        char* dt = text(&d);
+        check(dt[0] == 'Y' && dt[1] == 'a' && strlen(dt) == 41, "the text is changed only at the match");
+        asys.free(dt);
+        asys.free(xa);
+        asys.free(aaa);
+    }
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

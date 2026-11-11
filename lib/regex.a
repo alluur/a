@@ -1,233 +1,2108 @@
 // =============================================================================
-//  regex - small regular expressions                         import regex;
+//  regex - regular expressions                                                                  import regex;
 //
-//  Supported: literals  .  ^  $  *  +  ?  [abc] [a-z] [^0-9]  \d \D \w \W \s \S  and \. style escapes.
-//  Matching is greedy with backtracking. Not supported: groups ( ), alternation |, {n,m}.
+//  A backtracking engine with Perl / Python semantics (leftmost, first alternative wins, greedy and lazy quantifiers).
 //
+//  Syntax    literals   .  ^  $  \A  \Z  \b  \B   [abc] [a-z] [^0-9] [[:alpha:]]   \d \D \w \W \s \S   \n \t \r \f \v \0 \xHH
+//            groups     (...)  (?:...)  (?P<name>...)  (?<name>...)   at most 32 capturing groups
+//            alternation a|b        repetition  * + ? {n} {n,} {n,m} {,m}   lazy forms  *? +? ?? {n,m}?
+//            back references \1 .. \9 (and \10 .. \32), (?P=name)         lookahead (?=...) (?!...)
+//            flags      (?i) (?s) (?m) at any place (valid to the end of the group), (?i:...), or the flags argument
+//  Details   `.` and negated classes take a whole UTF-8 character; \w also matches every non-ASCII character; case
+//            folding (i) is for ASCII letters. `$` matches at the end of the text and before a final "\n" (like Python),
+//            with (?m) before every "\n". A repeated group that matched the empty string ends its repetition
+//            (Perl / Python: (a*)* on "b" matches "" once; in {m,n} an empty iteration beyond m ends it too). A back reference
+//            to a group that did not take part fails to match. \B matches in an empty text (Perl and Python 3.14 do; older
+//            Pythons do not).
+//            A back reference to a group that does not exist, an unclosed group, a bad range, "nothing to repeat" and a
+//            program that gets too large are compile errors (Regex.ok is false, Regex.error says why).
+//  Limits    a search stops after 5 million steps (Regex.exceeded) so that a pattern like (a+)+b cannot hang an editor.
+//
+//    Regex* re = regex.compile("(\\w+)@(\\w+)\\.com", 0);        if (!re->ok) println(re->error);
+//    int caps[66];                                                // 2 * (groups + 1) numbers, -1 = the group did not take part
+//    int at = re->search(text, len, 0, &caps[0]);                 // start of the match or -1; caps[0], caps[1] = whole match
+//    re->matchAt(text, len, pos, &caps[0])                        // anchored at pos: end of the match or -1
+//    re->matchFull(text, len, &caps[0])                           // the whole text must match
+//    re->groupIndex("name")  re->groups  re->dispose()
+//
+//  The simple functions below compile the pattern every call (the last 8 patterns are cached). The first four keep the OLD
+//  simple dialect of this module (F_SIMPLE): ( ) | { } are plain characters, a ^ that is not first and a $ that is not last are
+//  plain characters (so  regex.test("main()", line)  finds "main()", as a shell grep expects), . matches a line break and $
+//  matches only at the very end of the text. Use compile() or replaceGroups for
+//  the full syntax; compile(pattern, F_SIMPLE) gives the old dialect as an object.
 //    bool regex.matches(pattern, text)            the whole text must match
 //    int  regex.search(pattern, text, &len)       start of the first match (or -1), len = its length
 //    bool regex.test(pattern, text)               matches anywhere
-//    char* regex.replaceAll(pattern, text, repl)  replaces every match
+//    char* regex.replaceAll(pattern, text, repl)  replaces every match by the text repl (as it is)
+//    char* regex.replaceGroups(pattern, text, repl)   the full syntax; $0 .. $9 and ${n} in repl are the groups, $$ a dollar
+//    char* regex.quote(text)                      escapes everything special, so quote(s) matches exactly s
 // =============================================================================
+import asys;
 module regex;
 
-// index just after the atom (a character, an escape or a [set]) starting at p
-private int atomEnd(char* pat, int p) {
-    if (pat[p] == 92 && pat[p + 1] != 0) {
-        return p + 2;
+public const MAXGROUPS = 32;
+public const F_ICASE = 1;
+public const F_MULTILINE = 2;
+public const F_DOTALL = 4;
+public const F_SIMPLE = 8;      // the old simple dialect: ( ) | { } are plain characters, ^ only at the start and $ only at the end are anchors, . matches \n
+
+private const OP_MATCH = 0;
+private const OP_CHAR = 1;
+private const OP_CHARI = 2;
+private const OP_ANY = 3;
+private const OP_ANYNL = 4;
+private const OP_CLASS = 5;
+private const OP_SPLIT = 6;
+private const OP_JMP = 7;
+private const OP_SAVE = 8;
+private const OP_BOL = 9;
+private const OP_EOL = 10;
+private const OP_MBOL = 11;
+private const OP_MEOL = 12;
+private const OP_BOT = 13;
+private const OP_EOT = 14;
+private const OP_WORDB = 15;
+private const OP_NWORDB = 16;
+private const OP_BACKREF = 17;
+private const OP_BACKREFI = 18;
+private const OP_MARK = 19;
+private const OP_LOOP = 20;
+private const OP_REP1 = 21;
+private const OP_LOOK = 22;
+private const OP_LOOKEND = 23;
+private const OP_EMPTYX = 24;
+
+private const N_EMPTY = 0;
+private const N_CHAR = 1;
+private const N_ANY = 2;
+private const N_CLASS = 3;
+private const N_CAT = 4;
+private const N_ALT = 5;
+private const N_GROUP = 6;
+private const N_REP = 7;
+private const N_BOL = 8;
+private const N_EOL = 9;
+private const N_BOT = 10;
+private const N_EOT = 11;
+private const N_WORDB = 12;
+private const N_NWORDB = 13;
+private const N_BACKREF = 14;
+private const N_LOOK = 15;
+
+private const K_BRANCH = 1;
+private const K_SAVE = 2;
+private const K_REG = 3;
+private const K_REPG = 4;
+private const K_REPL = 5;
+
+private const CF_NEG = 1;
+private const CF_HI = 2;            // every code point >= 128 is a member (before negation)
+
+private const MAX_CODE = 400000;
+private const MAX_STACK = 12000000;
+private const MAX_DEPTH = 150;
+
+struct RNode {
+    int type;
+    int a;
+    int b;
+    int c;
+    int flags;
+    int next;
+    int kid;
+}
+
+private bool isWordByte(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c >= 128;
+}
+
+private int lowerByte(int c) {
+    if (c >= 'A' && c <= 'Z') {
+        return c + 32;
     }
-    if (pat[p] == '[') {
-        int i = p + 1;
-        if (pat[i] == '^') {
-            i++;
+    return c;
+}
+
+// length of the UTF-8 sequence starting at pos (1 for invalid bytes and at the end)
+private int charLen(char* t, int n, int pos) {
+    int b = t[pos];
+    if (b < 0xC2) {
+        return 1;
+    }
+    int need = 1;
+    if (b < 0xE0) { need = 2; }
+    else if (b < 0xF0) { need = 3; }
+    else if (b < 0xF5) { need = 4; }
+    else { return 1; }
+    if (pos + need > n) {
+        return 1;
+    }
+    for (int i = 1; i < need; i++) {
+        if ((t[pos + i] & 0xC0) != 0x80) {
+            return 1;
         }
-        if (pat[i] == ']') {
-            i++;
+    }
+    return need;
+}
+
+private int decodeAt(char* t, int n, int pos, int len) {
+    if (len == 1) {
+        return t[pos];
+    }
+    int b = t[pos];
+    int v = b & (0xFF >> (len + 1));
+    for (int i = 1; i < len; i++) {
+        v = (v << 6) | (t[pos + i] & 0x3F);
+    }
+    return v;
+}
+
+// The old simple dialect (the one the module had before groups and alternation were added) written in the full syntax: ( ) | { }
+// and a ^ that is not first or a $ that is not last are plain characters; sets [..] and escapes are copied as they are.
+private char* simpleToFull(char* p) {
+    int n = strlen(p);
+    char* out = asys.alloc(n * 2 + 2);
+    int o = 0;
+    int i = 0;
+    while (i < n) {
+        int c = p[i];
+        if (c == 92) {
+            out[o] = 92;
+            o++;
+            if (i + 1 < n) {
+                out[o] = p[i + 1];
+                o++;
+                i = i + 2;
+            } else {
+                out[o] = 92;                     // a lone backslash at the end is a backslash
+                o++;
+                i++;
+            }
+            continue;
         }
-        while (pat[i] != 0 && pat[i] != ']') {
-            i++;
+        if (c == '[') {
+            int j = i + 1;
+            if (j < n && p[j] == '^') { j++; }
+            if (j < n && p[j] == ']') { j++; }
+            while (j < n && p[j] != ']') {
+                if (p[j] == 92 && j + 1 < n) { j++; }
+                j++;
+            }
+            if (j < n) { j++; }
+            while (i < j) {
+                out[o] = p[i];
+                o++;
+                i++;
+            }
+            continue;
         }
-        if (pat[i] == ']') {
+        if (c == '$' && i + 1 == n) {
+            out[o] = 92;                             // the old $ matched at the very end only: \Z, not "before a final line break"
+            out[o + 1] = 'Z';
+            o = o + 2;
             i++;
+            continue;
         }
+        if (c == '(' || c == ')' || c == '|' || c == '{' || c == '}' || (c == '^' && i > 0) || c == '$') {
+            out[o] = 92;
+            o++;
+        }
+        out[o] = c;
+        o++;
+        i++;
+    }
+    out[o] = 0;
+    return out;
+}
+
+public class Regex {
+    public bool ok;
+    public char* error;
+    public int errorPos;
+    public int groups;                  // number of capture groups
+    public bool exceeded;               // the last search hit the step limit
+    public int stepLimit;
+    public int flags;
+
+    // pattern and parser state
+    private char* pat;
+    private int ppos;
+    private int plen;
+    private int pflags;
+    private int depth;
+    private int openMask;
+    private char** names;
+    private RNode* nodes;
+    private int nnodes;
+    private int ncapNodes;
+    // classes: per class { flags, bits0, bits1, nranges, lo, hi, ... }
+    private int* cls;
+    private int ncls;
+    private int clsCap;
+    // program
+    private int* code;
+    private int ncode;
+    private int codeCap;
+    private int nregs;
+    private int* regs;
+    // matching state
+    private int* stk;
+    private int stkTop;
+    private int stkCap;
+    private int* work;
+    private int steps;
+    private char* text;
+    private int tlen;
+    private bool requireEnd;
+    private int rejectEnd;               // a match that ends here is refused (replace must go on after an empty match)
+    // search optimisation
+    private bool anchoredStart;
+    private bool useFirst;
+    private char* first;                // 256 flags
+
+    public Regex(char* pattern, int fl) {
+        flags = fl;
+        stepLimit = 5000000;
+        rejectEnd = -1;
+        ok = true;
+        error = "";
+        work = (int*) asys.alloc(8 * (2 * (MAXGROUPS + 1) + 2));
+        if ((fl & F_SIMPLE) != 0) {
+            char* full = simpleToFull(pattern);
+            compileIt(full);
+            asys.free(full);
+        } else {
+            compileIt(pattern);
+        }
+    }
+
+    // frees everything the object holds (the object itself is a few hundred bytes of ordinary heap)
+    public void dispose() {
+        asys.free(pat);
+        asys.free((char*) nodes);
+        asys.free((char*) cls);
+        asys.free((char*) code);
+        asys.free((char*) regs);
+        asys.free((char*) stk);
+        asys.free((char*) work);
+        asys.free(first);
+        if (names != null) {
+            for (int i = 0; i <= MAXGROUPS; i++) {
+                asys.free(names[i]);
+            }
+            asys.free((char*) names);
+        }
+        pat = null; nodes = null; cls = null; code = null; regs = null; stk = null; work = null;
+        first = null; names = null;
+        ok = false;
+    }
+
+    // ---- errors ---------------------------------------------------------------------------------------------------------
+    private void fail(char* msg, int at) {
+        if (ok) {
+            ok = false;
+            error = msg;
+            errorPos = at;
+        }
+    }
+
+    // ---- nodes ----------------------------------------------------------------------------------------------------------
+    private int newNode(int type) {
+        if (nnodes >= ncapNodes) {
+            int nc = (ncapNodes == 0) ? 64 : ncapNodes * 2;
+            if (nc > 400000) {
+                fail("pattern too large", ppos);
+                return 0;
+            }
+            char* nn = asys.realloc((char*) nodes, nc * sizeof(RNode));
+            if (nn == null) {
+                fail("out of memory", ppos);
+                return 0;
+            }
+            nodes = (RNode*) nn;
+            ncapNodes = nc;
+        }
+        int i = nnodes;
+        nnodes++;
+        nodes[i].type = type;
+        nodes[i].a = 0;
+        nodes[i].b = 0;
+        nodes[i].c = 0;
+        nodes[i].flags = pflags;
+        nodes[i].next = 0;
+        nodes[i].kid = 0;
         return i;
     }
-    return p + 1;
-}
 
-private bool classOf(int e, int c) {
-    switch (e) {
-        case 'd': return isDigit(c);
-        case 'D': return !isDigit(c);
-        case 'w': return isAlpha(c) || isDigit(c) || c == '_';
-        case 'W': return !(isAlpha(c) || isDigit(c) || c == '_');
-        case 's': return isSpace(c);
-        case 'S': return !isSpace(c);
-        case 'n': return c == 10;
-        case 't': return c == 9;
+    // ---- classes --------------------------------------------------------------------------------------------------------
+    private int newClass() {
+        int need = ncls + 4;
+        if (need + 2 > clsCap) {
+            int nc = (clsCap == 0) ? 256 : clsCap * 2;
+            while (nc < need + 2) { nc = nc * 2; }
+            char* nn = asys.realloc((char*) cls, nc * 8);
+            if (nn == null) {
+                fail("out of memory", ppos);
+                return 0;
+            }
+            cls = (int*) nn;
+            clsCap = nc;
+        }
+        int at = ncls;
+        cls[at] = 0;
+        cls[at + 1] = 0;
+        cls[at + 2] = 0;
+        cls[at + 3] = 0;
+        ncls = ncls + 4;
+        return at;
     }
-    return c == e;
-}
 
-private bool atomMatch(char* pat, int p, int c) {
-    if (c == 0) {
-        return false;
+    private void clsBit(int at, int c) {
+        if (c < 64) {
+            cls[at + 1] = cls[at + 1] | (1 << c);
+        } else {
+            cls[at + 2] = cls[at + 2] | (1 << (c - 64));
+        }
     }
-    if (pat[p] == '.') {
+
+    private void clsRange(int at, int lo, int hi, bool icase) {
+        if (lo > hi) {
+            return;
+        }
+        int a = lo;
+        while (a <= hi && a < 128) {
+            clsBit(at, a);
+            if (icase) {
+                if (a >= 'a' && a <= 'z') { clsBit(at, a - 32); }
+                if (a >= 'A' && a <= 'Z') { clsBit(at, a + 32); }
+            }
+            a++;
+        }
+        if (hi >= 128) {
+            int l = (lo < 128) ? 128 : lo;
+            // append the range: the class record stays the last thing in cls
+            if (ncls + 2 > clsCap) {
+                int nc = clsCap * 2;
+                char* nn = asys.realloc((char*) cls, nc * 8);
+                if (nn == null) {
+                    fail("out of memory", ppos);
+                    return;
+                }
+                cls = (int*) nn;
+                clsCap = nc;
+            }
+            cls[ncls] = l;
+            cls[ncls + 1] = hi;
+            ncls = ncls + 2;
+            cls[at + 3] = cls[at + 3] + 1;
+        }
+    }
+
+    // adds a shorthand class (d w s and their complements) to the class at `at`
+    private void clsShorthand(int at, int e) {
+        bool neg = (e == 'D' || e == 'W' || e == 'S');
+        int lo = e | 32;
+        for (int c = 0; c < 128; c++) {
+            bool in = false;
+            if (lo == 'd') { in = (c >= '0' && c <= '9'); }
+            else if (lo == 'w') { in = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'; }
+            else { in = (c == ' ' || (c >= 9 && c <= 13)); }
+            if (in != neg) {
+                clsBit(at, c);
+            }
+        }
+        bool hi = (lo == 'w') != neg;                       // \w and \D \S contain the non-ASCII characters
+        if (hi) {
+            cls[at] = cls[at] | CF_HI;
+        }
+    }
+
+    private bool clsHas(int at, int c, int len) {
+        int fl = cls[at];
+        bool in = false;
+        if (c < 128) {
+            if (c < 64) {
+                in = ((cls[at + 1] >> c) & 1) != 0;
+            } else {
+                in = ((cls[at + 2] >> (c - 64)) & 1) != 0;
+            }
+        } else {
+            if ((fl & CF_HI) != 0) {
+                in = true;
+            } else {
+                int nr = cls[at + 3];
+                int base = at + 4;
+                for (int i = 0; i < nr && !in; i++) {
+                    if (c >= cls[base + i * 2] && c <= cls[base + i * 2 + 1]) {
+                        in = true;
+                    }
+                }
+            }
+        }
+        return in != ((fl & CF_NEG) != 0);
+    }
+
+    // ---- parser ---------------------------------------------------------------------------------------------------------
+    private int peek() {
+        if (ppos >= plen) {
+            return 0;
+        }
+        return pat[ppos];
+    }
+
+    private bool more() {
+        return ppos < plen;
+    }
+
+    private int parseAlt() {
+        int first = parseCat();
+        if (!ok) { return 0; }
+        if (peek() != '|' || !more()) {
+            return first;
+        }
+        int alt = newNode(N_ALT);
+        nodes[alt].kid = first;
+        int last = first;
+        while (more() && peek() == '|') {
+            ppos++;
+            int nx = parseCat();
+            if (!ok) { return 0; }
+            nodes[last].next = nx;
+            last = nx;
+        }
+        return alt;
+    }
+
+    private int parseCat() {
+        int head = 0;
+        int last = 0;
+        int count = 0;
+        while (more() && peek() != '|' && peek() != ')') {
+            int n = parseRepeat();
+            if (!ok) { return 0; }
+            if (n == 0) { continue; }
+            if (head == 0) { head = n; } else { nodes[last].next = n; }
+            last = n;
+            count++;
+        }
+        if (count == 0) {
+            return newNode(N_EMPTY);
+        }
+        if (count == 1) {
+            return head;
+        }
+        int cat = newNode(N_CAT);
+        nodes[cat].kid = head;
+        return cat;
+    }
+
+    // true when pat[ppos] starts a valid {n} {n,} {n,m} {,m}; the numbers are stored in lo / hi (-1: no upper limit)
+    private bool braceQuant(int* lo, int* hi, int* endPos) {
+        int i = ppos + 1;
+        int a = 0;
+        bool haveA = false;
+        while (i < plen && pat[i] >= '0' && pat[i] <= '9') {
+            a = a * 10 + (pat[i] - '0');
+            if (a > 100000) { a = 100000; }
+            haveA = true;
+            i++;
+        }
+        int b = a;
+        bool comma = false;
+        bool haveB = haveA;
+        if (i < plen && pat[i] == ',') {
+            comma = true;
+            i++;
+            b = 0;
+            haveB = false;
+            while (i < plen && pat[i] >= '0' && pat[i] <= '9') {
+                b = b * 10 + (pat[i] - '0');
+                if (b > 100000) { b = 100000; }
+                haveB = true;
+                i++;
+            }
+        }
+        if (i >= plen || pat[i] != '}') {
+            return false;
+        }
+        if (!haveA && !comma) {
+            return false;
+        }
+        *lo = a;
+        if (!comma) {
+            *hi = a;
+        } else if (haveB) {
+            *hi = b;
+        } else {
+            *hi = -1;
+        }
+        *endPos = i + 1;
         return true;
     }
-    if (pat[p] == 92) {
-        return classOf(pat[p + 1], c);
-    }
-    if (pat[p] == '[') {
-        int i = p + 1;
-        bool neg = false;
-        if (pat[i] == '^') {
-            neg = true;
-            i++;
-        }
-        bool found = false;
-        bool first = true;
-        while (pat[i] != 0 && (pat[i] != ']' || first)) {
-            first = false;
-            int lo = pat[i];
-            if (lo == 92 && pat[i + 1] != 0) {
-                i++;
-                if (classOf(pat[i], c) && (pat[i] == 'd' || pat[i] == 'w' || pat[i] == 's' || pat[i] == 'D' || pat[i] == 'W' || pat[i] == 'S')) {
-                    found = true;
+
+    private int parseRepeat() {
+        int startPos = ppos;
+        int atom = parseAtom();
+        if (!ok || atom == 0) { return atom; }
+        int t = nodes[atom].type;
+        bool quantified = false;
+        for (;;) {
+            if (!more()) { break; }
+            int c = peek();
+            int mn = 0;
+            int mx = -1;
+            if (c == '*') { ppos++; }
+            else if (c == '+') { mn = 1; ppos++; }
+            else if (c == '?') { mx = 1; ppos++; }
+            else if (c == '{') {
+                int lo = 0;
+                int hi = 0;
+                int endp = 0;
+                if (!braceQuant(&lo, &hi, &endp)) { break; }
+                if (hi >= 0 && lo > hi) {
+                    fail("min repeat greater than max repeat", ppos);
+                    return 0;
                 }
-                lo = pat[i];
-                if (lo == 'n') lo = 10;
-                if (lo == 't') lo = 9;
-            }
-            if (pat[i + 1] == '-' && pat[i + 2] != ']' && pat[i + 2] != 0) {
-                if (c >= lo && c <= pat[i + 2]) {
-                    found = true;
-                }
-                i = i + 3;
+                mn = lo;
+                mx = hi;
+                ppos = endp;
             } else {
-                if (c == lo) {
-                    found = true;
-                }
-                i++;
+                break;
             }
+            if (quantified) {
+                fail("multiple repeat", ppos - 1);
+                return 0;
+            }
+            if (t == N_BOL || t == N_EOL || t == N_BOT || t == N_EOT || t == N_WORDB || t == N_NWORDB) {
+                fail("nothing to repeat", startPos);
+                return 0;
+            }
+            bool lazy = false;
+            if (more() && peek() == '?') {
+                lazy = true;
+                ppos++;
+            }
+            int rep = newNode(N_REP);
+            nodes[rep].kid = atom;
+            nodes[rep].a = mn;
+            nodes[rep].b = mx;
+            nodes[rep].c = lazy ? 1 : 0;
+            atom = rep;
+            quantified = true;
         }
-        return found != neg;
+        return atom;
     }
-    return pat[p] == c;
-}
 
-// returns the index in s where the match of pat[p..] ends, or -1
-private int matchHere(char* pat, int p, char* s, int i) {
-    if (pat[p] == 0) {
-        return i;
+    private int hexVal(int c) {
+        if (c >= '0' && c <= '9') { return c - '0'; }
+        if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
+        if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
+        return -1;
     }
-    if (pat[p] == '$' && pat[p + 1] == 0) {
-        if (s[i] == 0) {
-            return i;
+
+    // reads the escape after a backslash that stands for one character (not a class or assertion): returns the code point or -1
+    private int parseCharEscape(int c) {
+        switch (c) {
+            case 'n': return 10;
+            case 't': return 9;
+            case 'r': return 13;
+            case 'f': return 12;
+            case 'v': return 11;
+            case 'a': return 7;
+            case 'e': return 27;
+        }
+        if (c == 'x') {
+            int h1 = (ppos + 1 < plen) ? hexVal(pat[ppos]) : -1;
+            int h2 = (ppos + 1 < plen) ? hexVal(pat[ppos + 1]) : -1;
+            if (h1 < 0 || h2 < 0) {
+                fail("incomplete escape \\x", ppos - 2);
+                return -2;
+            }
+            ppos = ppos + 2;
+            return h1 * 16 + h2;
+        }
+        if (c == '0') {
+            int v = 0;
+            int k = 0;
+            while (k < 2 && ppos < plen && pat[ppos] >= '0' && pat[ppos] <= '7') {
+                v = v * 8 + (pat[ppos] - '0');
+                ppos++;
+                k++;
+            }
+            return v;
         }
         return -1;
     }
-    int e = atomEnd(pat, p);
-    int q = pat[e];
-    if (q == '*' || q == '+') {
+
+    private int addLiteral(int cp) {
+        // one code point as UTF-8 bytes
+        char b[4];
         int n = 0;
-        while (atomMatch(pat, p, s[i + n])) {
-            n++;
+        if (cp < 0x80) { b[0] = cp; n = 1; }
+        else if (cp < 0x800) { b[0] = 0xC0 | (cp >> 6); b[1] = 0x80 | (cp & 0x3F); n = 2; }
+        else if (cp < 0x10000) { b[0] = 0xE0 | (cp >> 12); b[1] = 0x80 | ((cp >> 6) & 0x3F); b[2] = 0x80 | (cp & 0x3F); n = 3; }
+        else { b[0] = 0xF0 | (cp >> 18); b[1] = 0x80 | ((cp >> 12) & 0x3F); b[2] = 0x80 | ((cp >> 6) & 0x3F); b[3] = 0x80 | (cp & 0x3F); n = 4; }
+        if (n == 1) {
+            int nd = newNode(N_CHAR);
+            nodes[nd].a = b[0];
+            return nd;
         }
-        int least = 0;
-        if (q == '+') {
-            least = 1;
+        int cat = newNode(N_CAT);
+        int last = 0;
+        for (int i = 0; i < n; i++) {
+            int nd = newNode(N_CHAR);
+            nodes[nd].a = b[i];
+            nodes[nd].flags = 0;              // multi-byte characters are never case folded
+            if (last == 0) { nodes[cat].kid = nd; } else { nodes[last].next = nd; }
+            last = nd;
         }
-        while (n >= least) {
-            int r = matchHere(pat, e + 1, s, i + n);
-            if (r >= 0) {
-                return r;
-            }
-            n--;
-        }
-        return -1;
+        return cat;
     }
-    if (q == '?') {
-        if (atomMatch(pat, p, s[i])) {
-            int r = matchHere(pat, e + 1, s, i + 1);
-            if (r >= 0) {
-                return r;
-            }
-        }
-        return matchHere(pat, e + 1, s, i);
-    }
-    if (atomMatch(pat, p, s[i])) {
-        return matchHere(pat, e, s, i + 1);
-    }
-    return -1;
-}
 
-// first match at or after position from: returns its start (or -1) and stores its length in *len
-private int searchFrom(char* pat, char* s, int from, int* len) {
-    if (pat[0] == '^') {
-        if (from > 0) {
+    private int parseGroupRef(int num, int at) {
+        if (num < 1 || num > MAXGROUPS || num > groups) {
+            fail("invalid group reference", at);
+            return 0;
+        }
+        if (num <= MAXGROUPS && ((openMask >> num) & 1) != 0) {
+            fail("cannot refer to an open group", at);
+            return 0;
+        }
+        int nd = newNode(N_BACKREF);
+        nodes[nd].a = num;
+        return nd;
+    }
+
+    private int parseAtom() {
+        int at = ppos;
+        int c = pat[ppos];
+        ppos++;
+        switch (c) {
+            case '(': return parseGroup(at);
+            case '[': return parseClass(at);
+            case '.': return newNode(N_ANY);
+            case '^': return newNode(N_BOL);
+            case '$': return newNode(N_EOL);
+            case '*': fail("nothing to repeat", at); return 0;
+            case '+': fail("nothing to repeat", at); return 0;
+            case '?': fail("nothing to repeat", at); return 0;
+            case '{': {
+                ppos = at;
+                int lo = 0;
+                int hi = 0;
+                int endp = 0;
+                if (braceQuant(&lo, &hi, &endp)) {
+                    fail("nothing to repeat", at);
+                    return 0;
+                }
+                ppos = at + 1;
+                int nd = newNode(N_CHAR);
+                nodes[nd].a = '{';
+                return nd;
+            }
+            case 92: return parseEscape(at);
+        }
+        // a literal character, possibly multi-byte
+        if (c >= 0xC2) {
+            int len = charLen(pat, plen, at);
+            if (len > 1) {
+                int cp = decodeAt(pat, plen, at, len);
+                ppos = at + len;
+                return addLiteral(cp);
+            }
+        }
+        int nd = newNode(N_CHAR);
+        nodes[nd].a = c;
+        return nd;
+    }
+
+    private int parseEscape(int at) {
+        if (!more()) {
+            fail("bad escape (end of pattern)", at);
+            return 0;
+        }
+        int c = pat[ppos];
+        ppos++;
+        switch (c) {
+            case 'd': case 'D': case 'w': case 'W': case 's': case 'S': {
+                int k = newClass();
+                if (!ok) { return 0; }
+                clsShorthand(k, c);
+                int nd = newNode(N_CLASS);
+                nodes[nd].a = k;
+                return nd;
+            }
+            case 'b': return newNode(N_WORDB);
+            case 'B': return newNode(N_NWORDB);
+            case 'A': return newNode(N_BOT);
+            case 'Z': return newNode(N_EOT);
+            case 'z': return newNode(N_EOT);
+        }
+        if (c >= '1' && c <= '9') {
+            int num = c - '0';
+            if (ppos < plen && pat[ppos] >= '0' && pat[ppos] <= '9' && num * 10 + (pat[ppos] - '0') <= MAXGROUPS) {
+                num = num * 10 + (pat[ppos] - '0');
+                ppos++;
+            }
+            return parseGroupRef(num, at);
+        }
+        int ch = parseCharEscape(c);
+        if (ch == -2) { return 0; }
+        if (ch >= 0) {
+            int nd = newNode(N_CHAR);
+            nodes[nd].a = ch;
+            return nd;
+        }
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+            fail("bad escape", at);
+            return 0;
+        }
+        // an escaped punctuation character (or a multi-byte one) stands for itself
+        if (c >= 0xC2) {
+            int len = charLen(pat, plen, ppos - 1);
+            if (len > 1) {
+                int cp = decodeAt(pat, plen, ppos - 1, len);
+                ppos = ppos - 1 + len;
+                return addLiteral(cp);
+            }
+        }
+        int nd = newNode(N_CHAR);
+        nodes[nd].a = c;
+        nodes[nd].flags = pflags & ~F_ICASE;
+        return nd;
+    }
+
+    private bool posixClass(int at, char* name, int nlen) {
+        bool icase = (pflags & F_ICASE) != 0;
+        if (nlen == 5 && memEq(name, "alpha", 5)) { clsRange(at, 'a', 'z', false); clsRange(at, 'A', 'Z', false); return true; }
+        if (nlen == 5 && memEq(name, "digit", 5)) { clsRange(at, '0', '9', false); return true; }
+        if (nlen == 5 && memEq(name, "alnum", 5)) { clsRange(at, 'a', 'z', false); clsRange(at, 'A', 'Z', false); clsRange(at, '0', '9', false); return true; }
+        if (nlen == 5 && memEq(name, "upper", 5)) { clsRange(at, 'A', 'Z', icase); return true; }
+        if (nlen == 5 && memEq(name, "lower", 5)) { clsRange(at, 'a', 'z', icase); return true; }
+        if (nlen == 5 && memEq(name, "space", 5)) { clsRange(at, 9, 13, false); clsRange(at, ' ', ' ', false); return true; }
+        if (nlen == 5 && memEq(name, "punct", 5)) { clsRange(at, 33, 47, false); clsRange(at, 58, 64, false); clsRange(at, 91, 96, false); clsRange(at, 123, 126, false); return true; }
+        if (nlen == 6 && memEq(name, "xdigit", 6)) { clsRange(at, '0', '9', false); clsRange(at, 'a', 'f', false); clsRange(at, 'A', 'F', false); return true; }
+        if (nlen == 4 && memEq(name, "word", 4)) { clsShorthand(at, 'w'); return true; }
+        if (nlen == 5 && memEq(name, "blank", 5)) { clsRange(at, ' ', ' ', false); clsRange(at, 9, 9, false); return true; }
+        return false;
+    }
+
+    private bool memEq(char* a, char* b, int n) {
+        for (int i = 0; i < n; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    private int parseClass(int at) {
+        int k = newClass();
+        if (!ok) { return 0; }
+        bool icase = (pflags & F_ICASE) != 0;
+        if (peek() == '^' && more()) {
+            cls[k] = cls[k] | CF_NEG;
+            ppos++;
+        }
+        bool first = true;
+        for (;;) {
+            if (!more()) {
+                fail("unterminated character set", at);
+                return 0;
+            }
+            int c = pat[ppos];
+            if (c == ']' && !first) {
+                ppos++;
+                break;
+            }
+            first = false;
+            int lo = -1;
+            int ctStart = ppos;
+            if (c == '[' && ppos + 1 < plen && pat[ppos + 1] == ':') {
+                int e = ppos + 2;
+                while (e + 1 < plen && !(pat[e] == ':' && pat[e + 1] == ']')) { e++; }
+                if (e + 1 < plen && posixClass(k, &pat[ppos + 2], e - ppos - 2)) {
+                    ppos = e + 2;
+                    continue;
+                }
+            }
+            if (c == 92) {
+                ppos++;
+                if (!more()) {
+                    fail("bad escape (end of pattern)", ctStart);
+                    return 0;
+                }
+                int e = pat[ppos];
+                ppos++;
+                if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
+                    clsShorthand(k, e);
+                    continue;
+                }
+                if (e == 'b') {
+                    lo = 8;
+                } else {
+                    int ch = parseCharEscape(e);
+                    if (ch == -2) { return 0; }
+                    if (ch >= 0) {
+                        lo = ch;
+                    } else if ((e >= 'a' && e <= 'z') || (e >= 'A' && e <= 'Z') || (e >= '1' && e <= '9')) {
+                        fail("bad escape", ctStart);
+                        return 0;
+                    } else {
+                        int len = (e >= 0xC2) ? charLen(pat, plen, ppos - 1) : 1;
+                        if (len > 1) {
+                            lo = decodeAt(pat, plen, ppos - 1, len);
+                            ppos = ppos - 1 + len;
+                        } else {
+                            lo = e;
+                        }
+                    }
+                }
+            } else {
+                int len = (c >= 0xC2) ? charLen(pat, plen, ppos) : 1;
+                lo = decodeAt(pat, plen, ppos, len);
+                ppos = ppos + len;
+            }
+            // a range?
+            if (peek() == '-' && ppos + 1 < plen && pat[ppos + 1] != ']') {
+                int save = ppos;
+                ppos++;
+                int hi = -1;
+                int c2 = pat[ppos];
+                if (c2 == 92) {
+                    ppos++;
+                    if (!more()) {
+                        fail("bad escape (end of pattern)", save);
+                        return 0;
+                    }
+                    int e = pat[ppos];
+                    ppos++;
+                    if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
+                        // "a-\d": the dash is a literal
+                        clsRange(k, lo, lo, icase);
+                        clsRange(k, '-', '-', false);
+                        clsShorthand(k, e);
+                        continue;
+                    }
+                    if (e == 'b') {
+                        hi = 8;
+                    } else {
+                        int ch = parseCharEscape(e);
+                        if (ch == -2) { return 0; }
+                        if (ch >= 0) { hi = ch; }
+                        else if ((e >= 'a' && e <= 'z') || (e >= 'A' && e <= 'Z')) { fail("bad escape", save); return 0; }
+                        else { hi = e; }
+                    }
+                } else {
+                    int len = (c2 >= 0xC2) ? charLen(pat, plen, ppos) : 1;
+                    hi = decodeAt(pat, plen, ppos, len);
+                    ppos = ppos + len;
+                }
+                if (hi < lo) {
+                    fail("bad character range", ctStart);
+                    return 0;
+                }
+                clsRange(k, lo, hi, icase);
+            } else {
+                clsRange(k, lo, lo, icase);
+            }
+        }
+        int nd = newNode(N_CLASS);
+        nodes[nd].a = k;
+        return nd;
+    }
+
+    private int groupName(int at, int endChar, char** out) {
+        int s = ppos;
+        while (more() && peek() != endChar) {
+            int c = peek();
+            if (!(isAlpha(c) || c == '_' || (isDigit(c) && ppos > s))) {
+                fail("bad character in group name", ppos);
+                return -1;
+            }
+            ppos++;
+        }
+        if (!more() || ppos == s) {
+            fail("missing group name", at);
             return -1;
         }
-        int r = matchHere(pat, 1, s, 0);
+        *out = asys.strDupN(&pat[s], ppos - s);
+        ppos++;
+        return 0;
+    }
+
+    private int findName(char* nm) {
+        if (names == null) { return 0; }
+        for (int i = 1; i <= groups; i++) {
+            if (names[i] != null && streq(names[i], nm)) { return i; }
+        }
+        return 0;
+    }
+
+    public int groupIndex(char* nm) {
+        return findName(nm);
+    }
+
+    private int parseGroup(int at) {
+        depth++;
+        if (depth > MAX_DEPTH) {
+            fail("pattern nested too deeply", at);
+            return 0;
+        }
+        int savedFlags = pflags;
+        int capNo = 0;
+        int lookKind = 0;                  // 1 = positive, 2 = negative
+        int backName = 0;
+        if (peek() == '?' && more()) {
+            ppos++;
+            int c = peek();
+            if (c == ':') {
+                ppos++;
+            } else if (c == '=') {
+                ppos++;
+                lookKind = 1;
+            } else if (c == '!') {
+                ppos++;
+                lookKind = 2;
+            } else if (c == 'P' || c == '<') {
+                bool pform = (c == 'P');
+                if (pform) { ppos++; }
+                if (pform && peek() == '=') {
+                    // (?P=name): a back reference
+                    ppos++;
+                    char* nm = null;
+                    if (groupName(at, ')', &nm) < 0) { return 0; }
+                    int g = findName(nm);
+                    asys.free(nm);
+                    if (g == 0) {
+                        fail("unknown group name", at);
+                        return 0;
+                    }
+                    depth--;
+                    return parseGroupRef(g, at);
+                }
+                if (peek() != '<') {
+                    fail("unknown extension ?P", at);
+                    return 0;
+                }
+                ppos++;
+                if (!pform && (peek() == '=' || peek() == '!')) {
+                    fail("look-behind is not supported", at);
+                    return 0;
+                }
+                char* nm = null;
+                if (groupName(at, '>', &nm) < 0) { return 0; }
+                if (findName(nm) != 0) {
+                    asys.free(nm);
+                    fail("redefinition of group name", at);
+                    return 0;
+                }
+                capNo = newGroup(at);
+                if (!ok) { asys.free(nm); return 0; }
+                names[capNo] = nm;
+            } else {
+                // inline flags: (?i) (?s) (?m) (?-i) (?i:...)
+                bool on = true;
+                int nf = pflags;
+                int seen = 0;
+                for (;;) {
+                    if (!more()) {
+                        fail("missing ) in flags", at);
+                        return 0;
+                    }
+                    int f = peek();
+                    if (f == '-') { on = false; ppos++; continue; }
+                    int bit = 0;
+                    if (f == 'i') { bit = F_ICASE; }
+                    else if (f == 's') { bit = F_DOTALL; }
+                    else if (f == 'm') { bit = F_MULTILINE; }
+                    else if (f == 'x' || f == 'a' || f == 'u' || f == 'L') { bit = 0; }
+                    else { break; }
+                    ppos++;
+                    seen++;
+                    if (on) { nf = nf | bit; } else { nf = nf & ~bit; }
+                }
+                if (peek() == ')' && more()) {
+                    // flags for the rest of the enclosing group
+                    ppos++;
+                    pflags = nf;
+                    depth--;
+                    return 0;
+                }
+                if (peek() == ':' && more() && seen > 0) {
+                    ppos++;
+                    pflags = nf;
+                } else {
+                    fail("unknown extension", at);
+                    return 0;
+                }
+            }
+        } else {
+            capNo = newGroup(at);
+            if (!ok) { return 0; }
+        }
+        if (capNo > 0) {
+            openMask = openMask | (1 << capNo);
+        }
+        int body = parseAlt();
+        if (!ok) { return 0; }
+        if (!more() || peek() != ')') {
+            fail("missing )", at);
+            return 0;
+        }
+        ppos++;
+        pflags = savedFlags;
+        depth--;
+        if (capNo > 0) {
+            openMask = openMask & ~(1 << capNo);
+            int g = newNode(N_GROUP);
+            nodes[g].a = capNo;
+            nodes[g].kid = body;
+            return g;
+        }
+        if (lookKind != 0) {
+            int lk = newNode(N_LOOK);
+            nodes[lk].a = (lookKind == 2) ? 1 : 0;
+            nodes[lk].kid = body;
+            return lk;
+        }
+        // a non-capturing group: wrap it so that a following quantifier applies to the whole group
+        int cat = newNode(N_CAT);
+        nodes[cat].kid = body;
+        return cat;
+    }
+
+    private int newGroup(int at) {
+        if (groups >= MAXGROUPS) {
+            fail("too many groups (at most 32)", at);
+            return 0;
+        }
+        if (names == null) {
+            names = (char**) asys.alloc((MAXGROUPS + 1) * 8);
+        }
+        groups++;
+        return groups;
+    }
+
+    // ---- code generation ------------------------------------------------------------------------------------------------
+    private int emit(int v) {
+        if (ncode >= codeCap) {
+            int nc = (codeCap == 0) ? 128 : codeCap * 2;
+            if (nc > MAX_CODE * 2) {
+                fail("pattern too large", ppos);
+                return 0;
+            }
+            char* nn = asys.realloc((char*) code, nc * 8);
+            if (nn == null) {
+                fail("out of memory", ppos);
+                return 0;
+            }
+            code = (int*) nn;
+            codeCap = nc;
+        }
+        if (ncode >= MAX_CODE) {
+            fail("pattern too large", ppos);
+            return 0;
+        }
+        code[ncode] = v;
+        ncode++;
+        return ncode - 1;
+    }
+
+    private bool isSimple(int n) {
+        int t = nodes[n].type;
+        return t == N_CHAR || t == N_ANY || t == N_CLASS;
+    }
+
+    // emits the opcode and operand of a single-character atom: returns the kind in *kind and the operand in *arg
+    private void atomOf(int n, int* kind, int* arg) {
+        int t = nodes[n].type;
+        int fl = nodes[n].flags;
+        if (t == N_CHAR) {
+            int c = nodes[n].a;
+            if ((fl & F_ICASE) != 0 && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+                *kind = OP_CHARI;
+                *arg = lowerByte(c);
+            } else {
+                *kind = OP_CHAR;
+                *arg = c;
+            }
+        } else if (t == N_ANY) {
+            *kind = ((fl & F_DOTALL) != 0) ? OP_ANYNL : OP_ANY;
+            *arg = 0;
+        } else {
+            *kind = OP_CLASS;
+            *arg = nodes[n].a;
+        }
+    }
+
+    private void emitNode(int n) {
+        if (!ok) { return; }
+        int t = nodes[n].type;
+        int fl = nodes[n].flags;
+        switch (t) {
+            case N_EMPTY: return;
+            case N_CHAR: case N_ANY: case N_CLASS: {
+                int kind = 0;
+                int arg = 0;
+                atomOf(n, &kind, &arg);
+                emit(kind);
+                if (kind != OP_ANY && kind != OP_ANYNL) {
+                    emit(arg);
+                }
+                return;
+            }
+            case N_CAT: {
+                int k = nodes[n].kid;
+                while (k != 0 && ok) {
+                    emitNode(k);
+                    k = nodes[k].next;
+                }
+                return;
+            }
+            case N_ALT: {
+                int ncl = 0;
+                int k = nodes[n].kid;
+                while (k != 0) { ncl++; k = nodes[k].next; }
+                int* jmps = (int*) asys.alloc(ncl * 8 + 8);
+                int nj = 0;
+                k = nodes[n].kid;
+                while (k != 0 && ok) {
+                    if (nodes[k].next != 0) {
+                        int s = emit(OP_SPLIT);
+                        emit(s + 3);
+                        int bpos = emit(0);
+                        emitNode(k);
+                        emit(OP_JMP);
+                        int jp = emit(0);
+                        jmps[nj] = jp;
+                        nj++;
+                        if (ok) { code[bpos] = ncode; }
+                    } else {
+                        emitNode(k);
+                    }
+                    k = nodes[k].next;
+                }
+                if (ok) {
+                    for (int i = 0; i < nj; i++) {
+                        code[jmps[i]] = ncode;
+                    }
+                }
+                asys.free((char*) jmps);
+                return;
+            }
+            case N_GROUP: {
+                emit(OP_SAVE);
+                emit(nodes[n].a * 2);
+                emitNode(nodes[n].kid);
+                emit(OP_SAVE);
+                emit(nodes[n].a * 2 + 1);
+                return;
+            }
+            case N_BOL: emit(((fl & F_MULTILINE) != 0) ? OP_MBOL : OP_BOL); return;
+            case N_EOL: emit(((fl & F_MULTILINE) != 0) ? OP_MEOL : OP_EOL); return;
+            case N_BOT: emit(OP_BOT); return;
+            case N_EOT: emit(OP_EOT); return;
+            case N_WORDB: emit(OP_WORDB); return;
+            case N_NWORDB: emit(OP_NWORDB); return;
+            case N_BACKREF: {
+                emit(((fl & F_ICASE) != 0) ? OP_BACKREFI : OP_BACKREF);
+                emit(nodes[n].a);
+                return;
+            }
+            case N_LOOK: {
+                emit(OP_LOOK);
+                emit(nodes[n].a);
+                int endp = emit(0);
+                emitNode(nodes[n].kid);
+                emit(OP_LOOKEND);
+                if (ok) { code[endp] = ncode; }
+                return;
+            }
+            case N_REP: emitRep(n); return;
+        }
+    }
+
+    private void emitLoop(int kid, bool lazy, bool star) {
+        int reg = nregs;
+        nregs++;
+        int splitPos = 0;
+        if (star) {
+            splitPos = emit(OP_SPLIT);
+            emit(0);
+            emit(0);
+        }
+        int l1 = ncode;
+        emit(OP_MARK);
+        emit(reg);
+        emitNode(kid);
+        emit(OP_LOOP);
+        emit(reg);
+        emit(l1);
+        int exitSlot = emit(0);
+        emit(lazy ? 1 : 0);
+        if (!ok) { return; }
+        int exitPc = ncode;
+        code[exitSlot] = exitPc;
+        if (star) {
+            if (lazy) {
+                code[splitPos + 1] = exitPc;
+                code[splitPos + 2] = l1;
+            } else {
+                code[splitPos + 1] = l1;
+                code[splitPos + 2] = exitPc;
+            }
+        }
+    }
+
+    private void emitRep(int n) {
+        int kid = nodes[n].kid;
+        int mn = nodes[n].a;
+        int mx = nodes[n].b;
+        bool lazy = nodes[n].c != 0;
+        if (isSimple(kid)) {
+            int kind = 0;
+            int arg = 0;
+            atomOf(kid, &kind, &arg);
+            emit(OP_REP1);
+            emit(kind);
+            emit(arg);
+            emit(mn);
+            emit(mx);
+            emit(lazy ? 1 : 0);
+            return;
+        }
+        if (mx == 0) {
+            return;
+        }
+        if (mx < 0) {
+            if (mn == 0) {
+                emitLoop(kid, lazy, true);
+            } else {
+                for (int i = 0; i < mn - 1 && ok; i++) {
+                    emitNode(kid);
+                }
+                emitLoop(kid, lazy, false);
+            }
+            return;
+        }
+        for (int i = 0; i < mn && ok; i++) {
+            emitNode(kid);
+        }
+        int extra = mx - mn;
+        if (extra > 2000) {
+            fail("repeat count too large", ppos);
+            return;
+        }
+        // The optional copies: like the loop of * and +, a copy that matched the empty string ends the repetition (Perl / Python:
+        // after an empty iteration beyond the minimum no further iteration is tried). OP_MARK remembers where a copy started and
+        // OP_EMPTYX after it jumps to the end when nothing was consumed; one register serves all copies (a mark is only needed
+        // until the end of its own copy).
+        int* ends = (int*) asys.alloc(extra * 16 + 16);
+        int ne = 0;
+        int reg = nregs;
+        nregs++;
+        for (int i = 0; i < extra && ok; i++) {
+            int s = emit(OP_SPLIT);
+            int a = emit(0);
+            int b = emit(0);
+            if (!ok) { break; }
+            if (lazy) {
+                code[a] = 0;                       // patched to the end below
+                code[b] = s + 3;
+                ends[ne] = a;
+            } else {
+                code[a] = s + 3;
+                code[b] = 0;
+                ends[ne] = b;
+            }
+            ne++;
+            emit(OP_MARK);
+            emit(reg);
+            emitNode(kid);
+            if (i + 1 < extra) {
+                emit(OP_EMPTYX);
+                emit(reg);
+                ends[ne] = emit(0);
+                ne++;
+            }
+        }
+        if (ok) {
+            for (int i = 0; i < ne; i++) {
+                code[ends[i]] = ncode;
+            }
+        }
+        asys.free((char*) ends);
+    }
+
+    // which bytes can start a match: marks them in first[]; returns true when the node can match the empty string
+    private bool firstSet(int n, char* fs) {
+        int t = nodes[n].type;
+        int fl = nodes[n].flags;
+        switch (t) {
+            case N_EMPTY: return true;
+            case N_CHAR: {
+                int c = nodes[n].a;
+                fs[c] = 1;
+                if ((fl & F_ICASE) != 0 && ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))) {
+                    fs[lowerByte(c)] = 1;
+                    fs[lowerByte(c) - 32] = 1;
+                }
+                return false;
+            }
+            case N_ANY: {
+                for (int i = 0; i < 256; i++) { fs[i] = 1; }
+                return false;
+            }
+            case N_CLASS: {
+                int k = nodes[n].a;
+                for (int c = 0; c < 128; c++) {
+                    if (clsHas(k, c, 1)) { fs[c] = 1; }
+                }
+                for (int c = 128; c < 256; c++) { fs[c] = 1; }
+                return false;
+            }
+            case N_CAT: {
+                int k = nodes[n].kid;
+                while (k != 0) {
+                    if (!firstSet(k, fs)) { return false; }
+                    k = nodes[k].next;
+                }
+                return true;
+            }
+            case N_ALT: {
+                bool any = false;
+                int k = nodes[n].kid;
+                while (k != 0) {
+                    if (firstSet(k, fs)) { any = true; }
+                    k = nodes[k].next;
+                }
+                return any;
+            }
+            case N_GROUP: return firstSet(nodes[n].kid, fs);
+            case N_REP: {
+                bool e = firstSet(nodes[n].kid, fs);
+                return e || nodes[n].a == 0;
+            }
+            case N_BOL: case N_EOL: case N_BOT: case N_EOT: case N_WORDB: case N_NWORDB: case N_LOOK: return true;
+            case N_BACKREF: {
+                for (int i = 0; i < 256; i++) { fs[i] = 1; }
+                return true;
+            }
+        }
+        for (int i = 0; i < 256; i++) { fs[i] = 1; }
+        return true;
+    }
+
+    private bool startsAnchored(int n) {
+        int t = nodes[n].type;
+        switch (t) {
+            case N_BOT: return true;
+            case N_BOL: return (nodes[n].flags & F_MULTILINE) == 0;
+            case N_CAT: {
+                int k = nodes[n].kid;
+                if (k == 0) { return false; }
+                return startsAnchored(k);
+            }
+            case N_GROUP: return startsAnchored(nodes[n].kid);
+            case N_ALT: {
+                int k = nodes[n].kid;
+                while (k != 0) {
+                    if (!startsAnchored(k)) { return false; }
+                    k = nodes[k].next;
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void compileIt(char* pattern) {
+        plen = strlen(pattern);
+        pat = asys.strDup(pattern);
+        pflags = flags & 7;
+        if ((flags & F_SIMPLE) != 0) {
+            pflags = pflags | F_DOTALL;                       // the old dialect's . matched a line break too
+        }
+        nnodes = 1;                                       // node 0 means "none"
+        ppos = 0;
+        int root = parseAlt();
+        if (ok && ppos < plen) {
+            fail("unbalanced )", ppos);
+        }
+        if (!ok) {
+            return;
+        }
+        // every back reference must name an existing group
+        for (int i = 1; i < nnodes; i++) {
+            if (nodes[i].type == N_BACKREF && nodes[i].a > groups) {
+                fail("invalid group reference", 0);
+                return;
+            }
+        }
+        emitNode(root);
+        emit(OP_MATCH);
+        if (!ok) { return; }
+        regs = (int*) asys.alloc((nregs + 1) * 8);
+        first = asys.alloc(256);
+        anchoredStart = startsAnchored(root);
+        bool canEmpty = firstSet(root, first);
+        useFirst = !canEmpty;
+        asys.free((char*) nodes);
+        nodes = null;
+        ncapNodes = 0;
+        nnodes = 0;
+    }
+
+    // ---- matcher --------------------------------------------------------------------------------------------------------
+    private bool push(int kind, int a, int b, int c, int d) {
+        if (stkTop + 5 > stkCap) {
+            int nc = (stkCap == 0) ? 1024 : stkCap * 2;
+            if (nc > MAX_STACK) {
+                exceeded = true;
+                return false;
+            }
+            char* nn = asys.realloc((char*) stk, nc * 8);
+            if (nn == null) {
+                exceeded = true;
+                return false;
+            }
+            stk = (int*) nn;
+            stkCap = nc;
+        }
+        stk[stkTop] = kind;
+        stk[stkTop + 1] = a;
+        stk[stkTop + 2] = b;
+        stk[stkTop + 3] = c;
+        stk[stkTop + 4] = d;
+        stkTop = stkTop + 5;
+        return true;
+    }
+
+    // consumes one character for an atom at pos: the new position or -1
+    private int atomStep(int kind, int arg, int pos) {
+        if (pos >= tlen) {
+            return -1;
+        }
+        int c = text[pos];
+        switch (kind) {
+            case OP_CHAR:
+                if (c == arg) { return pos + 1; }
+                return -1;
+            case OP_CHARI:
+                if (lowerByte(c) == arg) { return pos + 1; }
+                return -1;
+            case OP_ANY:
+                if (c == 10) { return -1; }
+                if (c < 128) { return pos + 1; }
+                return pos + charLen(text, tlen, pos);
+            case OP_ANYNL:
+                if (c < 128) { return pos + 1; }
+                return pos + charLen(text, tlen, pos);
+            case OP_CLASS: {
+                if (c < 128) {
+                    if (clsHas(arg, c, 1)) { return pos + 1; }
+                    return -1;
+                }
+                int len = charLen(text, tlen, pos);
+                int cp = decodeAt(text, tlen, pos, len);
+                if (clsHas(arg, cp, len)) { return pos + len; }
+                return -1;
+            }
+        }
+        return -1;
+    }
+
+    private bool wordAt(int pos) {
+        if (pos < 0 || pos >= tlen) {
+            return false;
+        }
+        return isWordByte(text[pos]);
+    }
+
+    // runs the program from pc at position sp; returns the end position or -1 (-2: step limit). base = the stack level
+    // below which this run may not backtrack
+    private int run(int pc0, int sp0, int base) {
+        int pc = pc0;
+        int sp = sp0;
+        for (;;) {
+            steps++;
+            if (steps > stepLimit) {
+                exceeded = true;
+                return -2;
+            }
+            bool good = true;
+            int op = code[pc];
+            switch (op) {
+                case OP_MATCH:
+                    if ((requireEnd && sp != tlen) || sp == rejectEnd) {
+                        good = false;
+                    } else {
+                        return sp;
+                    }
+                    break;
+                case OP_LOOKEND:
+                    return sp;
+                case OP_CHAR:
+                    if (sp < tlen && text[sp] == code[pc + 1]) { sp++; pc = pc + 2; } else { good = false; }
+                    break;
+                case OP_CHARI:
+                    if (sp < tlen && lowerByte(text[sp]) == code[pc + 1]) { sp++; pc = pc + 2; } else { good = false; }
+                    break;
+                case OP_ANY: case OP_ANYNL: {
+                    int q = atomStep(op, 0, sp);
+                    if (q < 0) { good = false; } else { sp = q; pc++; }
+                    break;
+                }
+                case OP_CLASS: {
+                    int q = atomStep(OP_CLASS, code[pc + 1], sp);
+                    if (q < 0) { good = false; } else { sp = q; pc = pc + 2; }
+                    break;
+                }
+                case OP_SPLIT:
+                    if (!push(K_BRANCH, code[pc + 2], sp, 0, 0)) { return -2; }
+                    pc = code[pc + 1];
+                    break;
+                case OP_JMP:
+                    pc = code[pc + 1];
+                    break;
+                case OP_SAVE: {
+                    int slot = code[pc + 1];
+                    if (!push(K_SAVE, slot, work[slot], 0, 0)) { return -2; }
+                    work[slot] = sp;
+                    pc = pc + 2;
+                    break;
+                }
+                case OP_BOL: case OP_BOT:
+                    if (sp == 0) { pc++; } else { good = false; }
+                    break;
+                case OP_MBOL:
+                    if (sp == 0 || text[sp - 1] == 10) { pc++; } else { good = false; }
+                    break;
+                case OP_EOL:
+                    if (sp == tlen || (sp == tlen - 1 && text[sp] == 10)) { pc++; } else { good = false; }
+                    break;
+                case OP_MEOL:
+                    if (sp == tlen || text[sp] == 10) { pc++; } else { good = false; }
+                    break;
+                case OP_EOT:
+                    if (sp == tlen) { pc++; } else { good = false; }
+                    break;
+                case OP_WORDB: case OP_NWORDB: {
+                    bool b = wordAt(sp - 1) != wordAt(sp);
+                    if (b == (op == OP_WORDB)) { pc++; } else { good = false; }
+                    break;
+                }
+                case OP_BACKREF: case OP_BACKREFI: {
+                    int g = code[pc + 1];
+                    int s0 = work[g * 2];
+                    int e0 = work[g * 2 + 1];
+                    if (s0 < 0 || e0 < 0) {
+                        good = false;
+                        break;
+                    }
+                    int l = e0 - s0;
+                    if (sp + l > tlen) {
+                        good = false;
+                        break;
+                    }
+                    bool same = true;
+                    for (int i = 0; i < l; i++) {
+                        int x = text[s0 + i];
+                        int y = text[sp + i];
+                        if (x != y) {
+                            if (op == OP_BACKREFI && lowerByte(x) == lowerByte(y)) { continue; }
+                            same = false;
+                            break;
+                        }
+                    }
+                    if (same) { sp = sp + l; pc = pc + 2; } else { good = false; }
+                    break;
+                }
+                case OP_MARK: {
+                    int r = code[pc + 1];
+                    if (!push(K_REG, r, regs[r], 0, 0)) { return -2; }
+                    regs[r] = sp;
+                    pc = pc + 2;
+                    break;
+                }
+                case OP_LOOP: {
+                    int r = code[pc + 1];
+                    int bodyPc = code[pc + 2];
+                    int exitPc = code[pc + 3];
+                    bool lazy = code[pc + 4] != 0;
+                    if (sp == regs[r]) {
+                        pc = exitPc;                         // an empty iteration ends the repetition
+                    } else if (!lazy) {
+                        if (!push(K_BRANCH, exitPc, sp, 0, 0)) { return -2; }
+                        pc = bodyPc;
+                    } else {
+                        if (!push(K_BRANCH, bodyPc, sp, 0, 0)) { return -2; }
+                        pc = exitPc;
+                    }
+                    break;
+                }
+                case OP_EMPTYX: {
+                    if (sp == regs[code[pc + 1]]) {
+                        pc = code[pc + 2];                   // an empty iteration ends a bounded repetition
+                    } else {
+                        pc = pc + 3;
+                    }
+                    break;
+                }
+                case OP_REP1: {
+                    int kind = code[pc + 1];
+                    int arg = code[pc + 2];
+                    int mn = code[pc + 3];
+                    int mx = code[pc + 4];
+                    bool lazy = code[pc + 5] != 0;
+                    int p = sp;
+                    int cnt = 0;
+                    while (cnt < mn) {
+                        int q = atomStep(kind, arg, p);
+                        if (q < 0) { break; }
+                        p = q;
+                        cnt++;
+                    }
+                    if (cnt < mn) {
+                        good = false;
+                        break;
+                    }
+                    if (!lazy) {
+                        int minPos = p;
+                        int extra = 0;
+                        while (mx < 0 || cnt < mx) {
+                            int q = atomStep(kind, arg, p);
+                            if (q < 0) { break; }
+                            p = q;
+                            cnt++;
+                            extra++;
+                        }
+                        if (extra > 0) {
+                            if (!push(K_REPG, pc + 6, minPos, p, extra)) { return -2; }
+                        }
+                        sp = p;
+                        pc = pc + 6;
+                    } else {
+                        if (mx < 0 || cnt < mx) {
+                            if (!push(K_REPL, pc, p, cnt, 0)) { return -2; }
+                        }
+                        sp = p;
+                        pc = pc + 6;
+                    }
+                    break;
+                }
+                case OP_LOOK: {
+                    bool neg = code[pc + 1] != 0;
+                    int endPc = code[pc + 2];
+                    int savedTop = stkTop;
+                    int r = run(pc + 3, sp, savedTop);
+                    if (r == -2) {
+                        return -2;
+                    }
+                    if (!neg) {
+                        if (r >= 0) {
+                            keepUndoOnly(savedTop);
+                            pc = endPc;
+                        } else {
+                            good = false;
+                        }
+                    } else {
+                        if (r >= 0) {
+                            unwindTo(savedTop);
+                            good = false;
+                        } else {
+                            pc = endPc;
+                        }
+                    }
+                    break;
+                }
+                default:
+                    return -1;
+            }
+            if (good) {
+                continue;
+            }
+            // backtrack
+            bool resumed = false;
+            while (!resumed) {
+                if (stkTop <= base) {
+                    return -1;
+                }
+                stkTop = stkTop - 5;
+                int kind = stk[stkTop];
+                int a = stk[stkTop + 1];
+                int b = stk[stkTop + 2];
+                if (kind == K_SAVE) {
+                    work[a] = b;
+                } else if (kind == K_REG) {
+                    regs[a] = b;
+                } else if (kind == K_BRANCH) {
+                    pc = a;
+                    sp = b;
+                    resumed = true;
+                } else if (kind == K_REPG) {
+                    int c = stk[stkTop + 3];
+                    int extra = stk[stkTop + 4];
+                    int np;
+                    if (c - b == extra) {
+                        np = c - 1;                           // every character was one byte
+                    } else {
+                        np = b;                               // walk forward from the minimum
+                        for (int i = 0; i < extra - 1; i++) {
+                            np = np + charLen(text, tlen, np);
+                        }
+                    }
+                    if (extra > 1) {
+                        stk[stkTop + 3] = np;
+                        stk[stkTop + 4] = extra - 1;
+                        stkTop = stkTop + 5;
+                    }
+                    sp = np;
+                    pc = a;
+                    resumed = true;
+                } else if (kind == K_REPL) {
+                    int cur = b;
+                    int cnt = stk[stkTop + 3];
+                    int kk = code[a + 1];
+                    int arg = code[a + 2];
+                    int mx = code[a + 4];
+                    int q = atomStep(kk, arg, cur);
+                    if (q >= 0) {
+                        if (mx < 0 || cnt + 1 < mx) {
+                            stk[stkTop + 2] = q;
+                            stk[stkTop + 3] = cnt + 1;
+                            stkTop = stkTop + 5;
+                        }
+                        sp = q;
+                        pc = a + 6;
+                        resumed = true;
+                    }
+                }
+            }
+        }
+        return -1;
+    }
+
+    // after a successful positive look-ahead: forget its choice points but keep the undo records of captures
+    private void keepUndoOnly(int from) {
+        int w = from;
+        for (int r = from; r < stkTop; r = r + 5) {
+            int kind = stk[r];
+            if (kind == K_SAVE || kind == K_REG) {
+                if (w != r) {
+                    for (int i = 0; i < 5; i++) { stk[w + i] = stk[r + i]; }
+                }
+                w = w + 5;
+            }
+        }
+        stkTop = w;
+    }
+
+    private void unwindTo(int level) {
+        while (stkTop > level) {
+            stkTop = stkTop - 5;
+            int kind = stk[stkTop];
+            if (kind == K_SAVE) {
+                work[stk[stkTop + 1]] = stk[stkTop + 2];
+            } else if (kind == K_REG) {
+                regs[stk[stkTop + 1]] = stk[stkTop + 2];
+            }
+        }
+    }
+
+    private int attempt(int start, int* caps) {
+        stkTop = 0;
+        int nslots = 2 * (groups + 1);
+        for (int i = 0; i < nslots; i++) { work[i] = -1; }
+        int r = run(0, start, 0);
         if (r < 0) {
             return -1;
         }
-        *len = r;
-        return 0;
-    }
-    int i = from;
-    for (;;) {
-        int r = matchHere(pat, 0, s, i);
-        if (r >= 0) {
-            *len = r - i;
-            return i;
+        work[0] = start;
+        work[1] = r;
+        if (caps != null) {
+            for (int i = 0; i < nslots; i++) { caps[i] = work[i]; }
         }
-        if (s[i] == 0) {
+        return r;
+    }
+
+    private bool boundaryOk(char* t, int pos, int from) {
+        if (pos <= from || pos >= tlen) {
+            return true;
+        }
+        if ((t[pos] & 0xC0) != 0x80) {
+            return true;
+        }
+        // a continuation byte: it is a start position only when it does not belong to a valid sequence that began earlier
+        for (int back = 1; back <= 3 && pos - back >= from; back++) {
+            int b = t[pos - back];
+            if ((b & 0xC0) == 0x80) { continue; }
+            if (b >= 0xC2 && charLen(t, tlen, pos - back) > back) { return false; }
+            return true;
+        }
+        return true;
+    }
+
+    // Anchored match at pos: the end of the match or -1. caps (may be null) receives 2 * (groups + 1) numbers.
+    public int matchAt(char* t, int n, int pos, int* caps) {
+        if (!ok || pos < 0 || pos > n) {
             return -1;
         }
-        i++;
+        text = t;
+        tlen = n;
+        rejectEnd = -1;
+        requireEnd = false;
+        exceeded = false;
+        steps = 0;
+        return attempt(pos, caps);
     }
-    return -1;
+
+    // the whole text must match (the alternatives are tried until one reaches the end)
+    public bool matchFull(char* t, int n, int* caps) {
+        if (!ok) {
+            return false;
+        }
+        text = t;
+        tlen = n;
+        rejectEnd = -1;
+        requireEnd = true;
+        exceeded = false;
+        steps = 0;
+        int r = attempt(0, caps);
+        requireEnd = false;
+        return r >= 0;
+    }
+
+    // The first match at or after from: its start or -1; caps (may be null) gets the groups.
+    public int search(char* t, int n, int from, int* caps) {
+        return searchAdv(t, n, from, caps, false);
+    }
+
+    // Like search; with mustAdvance a match that ends at `from` (an empty match right there) is refused, so the engine looks
+    // for a longer match at that place first (this is what replace-all needs after an empty match, as in Python 3.7+).
+    public int searchAdv(char* t, int n, int from, int* caps, bool mustAdvance) {
+        if (!ok || from < 0 || from > n) {
+            return -1;
+        }
+        text = t;
+        tlen = n;
+        rejectEnd = mustAdvance ? from : -1;
+        requireEnd = false;
+        exceeded = false;
+        steps = 0;
+        int start = from;
+        while (start <= n) {
+            if (useFirst) {
+                while (start < n && first[t[start]] == 0) {
+                    start++;
+                }
+                if (start >= n) {
+                    return -1;
+                }
+            }
+            if (anchoredStart && start > 0) {
+                return -1;
+            }
+            if (boundaryOk(t, start, from)) {
+                int r = attempt(start, caps);
+                if (r >= 0) {
+                    return start;
+                }
+                if (exceeded) {
+                    return -1;
+                }
+            }
+            start++;
+        }
+        return -1;
+    }
 }
 
-public int search(char* pat, char* s, int* len) {
-    return searchFrom(pat, s, 0, len);
+// ---- convenience functions ------------------------------------------------------------------------------------------------------
+// Compiles a pattern. Check re->ok; the error text is in re->error. Free it with re->dispose().
+public Regex* compile(char* pattern, int flags = 0) {
+    Regex* r = new Regex(pattern, flags);
+    return r;
 }
 
-public bool test(char* pat, char* s) {
-    int len;
-    return searchFrom(pat, s, 0, &len) >= 0;
+private Regex* cacheRe[8];
+private char* cachePat[8];
+private int cacheFlags[8];
+private int cacheNext;
+
+private Regex* cached(char* pattern, int flags) {
+    for (int i = 0; i < 8; i++) {
+        if (cachePat[i] != null && cacheFlags[i] == flags && streq(cachePat[i], pattern)) {
+            return cacheRe[i];
+        }
+    }
+    int slot = cacheNext;
+    cacheNext = (cacheNext + 1) % 8;
+    if (cacheRe[slot] != null) {
+        cacheRe[slot]->dispose();
+        asys.free(cachePat[slot]);
+    }
+    Regex* r = new Regex(pattern, flags);
+    cacheRe[slot] = r;
+    cachePat[slot] = asys.strDup(pattern);
+    cacheFlags[slot] = flags;
+    return r;
+}
+
+// start of the first match of pattern in text (-1 if none); *len = its length. A bad pattern finds nothing.
+public int search(char* pattern, char* text, int* len) {
+    Regex* r = cached(pattern, F_SIMPLE);
+    if (!r->ok) {
+        return -1;
+    }
+    int caps[66];
+    int at = r->search(text, strlen(text), 0, &caps[0]);
+    if (at >= 0 && len != null) {
+        *len = caps[1] - caps[0];
+    }
+    return at;
+}
+
+public bool test(char* pattern, char* text) {
+    Regex* r = cached(pattern, F_SIMPLE);
+    if (!r->ok) {
+        return false;
+    }
+    return r->search(text, strlen(text), 0, null) >= 0;
 }
 
 // the whole text must match the pattern
-public bool matches(char* pat, char* s) {
-    int p = 0;
-    if (pat[0] == '^') {
-        p = 1;
+public bool matches(char* pattern, char* text) {
+    Regex* r = cached(pattern, F_SIMPLE);
+    if (!r->ok) {
+        return false;
     }
-    // try every possible end by appending an implicit $
-    int n = strlen(pat);
-    char* full = alloc(n + 2);
-    memcpy(full, pat, n);
-    if (!(n > 0 && pat[n - 1] == '$' && (n < 2 || pat[n - 2] != 92))) {
-        full[n] = '$';
-    }
-    return matchHere(full, p, s, 0) >= 0;
+    return r->matchFull(text, strlen(text), null);
 }
 
-public char* replaceAll(char* pat, char* s, char* repl) {
+private char* appendTo(char* out, int* o, int* cap, char* src, int len) {
+    if (len <= 0) {
+        return out;
+    }
+    if (*o + len + 1 > *cap) {
+        int nc = *cap * 2;
+        while (nc < *o + len + 1) {
+            nc = nc * 2;
+        }
+        char* nb = asys.realloc(out, nc);
+        if (nb == null) {
+            return out;
+        }
+        out = nb;
+        *cap = nc;
+    }
+    memcpy(&out[*o], src, len);
+    *o = *o + len;
+    return out;
+}
+
+private char* replaceCore(char* pattern, char* text, char* repl, bool groups) {
+    Regex* r = cached(pattern, groups ? 0 : F_SIMPLE);
+    int n = strlen(text);
     int rl = strlen(repl);
-    int cap = strlen(s) * (rl + 1) + 16;
-    char* out = alloc(cap);
+    int cap = n + 64;
+    char* out = asys.alloc(cap);
     int o = 0;
+    if (!r->ok) {
+        memcpy(out, text, n);
+        return out;
+    }
+    int caps[66];
     int pos = 0;
-    int n = strlen(s);
+    int last = 0;
+    bool noEmpty = false;
     while (pos <= n) {
-        int len;
-        int at = searchFrom(pat, s, pos, &len);
+        int at = r->searchAdv(text, n, pos, &caps[0], noEmpty);
         if (at < 0) {
             break;
         }
-        memcpy(&out[o], &s[pos], at - pos);
-        o = o + at - pos;
-        memcpy(&out[o], repl, rl);
-        o = o + rl;
-        if (len == 0) {
-            if (s[at] == 0) {
-                pos = n + 1;
-                break;
-            }
-            out[o] = s[at];
-            o++;
-            pos = at + 1;
+        int e = caps[1];
+        out = appendTo(out, &o, &cap, &text[last], at - last);
+        if (!groups) {
+            out = appendTo(out, &o, &cap, repl, rl);
         } else {
-            pos = at + len;
+            for (int i = 0; i < rl; i++) {
+                int c = repl[i];
+                if (c == '$' && i + 1 < rl) {
+                    int d = repl[i + 1];
+                    int g = -1;
+                    int adv = 1;
+                    if (d >= '0' && d <= '9') {
+                        g = d - '0';
+                    } else if (d == '{') {
+                        int j = i + 2;
+                        int v = 0;
+                        while (j < rl && repl[j] >= '0' && repl[j] <= '9') {
+                            v = v * 10 + (repl[j] - '0');
+                            j++;
+                        }
+                        if (j < rl && repl[j] == '}' && j > i + 2) {
+                            g = v;
+                            adv = j - i;
+                        }
+                    } else if (d == '$') {
+                        out = appendTo(out, &o, &cap, "$", 1);
+                        i++;
+                        continue;
+                    }
+                    if (g >= 0) {
+                        if (g <= r->groups && caps[2 * g] >= 0) {
+                            out = appendTo(out, &o, &cap, &text[caps[2 * g]], caps[2 * g + 1] - caps[2 * g]);
+                        }
+                        i = i + adv;
+                        continue;
+                    }
+                }
+                char one[2];
+                one[0] = c;
+                out = appendTo(out, &o, &cap, &one[0], 1);
+            }
         }
+        last = e;
+        pos = e;
+        noEmpty = (e == at);
     }
-    if (pos <= n) {
-        memcpy(&out[o], &s[pos], n - pos);
-        o = o + n - pos;
+    if (last < n) {
+        out = appendTo(out, &o, &cap, &text[last], n - last);
     }
+    out[o] = 0;
+    return out;
+}
+
+// replaces every match by repl (repl is used as it is). The result is a new string (asys memory).
+public char* replaceAll(char* pattern, char* text, char* repl) {
+    return replaceCore(pattern, text, repl, false);
+}
+
+// like replaceAll, but $0 .. $9 and ${n} in repl stand for the groups of the match ($$ is a dollar sign)
+public char* replaceGroups(char* pattern, char* text, char* repl) {
+    return replaceCore(pattern, text, repl, true);
+}
+
+// a pattern that matches exactly this text
+public char* quote(char* s) {
+    int n = strlen(s);
+    char* out = asys.alloc(n * 2 + 1);
+    int o = 0;
+    for (int i = 0; i < n; i++) {
+        int c = s[i];
+        if (c < 128 && !(isAlpha(c) || isDigit(c) || c == '_') && c != ' ' && c >= 32) {
+            out[o] = 92;
+            o++;
+        }
+        if (c == 10) {
+            out[o] = 92;
+            out[o + 1] = 'n';
+            o = o + 2;
+            continue;
+        }
+        out[o] = c;
+        o++;
+    }
+    out[o] = 0;
     return out;
 }

@@ -1,0 +1,808 @@
+// Regression tests for the problems found in earlier reviews of this code: atomic saves (temp file permissions and names), extreme
+// tab and indent widths, dispose() that really frees, big text cycles that must not leave memory behind, bounded directory walks.
+// Second review round: exact undo / redo after the history was trimmed, pasting whole-line clipboard entries into several cursors,
+// out-of-range line numbers, a glob that cannot blow up, atomic saves of file names at the limit (also on AOS: 55 bytes), the step
+// limit of a find in files, and the old simple dialect of the four old regex functions
+import acode;
+import asyntax;
+import atheme;
+import afind;
+import aproject;
+import regex;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (got == null || !streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got == null ? "(null)" : got, want);
+    }
+}
+
+bool permOk;
+
+// is s well formed UTF-8 (no stray or missing continuation bytes)?
+bool validUtf8(char* s) {
+    int i = 0;
+    while (s[i] != 0) {
+        int c = s[i];
+        int need = 0;
+        if (c >= 0xF0) { need = 3; }
+        else if (c >= 0xE0) { need = 2; }
+        else if (c >= 0xC0) { need = 1; }
+        else if (c >= 0x80) { return false; }
+        for (int k = 1; k <= need; k++) {
+            if ((s[i + k] & 0xC0) != 0x80) { return false; }
+        }
+        i = i + need + 1;
+    }
+    return true;
+}
+
+char* repeat(char* unit, int times) {
+    int ul = strlen(unit);
+    char* r = asys.alloc(ul * times + 1);
+    for (int i = 0; i < times; i++) { memcpy(&r[i * ul], unit, ul); }
+    return r;
+}
+
+// the name of a temp file in dir (".<name>.tmp-xxxx"), or null
+char* tempIn(char* dir) {
+    asys.DirList dl();
+    asys.listDir(dir, &dl);
+    char* r = null;
+    for (int i = 0; i < dl.count; i++) {
+        if (contains(dl.name(i), ".tmp-")) { r = asys.strDup(dl.name(i)); }
+    }
+    dl.dispose();
+    return r;
+}
+
+void rmFiles(char* dir) {
+    asys.DirList dl();
+    asys.listDir(dir, &dl);
+    for (int i = 0; i < dl.count; i++) {
+        char* p = asys.join(dir, dl.name(i));
+        asys.unlink(p);
+        asys.free(p);
+    }
+    dl.dispose();
+    asys.rmdir(dir);
+}
+
+int main() {
+    permOk = asys.platform() == asys.OS_LINUX;
+    char* dir = "build/tests/t218_work";
+    asys.mkdirs(dir);
+
+    // ---- atomic save: the temp file has the final permissions from its first byte, a random name, and never survives a failure
+    {
+        char* f = "build/tests/t218_work/secret.txt";
+        asys.writeFile(f, "old", 3);
+        asys.chmod(f, 384);
+        asys.AtomicFile a1();
+        asys.AtomicFile a2();
+        checkEq(a1.open(f, 420, 0), 0, "open the first writer");
+        checkEq(a2.open(f, 420, 0), 0, "and a second one at the same time (different temp files)");
+        a1.write("new", 3);
+        asys.DirList dl();
+        asys.listDir(dir, &dl);
+        int temps = 0;
+        bool modesOk = true;
+        char* name1 = null;
+        for (int i = 0; i < dl.count; i++) {
+            if (contains(dl.name(i), ".tmp-")) {
+                temps++;
+                char* p = asys.join(dir, dl.name(i));
+                asys.Stat st;
+                asys.stat(p, &st);
+                if (permOk && st.perm() != 384) { modesOk = false; }
+                if (name1 == null) { name1 = asys.strDup(dl.name(i)); }
+                asys.free(p);
+            }
+        }
+        dl.dispose();
+        checkEq(temps, 2, "two temp files while two writers are open");
+        check(modesOk, "both have the permissions of the old file (0600) while they are still empty or partly written");
+        check(name1 != null && strlen(name1) >= strlen(".secret.txt.tmp-") + 12, "the names carry 12 random hex digits");
+        a2.abort();
+        check(a1.commit() == 0, "commit the first");
+        check(tempIn(dir) == null, "no temp file remains after abort and commit");
+        char* t = asys.readFile(f, null, -1, null);
+        check(streq(t, "new"), "the committed content");
+        asys.free(t);
+        asys.Stat st;
+        asys.stat(f, &st);
+        check(!permOk || st.perm() == 384, "the permissions survived");
+        // the names differ between runs
+        asys.AtomicFile b1();
+        asys.AtomicFile b2();
+        b1.open(f, 420, 0);
+        char* n1 = tempIn(dir);
+        b1.abort();
+        b2.open(f, 420, 0);
+        char* n2 = tempIn(dir);
+        b2.abort();
+        check(n1 != null && n2 != null && !streq(n1, n2), "two temp names in a row are different");
+        // a write that fails leaves nothing behind
+        check(asys.writeFileAtomic("build/tests/t218_work/missing-dir/x", "a", 1, 420, 0) < 0, "a failing write");
+        check(tempIn(dir) == null, "leaves no temp file");
+        // a buffer that cannot be saved because the target is a directory
+        acode.Buffer b();
+        b.setText("data", 4);
+        check(b.save("build/tests/t218_work", 0) < 0, "saving over a directory fails");
+        check(tempIn(dir) == null && b.modified() == false, "cleanly (and the buffer keeps its state)");
+        asys.free(name1);
+        asys.free(n1);
+        asys.free(n2);
+    }
+
+    // ---- extreme tab and indent widths: nothing divides by zero, nothing overflows
+    {
+        int widths[7];
+        widths[0] = 0; widths[1] = -1; widths[2] = -100; widths[3] = 1000000; widths[4] = 1; widths[5] = 64; widths[6] = 65;
+        bool survived = true;
+        for (int wi = 0; wi < 7; wi++) {
+            acode.Buffer b();
+            b.setText("  a\n\tb\n        c {\n    \n\xe4\xb8\xad\td\n", 32);
+            acode.Editor* e = new acode.Editor(&b);
+            e->setTabWidth(widths[wi]);
+            e->setIndentWidth(widths[wi]);
+            e->setLanguage("c");
+            for (int round = 0; round < 2; round++) {
+                e->useTabs = round == 1;
+                e->setCursor(10);
+                e->tab();
+                e->backtab();
+                e->selectAll();
+                e->indentLines();
+                e->outdentLines();
+                e->toggleLineComment();
+                e->toggleLineComment();
+                e->setCursor(b.length());
+                e->newline();
+                e->typeChar('}');
+                e->backspace();
+                e->backspace();
+                e->moveUp(false);
+                e->moveDown(false);
+                e->moveHome(false);
+                e->moveEnd(false);
+                e->gotoLine(2, 9);
+                e->addCursorsInColumn(0, 3, 5);
+                e->moveVertical(2, true);
+                e->clearExtraCursors();
+                e->convertIndentation(round == 0);
+                e->detectIndent(true);
+                e->selectAll();
+                e->moveLinesDown();
+                e->duplicateLines();
+                e->deleteLines();
+                int col = e->caretCol();
+                if (col < 0) { survived = false; }
+                int vc = b.visualCol(0, b.lineEnd(0), widths[wi]);
+                int oc = b.offsetAtCol(1, 7, widths[wi]);
+                if (vc < 0 || oc < 0) { survived = false; }
+                e->undo();
+                e->undo();
+                e->redo();
+            }
+            e->dispose();
+            b.dispose();
+        }
+        check(survived, "every indentation command works with tab and indent widths of 0, -1, -100, 1000000, 1, 64 and 65");
+    }
+
+    // ---- dispose() frees: create, use and dispose each kind of object repeatedly; nothing may accumulate
+    {
+        int before = asys.memInUse();
+        for (int cycle = 0; cycle < 21; cycle++) {
+            if (cycle == 1) { before = asys.memInUse(); }        // the first round creates the lazily built tables (keyword sets, environment)
+            acode.Buffer b();
+            acode.Editor e(&b);
+            e.insertString("hello world\nsecond line\nthird\n");
+            e.typeString("typed text");
+            e.copy();
+            e.selectAll();
+            e.paste();
+            e.undo();
+            e.dispose();
+            b.dispose();
+            acode.Buffer c();
+            c.setText("int main() { return 1; }\n// note\n", 33);
+            asyntax.Highlighter* h = new asyntax.Highlighter(&c, asyntax.Lang.C);
+            asyntax.Token tk[16];
+            h->tokens(0, &tk[0], 16);
+            h->tokens(1, &tk[0], 16);
+            h->dispose();
+            asyntax.SymbolList sl();
+            asyntax.symbols(&c, asyntax.Lang.C, &sl);
+            sl.dispose();
+            asyntax.Completer cp();
+            cp.addBuffer(&c, asyntax.Lang.C);
+            asyntax.Candidate cand[8];
+            cp.complete("ma", asyntax.Lang.C, &cand[0], 8);
+            cp.dispose();
+            afind.Finder f(&c);
+            f.setPattern("(\\w+) ", afind.OPT_REGEX);
+            f.count(100);
+            f.findNext(0);
+            f.dispose();
+            c.dispose();
+            regex.Regex* r = regex.compile("(a|b)+c{2,3}[x-z]", 0);
+            int caps[66];
+            r->search("abcc", 4, 0, &caps[0]);
+            r->dispose();
+            atheme.Theme* t = atheme.builtin("nord");
+            char* ini = t->toIni();
+            asys.free(ini);
+            t->dispose();
+            atheme.Warnings w();
+            w.add("x");
+            w.dispose();
+            atheme.Settings s();
+            s.addRecentFile("/a");
+            s.setBinding("a", "b");
+            char* si = s.toIni();
+            asys.free(si);
+            s.dispose();
+            aproject.Ignore ig();
+            ig.addBuiltin();
+            ig.addPattern("x/", "");
+            ig.dispose();
+            aproject.Recent rc();
+            rc.add("a");
+            rc.add("b");
+            rc.dispose();
+            aproject.Watcher wt();
+            wt.watch("build/tests/t218_work");
+            aproject.WatchEvent ev[4];
+            wt.poll(&ev[0], 4);
+            wt.dispose();
+            aproject.QuickOpen q();
+            q.index("build/tests/t218_work", null);
+            q.dispose();
+            aproject.FileTree* ft = new aproject.FileTree("build/tests/t218_work", null);
+            ft->load(ft->root);
+            ft->dispose();
+            aproject.FindJob* fj = new aproject.FindJob();
+            fj->start("build/tests/t218_work", "x", 0, null, 1);
+            while (fj->step(10) == aproject.FIND_RUNNING) { }
+            fj->dispose();
+            asys.DirList dl();
+            asys.listDir("build/tests/t218_work", &dl);
+            dl.dispose();
+            if (asys.canSpawn()) {
+                aproject.RunJob* rj = new aproject.RunJob();
+                rj->startShell("echo hi", null);
+                rj->wait(5000);
+                rj->dispose();
+                aproject.BuildJob* bj = new aproject.BuildJob();
+                bj->startShell("echo 'a.c:1: error: e'", null);
+                bj->wait(5000);
+                bj->dispose();
+            }
+        }
+        checkEq(asys.memInUse(), before, "20 cycles over every class leave exactly nothing allocated through asys");
+        checkEq(asys.memBadFrees(), 0, "and no bad free was made anywhere");
+    }
+
+    // ---- big text cycles: the memory goes back (24 MB here; the full 50 MB cycle was measured separately)
+    {
+        int before = asys.memInUse();
+        int mappedBefore = asys.memMapped();
+        int n = 24 * 1024 * 1024;
+        char* big = asys.alloc(n);
+        for (int i = 0; i < n; i++) { big[i] = (i % 64 == 63) ? 10 : 'a' + (i % 20); }
+        acode.Buffer b();
+        b.setText(big, n);
+        asys.free(big);
+        check(b.memoryUsed() >= n, "the buffer holds the text");
+        acode.Editor e(&b);
+        e.setCursor(100);
+        e.insertString("x");
+        e.selectAll();
+        e.deleteForward();
+        check(b.length() == 0, "everything deleted");
+        b.clearHistory();
+        check(b.memoryUsed() < 2 * 1024 * 1024, "and without history almost nothing is held");
+        b.setText("tiny", 4);
+        e.dispose();
+        b.dispose();
+        check(asys.memInUse() - before < 1024 * 1024, "after the cycle less than 1 MB is in use");
+        check(asys.keepsBigBlocks() || asys.memMapped() - mappedBefore < 8 * 1024 * 1024, "and the big blocks were returned to the system (Windows and AOS cannot unmap: the allocator keeps them for reuse)");
+    }
+
+    // ---- a highlighter's table (one entry per line) goes back as soon as the buffer is replaced, not at the next request
+    {
+        int before = asys.memInUse();
+        int n = 400000;
+        char* lines = asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) { lines[i * 8] = 'x'; lines[i * 8 + 1] = ' '; lines[i * 8 + 2] = '='; lines[i * 8 + 3] = ' '; lines[i * 8 + 4] = '1'; lines[i * 8 + 5] = ';'; lines[i * 8 + 6] = ' '; lines[i * 8 + 7] = 10; }
+        acode.Buffer b();
+        b.setText(lines, n * 8);
+        asys.free(lines);
+        asyntax.Highlighter* h = new asyntax.Highlighter(&b, asyntax.Lang.C);
+        asyntax.Token tok[16];
+        h->tokens(n - 1, &tok[0], 16);
+        int full = asys.memInUse() - before;
+        b.setText("tiny", 4);
+        int after = asys.memInUse() - before;
+        check(full > 3 * 1024 * 1024, "the highlighter held a table for 400000 lines");
+        check(after < 256 * 1024, "setText gave the table back at once");
+        h->dispose();
+        b.dispose();
+        check(asys.memInUse() - before < 256 * 1024, "and nothing is left after dispose");
+    }
+
+    // ---- directory walks are bounded: a chain of 80 directories
+    {
+        char* path = asys.strDup("build/tests/t218_work/deep");
+        asys.mkdir(path, 493);
+        for (int i = 0; i < 80; i++) {
+            char* np = asys.join(path, "d");
+            asys.free(path);
+            path = np;
+            asys.mkdir(path, 493);
+        }
+        char* leaf = asys.join(path, "found.txt");
+        asys.writeFile(leaf, "needle", 6);
+        asys.free(leaf);
+        aproject.FindJob* fj = new aproject.FindJob();
+        fj->start("build/tests/t218_work", "needle", 0, null, 0);
+        int guard = 0;
+        while (fj->step(50) == aproject.FIND_RUNNING && guard < 10000) { guard++; }
+        check(guard < 10000 && fj->status() == aproject.FIND_DONE, "the walk of an 80 level deep chain ends");
+        check(fj->dirsSkipped >= 1, "below the depth limit directories are skipped and counted");
+        fj->dispose();
+        aproject.FileTree* ft = new aproject.FileTree("build/tests/t218_work", null);
+        ft->maxDepth = 10;
+        ft->load(ft->root);
+        aproject.TreeNode* n = ft->root;
+        for (int i = 0; i < 12 && n != null; i++) {
+            ft->expand(n);
+            n = (n->nkids > 0) ? n->kids[0] : null;
+        }
+        check(ft->truncated, "the tree stops at maxDepth and says so");
+        ft->dispose();
+        // remove the chain again (deepest first)
+        char* p2 = asys.strDup("build/tests/t218_work/deep");
+        char* parts[90];
+        int np = 0;
+        parts[np] = asys.strDup(p2);
+        np++;
+        for (int i = 0; i < 80; i++) {
+            char* q = asys.join(parts[np - 1], "d");
+            parts[np] = q;
+            np++;
+        }
+        char* lf = asys.join(parts[np - 1], "found.txt");
+        asys.unlink(lf);
+        asys.free(lf);
+        for (int i = np - 1; i >= 0; i--) { asys.rmdir(parts[i]); asys.free(parts[i]); }
+        asys.free(p2);
+        asys.free(path);
+    }
+
+    // ---- undo and redo stay exact when the history is trimmed. dropOldest moved the operations down but did not rebase the
+    // data offset each operation keeps: after a trim redo re-inserted wrong bytes and undo of a deletion restored wrong bytes. The
+    // earlier tests only inserted and only undid. A model (the text after every edit) checks every single undo and redo step.
+    {
+        int limits[3];
+        limits[0] = 1024;
+        limits[1] = 2500;
+        limits[2] = 12000;
+        bool exactUndo = true;
+        bool exactRedo = true;
+        bool exactAfterNew = true;
+        bool wasTrimmed = true;
+        bool kept = true;
+        for (int li = 0; li < 3; li++) {
+            acode.Buffer b();
+            b.setHistoryLimit(limits[li]);
+            int nEdits = 300;
+            char** states = (char**) asys.alloc((nEdits + 2) * 8);
+            states[0] = b.getText(0, b.length());
+            int sd = 4711 + li * 17;
+            char piece[16];
+            for (int i = 0; i < nEdits; i++) {
+                sd = (sd * 1103515245 + 12345) & 0x7FFFFFFF;
+                int r = sd >> 8;
+                int len = b.length();
+                int kind = r % 5;
+                int at = (len > 0) ? (r / 5) % (len + 1) : 0;
+                int n = 1 + (r / 97) % 6;
+                for (int k = 0; k < n; k++) { piece[k] = 'a' + (r / (k + 3)) % 26; }
+                piece[n] = 0;
+                if (at >= len && len > 0) { at = len - 1; }
+                int dl = (len - at < n) ? len - at : n;
+                if (kind <= 1 || len == 0) {
+                    b.edit(at, 0, &piece[0], n);
+                } else if (kind == 2) {
+                    b.edit(at, dl, "", 0);
+                } else if (kind == 3) {
+                    b.edit(at, dl, &piece[0], n);
+                } else {
+                    // one step with two operations: a deletion, then an insertion at the start
+                    b.beginGroup(null, 0, acode.KEY_NONE);
+                    b.edit(at, dl, "", 0);
+                    b.edit(0, 0, &piece[0], n);
+                    b.endGroup(null, 0);
+                }
+                b.sealHistory();
+                states[i + 1] = b.getText(0, b.length());
+            }
+            int depth = b.undoDepth();
+            if (depth < 3 || depth >= nEdits) { wasTrimmed = false; }
+            if (b.historyBytes() > limits[li]) { kept = false; }
+            int out[8];
+            // undo one step at a time: after k steps the text is the one after edit nEdits - k
+            for (int k = 1; k <= depth; k++) {
+                b.undo(&out[0], 8);
+                char* t = b.getText(0, b.length());
+                if (!streq(t, states[nEdits - k])) { exactUndo = false; }
+                asys.free(t);
+            }
+            if (b.canUndo()) { exactUndo = false; }
+            // and redo them all again
+            for (int k = depth - 1; k >= 0; k--) {
+                b.redo(&out[0], 8);
+                char* t = b.getText(0, b.length());
+                if (!streq(t, states[nEdits - k])) { exactRedo = false; }
+                asys.free(t);
+            }
+            if (b.canRedo()) { exactRedo = false; }
+            // undo three steps, make a NEW edit (the redo steps are dropped), undo everything again
+            for (int k = 0; k < 3; k++) { b.undo(&out[0], 8); }
+            b.sealHistory();
+            b.edit(0, 0, "Z", 1);
+            b.sealHistory();
+            b.undo(&out[0], 8);
+            int steps = 0;
+            char* t0 = b.getText(0, b.length());
+            if (!streq(t0, states[nEdits - 3])) { exactAfterNew = false; }
+            asys.free(t0);
+            while (b.canUndo()) {
+                b.undo(&out[0], 8);
+                steps++;
+                char* t = b.getText(0, b.length());
+                if (!streq(t, states[nEdits - 3 - steps])) { exactAfterNew = false; }
+                asys.free(t);
+            }
+            for (int i = 0; i <= nEdits; i++) { asys.free(states[i]); }
+            asys.free((char*) states);
+            b.dispose();
+        }
+        check(wasTrimmed, "the history limit really trimmed (some, but not all, steps were kept)");
+        check(kept, "and the history stays within its limit");
+        check(exactUndo, "after trimming every undo step restores exactly the text of that moment (insertions, deletions, replacements, groups)");
+        check(exactRedo, "after trimming every redo step brings back exactly the text of that moment");
+        check(exactAfterNew, "after trimming, undo / new edit / undo-all still restores exact texts");
+    }
+
+    // ---- pasting a clipboard entry that was copied as WHOLE LINES into as many cursors that all have a selection: each cursor gets
+    // its own line (the pieces of a whole-line copy have no separator byte; the code assumed one and the pieces drifted)
+    {
+        acode.Buffer b();
+        acode.Editor e(&b);
+        char* t = "one\nzz\ntwo\nzz\nthree\nzz\nXa\nYb\nZc\n";
+        b.setText(t, strlen(t));
+        e.setCursor(0);
+        e.addCursor(b.lineStart(2), b.lineStart(2));
+        e.addCursor(b.lineStart(4), b.lineStart(4));
+        e.copy();
+        check(e.clip->isLineMode(0) && e.clip->pieceCount(0) == 3, "three carets without selection copy three whole lines");
+        int x = b.lineStart(6);
+        int y = b.lineStart(7);
+        int z = b.lineStart(8);
+        e.setSelection(x, x + 1);
+        e.addCursor(y, y + 1);
+        e.addCursor(z, z + 1);
+        e.paste();
+        char* r = b.getText(b.lineStart(6), b.length());
+        checkStr(r, "one\na\ntwo\nb\nthree\nc\n", "one whole line into each selection (no drift, no stray bytes)");
+        asys.free(r);
+        check(e.cursorCount() == 3, "three cursors remain");
+        // UTF-8 lines: a drift would cut a character
+        acode.Buffer b2();
+        acode.Editor e2(&b2);
+        char* t2 = "\xc3\xa9" "1\nxx\n\xe2\x82\xac" "22\nxx\n\xc3\xbc" "333\nxx\nP1\nP2\nP3\n";
+        b2.setText(t2, strlen(t2));
+        e2.setCursor(0);
+        e2.addCursor(b2.lineStart(2), b2.lineStart(2));
+        e2.addCursor(b2.lineStart(4), b2.lineStart(4));
+        e2.copy();
+        int p1 = b2.lineStart(6);
+        int p2 = b2.lineStart(7);
+        int p3 = b2.lineStart(8);
+        e2.setSelection(p1, p1 + 2);
+        e2.addCursor(p2, p2 + 2);
+        e2.addCursor(p3, p3 + 2);
+        e2.paste();
+        char* r2 = b2.getText(0, b2.length());
+        check(validUtf8(r2), "the result is still valid UTF-8");
+        char* tail = b2.getText(b2.lineStart(6), b2.length());
+        checkStr(tail, "\xc3\xa9" "1\n\n\xe2\x82\xac" "22\n\n\xc3\xbc" "333\n\n", "multi-byte lines are not cut (each \"Pn\" was replaced by one whole line, the old line break stays)");
+        asys.free(tail);
+        asys.free(r2);
+        // selections copied (not lines): pieces are joined by one separator that belongs to no piece: still one piece per cursor
+        acode.Buffer b3();
+        acode.Editor e3(&b3);
+        b3.setText("ab cde f ... ... ...", 20);
+        e3.setSelection(0, 2);
+        e3.addCursor(3, 6);
+        e3.addCursor(7, 8);
+        e3.copy();
+        check(!e3.clip->isLineMode(0) && e3.clip->pieceCount(0) == 3, "three selections copy three pieces");
+        e3.setSelection(9, 12);
+        e3.addCursor(13, 16);
+        e3.addCursor(17, 20);
+        e3.paste();
+        char* r3 = b3.getText(0, b3.length());
+        checkStr(r3, "ab cde f ab cde f", "selection pieces still go one per cursor");
+        asys.free(r3);
+        e3.dispose();
+        b3.dispose();
+        e2.dispose();
+        b2.dispose();
+        e.dispose();
+        b.dispose();
+    }
+
+    // ---- out-of-range line numbers (lineStart / lineEnd / lineLength used to read past the line index and crash)
+    {
+        acode.Buffer b();
+        b.setText("a\nb\nc", 5);
+        checkEq(b.lineStart(2), 4, "lineStart of the last line");
+        checkEq(b.lineStart(3), 5, "lineStart one past the last line is the end of the text");
+        checkEq(b.lineStart(1000000), 5, "lineStart far past the end");
+        checkEq(b.lineEnd(1000000), 5, "lineEnd far past the end");
+        checkEq(b.lineLength(1000000), 0, "lineLength far past the end");
+        checkEq(b.lineStart(-3), 0, "lineStart of a negative line");
+        checkEq(b.lineEnd(-3), 0, "lineEnd of a negative line");
+        checkEq(b.lineLength(-3), 0, "lineLength of a negative line");
+        checkEq(b.lineLength(0), 1, "lineLength of line 0 as before");
+        b.dispose();
+    }
+
+    // ---- a glob cannot blow up. The recursive matcher took 15 s for six stars against a 100 byte name and minutes for seven (a
+    // .gitignore line from a repository could freeze the file tree): it is an automaton now, time O(pattern * text)
+    {
+        char* name = repeat("a", 100);
+        int t0 = asys.monoMs();
+        bool m1 = aproject.globMatch("*a*a*a*a*a*b", name);
+        bool m2 = aproject.globMatch("*a*a*a*a*a*a*a*a*a*a*a*a*a*b", name);
+        bool m3 = aproject.globMatch("*a*a*a*a*a*a*a*a*a*a*a*a*a", name);
+        bool m4 = aproject.globMatch("**a**a**a**a*[ab]*a*?*a*b", name);
+        char* many = repeat("*a", 300);                          // a pattern of 600 bytes (takes the heap path)
+        bool m5 = aproject.globMatch(many, name);
+        char* many2 = asys.concat3(many, "b", "");
+        bool m6 = aproject.globMatch(many2, name);
+        aproject.Ignore ign();
+        ign.addPattern("*a*a*a*a*a*a*b", "");
+        bool ig = ign.ignored(name, false);
+        int took = asys.monoMs() - t0;
+        check(!m1 && !m2 && !m4 && !m6, "stars against a long name that cannot match: false, at once");
+        check(m3, "and the same pattern without the impossible b matches");
+        check(!m5, "300 stars and a's against 100 a's: not enough a's, false");
+        check(!ig, "an ignore rule with six stars does not hang and does not match");
+        check(took < 3000, "all of this takes well under 3 seconds (it took minutes)");
+        ign.dispose();
+        asys.free(many2);
+        asys.free(many);
+        asys.free(name);
+        // the meaning of the patterns did not change
+        check(aproject.globMatch("*.a", "x.a") && !aproject.globMatch("*.a", "x.b"), "*.a");
+        check(!aproject.globMatch("*", "a/b") && aproject.globMatch("**", "a/b"), "* stops at a slash, ** does not");
+        check(aproject.globMatch("a/**/b", "a/b") && aproject.globMatch("a/**/b", "a/x/y/b") && !aproject.globMatch("a/**/b", "a/xb"), "a/**/b");
+        check(aproject.globMatch("**/b", "b") && aproject.globMatch("**/b", "x/y/b") && !aproject.globMatch("**/b", "xb"), "**/b");
+        check(aproject.globMatch("a?c", "abc") && !aproject.globMatch("a?c", "a/c"), "? is one character but not a slash");
+        check(aproject.globMatch("[a-c]x", "bx") && !aproject.globMatch("[!a]x", "ax") && aproject.globMatch("[^a]x", "bx"), "sets");
+        check(aproject.globMatch("\\*", "*") && !aproject.globMatch("\\*", "a"), "an escaped star");
+        check(aproject.globMatch("[", "[") && aproject.globMatch("a[", "a[") && !aproject.globMatch("[", "a"), "a bracket without its closing bracket is a plain character");
+        check(aproject.globMatch("", "") && !aproject.globMatch("", "a") && aproject.globMatch("*", ""), "empty pattern and text");
+    }
+
+    // ---- atomic saves of names at the file system's limit. The temp name is ".<name>.tmp-<12 hex>"; on AOS (names of at most 55
+    // bytes) every name of 38 to 55 bytes failed with -28 (the kernel's answer to a failed create), and on Linux a 255 byte name made
+    // the cut temp name the same every time, so one stale file of that name made every later save fail with -EEXIST
+    {
+        int nm = asys.nameMax();
+        check(nm == 255 || (nm == 55 && asys.platform() == asys.OS_AOS), "nameMax is 255, and 55 on AOS");
+        char* dirE = "build/tests/t218_work/names";
+        asys.mkdirs(dirE);
+        if (asys.platform() != asys.OS_WINDOWS) {                 // Windows has MAX_PATH instead of this limit
+            int lens[4];
+            lens[0] = 20;
+            lens[1] = (nm == 55) ? 38 : 237;                       // the shortest name whose temp name is too long (name + 18 > limit)
+            lens[2] = nm - 1;
+            lens[3] = nm;
+            bool allOk = true;
+            bool contentOk = true;
+            bool noLeft = true;
+            bool tempOk = true;
+            for (int li = 0; li < 4; li++) {
+                char* leaf = repeat("n", lens[li]);
+                check(asys.validName(leaf), "the name is valid");
+                char* path = asys.join(dirE, leaf);
+                asys.writeFile(path, "old", 3);
+                char* stale = null;
+                if (nm == 255 && lens[li] >= 250) {
+                    // what the old code produced for this name: ".nnn..." cut to 250 bytes
+                    char* st = repeat("n", 249);
+                    char* st2 = asys.concat3(".", st, "");
+                    stale = asys.join(dirE, st2);
+                    asys.free(st);
+                    asys.free(st2);
+                    asys.writeFile(stale, "stale", 5);
+                }
+                // while the file is open, the temp file has a name that fits and ends with 12 hex digits
+                asys.AtomicFile af();
+                if (af.open(path, 420, 0) != 0) { allOk = false; }
+                asys.DirList dl();
+                asys.listDir(dirE, &dl);
+                int tmpCount = 0;
+                for (int i = 0; i < dl.count; i++) {
+                    char* nmv = dl.name(i);
+                    if (contains(nmv, ".tmp-") && nmv[0] == '.') {
+                        tmpCount++;
+                        int l = strlen(nmv);
+                        if (l > nm || l > 250) { tempOk = false; }
+                        for (int k = l - 12; k < l; k++) {
+                            int c = nmv[k];
+                            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { tempOk = false; }
+                        }
+                        if (!validUtf8(nmv)) { tempOk = false; }
+                    }
+                }
+                dl.dispose();
+                if (tmpCount != 1) { tempOk = false; }
+                af.write("new", 3);
+                if (af.commit() != 0) { allOk = false; }
+                int len = 0;
+                int er = 0;
+                char* back = asys.readFile(path, &len, -1, &er);
+                if (back == null || len != 3 || !streq(back, "new")) { contentOk = false; }
+                asys.free(back);
+                // a Buffer saves the same way
+                acode.Buffer b();
+                b.setText("buffer", 6);
+                if (b.save(path, 0) != 0) { allOk = false; }
+                b.dispose();
+                // nothing but the target (and the stale file we made) is left
+                asys.DirList d2();
+                asys.listDir(dirE, &d2);
+                int want = (stale != null) ? 2 : 1;
+                if (d2.count != want) { noLeft = false; }
+                d2.dispose();
+                asys.unlink(path);
+                if (stale != null) { asys.unlink(stale); asys.free(stale); }
+                asys.free(path);
+                asys.free(leaf);
+            }
+            check(allOk, "writing and saving files with names of 20 bytes up to the limit works (also with a stale file of the old cut name)");
+            check(contentOk, "and the content is the new content");
+            check(tempOk, "the temp file name fits the limit, keeps its random part and is valid UTF-8");
+            check(noLeft, "and no temp file is left behind");
+            // a multi-byte name: the base is cut at a character boundary
+            char* u = repeat("\xc3\xa9", (nm - 2) / 2);                // e-acute, 2 bytes each: about the limit
+            char* upath = asys.join(dirE, u);
+            asys.writeFile(upath, "old", 3);
+            asys.AtomicFile af2();
+            checkEq(af2.open(upath, 420, 0), 0, "a name of 2 byte characters at the limit opens");
+            asys.DirList d3();
+            asys.listDir(dirE, &d3);
+            bool utf = true;
+            for (int i = 0; i < d3.count; i++) { if (!validUtf8(d3.name(i))) { utf = false; } }
+            d3.dispose();
+            check(utf, "the temp name of a multi-byte name is cut between characters");
+            af2.write("n", 1);
+            checkEq(af2.commit(), 0, "and it commits");
+            asys.unlink(upath);
+            asys.free(upath);
+            asys.free(u);
+        }
+        // a name over the limit is refused by validName
+        char* over = repeat("n", nm + 1);
+        check(!asys.validName(over), "a name one byte over the limit is not valid");
+        asys.free(over);
+        asys.rmdir(dirE);
+    }
+
+    // ---- find in files says when a regular expression gave up (the step limit): before, a catastrophic pattern just gave 0 results
+    {
+        char* dirX = "build/tests/t218_work/exc";
+        asys.mkdirs(dirX);
+        char* aaa = repeat("a", 60);
+        char* longLine = asys.concat3(aaa, "c\n", "");
+        asys.writeFile("build/tests/t218_work/exc/a_long.txt", longLine, strlen(longLine));
+        asys.writeFile("build/tests/t218_work/exc/b_short.txt", "xaab\nyy\n", 8);
+        asys.writeFile("build/tests/t218_work/exc/c_other.txt", "nothing here\n", 13);
+        aproject.FindJob* fj = new aproject.FindJob();
+        int sr = fj->start(dirX, "(a+)+b", aproject.FIND_REGEX, null, 0);
+        checkEq(sr, 0, "the job starts");
+        int guard = 0;
+        while (fj->step(100) == aproject.FIND_RUNNING && guard < 10000) { guard++; }
+        check(fj->status() == aproject.FIND_DONE, "the job ends");
+        check(fj->exceeded, "it says that a pattern hit the step limit");
+        checkEq(fj->filesExceeded, 1, "in one file");
+        checkEq(fj->count, 1, "the short file still gives its result");
+        check(fj->count == 1 && streq(fj->results[0].path, "b_short.txt"), "and it is the one from the short file");
+        fj->dispose();
+        // a pattern that does not blow up never sets the flag
+        aproject.FindJob* f2 = new aproject.FindJob();
+        f2->start(dirX, "aab", aproject.FIND_REGEX, null, 0);
+        guard = 0;
+        while (f2->step(100) == aproject.FIND_RUNNING && guard < 10000) { guard++; }
+        check(!f2->exceeded && f2->filesExceeded == 0 && f2->count == 1, "an ordinary search does not set it");
+        f2->dispose();
+        asys.unlink("build/tests/t218_work/exc/a_long.txt");
+        asys.unlink("build/tests/t218_work/exc/b_short.txt");
+        asys.unlink("build/tests/t218_work/exc/c_other.txt");
+        asys.rmdir(dirX);
+        asys.free(longLine);
+        asys.free(aaa);
+    }
+
+    // ---- the four old regex functions keep the OLD simple dialect: ( ) | { } are plain characters (the rewritten module made them
+    // operators, so grep "main()" in the AOS shell also matched "int main {" and "a|b" became an alternation)
+    {
+        check(regex.matches("a(b)", "a(b)") && !regex.matches("a(b)", "ab"), "matches: ( ) are plain characters");
+        check(regex.test("main()", "int main() {") && !regex.test("main()", "int main {"), "test: main() finds only main()");
+        check(regex.test("a|b", "x a|b y") && !regex.test("a|b", "b"), "test: | is a plain character");
+        check(regex.matches("x{2}", "x{2}") && !regex.matches("x{2}", "xx"), "matches: { } are plain characters");
+        int len = 0;
+        checkEq(regex.search("a{1}b", "zz a{1}b", &len), 3, "search finds the literal");
+        checkEq(len, 5, "and reports its length");
+        char* r1 = regex.replaceAll("(x)", "a(x)b(x)", "[]");
+        checkStr(r1, "a[]b[]", "replaceAll with ( ) in the pattern");
+        asys.free(r1);
+        char* r2 = regex.replaceAll("a|b", "a|b b", "-");
+        checkStr(r2, "- b", "replaceAll with | in the pattern");
+        asys.free(r2);
+        check(regex.test("a^b", "a^b") && regex.test("a$b", "a$b"), "a ^ or $ in the middle is a plain character");
+        check(regex.test("^ab$", "ab") && !regex.test("^ab$", "xab") && !regex.test("^ab$", "abx"), "^ at the start and $ at the end are anchors");
+        check(regex.test("[(|)]+", "(|)") && regex.matches("[^(]+", "abc"), "sets");
+        check(regex.matches("\\(a\\)", "(a)") && regex.matches("a*b?c+", "aac"), "escapes and the old quantifiers work");
+        check(regex.test("\\d+\\.\\d", "v 12.5"), "\\d and \\. as before");
+        // . matches a line break and $ only the very end (the full syntax: not so, . stops at a line break and $ also matches before a final one)
+        check(regex.test("a.b", "a\nb") && regex.matches("a.b", "a\nb"), "the old . matched a line break too");
+        check(regex.test("a$", "a") && !regex.test("a$", "a\n"), "the old $ matches at the very end only, not before a final line break");
+        check(!regex.test("^b", "a\nb") && regex.test("^a", "a\nb"), "the old ^ is the start of the text only");
+        regex.Regex* fullDollar = regex.compile("a$", 0);
+        check(fullDollar->search("a\n", 2, 0, null) == 0, "the full syntax: $ also matches before a final line break (like Python)");
+        fullDollar->dispose();
+        // the full syntax is for compile() and replaceGroups
+        regex.Regex* full = regex.compile("a(b|c)", 0);
+        check(full->ok && full->matchFull("ac", 2, null), "compile() has groups and alternation");
+        full->dispose();
+        regex.Regex* simple = regex.compile("a(b)", regex.F_SIMPLE);
+        check(simple->ok && simple->matchFull("a(b)", 4, null) && !simple->matchFull("ab", 2, null), "compile(F_SIMPLE) is the old dialect");
+        simple->dispose();
+        char* r3 = regex.replaceGroups("(\\w)(\\d)", "a1 b2", "$2$1");
+        checkStr(r3, "1a 2b", "replaceGroups has the full syntax");
+        asys.free(r3);
+    }
+    rmFiles(dir);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

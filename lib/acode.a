@@ -1,0 +1,4050 @@
+// =============================================================================
+//  acode - the text engine of AIDE                                                              import acode;
+//
+//  Two layers, no user interface:
+//
+//    Buffer    the text: a gap buffer (UTF-8 bytes, '\n' between lines in text mode) plus a line index that is a gap array, so
+//              that 100 000 lines can be inserted one by one anywhere near the previous edit in linear time and a 120 MB file
+//              loads in under a second. Undo / redo history (grouped, merging, memory cap, save point), change listeners,
+//              versions, file load / save (atomic), external change detection, binary / BOM / line ending handling.
+//    Editor    cursors (any number, each with a selection) over a Buffer and every command an editor offers: typing, newline
+//              with auto-indent, backspace / delete, word / line / paragraph motions, indentation, comment toggling, line
+//              operations, clipboard ring, bracket matching, clean-ups. Every command is ONE undo step; undo and redo restore
+//              the cursors exactly.
+//
+//  A front end reads the text through cheap accessors and redraws when a listener says something changed:
+//
+//    acode.Buffer b();                                   // objects with a constructor are declared with ()
+//    b.load("main.a");                                   // 0 or -errno; a FIFO, device or directory gives -ENOTREG without opening it
+//    acode.Editor e(&b);
+//    e.typeString("int x;");  e.newline();  e.undo();
+//    int n = b.lineCount();
+//    int len = 0;  char* p = b.linePtr(i, &len);         // the bytes of line i, no copy (valid until the next edit)
+//    b.save(null, 0);                                    // atomic: temp file + rename, permissions kept
+//
+//  Positions are byte offsets into the text. Columns: visualCol(line, off, tabWidth) counts tabs (jump to the next multiple of
+//  tabWidth), wide characters (2) and combining marks (0); offsetAtCol is its inverse. Carets are always on character boundaries.
+//
+//  BUFFER
+//    length() lineCount() lineStart(i) lineEnd(i) lineLength(i) lineAt(off) byteAt(off) copyRange(from, to, out) getText(from, to)
+//    getLine(i) linePtr(i, &len) flatten() charStart(off) nextChar(off) prevChar(off) decodeAt(off, &size) visualCol offsetAtCol
+//    countChars memoryUsed()
+//    edit(off, delLen, ins, insLen) insert remove      the one primitive every change goes through; false when read only
+//    setText(text, n) load(path) save(path, flags) reload() checkExternal() acknowledgeExternal() dispose()
+//    modified() markSaved() undo(out, max) redo(out, max) canUndo() canRedo() undoDepth() redoDepth() setHistory(on)
+//    setHistoryLimit(bytes) historyBytes() clearHistory() sealHistory() beginGroup(snapshot, n, key) endGroup(snapshot, n)
+//    addListener(func, user) removeListener(id) listenerCount()     func is  int cb(int user, acode.Change* c)
+//    fields: version readOnly binary eol eolMixed hasBom path maxLoad
+//
+//  EDITOR (m = move with extend = true for shift)
+//    cursors: setCursor setSelection addCursor addCursorsInColumn clearExtraCursors collapse normalize caret() caretLine() caretCol()
+//             cursorCount() hasSelection(i) selStart(i) selEnd(i) anySelection() cur[i].anchor / .pos / .goal, primary
+//    motions: moveLeft moveRight moveUp moveDown moveVertical(n, extend) moveHome moveEnd moveWordLeft moveWordRight
+//             moveParagraphUp moveParagraphDown moveDocStart moveDocEnd gotoLine(line, col) selectAll selectLine selectWord
+//    editing: insertText insertString typeChar typeString newline backspace deleteForward deleteWordBack deleteWordForward
+//             deleteToLineEnd tab backtab indentLines outdentLines toggleLineComment toggleBlockComment changeCase
+//    lines:   moveLinesUp moveLinesDown duplicateLines joinLines deleteLines
+//    clipboard: copy cut paste pasteEntry(i) clip (a Clipboard ring: push pushText text(i) promote count ...)
+//    misc:    undo() redo() breakUndo() trimTrailingWhitespace() ensureFinalNewline() convertIndentation(toSpaces) detectIndent(apply)
+//             matchBracket(pos) matchNearCaret(&at) selectEnclosingBrackets() addNextOccurrence() setLanguage(name) setComments(...)
+//             saveFile(path, flags, trim, finalNewline) beginGroup(key) / endGroup() for your own multi-step edits
+//    settings: tabWidth indentWidth (below 1 means 4, above 64 means 64) useTabs autoIndent smartHome smartBackspace electric
+//             trimAutoIndent indentColon lineComment blockOpen blockClose
+//
+//  Rules the tests check: undo / redo restore the exact cursors (also backwards selections and several cursors); typing, backspace
+//  and delete merge into one undo step (a new word starts a new one); moveLines keeps the selections with the block (also when the
+//  selection ends at column 0 of the next line); turning the history off forgets it; binary buffers round-trip byte for byte;
+//  load never opens a FIFO; save never leaves a temp file; dispose() gives everything back; tab width 0 or negative cannot crash.
+//  Listener table, cursor table, history arrays and the line index all grow without a fixed limit.
+// =============================================================================
+import asys;
+module acode;
+
+// ---- constants ----------------------------------------------------------------------------------------------------------------
+public const EOL_LF = 0;
+public const EOL_CRLF = 1;
+public const EOL_CR = 2;
+
+public const EXT_NONE = 0;                  // the file on disk is as we left it
+public const EXT_CHANGED = 1;               // it was modified (or replaced) by someone else
+public const EXT_DELETED = 2;               // it is gone
+
+public const CH_EDIT = 0;                   // Change.kind: an ordinary edit
+public const CH_UNDO = 1;
+public const CH_REDO = 2;
+public const CH_RESET = 3;                  // the whole text was replaced (load, setText)
+
+// undo merge keys: consecutive groups with the same non-zero key and untouched cursors become one undo step
+public const KEY_NONE = 0;
+public const KEY_TYPE = 1;
+public const KEY_BACKSPACE = 2;
+public const KEY_DELETE = 3;
+
+// description of one change of the text, given to the change listeners AFTER it was applied
+public struct Change {
+    int off;            // where the old text started
+    int delLen;         // bytes removed
+    int insLen;         // bytes inserted
+    int line;           // the line that contains `off` (in the new text); lines after it may have moved
+    int delLines;       // line breaks removed
+    int insLines;       // line breaks inserted
+    int version;        // Buffer.version after the change
+    int kind;           // CH_EDIT, CH_UNDO, CH_REDO, CH_RESET
+}
+
+private int imin(int a, int b) {
+    if (a < b) { return a; }
+    return b;
+}
+
+private int imax(int a, int b) {
+    if (a > b) { return a; }
+    return b;
+}
+
+// ---- characters -------------------------------------------------------------------------------------------------------------------
+// the number of terminal columns a code point takes: 0 for combining and zero width characters, 2 for East Asian wide characters
+// and emoji, 1 for everything else (control characters count 1: the front end decides how to draw them)
+public int charWidth(int cp) {
+    if (cp < 0x300) {
+        return 1;
+    }
+    if ((cp >= 0x300 && cp <= 0x36F) || (cp >= 0x1AB0 && cp <= 0x1AFF) || (cp >= 0x1DC0 && cp <= 0x1DFF) || (cp >= 0x20D0 && cp <= 0x20FF) ||
+        (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0xFE20 && cp <= 0xFE2F) || (cp >= 0x200B && cp <= 0x200F) || cp == 0x2060 || cp == 0xFEFF) {
+        return 0;
+    }
+    if ((cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0x303E) || (cp >= 0x3041 && cp <= 0x33FF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+        (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xA000 && cp <= 0xA4CF) || (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+        (cp >= 0xFE30 && cp <= 0xFE6F) || (cp >= 0xFF00 && cp <= 0xFF60) || (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x1F300 && cp <= 0x1F64F) ||
+        (cp >= 0x1F900 && cp <= 0x1F9FF) || (cp >= 0x20000 && cp <= 0x3FFFD)) {
+        return 2;
+    }
+    return 1;
+}
+
+// character classes for word motions: 0 white space (not a line break), 1 word (letters, digits, '_' and every non-ASCII
+// character), 2 punctuation, 3 line break
+public int charClass(int c) {
+    if (c == 10 || c == 13) {
+        return 3;
+    }
+    if (c == ' ' || c == 9 || c == 11 || c == 12) {
+        return 0;
+    }
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c >= 128) {
+        return 1;
+    }
+    return 2;
+}
+
+// the number of bytes the UTF-8 sequence starting with this lead byte needs (1 for ASCII and invalid lead bytes)
+private int seqLen(int b) {
+    if (b < 0xC2) { return 1; }
+    if (b < 0xE0) { return 2; }
+    if (b < 0xF0) { return 3; }
+    if (b < 0xF5) { return 4; }
+    return 1;
+}
+
+// writes the UTF-8 form of a code point (up to 4 bytes) and returns the byte count
+public int encodeUtf8(int cp, char* out) {
+    if (cp < 0x80) {
+        out[0] = cp;
+        return 1;
+    }
+    if (cp < 0x800) {
+        out[0] = 0xC0 | (cp >> 6);
+        out[1] = 0x80 | (cp & 0x3F);
+        return 2;
+    }
+    if (cp < 0x10000) {
+        out[0] = 0xE0 | (cp >> 12);
+        out[1] = 0x80 | ((cp >> 6) & 0x3F);
+        out[2] = 0x80 | (cp & 0x3F);
+        return 3;
+    }
+    out[0] = 0xF0 | (cp >> 18);
+    out[1] = 0x80 | ((cp >> 12) & 0x3F);
+    out[2] = 0x80 | ((cp >> 6) & 0x3F);
+    out[3] = 0x80 | (cp & 0x3F);
+    return 4;
+}
+
+// ---- the buffer -----------------------------------------------------------------------------------------------------------------------
+const S_OPS = 0;            // undo step record: index of the first operation
+const S_NOPS = 1;
+const S_BGEN = 2;           // the state (generation) before and after the step
+const S_AGEN = 3;
+const S_CBOFF = 4;          // cursor snapshot before: offset in the cursor arena, number of ints
+const S_CBN = 5;
+const S_CAOFF = 6;          // cursor snapshot after
+const S_CAN = 7;
+const S_KEY = 8;
+const S_SEALED = 9;
+const S_DATA = 10;          // start of this step's bytes in the data arena
+const SREC = 12;            // ints per step record
+
+// The storage of a buffer that holds nothing and has been given nothing: it points here instead of at heap memory, so that an empty
+// or disposed buffer costs no allocation (the first edit allocates).
+char emptyData[16];
+int emptyLs[4];
+
+// A text buffer: a gap buffer for the bytes (UTF-8, always '\n' between lines in text mode), a line index that is a gap array
+// as well (so inserting 100 000 lines one by one, anywhere near the previous edit, costs nothing), undo / redo history with
+// cursor snapshots, change listeners and file load / save.
+public class Buffer {
+    // ---- state visible to the front end
+    public int version;                 // grows with every change of the text (also undo / redo / load)
+    public bool readOnly;               // edits are refused
+    public bool binary;                 // raw bytes: no end-of-line, BOM or trim handling
+    public int eol;                     // EOL_LF / EOL_CRLF / EOL_CR: what the file used and what save() writes
+    public bool eolMixed;               // the file mixed line ending styles (it is saved with the dominant one)
+    public bool hasBom;                 // the file started with a UTF-8 byte order mark (written back by save)
+    public char* path;                  // the file this buffer was loaded from / saved to (an asys string) or null
+    public int maxLoad;                 // load() refuses bigger files (default 1 GiB)
+    public bool inNotify;               // true while the listeners run (edits from a listener are refused)
+
+    // ---- text: a gap buffer
+    private char* data;
+    private int cap;
+    private int gs;                     // the gap is [gs, ge)
+    private int ge;
+    private char* scratch;              // linePtr's copy of a line that straddles the gap
+    private int scratchCap;
+
+    // ---- line index: a gap array of line start offsets. Entries after the gap are stored relative (add lshift).
+    private int* ls;
+    private int lcap;
+    private int lgs;
+    private int lge;
+    private int lshift;
+    private int nlines;
+
+    // ---- listeners
+    private func* lfn;
+    private int* luser;
+    private int* lid;
+    private int ln;
+    private int lcapL;
+    private int nextId;
+
+    // ---- history
+    private bool histOn;
+    private int* steps;
+    private int nsteps;
+    private int stepsCap;
+    private int top;                    // steps [0, top) are applied, [top, nsteps) can be redone
+    private int* ops;                   // 4 ints per operation: offset, deleted length, inserted length, data offset
+    private int nops;
+    private int opsCap;
+    private char* hdata;                // deleted bytes then inserted bytes of every operation
+    private int hlen;
+    private int hcap;
+    private int* hcurs;                 // cursor snapshots
+    private int hclen;
+    private int hccap;
+    private int histLimit;
+    private int grpDepth;               // nesting of beginGroup
+    private int grpStep;                // the step of the open group (-1 until its first operation)
+    private int grpKey;
+    private int* pendSnap;              // the snapshot given to beginGroup
+    private int pendN;
+    private int pendCap;
+    private int gen;                    // the current state; every change makes a new one
+    private int genCounter;
+    private int savedGen;
+    private bool sealNext;              // the next group must not merge into the previous step
+
+    // ---- file state
+    private bool diskKnown;
+    private int diskMtime;
+    private int diskNs;
+    private int diskSize;
+
+    public Buffer() {
+        maxLoad = 1073741824;
+        histOn = true;
+        histLimit = 33554432;
+        grpStep = -1;
+        eol = EOL_LF;
+        toEmpty();
+    }
+
+    // ---- storage -------------------------------------------------------------------------------------------------------------------
+    // the state of a buffer without text and without memory
+    private void toEmpty() {
+        data = &emptyData[0];
+        cap = 0;
+        gs = 0;
+        ge = 0;
+        ls = &emptyLs[0];
+        emptyLs[0] = 0;
+        lcap = 1;
+        lgs = 1;
+        lge = 1;
+        lshift = 0;
+        nlines = 1;
+    }
+
+    // gives an empty buffer real storage before something is written into it
+    private void own() {
+        if (data == &emptyData[0] || data == null) {
+            data = null;
+            ls = null;
+            resetStorage(null, 0, 0);
+        }
+    }
+
+    // installs blk (an asys block holding len bytes at its start, capacity bcap) as the text and builds the line index
+    private void resetStorage(char* blk, int len, int bcap) {
+        if (data != &emptyData[0]) { asys.free(data); }
+        if (ls != &emptyLs[0]) { asys.free((char*) ls); }
+        asys.free(scratch);
+        scratch = null;
+        scratchCap = 0;
+        if (blk == null) {
+            bcap = 1024;
+            blk = asys.alloc(bcap);
+            len = 0;
+        }
+        data = blk;
+        cap = bcap;
+        gs = len;
+        ge = cap;
+        // count the lines
+        int n = 1;
+        for (int i = 0; i < len; i++) {
+            if (blk[i] == 10) {
+                n++;
+            }
+        }
+        lcap = n + n / 8 + 64;
+        ls = (int*) asys.alloc(lcap * 8);
+        ls[0] = 0;
+        int k = 1;
+        for (int i = 0; i < len; i++) {
+            if (blk[i] == 10) {
+                ls[k] = i + 1;
+                k++;
+            }
+        }
+        nlines = n;
+        lgs = n;
+        lge = lcap;
+        lshift = 0;
+    }
+
+    // frees everything: the buffer is empty afterwards (it can be used again, the next edit allocates)
+    public void dispose() {
+        if (data != &emptyData[0]) { asys.free(data); }
+        if (ls != &emptyLs[0]) { asys.free((char*) ls); }
+        asys.free(scratch);
+        asys.free((char*) lfn);
+        asys.free((char*) luser);
+        asys.free((char*) lid);
+        asys.free((char*) steps);
+        asys.free((char*) ops);
+        asys.free(hdata);
+        asys.free((char*) hcurs);
+        asys.free((char*) pendSnap);
+        asys.free(path);
+        data = null; ls = null; scratch = null; lfn = null; luser = null; lid = null; steps = null; ops = null; hdata = null;
+        hcurs = null; pendSnap = null; path = null;
+        cap = 0; scratchCap = 0; ln = 0; lcapL = 0; nsteps = 0; top = 0; stepsCap = 0; nops = 0; opsCap = 0; hlen = 0; hcap = 0;
+        hclen = 0; hccap = 0; pendN = 0; pendCap = 0; diskKnown = false;
+        toEmpty();
+        version++;
+    }
+
+    public int length() {
+        return cap - (ge - gs);
+    }
+
+    public int lineCount() {
+        return nlines;
+    }
+
+    // how many bytes the buffer holds in memory in total (text, line index, history)
+    public int memoryUsed() {
+        return cap + lcap * 8 + hcap + opsCap * 8 + hccap * 8 + stepsCap * 8;
+    }
+
+    // ---- line index -------------------------------------------------------------------------------------------------------------
+    // offset of the start of line i (0 <= i < lineCount); a line number outside that range is an empty line at the nearest end
+    // of the text (0 below the first line, the text length past the last)
+    public int lineStart(int i) {
+        if (i < 0) {
+            return 0;
+        }
+        if (i >= nlines) {
+            return length();
+        }
+        if (i < lgs) {
+            return ls[i];
+        }
+        return ls[i + (lge - lgs)] + lshift;
+    }
+
+    // offset of the end of line i: the position of its line break, or the end of the text for the last line
+    public int lineEnd(int i) {
+        if (i < 0) {
+            return 0;
+        }
+        if (i + 1 < nlines) {
+            return lineStart(i + 1) - 1;
+        }
+        return length();
+    }
+
+    public int lineLength(int i) {
+        return lineEnd(i) - lineStart(i);
+    }
+
+    // the line that contains offset off (an offset at the very end belongs to the last line)
+    public int lineAt(int off) {
+        int lo = 0;
+        int hi = nlines - 1;
+        while (lo < hi) {
+            int mid = (lo + hi + 1) >> 1;
+            if (lineStart(mid) <= off) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return lo;
+    }
+
+    private void moveLineGap(int to) {
+        if (to == lgs) {
+            return;
+        }
+        if (to < lgs) {
+            int n = lgs - to;
+            // the entries [to, lgs) move behind the gap and become relative
+            for (int i = n - 1; i >= 0; i--) {
+                ls[lge - n + i] = ls[to + i] - lshift;
+            }
+            lge = lge - n;
+            lgs = to;
+        } else {
+            int n = to - lgs;
+            for (int i = 0; i < n; i++) {
+                ls[lgs + i] = ls[lge + i] + lshift;
+            }
+            lgs = to;
+            lge = lge + n;
+        }
+    }
+
+    private void ensureLineCap(int extra) {
+        if (nlines + extra <= lcap) {
+            return;
+        }
+        int nc = lcap * 2;
+        while (nc < nlines + extra + 16) {
+            nc = nc * 2;
+        }
+        int tail = lcap - lge;
+        char* nb = asys.realloc((char*) ls, nc * 8);
+        if (nb == null) {
+            return;
+        }
+        ls = (int*) nb;
+        asys.moveBytes((char*) &ls[nc - tail], (char*) &ls[lge], tail * 8);
+        lge = nc - tail;
+        lcap = nc;
+    }
+
+    // ---- bytes ------------------------------------------------------------------------------------------------------------------------
+    // the byte at offset off (0..255), -1 outside the text
+    public int byteAt(int off) {
+        if (off < 0 || off >= length()) {
+            return -1;
+        }
+        if (off < gs) {
+            return data[off];
+        }
+        return data[off + (ge - gs)];
+    }
+
+    // copies bytes [from, to) into out (no terminator); returns the count
+    public int copyRange(int from, int to, char* out) {
+        int len = length();
+        if (from < 0) { from = 0; }
+        if (to > len) { to = len; }
+        if (to <= from) {
+            return 0;
+        }
+        int n = to - from;
+        if (to <= gs) {
+            memcpy(out, &data[from], n);
+        } else if (from >= gs) {
+            memcpy(out, &data[from + (ge - gs)], n);
+        } else {
+            int first = gs - from;
+            memcpy(out, &data[from], first);
+            memcpy(&out[first], &data[ge], n - first);
+        }
+        return n;
+    }
+
+    // a copy of bytes [from, to) as a NUL terminated string (free it with asys.free)
+    public char* getText(int from, int to) {
+        int len = length();
+        if (from < 0) { from = 0; }
+        if (to > len) { to = len; }
+        if (to < from) { to = from; }
+        char* r = asys.alloc(to - from + 1);
+        if (r != null) {
+            copyRange(from, to, r);
+        }
+        return r;
+    }
+
+    // a copy of line i without its line break
+    public char* getLine(int i) {
+        if (i < 0 || i >= nlines) {
+            return asys.strDup("");
+        }
+        return getText(lineStart(i), lineEnd(i));
+    }
+
+    // A pointer to the bytes of line i (without the line break) and its length in *len. No copy is made unless the gap
+    // lies inside the line; then the line is copied to an internal scratch area. The pointer stays valid until the next
+    // edit or the next call that needs the scratch area; do not write through it and do not free it.
+    public char* linePtr(int i, int* len) {
+        if (i < 0 || i >= nlines) {
+            *len = 0;
+            return data;
+        }
+        int s = lineStart(i);
+        int e = lineEnd(i);
+        *len = e - s;
+        if (e <= gs) {
+            return &data[s];
+        }
+        if (s >= gs) {
+            return &data[s + (ge - gs)];
+        }
+        int n = e - s;
+        if (scratchCap < n + 1) {
+            int nc = imax(256, n + 1);
+            char* nb = asys.alloc(nc);
+            asys.free(scratch);
+            scratch = nb;
+            scratchCap = nc;
+        }
+        copyRange(s, e, scratch);
+        scratch[n] = 0;
+        return scratch;
+    }
+
+    // Moves the gap to the end and returns the whole text as one contiguous block (valid until the next edit). The block is
+    // NUL terminated. Use it for searches that cross lines.
+    public char* flatten() {
+        own();
+        textMoveGap(length());
+        if (ge - gs < 1) {
+            textEnsure(1);
+        }
+        data[gs] = 0;
+        return data;
+    }
+
+    // ---- characters ---------------------------------------------------------------------------------------------------------------
+    // the start of the character that contains byte offset off (invalid bytes are characters of their own)
+    public int charStart(int off) {
+        int len = length();
+        if (off <= 0) { return 0; }
+        if (off >= len) { return len; }
+        int b = byteAt(off);
+        if ((b & 0xC0) != 0x80) {
+            return off;
+        }
+        for (int back = 1; back <= 3 && off - back >= 0; back++) {
+            int c = byteAt(off - back);
+            if ((c & 0xC0) == 0x80) {
+                continue;
+            }
+            if (c >= 0xC2 && nextChar(off - back) > off) {
+                return off - back;
+            }
+            return off;
+        }
+        return off;
+    }
+
+    // the offset after the character that starts at off
+    public int nextChar(int off) {
+        int len = length();
+        if (off >= len) { return len; }
+        int b = byteAt(off);
+        if (b < 0xC2) { return off + 1; }
+        int need = seqLen(b);
+        if (need == 1 || off + need > len) { return off + 1; }
+        for (int i = 1; i < need; i++) {
+            if ((byteAt(off + i) & 0xC0) != 0x80) {
+                return off + 1;
+            }
+        }
+        return off + need;
+    }
+
+    // the start of the character before off
+    public int prevChar(int off) {
+        if (off <= 0) { return 0; }
+        int p = off - 1;
+        int b = byteAt(p);
+        if ((b & 0xC0) != 0x80) {
+            return p;
+        }
+        for (int back = 1; back <= 3 && p - back >= 0; back++) {
+            int c = byteAt(p - back);
+            if ((c & 0xC0) == 0x80) {
+                continue;
+            }
+            if (c >= 0xC2 && nextChar(p - back) == off) {
+                return p - back;
+            }
+            break;
+        }
+        return p;
+    }
+
+    // the code point at off and its length in *size (U+FFFD with size 1 for an invalid byte); -1 at the end
+    public int decodeAt(int off, int* size) {
+        int len = length();
+        if (off < 0 || off >= len) {
+            *size = 0;
+            return -1;
+        }
+        int b = byteAt(off);
+        if (b < 0x80) {
+            *size = 1;
+            return b;
+        }
+        int nx = nextChar(off);
+        int n = nx - off;
+        *size = n;
+        if (n == 1) {
+            return 0xFFFD;
+        }
+        int v = b & (0xFF >> (n + 1));
+        for (int i = 1; i < n; i++) {
+            v = (v << 6) | (byteAt(off + i) & 0x3F);
+        }
+        return v;
+    }
+
+    // The display column of byte offset off inside line `line` (tabs jump to the next multiple of tabWidth, wide characters
+    // take 2, combining ones 0). tabWidth < 1 means 4.
+    public int visualCol(int line, int off, int tabWidth) {
+        if (tabWidth < 1) { tabWidth = 4; }
+        int s = lineStart(line);
+        int col = 0;
+        int p = s;
+        while (p < off) {
+            int sz = 1;
+            int cp = decodeAt(p, &sz);
+            if (cp == 9) {
+                col = col + tabWidth - (col % tabWidth);
+            } else {
+                col = col + charWidth(cp);
+            }
+            p = p + sz;
+        }
+        return col;
+    }
+
+    // The byte offset in `line` whose display column is closest to vcol without going past it (a tab or wide character is not
+    // split: the offset before it is returned). Capped at the end of the line.
+    public int offsetAtCol(int line, int vcol, int tabWidth) {
+        if (tabWidth < 1) { tabWidth = 4; }
+        int p = lineStart(line);
+        int e = lineEnd(line);
+        int col = 0;
+        while (p < e) {
+            int sz = 1;
+            int cp = decodeAt(p, &sz);
+            int w = 0;
+            if (cp == 9) {
+                w = tabWidth - (col % tabWidth);
+            } else {
+                w = charWidth(cp);
+            }
+            if (col + w > vcol) {
+                break;
+            }
+            col = col + w;
+            p = p + sz;
+        }
+        return p;
+    }
+
+    // number of characters (code points) in [from, to)
+    public int countChars(int from, int to) {
+        int n = 0;
+        int p = from;
+        while (p < to) {
+            p = nextChar(p);
+            n++;
+        }
+        return n;
+    }
+
+    // ---- gap buffer primitives ---------------------------------------------------------------------------------------------------
+    private void textMoveGap(int pos) {
+        if (pos == gs) {
+            return;
+        }
+        if (pos < gs) {
+            int n = gs - pos;
+            asys.moveBytes(&data[ge - n], &data[pos], n);
+            gs = pos;
+            ge = ge - n;
+        } else {
+            int n = pos - gs;
+            asys.moveBytes(&data[gs], &data[ge], n);
+            gs = gs + n;
+            ge = ge + n;
+        }
+    }
+
+    // makes sure the gap holds at least need bytes
+    private bool textEnsure(int need) {
+        if (ge - gs >= need) {
+            return true;
+        }
+        int len = length();
+        int nc = imax(cap * 2, 1024);
+        while (nc < len + need + 4096) {
+            nc = nc * 2;
+        }
+        int tail = cap - ge;
+        char* nb = asys.realloc(data, nc);
+        if (nb == null) {
+            return false;
+        }
+        data = nb;
+        asys.moveBytes(&data[nc - tail], &data[ge], tail);
+        // the moved-from area keeps old bytes: clear the gap so that a fresh gap is zero (cheap for the typical small gap)
+        ge = nc - tail;
+        cap = nc;
+        return true;
+    }
+
+    // gives memory back after the text became much smaller than its storage
+    private void maybeShrink() {
+        int len = length();
+        if (cap > 262144 && len * 4 < cap) {
+            textMoveGap(len);
+            int nc = imax(len * 2, 65536);
+            char* nb = asys.alloc(nc);
+            if (nb != null) {
+                memcpy(nb, data, len);
+                asys.free(data);
+                data = nb;
+                cap = nc;
+                gs = len;
+                ge = cap;
+            }
+        }
+        if (lcap > 4096 && nlines * 4 < lcap) {
+            moveLineGap(nlines);
+            int nc = nlines * 2 + 64;
+            char* nb = asys.alloc(nc * 8);
+            if (nb != null) {
+                memcpy(nb, (char*) ls, nlines * 8);
+                asys.free((char*) ls);
+                ls = (int*) nb;
+                lcap = nc;
+                lgs = nlines;
+                lge = lcap;
+            }
+        }
+        if (scratchCap > 65536) {
+            asys.free(scratch);
+            scratch = null;
+            scratchCap = 0;
+        }
+    }
+
+    // removes [a, b) from the line index; returns the number of line breaks removed
+    private int lineDelete(int a, int b) {
+        if (b <= a) {
+            return 0;
+        }
+        int la = lineAt(a);
+        int lb = lineAt(b);
+        int k = lb - la;
+        moveLineGap(la + 1);
+        lge = lge + k;
+        nlines = nlines - k;
+        lshift = lshift - (b - a);
+        return k;
+    }
+
+    // adds n bytes inserted at off to the line index; returns the number of line breaks in them
+    private int lineInsert(int off, char* ins, int n) {
+        if (n <= 0) {
+            return 0;
+        }
+        int k = 0;
+        for (int i = 0; i < n; i++) {
+            if (ins[i] == 10) {
+                k++;
+            }
+        }
+        int l = lineAt(off);
+        moveLineGap(l + 1);
+        ensureLineCap(k);
+        lshift = lshift + n;
+        if (k > 0) {
+            for (int i = 0; i < n; i++) {
+                if (ins[i] == 10) {
+                    ls[lgs] = off + i + 1;
+                    lgs++;
+                }
+            }
+            nlines = nlines + k;
+        }
+        return k;
+    }
+
+    // replaces [off, off + delLen) by ins in text and line index (no history, no listeners)
+    private bool replaceRaw(int off, int delLen, char* ins, int insLen, int* delLines, int* insLines) {
+        *delLines = 0;
+        *insLines = 0;
+        if (delLen > 0) {
+            textMoveGap(off);
+            ge = ge + delLen;
+            *delLines = lineDeleteAfter(off, delLen);
+        }
+        if (insLen > 0) {
+            if (!textEnsure(insLen)) {
+                return false;
+            }
+            textMoveGap(off);
+            memcpy(&data[gs], ins, insLen);
+            gs = gs + insLen;
+            *insLines = lineInsert(off, ins, insLen);
+        }
+        return true;
+    }
+
+    // lineDelete for text that has just left the gap buffer: the line index still describes the old text
+    private int lineDeleteAfter(int off, int n) {
+        return lineDelete(off, off + n);
+    }
+
+    // ---- listeners ----------------------------------------------------------------------------------------------------------------------
+    // Registers a function  int cb(int user, Change* c)  that is called after every change of the text. Returns an id for
+    // removeListener. There is no limit on the number of listeners.
+    public int addListener(func cb, int user) {
+        if (ln == lcapL) {
+            int nc = (lcapL == 0) ? 8 : lcapL * 2;
+            lfn = (func*) asys.realloc((char*) lfn, nc * 8);
+            luser = (int*) asys.realloc((char*) luser, nc * 8);
+            lid = (int*) asys.realloc((char*) lid, nc * 8);
+            lcapL = nc;
+        }
+        nextId++;
+        lfn[ln] = cb;
+        luser[ln] = user;
+        lid[ln] = nextId;
+        ln++;
+        return nextId;
+    }
+
+    public void removeListener(int id) {
+        for (int i = 0; i < ln; i++) {
+            if (lid[i] == id) {
+                for (int j = i; j + 1 < ln; j++) {
+                    lfn[j] = lfn[j + 1];
+                    luser[j] = luser[j + 1];
+                    lid[j] = lid[j + 1];
+                }
+                ln--;
+                return;
+            }
+        }
+    }
+
+    public int listenerCount() {
+        return ln;
+    }
+
+    private void notify(int off, int delLen, int insLen, int delLines, int insLines, int kind) {
+        version++;
+        if (ln == 0) {
+            return;
+        }
+        Change c;
+        c.off = off;
+        c.delLen = delLen;
+        c.insLen = insLen;
+        c.line = lineAt(off);
+        c.delLines = delLines;
+        c.insLines = insLines;
+        c.version = version;
+        c.kind = kind;
+        inNotify = true;
+        for (int i = 0; i < ln; i++) {
+            func f = lfn[i];
+            f(luser[i], &c);
+        }
+        inNotify = false;
+    }
+
+    // ---- history -------------------------------------------------------------------------------------------------------------------------
+    // switches the undo history on or off. Turning it off FORGETS the history (nothing stale is kept).
+    public void setHistory(bool on) {
+        if (!on) {
+            clearHistory();
+        }
+        histOn = on;
+    }
+
+    public bool historyOn() {
+        return histOn;
+    }
+
+    // the history is cut to this many bytes (oldest steps go first); default 32 MiB
+    public void setHistoryLimit(int bytes) {
+        histLimit = imax(bytes, 1024);
+        trimHistory();
+    }
+
+    public int historyBytes() {
+        return hlen + nops * 32 + nsteps * SREC * 8 + hclen * 8;
+    }
+
+    public void clearHistory() {
+        asys.free((char*) steps);
+        asys.free((char*) ops);
+        asys.free(hdata);
+        asys.free((char*) hcurs);
+        steps = null; ops = null; hdata = null; hcurs = null;
+        nsteps = 0; top = 0; stepsCap = 0; nops = 0; opsCap = 0; hlen = 0; hcap = 0; hclen = 0; hccap = 0;
+        grpStep = -1;
+        sealNext = false;
+    }
+
+    public bool canUndo() {
+        return top > 0;
+    }
+
+    public bool canRedo() {
+        return top < nsteps;
+    }
+
+    public int undoDepth() {
+        return top;
+    }
+
+    public int redoDepth() {
+        return nsteps - top;
+    }
+
+    // the text differs from the last load / save
+    public bool modified() {
+        return gen != savedGen;
+    }
+
+    // declares the current text as saved (the "modified" flag clears; later edits never merge into steps from before)
+    public void markSaved() {
+        savedGen = gen;
+        sealNext = true;
+        if (nsteps > 0 && top == nsteps) {
+            steps[(nsteps - 1) * SREC + S_SEALED] = 1;
+        }
+    }
+
+    // the next edit starts a new undo step, whatever its merge key
+    public void sealHistory() {
+        sealNext = true;
+        if (nsteps > 0 && top == nsteps) {
+            steps[(nsteps - 1) * SREC + S_SEALED] = 1;
+        }
+    }
+
+    private bool growSteps() {
+        if (nsteps + 1 <= stepsCap) {
+            return true;
+        }
+        int nc = (stepsCap == 0) ? 64 : stepsCap * 2;
+        char* nb = asys.realloc((char*) steps, nc * SREC * 8);
+        if (nb == null) { return false; }
+        steps = (int*) nb;
+        stepsCap = nc;
+        return true;
+    }
+
+    private bool growOps() {
+        if (nops + 1 <= opsCap) {
+            return true;
+        }
+        int nc = (opsCap == 0) ? 256 : opsCap * 2;
+        char* nb = asys.realloc((char*) ops, nc * 32);
+        if (nb == null) { return false; }
+        ops = (int*) nb;
+        opsCap = nc;
+        return true;
+    }
+
+    private bool growData(int extra) {
+        if (hlen + extra <= hcap) {
+            return true;
+        }
+        int nc = (hcap == 0) ? 4096 : hcap * 2;
+        while (nc < hlen + extra) { nc = nc * 2; }
+        char* nb = asys.realloc(hdata, nc);
+        if (nb == null) { return false; }
+        hdata = nb;
+        hcap = nc;
+        return true;
+    }
+
+    private bool growCurs(int extra) {
+        if (hclen + extra <= hccap) {
+            return true;
+        }
+        int nc = (hccap == 0) ? 256 : hccap * 2;
+        while (nc < hclen + extra) { nc = nc * 2; }
+        char* nb = asys.realloc((char*) hcurs, nc * 8);
+        if (nb == null) { return false; }
+        hcurs = (int*) nb;
+        hccap = nc;
+        return true;
+    }
+
+    // Opens an undo group: everything edited until the matching endGroup is one undo step. snap / n: the cursors before the
+    // change as numbers (anchor, position pairs; n = 2 * cursors), restored by undo. key: groups with the same non-zero
+    // key whose snapshot equals the cursors the previous step ended with are merged into that step (typing, backspace).
+    // Groups nest; only the outermost counts.
+    public void beginGroup(int* snap, int n, int key) {
+        grpDepth++;
+        if (grpDepth > 1) {
+            return;
+        }
+        grpKey = key;
+        pendN = 0;
+        if (snap != null && n > 0) {
+            if (n > pendCap) {
+                asys.free((char*) pendSnap);
+                pendSnap = (int*) asys.alloc(n * 8);
+                pendCap = n;
+            }
+            for (int i = 0; i < n; i++) { pendSnap[i] = snap[i]; }
+            pendN = n;
+        }
+        grpStep = -1;
+    }
+
+    // creates (or continues) the step of the open group when its first operation is recorded
+    private bool openStep() {
+        if (grpStep >= 0) {
+            return true;
+        }
+        if (!histOn) {
+            return false;
+        }
+        // may the group continue the previous step?
+        if (grpKey != KEY_NONE && !sealNext && nsteps > 0 && top == nsteps && pendN > 0) {
+            int* p = &steps[(nsteps - 1) * SREC];
+            if (p[S_KEY] == grpKey && p[S_SEALED] == 0 && p[S_CAN] == pendN) {
+                bool same = true;
+                for (int i = 0; i < pendN; i++) {
+                    if (hcurs[p[S_CAOFF] + i] != pendSnap[i]) {
+                        same = false;
+                        break;
+                    }
+                }
+                if (same) {
+                    grpStep = nsteps - 1;
+                    return true;
+                }
+            }
+        }
+        // a new step: forget what could be redone
+        if (top < nsteps) {
+            int* f = &steps[top * SREC];
+            nops = f[S_OPS];
+            hlen = f[S_DATA];
+            hclen = f[S_CBOFF];
+            nsteps = top;
+        }
+        if (!growSteps() || !growCurs(pendN + 2)) {
+            return false;
+        }
+        int* s = &steps[nsteps * SREC];
+        s[S_OPS] = nops;
+        s[S_NOPS] = 0;
+        s[S_BGEN] = gen;
+        s[S_AGEN] = gen;
+        s[S_CBOFF] = hclen;
+        s[S_CBN] = pendN;
+        for (int i = 0; i < pendN; i++) { hcurs[hclen + i] = pendSnap[i]; }
+        hclen = hclen + pendN;
+        s[S_CAOFF] = hclen;
+        s[S_CAN] = 0;
+        s[S_KEY] = grpKey;
+        s[S_SEALED] = 0;
+        s[S_DATA] = hlen;
+        nsteps++;
+        top = nsteps;
+        grpStep = nsteps - 1;
+        sealNext = false;
+        return true;
+    }
+
+    // records an operation that is about to be applied: the old bytes [off, off + delLen) and the new bytes
+    private void recordOp(int off, int delLen, char* ins, int insLen) {
+        if (!openStep()) {
+            return;
+        }
+        int* s = &steps[grpStep * SREC];
+        // an insertion that continues the previous insertion, or a deletion that continues the previous deletion forwards, is
+        // stored in the same operation
+        if (s[S_NOPS] > 0) {
+            int* o = &ops[(s[S_OPS] + s[S_NOPS] - 1) * 4];
+            if (delLen == 0 && insLen > 0 && o[1] == 0 && o[0] + o[2] == off && o[3] + o[2] == hlen) {
+                if (growData(insLen)) {
+                    memcpy(&hdata[hlen], ins, insLen);
+                    hlen = hlen + insLen;
+                    o[2] = o[2] + insLen;
+                    return;
+                }
+            }
+            if (insLen == 0 && delLen > 0 && o[2] == 0 && o[0] == off && o[3] + o[1] == hlen) {
+                if (growData(delLen)) {
+                    copyRange(off, off + delLen, &hdata[hlen]);
+                    hlen = hlen + delLen;
+                    o[1] = o[1] + delLen;
+                    return;
+                }
+            }
+        }
+        if (!growOps() || !growData(delLen + insLen)) {
+            return;
+        }
+        int* o = &ops[nops * 4];
+        o[0] = off;
+        o[1] = delLen;
+        o[2] = insLen;
+        o[3] = hlen;
+        copyRange(off, off + delLen, &hdata[hlen]);
+        if (insLen > 0) {
+            memcpy(&hdata[hlen + delLen], ins, insLen);
+        }
+        hlen = hlen + delLen + insLen;
+        nops++;
+        s[S_NOPS] = s[S_NOPS] + 1;
+    }
+
+    // Closes the group opened by beginGroup. snap / n: the cursors after the change.
+    public void endGroup(int* snap, int n) {
+        if (grpDepth <= 0) {
+            return;
+        }
+        grpDepth--;
+        if (grpDepth > 0) {
+            return;
+        }
+        if (grpStep >= 0 && histOn) {
+            int* s = &steps[grpStep * SREC];
+            s[S_AGEN] = gen;
+            // the "after" snapshot is always the last thing in the cursor arena
+            hclen = s[S_CAOFF];
+            if (snap != null && n > 0 && growCurs(n)) {
+                for (int i = 0; i < n; i++) { hcurs[hclen + i] = snap[i]; }
+                hclen = hclen + n;
+                s[S_CAN] = n;
+            } else {
+                s[S_CAN] = 0;
+            }
+            if (s[S_NOPS] == 0) {
+                // nothing was recorded: drop the empty step
+                hclen = s[S_CBOFF];
+                nsteps--;
+                top = nsteps;
+            }
+        }
+        grpStep = -1;
+        if (histOn && historyBytes() > histLimit) {
+            trimHistory();
+        }
+    }
+
+    // drops the oldest steps until the history is within three quarters of its limit
+    private void trimHistory() {
+        if (nsteps == 0 || historyBytes() <= histLimit || grpDepth > 0) {
+            return;
+        }
+        int target = histLimit / 4 * 3;
+        int drop = 1;
+        while (drop < nsteps) {
+            int* f = &steps[drop * SREC];
+            int bytes = (hlen - f[S_DATA]) + (nops - f[S_OPS]) * 32 + (nsteps - drop) * SREC * 8 + (hclen - f[S_CBOFF]) * 8;
+            if (bytes <= target) {
+                break;
+            }
+            drop++;
+        }
+        dropOldest(drop);
+    }
+
+    private void dropOldest(int k) {
+        if (k <= 0) {
+            return;
+        }
+        if (k >= nsteps) {
+            clearHistory();
+            return;
+        }
+        int* f = &steps[k * SREC];
+        int op0 = f[S_OPS];
+        int d0 = f[S_DATA];
+        int c0 = f[S_CBOFF];
+        asys.moveBytes((char*) ops, (char*) &ops[op0 * 4], (nops - op0) * 32);
+        asys.moveBytes(hdata, &hdata[d0], hlen - d0);
+        asys.moveBytes((char*) hcurs, (char*) &hcurs[c0], (hclen - c0) * 8);
+        asys.moveBytes((char*) steps, (char*) f, (nsteps - k) * SREC * 8);
+        nsteps = nsteps - k;
+        nops = nops - op0;
+        hlen = hlen - d0;
+        hclen = hclen - c0;
+        // every operation keeps the offset of its bytes in hdata: rebase them as well (not only the per-step offsets)
+        for (int i = 0; i < nops; i++) {
+            ops[i * 4 + 3] = ops[i * 4 + 3] - d0;
+        }
+        for (int i = 0; i < nsteps; i++) {
+            int* s = &steps[i * SREC];
+            s[S_OPS] = s[S_OPS] - op0;
+            s[S_DATA] = s[S_DATA] - d0;
+            s[S_CBOFF] = s[S_CBOFF] - c0;
+            s[S_CAOFF] = s[S_CAOFF] - c0;
+        }
+        top = imax(top - k, 0);
+        if (nsteps < stepsCap / 4 && stepsCap > 256) {
+            char* nb = asys.realloc((char*) steps, (nsteps * 2 + 16) * SREC * 8);
+            if (nb != null) {
+                steps = (int*) nb;
+                stepsCap = nsteps * 2 + 16;
+            }
+        }
+        if (hcap > 65536 && hlen * 4 < hcap) {
+            char* nb = asys.realloc(hdata, hlen * 2 + 4096);
+            if (nb != null) {
+                hdata = nb;
+                hcap = hlen * 2 + 4096;
+            }
+        }
+        if (opsCap > 1024 && nops * 4 < opsCap) {
+            char* nb = asys.realloc((char*) ops, (nops * 2 + 64) * 32);
+            if (nb != null) {
+                ops = (int*) nb;
+                opsCap = nops * 2 + 64;
+            }
+        }
+    }
+
+    // how many numbers the cursor snapshot of the next undo / redo has (-1: nothing to undo / redo)
+    public int undoSnapshotSize() {
+        if (top == 0) { return -1; }
+        return steps[(top - 1) * SREC + S_CBN];
+    }
+
+    public int redoSnapshotSize() {
+        if (top >= nsteps) { return -1; }
+        return steps[top * SREC + S_CAN];
+    }
+
+    // Undoes the last step. The cursor snapshot recorded before that step is copied to out (at most max numbers) and its
+    // length returned (0 when none was recorded); -1 when there is nothing to undo.
+    public int undo(int* out, int max) {
+        if (top == 0 || readOnly || grpDepth > 0) {
+            return -1;
+        }
+        top--;
+        int* s = &steps[top * SREC];
+        int first = s[S_OPS];
+        int cnt = s[S_NOPS];
+        for (int i = cnt - 1; i >= 0; i--) {
+            int* o = &ops[(first + i) * 4];
+            int off = o[0];
+            int dl = o[1];
+            int il = o[2];
+            char* old = &hdata[o[3]];
+            int dLines = 0;
+            int iLines = 0;
+            replaceRaw(off, il, old, dl, &dLines, &iLines);
+            maybeShrinkSoon();
+            notify(off, il, dl, dLines, iLines, CH_UNDO);
+        }
+        gen = s[S_BGEN];
+        sealNext = true;
+        int n = imin(s[S_CBN], max);
+        for (int i = 0; i < n; i++) { out[i] = hcurs[s[S_CBOFF] + i]; }
+        return n;
+    }
+
+    public int redo(int* out, int max) {
+        if (top >= nsteps || readOnly || grpDepth > 0) {
+            return -1;
+        }
+        int* s = &steps[top * SREC];
+        int first = s[S_OPS];
+        int cnt = s[S_NOPS];
+        for (int i = 0; i < cnt; i++) {
+            int* o = &ops[(first + i) * 4];
+            int off = o[0];
+            int dl = o[1];
+            int il = o[2];
+            char* nw = &hdata[o[3] + dl];
+            int dLines = 0;
+            int iLines = 0;
+            replaceRaw(off, dl, nw, il, &dLines, &iLines);
+            maybeShrinkSoon();
+            notify(off, dl, il, dLines, iLines, CH_REDO);
+        }
+        gen = s[S_AGEN];
+        top++;
+        sealNext = true;
+        int n = imin(s[S_CAN], max);
+        for (int i = 0; i < n; i++) { out[i] = hcurs[s[S_CAOFF] + i]; }
+        return n;
+    }
+
+    private void maybeShrinkSoon() {
+        int len = length();
+        if (cap > 262144 && len * 4 < cap) {
+            maybeShrink();
+        }
+    }
+
+    // ---- editing ----------------------------------------------------------------------------------------------------------------------
+    // Replaces delLen bytes at off by insLen bytes of ins; this is the one primitive every edit goes through. Returns false
+    // (and changes nothing) when the buffer is read only, the range is outside the text, or a listener is running.
+    // Offsets are bytes; keep them on character boundaries (the editor layer does). In text mode the inserted text should
+    // use '\n' only (Editor.insertText converts).
+    public bool edit(int off, int delLen, char* ins, int insLen) {
+        if (data == null) {
+            maxLoad = 1073741824;
+            histOn = true;
+            histLimit = 33554432;
+            grpStep = -1;                            // a zeroed object that never saw its constructor
+        }
+        if (readOnly || inNotify) {
+            return false;
+        }
+        own();
+        int len = length();
+        if (off < 0 || delLen < 0 || insLen < 0 || off > len || delLen > len - off) {
+            return false;
+        }
+        if (delLen == 0 && insLen == 0) {
+            return true;
+        }
+        bool implicit = false;
+        if (grpDepth == 0) {
+            beginGroup(null, 0, 0);
+            implicit = true;
+        }
+        if (histOn) {
+            recordOp(off, delLen, ins, insLen);
+        }
+        int dLines = 0;
+        int iLines = 0;
+        bool ok = replaceRaw(off, delLen, ins, insLen, &dLines, &iLines);
+        if (ok) {
+            genCounter++;
+            gen = genCounter;
+            if (delLen > insLen) {
+                maybeShrinkSoon();
+            }
+            notify(off, delLen, insLen, dLines, iLines, CH_EDIT);
+        }
+        if (implicit) {
+            endGroup(null, 0);
+        }
+        return ok;
+    }
+
+    public bool insert(int off, char* ins, int n) {
+        return edit(off, 0, ins, n);
+    }
+
+    public bool remove(int from, int to) {
+        return edit(from, to - from, null, 0);
+    }
+
+    // ---- loading ------------------------------------------------------------------------------------------------------------------------
+    // takes the raw bytes of a file in blk (an asys block, len bytes at its start, capacity bcap) as the new text: detects
+    // binary content, the byte order mark and the line ending style, converts to '\n', builds the line index and forgets the
+    // history. The old text is freed.
+    private void adopt(char* blk, int len, int bcap, bool forceBinary) {
+        // binary? a NUL byte in the first 8000 bytes, or a UTF-16 / UTF-32 byte order mark
+        bool bin = forceBinary;
+        if (!bin) {
+            int scan = imin(len, 8000);
+            for (int i = 0; i < scan; i++) {
+                if (blk[i] == 0) {
+                    bin = true;
+                    break;
+                }
+            }
+            if (len >= 2 && ((blk[0] == 0xFF && blk[1] == 0xFE) || (blk[0] == 0xFE && blk[1] == 0xFF))) {
+                bin = true;
+            }
+        }
+        binary = bin;
+        hasBom = false;
+        eolMixed = false;
+        eol = EOL_LF;
+        if (!bin) {
+            if (len >= 3 && blk[0] == 0xEF && blk[1] == 0xBB && blk[2] == 0xBF) {
+                hasBom = true;
+                asys.moveBytes(blk, &blk[3], len - 3);
+                len = len - 3;
+            }
+            int lf = 0;
+            int crlf = 0;
+            int cr = 0;
+            for (int i = 0; i < len; i++) {
+                int c = blk[i];
+                if (c == 10) {
+                    if (i > 0 && blk[i - 1] == 13) { crlf++; } else { lf++; }
+                } else if (c == 13) {
+                    if (i + 1 >= len || blk[i + 1] != 10) { cr++; }
+                }
+            }
+            if (lf + crlf == 0 && cr > 0) {
+                eol = EOL_CR;
+                for (int i = 0; i < len; i++) {
+                    if (blk[i] == 13) { blk[i] = 10; }
+                }
+            } else {
+                if (crlf > lf) { eol = EOL_CRLF; }
+                eolMixed = lf > 0 && crlf > 0;
+                if (crlf > 0) {
+                    int w = 0;
+                    for (int r = 0; r < len; r++) {
+                        if (blk[r] == 13 && r + 1 < len && blk[r + 1] == 10) {
+                            continue;
+                        }
+                        blk[w] = blk[r];
+                        w++;
+                    }
+                    len = w;
+                }
+            }
+        }
+        if (bcap < len + 1) {
+            char* nb = asys.realloc(blk, len + 1024);
+            if (nb != null) {
+                blk = nb;
+                bcap = len + 1024;
+            }
+        }
+        int oldLen = length();
+        int oldLines = nlines;
+        clearHistory();
+        resetStorage(blk, len, bcap);
+        genCounter++;
+        gen = genCounter;
+        savedGen = gen;
+        notify(0, oldLen, len, oldLines - 1, nlines - 1, CH_RESET);
+    }
+
+    // Replaces the whole content by text (n bytes, as if it had been read from a file: BOM, line endings and binary
+    // content are detected). Clears the history; the buffer is "not modified" afterwards. Honours readOnly? No: this is
+    // how content gets in; use edit() for edits that must respect the flag.
+    public void setText(char* text, int n) {
+        int bcap = n + n / 8 + 1024;
+        char* blk = asys.alloc(bcap);
+        if (blk == null) {
+            return;
+        }
+        memcpy(blk, text, n);
+        adopt(blk, n, bcap, false);
+    }
+
+    // reads a file. 0 or -errno: ENOENT, EACCES, ENOTREG (a FIFO, device or directory: never opened for reading, so it cannot
+    // hang), ETOOBIG (more than maxLoad bytes). On failure the buffer is unchanged.
+    public int load(char* file) {
+        asys.Stat pre;
+        if (asys.stat(file, &pre) == 0 && !pre.isFile()) {
+            return -asys.ENOTREG;                    // before opening: a FIFO would block, Windows cannot open a directory
+        }
+        int fd = asys.fileOpen(file, asys.F_READ | asys.F_NONBLOCK | asys.F_CLOEXEC, 0);
+        if (fd < 0) {
+            return fd;
+        }
+        asys.Stat st;
+        if (asys.fstat(fd, &st) < 0) {
+            asys.fileClose(fd);
+            return -asys.EIO;
+        }
+        if (!st.isFile()) {
+            asys.fileClose(fd);
+            return -asys.ENOTREG;
+        }
+        if (st.size > maxLoad) {
+            asys.fileClose(fd);
+            return -asys.ETOOBIG;
+        }
+        int bcap = st.size + st.size / 16 + 4096;
+        char* blk = asys.alloc(bcap);
+        if (blk == null) {
+            asys.fileClose(fd);
+            return -asys.ENOMEM;
+        }
+        int len = 0;
+        int err = 0;
+        for (;;) {
+            if (len + 4096 > bcap) {
+                char* nb = asys.realloc(blk, bcap * 2);
+                if (nb == null) {
+                    err = -asys.ENOMEM;
+                    break;
+                }
+                blk = nb;
+                bcap = bcap * 2;
+            }
+            int got = asys.fileRead(fd, &blk[len], bcap - len);
+            if (got == -asys.EAGAIN) {
+                asys.sleepMs(1);
+                continue;
+            }
+            if (got < 0) {
+                err = got;
+                break;
+            }
+            if (got == 0) {
+                break;
+            }
+            len = len + got;
+            if (len > maxLoad) {
+                err = -asys.ETOOBIG;
+                break;
+            }
+        }
+        asys.fileClose(fd);
+        if (err != 0) {
+            asys.free(blk);
+            return err;
+        }
+        adopt(blk, len, bcap, false);
+        char* np = asys.strDup(file);
+        asys.free(path);
+        path = np;
+        readDiskInfo();
+        return 0;
+    }
+
+    private void readDiskInfo() {
+        asys.Stat st;
+        if (path != null && asys.stat(path, &st) == 0) {
+            diskKnown = true;
+            diskMtime = st.mtime;
+            diskNs = st.mtimeNs;
+            diskSize = st.size;
+        } else {
+            diskKnown = false;
+        }
+    }
+
+    // Asks the file system whether the file changed behind our back: EXT_NONE, EXT_CHANGED (modification time or size differ
+    // from what we saw when we loaded or saved it) or EXT_DELETED. Buffers without a file report EXT_NONE.
+    public int checkExternal() {
+        if (path == null || !diskKnown) {
+            return EXT_NONE;
+        }
+        asys.Stat st;
+        int r = asys.stat(path, &st);
+        if (r == -asys.ENOENT || r == -asys.ENOTDIR) {
+            return EXT_DELETED;
+        }
+        if (r < 0) {
+            return EXT_NONE;
+        }
+        if (st.mtime != diskMtime || st.mtimeNs != diskNs || st.size != diskSize) {
+            return EXT_CHANGED;
+        }
+        return EXT_NONE;
+    }
+
+    // accepts the file on disk as it is now (the user chose to keep the buffer): checkExternal reports EXT_NONE again
+    public void acknowledgeExternal() {
+        readDiskInfo();
+    }
+
+    // reads the file again, discarding the buffer (and its history). 0 or -errno.
+    public int reload() {
+        if (path == null) {
+            return -asys.ENOENT;
+        }
+        char* p = asys.strDup(path);
+        int r = load(p);
+        asys.free(p);
+        return r;
+    }
+
+    // ---- saving ------------------------------------------------------------------------------------------------------------------------
+    // Writes the text to `to` (null: the file the buffer came from): atomically through a temp file (see asys.AtomicFile),
+    // with the line endings and byte order mark it had (binary buffers byte for byte). flags: asys.W_BACKUP keeps the old
+    // content as "to~", asys.W_NOSYNC skips the fsync, asys.W_INPLACE_OK allows overwriting in place when no temp file can
+    // be made. On success the buffer is "not modified", remembers the new path and modification time. Returns 0 or -errno
+    // (the old file is untouched on errors).
+    public int save(char* to, int flags) {
+        char* target = (to != null) ? to : path;
+        if (target == null) {
+            return -asys.EINVAL;
+        }
+        asys.AtomicFile f;
+        int perm = 420;
+        int r = f.open(target, perm, flags);
+        if (r < 0) {
+            return r;
+        }
+        r = writeTo(&f);
+        if (r < 0) {
+            f.abort();
+            return r;
+        }
+        r = f.commit();
+        if (r < 0) {
+            return r;
+        }
+        if (to != null && (path == null || !streq(path, to))) {
+            char* np = asys.strDup(to);
+            asys.free(path);
+            path = np;
+        }
+        readDiskInfo();
+        markSaved();
+        return 0;
+    }
+
+    // streams the text with its line endings to f
+    private int writeTo(asys.AtomicFile* f) {
+        if (hasBom && !binary) {
+            char bom[3];
+            bom[0] = 0xEF; bom[1] = 0xBB; bom[2] = 0xBF;
+            int w = f->write(&bom[0], 3);
+            if (w < 0) { return w; }
+        }
+        if (binary || eol == EOL_LF) {
+            if (gs > 0) {
+                int w = f->write(data, gs);
+                if (w < 0) { return w; }
+            }
+            if (cap - ge > 0) {
+                int w = f->write(&data[ge], cap - ge);
+                if (w < 0) { return w; }
+            }
+            return 0;
+        }
+        char* out = asys.alloc(65536 + 8);
+        if (out == null) {
+            return -asys.ENOMEM;
+        }
+        int o = 0;
+        int rc = 0;
+        for (int seg = 0; seg < 2 && rc == 0; seg++) {
+            char* p = (seg == 0) ? data : &data[ge];
+            int n = (seg == 0) ? gs : cap - ge;
+            for (int i = 0; i < n; i++) {
+                int c = p[i];
+                if (c == 10) {
+                    if (eol == EOL_CRLF) {
+                        out[o] = 13;
+                        o++;
+                    }
+                    out[o] = (eol == EOL_CR) ? 13 : 10;
+                    o++;
+                } else {
+                    out[o] = c;
+                    o++;
+                }
+                if (o >= 65536) {
+                    int w = f->write(out, o);
+                    if (w < 0) { rc = w; break; }
+                    o = 0;
+                }
+            }
+        }
+        if (rc == 0 && o > 0) {
+            int w = f->write(out, o);
+            if (w < 0) { rc = w; }
+        }
+        asys.free(out);
+        return rc;
+    }
+}
+
+// ---- the clipboard ring ---------------------------------------------------------------------------------------------------------------
+// One clipboard entry: the text, whether it was copied as whole lines (no selection), and how it splits into pieces (one per cursor)
+struct ClipEntry {
+    char* text;
+    int len;
+    int lineMode;
+    int npieces;
+    int* pieceLens;
+}
+
+// A ring of the last copied texts (newest first). Copying with several cursors remembers the pieces, so pasting into the
+// same number of cursors puts one piece into each. The ring is limited in entries and in bytes.
+public class Clipboard {
+    public int maxEntries;
+    public int maxBytes;
+    private ClipEntry* e;
+    private int n;
+    private int bytes;
+
+    public Clipboard() {
+        maxEntries = 20;
+        maxBytes = 67108864;
+        e = (ClipEntry*) asys.alloc(64 * sizeof(ClipEntry));
+    }
+
+    public int count() {
+        return n;
+    }
+
+    public int length(int i) {
+        if (i < 0 || i >= n) { return 0; }
+        return e[i].len;
+    }
+
+    // the text of entry i (0 = newest), NUL terminated; owned by the clipboard
+    public char* text(int i) {
+        if (i < 0 || i >= n) { return ""; }
+        return e[i].text;
+    }
+
+    public bool isLineMode(int i) {
+        if (i < 0 || i >= n) { return false; }
+        return e[i].lineMode != 0;
+    }
+
+    public int pieceCount(int i) {
+        if (i < 0 || i >= n) { return 0; }
+        return e[i].npieces;
+    }
+
+    public int pieceLength(int i, int k) {
+        if (i < 0 || i >= n || k < 0 || k >= e[i].npieces) { return 0; }
+        return e[i].pieceLens[k];
+    }
+
+    private void freeEntry(int i) {
+        bytes = bytes - e[i].len;
+        asys.free(e[i].text);
+        asys.free((char*) e[i].pieceLens);
+    }
+
+    public void clear() {
+        for (int i = 0; i < n; i++) {
+            freeEntry(i);
+        }
+        n = 0;
+        bytes = 0;
+    }
+
+    public void dispose() {
+        clear();
+        asys.free((char*) e);
+        e = null;
+    }
+
+    // Puts a text in front. pieceLens (npieces numbers, may be null) says how the text divides per cursor (the pieces are joined
+    // by '\n' in text). An entry equal to the newest one is not added twice. Entries over the limits fall off the end.
+    public void push(char* text, int len, bool lineMode, int* pieceLens, int npieces) {
+        if (e == null) {
+            e = (ClipEntry*) asys.alloc(64 * sizeof(ClipEntry));
+        }
+        if (len > maxBytes) {
+            return;
+        }
+        if (n > 0 && e[0].len == len && (e[0].lineMode != 0) == lineMode && asys.bytesEqual(e[0].text, text, len) && e[0].npieces == npieces) {
+            return;
+        }
+        int cap = imin(maxEntries, 63);
+        while (n >= cap && n > 0) {
+            n--;
+            freeEntry(n);
+        }
+        while (n > 0 && bytes + len > maxBytes) {
+            n--;
+            freeEntry(n);
+        }
+        for (int i = n; i > 0; i--) {
+            e[i] = e[i - 1];
+        }
+        n++;
+        e[0].text = asys.strDupN(text, len);
+        e[0].len = len;
+        e[0].lineMode = lineMode ? 1 : 0;
+        e[0].npieces = npieces;
+        e[0].pieceLens = null;
+        if (npieces > 0 && pieceLens != null) {
+            e[0].pieceLens = (int*) asys.alloc(npieces * 8);
+            for (int i = 0; i < npieces; i++) {
+                e[0].pieceLens[i] = pieceLens[i];
+            }
+        }
+        bytes = bytes + len;
+    }
+
+    // a plain text (for example from the system clipboard)
+    public void pushText(char* text) {
+        push(text, strlen(text), false, null, 1);
+    }
+
+    // moves entry i to the front (rotating through the ring)
+    public void promote(int i) {
+        if (i <= 0 || i >= n) { return; }
+        ClipEntry t = e[i];
+        for (int k = i; k > 0; k--) {
+            e[k] = e[k - 1];
+        }
+        e[0] = t;
+    }
+}
+
+// ---- cursors and the editor -------------------------------------------------------------------------------------------------------------
+public struct Cursor {
+    public int anchor;          // where the selection started
+    public int pos;             // the caret (the moving end)
+    public int goal;            // the display column kept while moving up and down (-1: take it from the caret)
+    public int tag;
+}
+
+// The editing layer: a set of cursors (each with an optional selection) over a Buffer and the commands an editor offers.
+// Every command works on all cursors, is ONE undo step (typing and backspacing merge into longer steps), and keeps the buffer
+// consistent: carets never sit inside a multi-byte character, overlapping cursors are merged, undo and redo restore the
+// cursors exactly as they were.
+public class Editor {
+    public Buffer* buf;
+    public Cursor* cur;
+    public int ncur;
+    public int primary;                 // the cursor a view follows (index into cur)
+    public Clipboard* clip;             // the clipboard ring (an editor makes its own; assign a shared one to share copies between editors)
+    private Clipboard* ownClip;
+    // settings (tabWidth and indentWidth below 1 are treated as 4, above 64 as 64)
+    public int tabWidth;
+    public int indentWidth;
+    public bool useTabs;                // indent with tab characters instead of spaces
+    public bool autoIndent;             // Enter copies the indentation and opens a level after { ( [ (and ':' with indentColon)
+    public bool smartHome;              // Home toggles between the first non-blank and the line start
+    public bool smartBackspace;         // Backspace in leading spaces removes up to the previous indent stop
+    public bool electric;               // typing } ) ] on a blank line aligns it with its opener
+    public bool trimAutoIndent;         // Enter on a line holding only indentation empties that line
+    public bool indentColon;            // python style: a line ending in ':' opens a level
+    public char* lineComment;           // "//" ...; asys strings (setComments / setLanguage)
+    public char* blockOpen;
+    public char* blockClose;
+
+    private int curCap;
+    private int listenerId;
+    private int* snap;
+    private int snapCap;
+
+    public Editor(Buffer* b) {
+        buf = b;
+        tabWidth = 4;
+        indentWidth = 4;
+        autoIndent = true;
+        smartHome = true;
+        smartBackspace = true;
+        electric = true;
+        trimAutoIndent = true;
+        lineComment = asys.strDup("");
+        blockOpen = asys.strDup("");
+        blockClose = asys.strDup("");
+        curCap = 4;
+        cur = (Cursor*) asys.alloc(curCap * sizeof(Cursor));
+        ncur = 1;
+        cur[0].goal = -1;
+        clip = new Clipboard();
+        ownClip = clip;
+        listenerId = buf->addListener(editorOnChange, (int) this);
+    }
+
+    // detaches from the buffer and frees the cursors (the buffer and the clipboard are not owned and stay alive)
+    public void dispose() {
+        if (buf != null) {
+            buf->removeListener(listenerId);
+        }
+        asys.free((char*) cur);
+        asys.free((char*) snap);
+        asys.free(lineComment);
+        asys.free(blockOpen);
+        asys.free(blockClose);
+        if (ownClip != null) {
+            ownClip->dispose();                      // the clipboard this editor made itself (a shared one is not ours to free)
+            ownClip = null;
+        }
+        cur = null;
+        snap = null;
+        lineComment = null;
+        blockOpen = null;
+        blockClose = null;
+        ncur = 0;
+        curCap = 0;
+        snapCap = 0;
+    }
+
+    // ---- settings -------------------------------------------------------------------------------------------------------------------
+    private int tw() {
+        if (tabWidth < 1) { return 4; }
+        if (tabWidth > 64) { return 64; }
+        return tabWidth;
+    }
+
+    private int iw() {
+        if (indentWidth < 1) { return 4; }
+        if (indentWidth > 64) { return 64; }
+        return indentWidth;
+    }
+
+    public void setTabWidth(int w) {
+        tabWidth = w;
+    }
+
+    public void setIndentWidth(int w) {
+        indentWidth = w;
+    }
+
+    // line comment token and block comment pair ("" = none)
+    public void setComments(char* line, char* open, char* close) {
+        asys.free(lineComment);
+        asys.free(blockOpen);
+        asys.free(blockClose);
+        lineComment = asys.strDup(line);
+        blockOpen = asys.strDup(open);
+        blockClose = asys.strDup(close);
+    }
+
+    // Sets comment tokens and indentation rules for a language by name: "a" "c" "cpp" "java" "javascript" "typescript" "rust" "go"
+    // "swift" "css" (// and /* */), "python" "shell" "bash" "makefile" "toml" "yaml" "ruby" "perl" (#), "ini" (;), "html" "xml"
+    // "markdown" (<!-- -->), "sql" "lua" "haskell" (--), "text" "json" (none). Unknown names: no comments. Returns true when known.
+    public bool setLanguage(char* name) {
+        char* line = "";
+        char* open = "";
+        char* close = "";
+        bool known = true;
+        bool colon = false;
+        if (streq(name, "a") || streq(name, "c") || streq(name, "cpp") || streq(name, "java") || streq(name, "javascript") || streq(name, "typescript") ||
+            streq(name, "rust") || streq(name, "go") || streq(name, "swift") || streq(name, "csharp") || streq(name, "kotlin")) {
+            line = "//"; open = "/*"; close = "*/";
+        } else if (streq(name, "css")) {
+            open = "/*"; close = "*/";
+        } else if (streq(name, "python")) {
+            line = "#"; colon = true;
+        } else if (streq(name, "shell") || streq(name, "bash") || streq(name, "makefile") || streq(name, "toml") || streq(name, "yaml") ||
+                   streq(name, "ruby") || streq(name, "perl") || streq(name, "conf")) {
+            line = "#";
+        } else if (streq(name, "ini")) {
+            line = ";";
+        } else if (streq(name, "html") || streq(name, "xml") || streq(name, "markdown")) {
+            open = "<!--"; close = "-->";
+        } else if (streq(name, "sql") || streq(name, "lua") || streq(name, "haskell")) {
+            line = "--";
+        } else if (streq(name, "text") || streq(name, "json") || streq(name, "plain")) {
+            known = true;
+        } else {
+            known = false;
+        }
+        setComments(line, open, close);
+        indentColon = colon;
+        return known;
+    }
+
+    // ---- cursor access -----------------------------------------------------------------------------------------------------------------
+    public int cursorCount() {
+        return ncur;
+    }
+
+    private int lo(int i) {
+        return (cur[i].anchor < cur[i].pos) ? cur[i].anchor : cur[i].pos;
+    }
+
+    private int hi(int i) {
+        return (cur[i].anchor > cur[i].pos) ? cur[i].anchor : cur[i].pos;
+    }
+
+    public bool hasSelection(int i) {
+        return cur[i].anchor != cur[i].pos;
+    }
+
+    public int selStart(int i) {
+        return lo(i);
+    }
+
+    public int selEnd(int i) {
+        return hi(i);
+    }
+
+    // the caret of the primary cursor
+    public int caret() {
+        return cur[primary].pos;
+    }
+
+    public int caretLine() {
+        return buf->lineAt(cur[primary].pos);
+    }
+
+    // the display column of the primary caret
+    public int caretCol() {
+        int p = cur[primary].pos;
+        return buf->visualCol(buf->lineAt(p), p, tw());
+    }
+
+    public bool anySelection() {
+        for (int i = 0; i < ncur; i++) {
+            if (cur[i].anchor != cur[i].pos) { return true; }
+        }
+        return false;
+    }
+
+    private void growCur(int want) {
+        if (want <= curCap) {
+            return;
+        }
+        int nc = curCap * 2;
+        while (nc < want) { nc = nc * 2; }
+        char* nb = asys.realloc((char*) cur, nc * sizeof(Cursor));
+        if (nb == null) {
+            return;
+        }
+        cur = (Cursor*) nb;
+        curCap = nc;
+    }
+
+    // keeps one cursor, a caret at pos
+    public void setCursor(int pos) {
+        ncur = 1;
+        primary = 0;
+        cur[0].anchor = pos;
+        cur[0].pos = pos;
+        cur[0].goal = -1;
+        normalize();
+    }
+
+    // keeps one cursor with a selection from anchor to pos (the caret is at pos)
+    public void setSelection(int anchor, int pos) {
+        ncur = 1;
+        primary = 0;
+        cur[0].anchor = anchor;
+        cur[0].pos = pos;
+        cur[0].goal = -1;
+        normalize();
+    }
+
+    // adds a cursor (it becomes the primary one); returns false when it was merged into an existing cursor
+    public bool addCursor(int anchor, int pos) {
+        growCur(ncur + 1);
+        int before = ncur;
+        cur[ncur].anchor = anchor;
+        cur[ncur].pos = pos;
+        cur[ncur].goal = -1;
+        cur[ncur].tag = 0;
+        primary = ncur;
+        ncur++;
+        normalize();
+        return ncur == before + 1;
+    }
+
+    // one cursor per line from line1 to line2, at display column col (a column selection with width 0); lines that are shorter
+    // than col get their caret at the end of the line
+    public void addCursorsInColumn(int line1, int line2, int col) {
+        int a = imin(line1, line2);
+        int b = imax(line1, line2);
+        a = imax(a, 0);
+        b = imin(b, buf->lineCount() - 1);
+        ncur = 0;
+        for (int l = a; l <= b; l++) {
+            growCur(ncur + 1);
+            int p = buf->offsetAtCol(l, col, tw());
+            cur[ncur].anchor = p;
+            cur[ncur].pos = p;
+            cur[ncur].goal = col;
+            cur[ncur].tag = 0;
+            ncur++;
+        }
+        if (ncur == 0) {
+            ncur = 1;
+            cur[0].anchor = 0;
+            cur[0].pos = 0;
+        }
+        primary = ncur - 1;
+        normalize();
+    }
+
+    public void clearExtraCursors() {
+        cur[0] = cur[primary];
+        ncur = 1;
+        primary = 0;
+    }
+
+    // collapses every selection to its caret
+    public void collapse() {
+        for (int i = 0; i < ncur; i++) {
+            cur[i].anchor = cur[i].pos;
+        }
+        normalize();
+    }
+
+    // Brings the cursors into order: positions inside the text and on character boundaries, sorted, overlapping or touching
+    // selections (and equal carets) merged. The primary cursor stays the primary one.
+    public void normalize() {
+        int len = buf->length();
+        for (int i = 0; i < ncur; i++) {
+            cur[i].anchor = buf->charStart(imax(0, imin(cur[i].anchor, len)));
+            cur[i].pos = buf->charStart(imax(0, imin(cur[i].pos, len)));
+            cur[i].tag = (i == primary) ? 1 : 0;
+        }
+        // insertion sort by selection start (cursors are nearly sorted already)
+        for (int i = 1; i < ncur; i++) {
+            Cursor c = cur[i];
+            int key = (c.anchor < c.pos) ? c.anchor : c.pos;
+            int j = i - 1;
+            while (j >= 0 && lo(j) > key) {
+                cur[j + 1] = cur[j];
+                j--;
+            }
+            cur[j + 1] = c;
+        }
+        // merge
+        int w = 0;
+        for (int i = 0; i < ncur; i++) {
+            if (w > 0) {
+                int pl = lo(w - 1);
+                int ph = hi(w - 1);
+                int cl = lo(i);
+                int ch = hi(i);
+                bool pCaret = cur[w - 1].anchor == cur[w - 1].pos;
+                bool cCaret = cur[i].anchor == cur[i].pos;
+                if (cl < ph || (cl == ph && (pCaret || cCaret))) {
+                    int nl = pl;
+                    int nh = imax(ph, ch);
+                    bool forward = cur[w - 1].anchor <= cur[w - 1].pos;
+                    if (cur[i].tag == 1) {
+                        forward = cur[i].anchor <= cur[i].pos;
+                    }
+                    int tg = cur[w - 1].tag | cur[i].tag;
+                    int goal = cur[w - 1].goal;
+                    if (forward) {
+                        cur[w - 1].anchor = nl;
+                        cur[w - 1].pos = nh;
+                    } else {
+                        cur[w - 1].anchor = nh;
+                        cur[w - 1].pos = nl;
+                    }
+                    cur[w - 1].tag = tg;
+                    cur[w - 1].goal = goal;
+                    continue;
+                }
+            }
+            cur[w] = cur[i];
+            w++;
+        }
+        ncur = w;
+        primary = ncur - 1;
+        for (int i = 0; i < ncur; i++) {
+            if ((cur[i].tag & 1) != 0) { primary = i; }
+        }
+        for (int i = 0; i < ncur; i++) { cur[i].tag = 0; }
+    }
+
+    // called by the buffer after every change: moves the cursors along
+    public void mapChange(Change* c) {
+        int off = c->off;
+        int del = c->delLen;
+        int ins = c->insLen;
+        for (int i = 0; i < ncur; i++) {
+            cur[i].anchor = mapPos(cur[i].anchor, off, del, ins);
+            cur[i].pos = mapPos(cur[i].pos, off, del, ins);
+        }
+    }
+
+    private int mapPos(int p, int off, int del, int ins) {
+        if (p <= off) {
+            return p;
+        }
+        if (p >= off + del) {
+            return p + ins - del;
+        }
+        return off;
+    }
+
+    // ---- snapshots for undo ---------------------------------------------------------------------------------------------------------------
+    // the cursors as numbers: primary, then anchor / position pairs
+    private int snapshot() {
+        int n = 1 + ncur * 2;
+        if (n > snapCap) {
+            asys.free((char*) snap);
+            snap = (int*) asys.alloc(n * 8 + 64);
+            snapCap = n + 8;
+        }
+        snap[0] = primary;
+        for (int i = 0; i < ncur; i++) {
+            snap[1 + i * 2] = cur[i].anchor;
+            snap[2 + i * 2] = cur[i].pos;
+        }
+        return n;
+    }
+
+    private void restoreSnapshot(int* s, int n) {
+        if (n < 3) {
+            normalize();
+            return;
+        }
+        int pairs = (n - 1) / 2;
+        growCur(pairs);
+        for (int i = 0; i < pairs; i++) {
+            cur[i].anchor = s[1 + i * 2];
+            cur[i].pos = s[2 + i * 2];
+            cur[i].goal = -1;
+            cur[i].tag = 0;
+        }
+        ncur = pairs;
+        primary = imax(0, imin(s[0], pairs - 1));
+        normalize();
+    }
+
+    private void beginEdit(int key) {
+        int n = snapshot();
+        buf->beginGroup(snap, n, key);
+    }
+
+    private void endEdit() {
+        normalize();
+        int n = snapshot();
+        buf->endGroup(snap, n);
+    }
+
+    // Opens / closes an undo group around edits made directly on the buffer (find and replace, scripts): everything between the calls is
+    // one undo step, and undo restores the cursors as they are now.
+    public void beginGroup(int key) {
+        beginEdit(key);
+    }
+
+    public void endGroup() {
+        endEdit();
+    }
+
+    // Closes the current undo step so that the next typing starts a new one (call it when the user pauses or the view
+    // changes the active line).
+    public void breakUndo() {
+        buf->sealHistory();
+    }
+
+    // ---- undo / redo ---------------------------------------------------------------------------------------------------------------------
+    public bool undo() {
+        int need = buf->undoSnapshotSize();
+        if (need < 0) {
+            return false;
+        }
+        int* s = (int*) asys.alloc(need * 8 + 8);
+        int n = buf->undo(s, need);
+        if (n < 0) {
+            asys.free((char*) s);
+            return false;
+        }
+        if (n >= 3) {
+            restoreSnapshot(s, n);
+        } else {
+            normalize();
+        }
+        asys.free((char*) s);
+        return true;
+    }
+
+    public bool redo() {
+        int need = buf->redoSnapshotSize();
+        if (need < 0) {
+            return false;
+        }
+        int* s = (int*) asys.alloc(need * 8 + 8);
+        int n = buf->redo(s, need);
+        if (n < 0) {
+            asys.free((char*) s);
+            return false;
+        }
+        if (n >= 3) {
+            restoreSnapshot(s, n);
+        } else {
+            normalize();
+        }
+        asys.free((char*) s);
+        return true;
+    }
+
+    // ---- line helpers --------------------------------------------------------------------------------------------------------------------
+    // the offset of the first character of line `line` that is not a space or tab (the line end for a blank line)
+    private int indentEnd(int line) {
+        int p = buf->lineStart(line);
+        int e = buf->lineEnd(line);
+        while (p < e) {
+            int c = buf->byteAt(p);
+            if (c != ' ' && c != 9) { break; }
+            p++;
+        }
+        return p;
+    }
+
+    private bool isBlank(int line) {
+        return indentEnd(line) >= buf->lineEnd(line);
+    }
+
+    // appends the indentation for `cols` display columns to out (tabs first when useTabs); returns the new length
+    private int makeIndent(char* out, int o, int cols) {
+        if (useTabs) {
+            int t = tw();
+            while (cols >= t) {
+                out[o] = 9;
+                o++;
+                cols = cols - t;
+            }
+        }
+        while (cols > 0) {
+            out[o] = ' ';
+            o++;
+            cols--;
+        }
+        return o;
+    }
+
+    private int unitText(char* out) {
+        if (useTabs) {
+            out[0] = 9;
+            return 1;
+        }
+        int w = iw();
+        for (int i = 0; i < w; i++) { out[i] = ' '; }
+        return w;
+    }
+
+    // the first and last line a cursor touches; a selection that ends at column 0 of a later line does not include that line
+    private void cursorLines(int i, int* first, int* last) {
+        int a = lo(i);
+        int b = hi(i);
+        int f = buf->lineAt(a);
+        int l = buf->lineAt(b);
+        if (b > a && b == buf->lineStart(l) && l > f) {
+            l--;
+        }
+        *first = f;
+        *last = l;
+    }
+
+    // the line ranges of all cursors, merged (adjacent lines too): returns how many; rs / re receive first and last lines
+    private int lineRanges(int* rs, int* re) {
+        int n = 0;
+        for (int i = 0; i < ncur; i++) {
+            int f = 0;
+            int l = 0;
+            cursorLines(i, &f, &l);
+            if (n > 0 && f <= re[n - 1] + 1) {
+                if (l > re[n - 1]) { re[n - 1] = l; }
+            } else {
+                rs[n] = f;
+                re[n] = l;
+                n++;
+            }
+        }
+        return n;
+    }
+
+    // ---- motions --------------------------------------------------------------------------------------------------------------------------
+    private void moveTo(int i, int p, bool extend, bool keepGoal) {
+        cur[i].pos = p;
+        if (!extend) {
+            cur[i].anchor = p;
+        }
+        if (!keepGoal) {
+            cur[i].goal = -1;
+        }
+    }
+
+    public void moveLeft(bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            if (!extend && hasSelection(i)) {
+                moveTo(i, lo(i), false, false);
+            } else {
+                moveTo(i, buf->prevChar(cur[i].pos), extend, false);
+            }
+        }
+        normalize();
+    }
+
+    public void moveRight(bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            if (!extend && hasSelection(i)) {
+                moveTo(i, hi(i), false, false);
+            } else {
+                moveTo(i, buf->nextChar(cur[i].pos), extend, false);
+            }
+        }
+        normalize();
+    }
+
+    // up / down by n lines, keeping the display column
+    public void moveVertical(int n, bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            int p = cur[i].pos;
+            int line = buf->lineAt(p);
+            int goal = cur[i].goal;
+            if (goal < 0) {
+                goal = buf->visualCol(line, p, tw());
+            }
+            int nl = line + n;
+            if (nl < 0) {
+                moveTo(i, 0, extend, true);
+                cur[i].goal = goal;
+                continue;
+            }
+            if (nl >= buf->lineCount()) {
+                moveTo(i, buf->length(), extend, true);
+                cur[i].goal = goal;
+                continue;
+            }
+            moveTo(i, buf->offsetAtCol(nl, goal, tw()), extend, true);
+            cur[i].goal = goal;
+        }
+        normalize();
+    }
+
+    public void moveUp(bool extend) {
+        moveVertical(-1, extend);
+    }
+
+    public void moveDown(bool extend) {
+        moveVertical(1, extend);
+    }
+
+    // Home: with smartHome the caret goes to the first non-blank character, and to the line start when it is there already
+    public void moveHome(bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            int p = cur[i].pos;
+            int line = buf->lineAt(p);
+            int ls = buf->lineStart(line);
+            int ie = indentEnd(line);
+            int target = ls;
+            if (smartHome && ie < buf->lineEnd(line)) {
+                target = (p == ie) ? ls : ie;
+            }
+            moveTo(i, target, extend, false);
+        }
+        normalize();
+    }
+
+    public void moveEnd(bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            int line = buf->lineAt(cur[i].pos);
+            moveTo(i, buf->lineEnd(line), extend, false);
+        }
+        normalize();
+    }
+
+    // the offset where a word motion to the right ends: the end of the current word (or run of punctuation) and the white
+    // space after it; at a line end the start of the next line
+    public int wordRightFrom(int p) {
+        int len = buf->length();
+        if (p >= len) {
+            return len;
+        }
+        int c = charClass(buf->byteAt(p));
+        if (c == 3) {
+            return p + 1;
+        }
+        if (c != 0) {
+            while (p < len && charClass(buf->byteAt(p)) == c) {
+                p = p + 1;
+            }
+        }
+        while (p < len && charClass(buf->byteAt(p)) == 0) {
+            p++;
+        }
+        return buf->charStart(p);
+    }
+
+    // the start of the word to the left of p (skipping white space first); at a line start the end of the previous line
+    public int wordLeftFrom(int p) {
+        if (p <= 0) {
+            return 0;
+        }
+        while (p > 0 && charClass(buf->byteAt(p - 1)) == 0) {
+            p--;
+        }
+        if (p == 0) {
+            return 0;
+        }
+        int c = charClass(buf->byteAt(p - 1));
+        if (c == 3) {
+            return p - 1;
+        }
+        while (p > 0 && charClass(buf->byteAt(p - 1)) == c) {
+            p--;
+        }
+        return buf->charStart(p);
+    }
+
+    public void moveWordRight(bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            moveTo(i, wordRightFrom(cur[i].pos), extend, false);
+        }
+        normalize();
+    }
+
+    public void moveWordLeft(bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            moveTo(i, wordLeftFrom(cur[i].pos), extend, false);
+        }
+        normalize();
+    }
+
+    // the start of the next paragraph (the next blank line after some text) below / above a line
+    private int paraLine(int line, int dir) {
+        int n = buf->lineCount();
+        int l = line;
+        // skip blank lines first
+        while (l >= 0 && l < n && isBlank(l)) { l = l + dir; }
+        while (l >= 0 && l < n && !isBlank(l)) { l = l + dir; }
+        if (l < 0) { return 0; }
+        if (l >= n) { return n - 1; }
+        return l;
+    }
+
+    public void moveParagraphDown(bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            int l = paraLine(buf->lineAt(cur[i].pos), 1);
+            int p = (l >= buf->lineCount() - 1 && !isBlank(l)) ? buf->length() : buf->lineStart(l);
+            moveTo(i, p, extend, false);
+        }
+        normalize();
+    }
+
+    public void moveParagraphUp(bool extend) {
+        for (int i = 0; i < ncur; i++) {
+            int l = paraLine(buf->lineAt(cur[i].pos), -1);
+            moveTo(i, buf->lineStart(l), extend, false);
+        }
+        normalize();
+    }
+
+    public void moveDocStart(bool extend) {
+        clearExtraCursors();
+        moveTo(0, 0, extend, false);
+        normalize();
+    }
+
+    public void moveDocEnd(bool extend) {
+        clearExtraCursors();
+        moveTo(0, buf->length(), extend, false);
+        normalize();
+    }
+
+    // puts one caret on line `line` (0 based) at display column col
+    public void gotoLine(int line, int col) {
+        line = imax(0, imin(line, buf->lineCount() - 1));
+        setCursor(buf->offsetAtCol(line, imax(col, 0), tw()));
+    }
+
+    public void selectAll() {
+        setSelection(0, buf->length());
+    }
+
+    // selects the whole line (with its line break) of every cursor; a second call adds the next line
+    public void selectLine() {
+        for (int i = 0; i < ncur; i++) {
+            int a = lo(i);
+            int b = hi(i);
+            int l1 = buf->lineAt(a);
+            int l2 = buf->lineAt(b);
+            int s = buf->lineStart(l1);
+            int e = (l2 + 1 < buf->lineCount()) ? buf->lineStart(l2 + 1) : buf->length();
+            if (a == s && b == e && l2 + 1 < buf->lineCount()) {
+                e = (l2 + 2 < buf->lineCount()) ? buf->lineStart(l2 + 2) : buf->length();
+            }
+            cur[i].anchor = s;
+            cur[i].pos = e;
+            cur[i].goal = -1;
+        }
+        normalize();
+    }
+
+    // selects the word at each caret
+    public void selectWord() {
+        for (int i = 0; i < ncur; i++) {
+            int p = cur[i].pos;
+            int len = buf->length();
+            int c = (p < len) ? charClass(buf->byteAt(p)) : 3;
+            if (c == 3 || c == 0) {
+                if (p > 0) {
+                    int cp = charClass(buf->byteAt(p - 1));
+                    if (cp == 1 || cp == 2) { c = cp; p = p - 1; }
+                }
+            }
+            int s = p;
+            int e = p;
+            if (c == 1 || c == 2) {
+                while (s > 0 && charClass(buf->byteAt(s - 1)) == c) { s--; }
+                while (e < len && charClass(buf->byteAt(e)) == c) { e++; }
+            }
+            cur[i].anchor = buf->charStart(s);
+            cur[i].pos = buf->charStart(e);
+            cur[i].goal = -1;
+        }
+        normalize();
+    }
+
+    // ---- reading the selection ---------------------------------------------------------------------------------------------------------------
+    // the selected text of cursor i (an asys string; "" for a caret)
+    public char* selectedText(int i) {
+        return buf->getText(lo(i), hi(i));
+    }
+
+    // ---- editing ---------------------------------------------------------------------------------------------------------------------------------
+    // Replaces every selection (or inserts at every caret) by the text. In text mode CRLF and CR in the text become '\n'.
+    // key: undo merge key (KEY_NONE for a paste). Returns false when the buffer is read only.
+    private bool replaceSelections(char* s, int n, int key) {
+        if (buf->readOnly) {
+            return false;
+        }
+        char* t = s;
+        int tn = n;
+        char* owned = null;
+        if (!buf->binary) {
+            bool hasCr = false;
+            for (int i = 0; i < n; i++) {
+                if (s[i] == 13) { hasCr = true; break; }
+            }
+            if (hasCr) {
+                owned = asys.alloc(n + 1);
+                int w = 0;
+                for (int i = 0; i < n; i++) {
+                    if (s[i] == 13) {
+                        owned[w] = 10;
+                        w++;
+                        if (i + 1 < n && s[i + 1] == 10) { i++; }
+                    } else {
+                        owned[w] = s[i];
+                        w++;
+                    }
+                }
+                t = owned;
+                tn = w;
+            }
+        }
+        normalize();
+        beginEdit(key);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            buf->edit(a, b - a, t, tn);
+            cur[i].anchor = a + tn;
+            cur[i].pos = a + tn;
+            cur[i].goal = -1;
+        }
+        endEdit();
+        asys.free(owned);
+        return true;
+    }
+
+    // inserts text at every caret / replaces every selection (one undo step; use it for paste and programmatic edits)
+    public bool insertText(char* s, int n) {
+        return replaceSelections(s, n, KEY_NONE);
+    }
+
+    public bool insertString(char* s) {
+        return replaceSelections(s, strlen(s), KEY_NONE);
+    }
+
+    // types one character (a code point). '\n' is newline(). Consecutive typing merges into one undo step per word.
+    public bool typeChar(int cp) {
+        if (cp == 10 || cp == 13) {
+            return newline();
+        }
+        if (buf->readOnly) {
+            return false;
+        }
+        char b[8];
+        int n = encodeUtf8(cp, &b[0]);
+        // a new word (after white space or punctuation) starts a new undo step
+        if (ncur == 1 && charClass(cp) == 1) {
+            int p = lo(0);
+            if (p > 0 && charClass(buf->byteAt(p - 1)) != 1 && charClass(buf->byteAt(p - 1)) != 3 && cur[0].anchor == cur[0].pos) {
+                buf->sealHistory();
+            }
+        }
+        if (electric && (cp == '}' || cp == ')' || cp == ']') && !buf->binary) {
+            if (electricClose(cp)) {
+                return true;
+            }
+        }
+        return replaceSelections(&b[0], n, KEY_TYPE);
+    }
+
+    // types a string character by character (each as typeChar would)
+    public void typeString(char* s) {
+        int i = 0;
+        int n = strlen(s);
+        while (i < n) {
+            int sz = 1;
+            int c = s[i];
+            int cp = c;
+            if (c >= 0xC2) {
+                int len = (c < 0xE0) ? 2 : ((c < 0xF0) ? 3 : 4);
+                if (i + len <= n) {
+                    cp = c & (0xFF >> (len + 1));
+                    for (int k = 1; k < len; k++) { cp = (cp << 6) | (s[i + k] & 0x3F); }
+                    sz = len;
+                }
+            }
+            typeChar(cp);
+            i = i + sz;
+        }
+    }
+
+    // typing a closing bracket on a line that holds only white space: re-indent the line like the line of its opening bracket
+    private bool electricClose(int cp) {
+        if (ncur != 1 || cur[0].anchor != cur[0].pos) {
+            return false;
+        }
+        int p = cur[0].pos;
+        int line = buf->lineAt(p);
+        int ls = buf->lineStart(line);
+        if (p == ls) {
+            return false;
+        }
+        for (int q = ls; q < p; q++) {
+            int c = buf->byteAt(q);
+            if (c != ' ' && c != 9) { return false; }
+        }
+        int open = (cp == '}') ? '{' : ((cp == ')') ? '(' : '[');
+        int m = findOpener(p, open, cp);
+        char ind[300];
+        int n = 0;
+        if (m >= 0) {
+            int ml = buf->lineAt(m);
+            int ie = indentEnd(ml);
+            int cols = buf->visualCol(ml, ie, tw());
+            n = makeIndent(&ind[0], 0, imin(cols, 250));
+        } else {
+            int cols = buf->visualCol(line, p, tw());
+            cols = imax(0, cols - iw());
+            n = makeIndent(&ind[0], 0, cols);
+        }
+        ind[n] = cp;
+        n++;
+        beginEdit(KEY_NONE);
+        buf->edit(ls, p - ls, &ind[0], n);
+        cur[0].anchor = ls + n;
+        cur[0].pos = ls + n;
+        cur[0].goal = -1;
+        endEdit();
+        return true;
+    }
+
+    // Enter: a new line with the indentation of the current one; one level deeper after an opening bracket (or ':' with
+    // indentColon); between a bracket pair the closing bracket moves to its own line.
+    public bool newline() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        beginEdit(KEY_NONE);
+        char unit[80];
+        int ul = unitText(&unit[0]);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            int line = buf->lineAt(a);
+            int ls = buf->lineStart(line);
+            char text[700];
+            int n = 0;
+            text[n] = 10;
+            n++;
+            int startDel = a;
+            bool extra = false;
+            bool closer = false;
+            if (autoIndent && !buf->binary) {
+                int ie = indentEnd(line);
+                int indLen = imin(ie, a) - ls;
+                if (indLen > 300) { indLen = 300; }
+                for (int k = 0; k < indLen; k++) { text[n + k] = buf->byteAt(ls + k); }
+                n = n + indLen;
+                // the last non-blank character before the caret opens a level?
+                int q = a;
+                while (q > ls && (buf->byteAt(q - 1) == ' ' || buf->byteAt(q - 1) == 9)) { q--; }
+                int c1 = (q > ls) ? buf->byteAt(q - 1) : 0;
+                if (c1 == '{' || c1 == '(' || c1 == '[' || (c1 == ':' && indentColon)) {
+                    extra = true;
+                    memcpy(&text[n], &unit[0], ul);
+                    n = n + ul;
+                }
+                if (extra && c1 != ':') {
+                    int e = buf->lineEnd(line);
+                    int r = b;
+                    while (r < e && (buf->byteAt(r) == ' ' || buf->byteAt(r) == 9)) { r++; }
+                    int c2 = (r < e) ? buf->byteAt(r) : 0;
+                    if ((c1 == '{' && c2 == '}') || (c1 == '(' && c2 == ')') || (c1 == '[' && c2 == ']')) {
+                        closer = true;
+                    }
+                }
+                // a line that holds only indentation gives it away to the new line
+                if (trimAutoIndent && a == b && q == ls && a > ls && buf->lineEnd(line) == a) {
+                    startDel = ls;
+                }
+            }
+            int caretAt = n;
+            if (closer) {
+                text[n] = 10;
+                n++;
+                int ie = indentEnd(line);
+                int indLen = imin(imin(ie, a) - ls, 300);
+                for (int k = 0; k < indLen; k++) { text[n + k] = buf->byteAt(ls + k); }
+                n = n + indLen;
+            }
+            buf->edit(startDel, b - startDel, &text[0], n);
+            cur[i].anchor = startDel + caretAt;
+            cur[i].pos = startDel + caretAt;
+            cur[i].goal = -1;
+        }
+        endEdit();
+        return true;
+    }
+
+    // Backspace: deletes the selection, or the character before the caret (in leading spaces: back to the previous indent stop)
+    public bool backspace() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        bool anySel = anySelection();
+        beginEdit(anySel ? KEY_NONE : KEY_BACKSPACE);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            if (a == b) {
+                if (a == 0) { continue; }
+                int line = buf->lineAt(a);
+                int ls = buf->lineStart(line);
+                int from = buf->prevChar(a);
+                if (smartBackspace && !useTabs && a > ls && !buf->binary) {
+                    bool spaces = true;
+                    for (int q = ls; q < a; q++) {
+                        if (buf->byteAt(q) != ' ') { spaces = false; break; }
+                    }
+                    if (spaces) {
+                        int w = iw();
+                        int cols = a - ls;
+                        int back = cols % w;
+                        if (back == 0) { back = w; }
+                        from = a - imin(back, cols);
+                    }
+                }
+                a = from;
+            }
+            buf->edit(a, b - a, null, 0);
+            cur[i].anchor = a;
+            cur[i].pos = a;
+            cur[i].goal = -1;
+        }
+        endEdit();
+        return true;
+    }
+
+    // Delete: deletes the selection, or the character after the caret
+    public bool deleteForward() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        bool anySel = anySelection();
+        beginEdit(anySel ? KEY_NONE : KEY_DELETE);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            if (a == b) {
+                b = buf->nextChar(a);
+            }
+            buf->edit(a, b - a, null, 0);
+            cur[i].anchor = a;
+            cur[i].pos = a;
+            cur[i].goal = -1;
+        }
+        endEdit();
+        return true;
+    }
+
+    // deletes from the caret to the start of the previous word (or the selection)
+    public bool deleteWordBack() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        beginEdit(KEY_NONE);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            if (a == b) {
+                a = wordLeftFrom(a);
+            }
+            buf->edit(a, b - a, null, 0);
+            cur[i].anchor = a;
+            cur[i].pos = a;
+            cur[i].goal = -1;
+        }
+        endEdit();
+        return true;
+    }
+
+    public bool deleteWordForward() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        beginEdit(KEY_NONE);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            if (a == b) {
+                b = wordRightFrom(b);
+            }
+            buf->edit(a, b - a, null, 0);
+            cur[i].anchor = a;
+            cur[i].pos = a;
+            cur[i].goal = -1;
+        }
+        endEdit();
+        return true;
+    }
+
+    // deletes from the caret to the end of the line (the line break when the caret is at the end)
+    public bool deleteToLineEnd() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        beginEdit(KEY_NONE);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            if (a == b) {
+                int e = buf->lineEnd(buf->lineAt(a));
+                b = (e == a) ? buf->nextChar(a) : e;
+            }
+            buf->edit(a, b - a, null, 0);
+            cur[i].anchor = a;
+            cur[i].pos = a;
+            cur[i].goal = -1;
+        }
+        endEdit();
+        return true;
+    }
+
+    // Tab key: with a selection spanning lines indents them; otherwise inserts a tab, or spaces up to the next indent stop
+    public bool tab() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        bool multi = false;
+        for (int i = 0; i < ncur; i++) {
+            int f = 0;
+            int l = 0;
+            cursorLines(i, &f, &l);
+            if (hasSelection(i) && l > f) { multi = true; }
+        }
+        if (multi) {
+            return indentLines();
+        }
+        beginEdit(KEY_NONE);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            char t[80];
+            int n = 0;
+            if (useTabs) {
+                t[0] = 9;
+                n = 1;
+            } else {
+                int line = buf->lineAt(a);
+                int col = buf->visualCol(line, a, tw());
+                int w = iw();
+                n = w - (col % w);
+                for (int k = 0; k < n; k++) { t[k] = ' '; }
+            }
+            buf->edit(a, b - a, &t[0], n);
+            cur[i].anchor = a + n;
+            cur[i].pos = a + n;
+            cur[i].goal = -1;
+        }
+        endEdit();
+        return true;
+    }
+
+    // Shift+Tab
+    public bool backtab() {
+        return outdentLines();
+    }
+
+    // inserts one indent unit at the start of every selected (or caret) line that is not empty
+    public bool indentLines() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        int* rs = (int*) asys.alloc(ncur * 8 + 8);
+        int* re = (int*) asys.alloc(ncur * 8 + 8);
+        int nr = lineRanges(rs, re);
+        char unit[80];
+        int ul = unitText(&unit[0]);
+        beginEdit(KEY_NONE);
+        for (int r = nr - 1; r >= 0; r--) {
+            for (int l = re[r]; l >= rs[r]; l--) {
+                if (buf->lineLength(l) == 0) { continue; }
+                int s = buf->lineStart(l);
+                // carets (without selection) that sit exactly at the line start move after the new indent
+                int caretIdx = -1;
+                for (int i = 0; i < ncur; i++) {
+                    if (cur[i].anchor == cur[i].pos && cur[i].pos == s) { caretIdx = i; }
+                }
+                buf->edit(s, 0, &unit[0], ul);
+                if (caretIdx >= 0) {
+                    cur[caretIdx].anchor = s + ul;
+                    cur[caretIdx].pos = s + ul;
+                }
+            }
+        }
+        endEdit();
+        asys.free((char*) rs);
+        asys.free((char*) re);
+        return true;
+    }
+
+    // removes up to one indent unit from the start of every selected line
+    public bool outdentLines() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        int* rs = (int*) asys.alloc(ncur * 8 + 8);
+        int* re = (int*) asys.alloc(ncur * 8 + 8);
+        int nr = lineRanges(rs, re);
+        beginEdit(KEY_NONE);
+        int w = iw();
+        for (int r = nr - 1; r >= 0; r--) {
+            for (int l = re[r]; l >= rs[r]; l--) {
+                int s = buf->lineStart(l);
+                int n = 0;
+                if (buf->byteAt(s) == 9) {
+                    n = 1;
+                } else {
+                    while (n < w && buf->byteAt(s + n) == ' ' && s + n < buf->lineEnd(l)) { n++; }
+                }
+                if (n > 0) {
+                    buf->edit(s, n, null, 0);
+                }
+            }
+        }
+        endEdit();
+        asys.free((char*) rs);
+        asys.free((char*) re);
+        return true;
+    }
+
+    // ---- comments ---------------------------------------------------------------------------------------------------------------------------
+    // Comments the selected lines with the line comment token (at the shallowest indentation), or removes the comments when every
+    // non-blank line already has one. Without a line comment the block comment pair is put around each line's text.
+    // Returns false when the language has no comments or the buffer is read only.
+    public bool toggleLineComment() {
+        if (buf->readOnly) {
+            return false;
+        }
+        char* tok = lineComment;
+        bool block = false;
+        if (tok[0] == 0) {
+            if (blockOpen[0] == 0) { return false; }
+            tok = blockOpen;
+            block = true;
+        }
+        int tl = strlen(tok);
+        int cl = strlen(blockClose);
+        normalize();
+        int* rs = (int*) asys.alloc(ncur * 8 + 8);
+        int* re = (int*) asys.alloc(ncur * 8 + 8);
+        int nr = lineRanges(rs, re);
+        // are all non-blank lines commented?
+        bool all = true;
+        bool any = false;
+        int minCol = 100000;
+        for (int r = 0; r < nr; r++) {
+            for (int l = rs[r]; l <= re[r]; l++) {
+                if (isBlank(l)) { continue; }
+                any = true;
+                int ie = indentEnd(l);
+                if (!lineStartsWith(ie, buf->lineEnd(l), tok)) { all = false; }
+                int col = buf->visualCol(l, ie, tw());
+                if (col < minCol) { minCol = col; }
+            }
+        }
+        if (!any) {
+            asys.free((char*) rs);
+            asys.free((char*) re);
+            return true;
+        }
+        beginEdit(KEY_NONE);
+        for (int r = nr - 1; r >= 0; r--) {
+            for (int l = re[r]; l >= rs[r]; l--) {
+                if (isBlank(l)) { continue; }
+                int ie = indentEnd(l);
+                int e = buf->lineEnd(l);
+                if (all) {
+                    // remove the closing token first (it is behind), then the opening one with one space
+                    if (block && cl > 0) {
+                        int q = e;
+                        while (q > ie && (buf->byteAt(q - 1) == ' ' || buf->byteAt(q - 1) == 9)) { q--; }
+                        if (q - cl >= ie + tl && lineEndsWith(q, blockClose)) {
+                            int from = q - cl;
+                            if (from > ie + tl && buf->byteAt(from - 1) == ' ') { from--; }
+                            buf->edit(from, q - from, null, 0);
+                        }
+                    }
+                    int n = tl;
+                    if (buf->byteAt(ie + tl) == ' ') { n++; }
+                    buf->edit(ie, n, null, 0);
+                } else {
+                    if (block && cl > 0) {
+                        char* tail = asys.concat3(" ", blockClose, "");
+                        int q = e;
+                        buf->edit(q, 0, tail, 1 + cl);
+                        asys.free(tail);
+                    }
+                    int at = buf->offsetAtCol(l, minCol, tw());
+                    if (at > ie) { at = ie; }
+                    char* head = asys.concat3(tok, " ", "");
+                    buf->edit(at, 0, head, tl + 1);
+                    asys.free(head);
+                }
+            }
+        }
+        endEdit();
+        asys.free((char*) rs);
+        asys.free((char*) re);
+        return true;
+    }
+
+    private bool lineStartsWith(int p, int e, char* tok) {
+        int n = strlen(tok);
+        if (p + n > e) { return false; }
+        for (int i = 0; i < n; i++) {
+            if (buf->byteAt(p + i) != tok[i]) { return false; }
+        }
+        return true;
+    }
+
+    // does the text before offset q end with tok?
+    private bool lineEndsWith(int q, char* tok) {
+        int n = strlen(tok);
+        if (q - n < 0) { return false; }
+        for (int i = 0; i < n; i++) {
+            if (buf->byteAt(q - n + i) != tok[i]) { return false; }
+        }
+        return true;
+    }
+
+    // Wraps every selection in the block comment pair, or removes the pair when the selection is already wrapped (also when
+    // the pair lies just outside the selection). A caret without selection comments the text of its line.
+    public bool toggleBlockComment() {
+        if (buf->readOnly || blockOpen[0] == 0) {
+            return false;
+        }
+        int ol = strlen(blockOpen);
+        int cl = strlen(blockClose);
+        normalize();
+        beginEdit(KEY_NONE);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            if (a == b) {
+                int line = buf->lineAt(a);
+                a = indentEnd(line);
+                b = buf->lineEnd(line);
+                while (b > a && (buf->byteAt(b - 1) == ' ' || buf->byteAt(b - 1) == 9)) { b--; }
+            }
+            bool inside = (b - a >= ol + cl) && lineStartsWith(a, b, blockOpen) && lineEndsWith(b, blockClose);
+            bool outside = a >= ol && lineEndsWith(a, blockOpen) && lineStartsWith(b, buf->length(), blockClose);
+            if (inside) {
+                buf->edit(b - cl, cl, null, 0);
+                buf->edit(a, ol, null, 0);
+                cur[i].anchor = a;
+                cur[i].pos = b - ol - cl;
+            } else if (outside) {
+                buf->edit(b, cl, null, 0);
+                buf->edit(a - ol, ol, null, 0);
+                cur[i].anchor = a - ol;
+                cur[i].pos = b - ol;
+            } else {
+                buf->edit(b, 0, blockClose, cl);
+                buf->edit(a, 0, blockOpen, ol);
+                cur[i].anchor = a;
+                cur[i].pos = b + ol + cl;
+            }
+            cur[i].goal = -1;
+        }
+        endEdit();
+        return true;
+    }
+
+    // ---- line operations -----------------------------------------------------------------------------------------------------------------------
+    // Moves the lines the cursors touch up (dir -1) or down (+1) by one line; the selections move with them. A selection that ends
+    // at column 0 of the next line moves its end along. Returns false when nothing could move.
+    public bool moveLines(int dir) {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        int* rs = (int*) asys.alloc(ncur * 8 + 8);
+        int* re = (int*) asys.alloc(ncur * 8 + 8);
+        int nr = lineRanges(rs, re);
+        int* na = (int*) asys.alloc(ncur * 8 + 8);
+        int* np = (int*) asys.alloc(ncur * 8 + 8);
+        int* oa = (int*) asys.alloc(ncur * 8 + 8);
+        int* op = (int*) asys.alloc(ncur * 8 + 8);
+        int n0 = ncur;
+        for (int i = 0; i < n0; i++) {
+            oa[i] = cur[i].anchor;
+            op[i] = cur[i].pos;
+            na[i] = oa[i];
+            np[i] = op[i];
+        }
+        bool moved = false;
+        beginEdit(KEY_NONE);
+        int nl = buf->lineCount();
+        for (int r = 0; r < nr; r++) {
+            int first = rs[r];
+            int last = re[r];
+            if (dir < 0 && first == 0) { continue; }
+            if (dir > 0 && last >= nl - 1) { continue; }
+            int bs = buf->lineStart(first);
+            int be = buf->lineEnd(last);
+            int blen = be - bs;
+            int other = (dir < 0) ? first - 1 : last + 1;
+            int os = buf->lineStart(other);
+            int oe = buf->lineEnd(other);
+            int olen = oe - os;
+            int regionStart = (dir < 0) ? os : bs;
+            int regionEnd = (dir < 0) ? be : oe;
+            char* t = asys.alloc(blen + olen + 2);
+            int w = 0;
+            if (dir < 0) {
+                buf->copyRange(bs, be, &t[w]); w = w + blen;
+                t[w] = 10; w++;
+                buf->copyRange(os, oe, &t[w]); w = w + olen;
+            } else {
+                buf->copyRange(os, oe, &t[w]); w = w + olen;
+                t[w] = 10; w++;
+                buf->copyRange(bs, be, &t[w]); w = w + blen;
+            }
+            // the cursors inside [bs, be + 1] belong to the block (the +1 is the start of the next line); they move with it
+            int delta = (dir < 0) ? -(olen + 1) : (olen + 1);
+            for (int i = 0; i < n0; i++) {
+                int a = (oa[i] < op[i]) ? oa[i] : op[i];
+                int b = (oa[i] > op[i]) ? oa[i] : op[i];
+                if (a >= bs && b <= be + 1) {
+                    na[i] = oa[i] + delta;
+                    np[i] = op[i] + delta;
+                }
+            }
+            buf->edit(regionStart, regionEnd - regionStart, t, w);
+            asys.free(t);
+            moved = true;
+        }
+        if (moved) {
+            for (int i = 0; i < n0; i++) {
+                cur[i].anchor = na[i];
+                cur[i].pos = np[i];
+                cur[i].goal = -1;
+            }
+        }
+        endEdit();
+        asys.free((char*) rs);
+        asys.free((char*) re);
+        asys.free((char*) na);
+        asys.free((char*) np);
+        asys.free((char*) oa);
+        asys.free((char*) op);
+        return moved;
+    }
+
+    public bool moveLinesUp() {
+        return moveLines(-1);
+    }
+
+    public bool moveLinesDown() {
+        return moveLines(1);
+    }
+
+    // Copies the touched lines below themselves; the cursors move to the copy
+    public bool duplicateLines() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        int* rs = (int*) asys.alloc(ncur * 8 + 8);
+        int* re = (int*) asys.alloc(ncur * 8 + 8);
+        int nr = lineRanges(rs, re);
+        beginEdit(KEY_NONE);
+        for (int r = nr - 1; r >= 0; r--) {
+            int bs = buf->lineStart(rs[r]);
+            int be = buf->lineEnd(re[r]);
+            int blen = be - bs;
+            char* t = asys.alloc(blen + 2);
+            t[0] = 10;
+            buf->copyRange(bs, be, &t[1]);
+            // the cursors of this range (positions in [bs, be + 1]) move to the copy
+            int shift = blen + 1;
+            int n0 = ncur;
+            int* oa = (int*) asys.alloc(n0 * 8 + 8);
+            int* op = (int*) asys.alloc(n0 * 8 + 8);
+            for (int i = 0; i < n0; i++) { oa[i] = cur[i].anchor; op[i] = cur[i].pos; }
+            buf->edit(be, 0, t, blen + 1);
+            for (int i = 0; i < n0; i++) {
+                if (oa[i] >= bs && oa[i] <= be + 1 && op[i] >= bs && op[i] <= be + 1) {
+                    cur[i].anchor = oa[i] + shift;
+                    cur[i].pos = op[i] + shift;
+                }
+            }
+            asys.free(t);
+            asys.free((char*) oa);
+            asys.free((char*) op);
+        }
+        endEdit();
+        asys.free((char*) rs);
+        asys.free((char*) re);
+        return true;
+    }
+
+    // Joins each touched line with the next one (a selection joins all its lines): the line break and the indentation of the next
+    // line are replaced by one space (none when either side is empty). The caret goes to the join point.
+    public bool joinLines() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        int* rs = (int*) asys.alloc(ncur * 8 + 8);
+        int* re = (int*) asys.alloc(ncur * 8 + 8);
+        int nr = 0;
+        for (int i = 0; i < ncur; i++) {
+            int f = 0;
+            int l = 0;
+            cursorLines(i, &f, &l);
+            if (l == f) { l = f + 1; }
+            if (l >= buf->lineCount()) { l = buf->lineCount() - 1; }
+            if (l <= f) { continue; }
+            if (nr > 0 && f <= re[nr - 1]) {
+                if (l > re[nr - 1]) { re[nr - 1] = l; }
+            } else {
+                rs[nr] = f;
+                re[nr] = l;
+                nr++;
+            }
+        }
+        if (nr == 0) {
+            asys.free((char*) rs);
+            asys.free((char*) re);
+            return false;
+        }
+        int* joinAt = (int*) asys.alloc(nr * 8 + 8);
+        beginEdit(KEY_NONE);
+        for (int r = nr - 1; r >= 0; r--) {
+            int len0 = buf->length();
+            int lastJoin = 0;
+            for (int l = re[r] - 1; l >= rs[r]; l--) {
+                int e = buf->lineEnd(l);
+                int next = indentEnd(l + 1);
+                bool space = buf->lineLength(l) > 0 && next < buf->lineEnd(l + 1);
+                if (space) {
+                    int c = buf->byteAt(e - 1);
+                    if (c == ' ' || c == 9) { space = false; }
+                }
+                buf->edit(e, next - e, space ? " " : "", space ? 1 : 0);
+                lastJoin = e;
+            }
+            joinAt[r] = lastJoin;
+            int d = buf->length() - len0;
+            for (int k = r + 1; k < nr; k++) { joinAt[k] = joinAt[k] + d; }
+        }
+        growCur(nr);
+        ncur = nr;
+        for (int r = 0; r < nr; r++) {
+            cur[r].anchor = joinAt[r];
+            cur[r].pos = joinAt[r];
+            cur[r].goal = -1;
+        }
+        primary = ncur - 1;
+        endEdit();
+        asys.free((char*) joinAt);
+        asys.free((char*) rs);
+        asys.free((char*) re);
+        return true;
+    }
+
+    // deletes the touched lines completely; carets go to the start of the line that moved up into each place
+    public bool deleteLines() {
+        if (buf->readOnly) {
+            return false;
+        }
+        normalize();
+        int* rs = (int*) asys.alloc(ncur * 8 + 8);
+        int* re = (int*) asys.alloc(ncur * 8 + 8);
+        int nr = lineRanges(rs, re);
+        beginEdit(KEY_NONE);
+        for (int r = nr - 1; r >= 0; r--) {
+            int bs = buf->lineStart(rs[r]);
+            int be = buf->lineEnd(re[r]);
+            int from = bs;
+            int to = be;
+            if (re[r] + 1 < buf->lineCount()) {
+                to = be + 1;
+            } else if (rs[r] > 0) {
+                from = bs - 1;
+            }
+            buf->edit(from, to - from, null, 0);
+        }
+        int removed = 0;
+        growCur(nr);
+        ncur = nr;
+        for (int r = 0; r < nr; r++) {
+            int l = imin(imax(rs[r] - removed, 0), buf->lineCount() - 1);
+            cur[r].anchor = buf->lineStart(l);
+            cur[r].pos = buf->lineStart(l);
+            cur[r].goal = -1;
+            removed = removed + (re[r] - rs[r] + 1);
+        }
+        primary = ncur - 1;
+        endEdit();
+        asys.free((char*) rs);
+        asys.free((char*) re);
+        return true;
+    }
+
+    // ---- clipboard ---------------------------------------------------------------------------------------------------------------------------------
+    // copies the selections (one piece per cursor); without a selection the whole lines of the carets are copied
+    public void copy() {
+        normalize();
+        if (anySelection()) {
+            int total = 0;
+            int* pl = (int*) asys.alloc(ncur * 8 + 8);
+            int np = 0;
+            for (int i = 0; i < ncur; i++) {
+                if (hasSelection(i)) {
+                    pl[np] = hi(i) - lo(i);
+                    total = total + pl[np] + 1;
+                    np++;
+                }
+            }
+            char* t = asys.alloc(total + 1);
+            int w = 0;
+            int k = 0;
+            for (int i = 0; i < ncur; i++) {
+                if (hasSelection(i)) {
+                    if (k > 0) { t[w] = 10; w++; }
+                    buf->copyRange(lo(i), hi(i), &t[w]);
+                    w = w + pl[k];
+                    k++;
+                }
+            }
+            clip->push(t, w, false, pl, np);
+            asys.free(t);
+            asys.free((char*) pl);
+            return;
+        }
+        // whole lines
+        int* rs = (int*) asys.alloc(ncur * 8 + 8);
+        int* re = (int*) asys.alloc(ncur * 8 + 8);
+        int nr = lineRanges(rs, re);
+        int total = 0;
+        for (int r = 0; r < nr; r++) {
+            total = total + (buf->lineEnd(re[r]) - buf->lineStart(rs[r])) + 1;
+        }
+        char* t = asys.alloc(total + 1);
+        int w = 0;
+        int* pl = (int*) asys.alloc(nr * 8 + 8);
+        for (int r = 0; r < nr; r++) {
+            int s = buf->lineStart(rs[r]);
+            int e = buf->lineEnd(re[r]);
+            buf->copyRange(s, e, &t[w]);
+            w = w + (e - s);
+            t[w] = 10;
+            w++;
+            pl[r] = e - s + 1;
+        }
+        clip->push(t, w, true, pl, nr);
+        asys.free(t);
+        asys.free((char*) pl);
+        asys.free((char*) rs);
+        asys.free((char*) re);
+    }
+
+    // copy, then delete the selections (or the whole lines)
+    public bool cut() {
+        if (buf->readOnly) {
+            return false;
+        }
+        copy();
+        if (anySelection()) {
+            return replaceSelections("", 0, KEY_NONE);
+        }
+        return deleteLines();
+    }
+
+    // Pastes the clipboard entry `index` (0 = newest). An entry copied as whole lines goes above the line of each caret. When
+    // the entry has as many pieces as there are cursors, each cursor gets its own piece.
+    public bool pasteEntry(int index) {
+        if (buf->readOnly || index < 0 || index >= clip->count()) {
+            return false;
+        }
+        char* t = clip->text(index);
+        int n = clip->length(index);
+        normalize();
+        if (clip->isLineMode(index) && !anySelection()) {
+            beginEdit(KEY_NONE);
+            // from the last caret to the first: a line break is added when the text does not end with one
+            for (int i = ncur - 1; i >= 0; i--) {
+                int line = buf->lineAt(cur[i].pos);
+                int s = buf->lineStart(line);
+                int keep = cur[i].pos - s;
+                char* conv = t;
+                buf->edit(s, 0, conv, n);
+                cur[i].anchor = s + n + keep;
+                cur[i].pos = s + n + keep;
+                cur[i].goal = -1;
+            }
+            endEdit();
+            return true;
+        }
+        int np = clip->pieceCount(index);
+        if (np == ncur && np > 1) {
+            beginEdit(KEY_NONE);
+            int* offs = (int*) asys.alloc(np * 8 + 8);
+            int o = 0;
+            // selection pieces are joined by one '\n' that belongs to no piece; whole-line pieces already end with their '\n'
+            int sep = clip->isLineMode(index) ? 0 : 1;
+            for (int k = 0; k < np; k++) {
+                offs[k] = o;
+                o = o + clip->pieceLength(index, k) + sep;
+            }
+            for (int i = ncur - 1; i >= 0; i--) {
+                int a = lo(i);
+                int b = hi(i);
+                int pl = clip->pieceLength(index, i);
+                buf->edit(a, b - a, &t[offs[i]], pl);
+                cur[i].anchor = a + pl;
+                cur[i].pos = a + pl;
+                cur[i].goal = -1;
+            }
+            asys.free((char*) offs);
+            endEdit();
+            return true;
+        }
+        return replaceSelections(t, n, KEY_NONE);
+    }
+
+    public bool paste() {
+        return pasteEntry(0);
+    }
+
+    // Saves the buffer (see Buffer.save); with trim / finalNewline the cleanups run first, as undoable edits.
+    public int saveFile(char* to, int flags, bool trim, bool finalNewline) {
+        if (trim) { trimTrailingWhitespace(); }
+        if (finalNewline) { ensureFinalNewline(); }
+        return buf->save(to, flags);
+    }
+
+    // ---- whole buffer cleanups --------------------------------------------------------------------------------------------------------------
+    // removes trailing spaces and tabs from every line; returns how many lines changed (0 for binary buffers)
+    public int trimTrailingWhitespace() {
+        if (buf->readOnly || buf->binary) {
+            return 0;
+        }
+        int changed = 0;
+        int n = buf->lineCount();
+        // find the lines first (the line index changes while we edit)
+        int cap = 64;
+        int* from = (int*) asys.alloc(cap * 8);
+        int* to = (int*) asys.alloc(cap * 8);
+        int cnt = 0;
+        for (int l = 0; l < n; l++) {
+            int s = buf->lineStart(l);
+            int e = buf->lineEnd(l);
+            int q = e;
+            while (q > s && (buf->byteAt(q - 1) == ' ' || buf->byteAt(q - 1) == 9)) { q--; }
+            if (q < e) {
+                if (cnt == cap) {
+                    cap = cap * 2;
+                    from = (int*) asys.realloc((char*) from, cap * 8);
+                    to = (int*) asys.realloc((char*) to, cap * 8);
+                }
+                from[cnt] = q;
+                to[cnt] = e;
+                cnt++;
+            }
+        }
+        if (cnt > 0) {
+            beginEdit(KEY_NONE);
+            for (int k = cnt - 1; k >= 0; k--) {
+                buf->edit(from[k], to[k] - from[k], null, 0);
+            }
+            endEdit();
+            changed = cnt;
+        }
+        asys.free((char*) from);
+        asys.free((char*) to);
+        return changed;
+    }
+
+    // makes sure a non-empty text ends with a line break; returns true when one was added
+    public bool ensureFinalNewline() {
+        int len = buf->length();
+        if (buf->readOnly || buf->binary || len == 0 || buf->byteAt(len - 1) == 10) {
+            return false;
+        }
+        beginEdit(KEY_NONE);
+        buf->edit(len, 0, "\n", 1);
+        endEdit();
+        return true;
+    }
+
+    // converts the indentation of every line: tabs to spaces (toSpaces) or leading runs of spaces to tabs; returns the lines changed
+    public int convertIndentation(bool toSpaces) {
+        if (buf->readOnly || buf->binary) {
+            return 0;
+        }
+        int n = buf->lineCount();
+        int changed = 0;
+        int cap = 64;
+        int* from = (int*) asys.alloc(cap * 8);
+        int* to = (int*) asys.alloc(cap * 8);
+        char** rep = (char**) asys.alloc(cap * 8);
+        int cnt = 0;
+        int t = tw();
+        for (int l = 0; l < n; l++) {
+            int s = buf->lineStart(l);
+            int ie = indentEnd(l);
+            if (ie == s) { continue; }
+            int cols = buf->visualCol(l, ie, t);
+            char* ind = asys.alloc(cols + 2);
+            int o = 0;
+            if (toSpaces) {
+                for (int k = 0; k < cols; k++) { ind[k] = ' '; }
+                o = cols;
+            } else {
+                int c = cols;
+                while (c >= t) { ind[o] = 9; o++; c = c - t; }
+                while (c > 0) { ind[o] = ' '; o++; c--; }
+            }
+            bool same = (ie - s == o);
+            for (int k = 0; same && k < o; k++) {
+                if (buf->byteAt(s + k) != ind[k]) { same = false; }
+            }
+            if (same) {
+                asys.free(ind);
+                continue;
+            }
+            if (cnt == cap) {
+                cap = cap * 2;
+                from = (int*) asys.realloc((char*) from, cap * 8);
+                to = (int*) asys.realloc((char*) to, cap * 8);
+                rep = (char**) asys.realloc((char*) rep, cap * 8);
+            }
+            from[cnt] = s;
+            to[cnt] = ie;
+            ind[o] = 0;
+            rep[cnt] = ind;
+            cnt++;
+        }
+        if (cnt > 0) {
+            beginEdit(KEY_NONE);
+            for (int k = cnt - 1; k >= 0; k--) {
+                buf->edit(from[k], to[k] - from[k], rep[k], strlen(rep[k]));
+            }
+            endEdit();
+            changed = cnt;
+        }
+        for (int k = 0; k < cnt; k++) { asys.free(rep[k]); }
+        asys.free((char*) rep);
+        asys.free((char*) from);
+        asys.free((char*) to);
+        return changed;
+    }
+
+    // upper / lower case of every selection (ASCII letters)
+    public bool changeCase(bool upper) {
+        if (buf->readOnly || !anySelection()) {
+            return false;
+        }
+        normalize();
+        beginEdit(KEY_NONE);
+        for (int i = ncur - 1; i >= 0; i--) {
+            int a = lo(i);
+            int b = hi(i);
+            if (a == b) { continue; }
+            char* t = buf->getText(a, b);
+            for (int k = 0; k < b - a; k++) {
+                int c = t[k];
+                if (upper && c >= 'a' && c <= 'z') { t[k] = c - 32; }
+                if (!upper && c >= 'A' && c <= 'Z') { t[k] = c + 32; }
+            }
+            buf->edit(a, b - a, t, b - a);
+            asys.free(t);
+            cur[i].anchor = (cur[i].anchor <= cur[i].pos) ? a : b;
+            cur[i].pos = (cur[i].anchor == a) ? b : a;
+        }
+        endEdit();
+        return true;
+    }
+
+    // Looks at the first 2000 lines and decides between tabs and spaces and the indent width (2, 3, 4 or 8). Returns false
+    // when there is no indentation to learn from; with apply the settings of the editor are changed.
+    public bool detectIndent(bool apply) {
+        int n = imin(buf->lineCount(), 2000);
+        int tabs = 0;
+        int spaces = 0;
+        int hist[17];
+        for (int i = 0; i < 17; i++) { hist[i] = 0; }
+        int prevCols = 0;
+        for (int l = 0; l < n; l++) {
+            int s = buf->lineStart(l);
+            int ie = indentEnd(l);
+            if (ie >= buf->lineEnd(l)) { continue; }
+            int c0 = buf->byteAt(s);
+            if (c0 == 9) {
+                tabs++;
+            } else if (c0 == ' ') {
+                spaces++;
+                int cols = ie - s;
+                int d = cols - prevCols;
+                if (d < 0) { d = -d; }
+                if (d > 0 && d <= 16) { hist[d]++; }
+                prevCols = cols;
+            } else {
+                prevCols = 0;
+            }
+        }
+        if (tabs == 0 && spaces == 0) {
+            return false;
+        }
+        if (apply) {
+            if (tabs > spaces) {
+                useTabs = true;
+            } else {
+                useTabs = false;
+                int best = 4;
+                int bestN = 0;
+                int cand[4];
+                cand[0] = 4; cand[1] = 2; cand[2] = 8; cand[3] = 3;
+                for (int k = 0; k < 4; k++) {
+                    if (hist[cand[k]] > bestN) { bestN = hist[cand[k]]; best = cand[k]; }
+                }
+                indentWidth = best;
+            }
+        }
+        return true;
+    }
+
+    // ---- brackets -----------------------------------------------------------------------------------------------------------------------------
+    // the closing partner of an opening bracket, or the opening partner of a closing bracket; 0 for other characters
+    private int partner(int c) {
+        switch (c) {
+            case '(': return ')';
+            case ')': return '(';
+            case '[': return ']';
+            case ']': return '[';
+            case '{': return '}';
+            case '}': return '{';
+        }
+        return 0;
+    }
+
+    // Collects the offsets of brackets of type `ch` that are code (not inside a string, character literal or comment) on one
+    // line, in order. Strings and comments are recognised by quotes and the editor's comment tokens within that line.
+    // Returns the count (at most max). inBlock: whether the line starts inside a block comment; the state at the line end is
+    // stored back.
+    private int bracketsOnLine(int line, int ch, int* out, int max, bool* inBlock, bool lex) {
+        int s = buf->lineStart(line);
+        int e = buf->lineEnd(line);
+        int n = 0;
+        int quote = 0;
+        int lc = strlen(lineComment);
+        int bo = strlen(blockOpen);
+        int bc = strlen(blockClose);
+        int p = s;
+        while (p < e) {
+            int c = buf->byteAt(p);
+            if (lex) {
+                if (*inBlock) {
+                    if (bc > 0 && c == blockClose[0] && lineStartsWith(p, e, blockClose)) {
+                        *inBlock = false;
+                        p = p + bc;
+                        continue;
+                    }
+                    p++;
+                    continue;
+                }
+                if (quote != 0) {
+                    if (c == 92) { p = p + 2; continue; }
+                    if (c == quote) { quote = 0; }
+                    p++;
+                    continue;
+                }
+                if (lc > 0 && c == lineComment[0] && lineStartsWith(p, e, lineComment)) {
+                    break;
+                }
+                if (bo > 0 && c == blockOpen[0] && lineStartsWith(p, e, blockOpen)) {
+                    *inBlock = true;
+                    p = p + bo;
+                    continue;
+                }
+                if (c == '"' || c == 39) {
+                    quote = c;
+                    p++;
+                    continue;
+                }
+            }
+            if (c == ch && n < max) {
+                out[n] = p;
+                n++;
+            }
+            p++;
+        }
+        return n;
+    }
+
+    // is offset p inside a string or comment according to the line-local rules above?
+    private bool inStringOrComment(int p) {
+        int line = buf->lineAt(p);
+        int s = buf->lineStart(line);
+        int quote = 0;
+        int lc = strlen(lineComment);
+        int bo = strlen(blockOpen);
+        int bc = strlen(blockClose);
+        bool block = false;
+        int q = s;
+        while (q < p) {
+            int c = buf->byteAt(q);
+            if (block) {
+                if (bc > 0 && lineStartsWith(q, p, blockClose)) { block = false; q = q + bc; continue; }
+                q++;
+                continue;
+            }
+            if (quote != 0) {
+                if (c == 92) { q = q + 2; continue; }
+                if (c == quote) { quote = 0; }
+                q++;
+                continue;
+            }
+            if (lc > 0 && lineStartsWith(q, buf->lineEnd(line), lineComment)) { return true; }
+            if (bo > 0 && lineStartsWith(q, buf->lineEnd(line), blockOpen)) { block = true; q = q + bo; continue; }
+            if (c == '"' || c == 39) { quote = c; }
+            q++;
+        }
+        return block || quote != 0;
+    }
+
+    // The offset of the bracket that matches the one at `pos` (an opening or closing bracket), or -1. Brackets inside strings
+    // and comments are skipped (unless the bracket itself is in one). Looks at most 20000 lines away.
+    public int matchBracket(int pos) {
+        int c = buf->byteAt(pos);
+        int other = partner(c);
+        if (other == 0) {
+            return -1;
+        }
+        bool forward = (c == '(' || c == '[' || c == '{');
+        bool lex = !inStringOrComment(pos);
+        int line = buf->lineAt(pos);
+        int nl = buf->lineCount();
+        int depth = 0;
+        int limit = 20000;
+        int* pos1 = (int*) asys.alloc(8 * 4096);
+        int* pos2 = (int*) asys.alloc(8 * 4096);
+        int result = -1;
+        bool block = false;
+        if (forward) {
+            for (int l = line; l < nl && l < line + limit && result < 0; l++) {
+                bool b1 = block;
+                bool b2 = block;
+                int n1 = bracketsOnLine(l, c, pos1, 4096, &b1, lex);
+                int n2 = bracketsOnLine(l, other, pos2, 4096, &b2, lex);
+                block = b1;
+                int i1 = 0;
+                int i2 = 0;
+                while ((i1 < n1 || i2 < n2) && result < 0) {
+                    bool takeOpen = (i2 >= n2) || (i1 < n1 && pos1[i1] < pos2[i2]);
+                    int at = takeOpen ? pos1[i1] : pos2[i2];
+                    if (takeOpen) { i1++; } else { i2++; }
+                    if (at < pos) { continue; }
+                    if (at == pos) { depth = 1; continue; }
+                    if (takeOpen) {
+                        depth++;
+                    } else {
+                        depth--;
+                        if (depth == 0) { result = at; }
+                    }
+                }
+            }
+        } else {
+            for (int l = line; l >= 0 && l > line - limit && result < 0; l--) {
+                bool b1 = false;
+                bool b2 = false;
+                int n1 = bracketsOnLine(l, c, pos1, 4096, &b1, lex);
+                int n2 = bracketsOnLine(l, other, pos2, 4096, &b2, lex);
+                int i1 = n1 - 1;
+                int i2 = n2 - 1;
+                while ((i1 >= 0 || i2 >= 0) && result < 0) {
+                    bool takeClose = (i2 < 0) || (i1 >= 0 && pos1[i1] > pos2[i2]);
+                    int at = takeClose ? pos1[i1] : pos2[i2];
+                    if (takeClose) { i1--; } else { i2--; }
+                    if (at > pos) { continue; }
+                    if (at == pos) { depth = 1; continue; }
+                    if (takeClose) {
+                        depth++;
+                    } else {
+                        depth--;
+                        if (depth == 0) { result = at; }
+                    }
+                }
+            }
+        }
+        asys.free((char*) pos1);
+        asys.free((char*) pos2);
+        return result;
+    }
+
+    // the opening bracket `open` that belongs to the closing bracket `close` that would be typed at offset p
+    private int findOpener(int p, int open, int close) {
+        int line = buf->lineAt(p);
+        int depth = 1;
+        int* a = (int*) asys.alloc(8 * 4096);
+        int* b = (int*) asys.alloc(8 * 4096);
+        int result = -1;
+        for (int l = line; l >= 0 && l > line - 20000 && result < 0; l--) {
+            bool b1 = false;
+            bool b2 = false;
+            int n1 = bracketsOnLine(l, open, a, 4096, &b1, true);
+            int n2 = bracketsOnLine(l, close, b, 4096, &b2, true);
+            int i1 = n1 - 1;
+            int i2 = n2 - 1;
+            while ((i1 >= 0 || i2 >= 0) && result < 0) {
+                bool takeOpen = (i2 < 0) || (i1 >= 0 && a[i1] > b[i2]);
+                int at = takeOpen ? a[i1] : b[i2];
+                if (takeOpen) { i1--; } else { i2--; }
+                if (at >= p) { continue; }
+                if (takeOpen) {
+                    depth--;
+                    if (depth == 0) { result = at; }
+                } else {
+                    depth++;
+                }
+            }
+        }
+        asys.free((char*) a);
+        asys.free((char*) b);
+        return result;
+    }
+
+    // the bracket pair next to the primary caret: looks at the character at the caret, then at the one before it. Returns the
+    // offset of the bracket that was found next to the caret in *at and the offset of its partner as the result (-1: none).
+    public int matchNearCaret(int* at) {
+        int p = cur[primary].pos;
+        int m = matchBracket(p);
+        if (m >= 0) {
+            *at = p;
+            return m;
+        }
+        if (p > 0) {
+            m = matchBracket(p - 1);
+            if (m >= 0) {
+                *at = p - 1;
+                return m;
+            }
+        }
+        return -1;
+    }
+
+    // Selects the text between the brackets around the caret (the innermost pair that encloses it). Called again it grows: first
+    // to the brackets themselves, then to the content of the next pair outwards, and so on. False when there is no larger pair
+    // (the selection is left as it was).
+    public bool selectEnclosingBrackets() {
+        int a = lo(primary);
+        int b = hi(primary);
+        // walk backwards to an opening bracket whose pair encloses the whole selection
+        for (int q = a - 1; q >= 0 && q > a - 200000; q--) {
+            int c = buf->byteAt(q);
+            if (c == '(' || c == '[' || c == '{') {
+                int m = matchBracket(q);
+                if (m >= b) {
+                    if (q + 1 < a || m > b) {
+                        setSelection(q + 1, m);
+                    } else {
+                        setSelection(q, m + 1);          // the content is selected already: now with the brackets
+                    }
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // adds a cursor selecting the next occurrence of the primary selection's text (the word at the caret when nothing is
+    // selected); returns false when there is no other occurrence
+    public bool addNextOccurrence() {
+        if (!anySelection()) {
+            selectWord();
+            return true;
+        }
+        int i = primary;
+        char* needle = buf->getText(lo(i), hi(i));
+        int nl = hi(i) - lo(i);
+        char* all = buf->flatten();
+        int len = buf->length();
+        int found = -1;
+        for (int pass = 0; pass < 2 && found < 0; pass++) {
+            int start = (pass == 0) ? hi(i) : 0;
+            int bound = (pass == 0) ? len - nl : lo(i) - 1;
+            for (int p = start; p <= bound; p++) {
+                if (all[p] == needle[0] && asys.bytesEqual(&all[p], needle, nl)) {
+                    bool taken = false;
+                    for (int k = 0; k < ncur; k++) {
+                        if (lo(k) == p && hi(k) == p + nl) { taken = true; }
+                    }
+                    if (!taken) {
+                        found = p;
+                        break;
+                    }
+                }
+            }
+        }
+        asys.free(needle);
+        if (found < 0) {
+            return false;
+        }
+        addCursor(found, found + nl);
+        return true;
+    }
+}
+
+// forwards buffer changes to the editor that registered for them
+int editorOnChange(int user, Change* c) {
+    Editor* ed = (Editor*) user;
+    ed->mapChange(c);
+    return 0;
+}

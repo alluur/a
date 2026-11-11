@@ -1,0 +1,414 @@
+// acode.Editor: cursors, selections, multi-cursor typing, undo / redo restoring the exact cursors, motions, UTF-8 safety
+import acode;
+import asys;
+
+int checks;
+int fails;
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (!streq(got, want)) {
+        fails++;
+        printf("FAIL: %s\n   got:  %s\n   want: %s\n", what, got, want);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+// the text with the cursors drawn in: a caret is |, a forward selection [text|], a backward one [|text]; line breaks show as ~
+char out[4096];
+char* render(acode.Editor* e) {
+    int n = e->buf->length();
+    int w = 0;
+    for (int p = 0; p <= n; p++) {
+        for (int i = 0; i < e->ncur; i++) {
+            int a = e->cur[i].anchor;
+            int c = e->cur[i].pos;
+            int lo = (a < c) ? a : c;
+            int hi = (a < c) ? c : a;
+            if (a == c) {
+                if (p == c) { out[w] = '|'; w++; }
+            } else {
+                if (p == lo) {
+                    out[w] = '[';
+                    w++;
+                    if (c < a) { out[w] = '|'; w++; }
+                }
+                if (p == hi) {
+                    if (c > a) { out[w] = '|'; w++; }
+                    out[w] = ']';
+                    w++;
+                }
+            }
+        }
+        if (p < n) {
+            int b = e->buf->byteAt(p);
+            if (b == 10) { out[w] = '~'; } else { out[w] = b; }
+            w++;
+        }
+    }
+    out[w] = 0;
+    return &out[0];
+}
+
+// opens a buffer with text and a caret / selection described like render output ("ab[c|]d"); returns the editor
+acode.Editor* open(acode.Buffer* b, char* marked) {
+    char plain[1024];
+    int pw = 0;
+    int a1[16];
+    int p1[16];
+    int nc = 0;
+    int selStart = -1;
+    bool back = false;
+    for (int i = 0; marked[i] != 0; i++) {
+        int c = marked[i];
+        if (c == '[') {
+            selStart = pw;
+            back = marked[i + 1] == '|';
+            if (back) { i++; }
+        } else if (c == ']') {
+            if (back) { a1[nc] = pw; p1[nc] = selStart; } else { a1[nc] = selStart; p1[nc] = pw; }
+            nc++;
+            selStart = -1;
+        } else if (c == '|') {
+            if (selStart < 0) { a1[nc] = pw; p1[nc] = pw; nc++; }
+        } else if (c == '~') {
+            plain[pw] = 10;
+            pw++;
+        } else {
+            plain[pw] = c;
+            pw++;
+        }
+    }
+    b->setText(&plain[0], pw);
+    acode.Editor* e = new acode.Editor(b);
+    e->setSelection(a1[0], p1[0]);
+    for (int k = 1; k < nc; k++) { e->addCursor(a1[k], p1[k]); }
+    return e;
+}
+
+int main() {
+    // ---- merged typing: one undo step, the caret goes back to where typing started
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "01234|56789");
+        e->typeString("abc");
+        checkStr(render(e), "01234abc|56789", "typing");
+        check(b.undoDepth() == 1, "typing 3 letters is one undo step");
+        e->undo();
+        checkStr(render(e), "01234|56789", "undo of merged typing restores the caret");
+        e->redo();
+        checkStr(render(e), "01234abc|56789", "redo of merged typing");
+        e->undo();
+        checkStr(render(e), "01234|56789", "undo again");
+    }
+    // ---- a new word starts a new step; a space belongs to the word before it
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "|");
+        e->typeString("foo bar");
+        checkEq(b.undoDepth(), 2, "two words are two steps");
+        e->undo();
+        checkStr(render(e), "foo |", "undo the second word");
+        e->undo();
+        checkStr(render(e), "|", "undo the first word");
+    }
+    // ---- backspace merges
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "abcdef|gh");
+        e->backspace(); e->backspace(); e->backspace();
+        checkStr(render(e), "abc|gh", "three backspaces");
+        checkEq(b.undoDepth(), 1, "backspaces merge");
+        e->undo();
+        checkStr(render(e), "abcdef|gh", "undo of merged backspaces restores the caret");
+        e->redo();
+        checkStr(render(e), "abc|gh", "redo of merged backspaces");
+    }
+    // ---- forward delete merges
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "ab|cdefgh");
+        e->deleteForward(); e->deleteForward();
+        checkStr(render(e), "ab|efgh", "two deletes");
+        checkEq(b.undoDepth(), 1, "deletes merge");
+        e->undo();
+        checkStr(render(e), "ab|cdefgh", "undo of merged deletes");
+        e->redo();
+        checkStr(render(e), "ab|efgh", "redo of merged deletes");
+    }
+    // ---- typing over a backward selection: undo restores the selection with its direction
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "012[|3456]789");
+        e->typeChar('X');
+        checkStr(render(e), "012X|789", "replace a backward selection");
+        e->undo();
+        checkStr(render(e), "012[|3456]789", "undo restores the backward selection");
+        e->redo();
+        checkStr(render(e), "012X|789", "redo");
+        e->undo();
+        e->deleteForward();
+        checkStr(render(e), "012|789", "delete the selection");
+        e->undo();
+        checkStr(render(e), "012[|3456]789", "undo of deleting a backward selection");
+    }
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "012[3456|]789");
+        e->insertString("zz");
+        checkStr(render(e), "012zz|789", "paste over a forward selection");
+        e->undo();
+        checkStr(render(e), "012[3456|]789", "undo restores the forward selection");
+        e->backspace();
+        checkStr(render(e), "012|789", "backspace deletes a selection");
+        e->undo();
+        checkStr(render(e), "012[3456|]789", "undo of backspace over a selection");
+    }
+    // ---- several cursors: typing, undo, redo
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "a|bc[|def]g[hi|]j|k");
+        checkEq(e->ncur, 4, "four cursors");
+        e->typeChar('-');
+        checkStr(render(e), "a-|bc-|g-|j-|k", "typing at four cursors");
+        e->undo();
+        checkStr(render(e), "a|bc[|def]g[hi|]j|k", "undo restores all four cursors exactly");
+        e->redo();
+        checkStr(render(e), "a-|bc-|g-|j-|k", "redo");
+        e->undo();
+        e->backspace();
+        checkStr(render(e), "|bc|g|k", "backspace at four cursors (selections deleted, carets delete a character)");
+        e->undo();
+        checkStr(render(e), "a|bc[|def]g[hi|]j|k", "undo after multi backspace");
+        e->undo();
+        check(!b.canUndo(), "everything is undone");
+        checkStr(render(e), "a|bc[|def]g[hi|]j|k", "and the cursors are where the setup left them");
+    }
+    // ---- multi-cursor typing merges and undoes together
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "x|~y|~z|");
+        e->typeString("12");
+        checkStr(render(e), "x12|~y12|~z12|", "typing twice at three carets");
+        checkEq(b.undoDepth(), 1, "multi-cursor typing merges");
+        e->undo();
+        checkStr(render(e), "x|~y|~z|", "undo restores three carets");
+    }
+    // ---- cursor merging
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "abcdef|");
+        e->addCursor(6, 6);
+        checkEq(e->ncur, 1, "equal carets merge");
+        e->addCursor(2, 4);
+        e->addCursor(3, 5);
+        checkStr(render(e), "ab[cde|]f|", "overlapping selections merge into one");
+        e->setSelection(1, 3);
+        e->addCursor(3, 3);
+        checkEq(e->ncur, 1, "a caret touching a selection merges");
+        e->addCursor(5, 5);
+        e->addCursor(0, 0);
+        checkEq(e->ncur, 3, "three separate cursors, kept sorted");
+        check(e->cur[0].pos == 0 && e->cur[2].pos == 5, "sorted by position");
+    }
+    // ---- UTF-8: carets never sit inside a character
+    {
+        acode.Buffer b();
+        b.setText("a\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80z", 11);
+        acode.Editor e(&b);
+        e.setCursor(2);
+        checkEq(e.caret(), 1, "a caret inside a two byte character moves to its start");
+        e.setCursor(4);
+        checkEq(e.caret(), 3, "inside the euro sign");
+        e.setCursor(9);
+        checkEq(e.caret(), 6, "inside the emoji");
+        e.setCursor(0);
+        e.moveRight(false);
+        checkEq(e.caret(), 1, "right over a");
+        e.moveRight(false);
+        checkEq(e.caret(), 3, "right over e-acute");
+        e.moveRight(false);
+        checkEq(e.caret(), 6, "right over euro");
+        e.moveRight(false);
+        checkEq(e.caret(), 10, "right over the emoji");
+        e.moveLeft(false);
+        checkEq(e.caret(), 6, "left over the emoji");
+        e.backspace();
+        checkEq(b.length(), 8, "backspace deletes the whole euro sign");
+        checkEq(e.caret(), 3, "and leaves the caret before it");
+        e.undo();
+        checkEq(b.length(), 11, "undo");
+        checkEq(e.caret(), 6, "undo restores the caret on a boundary");
+        e.setSelection(1, 6);
+        e.deleteForward();
+        checkEq(b.length(), 6, "delete a selection of two characters");
+        e.undo();
+        checkEq(e.cur[0].anchor, 1, "undo restores the anchor");
+        checkEq(e.cur[0].pos, 6, "undo restores the caret");
+        // column handling counts wide characters twice
+        b.setText("\xe4\xb8\xad\xe6\x96\x87x", 7);
+        checkEq(b.visualCol(0, 6, 4), 4, "two wide characters take four columns");
+        checkEq(b.offsetAtCol(0, 2, 4), 3, "column 2 is after the first wide character");
+        checkEq(b.offsetAtCol(0, 3, 4), 3, "column 3 is inside the second one: stay before it");
+    }
+    // ---- vertical motion keeps the display column (tabs, wide characters, short lines)
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "abcdefgh~ab~\tx~abcdefgh|");
+        e->setCursor(7);
+        e->moveDown(false);
+        checkStr(render(e), "abcdefgh~ab|~\tx~abcdefgh", "down onto a short line goes to its end");
+        e->moveDown(false);
+        checkStr(render(e), "abcdefgh~ab~\tx|~abcdefgh", "down onto a short tab line goes to its end");
+        e->moveDown(false);
+        checkStr(render(e), "abcdefgh~ab~\tx~abcdefg|h", "the goal column 7 comes back");
+        e->moveUp(false);
+        e->moveUp(false);
+        e->moveUp(false);
+        checkStr(render(e), "abcdefg|h~ab~\tx~abcdefgh", "and back up");
+        e->moveUp(false);
+        checkStr(render(e), "|abcdefgh~ab~\tx~abcdefgh", "up on the first line goes to the start");
+        e->moveDown(true);
+        check(e->hasSelection(0), "shift+down selects");
+    }
+    // a column inside a tab stays before the tab
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "abcdef~\tx|");
+        e->setCursor(2);
+        e->moveDown(false);
+        checkStr(render(e), "abcdef~|\tx", "column 2 is inside the tab: stay before it");
+        e->moveRight(false);
+        e->moveUp(false);
+        checkStr(render(e), "abcd|ef~\tx", "after the tab the column is 4");
+    }
+    // ---- Home, End, word and paragraph motions
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "    foo_bar baz(1)  ;~~second para~line two~~~third|");
+        e->setCursor(10);
+        e->moveHome(false);
+        checkEq(e->caret(), 4, "Home goes to the first non-blank");
+        e->moveHome(false);
+        checkEq(e->caret(), 0, "Home again goes to the line start");
+        e->moveHome(false);
+        checkEq(e->caret(), 4, "and toggles back");
+        e->moveEnd(false);
+        checkEq(e->caret(), 21, "End");
+        e->setCursor(0);
+        e->moveWordRight(false);
+        checkEq(e->caret(), 4, "word right from the indentation");
+        e->moveWordRight(false);
+        checkEq(e->caret(), 12, "word right over foo_bar and the space");
+        e->moveWordRight(false);
+        checkEq(e->caret(), 15, "word right over baz");
+        e->moveWordRight(false);
+        checkEq(e->caret(), 16, "word right over the punctuation (");
+        e->moveWordLeft(false);
+        checkEq(e->caret(), 15, "word left");
+        e->moveWordLeft(false);
+        checkEq(e->caret(), 12, "word left to baz");
+        e->moveWordLeft(false);
+        checkEq(e->caret(), 4, "word left to foo_bar");
+        e->moveWordLeft(false);
+        checkEq(e->caret(), 0, "word left to the line start");
+        e->setCursor(21);
+        e->moveWordRight(false);
+        checkEq(e->caret(), 22, "word right at a line end goes to the next line start");
+        e->moveWordLeft(false);
+        checkEq(e->caret(), 21, "word left at a line start goes to the previous line end");
+        e->setCursor(0);
+        e->moveParagraphDown(false);
+        checkStr(render(e), "    foo_bar baz(1)  ;~|~second para~line two~~~third", "paragraph down stops at the blank line");
+        e->moveParagraphDown(false);
+        checkStr(render(e), "    foo_bar baz(1)  ;~~second para~line two~|~~third", "paragraph down again (skips the blank line, then the paragraph)");
+        e->moveParagraphDown(false);
+        checkStr(render(e), "    foo_bar baz(1)  ;~~second para~line two~~~third|", "the last paragraph ends at the text end");
+        e->moveParagraphUp(false);
+        checkStr(render(e), "    foo_bar baz(1)  ;~~second para~line two~~|~third", "paragraph up");
+        e->moveDocStart(false);
+        checkEq(e->caret(), 0, "document start");
+        e->moveDocEnd(true);
+        checkEq(e->cur[0].anchor, 0, "shift+document end keeps the anchor");
+        checkEq(e->caret(), b.length(), "and reaches the end");
+    }
+    // ---- selections: select all, line, word; extend, collapse on arrow keys
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "one two~three four|");
+        e->setCursor(5);
+        e->selectWord();
+        checkStr(render(e), "one [two|]~three four", "select word");
+        e->moveRight(false);
+        checkStr(render(e), "one two|~three four", "right collapses to the end of the selection");
+        e->setSelection(4, 7);
+        e->moveLeft(false);
+        checkStr(render(e), "one |two~three four", "left collapses to the start");
+        e->setCursor(2);
+        e->selectLine();
+        checkStr(render(e), "[one two~|]three four", "select line includes the line break");
+        e->selectLine();
+        checkStr(render(e), "[one two~three four|]", "again: the next line");
+        e->selectAll();
+        checkStr(render(e), "[one two~three four|]", "select all");
+        e->setCursor(3);
+        e->moveRight(true);
+        e->moveRight(true);
+        checkStr(render(e), "one[ t|]wo~three four", "shift+right extends");
+        e->setCursor(3);
+        e->moveLeft(true);
+        e->moveLeft(true);
+        checkStr(render(e), "o[|ne] two~three four", "shift+left selects backwards");
+        e->moveRight(true);
+        e->moveRight(true);
+        e->moveRight(true);
+        checkStr(render(e), "one[ |]two~three four", "extending across the anchor turns the selection around");
+    }
+    // ---- tab width 0 or negative must not crash
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "a\tb~c|");
+        e->setTabWidth(0);
+        e->setIndentWidth(-3);
+        e->setCursor(2);
+        e->moveDown(false);
+        checkStr(render(e), "a\tb~c|", "vertical motion with tab width 0 (taken as 4): the caret goes to the end of the short line");
+        e->tab();
+        e->backtab();
+        e->indentLines();
+        check(b.visualCol(0, 2, 0) == 5 || b.visualCol(0, 2, 0) >= 2, "visualCol with tab width 0 does not crash");
+        check(b.offsetAtCol(0, 3, -5) >= 0, "offsetAtCol with a negative tab width");
+        e->setTabWidth(1000);
+        int lenBefore = b.length();
+        e->tab();
+        check(b.length() - lenBefore >= 1 && b.length() - lenBefore <= 64, "a huge tab width is clamped: tab inserts between 1 and 64 characters");
+    }
+    // ---- a read-only buffer refuses every edit
+    {
+        acode.Buffer b();
+        acode.Editor* e = open(&b, "abc|");
+        b.readOnly = true;
+        check(!e->typeChar('x') && !e->backspace() && !e->insertString("y") && !e->newline() && !e->deleteForward(), "edits are refused");
+        checkEq(b.length(), 3, "text unchanged");
+        check(!b.edit(0, 0, "z", 1), "Buffer.edit refuses too");
+        b.readOnly = false;
+        check(e->typeChar('x'), "writable again");
+    }
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

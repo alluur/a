@@ -1,0 +1,2256 @@
+// =============================================================================
+//  aproject - projects: files, searching and jobs                                                 import aproject;
+//
+//  Ignore         .gitignore style rules (* ? [a-z] ** ! / and a trailing slash) plus a built-in list (.git, node_modules, *.o ...)
+//  FileTree       a lazy directory tree: directories are read when they are opened; sorted (folders first); symbolic links are
+//                 NOT followed unless asked for (then a loop is detected by device + inode); a bound on the number of entries
+//  Watcher        polling file watcher: created / modified / deleted files and directory entries
+//  FindJob        find in files, plain or regular expression, with context lines; runs in steps and can be cancelled
+//  QuickOpen      fuzzy file name search over a project ("fmain" finds src/main.a)
+//  Recent         a most-recently-used list of paths that can be saved
+//  Job            runs a command with pipes without ever blocking: output is collected (capped), input is queued, timeout and
+//                 kill, exit status; BuildJob adds diagnostics ("file:line: error: message", GCC / Clang / MSVC / Rust /
+//                 Python), RunJob runs a program; both work on Linux and AOS (asys.Process underneath).
+//
+//    aproject.Ignore ign();  ign.addBuiltin();  ign.loadFile("/proj/.gitignore", "");
+//    aproject.FileTree* tree = new aproject.FileTree("/proj", &ign);   tree->load(tree->root);
+//    aproject.FindJob* find = new aproject.FindJob();  find->start("/proj", "TODO", 0, &ign, 1);
+//    while (find->step(20) == aproject.FIND_RUNNING) { ...update the UI... }
+//    aproject.BuildJob* b = new aproject.BuildJob();  b->startCompiler("main.a", "main", null);
+//    while (b->poll()) { read b->read(...), look at b->problemCount ...; sleep a little }
+// =============================================================================
+import asys;
+import acode;
+import regex;
+module aproject;
+
+private int imin(int a, int b) {
+    if (a < b) { return a; }
+    return b;
+}
+
+private int imax(int a, int b) {
+    if (a > b) { return a; }
+    return b;
+}
+
+// ---- glob matching -------------------------------------------------------------------------------------------------------------------------
+// Does a glob pattern match a whole text? '*' does not cross '/', "**" does ("**/" also matches no directory at all), '?' is one
+// character except '/', [abc] [a-z] [!a] [^a] are sets (never matching '/'), '\' quotes the next character, a '[' without a
+// closing ']' is a plain character.
+// The matcher simulates the pattern as an automaton over the text: time O(pattern * text), memory O(pattern), no recursion, so
+// no pattern (not even "*a*a*a*a*a*b" against a long name of a's) can make it slow down more than that. An earlier version
+// backtracked and took minutes for seven stars.
+const GK_LIT = 0;
+const GK_ANY = 1;
+const GK_SET = 2;
+const GK_STAR = 3;
+const GK_DSTAR = 4;
+
+// the pattern as tokens: 4 numbers each (kind, byte, set open, set close); returns how many
+private int globTokens(char* p, int plen, int* tok) {
+    int m = 0;
+    int pi = 0;
+    while (pi < plen) {
+        int c = p[pi];
+        int* k = &tok[m * 4];
+        k[1] = 0;
+        k[2] = 0;
+        k[3] = 0;
+        if (c == '*') {
+            int ss = 1;
+            while (pi + ss < plen && p[pi + ss] == '*') { ss++; }
+            k[0] = (ss >= 2) ? GK_DSTAR : GK_STAR;
+            pi = pi + ss;
+            m++;
+            continue;
+        }
+        if (c == '?') {
+            k[0] = GK_ANY;
+            pi++;
+            m++;
+            continue;
+        }
+        if (c == '[') {
+            int q = pi + 1;
+            if (q < plen && (p[q] == '!' || p[q] == '^')) { q++; }
+            bool first = true;
+            while (q < plen && (p[q] != ']' || first)) {
+                first = false;
+                if (p[q] == 92 && q + 1 < plen) { q++; }
+                if (q + 2 < plen && p[q + 1] == '-' && p[q + 2] != ']') { q = q + 3; } else { q++; }
+            }
+            if (q < plen) {
+                k[0] = GK_SET;
+                k[2] = pi;
+                k[3] = q;
+                pi = q + 1;
+                m++;
+                continue;
+            }
+            // no closing bracket: a plain '['
+        } else if (c == 92 && pi + 1 < plen) {
+            pi++;
+            c = p[pi];
+        }
+        k[0] = GK_LIT;
+        k[1] = c;
+        pi++;
+        m++;
+    }
+    return m;
+}
+
+// is ch in the set p[open..close] ('[' at open, ']' at close)?
+private bool globSetHas(char* p, int plen, int open, int close, int ch) {
+    int q = open + 1;
+    bool neg = false;
+    if (q < close && (p[q] == '!' || p[q] == '^')) { neg = true; q++; }
+    bool found = false;
+    bool first = true;
+    while (q < close && (p[q] != ']' || first)) {
+        first = false;
+        int lo = p[q];
+        if (lo == 92 && q + 1 < plen) { q++; lo = p[q]; }
+        if (q + 2 < plen && p[q + 1] == '-' && p[q + 2] != ']') {
+            int hi = p[q + 2];
+            if (ch >= lo && ch <= hi) { found = true; }
+            q = q + 3;
+        } else {
+            if (ch == lo) { found = true; }
+            q++;
+        }
+    }
+    return found != neg;
+}
+
+// the automaton: cur / nxt hold one flag per token position 0..m (m: the pattern is complete)
+private bool globRun(char* p, int plen, char* t, int tlen, int* tok, char* cur, char* nxt) {
+    int m = globTokens(p, plen, tok);
+    for (int i = 0; i <= m + 1; i++) {
+        cur[i] = 0;
+        nxt[i] = 0;
+    }
+    cur[0] = 1;
+    for (int ti = 0; ; ti++) {
+        // stars may match nothing; "**/" may also match no directory at all (at the start of a path component)
+        bool compStart = ti == 0 || t[ti - 1] == '/';
+        for (int i = 0; i < m; i++) {
+            if (cur[i] == 0) { continue; }
+            int kd = tok[i * 4];
+            if (kd == GK_STAR || kd == GK_DSTAR) {
+                cur[i + 1] = 1;
+                if (kd == GK_DSTAR && compStart && i + 1 < m && tok[(i + 1) * 4] == GK_LIT && tok[(i + 1) * 4 + 1] == '/') {
+                    cur[i + 2] = 1;
+                }
+            }
+        }
+        if (ti >= tlen) {
+            return cur[m] != 0;
+        }
+        int c = t[ti];
+        bool any = false;
+        for (int i = 0; i <= m; i++) { nxt[i] = 0; }
+        for (int i = 0; i < m; i++) {
+            if (cur[i] == 0) { continue; }
+            int* k = &tok[i * 4];
+            int kd = k[0];
+            if (kd == GK_LIT) {
+                if (c == k[1]) { nxt[i + 1] = 1; any = true; }
+            } else if (kd == GK_ANY) {
+                if (c != '/') { nxt[i + 1] = 1; any = true; }
+            } else if (kd == GK_SET) {
+                if (c != '/' && globSetHas(p, plen, k[2], k[3], c)) { nxt[i + 1] = 1; any = true; }
+            } else if (kd == GK_STAR) {
+                if (c != '/') { nxt[i] = 1; any = true; }
+            } else {
+                nxt[i] = 1;
+                any = true;
+            }
+        }
+        if (!any) {
+            return false;
+        }
+        char* sw = cur;
+        cur = nxt;
+        nxt = sw;
+    }
+    return false;
+}
+
+private bool globTest(char* p, int plen, char* t, int tlen) {
+    if (plen <= 96) {
+        int tok[400];
+        char st[256];
+        return globRun(p, plen, t, tlen, &tok[0], &st[0], &st[128]);
+    }
+    int* tok = (int*) asys.alloc((plen + 2) * 32);
+    char* st = asys.alloc((plen + 4) * 2);
+    if (tok == null || st == null) {
+        asys.free((char*) tok);
+        asys.free(st);
+        return false;
+    }
+    bool r = globRun(p, plen, t, tlen, tok, st, &st[plen + 4]);
+    asys.free((char*) tok);
+    asys.free(st);
+    return r;
+}
+
+// public: does a glob pattern match a whole text? (for file name filters such as "*.a")
+public bool globMatch(char* pattern, char* text) {
+    return globTest(pattern, strlen(pattern), text, strlen(text));
+}
+
+// ---- ignore rules --------------------------------------------------------------------------------------------------------------------------------
+struct IgnoreRule {
+    char* pat;                // the pattern without ! / and the trailing slash
+    char* base;               // the directory (relative to the project root, "" for the root) of the .gitignore it came from
+    bool negate;
+    bool dirOnly;
+    bool anchored;
+}
+
+// A list of ignore rules. The last rule that matches a path wins; "!" re-includes. Rules from nested .gitignore files carry the
+// directory they belong to, so  loadFile("/proj/sub/.gitignore", "sub")  makes them apply to paths below sub only.
+public class Ignore {
+    private IgnoreRule* rules;
+    public int count;
+    private int cap;
+
+    public Ignore() {
+    }
+
+    public void dispose() {
+        for (int i = 0; i < count; i++) {
+            asys.free(rules[i].pat);
+            asys.free(rules[i].base);
+        }
+        asys.free((char*) rules);
+        rules = null;
+        count = 0;
+        cap = 0;
+    }
+
+    // adds one rule line (a line of a .gitignore: blank lines and # comments are skipped); base: the directory of that file
+    // relative to the root ("" for the root itself)
+    public void addPattern(char* line, char* base) {
+        int n = strlen(line);
+        while (n > 0 && (line[n - 1] == ' ' || line[n - 1] == 9 || line[n - 1] == 13)) { n--; }
+        int s = 0;
+        if (n == 0 || line[0] == '#') { return; }
+        bool negate = false;
+        if (line[0] == '!') { negate = true; s = 1; }
+        else if (line[0] == 92 && n > 1 && (line[1] == '#' || line[1] == '!')) { s = 1; }
+        bool dirOnly = false;
+        if (n > s && line[n - 1] == '/') { dirOnly = true; n--; }
+        if (n <= s) { return; }
+        bool anchored = false;
+        if (line[s] == '/') { anchored = true; s++; }
+        for (int i = s; i < n; i++) {
+            if (line[i] == '/') { anchored = true; }
+        }
+        if (n <= s) { return; }
+        if (count == cap) {
+            cap = (cap == 0) ? 32 : cap * 2;
+            rules = (IgnoreRule*) asys.realloc((char*) rules, cap * sizeof(IgnoreRule));
+        }
+        rules[count].pat = asys.strDupN(&line[s], n - s);
+        rules[count].base = asys.strDup(base);
+        rules[count].negate = negate;
+        rules[count].dirOnly = dirOnly;
+        rules[count].anchored = anchored;
+        count++;
+    }
+
+    // adds the built-in list: version control directories, build leftovers, editor temp files
+    public void addBuiltin() {
+        char* list = ".git/ .hg/ .svn/ .bzr/ node_modules/ __pycache__/ *.pyc *.pyo *.o *.obj *.so *.dll *.dylib *.class .DS_Store Thumbs.db *.swp *.swo *~ #*#";
+        int n = strlen(list);
+        int s = 0;
+        for (int i = 0; i <= n; i++) {
+            if (i == n || list[i] == ' ') {
+                if (i > s) {
+                    char* w = asys.strDupN(&list[s], i - s);
+                    addPattern(w, "");
+                    asys.free(w);
+                }
+                s = i + 1;
+            }
+        }
+    }
+
+    // reads a .gitignore file; false when it cannot be read (it is not an error to have none). base: see addPattern.
+    public bool loadFile(char* path, char* base) {
+        int len = 0;
+        int e = 0;
+        char* t = asys.readFile(path, &len, 1048576, &e);
+        if (t == null) { return false; }
+        int s = 0;
+        for (int i = 0; i <= len; i++) {
+            if (i == len || t[i] == 10) {
+                if (i > s && i - s < 2000) {
+                    char* l = asys.strDupN(&t[s], i - s);
+                    addPattern(l, base);
+                    asys.free(l);
+                }
+                s = i + 1;
+            }
+        }
+        asys.free(t);
+        return true;
+    }
+
+    // Is the path (relative to the project root, with '/' separators) ignored? isDir: it is a directory.
+    public bool ignored(char* relPath, bool isDir) {
+        bool result = false;
+        int plen = strlen(relPath);
+        int nameStart = 0;
+        for (int i = 0; i < plen; i++) {
+            if (relPath[i] == '/') { nameStart = i + 1; }
+        }
+        for (int i = 0; i < count; i++) {
+            IgnoreRule* r = &rules[i];
+            if (r->dirOnly && !isDir) { continue; }
+            // the path below the directory of the rule
+            char* sub = relPath;
+            int bl = strlen(r->base);
+            if (bl > 0) {
+                if (plen <= bl || relPath[bl] != '/' || !asys.bytesEqual(relPath, r->base, bl)) { continue; }
+                sub = &relPath[bl + 1];
+            }
+            bool hit;
+            if (r->anchored) {
+                hit = globTest(r->pat, strlen(r->pat), sub, strlen(sub));
+            } else {
+                char* name = &relPath[nameStart];
+                hit = globTest(r->pat, strlen(r->pat), name, strlen(name));
+            }
+            if (hit) { result = !r->negate; }
+        }
+        return result;
+    }
+}
+
+// ---- recent files ----------------------------------------------------------------------------------------------------------------------------------
+public class Recent {
+    public int cap;
+    private char** items;
+    public int count;
+
+    public Recent() {
+        cap = 20;
+    }
+
+    public void setCapacity(int n) {
+        cap = imax(1, imin(n, 1000));
+        while (count > cap) {
+            count--;
+            asys.free(items[count]);
+        }
+    }
+
+    // puts a path in front (an existing entry moves there); the oldest entries fall off
+    public void add(char* path) {
+        if (path == null || path[0] == 0) { return; }
+        if (items == null) { items = (char**) asys.alloc(1001 * 8); }
+        int at = -1;
+        for (int i = 0; i < count; i++) {
+            if (streq(items[i], path)) { at = i; break; }
+        }
+        if (at >= 0) {
+            char* keep = items[at];
+            for (int i = at; i > 0; i--) { items[i] = items[i - 1]; }
+            items[0] = keep;
+            return;
+        }
+        if (count >= cap) {
+            count--;
+            asys.free(items[count]);
+        }
+        for (int i = count; i > 0; i--) { items[i] = items[i - 1]; }
+        items[0] = asys.strDup(path);
+        count++;
+    }
+
+    public char* at(int i) {
+        if (i < 0 || i >= count) { return null; }
+        return items[i];
+    }
+
+    public int indexOf(char* path) {
+        for (int i = 0; i < count; i++) {
+            if (streq(items[i], path)) { return i; }
+        }
+        return -1;
+    }
+
+    public void remove(char* path) {
+        int at = indexOf(path);
+        if (at < 0) { return; }
+        asys.free(items[at]);
+        for (int i = at; i + 1 < count; i++) { items[i] = items[i + 1]; }
+        count--;
+    }
+
+    public void clear() {
+        for (int i = 0; i < count; i++) { asys.free(items[i]); }
+        count = 0;
+    }
+
+    public void dispose() {
+        clear();
+        asys.free((char*) items);
+        items = null;
+    }
+
+    // one path per line, newest first (a new string)
+    public char* toText() {
+        int total = 1;
+        for (int i = 0; i < count; i++) { total = total + strlen(items[i]) + 1; }
+        char* out = asys.alloc(total);
+        int o = 0;
+        for (int i = 0; i < count; i++) {
+            int l = strlen(items[i]);
+            memcpy(&out[o], items[i], l);
+            o = o + l;
+            out[o] = 10;
+            o++;
+        }
+        return out;
+    }
+
+    // replaces the list by the lines of a text (as toText makes them)
+    public void fromText(char* text) {
+        clear();
+        int n = strlen(text);
+        // oldest first, so that the first line ends up in front
+        int ends[1100];
+        int starts[1100];
+        int k = 0;
+        int s = 0;
+        for (int i = 0; i <= n && k < 1000; i++) {
+            if (i == n || text[i] == 10) {
+                int e = i;
+                if (e > s && text[e - 1] == 13) { e--; }
+                if (e > s) {
+                    starts[k] = s;
+                    ends[k] = e;
+                    k++;
+                }
+                s = i + 1;
+            }
+        }
+        for (int j = k - 1; j >= 0; j--) {
+            char* p = asys.strDupN(&text[starts[j]], ends[j] - starts[j]);
+            add(p);
+            asys.free(p);
+        }
+    }
+
+    public int save(char* path) {
+        char* t = toText();
+        int r = asys.writeFileAtomic(path, t, strlen(t), 420, asys.W_NOSYNC);
+        asys.free(t);
+        return (r < 0) ? r : 0;
+    }
+
+    public int load(char* path) {
+        int len = 0;
+        int e = 0;
+        char* t = asys.readFile(path, &len, 1048576, &e);
+        if (t == null) { return e; }
+        fromText(t);
+        asys.free(t);
+        return 0;
+    }
+}
+
+// ---- the file tree ---------------------------------------------------------------------------------------------------------------------------------
+public class TreeNode {
+    public char* name;
+    public char* path;              // the full path (root path + '/' + ...)
+    public char* rel;               // the path below the root, "" for the root
+    public int kind;                // asys.K_FILE, K_DIR, K_LINK, K_OTHER
+    public bool loaded;             // the children were read
+    public bool expanded;
+    public bool loop;               // a directory that leads back to one of its ancestors (only with followLinks)
+    public TreeNode* parent;
+    public TreeNode** kids;
+    public int nkids;
+    public int depth;
+    public int dev;
+    public int ino;
+    public int size;
+    public int mtime;
+    private int kcap;
+
+    public TreeNode() {
+    }
+
+    public bool isDir() {
+        return kind == asys.K_DIR;
+    }
+
+    public void addKid(TreeNode* k) {
+        if (nkids == kcap) {
+            kcap = (kcap == 0) ? 8 : kcap * 2;
+            kids = (TreeNode**) asys.realloc((char*) kids, kcap * 8);
+        }
+        kids[nkids] = k;
+        nkids++;
+    }
+}
+
+// A lazy tree of a directory: load() reads one directory (when the user opens it). Entries that the ignore rules reject are
+// left out. Symbolic links are listed as K_LINK entries and never entered, unless followLinks is set; then a directory whose
+// device and inode equal an ancestor's is marked as a loop and not entered. At most maxEntries nodes are created.
+public class FileTree {
+    public TreeNode* root;
+    public Ignore* ignore;
+    public bool followLinks;
+    public int maxEntries;
+    public int maxDepth;
+    public bool truncated;          // maxEntries or maxDepth stopped the loading of something
+    public int total;               // nodes created so far
+
+    public FileTree(char* rootPath, Ignore* ign) {
+        ignore = ign;
+        maxEntries = 200000;
+        maxDepth = 64;
+        root = makeNode(null, rootPath, "", asys.K_DIR);
+        // strip a trailing slash from the root's path (but keep "/")
+        int n = strlen(root->path);
+        while (n > 1 && root->path[n - 1] == '/') { root->path[n - 1] = 0; n--; }
+        asys.free(root->name);
+        root->name = asys.strDup(root->path);
+        asys.Stat st;
+        if (asys.stat(root->path, &st) == 0) {
+            root->dev = st.dev;
+            root->ino = st.ino;
+        }
+        root->expanded = true;
+    }
+
+    private TreeNode* makeNode(TreeNode* parent, char* path, char* name, int kind) {
+        TreeNode* n = new TreeNode();
+        n->parent = parent;
+        n->path = asys.strDup(path);
+        n->name = asys.strDup(name);
+        n->kind = kind;
+        n->depth = (parent == null) ? 0 : parent->depth + 1;
+        if (parent == null || parent->rel[0] == 0) {
+            n->rel = asys.strDup(name);
+        } else {
+            n->rel = asys.join(parent->rel, name);
+        }
+        total++;
+        return n;
+    }
+
+    // frees a node and everything below it
+    private void freeNode(TreeNode* n) {
+        for (int i = 0; i < n->nkids; i++) { freeNode(n->kids[i]); }
+        asys.free((char*) n->kids);
+        asys.free(n->name);
+        asys.free(n->path);
+        asys.free(n->rel);
+        n->kids = null;
+        n->nkids = 0;
+        total--;
+    }
+
+    public void dispose() {
+        if (root != null) { freeNode(root); }
+        root = null;
+    }
+
+    // forgets the children of a directory (it will be read again by load)
+    public void unload(TreeNode* n) {
+        for (int i = 0; i < n->nkids; i++) { freeNode(n->kids[i]); }
+        n->nkids = 0;
+        n->loaded = false;
+    }
+
+    // Reads the entries of a directory node: 0, or -errno. Does nothing for files and for directories that are already loaded.
+    public int load(TreeNode* n) {
+        if (n->kind != asys.K_DIR || n->loaded) { return 0; }
+        if (n->loop) { n->loaded = true; return 0; }
+        if (n->depth >= maxDepth) { truncated = true; n->loaded = true; return 0; }
+        asys.DirList dl();
+        int r = asys.listDir(n->path, &dl);
+        if (r < 0) { return r; }
+        dl.sort(true, true);
+        for (int i = 0; i < dl.count; i++) {
+            char* name = dl.name(i);
+            int kind = dl.kind(i);
+            char* rel = (n->rel[0] == 0) ? asys.strDup(name) : asys.join(n->rel, name);
+            bool skip = ignore != null && ignore->ignored(rel, kind == asys.K_DIR);
+            asys.free(rel);
+            if (skip) { continue; }
+            if (total >= maxEntries) { truncated = true; break; }
+            char* full = asys.join(n->path, name);
+            TreeNode* c = makeNode(n, full, name, kind);
+            asys.Stat st;
+            if (kind == asys.K_LINK && followLinks && asys.stat(full, &st) == 0 && st.isDir()) {
+                // a link to a directory behaves like a directory, unless it leads back to an ancestor
+                c->kind = asys.K_DIR;
+                c->dev = st.dev;
+                c->ino = st.ino;
+                for (TreeNode* a = n; a != null; a = a->parent) {
+                    if (a->dev == st.dev && a->ino == st.ino && a->ino != 0) { c->loop = true; }
+                }
+            } else if (kind == asys.K_DIR) {
+                if (asys.lstat(full, &st) == 0) {
+                    c->dev = st.dev;
+                    c->ino = st.ino;
+                    for (TreeNode* a = n; a != null; a = a->parent) {
+                        if (a->dev == st.dev && a->ino == st.ino && a->ino != 0) { c->loop = true; }
+                    }
+                }
+            } else if (asys.lstat(full, &st) == 0) {
+                c->size = st.size;
+                c->mtime = st.mtime;
+            }
+            asys.free(full);
+            n->addKid(c);
+        }
+        dl.dispose();
+        n->loaded = true;
+        return 0;
+    }
+
+    public void expand(TreeNode* n) {
+        if (n->kind != asys.K_DIR) { return; }
+        load(n);
+        n->expanded = true;
+    }
+
+    public void collapse(TreeNode* n) {
+        n->expanded = false;
+    }
+
+    private void collectExpanded(TreeNode* n, char*** list, int* count, int* cap) {
+        for (int i = 0; i < n->nkids; i++) {
+            TreeNode* k = n->kids[i];
+            if (k->kind == asys.K_DIR && k->expanded && k->loaded) {
+                if (*count == *cap) {
+                    *cap = (*cap == 0) ? 16 : *cap * 2;
+                    *list = (char**) asys.realloc((char*) *list, *cap * 8);
+                }
+                (*list)[*count] = asys.strDup(k->rel);
+                *count = *count + 1;
+                collectExpanded(k, list, count, cap);
+            }
+        }
+    }
+
+    // Reads a directory again, keeping the expanded state of every subdirectory that still exists (at any depth). 0 or -errno.
+    public int refresh(TreeNode* n) {
+        if (n->kind != asys.K_DIR) { return 0; }
+        char** open = null;
+        int no = 0;
+        int ocap = 0;
+        collectExpanded(n, &open, &no, &ocap);
+        unload(n);
+        int r = load(n);
+        // the list is in depth first order: every parent comes before its children
+        for (int k = 0; k < no; k++) {
+            TreeNode* d = find(open[k]);
+            if (d != null && d->kind == asys.K_DIR && !d->loop) {
+                d->expanded = true;
+                load(d);
+            }
+        }
+        for (int k = 0; k < no; k++) { asys.free(open[k]); }
+        asys.free((char*) open);
+        return r;
+    }
+
+    // the node of a path below the root that has been loaded, or null
+    public TreeNode* find(char* rel) {
+        TreeNode* n = root;
+        int len = strlen(rel);
+        int s = 0;
+        while (s < len) {
+            int e = s;
+            while (e < len && rel[e] != '/') { e++; }
+            if (e > s) {
+                TreeNode* next = null;
+                for (int i = 0; i < n->nkids; i++) {
+                    if (strlen(n->kids[i]->name) == e - s && asys.bytesEqual(n->kids[i]->name, &rel[s], e - s)) { next = n->kids[i]; break; }
+                }
+                if (next == null) { return null; }
+                n = next;
+            }
+            s = e + 1;
+        }
+        return n;
+    }
+
+    // The visible rows: the root's children, and the children of every expanded directory below them, depth first. Returns the
+    // count (at most max).
+    public int flatten(TreeNode** out, int max) {
+        int n = 0;
+        flattenInto(root, out, max, &n);
+        return n;
+    }
+
+    private void flattenInto(TreeNode* d, TreeNode** out, int max, int* n) {
+        for (int i = 0; i < d->nkids && *n < max; i++) {
+            TreeNode* k = d->kids[i];
+            out[*n] = k;
+            *n = *n + 1;
+            if (k->kind == asys.K_DIR && k->expanded && k->loaded) {
+                flattenInto(k, out, max, n);
+            }
+        }
+    }
+
+    // ---- changing the file system through the tree
+    // Creates an empty file (0) or a directory (1) in the directory node `dir`. 0 or -errno (-EBADNAME for an invalid name,
+    // -EEXIST when the name is taken). The tree is refreshed.
+    public int create(TreeNode* dir, char* name, bool asDirectory) {
+        if (!asys.validName(name)) { return -asys.EBADNAME; }
+        if (dir->kind != asys.K_DIR) { return -asys.ENOTDIR; }
+        char* p = asys.join(dir->path, name);
+        int r;
+        if (asDirectory) {
+            r = asys.mkdir(p, 493);
+        } else {
+            int fd = asys.fileOpen(p, asys.F_WRITE | asys.F_CREATE | asys.F_EXCL | asys.F_NOFOLLOW | asys.F_CLOEXEC, 420);
+            if (fd >= 0) { asys.fileClose(fd); r = 0; } else { r = fd; }
+        }
+        asys.free(p);
+        if (r == 0) { refresh(dir); }
+        return r;
+    }
+
+    // renames an entry to a new name in the same directory. 0 or -errno; the target must not exist.
+    public int rename(TreeNode* n, char* newName) {
+        if (n->parent == null) { return -asys.EINVAL; }
+        if (!asys.validName(newName)) { return -asys.EBADNAME; }
+        char* to = asys.join(n->parent->path, newName);
+        if (asys.exists(to)) {
+            asys.free(to);
+            return -asys.EEXIST;
+        }
+        int r = asys.rename(n->path, to);
+        asys.free(to);
+        if (r == 0) { refresh(n->parent); }
+        return r;
+    }
+
+    // deletes a file, a link or an EMPTY directory. 0 or -errno (-ENOTEMPTY).
+    public int remove(TreeNode* n) {
+        if (n->parent == null) { return -asys.EINVAL; }
+        TreeNode* par = n->parent;
+        int r;
+        if (n->kind == asys.K_DIR && !n->loop) { r = asys.rmdir(n->path); } else { r = asys.unlink(n->path); }
+        if (r == 0) { refresh(par); }
+        return r;
+    }
+}
+
+// ---- the file watcher --------------------------------------------------------------------------------------------------------------------------------
+public const WATCH_CREATED = 1;
+public const WATCH_MODIFIED = 2;
+public const WATCH_DELETED = 3;
+
+public struct WatchEvent {
+    int kind;
+    char* path;               // owned by the watcher until the next poll()
+}
+
+struct WatchEntry {
+    char* path;
+    bool isDir;
+    bool exists;
+    int mtime;
+    int mtimeNs;
+    int size;
+    char** kids;              // directories: names of the children, with a stat signature "name\tmtime\tns\tsize"
+    int nkids;
+}
+
+// Looks at files and directories whenever poll() is called (it uses no operating system notification, so it works everywhere).
+// Watching a directory reports entries that were created, modified (time or size) or deleted directly inside it.
+public class Watcher {
+    private WatchEntry* w;
+    private int n;
+    private int cap;
+    private char** evPaths;
+    private int nev;
+
+    public Watcher() {
+    }
+
+    private void snapshot(WatchEntry* e) {
+        asys.Stat st;
+        for (int i = 0; i < e->nkids; i++) { asys.free(e->kids[i]); }
+        asys.free((char*) e->kids);
+        e->kids = null;
+        e->nkids = 0;
+        if (asys.stat(e->path, &st) != 0) {
+            e->exists = false;
+            return;
+        }
+        e->exists = true;
+        e->isDir = st.isDir();
+        e->mtime = st.mtime;
+        e->mtimeNs = st.mtimeNs;
+        e->size = st.size;
+        if (e->isDir) {
+            asys.DirList dl();
+            if (asys.listDir(e->path, &dl) > 0) {
+                dl.sort(false, false);
+                e->kids = (char**) asys.alloc(dl.count * 8 + 8);
+                for (int i = 0; i < dl.count; i++) {
+                    char* full = asys.join(e->path, dl.name(i));
+                    asys.Stat cs;
+                    char sig[400];
+                    if (asys.lstat(full, &cs) == 0) {
+                        format(&sig[0], 400, "%s\t%d\t%d\t%d", dl.name(i), cs.mtime, cs.mtimeNs, cs.size);
+                    } else {
+                        format(&sig[0], 400, "%s\t0\t0\t0", dl.name(i));
+                    }
+                    asys.free(full);
+                    e->kids[i] = asys.strDup(&sig[0]);
+                }
+                e->nkids = dl.count;
+            }
+            dl.dispose();
+        }
+    }
+
+    // starts watching a path (a file or a directory); watching the same path twice does nothing
+    public void watch(char* path) {
+        for (int i = 0; i < n; i++) {
+            if (streq(w[i].path, path)) { return; }
+        }
+        if (n == cap) {
+            cap = (cap == 0) ? 16 : cap * 2;
+            w = (WatchEntry*) asys.realloc((char*) w, cap * sizeof(WatchEntry));
+        }
+        w[n].path = asys.strDup(path);
+        w[n].kids = null;
+        w[n].nkids = 0;
+        snapshot(&w[n]);
+        n++;
+    }
+
+    public void unwatch(char* path) {
+        for (int i = 0; i < n; i++) {
+            if (streq(w[i].path, path)) {
+                for (int k = 0; k < w[i].nkids; k++) { asys.free(w[i].kids[k]); }
+                asys.free((char*) w[i].kids);
+                asys.free(w[i].path);
+                for (int j = i; j + 1 < n; j++) { w[j] = w[j + 1]; }
+                n--;
+                return;
+            }
+        }
+    }
+
+    public int count() {
+        return n;
+    }
+
+    private void addEvent(WatchEvent* out, int max, int kind, char* path) {
+        if (nev >= max) { return; }
+        out[nev].kind = kind;
+        out[nev].path = path;
+        nev++;
+    }
+
+    // the length of the name part of a child signature "name\tmtime\tns\tsize"
+    private int nameLen(char* sig) {
+        int l = 0;
+        while (sig[l] != 0 && sig[l] != 9) { l++; }
+        return l;
+    }
+
+    private int cmpNames(char* a, char* b) {
+        int la = nameLen(a);
+        int lb = nameLen(b);
+        int m = imin(la, lb);
+        for (int k = 0; k < m; k++) {
+            if (a[k] != b[k]) { return a[k] - b[k]; }
+        }
+        return la - lb;
+    }
+
+    private void childEvent(WatchEvent* out, int limit, int kind, char* dir, char* sig) {
+        char* base = asys.strDupN(sig, nameLen(sig));
+        evPaths[nev] = asys.join(dir, base);
+        asys.free(base);
+        addEvent(out, limit, kind, evPaths[nev]);
+    }
+
+    // Compares everything that is watched with the state at the last poll and fills out with the changes (at most max).
+    // The paths in out stay valid until the next call. Returns the number of events.
+    public int poll(WatchEvent* out, int max) {
+        for (int i = 0; i < nev; i++) { asys.free(evPaths[i]); }
+        nev = 0;
+        if (evPaths == null) { evPaths = (char**) asys.alloc(4097 * 8); }
+        int limit = imin(max, 4096);
+        for (int i = 0; i < n; i++) {
+            WatchEntry* e = &w[i];
+            // take a fresh snapshot, keeping the old child list for the comparison
+            char** oldKids = e->kids;
+            int oldN = e->nkids;
+            e->kids = null;
+            e->nkids = 0;
+            bool wasExists = e->exists;
+            int om = e->mtime;
+            int ons = e->mtimeNs;
+            int os = e->size;
+            snapshot(e);
+            if (wasExists && !e->exists) {
+                evPaths[nev] = asys.strDup(e->path);
+                addEvent(out, limit, WATCH_DELETED, evPaths[nev]);
+            } else if (!wasExists && e->exists) {
+                evPaths[nev] = asys.strDup(e->path);
+                addEvent(out, limit, WATCH_CREATED, evPaths[nev]);
+            } else if (e->exists && !e->isDir && (om != e->mtime || ons != e->mtimeNs || os != e->size)) {
+                evPaths[nev] = asys.strDup(e->path);
+                addEvent(out, limit, WATCH_MODIFIED, evPaths[nev]);
+            }
+            if (e->isDir) {
+                // both child lists are sorted by name: a merge finds created, deleted and changed entries
+                int a = 0;
+                int b = 0;
+                while ((a < oldN || b < e->nkids) && nev < limit) {
+                    int c;
+                    if (a >= oldN) { c = 1; }
+                    else if (b >= e->nkids) { c = -1; }
+                    else { c = cmpNames(oldKids[a], e->kids[b]); }
+                    if (c < 0) {
+                        childEvent(out, limit, WATCH_DELETED, e->path, oldKids[a]);
+                        a++;
+                    } else if (c > 0) {
+                        childEvent(out, limit, WATCH_CREATED, e->path, e->kids[b]);
+                        b++;
+                    } else {
+                        if (!streq(oldKids[a], e->kids[b])) {
+                            childEvent(out, limit, WATCH_MODIFIED, e->path, e->kids[b]);
+                        }
+                        a++;
+                        b++;
+                    }
+                }
+            }
+            for (int k = 0; k < oldN; k++) { asys.free(oldKids[k]); }
+            asys.free((char*) oldKids);
+        }
+        return nev;
+    }
+
+    public void dispose() {
+        for (int i = 0; i < nev; i++) { asys.free(evPaths[i]); }
+        nev = 0;
+        asys.free((char*) evPaths);
+        evPaths = null;
+        while (n > 0) {
+            char* p = asys.strDup(w[0].path);
+            unwatch(p);
+            asys.free(p);
+        }
+        asys.free((char*) w);
+        w = null;
+        cap = 0;
+    }
+}
+
+// ---- find in files -----------------------------------------------------------------------------------------------------------------------------------
+public const FIND_RUNNING = 0;
+public const FIND_DONE = 1;
+public const FIND_CANCELLED = 2;
+
+public const FIND_REGEX = 1;
+public const FIND_ICASE = 2;
+public const FIND_WORD = 4;
+public const FIND_FOLLOW = 8;          // follow symbolic links to directories (a loop is detected by device and inode)
+
+public struct FindResult {
+    char* path;               // the file (below the start directory, as given)
+    int line;                 // 0 based
+    int col;                  // byte offset of the match in the line
+    int len;                  // length of the match
+    char* text;               // the line (cut to 400 bytes)
+    char* before;             // up to `context` lines before, joined by '\n' ("" if none)
+    char* after;              // and after
+}
+
+class DirFrame {
+    public char* path;
+    public asys.DirList* list;
+    public int idx;
+    public int dev;
+    public int ino;
+}
+
+// A search through all files below a directory. step() does a bounded amount of work, so it can run beside a user interface;
+// cancel() stops it. Only regular files are opened (a FIFO is skipped, never read), files with NUL bytes in the first 8000 bytes
+// are skipped as binary, symbolic links are not followed (unless FIND_FOLLOW; loops are detected), files over maxFileSize are
+// skipped, at most maxResults hits are collected.
+public class FindJob {
+    public FindResult* results;
+    public int count;
+    public int maxResults;
+    public int maxFileSize;
+    public int filesSearched;
+    public int filesSkipped;
+    public int dirsSkipped;
+    public bool truncated;            // maxResults was reached
+    public bool regexError;
+    public bool exceeded;             // a regular expression hit its step limit (Regex.exceeded) in some file: the results are incomplete
+    public int filesExceeded;         // in how many files (the rest of such a file is skipped)
+    public char* fileFilter;          // a glob for file names (null: all), e.g. "*.a"
+    private int state;
+    private int rcap;
+    private char* pattern;
+    private int flags;
+    private int context;
+    private Ignore* ignore;
+    private char* rootPath;
+    private DirFrame** stack;
+    private int sp;
+    private int maxDepth;
+    private regex.Regex* re;
+
+    public FindJob() {
+        maxResults = 10000;
+        maxFileSize = 5242880;
+        maxDepth = 64;
+        state = FIND_DONE;
+    }
+
+    // Starts a search for pattern below root. flags: FIND_REGEX FIND_ICASE FIND_WORD FIND_FOLLOW; ign (may be null) says what is
+    // not searched; context: lines of context before and after a hit. Returns 0 or -errno (also -EINVAL for a bad regex).
+    public int start(char* root, char* pat, int fl, Ignore* ign, int ctx) {
+        reset();
+        pattern = asys.strDup(pat);
+        flags = fl;
+        context = imax(0, imin(ctx, 20));
+        ignore = ign;
+        rootPath = asys.strDup(root);
+        int n = strlen(rootPath);
+        while (n > 1 && rootPath[n - 1] == '/') { rootPath[n - 1] = 0; n--; }
+        if (pat[0] == 0) { return -asys.EINVAL; }
+        if ((flags & FIND_REGEX) != 0) {
+            int rf = ((flags & FIND_ICASE) != 0) ? regex.F_ICASE : 0;
+            char* p2 = pattern;
+            char* wrapped = null;
+            if ((flags & FIND_WORD) != 0) {
+                wrapped = asys.concat3("\\b(?:", pattern, ")\\b");
+                p2 = wrapped;
+            }
+            re = regex.compile(p2, rf);
+            asys.free(wrapped);
+            if (!re->ok) {
+                regexError = true;
+                return -asys.EINVAL;
+            }
+        }
+        sp = 0;
+        stack = (DirFrame**) asys.alloc((maxDepth + 2) * 8);
+        asys.Stat st;
+        if (asys.stat(rootPath, &st) < 0) { return -asys.ENOENT; }
+        if (st.isFile()) {
+            searchFile(rootPath, rootPath);
+            state = FIND_DONE;
+            return 0;
+        }
+        if (!st.isDir()) { return -asys.ENOTDIR; }
+        push(rootPath, st.dev, st.ino);
+        state = FIND_RUNNING;
+        return 0;
+    }
+
+    // forgets everything (results too)
+    public void reset() {
+        for (int i = 0; i < count; i++) {
+            asys.free(results[i].path);
+            asys.free(results[i].text);
+            asys.free(results[i].before);
+            asys.free(results[i].after);
+        }
+        asys.free((char*) results);
+        results = null;
+        count = 0;
+        rcap = 0;
+        while (sp > 0) { pop(); }
+        asys.free((char*) stack);
+        stack = null;
+        asys.free(pattern);
+        asys.free(rootPath);
+        pattern = null;
+        rootPath = null;
+        if (re != null) {
+            re->dispose();
+            re = null;
+        }
+        filesSearched = 0;
+        filesSkipped = 0;
+        dirsSkipped = 0;
+        truncated = false;
+        regexError = false;
+        exceeded = false;
+        filesExceeded = 0;
+        state = FIND_DONE;
+    }
+
+    public void dispose() {
+        reset();
+    }
+
+    public void cancel() {
+        if (state == FIND_RUNNING) {
+            state = FIND_CANCELLED;
+            while (sp > 0) { pop(); }
+        }
+    }
+
+    public int status() {
+        return state;
+    }
+
+    private void push(char* path, int dev, int ino) {
+        DirFrame* f = new DirFrame();
+        f->path = asys.strDup(path);
+        f->list = new asys.DirList();
+        f->dev = dev;
+        f->ino = ino;
+        if (asys.listDir(path, f->list) < 0) {
+            f->list->dispose();
+        } else {
+            f->list->sort(false, false);
+        }
+        stack[sp] = f;
+        sp++;
+    }
+
+    private void pop() {
+        sp--;
+        DirFrame* f = stack[sp];
+        f->list->dispose();
+        asys.free(f->path);
+        stack[sp] = null;
+    }
+
+    // the path below the start directory
+    private char* relOf(char* full) {
+        int rl = strlen(rootPath);
+        if (strlen(full) > rl && full[rl] == '/') { return &full[rl + 1]; }
+        return full;
+    }
+
+    // Does some work: at most about budgetMs milliseconds (0: one entry). Returns FIND_RUNNING while there is more to do.
+    public int step(int budgetMs) {
+        if (state != FIND_RUNNING) { return state; }
+        int t0 = asys.monoMs();
+        for (;;) {
+            if (sp == 0) {
+                state = FIND_DONE;
+                return state;
+            }
+            DirFrame* f = stack[sp - 1];
+            if (f->idx >= f->list->count) {
+                pop();
+            } else {
+                int i = f->idx;
+                f->idx++;
+                char* name = f->list->name(i);
+                int kind = f->list->kind(i);
+                char* full = asys.join(f->path, name);
+                char* rel = relOf(full);
+                bool skip = ignore != null && ignore->ignored(rel, kind == asys.K_DIR);
+                if (!skip) {
+                    if (kind == asys.K_DIR) {
+                        asys.Stat st;
+                        bool loop = false;
+                        if (sp >= maxDepth) {
+                            dirsSkipped++;
+                        } else if (asys.lstat(full, &st) == 0) {
+                            for (int k = 0; k < sp; k++) {
+                                if (stack[k]->dev == st.dev && stack[k]->ino == st.ino && st.ino != 0) { loop = true; }
+                            }
+                            if (loop) { dirsSkipped++; } else { push(full, st.dev, st.ino); }
+                        }
+                    } else if (kind == asys.K_LINK) {
+                        asys.Stat st;
+                        if ((flags & FIND_FOLLOW) != 0 && asys.stat(full, &st) == 0) {
+                            if (st.isDir()) {
+                                bool loop = false;
+                                for (int k = 0; k < sp; k++) {
+                                    if (stack[k]->dev == st.dev && stack[k]->ino == st.ino && st.ino != 0) { loop = true; }
+                                }
+                                if (loop || sp >= maxDepth) { dirsSkipped++; } else { push(full, st.dev, st.ino); }
+                            } else if (st.isFile()) {
+                                searchFile(full, rel);
+                            }
+                        }
+                    } else if (kind == asys.K_FILE) {
+                        searchFile(full, rel);
+                    } else {
+                        filesSkipped++;
+                    }
+                }
+                asys.free(full);
+            }
+            if (count >= maxResults) {
+                truncated = true;
+                state = FIND_DONE;
+                while (sp > 0) { pop(); }
+                return state;
+            }
+            if (budgetMs <= 0 || asys.monoMs() - t0 >= budgetMs) {
+                return state;
+            }
+        }
+        return state;
+    }
+
+    private void addResult(char* shown, int line, int col, int mlen, char* text, int tlen, char* before, int bl, char* after, int al) {
+        if (count == rcap) {
+            rcap = (rcap == 0) ? 64 : rcap * 2;
+            results = (FindResult*) asys.realloc((char*) results, rcap * sizeof(FindResult));
+        }
+        results[count].path = asys.strDup(shown);
+        results[count].line = line;
+        results[count].col = col;
+        results[count].len = mlen;
+        results[count].text = asys.strDupN(text, imin(tlen, 400));
+        results[count].before = asys.strDupN(before, imin(bl, 4000));
+        results[count].after = asys.strDupN(after, imin(al, 4000));
+        stripCr(results[count].before);
+        stripCr(results[count].after);
+        count++;
+    }
+
+    // removes the CR of CRLF line ends (and a CR at the very end) from a context text
+    private void stripCr(char* t) {
+        int w = 0;
+        int n = strlen(t);
+        for (int i = 0; i < n; i++) {
+            if (t[i] == 13 && (i + 1 == n || t[i + 1] == 10)) { continue; }
+            t[w] = t[i];
+            w++;
+        }
+        t[w] = 0;
+    }
+
+    // a match of the plain pattern in line[from..): its start or -1
+    private int plainFind(char* line, int n, int from) {
+        int pl = strlen(pattern);
+        bool icase = (flags & FIND_ICASE) != 0;
+        bool word = (flags & FIND_WORD) != 0;
+        int c0 = pattern[0];
+        if (icase && c0 >= 'A' && c0 <= 'Z') { c0 = c0 + 32; }
+        for (int i = from; i + pl <= n; i++) {
+            int c = line[i];
+            if (icase && c >= 'A' && c <= 'Z') { c = c + 32; }
+            if (c != c0) { continue; }
+            bool same = true;
+            for (int k = 1; k < pl; k++) {
+                int a = line[i + k];
+                int b = pattern[k];
+                if (icase) {
+                    if (a >= 'A' && a <= 'Z') { a = a + 32; }
+                    if (b >= 'A' && b <= 'Z') { b = b + 32; }
+                }
+                if (a != b) { same = false; break; }
+            }
+            if (!same) { continue; }
+            if (word) {
+                if (i > 0 && isWordByte(line[i - 1])) { continue; }
+                if (i + pl < n && isWordByte(line[i + pl])) { continue; }
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    private bool isWordByte(int c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c >= 128;
+    }
+
+    // searches one regular file; skips binary and big files
+    private void searchFile(char* full, char* shown) {
+        if (fileFilter != null) {
+            char* base = full;
+            for (int i = 0; full[i] != 0; i++) {
+                if (full[i] == '/') { base = &full[i + 1]; }
+            }
+            if (!globMatch(fileFilter, base)) { return; }
+        }
+        int len = 0;
+        int err = 0;
+        char* data = asys.readFile(full, &len, maxFileSize, &err);
+        if (data == null) {
+            filesSkipped++;
+            return;
+        }
+        int scan = imin(len, 8000);
+        for (int i = 0; i < scan; i++) {
+            if (data[i] == 0) {
+                filesSkipped++;
+                asys.free(data);
+                return;
+            }
+        }
+        filesSearched++;
+        // line starts
+        int nl = 1;
+        for (int i = 0; i < len; i++) {
+            if (data[i] == 10) { nl++; }
+        }
+        int* ls = (int*) asys.alloc((nl + 2) * 8);
+        int k = 1;
+        for (int i = 0; i < len; i++) {
+            if (data[i] == 10) { ls[k] = i + 1; k++; }
+        }
+        ls[nl] = len + 1;
+        int caps[66];
+        bool gaveUp = false;
+        for (int line = 0; line < nl && count < maxResults && !gaveUp; line++) {
+            int s = ls[line];
+            int e = ls[line + 1] - 1;
+            int ll = e - s;
+            if (ll > 0 && data[e - 1] == 13) { ll--; }
+            int from = 0;
+            while (from <= ll && count < maxResults) {
+                int at;
+                int mlen = 0;
+                if (re != null) {
+                    at = re->search(&data[s], ll, from, &caps[0]);
+                    if (at >= 0) { mlen = caps[1] - caps[0]; }
+                    if (at < 0 && re->exceeded) {
+                        // a catastrophic pattern (or a huge line): say so, and do not spend the limit again on every later line
+                        exceeded = true;
+                        filesExceeded++;
+                        gaveUp = true;
+                    }
+                } else {
+                    at = plainFind(&data[s], ll, from);
+                    mlen = strlen(pattern);
+                }
+                if (at < 0) { break; }
+                int b0 = imax(0, line - context);
+                int bs = ls[b0];
+                int bn = (line > b0) ? ls[line] - 1 - bs : 0;
+                int a1 = imin(nl - 1, line + context);
+                int as1 = ls[imin(line + 1, nl)];
+                int an = (a1 > line) ? ls[a1 + 1] - 1 - as1 : 0;
+                if (an < 0) { an = 0; }
+                addResult(shown, line, at, mlen, &data[s], ll, &data[bs], bn, &data[(as1 > len) ? len : as1], an);
+                from = at + ((mlen > 0) ? mlen : 1);
+            }
+        }
+        asys.free((char*) ls);
+        asys.free(data);
+    }
+}
+
+// ---- quick open (fuzzy file search) ------------------------------------------------------------------------------------------------------------------
+public struct QuickMatch {
+    char* path;               // relative to the project root (owned by QuickOpen)
+    int score;
+}
+
+// An index of the files of a project and a fuzzy matcher: the characters of the query must appear in the path in order (ignoring case);
+// matches that are consecutive, at the start of a path component or word, or in the file name score higher. Recent files get a bonus.
+public class QuickOpen {
+    public char** files;
+    public int count;
+    public int maxFiles;
+    public bool truncated;
+    public Recent* recent;
+    private int cap;
+    private int bound;
+
+    public QuickOpen() {
+        maxFiles = 200000;
+    }
+
+    public void dispose() {
+        for (int i = 0; i < count; i++) { asys.free(files[i]); }
+        asys.free((char*) files);
+        files = null;
+        count = 0;
+        cap = 0;
+    }
+
+    private void add(char* rel) {
+        if (count >= maxFiles) { truncated = true; return; }
+        if (count == cap) {
+            cap = (cap == 0) ? 256 : cap * 2;
+            files = (char**) asys.realloc((char*) files, cap * 8);
+        }
+        files[count] = asys.strDup(rel);
+        count++;
+    }
+
+    // walks the directory (not following links, honouring ign) and collects the files; returns how many
+    public int index(char* root, Ignore* ign) {
+        dispose();
+        truncated = false;
+        walk(root, "", ign, 0);
+        return count;
+    }
+
+    private void walk(char* dir, char* rel, Ignore* ign, int depth) {
+        if (depth > 40 || count >= maxFiles) { truncated = truncated || count >= maxFiles; return; }
+        asys.DirList dl();
+        if (asys.listDir(dir, &dl) < 0) { return; }
+        dl.sort(false, false);
+        for (int i = 0; i < dl.count; i++) {
+            char* name = dl.name(i);
+            int kind = dl.kind(i);
+            char* r = (rel[0] == 0) ? asys.strDup(name) : asys.join(rel, name);
+            bool skip = ign != null && ign->ignored(r, kind == asys.K_DIR);
+            if (!skip) {
+                if (kind == asys.K_FILE) {
+                    add(r);
+                } else if (kind == asys.K_DIR) {
+                    char* full = asys.join(dir, name);
+                    walk(full, r, ign, depth + 1);
+                    asys.free(full);
+                }
+            }
+            asys.free(r);
+        }
+        dl.dispose();
+    }
+
+    // the score of a query against one path, or -1 when the query is not a subsequence of it
+    public int scoreOf(char* q, char* path) {
+        int ql = strlen(q);
+        int pl = strlen(path);
+        if (ql == 0) { return 0; }
+        int base = 0;
+        for (int i = 0; i < pl; i++) {
+            if (path[i] == '/') { base = i + 1; }
+        }
+        int score = 0;
+        int pi = 0;
+        int last = -2;
+        for (int qi = 0; qi < ql; qi++) {
+            int qc = q[qi];
+            if (qc >= 'A' && qc <= 'Z') { qc = qc + 32; }
+            bool found = false;
+            while (pi < pl) {
+                int pc = path[pi];
+                int lc = pc;
+                if (lc >= 'A' && lc <= 'Z') { lc = lc + 32; }
+                if (lc == qc) {
+                    found = true;
+                    int pts = 10;
+                    if (pi == last + 1) { pts = pts + 15; }                          // consecutive
+                    if (pi == 0 || path[pi - 1] == '/') { pts = pts + 20; }           // start of a component
+                    else if (path[pi - 1] == '_' || path[pi - 1] == '-' || path[pi - 1] == '.' || path[pi - 1] == ' ') { pts = pts + 12; }
+                    else if (pc >= 'A' && pc <= 'Z' && path[pi - 1] >= 'a' && path[pi - 1] <= 'z') { pts = pts + 12; }    // camelCase
+                    if (pi >= base) { pts = pts + 8; }                                // in the file name
+                    if (pc == q[qi]) { pts = pts + 2; }                               // same case
+                    score = score + pts;
+                    last = pi;
+                    pi++;
+                    break;
+                }
+                pi++;
+            }
+            if (!found) { return -1; }
+        }
+        // shorter paths and shorter gaps are better
+        score = score - (pl - ql) / 4;
+        // the query is the whole file name or its prefix
+        int bl = pl - base;
+        if (bl >= ql) {
+            bool pre = true;
+            for (int i = 0; i < ql && pre; i++) {
+                int a = path[base + i];
+                int b = q[i];
+                if (a >= 'A' && a <= 'Z') { a = a + 32; }
+                if (b >= 'A' && b <= 'Z') { b = b + 32; }
+                if (a != b) { pre = false; }
+            }
+            if (pre) { score = score + 40; if (bl == ql) { score = score + 40; } }
+        }
+        if (recent != null) {
+            int r = recent->indexOf(path);
+            if (r >= 0) { score = score + 50 - imin(r, 40); }
+        }
+        return score;
+    }
+
+    // The best matches for a query, best first (ties: shorter path, then alphabetical). Returns how many were stored (at most max).
+    // The paths are owned by the index.
+    public int query(char* q, QuickMatch* out, int max) {
+        int n = 0;
+        for (int i = 0; i < count; i++) {
+            int sc = scoreOf(q, files[i]);
+            if (sc < 0) { continue; }
+            // insert into the sorted output (a bounded insertion sort)
+            int at = n;
+            while (at > 0 && better(sc, files[i], out[at - 1].score, out[at - 1].path)) { at--; }
+            if (at >= max) { continue; }
+            int last = (n < max) ? n : max - 1;
+            for (int k = last; k > at; k--) { out[k] = out[k - 1]; }
+            out[at].path = files[i];
+            out[at].score = sc;
+            if (n < max) { n++; }
+        }
+        return n;
+    }
+
+    private bool better(int s1, char* p1, int s2, char* p2) {
+        if (s1 != s2) { return s1 > s2; }
+        int l1 = strlen(p1);
+        int l2 = strlen(p2);
+        if (l1 != l2) { return l1 < l2; }
+        return strcmp(p1, p2) < 0;
+    }
+}
+
+// ---- diagnostics ---------------------------------------------------------------------------------------------------------------------------------------
+public const SEV_ERROR = 0;
+public const SEV_WARNING = 1;
+public const SEV_NOTE = 2;
+public const SEV_INFO = 3;
+
+// one message of a compiler: the strings are asys memory owned by whoever holds the Problem
+public struct Problem {
+    char* path;
+    int line;                 // 1 based (as compilers print it)
+    int col;                  // 1 based, 0 when the compiler did not say
+    int severity;             // SEV_ERROR ...
+    char* message;
+}
+
+public char* severityName(int s) {
+    switch (s) {
+        case 0: return "error";
+        case 1: return "warning";
+        case 2: return "note";
+    }
+    return "info";
+}
+
+private bool isDigitB(int c) {
+    return c >= '0' && c <= '9';
+}
+
+// reads a number at s[i]; returns the position after it (i when there is none)
+private int readNum(char* s, int i, int* v) {
+    int p = i;
+    int n = 0;
+    while (isDigitB(s[p]) && n < 100000000) {
+        n = n * 10 + (s[p] - '0');
+        p++;
+    }
+    *v = n;
+    return p;
+}
+
+// severity words at the start of s: "error:" "fatal error:" "warning:" "note:" "info:" "hint:" "remark:" (case insensitive); returns the
+// severity and the length of the word including the colon, or -1
+private int severityAt(char* s, int* len) {
+    char* words[8];
+    int sev[8];
+    words[0] = "fatal error:"; sev[0] = 0;
+    words[1] = "error:"; sev[1] = 0;
+    words[2] = "warning:"; sev[2] = 1;
+    words[3] = "note:"; sev[3] = 2;
+    words[4] = "info:"; sev[4] = 3;
+    words[5] = "hint:"; sev[5] = 2;
+    words[6] = "remark:"; sev[6] = 3;
+    words[7] = "failure:"; sev[7] = 0;
+    for (int i = 0; i < 8; i++) {
+        int l = strlen(words[i]);
+        bool same = true;
+        for (int k = 0; k < l; k++) {
+            int c = s[k];
+            if (c >= 'A' && c <= 'Z') { c = c + 32; }
+            if (c != words[i][k]) { same = false; break; }
+        }
+        if (same) {
+            *len = l;
+            return sev[i];
+        }
+    }
+    return -1;
+}
+
+// removes terminal colour escape sequences (ESC [ ... letter) from a line: a new string
+private char* stripAnsi(char* line, int len) {
+    char* out = asys.alloc(len + 1);
+    int o = 0;
+    int i = 0;
+    while (i < len) {
+        if (line[i] == 27 && i + 1 < len && line[i + 1] == '[') {
+            i = i + 2;
+            while (i < len && !((line[i] >= 'A' && line[i] <= 'Z') || (line[i] >= 'a' && line[i] <= 'z'))) { i++; }
+            i++;
+            continue;
+        }
+        if (line[i] == 13) { i++; continue; }
+        out[o] = line[i];
+        o++;
+        i++;
+    }
+    out[o] = 0;
+    return out;
+}
+
+private void fillProblem(Problem* p, char* path, int plen, int line, int col, int sev, char* msg) {
+    p->path = asys.strDupN(path, plen);
+    p->line = line;
+    p->col = col;
+    p->severity = sev;
+    while (msg[0] == ' ' || msg[0] == 9) { msg = &msg[1]; }
+    int ml = strlen(msg);
+    while (ml > 0 && (msg[ml - 1] == ' ' || msg[ml - 1] == 9)) { ml--; }
+    p->message = asys.strDupN(msg, ml);
+}
+
+// Recognises one line of compiler output. Understood: the A compiler and GCC / Clang  "file:line: error: message" and
+// "file:line:col: warning: message" (also note / fatal error / info), "In file included from file:line:", Visual C
+// "file(line): error C1234: message" and "file(line,col): ...", Python "File "x.py", line 3, in f". On success the problem's
+// strings are new asys strings. Colour escape codes are ignored; Windows drive letters in paths are fine.
+public bool parseDiagnostic(char* rawLine, int rawLen, Problem* p) {
+    char* line = stripAnsi(rawLine, rawLen);
+    int n = strlen(line);
+    int s = 0;
+    while (line[s] == ' ' || line[s] == 9) { s++; }
+    bool ok = false;
+    // Python tracebacks
+    if (startsWith(&line[s], "File \"")) {
+        int q = s + 6;
+        int e = q;
+        while (line[e] != 0 && line[e] != '"') { e++; }
+        if (line[e] == '"' && startsWith(&line[e + 1], ", line ")) {
+            int ln = 0;
+            int ne = readNum(line, e + 8, &ln);
+            if (ne > e + 8) {
+                char* rest = &line[ne];
+                if (startsWith(rest, ", in ")) { rest = &rest[5]; } else { rest = ""; }
+                fillProblem(p, &line[q], e - q, ln, 0, SEV_NOTE, rest);
+                asys.free(line);
+                return true;
+            }
+        }
+    }
+    // "In file included from path:line:"
+    if (startsWith(&line[s], "In file included from ")) {
+        int q = s + 22;
+        int colon = -1;
+        for (int i = q; line[i] != 0; i++) {
+            if (line[i] == ':' && isDigitB(line[i + 1])) { colon = i; break; }
+        }
+        if (colon > q) {
+            int ln = 0;
+            readNum(line, colon + 1, &ln);
+            fillProblem(p, &line[q], colon - q, ln, 0, SEV_NOTE, "included from here");
+            asys.free(line);
+            return true;
+        }
+    }
+    // Visual C: path(line[,col]) : severity ...
+    for (int i = s; i < n && !ok; i++) {
+        if (line[i] == '(' && isDigitB(line[i + 1]) && i > s) {
+            int ln = 0;
+            int col = 0;
+            int e = readNum(line, i + 1, &ln);
+            if (line[e] == ',') { e = readNum(line, e + 1, &col); }
+            if (line[e] != ')') { continue; }
+            e++;
+            while (line[e] == ' ') { e++; }
+            if (line[e] != ':') { continue; }
+            e++;
+            while (line[e] == ' ') { e++; }
+            int sl = 0;
+            int sev = -1;
+            if (startsWith(&line[e], "error")) { sev = SEV_ERROR; sl = 5; }
+            else if (startsWith(&line[e], "fatal error")) { sev = SEV_ERROR; sl = 11; }
+            else if (startsWith(&line[e], "warning")) { sev = SEV_WARNING; sl = 7; }
+            if (sev < 0) { continue; }
+            int m = e + sl;
+            while (line[m] != 0 && line[m] != ':') { m++; }
+            if (line[m] == ':') { m++; }
+            fillProblem(p, &line[s], i - s, ln, col, sev, &line[m]);
+            ok = true;
+        }
+    }
+    if (ok) {
+        asys.free(line);
+        return true;
+    }
+    // path:line[:col]: severity: message
+    int start = s;
+    if (isAlpha(line[s]) && line[s + 1] == ':' && (line[s + 2] == 92 || line[s + 2] == '/')) {
+        start = s + 2;                                  // a drive letter
+    }
+    for (int i = start; i < n; i++) {
+        if (line[i] == ':' && isDigitB(line[i + 1]) && i > s) {
+            int ln = 0;
+            int col = 0;
+            int e = readNum(line, i + 1, &ln);
+            if (line[e] == ':' && isDigitB(line[e + 1])) { e = readNum(line, e + 1, &col); }
+            if (line[e] != ':') { break; }
+            e++;
+            while (line[e] == ' ') { e++; }
+            int sl = 0;
+            int sev = severityAt(&line[e], &sl);
+            if (sev < 0) { break; }
+            fillProblem(p, &line[s], i - s, ln, col, sev, &line[e + sl]);
+            asys.free(line);
+            return true;
+        }
+    }
+    asys.free(line);
+    return false;
+}
+
+// ---- jobs ------------------------------------------------------------------------------------------------------------------------------------------------
+// A command running beside the program. Nothing here blocks: poll() reads what the command has written (into a queue that is capped at
+// maxOutput bytes, oldest bytes dropped first, and the pipe is always emptied so the command never stalls), feeds the queued input
+// and notices the end of the command. The command runs in its own process group, so kill() ends the whole tree.
+public class Job {
+    public asys.Process* proc;
+    public bool started;
+    public bool running;            // false once the process was reaped
+    public bool exited;             // ended by exit(): exitCode is valid
+    public int exitCode;
+    public int termSignal;
+    public bool timedOut;           // the timeout killed it (exitCode / termSignal still tell how it really ended)
+    public bool killed;             // kill() was called
+    public bool inputBroken;        // the command closed its input
+    public int maxOutput;           // bytes of output kept (default 4 MB)
+    public int maxInput;            // bytes of queued input (default 1 MB)
+    public int timeoutMs;           // 0: none
+    public int droppedBytes;        // output that fell off the front of the queue
+    public int totalBytes;          // all output bytes seen
+    public int graceMs;             // after SIGTERM, how long before SIGKILL (default 300)
+
+    private char* out;
+    private int outStart;
+    private int outLen;
+    private int outCap;
+    private char* inq;
+    private int inPos;
+    private int inLen;
+    private int inCap;
+    private bool closeAfter;
+    private int startMs;
+    private int endMs;
+    private int killAt;
+    private bool termSent;
+    private bool hardSent;
+    private int exitSeenMs;
+    private char* lineBuf;
+    private int lineLen;
+    private bool lineOver;
+
+    public Job() {
+        maxOutput = 4194304;
+        maxInput = 1048576;
+        graceMs = 300;
+    }
+
+    // called for every complete line of output as it arrives (the line without its line break, NUL terminated); BuildJob overrides it
+    public virtual void onLine(char* line, int len) {
+    }
+
+    // Starts argv[0] (null terminated array; searched in PATH when it has no '/') in directory cwd (null: ours). env: extra
+    // "NAME=value" strings or null. Standard error is merged into the output. Returns 0 or -errno (-ENOSYS on Windows).
+    public int start(char** argv, char* cwd, char** env) {
+        if (started && running) { return -asys.EBUSY; }
+        reset();
+        proc = new asys.Process();
+        int r = proc->start(argv, cwd, env, asys.P_STDIN | asys.P_STDOUT | asys.P_MERGE | asys.P_GROUP);
+        if (r < 0) {
+            return r;
+        }
+        started = true;
+        running = true;
+        startMs = asys.monoMs();
+        return 0;
+    }
+
+    // runs a command line with /bin/sh -c
+    public int startShell(char* command, char* cwd) {
+        char* argv[4];
+        argv[0] = "/bin/sh";
+        argv[1] = "-c";
+        argv[2] = command;
+        argv[3] = null;
+        return start(&argv[0], cwd, null);
+    }
+
+    private void reset() {
+        if (proc != null) {
+            proc->dispose();
+        }
+        proc = null;
+        started = false;
+        running = false;
+        exited = false;
+        exitCode = -1;
+        termSignal = 0;
+        timedOut = false;
+        killed = false;
+        inputBroken = false;
+        droppedBytes = 0;
+        totalBytes = 0;
+        outStart = 0;
+        outLen = 0;
+        inPos = 0;
+        inLen = 0;
+        closeAfter = false;
+        termSent = false;
+        hardSent = false;
+        exitSeenMs = 0;
+        lineLen = 0;
+        lineOver = false;
+    }
+
+    // frees the buffers (and kills the command if it still runs)
+    public void dispose() {
+        if (proc != null) {
+            proc->dispose();
+        }
+        proc = null;
+        asys.free(out);
+        asys.free(inq);
+        asys.free(lineBuf);
+        out = null;
+        inq = null;
+        lineBuf = null;
+        outCap = 0;
+        inCap = 0;
+        running = false;
+    }
+
+    public int elapsedMs() {
+        if (!started) { return 0; }
+        return (running ? asys.monoMs() : endMs) - startMs;
+    }
+
+    // bytes of output waiting to be read
+    public int available() {
+        return outLen - outStart;
+    }
+
+    // Takes up to max bytes of output (stdout and stderr in the order they arrived). Returns how many.
+    public int read(char* buf, int max) {
+        int n = imin(max, outLen - outStart);
+        if (n > 0) {
+            memcpy(buf, &out[outStart], n);
+            outStart = outStart + n;
+            if (outStart == outLen) {
+                outStart = 0;
+                outLen = 0;
+            }
+        }
+        return n;
+    }
+
+    // Takes all output as a new string
+    public char* readAll() {
+        int n = outLen - outStart;
+        char* r = asys.strDupN((n > 0) ? &out[outStart] : "", n);
+        outStart = 0;
+        outLen = 0;
+        return r;
+    }
+
+    private void appendOut(char* data, int n) {
+        totalBytes = totalBytes + n;
+        // line splitting for onLine
+        for (int i = 0; i < n; i++) {
+            int c = data[i];
+            if (c == 10) {
+                if (lineBuf == null) { lineBuf = asys.alloc(8200); }
+                lineBuf[lineLen] = 0;
+                onLine(lineBuf, lineLen);
+                lineLen = 0;
+                lineOver = false;
+            } else {
+                if (lineBuf == null) { lineBuf = asys.alloc(8200); }
+                if (lineLen < 8000) {
+                    lineBuf[lineLen] = c;
+                    lineLen++;
+                } else {
+                    lineOver = true;
+                }
+            }
+        }
+        if (n > maxOutput) {
+            droppedBytes = droppedBytes + (outLen - outStart) + (n - maxOutput);
+            outStart = 0;
+            outLen = 0;
+            data = &data[n - maxOutput];
+            n = maxOutput;
+        }
+        int held = outLen - outStart;
+        if (held + n > maxOutput) {
+            // drop the oldest bytes (and a quarter more, so that this does not happen on every call)
+            int drop = held + n - maxOutput + maxOutput / 4;
+            if (drop > held) { drop = held; }
+            outStart = outStart + drop;
+            droppedBytes = droppedBytes + drop;
+        }
+        if (outLen + n > outCap) {
+            // compact first
+            if (outStart > 0) {
+                asys.moveBytes(out, &out[outStart], outLen - outStart);
+                outLen = outLen - outStart;
+                outStart = 0;
+            }
+            if (outLen + n > outCap) {
+                int nc = (outCap == 0) ? 65536 : outCap * 2;
+                while (nc < outLen + n) { nc = nc * 2; }
+                if (nc > maxOutput + 262144) { nc = maxOutput + 262144; }
+                char* nb = asys.realloc(out, nc);
+                if (nb == null) { return; }
+                out = nb;
+                outCap = nc;
+            }
+        }
+        memcpy(&out[outLen], data, n);
+        outLen = outLen + n;
+    }
+
+    // Queues text for the command's standard input. Never blocks. Returns false when the queue is full (maxInput) or the command no
+    // longer reads its input.
+    public bool sendInput(char* data, int n) {
+        if (!started || inputBroken || closeAfter) { return false; }
+        if (inLen - inPos + n > maxInput) { return false; }
+        if (inLen + n > inCap) {
+            if (inPos > 0) {
+                asys.moveBytes(inq, &inq[inPos], inLen - inPos);
+                inLen = inLen - inPos;
+                inPos = 0;
+            }
+            if (inLen + n > inCap) {
+                int nc = (inCap == 0) ? 4096 : inCap * 2;
+                while (nc < inLen + n) { nc = nc * 2; }
+                char* nb = asys.realloc(inq, nc);
+                if (nb == null) { return false; }
+                inq = nb;
+                inCap = nc;
+            }
+        }
+        memcpy(&inq[inLen], data, n);
+        inLen = inLen + n;
+        pumpInput();
+        return true;
+    }
+
+    // closes the command's input once everything queued has been written
+    public void closeInput() {
+        closeAfter = true;
+        pumpInput();
+    }
+
+    private void pumpInput() {
+        if (proc == null || proc->inFd < 0) { return; }
+        while (inPos < inLen) {
+            int w = proc->write(&inq[inPos], inLen - inPos);
+            if (w > 0) {
+                inPos = inPos + w;
+            } else if (w == -asys.EPIPE) {
+                inputBroken = true;
+                inPos = 0;
+                inLen = 0;
+                proc->closeIn();
+                return;
+            } else {
+                break;                              // the pipe is full: try again at the next poll
+            }
+        }
+        if (inPos >= inLen) {
+            inPos = 0;
+            inLen = 0;
+            if (closeAfter) { proc->closeIn(); }
+        }
+    }
+
+    private void beginKill() {
+        if (!running || termSent) { return; }
+        termSent = true;
+        proc->signalGroup(asys.SIGTERM);
+        killAt = asys.monoMs() + graceMs;
+    }
+
+    // asks the command (and everything it started) to end: SIGTERM now, SIGKILL after graceMs. The exit status stays the real one.
+    public void kill() {
+        if (!running) { return; }
+        killed = true;
+        beginKill();
+    }
+
+    // SIGKILL at once
+    public void killNow() {
+        if (!running) { return; }
+        killed = true;
+        termSent = true;
+        hardSent = true;
+        proc->signalGroup(asys.SIGKILL);
+    }
+
+    // Does the housekeeping: reads output, writes queued input, notices the end, enforces the timeout. Returns true while the job is
+    // still running or output is still arriving.
+    public bool poll() {
+        if (!started || proc == null) { return false; }
+        int now = asys.monoMs();
+        // output: read until the pipe is empty (at most 1 MB per call, so a flood cannot starve the caller)
+        if (proc->outFd >= 0) {
+            char* buf = asys.alloc(65536);
+            int total = 0;
+            while (total < 1048576) {
+                int n = proc->read(1, buf, 65536);
+                if (n > 0) {
+                    appendOut(buf, n);
+                    total = total + n;
+                } else {
+                    if (n == 0) { proc->closeOut(); }
+                    break;
+                }
+            }
+            asys.free(buf);
+        }
+        pumpInput();
+        if (running) {
+            int r = proc->tryWait();
+            if (r == 1) {
+                running = false;
+                exited = proc->exited;
+                exitCode = proc->exitCode;
+                termSignal = proc->termSignal;
+                endMs = asys.monoMs();
+                exitSeenMs = now;
+            } else if (r < 0 && r != 0) {
+                running = false;
+                endMs = asys.monoMs();
+                exitSeenMs = now;
+            }
+        }
+        if (running) {
+            if (timeoutMs > 0 && now - startMs >= timeoutMs && !termSent) {
+                timedOut = true;
+                beginKill();
+            }
+            if (termSent && !hardSent && now >= killAt) {
+                hardSent = true;
+                proc->signalGroup(asys.SIGKILL);
+            }
+            return true;
+        }
+        // the process ended: collect what is left in the pipe (a grandchild may keep it open: give up after a short grace)
+        if (proc->outFd >= 0) {
+            if (now - exitSeenMs > 300) {
+                proc->closeOut();
+                proc->closeIn();
+            } else {
+                return true;
+            }
+        }
+        proc->closeIn();
+        if (lineLen > 0 && lineBuf != null) {
+            lineBuf[lineLen] = 0;
+            onLine(lineBuf, lineLen);
+            lineLen = 0;
+        }
+        return false;
+    }
+
+    // Polls until the job has finished or timeoutMs has passed (-1: no limit); true when it finished. Sleeps 2 ms between rounds.
+    public bool wait(int timeoutMs2) {
+        int t0 = asys.monoMs();
+        while (poll()) {
+            if (timeoutMs2 >= 0 && asys.monoMs() - t0 >= timeoutMs2) { return false; }
+            proc->waitReadable(5);
+        }
+        return true;
+    }
+}
+
+// Runs a compiler (or any build command) and turns its messages into Problems.
+public class BuildJob : Job {
+    public Problem* problems;
+    public int problemCount;
+    public int maxProblems;
+    private int pcap;
+    private char* pendingMsg;           // Rust style: the header line waits for its " --> file:line:col" line
+    private int pendingSev;
+
+    public BuildJob() {
+        super();
+        maxProblems = 10000;
+    }
+
+    public void clearProblems() {
+        for (int i = 0; i < problemCount; i++) {
+            asys.free(problems[i].path);
+            asys.free(problems[i].message);
+        }
+        problemCount = 0;
+        asys.free(pendingMsg);
+        pendingMsg = null;
+    }
+
+    public void dispose() {
+        clearProblems();
+        asys.free((char*) problems);
+        problems = null;
+        pcap = 0;
+        super.dispose();
+    }
+
+    private void addProblem(Problem* p) {
+        if (problemCount >= maxProblems) {
+            asys.free(p->path);
+            asys.free(p->message);
+            return;
+        }
+        if (problemCount == pcap) {
+            pcap = (pcap == 0) ? 32 : pcap * 2;
+            problems = (Problem*) asys.realloc((char*) problems, pcap * sizeof(Problem));
+        }
+        problems[problemCount] = *p;
+        problemCount++;
+    }
+
+    public virtual void onLine(char* line, int len) {
+        Problem p;
+        if (parseDiagnostic(line, len, &p)) {
+            addProblem(&p);
+            return;
+        }
+        // Rust / Cargo: "error[E0425]: message" then "  --> file:line:col"
+        char* clean = stripAnsi(line, len);
+        int s = 0;
+        while (clean[s] == ' ') { s++; }
+        int sl = 0;
+        int sev = severityAt(&clean[s], &sl);
+        if (sev < 0 && startsWith(&clean[s], "error[")) {
+            int q = s;
+            while (clean[q] != 0 && clean[q] != ']') { q++; }
+            if (clean[q] == ']' && clean[q + 1] == ':') { sev = SEV_ERROR; sl = q + 2 - s; }
+        }
+        if (sev >= 0 && s == 0 && clean[sl] != 0) {
+            asys.free(pendingMsg);
+            pendingMsg = asys.strDup(&clean[sl]);
+            pendingSev = sev;
+        } else if (startsWith(&clean[s], "--> ") && pendingMsg != null) {
+            char* loc = &clean[s + 4];
+            int colon = -1;
+            for (int i = 0; loc[i] != 0; i++) {
+                if (loc[i] == ':' && isDigitB(loc[i + 1])) { colon = i; break; }
+            }
+            if (colon > 0) {
+                int ln = 0;
+                int col = 0;
+                int e = readNum(loc, colon + 1, &ln);
+                if (loc[e] == ':') { readNum(loc, e + 1, &col); }
+                Problem rp;
+                fillProblem(&rp, loc, colon, ln, col, pendingSev, pendingMsg);
+                addProblem(&rp);
+            }
+            asys.free(pendingMsg);
+            pendingMsg = null;
+        }
+        asys.free(clean);
+    }
+
+    // finds the A compiler: $AC, then "ac" in PATH, /usr/local/bin, /usr/bin, /bin (a new string, null if none exists)
+    public char* findCompiler() {
+        char* env = asys.getenv("AC");
+        if (env != null && env[0] != 0 && asys.isFile(env)) { return env; }
+        asys.free(env);
+        char* path = asys.getenv("PATH");
+        if (path != null) {
+            int n = strlen(path);
+            int s = 0;
+            for (int i = 0; i <= n; i++) {
+                if (i == n || path[i] == ':') {
+                    if (i > s) {
+                        char* d = asys.strDupN(&path[s], i - s);
+                        char* c = asys.join(d, "ac");
+                        asys.free(d);
+                        if (asys.isFile(c)) {
+                            asys.free(path);
+                            return c;
+                        }
+                        asys.free(c);
+                    }
+                    s = i + 1;
+                }
+            }
+            asys.free(path);
+        }
+        char* fixed[3];
+        fixed[0] = "/usr/local/bin/ac";
+        fixed[1] = "/usr/bin/ac";
+        fixed[2] = "/bin/ac";
+        for (int i = 0; i < 3; i++) {
+            if (asys.isFile(fixed[i])) { return asys.strDup(fixed[i]); }
+        }
+        return null;
+    }
+
+    // Starts  ac source [-o output] [-t target]  (the compiler is found by findCompiler). Returns 0 or -errno (-ENOENT without compiler).
+    public int startCompiler(char* source, char* output, char* target) {
+        clearProblems();
+        char* ac = findCompiler();
+        if (ac == null) { return -asys.ENOENT; }
+        char* argv[8];
+        int n = 0;
+        argv[n] = ac; n++;
+        argv[n] = source; n++;
+        if (output != null) { argv[n] = "-o"; n++; argv[n] = output; n++; }
+        if (target != null) { argv[n] = "-t"; n++; argv[n] = target; n++; }
+        argv[n] = null;
+        int r = start(&argv[0], null, null);
+        asys.free(ac);
+        return r;
+    }
+
+    // Starts any command (argv null terminated) as a build; the problems of a previous run are forgotten.
+    public int startCommand(char** argv, char* cwd) {
+        clearProblems();
+        return start(argv, cwd, null);
+    }
+
+    // how many problems of a severity
+    public int countOf(int severity) {
+        int n = 0;
+        for (int i = 0; i < problemCount; i++) {
+            if (problems[i].severity == severity) { n++; }
+        }
+        return n;
+    }
+}
+
+// Runs a program (the output of a build, or any command) with its input and output connected.
+public class RunJob : Job {
+    public RunJob() {
+        super();
+    }
+
+    // path: the program; args: null terminated list of arguments (may be null); the command is run in cwd
+    public int startProgram(char* path, char** args, char* cwd) {
+        int n = 0;
+        if (args != null) {
+            while (args[n] != null) { n++; }
+        }
+        char** argv = (char**) asys.alloc((n + 2) * 8);
+        argv[0] = path;
+        for (int i = 0; i < n; i++) { argv[i + 1] = args[i]; }
+        int r = start(argv, cwd, null);
+        asys.free((char*) argv);
+        return r;
+    }
+}

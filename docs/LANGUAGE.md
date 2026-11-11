@@ -979,7 +979,7 @@ code only to programs that import them, and a file of the same name next to your
 | `sort` | `sortInts(a, n)`, `sortStrings(a, n)`, `reverseInts`, `isSorted`, `binarySearch(a, n, key)` |
 | `collections` | `IntList`, `StrList`, `StrMap` (string to int), `IntMap` (int to int), `IntSet`, `StrSet`, `IntQueue`, `IntHeap` (min-heap), `PriorityQueue` |
 | `strings` | class `StringBuilder`; `concat repeat reverse count lastIndexOf replace padLeft padRight isBlank capitalize upper lower split join` |
-| `regex` | `matches(pattern, text)`, `search(pattern, text, &len)`, `test`, `replaceAll` with `. ^ $ * + ? [a-z] [^x] \d \w \s` (no groups or `\|`) |
+| `regex` | a backtracking engine with Perl / Python semantics: `compile(pattern, flags)` gives a `Regex` (`search searchAdv matchAt matchFull groupIndex`, up to 32 groups, named groups, back references, lazy quantifiers, `\b \A \Z`, classes, look-ahead, `(?i) (?s) (?m)`, UTF-8 aware, a step limit); the simple functions `matches(pattern, text)`, `search(pattern, text, &len)`, `test`, `replaceAll`, `replaceGroups` (`$1`), `quote` still exist. Details in [AIDE.md](AIDE.md#8-regex) |
 | `utf8` | `length decode encode isValid byteOffset toCodepoints fromCodepoints reverse` |
 | `json` | `parse(text)`, `stringify(v)`, `pretty(v)`, builders `newObject newArray newInt newString newBool newNull`; class `Json` with `get at size keyAt set push asInt asString asBool intOr stringOr boolOr` |
 | `csv` | `parseLine(line, sep, out, max)`, `quote(field, sep)`, `joinLine(fields, n, sep)` |
@@ -999,6 +999,8 @@ code only to programs that import them, and a file of the same name next to your
 | `cli` | class `ArgParser`: `addFlag addOption parse flag option optionInt positional positionalCount printHelp` (short, long, `--x=value`, combined `-abc`) |
 | `log` | leveled logging with timestamps and colours: `debug info warn error` (+ `f` variants), `setLevel setFd setTimestamps` |
 | `testing` | `assertEq assertStrEq check summary` for unit tests |
+| `asys` | system layer for tools that must run on Linux, AOS (and mostly Windows): memory that can be freed (`alloc realloc free memInUse`), whole-file reading of regular files only, atomic writing (`AtomicFile`, `writeFileAtomic`), `stat`, directory listing, time, random bytes, child processes with pipes (`Process`): see [AIDE.md](AIDE.md#2-asys---the-system-layer) |
+| `acode`, `asyntax`, `atheme`, `aproject`, `afind` | the editor core of AIDE, the A IDE: text `Buffer` and `Editor` with undo and multiple cursors; incremental syntax highlighting, symbols and completion; themes and settings; project tree, find in files, build and run jobs with diagnostics; search and replace. No user interface: see [AIDE.md](AIDE.md) |
 | `clib` (and `cctype climits cerrno cassert cstring cstdlib cstdio ctime cunistd cmath cfloat ccomplex clocale cwchar`) | the C standard library, see [12c](#12c-the-c-library) and [CLIB.md](CLIB.md) |
 | `term`, `tscreen`, `tui`, `tuix` | terminal user interfaces: keys, mouse and capabilities (`term`), cells, colours and the diff renderer (`tscreen`), widgets, menus, dialogs and the application loop (`tui`), tree, table, text pane, file / colour dialogs and the command palette (`tuix`); see [TUI.md](TUI.md) |
 | `net` | TCP / UDP networking and DNS, see [12a](#12a-networking) |
