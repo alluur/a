@@ -1,0 +1,1380 @@
+// =============================================================================
+//  aidecore - the parts of AIDE that have no user interface                                         import aidecore;
+//
+//  What a front end of AIDE (the GUI program aide-gui, or any other) needs besides the editor libraries (acode, asyntax, atheme,
+//  aproject, afind): the project file, the command lines of builds and runs, snippets, projects from templates, the copies of
+//  unsaved work, the session (open files of a project) and a few small helpers. Everything here is plain code that can be tested
+//  without a screen.
+//
+//    aidecore.Project p();  p.load("/home/me/demo");                  // reads /home/me/demo/.aide (missing file: the defaults)
+//    aidecore.BuildPlan* b = aidecore.makeBuildPlan(&p, "/home/me/demo/main.a", "/bin/ac", false, null);
+//    // b->argv is the command line (null terminated), b->display the line for the output panel, b->outPath the program
+//    aidecore.Words w("-x 'a b' c");   // w.count == 3, w.argv[1] is  a b
+//    aidecore.SnippetSet snips();  snips.load(configDir);  snips.insert(buf, ed, snips.find("main"), -1);
+//    int r = aidecore.newProject(aidecore.TPL_HELLO, "/home/me/new", "new", &mainPath);   // folder, main.a and .aide
+//
+//  The file `.aide` is shared with the terminal version of AIDE (aide): a `[project]` section (name, main, build, run, ignore, flags,
+//  output, target, version, config) and, written by the GUI version, any number of `[run NAME]` sections (run configurations: program,
+//  args, cwd, env). `Project.save` keeps every section it does not know (a `.aide` file written by a newer AIDE loses nothing).
+// =============================================================================
+import asys;
+import acode;
+import asyntax;
+import atheme;
+import aproject;
+module aidecore;
+
+private int imin(int a, int b) {
+    if (a < b) { return a; }
+    return b;
+}
+
+private int imax(int a, int b) {
+    if (a > b) { return a; }
+    return b;
+}
+
+private void setStr(char** slot, char* v) {
+    char* nv = (v == null) ? null : asys.strDup(v);
+    asys.free(*slot);
+    *slot = nv;
+}
+
+private bool boolOf(char* v) {
+    return streqi(v, "true") || streqi(v, "yes") || streqi(v, "on") || streqi(v, "1");
+}
+
+// ---- small helpers ---------------------------------------------------------------------------------------------------------------------
+// the process number (1 on Windows)
+public int selfPid() {
+    if (__OS == 1) { return 1; }
+    return __syscall(__ARCH == 0 ? 39 : 172, 0, 0, 0, 0, 0, 0);
+}
+
+// does a process of this number exist? (kill with signal 0; Linux and AOS)
+public bool processAlive(int pid) {
+    if (__OS == 1 || pid <= 0) { return false; }
+    int r = __syscall(__ARCH == 0 ? 62 : 129, pid, 0, 0, 0, 0, 0);
+    return r != -3;
+}
+
+// the name of a file without its folder (a pointer into the path)
+public char* baseName(char* p) {
+    int at = 0;
+    for (int i = 0; p[i] != 0; i++) {
+        if (p[i] == '/') { at = i + 1; }
+    }
+    return &p[at];
+}
+
+// the folder of a path: a new string ("." for a name without a slash, "/" for a file in the root)
+public char* dirName(char* p) {
+    int at = -1;
+    for (int i = 0; p[i] != 0; i++) {
+        if (p[i] == '/') { at = i; }
+    }
+    if (at < 0) { return asys.strDup("."); }
+    if (at == 0) { return asys.strDup("/"); }
+    return asys.strDupN(p, at);
+}
+
+// the path of a file relative to a folder when it is inside it, else the path itself (a pointer into path)
+public char* relativeTo(char* root, char* path) {
+    int n = strlen(root);
+    while (n > 1 && root[n - 1] == '/') { n--; }
+    if (n > 0 && strncmpEq(path, root, n) && path[n] == '/') { return &path[n + 1]; }
+    return path;
+}
+
+private bool strncmpEq(char* a, char* b, int n) {
+    for (int i = 0; i < n; i++) {
+        if (a[i] != b[i]) { return false; }
+    }
+    return true;
+}
+
+// a number made of the digits at the start of s
+public int parseNumber(char* s) {
+    int v = 0;
+    for (int i = 0; s[i] >= '0' && s[i] <= '9' && v < 100000000; i++) { v = v * 10 + (s[i] - '0'); }
+    return v;
+}
+
+// the shell quoting of a word:  it's  ->  'it'\''s'   (a new string)
+public char* shellQuote(char* s) {
+    int n = strlen(s);
+    char* r = asys.alloc(n * 4 + 3);
+    int o = 0;
+    r[o] = '\''; o++;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '\'') { r[o] = '\''; r[o + 1] = 92; r[o + 2] = '\''; r[o + 3] = '\''; o = o + 4; }
+        else { r[o] = s[i]; o++; }
+    }
+    r[o] = '\''; o++;
+    r[o] = 0;
+    return r;
+}
+
+// "$ word word ...\n": a command line as the output panel shows it (any length; a new string)
+public char* commandLineText(char** words, int n) {
+    int total = 4;
+    for (int k = 0; k < n; k++) { total = total + strlen(words[k]) + 3; }
+    char* r = asys.alloc(total);
+    int o = 0;
+    r[o] = '$'; o++;
+    r[o] = ' '; o++;
+    for (int k = 0; k < n; k++) {
+        if (k > 0) { r[o] = ' '; o++; }
+        bool quote = words[k][0] == 0;
+        for (int i = 0; words[k][i] != 0; i++) {
+            if (words[k][i] == ' ' || words[k][i] == 9) { quote = true; }
+        }
+        if (quote) { r[o] = '"'; o++; }
+        int l = strlen(words[k]);
+        memcpy(&r[o], words[k], l);
+        o = o + l;
+        if (quote) { r[o] = '"'; o++; }
+    }
+    r[o] = 10; o++;
+    r[o] = 0;
+    return r;
+}
+
+// ---- Words: a command line split into words ---------------------------------------------------------------------------------------------
+// Spaces and tabs separate the words; single or double quotes group (there are no escapes). At most 255 words.
+public class Words {
+    public char** argv;                     // null terminated
+    public int count;
+    private char* text;
+
+    public Words(char* line) {
+        argv = (char**) asys.alloc(256 * 8);
+        count = 0;
+        text = asys.strDup(line == null ? "" : line);
+        int len = strlen(text);
+        int i = 0;
+        while (i < len && count < 255) {
+            while (i < len && (text[i] == ' ' || text[i] == 9)) { i++; }
+            if (i >= len) { break; }
+            char* w = &text[i];
+            int o = i;
+            int q = 0;
+            while (i < len && (q != 0 || (text[i] != ' ' && text[i] != 9))) {
+                if (q == 0 && (text[i] == '"' || text[i] == '\'')) { q = text[i]; i++; continue; }
+                if (q != 0 && text[i] == q) { q = 0; i++; continue; }
+                text[o] = text[i];
+                o++;
+                i++;
+            }
+            bool more = i < len;
+            text[o] = 0;
+            argv[count] = w;
+            count++;
+            if (more) { i++; }
+        }
+        argv[count] = null;
+    }
+
+    public void dispose() {
+        asys.free((char*) argv);
+        asys.free(text);
+        argv = null;
+        text = null;
+        count = 0;
+    }
+}
+
+// ---- run configurations --------------------------------------------------------------------------------------------------------------------
+// What Run starts: the program that the build made (program empty) or another program, with arguments, a working directory (empty:
+// the project folder) and extra environment variables ("NAME=value NAME2='a b'", split like a command line).
+public class RunConfig {
+    public char* name;
+    public char* program;
+    public char* args;
+    public char* cwd;
+    public char* env;
+
+    public RunConfig(char* n) {
+        name = asys.strDup(n);
+        program = asys.strDup("");
+        args = asys.strDup("");
+        cwd = asys.strDup("");
+        env = asys.strDup("");
+    }
+
+    public void dispose() {
+        asys.free(name);
+        asys.free(program);
+        asys.free(args);
+        asys.free(cwd);
+        asys.free(env);
+        name = null;
+    }
+}
+
+// ---- the project file ---------------------------------------------------------------------------------------------------------------------------
+public class Project {
+    public char* root;                      // the project folder (absolute)
+    public char* name;
+    public char* mainFile;                  // relative to the root (or absolute)
+    public char* buildCmd;                  // a shell command that replaces the A compiler
+    public char* runArgs;
+    public char* ignore;                    // comma separated patterns
+    public char* flags;                     // extra flags for the compiler
+    public char* output;                    // overrides the name of the program
+    public char* target;                    // ac -t TARGET
+    public int version;
+    public bool release;
+    public bool loaded;                     // a .aide file was read (or written)
+    public RunConfig** runs;
+    public int nruns;
+    private int runCap;
+    private char* curSection;               // while loading: the run configuration that the entries belong to
+    private RunConfig* curRun;
+
+    public Project() {
+        runCap = 8;
+        runs = (RunConfig**) asys.alloc(runCap * 8);
+        reset();
+    }
+
+    // the defaults (the root stays)
+    public void reset() {
+        for (int i = 0; i < nruns; i++) { runs[i]->dispose(); }
+        nruns = 0;
+        setStr(&name, "");
+        setStr(&mainFile, "");
+        setStr(&buildCmd, "");
+        setStr(&runArgs, "");
+        setStr(&ignore, "");
+        setStr(&flags, "");
+        setStr(&output, "");
+        setStr(&target, "");
+        version = 1;
+        release = false;
+        loaded = false;
+    }
+
+    public void dispose() {
+        reset();
+        asys.free((char*) runs);
+        asys.free(root);
+        asys.free(name);
+        asys.free(mainFile);
+        asys.free(buildCmd);
+        asys.free(runArgs);
+        asys.free(ignore);
+        asys.free(flags);
+        asys.free(output);
+        asys.free(target);
+        runs = null;
+        root = null;
+        name = null;
+        mainFile = null;
+        buildCmd = null;
+        runArgs = null;
+        ignore = null;
+        flags = null;
+        output = null;
+        target = null;
+    }
+
+    public char* filePath() { return asys.join(root, ".aide"); }
+
+    // reads FOLDER/.aide; the settings are the defaults when there is no file (then 0 is not returned: -ENOENT or another error)
+    public int load(char* folder) {
+        setStr(&root, folder);
+        reset();
+        char* f = filePath();
+        int len = 0;
+        int err = 0;
+        char* text = asys.readFile(f, &len, 262144, &err);
+        asys.free(f);
+        if (text == null) { return (err < 0) ? err : -asys.ENOENT; }
+        loaded = true;
+        curRun = null;
+        atheme.parseIni(text, len, projectEntry, (int) this);
+        asys.free(text);
+        return 0;
+    }
+
+    public RunConfig* findRun(char* n) {
+        for (int i = 0; i < nruns; i++) {
+            if (streq(runs[i]->name, n)) { return runs[i]; }
+        }
+        return null;
+    }
+
+    // a new run configuration (or the existing one of that name)
+    public RunConfig* addRun(char* n) {
+        RunConfig* have = findRun(n);
+        if (have != null) { return have; }
+        if (nruns == runCap) {
+            runCap = runCap * 2;
+            runs = (RunConfig**) asys.realloc((char*) runs, runCap * 8);
+        }
+        RunConfig* r = new RunConfig(n);
+        runs[nruns] = r;
+        nruns++;
+        return r;
+    }
+
+    public bool removeRun(char* n) {
+        for (int i = 0; i < nruns; i++) {
+            if (streq(runs[i]->name, n)) {
+                runs[i]->dispose();
+                for (int j = i; j < nruns - 1; j++) { runs[j] = runs[j + 1]; }
+                nruns--;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // the project file as text, with the sections of the old file that this version does not know
+    public char* toText(char* oldText) {
+        int cap = 800 + strlen(name) + strlen(mainFile) + strlen(buildCmd) + strlen(runArgs) + strlen(ignore) + strlen(flags) + strlen(output) + strlen(target);
+        for (int i = 0; i < nruns; i++) {
+            cap = cap + 100 + strlen(runs[i]->name) + strlen(runs[i]->program) + strlen(runs[i]->args) + strlen(runs[i]->cwd) + strlen(runs[i]->env);
+        }
+        char* foreign = (oldText != null) ? foreignSections(oldText) : null;
+        if (foreign != null) { cap = cap + strlen(foreign); }
+        char* buf = asys.alloc(cap);
+        int n = format(buf, cap, "[project]\nname = %s\nmain = %s\nbuild = %s\nrun = %s\nignore = %s\n", name, mainFile, buildCmd, runArgs, ignore);
+        n = n + format(&buf[n], cap - n, "flags = %s\noutput = %s\ntarget = %s\nversion = %d\nconfig = %s\n", flags, output, target, version, release ? "release" : "debug");
+        for (int i = 0; i < nruns; i++) {
+            RunConfig* r = runs[i];
+            n = n + format(&buf[n], cap - n, "\n[run %s]\nprogram = %s\nargs = %s\ncwd = %s\nenv = %s\n", r->name, r->program, r->args, r->cwd, r->env);
+        }
+        if (foreign != null) {
+            n = n + format(&buf[n], cap - n, "%s", foreign);
+            asys.free(foreign);
+        }
+        buf[n] = 0;
+        return buf;
+    }
+
+    // writes FOLDER/.aide atomically (the sections of an existing file that are not known are kept): 0 or -errno
+    public int save() {
+        char* f = filePath();
+        int len = 0;
+        char* old = asys.readFile(f, &len, 262144, null);
+        char* t = toText(old);
+        asys.free(old);
+        int r = asys.writeFileAtomic(f, t, strlen(t), 420, asys.W_NOSYNC);
+        asys.free(t);
+        asys.free(f);
+        if (r >= 0) { loaded = true; }
+        return (r < 0) ? r : 0;
+    }
+
+    // the main file as an absolute path (a new string; null: none set)
+    public char* mainPath() {
+        if (mainFile == null || mainFile[0] == 0) { return null; }
+        if (mainFile[0] == '/') { return asys.strDup(mainFile); }
+        return asys.join(root, mainFile);
+    }
+
+    // NAME-VERSION-RELEASE.elf for a source file (the name that ac gives a program; .exe for the target windows); a new string
+    public char* defaultOutputName(char* source) {
+        char* b = baseName(source);
+        char nm[200];
+        int n = strlen(b);
+        if (n > 2 && b[n - 2] == '.' && b[n - 1] == 'a') { n = n - 2; }
+        n = imin(n, 180);
+        memcpy(&nm[0], b, n);
+        nm[n] = 0;
+        char out[300];
+        char* ext = ".elf";
+        if (startsWith(target, "windows")) { ext = ".exe"; }
+        format(&out[0], 300, "%s-%d-%s%s", &nm[0], version, release ? "release" : "debug", ext);
+        return asys.strDup(&out[0]);
+    }
+
+    // the ignore rules of the project (built-in, .gitignore, the patterns of the file); dispose the result when done
+    public aproject.Ignore* makeIgnore() {
+        aproject.Ignore* ig = new aproject.Ignore();
+        ig->addBuiltin();
+        char* g = asys.join(root, ".gitignore");
+        ig->loadFile(g, "");
+        asys.free(g);
+        ig->addPattern(".aide/", "");                    // a configuration directory is never project content
+        if (streq(root, "/")) {
+            ig->addPattern("/proc/", "");
+            ig->addPattern("/dev/", "");
+            ig->addPattern("/sys/", "");
+            ig->addPattern("/run/", "");
+        }
+        if (ignore != null && ignore[0] != 0) {
+            char* s = asys.strDup(ignore);
+            int n = strlen(s);
+            int st = 0;
+            for (int i = 0; i <= n; i++) {
+                if (i == n || s[i] == ',' || s[i] == ';') {
+                    s[i] = 0;
+                    char* t = &s[st];
+                    while (t[0] == ' ') { t = &t[1]; }
+                    int tl = strlen(t);
+                    while (tl > 0 && t[tl - 1] == ' ') { t[tl - 1] = 0; tl--; }
+                    if (tl > 0) { ig->addPattern(t, ""); }
+                    st = i + 1;
+                }
+            }
+            asys.free(s);
+        }
+        return ig;
+    }
+
+    public void entry(char* section, char* key, char* value) {
+        if (streqi(section, "project")) {
+            curRun = null;
+            if (streqi(key, "name")) { setStr(&name, value); }
+            else if (streqi(key, "main")) { setStr(&mainFile, value); }
+            else if (streqi(key, "build")) { setStr(&buildCmd, value); }
+            else if (streqi(key, "run") || streqi(key, "args")) { setStr(&runArgs, value); }
+            else if (streqi(key, "ignore")) { setStr(&ignore, value); }
+            else if (streqi(key, "flags")) { setStr(&flags, value); }
+            else if (streqi(key, "output")) { setStr(&output, value); }
+            else if (streqi(key, "target")) { setStr(&target, value); }
+            else if (streqi(key, "version")) { version = imax(0, imin(atoi(value), 1000000)); }
+            else if (streqi(key, "config") || streqi(key, "release")) { release = streqi(value, "release") || boolOf(value); }
+            return;
+        }
+        if (startsWith(section, "run ") || startsWith(section, "run\t")) {
+            char* rn = &section[4];
+            while (rn[0] == ' ') { rn = &rn[1]; }
+            if (rn[0] == 0 || strlen(rn) > 60) { return; }
+            if (curRun == null || !streq(curRun->name, rn)) { curRun = addRun(rn); }
+            if (streqi(key, "program")) { setStr(&curRun->program, value); }
+            else if (streqi(key, "args")) { setStr(&curRun->args, value); }
+            else if (streqi(key, "cwd")) { setStr(&curRun->cwd, value); }
+            else if (streqi(key, "env")) { setStr(&curRun->env, value); }
+        }
+    }
+}
+
+int projectEntry(int user, char* section, char* key, char* value) {
+    Project* p = (Project*) user;
+    p->entry(section, key, value);
+    return 0;
+}
+
+// The text of every section of an INI text except [project] and [run ...] (header lines included, comments and blank lines of those
+// sections too), or null when there are none. A new string.
+public char* foreignSections(char* text) {
+    int len = strlen(text);
+    char* out = asys.alloc(len + 8);
+    int o = 0;
+    bool keep = false;
+    int pos = 0;
+    while (pos < len) {
+        int e = pos;
+        while (e < len && text[e] != 10) { e++; }
+        int s = pos;
+        while (s < e && (text[s] == ' ' || text[s] == 9)) { s++; }
+        if (s < e && text[s] == '[') {
+            int c = s + 1;
+            while (c < e && text[c] != ']') { c++; }
+            if (c < e) {
+                char head[80];
+                int hl = imin(c - s - 1, 70);
+                memcpy(&head[0], &text[s + 1], hl);
+                head[hl] = 0;
+                keep = !(streqi(&head[0], "project") || startsWith(&head[0], "run ") || startsWith(&head[0], "run\t"));
+                if (keep && o > 0 && out[o - 1] != 10) { out[o] = 10; o++; }
+                if (keep && o == 0) { out[o] = 10; o++; }
+            }
+        }
+        if (keep) {
+            memcpy(&out[o], &text[pos], e - pos);
+            o = o + (e - pos);
+            out[o] = 10;
+            o++;
+        }
+        pos = e + 1;
+    }
+    out[o] = 0;
+    if (o == 0) {
+        asys.free(out);
+        return null;
+    }
+    return out;
+}
+
+// ---- build plans -----------------------------------------------------------------------------------------------------------------------------
+// How a build is started: the compiler command line (or the shell command of the project), the line shown in the output panel and the
+// program that will be made.
+public class BuildPlan {
+    public char** argv;                     // the compiler command line, null terminated (custom == false)
+    public int argc;
+    public bool custom;                     // the project's build command (shell) is used: shellCmd
+    public char* shellCmd;
+    public char* display;                   // "$ ac main.a -r debug -v 1\n"
+    public char* outPath;                   // the program the build makes (absolute); for a syntax check: the throw-away output
+    public char* source;                    // the file that is compiled (absolute)
+    public bool check;
+    private char** owned;
+    private int nowned;
+
+    public BuildPlan() {
+        argv = (char**) asys.alloc(80 * 8);
+        owned = (char**) asys.alloc(80 * 8);
+    }
+
+    private void own(char* s) {
+        if (nowned < 80) { owned[nowned] = s; nowned++; }
+    }
+
+    public void dispose() {
+        for (int i = 0; i < nowned; i++) { asys.free(owned[i]); }
+        asys.free((char*) owned);
+        asys.free((char*) argv);
+        asys.free(shellCmd);
+        asys.free(display);
+        asys.free(outPath);
+        asys.free(source);
+        argv = null;
+        owned = null;
+        nowned = 0;
+    }
+
+    public void add(char* word) {
+        if (argc < 78) {
+            char* c = asys.strDup(word);
+            own(c);
+            argv[argc] = c;
+            argc++;
+            argv[argc] = null;
+        }
+    }
+}
+
+// Plans the build of `source` (an absolute path) in the project. compiler: the path of ac. check: only check the syntax, the program goes
+// to checkOut (an absolute path; required then). A project with a build command and no check uses the shell command instead. The
+// words of the project's flags are appended. Returns a plan to dispose, or null when nothing can be planned (no source and no command).
+public BuildPlan* makeBuildPlan(Project* p, char* source, char* compiler, bool check, char* checkOut) {
+    BuildPlan* b = new BuildPlan();
+    b->check = check;
+    b->custom = p->buildCmd != null && p->buildCmd[0] != 0 && !check;
+    if (source != null) { b->source = asys.strDup(source); }
+    if (b->custom) {
+        b->shellCmd = asys.strDup(p->buildCmd);
+        char* one[1];
+        one[0] = p->buildCmd;
+        b->display = commandLineText(&one[0], 1);
+        char* o = (p->output != null && p->output[0] != 0) ? p->output : null;
+        if (o != null) { b->outPath = (o[0] == '/') ? asys.strDup(o) : asys.join(p->root, o); }
+        else {
+            char* dn = p->defaultOutputName(source != null ? source : "main.a");
+            b->outPath = asys.join(p->root, dn);
+            asys.free(dn);
+        }
+        return b;
+    }
+    if (source == null || compiler == null) {
+        b->dispose();
+        return null;
+    }
+    b->add(compiler);
+    b->add(relativeTo(p->root, source));
+    if (check) {
+        b->add("-o");
+        b->add(checkOut != null ? checkOut : "/dev/null");
+        b->outPath = asys.strDup(checkOut != null ? checkOut : "/dev/null");
+    } else if (p->output != null && p->output[0] != 0) {
+        b->add("-o");
+        b->add(p->output);
+        b->outPath = (p->output[0] == '/') ? asys.strDup(p->output) : asys.join(p->root, p->output);
+    } else {
+        char* dn = p->defaultOutputName(source);
+        b->outPath = asys.join(p->root, dn);
+        asys.free(dn);
+    }
+    if (!check) {
+        b->add("-r");
+        b->add(p->release ? "release" : "debug");
+        b->add("-v");
+        char v[24];
+        format(&v[0], 24, "%d", p->version);
+        b->add(&v[0]);
+        if (p->target != null && p->target[0] != 0) {
+            b->add("-t");
+            b->add(p->target);
+        }
+    }
+    if (p->flags != null && p->flags[0] != 0) {
+        Words w(p->flags);
+        for (int i = 0; i < w.count; i++) { b->add(w.argv[i]); }
+        w.dispose();
+    }
+    b->display = commandLineText(b->argv, b->argc);
+    return b;
+}
+
+// A new folder of an unpredictable name for the output of Check syntax: `ac -o` follows links, so a name that somebody could have prepared
+// (a link in /tmp) must not be used. mkdir fails when something of that name exists. The folder is in $TMPDIR (default /tmp), mode 0700.
+// A new string, null when no folder could be made.
+public char* makeCheckDir() {
+    char* base = asys.getenv("TMPDIR");
+    if (base == null || base[0] != '/' || !asys.isDir(base)) { asys.free(base); base = asys.strDup("/tmp"); }
+    int bl = strlen(base);
+    while (bl > 1 && base[bl - 1] == '/') { base[bl - 1] = 0; bl--; }
+    char* result = null;
+    for (int attempt = 0; attempt < 8 && result == null; attempt++) {
+        char rb[8];
+        asys.randomBytes(&rb[0], 6);
+        char hex[16];
+        char* digits = "0123456789abcdef";
+        for (int i = 0; i < 6; i++) { hex[i * 2] = digits[(rb[i] >> 4) & 15]; hex[i * 2 + 1] = digits[rb[i] & 15]; }
+        hex[12] = 0;
+        char name[80];
+        format(&name[0], 80, "/aide-check-%d-%s", selfPid(), &hex[0]);
+        char* d = asys.join((bl == 1) ? "" : base, &name[0]);
+        int r = asys.mkdir(d, 448);
+        if (r == 0) { result = d; }
+        else {
+            asys.free(d);
+            if (r != -asys.EEXIST) { break; }
+        }
+    }
+    asys.free(base);
+    return result;
+}
+
+// the command that runs a program in a shell for a run configuration: cd 'DIR' && NAME=value 'PROGRAM' args    (a new string)
+public char* runShellLine(char* cwd, char* env, char* program, char* args) {
+    char* q1 = shellQuote(cwd);
+    char* q2 = shellQuote(program);
+    Words ew(env);
+    int cap = strlen(q1) + strlen(q2) + strlen(args) + strlen(env) * 2 + 80;
+    char* out = asys.alloc(cap + ew.count * 4);
+    int o = format(out, cap, "cd %s && ", q1);
+    for (int i = 0; i < ew.count; i++) {
+        char* eq = ew.argv[i];
+        int k = indexOf(eq, '=');
+        if (k <= 0) { continue; }
+        char* val = shellQuote(&eq[k + 1]);
+        eq[k] = 0;
+        o = o + format(&out[o], cap + ew.count * 4 - o, "%s=%s ", eq, val);
+        asys.free(val);
+    }
+    o = o + format(&out[o], cap + ew.count * 4 - o, "%s %s", q2, args);
+    ew.dispose();
+    asys.free(q1);
+    asys.free(q2);
+    return out;
+}
+
+// ---- snippets --------------------------------------------------------------------------------------------------------------------------------
+// A snippet is text with one $0 marker: where the caret goes. Groups of four spaces at the start of a line become the indent unit of the
+// document, and every line gets the indentation of the line the snippet is inserted in. User snippets are in SNIPPETS.INI in the
+// configuration directory:   name = text  (\n for a line break, \t for a tab, \\ for a backslash).
+public class SnippetSet {
+    public char** names;
+    public char** infos;
+    public char** texts;
+    public int count;
+    private int cap;
+
+    public SnippetSet() {
+        cap = 64;
+        names = (char**) asys.alloc(cap * 8);
+        infos = (char**) asys.alloc(cap * 8);
+        texts = (char**) asys.alloc(cap * 8);
+        addBuiltin();
+    }
+
+    // adds (or replaces) a snippet; the strings are copied
+    public void add(char* name, char* info, char* text) {
+        for (int i = 0; i < count; i++) {
+            if (streq(names[i], name)) {
+                asys.free(infos[i]);
+                asys.free(texts[i]);
+                infos[i] = asys.strDup(info);
+                texts[i] = asys.strDup(text);
+                return;
+            }
+        }
+        if (count == cap) {
+            cap = cap * 2;
+            names = (char**) asys.realloc((char*) names, cap * 8);
+            infos = (char**) asys.realloc((char*) infos, cap * 8);
+            texts = (char**) asys.realloc((char*) texts, cap * 8);
+        }
+        names[count] = asys.strDup(name);
+        infos[count] = asys.strDup(info);
+        texts[count] = asys.strDup(text);
+        count++;
+    }
+
+    private void addBuiltin() {
+        add("main", "main function", "int main() {\n    $0\n    return 0;\n}\n");
+        add("mainargs", "main with arguments", "int main(int argc, char** argv) {\n    $0\n    return 0;\n}\n");
+        add("for", "counting loop", "for (int i = 0; i < $0; i++) {\n    \n}\n");
+        add("while", "while loop", "while ($0) {\n    \n}\n");
+        add("do", "do while loop", "do {\n    $0\n} while (false);\n");
+        add("if", "if statement", "if ($0) {\n    \n}\n");
+        add("ifelse", "if / else", "if ($0) {\n    \n} else {\n    \n}\n");
+        add("switch", "switch statement", "switch ($0) {\n    case 0:\n        break;\n    default:\n        break;\n}\n");
+        add("class", "class with a constructor", "class $0 {\npublic:\n    int value;\n\n    $0() {\n    }\n}\n");
+        add("struct", "struct", "struct $0 {\n    int x;\n    int y;\n}\n");
+        add("enum", "enum", "enum $0 {\n    First,\n    Second\n}\n");
+        add("func", "function", "int $0(int a, int b) {\n    return a + b;\n}\n");
+        add("println", "print a line", "println(\"$0\");\n");
+        add("printf", "formatted output", "printf(\"$0\\n\");\n");
+        add("import", "import a module", "import $0;\n");
+        add("module", "module header", "module $0;\n");
+        add("guimain", "a window with a button (import gui;)", "gui.Display* d = gui.connect(null);\ngui.Window* w = d->createWindow(\"$0\", 320, 200, 0);\ngui.Box* col = gui.vbox(10, 14);\ncol->add(new gui.Label(\"Hello\"));\nw->setRoot(col);\nw->fit();\nd->run();\n");
+    }
+
+    public int find(char* name) {
+        for (int i = 0; i < count; i++) {
+            if (streq(names[i], name)) { return i; }
+        }
+        return -1;
+    }
+
+    // reads the user's snippets (CONFIGDIR/snippets.ini); returns how many were added
+    public int load(char* configDir) {
+        char* f = asys.join(configDir, "snippets.ini");
+        int len = 0;
+        char* text = asys.readFile(f, &len, 262144, null);
+        asys.free(f);
+        if (text == null) { return 0; }
+        int before = count;
+        atheme.parseIni(text, len, snippetEntry, (int) this);
+        asys.free(text);
+        return count - before;
+    }
+
+    // expands the escapes of a stored snippet (\n \t \\) into real characters
+    public void addEscaped(char* name, char* escaped) {
+        int n = strlen(escaped);
+        char* t = asys.alloc(n + 1);
+        int o = 0;
+        for (int i = 0; i < n; i++) {
+            if (escaped[i] == 92 && i + 1 < n) {
+                i++;
+                if (escaped[i] == 'n') { t[o] = 10; }
+                else if (escaped[i] == 't') { t[o] = 9; }
+                else { t[o] = escaped[i]; }
+            } else { t[o] = escaped[i]; }
+            o++;
+        }
+        t[o] = 0;
+        add(name, "user snippet", t);
+        asys.free(t);
+    }
+
+    // inserts snippet idx at the caret of the editor (replacing the typed word from offset `from` when from >= 0); the caret goes to the
+    // $0 marker (or the end). Returns false when there is no such snippet or the buffer is read only.
+    public bool insert(acode.Buffer* b, acode.Editor* ed, int idx, int from) {
+        if (idx < 0 || idx >= count || b->readOnly) { return false; }
+        int caret = ed->caret();
+        int start = (from >= 0) ? from : caret;
+        int ln = b->lineAt(start);
+        int ls = b->lineStart(ln);
+        char indent[200];
+        int il = 0;
+        int p = ls;
+        while (p < start && il < 190 && (b->byteAt(p) == ' ' || b->byteAt(p) == 9)) { indent[il] = b->byteAt(p); il++; p++; }
+        indent[il] = 0;
+        char unit[70];
+        int ul = 0;
+        if (ed->useTabs) { unit[0] = 9; ul = 1; }
+        else { ul = imax(1, imin(ed->indentWidth, 64)); for (int i = 0; i < ul; i++) { unit[i] = ' '; } }
+        unit[ul] = 0;
+        char* src = texts[idx];
+        int sl = strlen(src);
+        if (sl > 0 && src[sl - 1] == 10) { sl--; }            // a snippet that ends with a line break ends where the line ends
+        char* out = asys.alloc(sl * 4 + 400);
+        int o = 0;
+        int marker = -1;
+        for (int i = 0; i < sl; i++) {
+            if (src[i] == '$' && src[i + 1] == '0') {
+                if (marker < 0) { marker = o; }
+                else {
+                    // a second $0 repeats the text that was typed at the first one: there is none, so it is left out
+                }
+                i++;
+                continue;
+            }
+            if (src[i] == 10) {
+                out[o] = 10; o++;
+                memcpy(&out[o], &indent[0], il); o = o + il;
+                int k = i + 1;
+                while (src[k] == ' ' && src[k + 1] == ' ' && src[k + 2] == ' ' && src[k + 3] == ' ') {
+                    memcpy(&out[o], &unit[0], ul); o = o + ul;
+                    k = k + 4;
+                }
+                i = k - 1;
+                continue;
+            }
+            out[o] = src[i];
+            o++;
+        }
+        out[o] = 0;
+        if (marker < 0 || marker > o) { marker = o; }
+        if (from >= 0) { ed->setSelection(from, caret); }
+        ed->insertText(out, o);
+        ed->setCursor(start + marker);
+        asys.free(out);
+        return true;
+    }
+
+    // Tab after a snippet word: the word before the caret (only blanks before it on the line) is replaced by the snippet of that name.
+    // False when the word is no snippet name.
+    public bool expandWord(acode.Buffer* b, acode.Editor* ed) {
+        int caret = ed->caret();
+        int st = asyntax.prefixStart(b, caret);
+        if (st == caret || caret - st > 40) { return false; }
+        int ls = b->lineStart(b->lineAt(st));
+        for (int p = ls; p < st; p++) {
+            int c = b->byteAt(p);
+            if (c != ' ' && c != 9) { return false; }
+        }
+        char w[48];
+        for (int i = 0; i < caret - st; i++) { w[i] = b->byteAt(st + i); }
+        w[caret - st] = 0;
+        int idx = find(&w[0]);
+        if (idx < 0) { return false; }
+        return insert(b, ed, idx, st);
+    }
+
+    public void dispose() {
+        for (int i = 0; i < count; i++) {
+            asys.free(names[i]);
+            asys.free(infos[i]);
+            asys.free(texts[i]);
+        }
+        asys.free((char*) names);
+        asys.free((char*) infos);
+        asys.free((char*) texts);
+        names = null;
+        infos = null;
+        texts = null;
+        count = 0;
+    }
+}
+
+int snippetEntry(int user, char* section, char* key, char* value) {
+    SnippetSet* s = (SnippetSet*) user;
+    bool word = key[0] != 0 && strlen(key) < 40;
+    for (int i = 0; word && key[i] != 0; i++) {
+        int c = key[i];
+        word = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+    }
+    if (word) { s->addEscaped(key, value); }
+    return 0;
+}
+
+// ---- projects from templates ------------------------------------------------------------------------------------------------------------------
+public const TPL_HELLO = 0;
+public const TPL_CONSOLE = 1;
+public const TPL_GUI = 2;
+public const TPL_SERVER = 3;
+public const TPL_COUNT = 4;
+
+public char* templateName(int kind) {
+    if (kind == TPL_HELLO) { return "Hello world"; }
+    if (kind == TPL_CONSOLE) { return "Console application"; }
+    if (kind == TPL_GUI) { return "GUI application"; }
+    if (kind == TPL_SERVER) { return "Network server"; }
+    return "";
+}
+
+public char* templateInfo(int kind) {
+    if (kind == TPL_HELLO) { return "One file that prints a greeting."; }
+    if (kind == TPL_CONSOLE) { return "Reads lines from the standard input, takes arguments, uses functions."; }
+    if (kind == TPL_GUI) { return "A window with a label, a text field and a button (needs the display server)."; }
+    if (kind == TPL_SERVER) { return "A small web server on port 8080 (http module)."; }
+    return "";
+}
+
+// The source of the main file of a template (a new string; the name of the project is written into the comment at the top)
+public char* templateSource(int kind, char* projectName) {
+    char* body = "";
+    if (kind == TPL_HELLO) {
+        body = "int main() {\n    println(\"Hello, world!\");\n    return 0;\n}\n";
+    } else if (kind == TPL_CONSOLE) {
+        body = "// Counts the lines and words that arrive on the standard input.\n//   echo \"some words\" | ./PROGRAM\n//   ./PROGRAM --shout   writes the result in capital letters\n"
+            "int countWords(char* line) {\n    int n = 0;\n    bool inWord = false;\n    for (int i = 0; line[i] != 0; i++) {\n"
+            "        if (isSpace(line[i])) {\n            inWord = false;\n        } else if (!inWord) {\n            inWord = true;\n            n++;\n        }\n    }\n    return n;\n}\n\n"
+            "int main(int argc, char** argv) {\n    bool shout = false;\n    for (int i = 1; i < argc; i++) {\n        if (streq(argv[i], \"--shout\")) { shout = true; }\n    }\n"
+            "    int lines = 0;\n    int words = 0;\n    char line[1024];\n    while (readLine(line, 1024) >= 0) {\n        lines++;\n        words = words + countWords(line);\n    }\n"
+            "    if (shout) {\n        printf(\"%d LINES, %d WORDS\\n\", lines, words);\n    } else {\n        printf(\"%d lines, %d words\\n\", lines, words);\n    }\n    return 0;\n}\n";
+    } else if (kind == TPL_GUI) {
+        body = "import gui;\n\ngui.Label* greeting;\ngui.TextBox* nameBox;\n\nint greet(int self) {\n    char text[200];\n    format(&text[0], 200, \"Hello, %s!\", nameBox->text());\n    greeting->setText(&text[0]);\n    return 0;\n}\n\n"
+            "int main() {\n    gui.Display* d = gui.connect(null);              // the display server named by ADISPLAY\n    if (d == null) {\n        println(\"no display server (start adisplayd, or run this from the desktop)\");\n        return 1;\n    }\n"
+            "    gui.Window* w = d->createWindow(\"PROGRAM\", 320, 160, 0);\n    gui.Box* col = gui.vbox(10, 14);\n    greeting = new gui.Label(\"What is your name?\");\n    nameBox = new gui.TextBox();\n    gui.Button* b = new gui.Button(\"Greet\");\n"
+            "    b->primary = true;\n    b->onClick = greet;\n    col->add(greeting);\n    col->add(nameBox);\n    col->add(b);\n    w->setRoot(col);\n    w->fit();\n    d->run();                                         // until the window is closed\n    return 0;\n}\n";
+    } else if (kind == TPL_SERVER) {
+        body = "// A small web server:  http://localhost:8080/hello?name=World      stop it with Ctrl+C or the Stop button\nimport http;\nimport net;\n\n"
+            "void handler(http.Request* q, int client) {\n    if (streq(&q->path[0], \"/hello\")) {\n        char name[64];\n        if (!http.queryValue(q, \"name\", name, 64)) { strcpy(name, \"stranger\"); }\n"
+            "        char body[160];\n        format(body, 160, \"<h1>Hello, %s!</h1>\", name);\n        http.respond(client, 200, \"text/html\", body);\n    } else {\n        http.respond(client, 404, \"text/plain\", \"not found\");\n    }\n}\n\n"
+            "int main() {\n    println(\"listening on http://localhost:8080/hello?name=World\");\n    http.serve(8080, handler, 0);\n    return 0;\n}\n";
+    }
+    // PROGRAM in the text is the name of the program that the project builds
+    char* prog = asys.alloc(strlen(projectName) + 40);
+    format(prog, strlen(projectName) + 40, "%s-1-debug.elf", projectName);
+    int bl = strlen(body);
+    int pl = strlen(prog);
+    char* out = asys.alloc(bl + 200 + 6 * pl);
+    int o = 0;
+    for (int i = 0; i < bl; i++) {
+        if (body[i] == 'P' && startsWith(&body[i], "PROGRAM")) {
+            if (kind == TPL_GUI) { memcpy(&out[o], projectName, strlen(projectName)); o = o + strlen(projectName); }
+            else { memcpy(&out[o], prog, pl); o = o + pl; }
+            i = i + 6;
+        } else {
+            out[o] = body[i];
+            o++;
+        }
+    }
+    out[o] = 0;
+    asys.free(prog);
+    return out;
+}
+
+// is this a usable name for a project folder? (letters, digits, - _ . ; not empty, not longer than 48)
+public bool validProjectName(char* name) {
+    int n = strlen(name);
+    if (n == 0 || n > 48 || name[0] == '.') { return false; }
+    for (int i = 0; i < n; i++) {
+        int c = name[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        if (!ok) { return false; }
+    }
+    return true;
+}
+
+// Makes a project from a template: the folder `dir` (made when needed, it must not contain main.a or .aide already), main.a, README.md
+// and the file .aide. *mainPath gets the absolute path of main.a (a new string). Returns 0 or -errno (-EEXIST: the files exist).
+public int newProject(int kind, char* dir, char* name, char** mainPath) {
+    if (kind < 0 || kind >= TPL_COUNT || !validProjectName(name)) { return -asys.EINVAL; }
+    int r = asys.mkdirs(dir);
+    if (r < 0 && !asys.isDir(dir)) { return r; }
+    char* mainFile = asys.join(dir, "main.a");
+    char* proj = asys.join(dir, ".aide");
+    if (asys.exists(mainFile) || asys.exists(proj)) {
+        asys.free(mainFile);
+        asys.free(proj);
+        return -asys.EEXIST;
+    }
+    char* src = templateSource(kind, name);
+    r = asys.writeFileAtomic(mainFile, src, strlen(src), 420, asys.W_NOSYNC);
+    asys.free(src);
+    if (r >= 0) {
+        char readme[600];
+        int n = format(&readme[0], 600, "# %s\n\n%s\n\nCreated by AIDE from the template \"%s\".\n\nBuild with F7, run with F5 (Build menu). The settings are in the file .aide.\n", name, templateInfo(kind), templateName(kind));
+        char* rf = asys.join(dir, "README.md");
+        asys.writeFileAtomic(rf, &readme[0], n, 420, asys.W_NOSYNC);
+        asys.free(rf);
+        Project p();
+        p.root = asys.strDup(dir);
+        setStr(&p.name, name);
+        setStr(&p.mainFile, "main.a");
+        r = p.save();
+        p.dispose();
+    }
+    if (r < 0) {
+        asys.free(mainFile);
+        return r;
+    }
+    if (mainPath != null) { *mainPath = mainFile; } else { asys.free(mainFile); }
+    return 0;
+}
+
+// ---- copies of unsaved work (recovery) ---------------------------------------------------------------------------------------------------
+// Every few seconds an instance writes the unsaved documents to CONFIG/recovery/PID-ID.rec (a header of three lines: AIDE-RECOVERY 1,
+// the path, the title; then the text) and touches a liveness mark. After a crash the next start finds records whose process is gone
+// (the mark is older than a minute, or the process does not exist). Both front ends of AIDE use this format.
+public class RecoveryItem {
+    public char* file;                      // full path of the record
+    public char* path;                      // the path of the document ("" for a new one)
+    public char* title;
+    public char* text;                      // points into raw
+    public int len;
+    public char* raw;
+}
+
+public class Recovery {
+    public char* dir;
+    public RecoveryItem** items;            // what scan() found
+    public int count;
+    private char* lockBase;
+
+    public Recovery(char* configDir) {
+        dir = asys.join(configDir, "recovery");
+        lockBase = asys.isAos() ? asys.strDup("/tmp") : asys.strDup(dir);
+    }
+
+    public char* recordPath(int id) {
+        char name[60];
+        format(&name[0], 60, "%d-%d.rec", selfPid(), id);
+        return asys.join(dir, &name[0]);
+    }
+
+    // writes the copy of a document (id: any number that is unique among the documents of this process); 0 or -errno
+    public int save(int id, char* path, char* title, char* text, int len) {
+        if (path != null && strlen(path) > 400) { return -asys.EINVAL; }
+        if (title != null && strlen(title) > 100) { return -asys.EINVAL; }
+        asys.mkdirs(dir);
+        char head[700];
+        int hn = format(&head[0], 700, "AIDE-RECOVERY 1\n%s\n%s\n", path != null ? path : "", title != null ? title : "");
+        char* data = asys.alloc(hn + len + 1);
+        memcpy(data, &head[0], hn);
+        memcpy(&data[hn], text, len);
+        char* f = recordPath(id);
+        int r = asys.writeFileAtomic(f, data, hn + len, 384, asys.W_NOSYNC);
+        asys.free(data);
+        asys.free(f);
+        return (r < 0) ? r : 0;
+    }
+
+    public void remove(int id) {
+        char* f = recordPath(id);
+        asys.unlink(f);
+        asys.free(f);
+    }
+
+    public char* lockPath(int pid) {
+        char name[60];
+        format(&name[0], 60, "aide-lock-%d", pid);
+        return asys.join(lockBase, &name[0]);
+    }
+
+    // "this instance is alive": the modification time of a small file; call it with every autosave
+    public void touchLock() {
+        asys.mkdirs(lockBase);
+        char* f = lockPath(selfPid());
+        char t[24];
+        int n = format(&t[0], 24, "%d", asys.nowMs() / 1000);
+        int fd = asys.fileOpen(f, asys.F_WRITE | asys.F_CREATE | asys.F_TRUNC | asys.F_NOFOLLOW | asys.F_CLOEXEC, 384);
+        if (fd >= 0) {
+            asys.fileWrite(fd, &t[0], n);
+            asys.fileClose(fd);
+        }
+        asys.free(f);
+    }
+
+    public void removeLock() {
+        char* f = lockPath(selfPid());
+        asys.unlink(f);
+        asys.free(f);
+    }
+
+    public bool instanceAlive(int pid) {
+        if (pid == selfPid()) { return true; }
+        char* f = lockPath(pid);
+        asys.Stat st;
+        bool fresh = false;
+        if (asys.stat(f, &st) == 0) { fresh = asys.nowMs() / 1000 - st.mtime < 60; }
+        asys.free(f);
+        if (!fresh) { return false; }
+        return processAlive(pid);
+    }
+
+    private void freeItems() {
+        for (int i = 0; i < count; i++) {
+            asys.free(items[i]->file);
+            asys.free(items[i]->path);
+            asys.free(items[i]->title);
+            asys.free(items[i]->raw);
+        }
+        asys.free((char*) items);
+        items = null;
+        count = 0;
+    }
+
+    // looks for the records of instances that are gone (also removes their liveness marks); the records are in items[0..count)
+    public int scan() {
+        freeItems();
+        items = (RecoveryItem**) asys.alloc(64 * 8);
+        asys.DirList dl;
+        if (asys.listDir(dir, &dl) < 0) { return 0; }
+        for (int i = 0; i < dl.count && count < 64; i++) {
+            char* nm = dl.name(i);
+            int l = strlen(nm);
+            if (l > 4 && streq(&nm[l - 4], ".rec")) {
+                int pid = atoi(nm);
+                if (pid <= 0 || instanceAlive(pid)) { continue; }
+                char* full = asys.join(dir, nm);
+                int len = 0;
+                char* t = asys.readFile(full, &len, 134217728, null);
+                if (t == null) { asys.free(full); continue; }
+                int p1 = 0;
+                while (p1 < len && t[p1] != 10) { p1++; }
+                int p2 = p1 + 1;
+                while (p2 < len && t[p2] != 10) { p2++; }
+                int p3 = p2 + 1;
+                while (p3 < len && t[p3] != 10) { p3++; }
+                if (p3 >= len || !startsWith(t, "AIDE-RECOVERY")) { asys.free(t); asys.unlink(full); asys.free(full); continue; }
+                RecoveryItem* it = new RecoveryItem();
+                it->file = full;
+                it->path = asys.strDupN(&t[p1 + 1], p2 - p1 - 1);
+                it->title = asys.strDupN(&t[p2 + 1], p3 - p2 - 1);
+                it->raw = t;
+                it->text = &t[p3 + 1];
+                it->len = len - p3 - 1;
+                items[count] = it;
+                count++;
+            }
+        }
+        dl.dispose();
+        return count;
+    }
+
+    // removes the marks of instances that are gone
+    public void sweepLocks() {
+        asys.DirList dl;
+        if (asys.listDir(lockBase, &dl) < 0) { return; }
+        for (int i = 0; i < dl.count; i++) {
+            char* nm = dl.name(i);
+            if (startsWith(nm, "aide-lock-")) {
+                int pid = atoi(&nm[10]);
+                if (pid > 0 && !instanceAlive(pid)) {
+                    char* f = asys.join(lockBase, nm);
+                    asys.unlink(f);
+                    asys.free(f);
+                }
+            }
+        }
+        dl.dispose();
+    }
+
+    // forgets item i (when it was taken or thrown away); with discard the record file is deleted
+    public void release(int i, bool discard) {
+        if (i < 0 || i >= count) { return; }
+        if (discard) { asys.unlink(items[i]->file); }
+    }
+
+    public void dispose() {
+        freeItems();
+        asys.free(dir);
+        asys.free(lockBase);
+        dir = null;
+        lockBase = null;
+    }
+}
+
+// ---- the session: the files that were open in a project ---------------------------------------------------------------------------------
+// CONFIG/sessions/HASH.ini (HASH from the project folder) holds the open files, their carets and the active file; the terminal AIDE reads and
+// writes the same file. The GUI keeps its own extras (split, panel sizes, the run configuration) in HASH.gui.ini.
+public class Session {
+    public char* root;
+    public char* path;                      // the common file
+    public char* guiPath;                   // the GUI extras
+    public char** files;
+    public int* lines;
+    public int* cols;
+    public int* scrollLines;
+    public int* scrollCols;
+    public int count;
+    public char* active;                    // the path of the active file ("" when none)
+    public bool wrap;
+    public char** extraKeys;
+    public char** extraVals;
+    public int nextra;
+    private int cap;
+
+    public Session(char* configDir, char* projectRoot) {
+        root = asys.strDup(projectRoot);
+        int h = 2166136261;
+        for (int i = 0; root[i] != 0; i++) { h = ((h ^ (root[i] & 255)) * 16777619) & 0xFFFFFFFF; }
+        char name[60];
+        format(&name[0], 60, "sessions/%x.ini", h);
+        path = asys.join(configDir, &name[0]);
+        format(&name[0], 60, "sessions/%x.gui.ini", h);
+        guiPath = asys.join(configDir, &name[0]);
+        cap = 16;
+        files = (char**) asys.alloc(cap * 8);
+        lines = (int*) asys.alloc(cap * 8);
+        cols = (int*) asys.alloc(cap * 8);
+        scrollLines = (int*) asys.alloc(cap * 8);
+        scrollCols = (int*) asys.alloc(cap * 8);
+        extraKeys = (char**) asys.alloc(32 * 8);
+        extraVals = (char**) asys.alloc(32 * 8);
+        active = asys.strDup("");
+    }
+
+    public void clear() {
+        for (int i = 0; i < count; i++) { asys.free(files[i]); }
+        count = 0;
+        setStr(&active, "");
+        for (int i = 0; i < nextra; i++) {
+            asys.free(extraKeys[i]);
+            asys.free(extraVals[i]);
+        }
+        nextra = 0;
+    }
+
+    public void add(char* file, int line, int col, int sl, int sc) {
+        if (count == cap) {
+            cap = cap * 2;
+            files = (char**) asys.realloc((char*) files, cap * 8);
+            lines = (int*) asys.realloc((char*) lines, cap * 8);
+            cols = (int*) asys.realloc((char*) cols, cap * 8);
+            scrollLines = (int*) asys.realloc((char*) scrollLines, cap * 8);
+            scrollCols = (int*) asys.realloc((char*) scrollCols, cap * 8);
+        }
+        files[count] = asys.strDup(file);
+        lines[count] = line;
+        cols[count] = col;
+        scrollLines[count] = sl;
+        scrollCols[count] = sc;
+        count++;
+    }
+
+    public void setExtra(char* key, char* value) {
+        for (int i = 0; i < nextra; i++) {
+            if (streq(extraKeys[i], key)) { setStr(&extraVals[i], value); return; }
+        }
+        if (nextra >= 32) { return; }
+        extraKeys[nextra] = asys.strDup(key);
+        extraVals[nextra] = asys.strDup(value);
+        nextra++;
+    }
+
+    public void setExtraInt(char* key, int v) {
+        char t[24];
+        format(&t[0], 24, "%d", v);
+        setExtra(key, &t[0]);
+    }
+
+    // the extra value of a key ("" when there is none)
+    public char* extra(char* key) {
+        for (int i = 0; i < nextra; i++) {
+            if (streq(extraKeys[i], key)) { return extraVals[i]; }
+        }
+        return "";
+    }
+
+    public int extraInt(char* key, int fallback) {
+        char* v = extra(key);
+        if (v[0] == 0) { return fallback; }
+        return atoi(v);
+    }
+
+    // writes both files (the folder is made when needed); 0 or -errno
+    public int save() {
+        char* dir = dirName(path);
+        asys.mkdirs(dir);
+        asys.free(dir);
+        int total = 0;
+        for (int i = 0; i < count; i++) { total = total + strlen(files[i]) + 60; }
+        int capb = 1024 + total + strlen(root) + strlen(active);
+        char* buf = asys.alloc(capb);
+        int n = format(buf, capb, "[session]\nroot = %s\nactive = %s\nwrap = %s\n", root, active, wrap ? "true" : "false");
+        for (int i = 0; i < count; i++) {
+            if (strlen(files[i]) > 500) { continue; }
+            n = n + format(&buf[n], capb - n, "file = \"%s\"\npos = %d,%d,%d,%d\n", files[i], lines[i], cols[i], scrollLines[i], scrollCols[i]);
+        }
+        int r = asys.writeFileAtomic(path, buf, n, 420, asys.W_NOSYNC);
+        asys.free(buf);
+        if (r < 0) { return r; }
+        int ecap = 256;
+        for (int i = 0; i < nextra; i++) { ecap = ecap + strlen(extraKeys[i]) + strlen(extraVals[i]) + 8; }
+        char* eb = asys.alloc(ecap);
+        int en = format(eb, ecap, "[gui]\n");
+        for (int i = 0; i < nextra; i++) { en = en + format(&eb[en], ecap - en, "%s = %s\n", extraKeys[i], extraVals[i]); }
+        r = asys.writeFileAtomic(guiPath, eb, en, 420, asys.W_NOSYNC);
+        asys.free(eb);
+        return (r < 0) ? r : 0;
+    }
+
+    // reads both files; 0, or -errno when there is no session file
+    public int load() {
+        clear();
+        int len = 0;
+        int err = 0;
+        char* text = asys.readFile(path, &len, 1048576, &err);
+        int result = 0;
+        if (text == null) {
+            result = (err < 0) ? err : -asys.ENOENT;
+        } else {
+            atheme.parseIni(text, len, sessionLine, (int) this);
+            asys.free(text);
+        }
+        text = asys.readFile(guiPath, &len, 262144, null);
+        if (text != null) {
+            atheme.parseIni(text, len, sessionGuiLine, (int) this);
+            asys.free(text);
+        }
+        return result;
+    }
+
+    public void dispose() {
+        clear();
+        asys.free(root);
+        asys.free(path);
+        asys.free(guiPath);
+        asys.free(active);
+        asys.free((char*) files);
+        asys.free((char*) lines);
+        asys.free((char*) cols);
+        asys.free((char*) scrollLines);
+        asys.free((char*) scrollCols);
+        asys.free((char*) extraKeys);
+        asys.free((char*) extraVals);
+        root = null;
+    }
+}
+
+int sessionLine(int user, char* section, char* key, char* value) {
+    Session* s = (Session*) user;
+    if (streqi(key, "file")) {
+        if (value[0] != 0) { s->add(value, 0, 0, 0, 0); }
+    } else if (streqi(key, "pos") && s->count > 0) {
+        int v[4];
+        int k = 0;
+        int cur = 0;
+        for (int i = 0; ; i++) {
+            if (value[i] >= '0' && value[i] <= '9') { cur = cur * 10 + (value[i] - '0'); }
+            else {
+                if (k < 4) { v[k] = cur; k++; }
+                cur = 0;
+                if (value[i] == 0) { break; }
+            }
+        }
+        int at = s->count - 1;
+        if (k >= 2) { s->lines[at] = v[0]; s->cols[at] = v[1]; }
+        if (k >= 4) { s->scrollLines[at] = v[2]; s->scrollCols[at] = v[3]; }
+    } else if (streqi(key, "active")) {
+        setStr(&s->active, value);
+    } else if (streqi(key, "wrap")) {
+        s->wrap = boolOf(value);
+    }
+    return 0;
+}
+
+int sessionGuiLine(int user, char* section, char* key, char* value) {
+    Session* s = (Session*) user;
+    s->setExtra(key, value);
+    return 0;
+}
+
+// ---- user interface scale ------------------------------------------------------------------------------------------------------------------
+// the sizes the text of the interface can be scaled to (percent of the normal size)
+public int scaleCount() { return 6; }
+
+public int scaleAt(int i) {
+    if (i == 0) { return 85; }
+    if (i == 1) { return 100; }
+    if (i == 2) { return 115; }
+    if (i == 3) { return 130; }
+    if (i == 4) { return 150; }
+    return 200;
+}
+
+// the nearest allowed scale (percent) for any number
+public int nearestScale(int percent) {
+    int best = 100;
+    int bd = 1000000;
+    for (int i = 0; i < scaleCount(); i++) {
+        int d = scaleAt(i) - percent;
+        if (d < 0) { d = -d; }
+        if (d < bd) { bd = d; best = scaleAt(i); }
+    }
+    return best;
+}
