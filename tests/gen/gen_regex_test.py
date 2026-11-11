@@ -30,6 +30,14 @@ CASES = [
     ("(a*)*", "b"), ("(a*)+", "b"), ("(a*)*", "aab"), ("(a|)+", "b"), ("(a?)*b", "aab"), ("(a*?)*", "aa"), ("(a*){2,3}", "aa"),
     ("(?:a*)*", "aaa"), ("(a*)*?b", "aab"), ("(a*)+?b", "aab"), ("(|a)+", "aa"), ("(a*|b)*", "abab"), ("(a|b*)*c", "abbc"),
     ("(?:(a)|b)*", "ab"), ("(a?)+", "aa"), ("(a?){3}", "a"), ("(a*)*$", "aa"), ("((a*)b?)*", "aabab"),
+    # bounded repeats of a group that can match the empty string (an empty iteration beyond the minimum ends the repetition),
+    # and empty matches that have priority over non-empty ones (lazy quantifiers, an empty first alternative): the replace loop must
+    # find the non-empty match at the place of an empty one, like Python 3.7+
+    ("(?:b?|xb){1,3}b", "xbbb"), ("(b?|xb){1,3}b", "xbbb"), ("(c{0,2}a??){1,3}.b", "caabcbcc"), ("(|b){1,2}b", "bb"),
+    ("(|b){2,3}c", "bbc"), ("(b?|.b){1,3}(b)", "cbbb"), ("(c{0,2}?|.b){1,3}(b)", "cbbbacccacc"), ("(a|){1,3}b", "aab"),
+    ("(?:a?|b){2,4}c", "abac"), ("(x?|b){1,2}b", "bb"), ("(a??){2,3}b", "aab"), ("(?:a|b?){0,3}c", "abc"), ("(a|b|){3}c", "abc"),
+    ("a*?", "aab"), ("x*|b", "ab"), ("a??", "aab"), ("(?:|a)", "aab"), ("(a)|", "ab"), ("(?:)|a", "aab"), ("a*?b?", "aabb"),
+    ("(a*?)(b?)", "aabb"), (r"\d*|b", "ab"), ("(a|ab)*?", "abab"), ("b*?|a", "baa"),
     # word boundaries, lookahead, flags
     (r"\bfoo\b", "a foo b"), (r"\Boo", "foo"), (r"\bfoo\b", "foobar"), ("foo(?=bar)", "foobar foobaz"), ("foo(?!bar)", "foobar foobaz"),
     (r"(?=(a+))a*b\1", "baaabac"), (r"(?i)abc", "xABCx"), (r"(?i:a)b", "Ab"), (r"(?i:a)b", "AB"), (r"(?s)a.b", "a\nb"), ("a.b", "a\nb"),

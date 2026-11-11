@@ -1,7 +1,9 @@
 // asys allocator fuzz: 6000 random alloc / realloc / free operations on up to 100 live blocks of all size classes (1 byte to 3 MB),
 // checked against a pattern that every block carries: contents survive realloc (grow and shrink, small <-> big), fresh memory
 // and the part added by realloc is zero, nothing overlaps, blockSize is at least what was asked, and when everything is freed the
-// counters are back where they started. Deterministic (a fixed seed).
+// counters are back where they started. It runs twice: with the platform's own treatment of big blocks (unmapped when freed, except on
+// Windows and AOS) and with the AOS / Windows treatment forced (asys.setKeepBigBlocks(1): freed big blocks stay in free lists and are
+// reused: the AOS kernel's mmap area only grows, so unmapping would use it up). Deterministic (a fixed seed).
 import asys;
 
 int checks;
@@ -76,10 +78,13 @@ bool zeroRange(char* p, int from, int to) {
     return to <= from || p[to - 1] == 0;
 }
 
-int main() {
+void fuzz(char* label, int mode) {
+    asys.setKeepBigBlocks(mode);
+    printf("%s\n", label);
     int baseUse = asys.memInUse();
     int baseBlocks = asys.memBlocks();
     int baseMapped = asys.memMapped();
+    int baseBad = asys.memBadFrees();
     bool patternsOk = true;
     bool zeroOk = true;
     bool sizeOk = true;
@@ -158,8 +163,102 @@ int main() {
     checkEq(asys.memInUse(), baseUse, "memInUse is back");
     checkEq(asys.memBlocks(), baseBlocks, "memBlocks is back");
     int grown = asys.memMapped() - baseMapped;
-    check(asys.platform() == asys.OS_WINDOWS || (grown % 2097152 == 0 && grown <= 16 * 1024 * 1024), "only whole 2 MiB chunks of small blocks stay mapped: every big block went back to the system");
-    checkEq(asys.memBadFrees(), 0, "no bad frees");
+    if (asys.keepsBigBlocks()) {
+        check(grown <= 64 * 1024 * 1024, "freed big blocks are kept for reuse: at most the blocks of the run stay mapped");
+    } else {
+        check(grown % 2097152 == 0 && grown <= 16 * 1024 * 1024, "only whole 2 MiB chunks of small blocks stay mapped: every big block went back to the system");
+    }
+    checkEq(asys.memBadFrees() - baseBad, 0, "no bad frees");
+    asys.setKeepBigBlocks(0);
+}
+
+// The AOS problem in miniature: its kernel never takes mmap address space back (and allows only 32 mappings per process), so
+// thousands of alloc + free cycles of a big block ran the process out of address space (alloc returned null with nothing in use).
+// With kept blocks the cycles reuse one block. Two tiers exist in this mode: blocks up to a quarter of the next chunk (512 KiB at first,
+// growing to 8 MiB) are carved from chunks, bigger ones are mapped on their own and kept in free lists when freed.
+void keepCycle() {
+    asys.setKeepBigBlocks(1);
+    int base = asys.memInUse();
+    int mapped0 = asys.memMapped();
+    bool allOk = true;
+    char* first = null;
+    bool same = true;
+    for (int i = 0; i < 5000; i++) {
+        char* p = asys.alloc(300000);
+        if (p == null) { allOk = false; break; }
+        if (first == null) { first = p; }
+        if (p != first) { same = false; }
+        p[0] = 1;
+        p[299999] = 1;
+        asys.free(p);
+    }
+    check(allOk, "5000 cycles of alloc(300000) + free never fail");
+    check(same, "and they all get the same block");
+    check(asys.memMapped() - mapped0 <= 8 * 1024 * 1024, "so no address space is used up");
+    checkEq(asys.memInUse(), base, "nothing is in use afterwards");
+    char* p = asys.alloc(300000);
+    p[1000] = 7;
+    p[150000] = 8;
+    p[299999] = 9;
+    asys.free(p);
+    char* q = asys.alloc(300000);
+    check(q == p, "the freed block is handed out again");
+    check(zeroRange(q, 0, 300000), "and it is zero (every byte)");
+    asys.free(q);
+
+    // the tier of blocks with their own mapping (over 8 MiB): 30 cycles map one block
+    int m1 = asys.memMapped();
+    bool bigOk = true;
+    char* firstBig = null;
+    bool sameBig = true;
+    for (int i = 0; i < 30; i++) {
+        char* b = asys.alloc(30000000);
+        if (b == null) { bigOk = false; break; }
+        if (firstBig == null) { firstBig = b; }
+        if (b != firstBig) { sameBig = false; }
+        b[0] = 1;
+        b[29999999] = 1;
+        asys.free(b);
+    }
+    check(bigOk && sameBig, "30 cycles of a 30 MB block always get the same block");
+    check(asys.memMapped() - m1 <= 34 * 1024 * 1024, "and map only one");
+    char* big = asys.alloc(30000000);
+    big[12345] = 5;
+    big[29000000] = 6;
+    asys.free(big);
+    char* big2 = asys.alloc(30000000);
+    check(big2 == big && zeroRange(big2, 0, 30000000), "a reused 30 MB block is zero again");
+    // a smaller request takes a free block that is at most two size classes bigger, a much smaller one gets a block of its own
+    asys.free(big2);
+    int m2 = asys.memMapped();
+    char* r = asys.alloc(26000000);
+    check(r == big2 && asys.memMapped() == m2, "a request one size class below reuses the free block");
+    check(asys.blockSize(r) >= 30000000, "(it got the bigger block)");
+    asys.free(r);
+    char* r2 = asys.alloc(12000000);
+    check(r2 != r && asys.memMapped() > m2 && asys.blockSize(r2) < 20000000, "a request far below does not waste it: a new block");
+    // growing by realloc (a text buffer doubling) keeps the content
+    char* g = asys.alloc(200000);
+    g[0] = 5;
+    g[199999] = 6;
+    g = asys.realloc(g, 2000000);
+    check(g != null && g[0] == 5 && g[199999] == 6 && zeroRange(g, 200000, 2000000), "realloc of a big block grows it and keeps its content");
+    g = asys.realloc(g, 20000000);
+    check(g != null && g[0] == 5 && g[199999] == 6 && zeroRange(g, 200000, 20000000), "and again, into a block of its own");
+    asys.free(g);
+    int bad0 = asys.memBadFrees();
+    asys.free(r2);
+    asys.free(r2);                      // a double free is ignored and counted
+    checkEq(asys.memBadFrees() - bad0, 1, "a double free of a kept block is ignored and counted once");
+    checkEq(asys.memInUse(), base, "everything is back");
+    asys.setKeepBigBlocks(0);
+}
+
+int main() {
+    keepCycle();                        // first: the free lists are still empty, so the sizes below are hermetic
+    fuzz("run 1: the platform's own treatment of big blocks", 0);
+    seed = 987654321;
+    fuzz("run 2: freed big blocks kept in free lists (AOS, Windows)", 1);
     printf("%d checks, %d failed\n", checks, fails);
     return fails == 0 ? 0 : 1;
 }

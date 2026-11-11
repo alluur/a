@@ -11,7 +11,9 @@
 //  Details   `.` and negated classes take a whole UTF-8 character; \w also matches every non-ASCII character; case
 //            folding (i) is for ASCII letters. `$` matches at the end of the text and before a final "\n" (like Python),
 //            with (?m) before every "\n". A repeated group that matched the empty string ends its repetition
-//            (Perl / Python: (a*)* on "b" matches "" once). A back reference to a group that did not take part fails to match.
+//            (Perl / Python: (a*)* on "b" matches "" once; in {m,n} an empty iteration beyond m ends it too). A back reference
+//            to a group that did not take part fails to match. \B matches in an empty text (Perl and Python 3.14 do; older
+//            Pythons do not).
 //            A back reference to a group that does not exist, an unclosed group, a bad range, "nothing to repeat" and a
 //            program that gets too large are compile errors (Regex.ok is false, Regex.error says why).
 //  Limits    a search stops after 5 million steps (Regex.exceeded) so that a pattern like (a+)+b cannot hang an editor.
@@ -23,12 +25,15 @@
 //    re->matchFull(text, len, &caps[0])                           // the whole text must match
 //    re->groupIndex("name")  re->groups  re->dispose()
 //
-//  The simple functions below compile the pattern every call (the last 8 patterns are cached):
+//  The simple functions below compile the pattern every call (the last 8 patterns are cached). The first four keep the OLD
+//  simple dialect of this module (F_SIMPLE): ( ) | { } are plain characters, a ^ that is not first and a $ that is not last are
+//  plain characters (so  regex.test("main()", line)  finds "main()", as a shell grep expects). Use compile() or replaceGroups for
+//  the full syntax; compile(pattern, F_SIMPLE) gives the old dialect as an object.
 //    bool regex.matches(pattern, text)            the whole text must match
 //    int  regex.search(pattern, text, &len)       start of the first match (or -1), len = its length
 //    bool regex.test(pattern, text)               matches anywhere
 //    char* regex.replaceAll(pattern, text, repl)  replaces every match by the text repl (as it is)
-//    char* regex.replaceGroups(pattern, text, repl)   the same, $0 .. $9 and ${n} in repl are the groups, $$ a dollar
+//    char* regex.replaceGroups(pattern, text, repl)   the full syntax; $0 .. $9 and ${n} in repl are the groups, $$ a dollar
 //    char* regex.quote(text)                      escapes everything special, so quote(s) matches exactly s
 // =============================================================================
 import asys;
@@ -38,6 +43,7 @@ public const MAXGROUPS = 32;
 public const F_ICASE = 1;
 public const F_MULTILINE = 2;
 public const F_DOTALL = 4;
+public const F_SIMPLE = 8;      // the old simple dialect: ( ) | { } are plain characters, ^ only at the start and $ only at the end are anchors
 
 private const OP_MATCH = 0;
 private const OP_CHAR = 1;
@@ -63,6 +69,7 @@ private const OP_LOOP = 20;
 private const OP_REP1 = 21;
 private const OP_LOOK = 22;
 private const OP_LOOKEND = 23;
+private const OP_EMPTYX = 24;
 
 private const N_EMPTY = 0;
 private const N_CHAR = 1;
@@ -149,6 +156,57 @@ private int decodeAt(char* t, int n, int pos, int len) {
     return v;
 }
 
+// The old simple dialect (the one the module had before groups and alternation were added) written in the full syntax: ( ) | { }
+// and a ^ that is not first or a $ that is not last are plain characters; sets [..] and escapes are copied as they are.
+private char* simpleToFull(char* p) {
+    int n = strlen(p);
+    char* out = asys.alloc(n * 2 + 2);
+    int o = 0;
+    int i = 0;
+    while (i < n) {
+        int c = p[i];
+        if (c == 92) {
+            out[o] = 92;
+            o++;
+            if (i + 1 < n) {
+                out[o] = p[i + 1];
+                o++;
+                i = i + 2;
+            } else {
+                out[o] = 92;                     // a lone backslash at the end is a backslash
+                o++;
+                i++;
+            }
+            continue;
+        }
+        if (c == '[') {
+            int j = i + 1;
+            if (j < n && p[j] == '^') { j++; }
+            if (j < n && p[j] == ']') { j++; }
+            while (j < n && p[j] != ']') {
+                if (p[j] == 92 && j + 1 < n) { j++; }
+                j++;
+            }
+            if (j < n) { j++; }
+            while (i < j) {
+                out[o] = p[i];
+                o++;
+                i++;
+            }
+            continue;
+        }
+        if (c == '(' || c == ')' || c == '|' || c == '{' || c == '}' || (c == '^' && i > 0) || (c == '$' && i + 1 < n)) {
+            out[o] = 92;
+            o++;
+        }
+        out[o] = c;
+        o++;
+        i++;
+    }
+    out[o] = 0;
+    return out;
+}
+
 public class Regex {
     public bool ok;
     public char* error;
@@ -201,7 +259,13 @@ public class Regex {
         ok = true;
         error = "";
         work = (int*) asys.alloc(8 * (2 * (MAXGROUPS + 1) + 2));
-        compileIt(pattern);
+        if ((fl & F_SIMPLE) != 0) {
+            char* full = simpleToFull(pattern);
+            compileIt(full);
+            asys.free(full);
+        } else {
+            compileIt(pattern);
+        }
     }
 
     // frees everything the object holds (the object itself is a few hundred bytes of ordinary heap)
@@ -1220,8 +1284,14 @@ public class Regex {
             fail("repeat count too large", ppos);
             return;
         }
-        int* ends = (int*) asys.alloc(extra * 8 + 8);
+        // The optional copies: like the loop of * and +, a copy that matched the empty string ends the repetition (Perl / Python:
+        // after an empty iteration beyond the minimum no further iteration is tried). OP_MARK remembers where a copy started and
+        // OP_EMPTYX after it jumps to the end when nothing was consumed; one register serves all copies (a mark is only needed
+        // until the end of its own copy).
+        int* ends = (int*) asys.alloc(extra * 16 + 16);
         int ne = 0;
+        int reg = nregs;
+        nregs++;
         for (int i = 0; i < extra && ok; i++) {
             int s = emit(OP_SPLIT);
             int a = emit(0);
@@ -1237,7 +1307,15 @@ public class Regex {
                 ends[ne] = b;
             }
             ne++;
+            emit(OP_MARK);
+            emit(reg);
             emitNode(kid);
+            if (i + 1 < extra) {
+                emit(OP_EMPTYX);
+                emit(reg);
+                ends[ne] = emit(0);
+                ne++;
+            }
         }
         if (ok) {
             for (int i = 0; i < ne; i++) {
@@ -1332,7 +1410,7 @@ public class Regex {
     private void compileIt(char* pattern) {
         plen = strlen(pattern);
         pat = asys.strDup(pattern);
-        pflags = flags;
+        pflags = flags & 7;
         nnodes = 1;                                       // node 0 means "none"
         ppos = 0;
         int root = parseAlt();
@@ -1548,6 +1626,14 @@ public class Regex {
                     } else {
                         if (!push(K_BRANCH, bodyPc, sp, 0, 0)) { return -2; }
                         pc = exitPc;
+                    }
+                    break;
+                }
+                case OP_EMPTYX: {
+                    if (sp == regs[code[pc + 1]]) {
+                        pc = code[pc + 2];                   // an empty iteration ends a bounded repetition
+                    } else {
+                        pc = pc + 3;
                     }
                     break;
                 }
@@ -1853,7 +1939,7 @@ private Regex* cached(char* pattern, int flags) {
 
 // start of the first match of pattern in text (-1 if none); *len = its length. A bad pattern finds nothing.
 public int search(char* pattern, char* text, int* len) {
-    Regex* r = cached(pattern, 0);
+    Regex* r = cached(pattern, F_SIMPLE);
     if (!r->ok) {
         return -1;
     }
@@ -1866,7 +1952,7 @@ public int search(char* pattern, char* text, int* len) {
 }
 
 public bool test(char* pattern, char* text) {
-    Regex* r = cached(pattern, 0);
+    Regex* r = cached(pattern, F_SIMPLE);
     if (!r->ok) {
         return false;
     }
@@ -1875,7 +1961,7 @@ public bool test(char* pattern, char* text) {
 
 // the whole text must match the pattern
 public bool matches(char* pattern, char* text) {
-    Regex* r = cached(pattern, 0);
+    Regex* r = cached(pattern, F_SIMPLE);
     if (!r->ok) {
         return false;
     }
@@ -1904,7 +1990,7 @@ private char* appendTo(char* out, int* o, int* cap, char* src, int len) {
 }
 
 private char* replaceCore(char* pattern, char* text, char* repl, bool groups) {
-    Regex* r = cached(pattern, 0);
+    Regex* r = cached(pattern, groups ? 0 : F_SIMPLE);
     int n = strlen(text);
     int rl = strlen(repl);
     int cap = n + 64;

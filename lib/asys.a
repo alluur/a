@@ -10,12 +10,13 @@
 //    * Functions that can fail return a value >= 0 on success and -ERRNO on failure (-asys.ENOENT, ...); functions that
 //      return pointers return null and may store the error code through an optional  int* err  argument.
 //      asys.errText(code) turns a code into text.
-//    * Memory from asys.alloc / realloc is ZEROED, can be given back with asys.free (big blocks go back to the operating
-//      system with munmap) and is counted: asys.memInUse() / memBlocks() / memMapped() make leaks visible to tests.
+//    * Memory from asys.alloc / realloc is ZEROED, can be given back with asys.free (on Linux big blocks go back to the
+//      operating system with munmap; on AOS and Windows, which cannot take address space back, freed big blocks stay in the
+//      allocator and are reused) and is counted: asys.memInUse() / memBlocks() / memMapped() make leaks visible to tests.
 //      Strings returned by asys functions (and by acode, asyntax, aproject, ...) are asys memory: free them with asys.free.
 //    * Paths are NUL terminated UTF-8 / byte strings; '/' is the separator (Windows accepts it too).
 //
-//  Memory      alloc(n) realloc(p, n) free(p) blockSize(p) memInUse() memBlocks() memMapped() moveBytes(dst, src, n)
+//  Memory      alloc(n) realloc(p, n) free(p) blockSize(p) memInUse() memBlocks() memMapped() keepsBigBlocks() moveBytes(dst, src, n)
 //              fillBytes(p, byte, n) bytesEqual(a, b, n) strDup(s) strDupN(s, n) join(a, b) concat3(a, b, c)
 //  Files       fileOpen(path, flags, mode) fileRead fileWrite fileClose fileSeek fileSync fileTruncate symlink mkfifo hasLinks
 //              readFile(path, &len, maxBytes, &err)    whole REGULAR file (a FIFO, device or directory is refused, it never blocks)
@@ -25,7 +26,8 @@
 //              stat(path, &st) lstat fstat   Stat has dev ino mode size mtime mtimeNs; st.isFile() isDir() isLink() isFifo()
 //              exists isFile isDir mkdir mkdirs rmdir unlink rename readlink setMtime chmod getcwd realpath
 //              listDir(path, DirList* out)    names + kinds, sorted on request; DirList.dispose() frees everything
-//              validName(name)                false for "", ".", "..", names with / \ or control characters or > 255 bytes
+//              validName(name)                false for "", ".", "..", names with / \ or control characters or > nameMax() bytes
+//              nameMax()                      255, on AOS 55
 //  Time        nowMs() (Unix epoch) monoMs() (monotonic) sleepMs(ms)
 //  Random      randomBytes(buf, n)  (getrandom, /dev/urandom, RtlGenRandom; a clock mix only as a last resort)
 //  Environment getenv(name) (a copy, free it) environment() (NAME=value strings, null terminated)
@@ -37,8 +39,12 @@
 //  AOS notes (what the kernel does not have, and what asys does about it)
 //    * no fchmod / fsync / mremap / link / symlink / utimensat: asys skips them (fsync becomes sync(2) on AOS), never
 //      calls them on AOS, so the kernel log stays quiet. Permissions are given when the file is created.
-//    * file names are limited to 55 bytes and paths to 255 bytes by the AOS file system; validName() only enforces
-//      the Linux limit of 255, the file system reports longer ones as an error.
+//    * file names are limited to 55 bytes and paths to 255 bytes by the AOS file system: nameMax() is 55 there and
+//      validName() refuses longer names; AtomicFile shortens the name of its temp file to fit (see AtomicFile).
+//      (A create with a too long name fails with -ENOSPC on AOS, the kernel's error for a failed create.)
+//    * freed big blocks stay in the allocator's free lists (the kernel's mmap area is a bump allocator, see "memory").
+//    * a process may have at most 32 mappings (and the kernel never merges them): asys maps its small-block chunks 2, 4, 8, 16,
+//      32 MiB there instead of 2 MiB each, but every live block over 128 KiB still takes one mapping (about 25 of them fit).
 //    * openat ignores the directory descriptor (AT_FDCWD behaviour), asys always passes AT_FDCWD.
 // =============================================================================
 module asys;
@@ -248,16 +254,21 @@ public char* errText(int code) {
 // ---- memory -----------------------------------------------------------------------------------------------------------------
 // Blocks have a 16 byte header { capacity | magic << 56, requested size }. Small blocks (up to 128 KiB) come from 2 MiB
 // chunks and are kept in free lists per size class (four classes per doubling, so at most 25 % is wasted); big blocks are
-// mapped directly and returned with munmap (Windows has no unmap in the import table: there big blocks are kept in free lists
-// as well). All memory is zeroed when it is handed out.
+// mapped directly and returned with munmap. Two systems cannot give address space back, so there big blocks are kept in the
+// free lists as well (and reused by the next request of the same size class, or of one or two classes below): Windows has no
+// unmap in the import table, and the AOS kernel hands out mmap addresses from a pointer that only moves up (munmap does not
+// lower it), so a long session of alloc / free of big blocks would use up the 788 MB mmap area with nothing in use.
+// All memory is zeroed when it is handed out.
 const MAGIC = 0xA5;
 const SMALL_MAX = 131072;
 const CHUNK = 2097152;
+const CHUNK_MAX = 33554432;
 const NCLASS = 160;
 
 private int* freeList[NCLASS];
 private char* chunkPtr;
 private int chunkLeft;
+private int chunkNext;
 private int statInUse;
 private int statBlocks;
 private int statMapped;
@@ -314,6 +325,46 @@ private int pageUp(int n) {
     return (n + 4095) & ~4095;
 }
 
+// 0: decide by the platform (the default), 1: keep freed big blocks in the free lists, 2: unmap them (setKeepBigBlocks)
+private int keepMode;
+
+// true where freed big blocks cannot be given back to the system: Windows and AOS (see "memory" above)
+private bool keepBig() {
+    if (__OS == 1) {
+        return true;
+    }
+    if (keepMode != 0) {
+        return keepMode == 1;
+    }
+    return platform() == OS_AOS;
+}
+
+// For tests: 1 makes the allocator behave as it does on AOS and Windows (freed big blocks stay in the free lists), 2 as on
+// Linux (they are unmapped), 0 goes back to the platform's choice. Call it while no big block is alive.
+public void setKeepBigBlocks(int mode) {
+    keepMode = mode;
+}
+
+// true when freed big blocks are kept for reuse instead of being unmapped
+public bool keepsBigBlocks() {
+    return keepBig();
+}
+
+// a free big block of the class c, or of one of the next `up` classes: unlinked and returned (the block start, header included)
+// with its class in *got; null when there is none
+private char* takeBigFree(int c, int up, int* got) {
+    for (int k = c; k <= c + up && k < NCLASS; k++) {
+        int* head = freeList[k];
+        if (head != null) {
+            freeList[k] = (int*) head[0];
+            char* raw = (char*) head;
+            *got = k;
+            return &raw[-16];
+        }
+    }
+    return null;
+}
+
 private void zeroBytes(char* p, int n) {
     if (n >= 64) {
         memset(p, 0, n);
@@ -322,6 +373,16 @@ private void zeroBytes(char* p, int n) {
     for (int i = 0; i < n; i++) {
         p[i] = 0;
     }
+}
+
+// Blocks up to this size are carved from chunks: 128 KiB, and on AOS a quarter of the next chunk (512 KiB, growing to 8 MiB),
+// because every block that gets its own mapping uses one of the 32 mappings a process may have there.
+private int smallLimit() {
+    if (__OS != 1 && keepBig()) {
+        int c = (chunkNext < CHUNK) ? CHUNK : chunkNext;
+        return c / 4;
+    }
+    return SMALL_MAX;
 }
 
 // Returns a zeroed block of at least n bytes (n may be 0), null when the system is out of memory.
@@ -334,7 +395,7 @@ public char* alloc(int n) {
     }
     int cap;
     char* raw;
-    if (n <= SMALL_MAX) {
+    if (n <= smallLimit()) {
         int c = classOf(n);
         cap = classSize(c);
         int* head = freeList[c];
@@ -345,33 +406,46 @@ public char* alloc(int n) {
             zeroBytes(&raw[16], cap);
         } else {
             if (chunkLeft < cap + 16) {
-                char* nc = mapPages(CHUNK);
+                // 2 MiB per chunk; on AOS the chunks grow (2, 4, 8, 16, 32 MiB): the kernel allows only 32 mappings per process
+                // and never merges them, so many small chunks would end at about 50 MB (untouched pages cost nothing there)
+                int csz = CHUNK;
+                if (keepBig() && __OS != 1) {
+                    csz = (chunkNext < CHUNK) ? CHUNK : chunkNext;
+                    chunkNext = (csz >= CHUNK_MAX) ? CHUNK_MAX : csz * 2;
+                }
+                char* nc = mapPages(csz);
                 if (nc == null) {
                     return null;
                 }
                 chunkPtr = nc;
-                chunkLeft = CHUNK;
-                statMapped = statMapped + CHUNK;
+                chunkLeft = csz;
+                statMapped = statMapped + csz;
             }
             raw = chunkPtr;
             chunkPtr = &chunkPtr[cap + 16];
             chunkLeft = chunkLeft - cap - 16;
         }
-    } else if (__OS == 1) {
+    } else if (keepBig()) {
         int c = classOf(n);
-        cap = classSize(c);
-        int* head = freeList[c];
-        if (head != null) {
-            freeList[c] = (int*) head[0];
-            raw = (char*) head;
-            raw = &raw[-16];
-            zeroBytes(&raw[16], cap);
-        } else {
-            raw = mapPages(cap + 16);
-            if (raw == null) {
-                return null;
+        int got = c;
+        raw = takeBigFree(c, 2, &got);                   // the class itself, or a block at most 50 % too big
+        bool reused = raw != null;
+        if (raw == null) {
+            raw = mapPages(classSize(c) + 16);
+            if (raw != null) {
+                statMapped = statMapped + classSize(c) + 16;
+            } else {
+                // the system is full: any bigger free block is better than failing
+                raw = takeBigFree(c + 3, NCLASS, &got);
+                reused = raw != null;
+                if (raw == null) {
+                    return null;
+                }
             }
-            statMapped = statMapped + cap + 16;
+        }
+        cap = classSize(got);
+        if (reused) {
+            zeroBytes(&raw[16], cap);                    // fresh pages are zero already
         }
     } else {
         int total = pageUp(n + 16);
@@ -420,7 +494,7 @@ public void free(char* p) {
     h[0] = 0;                                            // a second free() is caught by the magic
     statInUse = statInUse - cap;
     statBlocks--;
-    if (cap <= SMALL_MAX || __OS == 1) {
+    if (cap <= SMALL_MAX || (keepBig() && classSize(classOf(cap)) == cap)) {
         int c = classOf(cap);
         h[0] = (MAGIC << 56) | cap;                      // keep the header valid while the block sits in a list
         h[1] = -1;
@@ -466,7 +540,7 @@ public char* realloc(char* p, int n) {
         h[1] = n;
         return p;
     }
-    if (cap > SMALL_MAX && __OS != 1 && platform() == OS_LINUX) {
+    if (cap > SMALL_MAX && !keepBig() && platform() == OS_LINUX) {
         int total = cap + 16;
         int want = pageUp(n + 16);
         int r = sys(25, 216, (int) &p[-16], total, want, 1, 0, 0);       // mremap(MAYMOVE)
@@ -1471,7 +1545,14 @@ private int copyFile(char* from, char* to, int mode) {
 //   write():  appends data (any number of calls),
 //   commit(): flushes to the disk (unless W_NOSYNC) and renames the temp file over the target,
 //   abort():  removes the temp file.
-// If no temp file can be created and W_INPLACE_OK is set, the file is overwritten in place instead (not atomic).
+// If no temp file can be created (EACCES, EROFS, EPERM, ENAMETOOLONG) and W_INPLACE_OK is set, the file is overwritten in
+// place instead (not atomic).
+// Things a rename based save does that an in-place write would not (like `mv` and most editors' default): a file with several
+// hard links gets new content under the saved name only (the other names keep the old content); the owner and group of the
+// new file are those of the process, not of the old file; the write permission bit of the old file does not stop the save (the
+// permissions are copied, so a 0444 file stays 0444, but its content is replaced: a front end that wants to protect read-only
+// files has to look at the mode itself). The temp file's name is ".<name>.tmp-<12 hex digits>", the name part cut when the
+// result would be longer than the file system allows (55 bytes on AOS).
 public class AtomicFile {
     private int fd;
     private char* tmp;
@@ -1529,15 +1610,29 @@ public class AtomicFile {
         int sl = lastSlash(target);
         char* dir = (sl < 0) ? strDup(".") : (sl == 0 ? strDup("/") : strDupN(target, sl));
         char* base = &target[sl + 1];
-        for (int attempt = 0; attempt < 16; attempt++) {
+        // the temp name is ".<base>.tmp-<12 hex digits>" and must fit the file system: at most 250 bytes (Linux; the limit is
+        // 255), 55 on AOS, and on AOS the whole path must stay within 255 bytes. When the base is too long it is cut (at a
+        // character boundary), never the random part: a cut name would be the same for every save and a stale file with that
+        // name would make all later saves fail with -EEXIST.
+        int blen = strlen(base);
+        int maxLeaf = imin(nameMax(), 250);
+        if (__OS != 1 && platform() == OS_AOS) {
+            int dl = strlen(dir);
+            maxLeaf = imin(maxLeaf, 255 - ((dl == 1 && dir[0] == '/') ? 1 : dl + 1));
+        }
+        int keep = imin(blen, maxLeaf - 18);
+        while (keep > 0 && keep < blen && (base[keep] & 0xC0) == 0x80) {
+            keep--;
+        }
+        fd = -ENAMETOOLONG;
+        for (int attempt = 0; attempt < 16 && keep >= 1; attempt++) {
             char* rnd = hexName(6);
-            char* pre = concat3(".", base, ".tmp-");
+            char* cut = strDupN(base, keep);
+            char* pre = concat3(".", cut, ".tmp-");
             char* leaf = concat3(pre, rnd, "");
+            free(cut);
             free(pre);
             free(rnd);
-            if (strlen(leaf) > 250) {
-                leaf[250] = 0;
-            }
             tmp = join(dir, leaf);
             free(leaf);
             fd = fileOpen(tmp, F_WRITE | F_CREATE | F_EXCL | F_NOFOLLOW | F_CLOEXEC, perm);
@@ -1553,7 +1648,7 @@ public class AtomicFile {
             fd = -1;
             free(tmp);
             tmp = null;
-            if ((fl & W_INPLACE_OK) != 0 && existed && (e == -EACCES || e == -EROFS || e == -EPERM)) {
+            if ((fl & W_INPLACE_OK) != 0 && existed && (e == -EACCES || e == -EROFS || e == -EPERM || e == -ENAMETOOLONG)) {
                 fd = fileOpen(target, F_WRITE | F_TRUNC | F_CLOEXEC, perm);
                 if (fd >= 0) {
                     inplace = true;
@@ -1601,7 +1696,12 @@ public class AtomicFile {
         }
         int e = failed;
         if (e == 0 && (flags & W_NOSYNC) == 0) {
-            fileSync(fd);
+            // a failed flush (EIO, ENOSPC of a delayed allocation, a network file system) must not be hidden: the temp file
+            // would be renamed over the good file. -EINVAL / -ENOSYS only say that this kind of file cannot be synced.
+            int sy = fileSync(fd);
+            if (sy < 0 && sy != -EINVAL && sy != -ENOSYS) {
+                e = sy;
+            }
         }
         int c = fileClose(fd);
         fd = -1;
@@ -1663,13 +1763,19 @@ private bool fileHasMode(int fd) {
 }
 
 // ---- names and directories --------------------------------------------------------------------------------------------------------
-// A name for create / rename: not empty, not "." or "..", no '/' or '\', no control characters, at most 255 bytes.
+// The longest file name (in bytes) the file system takes: 255, and 55 on AOS.
+public int nameMax() {
+    return (__OS != 1 && platform() == OS_AOS) ? 55 : 255;
+}
+
+// A name for create / rename: not empty, not "." or "..", no '/' or '\', no control characters, at most nameMax() bytes
+// (255; 55 on AOS).
 public bool validName(char* name) {
     if (name == null) {
         return false;
     }
     int n = strlen(name);
-    if (n == 0 || n > 255) {
+    if (n == 0 || n > nameMax()) {
         return false;
     }
     if (n == 1 && name[0] == '.') {

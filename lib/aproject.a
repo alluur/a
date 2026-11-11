@@ -35,82 +35,171 @@ private int imax(int a, int b) {
 }
 
 // ---- glob matching -------------------------------------------------------------------------------------------------------------------------
-// does the pattern p[pi..plen) match t[ti..tlen)? '*' does not cross '/', "**" does ("**/" also matches no directory at all),
-// '?' is one character except '/', [abc] [a-z] [!a] [^a] are sets, '\' quotes the next character
-private bool globAt(char* p, int pi, int plen, char* t, int ti, int tlen) {
+// Does a glob pattern match a whole text? '*' does not cross '/', "**" does ("**/" also matches no directory at all), '?' is one
+// character except '/', [abc] [a-z] [!a] [^a] are sets (never matching '/'), '\' quotes the next character, a '[' without a
+// closing ']' is a plain character.
+// The matcher simulates the pattern as an automaton over the text: time O(pattern * text), memory O(pattern), no recursion, so
+// no pattern (not even "*a*a*a*a*a*b" against a long name of a's) can make it slow down more than that. An earlier version
+// backtracked and took minutes for seven stars.
+const GK_LIT = 0;
+const GK_ANY = 1;
+const GK_SET = 2;
+const GK_STAR = 3;
+const GK_DSTAR = 4;
+
+// the pattern as tokens: 4 numbers each (kind, byte, set open, set close); returns how many
+private int globTokens(char* p, int plen, int* tok) {
+    int m = 0;
+    int pi = 0;
     while (pi < plen) {
         int c = p[pi];
+        int* k = &tok[m * 4];
+        k[1] = 0;
+        k[2] = 0;
+        k[3] = 0;
         if (c == '*') {
             int ss = 1;
             while (pi + ss < plen && p[pi + ss] == '*') { ss++; }
-            bool cross = ss >= 2;
-            int rest = pi + ss;
-            if (rest >= plen) {
-                if (cross) { return true; }
-                for (int k = ti; k < tlen; k++) {
-                    if (t[k] == '/') { return false; }
-                }
-                return true;
-            }
-            for (int k = ti; k <= tlen; k++) {
-                if (globAt(p, rest, plen, t, k, tlen)) { return true; }
-                if (cross && p[rest] == '/' && (k == 0 || t[k - 1] == '/') && globAt(p, rest + 1, plen, t, k, tlen)) { return true; }
-                if (k < tlen && t[k] == '/' && !cross) { break; }
-            }
-            return false;
+            k[0] = (ss >= 2) ? GK_DSTAR : GK_STAR;
+            pi = pi + ss;
+            m++;
+            continue;
         }
-        if (ti >= tlen) { return false; }
         if (c == '?') {
-            if (t[ti] == '/') { return false; }
+            k[0] = GK_ANY;
             pi++;
-            ti++;
+            m++;
             continue;
         }
         if (c == '[') {
             int q = pi + 1;
-            bool neg = false;
-            if (q < plen && (p[q] == '!' || p[q] == '^')) { neg = true; q++; }
-            bool found = false;
+            if (q < plen && (p[q] == '!' || p[q] == '^')) { q++; }
             bool first = true;
             while (q < plen && (p[q] != ']' || first)) {
                 first = false;
-                int lo = p[q];
-                if (lo == 92 && q + 1 < plen) { q++; lo = p[q]; }
-                if (q + 2 < plen && p[q + 1] == '-' && p[q + 2] != ']') {
-                    int hi = p[q + 2];
-                    if (t[ti] >= lo && t[ti] <= hi) { found = true; }
-                    q = q + 3;
-                } else {
-                    if (t[ti] == lo) { found = true; }
-                    q++;
-                }
+                if (p[q] == 92 && q + 1 < plen) { q++; }
+                if (q + 2 < plen && p[q + 1] == '-' && p[q + 2] != ']') { q = q + 3; } else { q++; }
             }
-            if (q >= plen) {
-                // no closing bracket: the '[' is a plain character
-                if (t[ti] != '[') { return false; }
-                pi++;
-                ti++;
+            if (q < plen) {
+                k[0] = GK_SET;
+                k[2] = pi;
+                k[3] = q;
+                pi = q + 1;
+                m++;
                 continue;
             }
-            if (t[ti] == '/' || found == neg) { return false; }
-            pi = q + 1;
-            ti++;
-            continue;
-        }
-        if (c == 92 && pi + 1 < plen) {
+            // no closing bracket: a plain '['
+        } else if (c == 92 && pi + 1 < plen) {
             pi++;
             c = p[pi];
         }
-        if (t[ti] != c) { return false; }
+        k[0] = GK_LIT;
+        k[1] = c;
         pi++;
-        ti++;
+        m++;
     }
-    return ti == tlen;
+    return m;
+}
+
+// is ch in the set p[open..close] ('[' at open, ']' at close)?
+private bool globSetHas(char* p, int plen, int open, int close, int ch) {
+    int q = open + 1;
+    bool neg = false;
+    if (q < close && (p[q] == '!' || p[q] == '^')) { neg = true; q++; }
+    bool found = false;
+    bool first = true;
+    while (q < close && (p[q] != ']' || first)) {
+        first = false;
+        int lo = p[q];
+        if (lo == 92 && q + 1 < plen) { q++; lo = p[q]; }
+        if (q + 2 < plen && p[q + 1] == '-' && p[q + 2] != ']') {
+            int hi = p[q + 2];
+            if (ch >= lo && ch <= hi) { found = true; }
+            q = q + 3;
+        } else {
+            if (ch == lo) { found = true; }
+            q++;
+        }
+    }
+    return found != neg;
+}
+
+// the automaton: cur / nxt hold one flag per token position 0..m (m: the pattern is complete)
+private bool globRun(char* p, int plen, char* t, int tlen, int* tok, char* cur, char* nxt) {
+    int m = globTokens(p, plen, tok);
+    for (int i = 0; i <= m + 1; i++) {
+        cur[i] = 0;
+        nxt[i] = 0;
+    }
+    cur[0] = 1;
+    for (int ti = 0; ; ti++) {
+        // stars may match nothing; "**/" may also match no directory at all (at the start of a path component)
+        bool compStart = ti == 0 || t[ti - 1] == '/';
+        for (int i = 0; i < m; i++) {
+            if (cur[i] == 0) { continue; }
+            int kd = tok[i * 4];
+            if (kd == GK_STAR || kd == GK_DSTAR) {
+                cur[i + 1] = 1;
+                if (kd == GK_DSTAR && compStart && i + 1 < m && tok[(i + 1) * 4] == GK_LIT && tok[(i + 1) * 4 + 1] == '/') {
+                    cur[i + 2] = 1;
+                }
+            }
+        }
+        if (ti >= tlen) {
+            return cur[m] != 0;
+        }
+        int c = t[ti];
+        bool any = false;
+        for (int i = 0; i <= m; i++) { nxt[i] = 0; }
+        for (int i = 0; i < m; i++) {
+            if (cur[i] == 0) { continue; }
+            int* k = &tok[i * 4];
+            int kd = k[0];
+            if (kd == GK_LIT) {
+                if (c == k[1]) { nxt[i + 1] = 1; any = true; }
+            } else if (kd == GK_ANY) {
+                if (c != '/') { nxt[i + 1] = 1; any = true; }
+            } else if (kd == GK_SET) {
+                if (c != '/' && globSetHas(p, plen, k[2], k[3], c)) { nxt[i + 1] = 1; any = true; }
+            } else if (kd == GK_STAR) {
+                if (c != '/') { nxt[i] = 1; any = true; }
+            } else {
+                nxt[i] = 1;
+                any = true;
+            }
+        }
+        if (!any) {
+            return false;
+        }
+        char* sw = cur;
+        cur = nxt;
+        nxt = sw;
+    }
+    return false;
+}
+
+private bool globTest(char* p, int plen, char* t, int tlen) {
+    if (plen <= 96) {
+        int tok[400];
+        char st[256];
+        return globRun(p, plen, t, tlen, &tok[0], &st[0], &st[128]);
+    }
+    int* tok = (int*) asys.alloc((plen + 2) * 32);
+    char* st = asys.alloc((plen + 4) * 2);
+    if (tok == null || st == null) {
+        asys.free((char*) tok);
+        asys.free(st);
+        return false;
+    }
+    bool r = globRun(p, plen, t, tlen, tok, st, &st[plen + 4]);
+    asys.free((char*) tok);
+    asys.free(st);
+    return r;
 }
 
 // public: does a glob pattern match a whole text? (for file name filters such as "*.a")
 public bool globMatch(char* pattern, char* text) {
-    return globAt(pattern, 0, strlen(pattern), text, 0, strlen(text));
+    return globTest(pattern, strlen(pattern), text, strlen(text));
 }
 
 // ---- ignore rules --------------------------------------------------------------------------------------------------------------------------------
@@ -232,10 +321,10 @@ public class Ignore {
             }
             bool hit;
             if (r->anchored) {
-                hit = globAt(r->pat, 0, strlen(r->pat), sub, 0, strlen(sub));
+                hit = globTest(r->pat, strlen(r->pat), sub, strlen(sub));
             } else {
                 char* name = &relPath[nameStart];
-                hit = globAt(r->pat, 0, strlen(r->pat), name, 0, strlen(name));
+                hit = globTest(r->pat, strlen(r->pat), name, strlen(name));
             }
             if (hit) { result = !r->negate; }
         }
@@ -915,6 +1004,8 @@ public class FindJob {
     public int dirsSkipped;
     public bool truncated;            // maxResults was reached
     public bool regexError;
+    public bool exceeded;             // a regular expression hit its step limit (Regex.exceeded) in some file: the results are incomplete
+    public int filesExceeded;         // in how many files (the rest of such a file is skipped)
     public char* fileFilter;          // a glob for file names (null: all), e.g. "*.a"
     private int state;
     private int rcap;
@@ -1005,6 +1096,8 @@ public class FindJob {
         dirsSkipped = 0;
         truncated = false;
         regexError = false;
+        exceeded = false;
+        filesExceeded = 0;
         state = FIND_DONE;
     }
 
@@ -1220,7 +1313,8 @@ public class FindJob {
         }
         ls[nl] = len + 1;
         int caps[66];
-        for (int line = 0; line < nl && count < maxResults; line++) {
+        bool gaveUp = false;
+        for (int line = 0; line < nl && count < maxResults && !gaveUp; line++) {
             int s = ls[line];
             int e = ls[line + 1] - 1;
             int ll = e - s;
@@ -1232,6 +1326,12 @@ public class FindJob {
                 if (re != null) {
                     at = re->search(&data[s], ll, from, &caps[0]);
                     if (at >= 0) { mlen = caps[1] - caps[0]; }
+                    if (at < 0 && re->exceeded) {
+                        // a catastrophic pattern (or a huge line): say so, and do not spend the limit again on every later line
+                        exceeded = true;
+                        filesExceeded++;
+                        gaveUp = true;
+                    }
                 } else {
                     at = plainFind(&data[s], ll, from);
                     mlen = strlen(pattern);

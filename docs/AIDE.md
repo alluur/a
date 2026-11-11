@@ -61,26 +61,44 @@ processes, symbolic links, FIFOs and permission bits do not (those calls return 
 
 | Group | Functions |
 |---|---|
-| Memory | `alloc` (zeroed) `realloc` `free` `blockSize` `memInUse` `memBlocks` `memMapped` `memBadFrees` `moveBytes` (memmove) `fillBytes` `bytesEqual` `strDup` `strDupN` `join` `concat3` |
+| Memory | `alloc` (zeroed) `realloc` `free` `blockSize` `memInUse` `memBlocks` `memMapped` `memBadFrees` `keepsBigBlocks` `setKeepBigBlocks` (tests) `moveBytes` (memmove) `fillBytes` `bytesEqual` `strDup` `strDupN` `join` `concat3` |
 | Files | `fileOpen(path, flags, mode)` `fileRead` `fileWrite` `fileClose` `fileSeek` `fileSync` `fileTruncate`; `readFile(path, &len, maxBytes, &err)` (regular files only: a FIFO, device or directory gives `-ENOTREG` and never blocks) `writeFile` `writeFileAtomic` class `AtomicFile` |
-| Paths | `stat` `lstat` `fstat` (`Stat`: dev ino mode size mtime mtimeNs, `isFile()` `isDir()` `isLink()` `isFifo()` `perm()`) `exists` `isFile` `isDir` `mkdir` `mkdirs` `rmdir` `unlink` `rename` `readlink` `realpath` `getcwd` `chmod` `setMtime` `symlink` `mkfifo` `validName` |
+| Paths | `stat` `lstat` `fstat` (`Stat`: dev ino mode size mtime mtimeNs, `isFile()` `isDir()` `isLink()` `isFifo()` `perm()`) `exists` `isFile` `isDir` `mkdir` `mkdirs` `rmdir` `unlink` `rename` `readlink` `realpath` `getcwd` `chmod` `setMtime` `symlink` `mkfifo` `validName` `nameMax` |
 | Directories | `listDir(path, DirList*)`: names and kinds from `getdents64` (no `stat` per entry), `DirList.sort(dirsFirst, ignoreCase)` |
 | Time, random, environment | `nowMs` `monoMs` `sleepMs` `randomBytes` `getenv` `environment` |
 | Processes | class `Process`: `start(argv, cwd, env, flags)` `read` `write` `closeIn` `tryWait` `wait` `signal` `signalGroup` `waitReadable` `dispose`; `pollFds` |
 | Platform | `platform()` (`OS_LINUX`, `OS_AOS`, `OS_WINDOWS`; AOS is recognised through `uname`) `canSpawn()` `hasLinks()` |
 
 **Memory.** Small blocks (up to 128 KiB) come from 2 MiB chunks in four size classes per doubling (at most 25 % waste) and are
-reused through free lists; bigger blocks are `mmap`ed and go back to the system with `munmap` when freed; a big block that shrinks
-moves to a smaller one; `realloc` of big blocks uses `mremap` on Linux. Blocks carry a header with a magic number, so a double
-free or a foreign pointer is detected, ignored and counted (`memBadFrees`). `memInUse()` makes leaks visible: the tests compare it
-before and after a cycle.
+reused through free lists; bigger blocks are `mmap`ed and, **on Linux**, go back to the system with `munmap` when freed; a big
+block that shrinks moves to a smaller one; `realloc` of big blocks uses `mremap` on Linux. **On AOS and Windows freed big blocks
+stay in the free lists** (`keepsBigBlocks()` is true) and the next request of the same size class, or of one or two classes below
+(at most 50 % too big), takes one of them (zeroed again); if the system is full any bigger free block is used before `alloc` gives up.
+The reason on AOS: its kernel hands out `mmap` addresses from a pointer that only moves up and `munmap` never lowers it (`doMmap` in
+`kernel/sys.a`; the whole area is 0x10000000 - 0x3F000000, about 788 MB), so about 2600 cycles of `alloc(300000)` + `free` used up
+the address space with nothing in use and `alloc` returned null (this crashed a long AIDE session: found in review, `t204` crashed
+on AOS because of it). Windows has no `VirtualFree` in the compiler's import table. The price of keeping blocks is that the address
+space used is the sum, over the size classes, of the most big blocks that were alive at the same time; it is not given back. Blocks
+carry a header with a magic number, so a double free or a foreign pointer is detected, ignored and counted (`memBadFrees`).
+`memInUse()` makes leaks visible: the tests compare it before and after a cycle. `setKeepBigBlocks(1)` switches a Linux process to
+the AOS behaviour (tests do this: `t203`), `setKeepBigBlocks(0)` back.
 
 **Atomic writing** (`AtomicFile`, `writeFileAtomic`, `Buffer.save`): a temp file `.NAME.tmp-<12 random hex digits>` is created next
 to the target with `O_CREAT | O_EXCL | O_NOFOLLOW` and *the permissions of the existing file from its first byte*
 (`fchmod` only repairs what the umask removed); data is written, flushed (`fsync`; `sync` on AOS), and renamed over the target.
-A symbolic link as target is resolved (the data goes where the link points; a loop of 32 links is `-ELOOP`); on any error the
-temp file is removed; `W_BACKUP` keeps the old content as `NAME~`; `W_INPLACE_OK` allows overwriting in place when no temp file
-can be created.
+A failing `fsync` (`EIO`, `ENOSPC` of a delayed allocation, a network file system) makes the save fail and removes the temp file; the
+old file stays (`-EINVAL` / `-ENOSYS` only say that this kind of file cannot be synced and are ignored). A symbolic link as target
+is resolved (the data goes where the link points; a loop of 32 links is `-ELOOP`); on any error the temp file is removed;
+`W_BACKUP` keeps the old content as `NAME~`; `W_INPLACE_OK` allows overwriting in place when no temp file can be created (`EACCES`,
+`EROFS`, `EPERM`, `ENAMETOOLONG`).
+The temp name must fit the file system: if `.NAME.tmp-<12 hex>` would be longer than 250 bytes (Linux) or 55 bytes (AOS; there the
+whole path must also stay within 255) the NAME part is cut, at a character boundary and never the random part (an earlier version cut
+the end, so for a 255 byte name every save used the same temp name and one stale file of that name made all saves fail with `-EEXIST`,
+and on AOS every name of 38 to 55 bytes failed with `-ENOSPC`).
+What a rename based save does that an in-place write would not (it is the same as `mv` and most editors' default): **hard links
+are broken** (the other names keep the old content), the **owner and group** of the new file are those of the process, and the
+**write permission bit does not protect** a file (a 0444 file is replaced and stays 0444; a front end that wants to protect read-only
+files must look at the mode itself).
 
 **Processes.** `Process.start` forks, sets up the pipes (all `O_CLOEXEC`, parent ends non-blocking, descriptors below 3 are moved
 away before `dup2`), searches `PATH` itself, and reports a failing `exec` *synchronously* (`-ENOENT`, `-EACCES`) through a
@@ -177,19 +195,26 @@ work on all cursors from the last to the first, inside one undo group. Highlight
 
 `import aproject;`
 
+* **Globs** (`globMatch`, used by Ignore, the file tree and the file filter of find): `*` does not cross `/`, `**` does (`**/` may
+  also match no directory), `?`, `[a-z]` `[!a]` `[^a]`, `\` quotes. The matcher is an automaton over the text, time O(pattern x
+  text) and no recursion, so a hostile `.gitignore` line such as `*a*a*a*a*a*a*b` cannot freeze the tree (an earlier backtracking
+  version needed 15 s for six stars against a 100 byte name and minutes for seven; the new one is compared with it on 400 000 random
+  patterns, no difference).
 * **Ignore**: `.gitignore` rules (`*  ?  [a-z]  **  !  /anchor  dir/`), rules from nested files carry their directory, plus a
   built-in list (`.git/ .hg/ .svn/ .bzr/ node_modules/ __pycache__/ *.pyc *.pyo *.o *.obj *.so *.dll *.dylib *.class .DS_Store
   Thumbs.db *.swp *.swo *~ #*#`; `.a` files are *not* ignored, and neither is `.gitignore`).
 * **FileTree**: lazy; sorted folders first; ignore rules applied; symbolic links are entries of kind `K_LINK` and are **not
   followed** unless `followLinks` is set, then a directory whose (device, inode) equals an ancestor's is marked `loop` and not
   entered; `maxEntries` (200 000) and `maxDepth` (64) bound the walk (`truncated` says so); `create` / `rename` / `remove` validate
-  names (`-EBADNAME` for "", ".", "..", `/`, `\`, control characters, more than 255 bytes) and refresh the tree.
+  names (`-EBADNAME` for "", ".", "..", `/`, `\`, control characters, more than `nameMax()` = 255 bytes, 55 on AOS) and refresh the tree.
 * **Watcher**: polling: `watch(path)` / `unwatch(path)`, then `poll(events, max)` stats what is watched and reports created,
   modified and deleted entries (a watched directory reports its children).
 * **FindJob**: plain / case-insensitive / whole word / regex search with context lines; `step(budgetMs)` does a bounded amount of
   work and `cancel()` stops it; only regular files are opened (a FIFO is skipped, never read), binary files and files over
   `maxFileSize` (5 MiB) are skipped, results are capped (`maxResults`, 10 000), symbolic links are not followed unless
-  `FIND_FOLLOW` is given (then loops are detected by device and inode), the walk is at most 64 directories deep.
+  `FIND_FOLLOW` is given (then loops are detected by device and inode), the walk is at most 64 directories deep. When a regular
+  expression hits its step limit in a file (a catastrophic pattern such as `(a+)+b`, or a huge line) the job sets `exceeded` and
+  counts `filesExceeded`, and skips the rest of that file, so the results are known to be incomplete instead of silently empty.
 * **QuickOpen**: `index(root, ign)` then `query(text, out, max)`: fuzzy file name search (`"fmain"` finds `src/main.a`;
   consecutive characters, component and word starts and file name hits score higher, ties go to the shorter path).
   **Recent**: an MRU list with `add`, `indexOf`, `save(path)` and `load(path)`.
@@ -216,16 +241,23 @@ handles empty matches like Python 3.7 (`re.sub`).
 
 ## 8. regex
 
-`import regex;` was rewritten for AIDE; the old four functions keep working. A backtracking engine with Perl / Python
+`import regex;` was rewritten for AIDE. The old four functions (`matches`, `search`, `test`, `replaceAll`) keep their old simple
+dialect (`F_SIMPLE`, also usable with `compile(pattern, F_SIMPLE)`): `( ) | { }` are plain characters, a `^` that is not first and a `$`
+that is not last are plain characters, everything else as before (`grep "main()"` of the AOS shell relies on this). The new
+syntax is for `compile()` and `replaceGroups`. The engine is a backtracking engine with Perl / Python
 semantics: groups (up to 32) and non-capturing groups, named groups, alternation, greedy and lazy `* + ? {n,m}`, back
 references, `^ $ \A \Z \b \B`, classes with ranges, POSIX classes and the shorthands, look-ahead `(?= )` `(?! )`, flags `(?i) (?s)
 (?m)` also scoped, UTF-8 aware (`.` and negated classes take a whole character; `\w` includes non-ASCII letters; case folding is
-ASCII only). A repeated group that matched the empty string ends its repetition (`(a*)*` on `b` matches once). Errors are compile
+ASCII only). A repeated group that matched the empty string ends its repetition (`(a*)*` on `b` matches once); this holds for
+`* + {n,}` and for bounded `{m,n}`, where an empty iteration beyond the minimum ends the repetition like in Python (`(?:b?|xb){1,3}b`
+on `xbbb` matches 4 bytes). One known difference to Python before 3.14 (Python 3.14 and Perl agree with this engine): `\B` matches
+in an empty text. Errors are compile
 errors with a message and a position (back reference to a missing or open group, unbalanced parentheses, bad ranges, "nothing to
 repeat", "multiple repeat", a program over 400 000 instructions, nesting over 150). The matcher is a loop with an explicit stack
 (no recursion per character: `.*Z` over a million characters works) and stops after 5 million steps (`exceeded`) so `(a+)+b` cannot
-hang an editor. `tests/gen/gen_regex_test.py` runs 144 patterns through Python's `re` and compares search, group positions,
-fullmatch and `sub`.
+hang an editor. `tests/gen/gen_regex_test.py` runs 168 patterns through Python's `re` and compares search, group positions,
+fullmatch and `sub`. In addition 240 000 random patterns (groups, alternation, lazy and bounded quantifiers, back references,
+look-ahead, flags, UTF-8) were compared with Python 3.13 while reviewing this module: the only difference is `\B` in an empty text.
 
 ## 9. Writing a front end
 
@@ -260,8 +292,13 @@ Missing in AOS, and what asys does:
 * `fchmod`, `chmod`, `fsync`, `mremap`, `ftruncate`, `utimensat`, `link`, `symlink`: never called on AOS (asys asks `uname` once);
   `fsync` becomes `sync`, permissions are given when the file is created, `symlink` / `setMtime` return `-ENOSYS` and `hasLinks()` is false.
 * `statx` and `clock_nanosleep` do not exist in the kernel; asys does not use them (it uses `stat` and `nanosleep`).
-* File names are limited to 55 bytes and paths to 255 bytes by the AOS file system; `validName` enforces the Linux limit of 255
-  and the file system reports longer names as an error.
+* File names are limited to 55 bytes and paths to 255 bytes by the AOS file system; `nameMax()` is 55 there and `validName` refuses
+  longer names (the kernel reports a create with a too long name as `-ENOSPC`, which is misleading; `rename` says `-ENAMETOOLONG`).
+  `AtomicFile` shortens its temp name to fit (see section 2).
+* Freed big blocks stay in the allocator (the kernel never takes `mmap` address space back); see the Memory paragraph of section 2.
+* `setMtime` is `-ENOSYS` and the AOS file system stores whole seconds: `Buffer.checkExternal` compares size and modification time,
+  so a same-size rewrite within the same second as the load or save is not noticed. (`t207` waits a second on AOS for this reason.)
+* The AOS shell tools have no `head -c` and no `wc -c`; `t202` uses `head -n` and `wc -l`.
 * `execve` runs ELF files and `#!` scripts only (no fallback to the shell for a script without `#!`); `Job.startShell` needs
   `/bin/sh` to exist and to understand `-c`.
 * `fork` on AOS is a full copy of the address space (the kernel says so in `sys.a`: "a full copy is fine"), so starting a job from
@@ -276,7 +313,7 @@ Missing in AOS, and what asys does:
 | `t200_asys_mem` | allocator: zeroing, classes, big blocks, realloc, counters, double free, `moveBytes` |
 | `t201_asys_files` | files, atomic writes (permissions, backup, streaming, links, loops), listing, FIFOs, names, time, random |
 | `t202_asys_proc` | pipes, exit codes, environment, cwd, exec errors, 1 MB through `cat`, full pipes, `EPIPE`, floods, group kill |
-| `t203_asys_fuzz` | 6000 random alloc / realloc / free operations (1 byte to 3 MB) checked against block patterns, zeroing, overlap and the counters |
+| `t203_asys_fuzz` | 6000 random alloc / realloc / free operations (1 byte to 3 MB) checked against block patterns, zeroing, overlap and the counters, run twice (also with freed big blocks kept, as on AOS); 5000 `alloc(300000)` + `free` cycles map one block |
 | `t204_acode_diff` | 10 000 random edits + grouped undo / redo with cursor snapshots against a reference model; line index; UTF-8 |
 | `t205_acode_cursor` | exact cursor restoration (merged typing, backspace, delete, backwards selections, 4 cursors), motions, UTF-8, tab width 0 |
 | `t206_acode_lineops` | move / duplicate / join / delete lines, indentation, comments, auto-indent, brackets, clipboard, clean-ups |
@@ -287,11 +324,11 @@ Missing in AOS, and what asys does:
 | `t211_aproject_tree` | globs, ignore rules, tree (links, FIFOs, bounds, names), watcher, recent files, quick open |
 | `t212_aproject_find` | find in files: modes, context, steps, cancel, limits, FIFO, link loops |
 | `t213_aproject_job` | diagnostics (26 line formats and Rust's two line form), incremental output, input queue, timeout, kill, floods, the real `ac` |
-| `t214_afind` | find / replace rules above, Python comparison of `replace all` |
-| `t215_regex_python` | 144 patterns compared with Python's `re` (generated by `tests/gen/gen_regex_test.py`) |
+| `t214_afind` | find / replace rules above, Python comparison of `replace all` (also patterns where an empty match has priority: `a*?`, `x*|b`) |
+| `t215_regex_python` | 168 patterns compared with Python's `re` (generated by `tests/gen/gen_regex_test.py`), among them bounded repeats of groups that can be empty |
 | `t216_regex_more` | flags, POSIX classes, 32 groups, errors, limits, big inputs, `quote` |
 | `t217_acode_perf` | 100 000 lines inserted at the end / start / random places, 50 000 typed characters, 2000 cursors, a 3 MB file |
-| `t218_regressions` | temp file permissions and names, extreme tab widths, `dispose()` of every class, 24 MB cycles, bounded walks |
+| `t218_regressions` | temp file permissions and names (also at the name limit), extreme tab widths, `dispose()` of every class, 24 MB cycles, bounded walks; exact undo / redo after the history was trimmed (model based), whole-line paste into several cursors, out-of-range line numbers, glob worst cases, find in files `exceeded`, the old regex dialect |
 | `t219_aide_session` | a whole session through all modules: project, ignore rules, tree, quick open, find in files, buffer, editor, highlighter, symbols, completion, rename with undo, save, external change, watcher, settings, a real build with an error, the fix, the run |
 
 All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine). On Windows
