@@ -1,0 +1,811 @@
+// =============================================================================
+//  gcode_ide - the panels that the AIDE GUI adds to the editor widgets: search results, the run panel with its input line, the
+//  documentation viewer, and a few helpers (part of the module gcode: use  import gcode;)
+//
+//    gcode.SearchPane* sp = new gcode.SearchPane();           // find in files: query, options, results that you can click
+//    sp->onJump = jump;  sp->setRoot("/home/me/proj", ignore);  sp->search("TODO");     // int jump(int pane): jumpPath / jumpLine / jumpCol (1 based)
+//    gcode.RunPane* rp = new gcode.RunPane();                 // the output of a program, with a line that sends text to its standard input
+//    rp->start(job);                                          // job: a started aproject.RunJob
+//    gcode.DocView* dv = new gcode.DocView();  dv->openDocs();    // the documentation: /usr/share/a/docs/*.md and the AIDE manual, as pages
+// =============================================================================
+import gui;
+import gfx;
+import adp;
+import asys;
+import atheme;
+import asyntax;
+import aproject;
+import ghtml;
+import guix;
+import cstdlib;
+import gcode_core;
+import gcode_doc;
+import gcode_editor;
+import gcode_bars;
+import gcode_panes;
+module gcode;
+
+// =============================================================================
+//  SearchPane: find in files
+// =============================================================================
+// the list of results: one click jumps (a double click is not needed)
+public class JumpView : OutputView {
+    public JumpView() {
+        super();
+    }
+
+    public virtual void clicked(int i, int button, int mx, int mods, bool dbl) {
+        select(i);
+        if (button == 1) { activate(i); }
+    }
+
+    // a line "path:line:col: text" (what SearchPane writes) sets jumpPath, jumpLine and jumpCol
+    public virtual void activate(int i) {
+        char* t = lineText(i);
+        int n = strlen(t);
+        for (int k = 0; k < n; k++) {
+            if (t[k] != ':' || t[k + 1] < '0' || t[k + 1] > '9') { continue; }
+            int ln = 0;
+            int p = k + 1;
+            while (t[p] >= '0' && t[p] <= '9' && ln < 100000000) { ln = ln * 10 + (t[p] - '0'); p++; }
+            int col = 0;
+            if (t[p] == ':' && t[p + 1] >= '0' && t[p + 1] <= '9') {
+                p++;
+                while (t[p] >= '0' && t[p] <= '9' && col < 100000000) { col = col * 10 + (t[p] - '0'); p++; }
+            }
+            asys.free(jumpPath);
+            jumpPath = asys.strDupN(t, k);
+            jumpLine = ln;
+            jumpCol = col;
+            if (onJump != null) { onJump(this); }
+            return;
+        }
+    }
+}
+
+public class SearchPane : BarBox {
+    public LineEdit* findBox;
+    public LineEdit* filterBox;              // a file name pattern such as *.a (empty: every file)
+    public FlatButton* bCase;
+    public FlatButton* bWord;
+    public FlatButton* bRegex;
+    public FlatButton* bGo;
+    public FlatButton* bStop;
+    public BarLabel* status;
+    public OutputView* results;
+    public func onJump;                      // int f(int pane): jumpPath (as listed: relative to the root) / jumpLine / jumpCol, all 1 based
+    public func onFinished;                  // int f(int pane): the search ended (or was stopped)
+    public char* jumpPath;
+    public int jumpLine;
+    public int jumpCol;
+    public int stepMs;                       // how long one step of the search works (20; 0: one directory entry, tests use it)
+    public int matches;                      // matches found by the last search
+    public int files;                        // files that have a match
+    public bool running;
+    public char* root;
+    private aproject.Ignore* ignore;
+    private aproject.FindJob* job;
+    private int shown;
+    private int timer;
+    private char* lastPath;
+
+    public SearchPane() {
+        super(true, 0, 0);
+        flex = 1;
+        stepMs = 20;
+        bgCol = atheme.Col.Background;
+        jumpPath = asys.strDup("");
+        root = asys.strDup("");
+        BarBox* head = new BarBox(false, 4, 3);
+        head->lineTop = true;
+        head->lineBottom = true;
+        findBox = new LineEdit();
+        findBox->flex = 2;
+        findBox->placeholder = "Find in files";
+        findBox->onEnter = searchEnter;
+        findBox->userData = (int) this;
+        filterBox = new LineEdit();
+        filterBox->flex = 1;
+        filterBox->placeholder = "files: *.a";
+        filterBox->onEnter = searchEnter;
+        filterBox->userData = (int) this;
+        bCase = mk("Aa", "Match case", true);
+        bWord = mk("W", "Whole word", true);
+        bRegex = mk(".*", "Regular expression", true);
+        bGo = mk("Search", "Search the project (Enter)", false);
+        bStop = mk("Stop", "Stop the search", false);
+        bStop->enabled = false;
+        head->add(findBox);
+        head->add(filterBox);
+        head->add(bCase);
+        head->add(bWord);
+        head->add(bRegex);
+        head->add(bGo);
+        head->add(bStop);
+        status = new BarLabel("");
+        status->flex = 2;                    // (a label of its own width would move the buttons while the number of matches grows)
+        head->add(status);
+        add(head);
+        results = new JumpView();
+        results->onJump = searchJumped;
+        results->userData = (int) this;
+        results->emptyText = "No results";
+        add(results);
+    }
+
+    private FlatButton* mk(char* t, char* tip, bool tog) {
+        FlatButton* b = new FlatButton(t);
+        b->tooltip = tip;
+        b->toggle = tog;
+        b->onClick = searchButton;
+        b->userData = (int) this;
+        return b;
+    }
+
+    public virtual int prefH() { return 200; }
+
+    // the folder to search (the ignore rules are used for the search and must stay alive; the pane does not free them)
+    public void setRoot(char* path, aproject.Ignore* ign) {
+        asys.free(root);
+        root = asys.strDup(path);
+        ignore = ign;
+    }
+
+    public int options() {
+        int o = 0;
+        if (!bCase->checked) { o = o | aproject.FIND_ICASE; }
+        if (bWord->checked) { o = o | aproject.FIND_WORD; }
+        if (bRegex->checked) { o = o | aproject.FIND_REGEX; }
+        return o;
+    }
+
+    // starts a search for the text (the find field shows it); false when it cannot start (empty text, a bad regular expression, no folder)
+    public bool search(char* patternIn) {
+        char* pattern = asys.strDup(patternIn);            // (the find field's own text may be replaced below)
+        bool ok = searchNow(pattern);
+        asys.free(pattern);
+        return ok;
+    }
+
+    private bool searchNow(char* pattern) {
+        stop();
+        results->clear();
+        matches = 0;
+        files = 0;
+        shown = 0;
+        asys.free(lastPath);
+        lastPath = null;
+        findBox->setText(pattern);
+        if (job == null) { job = new aproject.FindJob(); }
+        asys.free(job->fileFilter);
+        job->fileFilter = null;
+        char* flt = filterBox->text();
+        if (flt[0] != 0) { job->fileFilter = asys.strDup(flt); }
+        if (pattern[0] == 0) {
+            status->setText("Type what to search for");
+            return false;
+        }
+        if (root[0] == 0) {
+            status->setText("No folder to search");
+            return false;
+        }
+        int r = job->start(root, pattern, options(), ignore, 0);
+        if (r < 0) {
+            status->setText(job->regexError ? "Invalid regular expression" : asys.errText(r));
+            return false;
+        }
+        running = true;
+        bStop->enabled = true;
+        bGo->enabled = false;
+        updateStatus();
+        armTimer();
+        return true;
+    }
+
+    public void focusQuery() {
+        findBox->focusMe();
+        findBox->selectAll();
+    }
+
+    public void stop() {
+        if (job != null && running) {
+            job->cancel();
+            collect();
+            finish();
+        }
+    }
+
+    private void armTimer() {
+        if (timer == 0 && win != null) {
+            int t = win->display->after(20, searchTick, (int) this);
+            if (t > 0) { timer = t; }
+        }
+    }
+
+    // takes the results that the job has found so far into the list
+    private void collect() {
+        while (shown < job->count) {
+            aproject.FindResult* fr = &job->results[shown];
+            if (lastPath == null || !streq(lastPath, fr->path)) {
+                files++;
+                asys.free(lastPath);
+                lastPath = asys.strDup(fr->path);
+            }
+            // "path:line:col: text" is a line that a click turns into a jump
+            char* tx = fr->text;
+            while (tx[0] == ' ' || tx[0] == 9) { tx = &tx[1]; }
+            int cap = strlen(fr->path) + strlen(tx) + 40;
+            char* ln = asys.alloc(cap);
+            format(ln, cap, "%s:%d:%d: %s\n", fr->path, fr->line + 1, fr->col + 1, tx);
+            results->append(ln);
+            asys.free(ln);
+            shown++;
+            matches++;
+        }
+    }
+
+    private void finish() {
+        running = false;
+        bStop->enabled = false;
+        bGo->enabled = true;
+        updateStatus();
+        if (onFinished != null) { onFinished(this); }
+    }
+
+    private void updateStatus() {
+        char t[140];
+        if (running) { format(&t[0], 140, "%d matches ...", matches); }
+        else if (job != null && job->truncated) { format(&t[0], 140, "%d matches in %d files (more were left out)", matches, files); }
+        else { format(&t[0], 140, "%d match%s in %d file%s (%d searched)", matches, matches == 1 ? "" : "es", files, files == 1 ? "" : "s", job != null ? job->filesSearched : 0); }
+        status->setText(&t[0]);
+    }
+
+    // works on the search for a short time (the timer calls it; tests call it by hand); true while the search goes on
+    public bool step() {
+        if (job == null || !running) { return false; }
+        int st = job->step(stepMs);
+        collect();
+        if (st != aproject.FIND_RUNNING) {
+            finish();
+            return false;
+        }
+        updateStatus();
+        return true;
+    }
+
+    public void tick() {
+        timer = 0;
+        if (step()) { armTimer(); }
+    }
+
+    public void jumped() {
+        asys.free(jumpPath);
+        jumpPath = asys.strDup(results->jumpPath);
+        jumpLine = results->jumpLine;
+        jumpCol = results->jumpCol;
+        if (onJump != null) { onJump(this); }
+    }
+
+    public void clicked(FlatButton* b) {
+        if (b == bGo) { search(findBox->text()); }
+        else if (b == bStop) { stop(); }
+    }
+}
+
+int searchEnter(int box) {
+    LineEdit* b = (LineEdit*) box;
+    SearchPane* p = (SearchPane*) b->userData;
+    p->search(p->findBox->text());
+    return 0;
+}
+
+int searchButton(int btn) {
+    FlatButton* b = (FlatButton*) btn;
+    SearchPane* p = (SearchPane*) b->userData;
+    p->clicked(b);
+    return 0;
+}
+
+int searchTick(int self) {
+    SearchPane* p = (SearchPane*) self;
+    p->tick();
+    return 0;
+}
+
+int searchJumped(int view) {
+    OutputView* v = (OutputView*) view;
+    SearchPane* p = (SearchPane*) v->userData;
+    p->jumped();
+    return 0;
+}
+
+// =============================================================================
+//  RunPane: the output of a program and a line that sends text to it
+// =============================================================================
+public class RunPane : BarBox {
+    public OutputView* output;
+    public LineEdit* input;
+    public FlatButton* bStop;
+    public FlatButton* bClear;
+    public BarLabel* status;
+    public func onFinished;                  // int f(int pane): the program ended; exitCode, signal
+    public func onJump;                      // int f(int pane): a line of the output looks like file:line (a crash report, a message): jumpPath ...
+    public char* jumpPath;
+    public int jumpLine;
+    public int jumpCol;
+    public bool running;
+    public int exitCode;
+    public int signal;                       // the signal that ended the program (0: it exited)
+    public char* title;                      // what runs (shown in the header)
+    private aproject.Job* job;
+    private int timer;
+    private int startMs;
+    private bool eofSent;
+
+    public RunPane() {
+        super(true, 0, 0);
+        flex = 1;
+        bgCol = atheme.Col.Background;
+        title = asys.strDup("");
+        jumpPath = asys.strDup("");
+        BarBox* head = new BarBox(false, 4, 3);
+        head->lineTop = true;
+        head->lineBottom = true;
+        status = new BarLabel("Nothing is running");
+        status->flex = 1;
+        head->add(status);
+        bStop = new FlatButton("Stop");
+        bStop->tooltip = "End the program (Shift+F5)";
+        bStop->onClick = runStopClicked;
+        bStop->userData = (int) this;
+        bStop->enabled = false;
+        bClear = new FlatButton("Clear");
+        bClear->onClick = runClearClicked;
+        bClear->userData = (int) this;
+        head->add(bStop);
+        head->add(bClear);
+        add(head);
+        output = new OutputView();
+        output->onJump = runJumped;
+        output->userData = (int) this;
+        add(output);
+        BarBox* row = new BarBox(false, 4, 3);
+        row->lineTop = true;
+        BarLabel* prompt = new BarLabel("Input:");
+        row->add(prompt);
+        RunInput* ri = new RunInput();
+        input = ri;
+        ri->pane = this;
+        input->flex = 1;
+        input->placeholder = "Type a line for the program and press Enter (Ctrl+D ends the input, Ctrl+C stops the program)";
+        input->onEnter = runInputEnter;
+        input->userData = (int) this;
+        row->add(input);
+        add(row);
+    }
+
+    public virtual int prefH() { return 200; }
+
+    public void clear() {
+        output->clear();
+    }
+
+    // follows a started job: its output goes to the pane, the line at the bottom sends input to it
+    public void start(aproject.Job* j, char* what) {
+        job = j;
+        running = true;
+        eofSent = false;
+        exitCode = 0;
+        signal = 0;
+        asys.free(title);
+        title = asys.strDup(what);
+        startMs = asys.monoMs();
+        bStop->enabled = true;
+        input->enabled = true;
+        setStatus("running");
+        armTimer();
+    }
+
+    private void setStatus(char* state) {
+        char t[300];
+        format(&t[0], 300, "%s: %s", title, state);
+        status->setText(&t[0]);
+    }
+
+    private void armTimer() {
+        if (timer == 0 && win != null) {
+            int t = win->display->after(30, runTick, (int) this);
+            if (t > 0) { timer = t; }
+        }
+    }
+
+    public void stop() {
+        if (job != null && running) { job->kill(); }
+    }
+
+    // sends a line (the text and a line break) to the program and shows it in the output; false when nothing runs
+    public bool sendLine(char* text) {
+        if (job == null || !running || eofSent) { return false; }
+        int n = strlen(text);
+        char* data = asys.alloc(n + 2);
+        memcpy(data, text, n);
+        data[n] = 10;
+        data[n + 1] = 0;
+        bool ok = job->sendInput(data, n + 1);
+        output->append(data);
+        asys.free(data);
+        return ok;
+    }
+
+    // the program gets the end of its input (like Ctrl+D)
+    public void endInput() {
+        if (job != null && running && !eofSent) {
+            eofSent = true;
+            job->closeInput();
+        }
+    }
+
+    // reads what the program wrote and notices its end; true while it runs
+    public bool poll() {
+        if (job == null || !running) { return false; }
+        bool more = job->poll();
+        char buf[4096];
+        int total = 0;
+        for (;;) {
+            int n = job->read(&buf[0], 4096);
+            if (n <= 0) { break; }
+            output->appendBytes(&buf[0], n);
+            total = total + n;
+            if (total > 262144) { break; }
+        }
+        if (!more && job->available() == 0) {
+            running = false;
+            int ms = asys.monoMs() - startMs;
+            char t[160];
+            if (job->exited) {
+                exitCode = job->exitCode;
+                signal = 0;
+                format(&t[0], 160, "\n[the program ended with exit code %d after %d.%02d s]\n", exitCode, ms / 1000, (ms % 1000) / 10);
+            } else {
+                exitCode = -1;
+                signal = job->termSignal;
+                format(&t[0], 160, "\n[the program was ended by signal %d (%s) after %d.%02d s]\n", signal, signalName(signal), ms / 1000, (ms % 1000) / 10);
+            }
+            output->append(&t[0]);
+            bStop->enabled = false;
+            input->enabled = false;
+            if (job->exited) { format(&t[0], 160, "ended, exit code %d", exitCode); }
+            else { format(&t[0], 160, "ended by signal %d", signal); }
+            setStatus(&t[0]);
+            if (onFinished != null) { onFinished(this); }
+            return false;
+        }
+        return true;
+    }
+
+    public void tick() {
+        timer = 0;
+        if (poll()) { armTimer(); }
+    }
+
+    public void jumped() {
+        asys.free(jumpPath);
+        jumpPath = asys.strDup(output->jumpPath);
+        jumpLine = output->jumpLine;
+        jumpCol = output->jumpCol;
+        if (onJump != null) { onJump(this); }
+    }
+
+    public void entered() {
+        if (!running) { return; }
+        sendLine(input->text());
+        input->setText("");
+    }
+
+    // keys of the input line: Ctrl+D ends the input, Ctrl+C stops the program
+    public bool inputKey(int key, int mods) {
+        if ((mods & adp.MOD_CTRL) != 0 && key == 'd') { endInput(); return true; }
+        if ((mods & adp.MOD_CTRL) != 0 && key == 'c' && input->text()[0] == 0) { stop(); return true; }
+        return false;
+    }
+}
+
+// the input line of a RunPane: Ctrl+D ends the input of the program, Ctrl+C with an empty line stops it
+public class RunInput : LineEdit {
+    public RunPane* pane;
+
+    public RunInput() {
+        super();
+    }
+
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn != 0 && pane != null && pane->inputKey(key, mods)) { return true; }
+        return super.onKey(dn, key, uni, mods);
+    }
+}
+
+public char* signalName(int sig) {
+    if (sig == 1) { return "hangup"; }
+    if (sig == 2) { return "interrupt"; }
+    if (sig == 3) { return "quit"; }
+    if (sig == 4) { return "illegal instruction"; }
+    if (sig == 6) { return "abort"; }
+    if (sig == 7) { return "bus error"; }
+    if (sig == 8) { return "arithmetic error"; }
+    if (sig == 9) { return "killed"; }
+    if (sig == 11) { return "segmentation fault"; }
+    if (sig == 13) { return "broken pipe"; }
+    if (sig == 15) { return "terminated"; }
+    return "signal";
+}
+
+int runInputEnter(int box) {
+    LineEdit* b = (LineEdit*) box;
+    RunPane* p = (RunPane*) b->userData;
+    p->entered();
+    return 0;
+}
+
+int runStopClicked(int btn) {
+    FlatButton* b = (FlatButton*) btn;
+    RunPane* p = (RunPane*) b->userData;
+    p->stop();
+    return 0;
+}
+
+int runClearClicked(int btn) {
+    FlatButton* b = (FlatButton*) btn;
+    RunPane* p = (RunPane*) b->userData;
+    p->clear();
+    return 0;
+}
+
+int runTick(int self) {
+    RunPane* p = (RunPane*) self;
+    p->tick();
+    return 0;
+}
+
+int runJumped(int view) {
+    OutputView* v = (OutputView*) view;
+    RunPane* p = (RunPane*) v->userData;
+    p->jumped();
+    return 0;
+}
+
+// =============================================================================
+//  DocView: the documentation as pages (Markdown files)
+// =============================================================================
+// the folder that holds the documentation of the language: $AIDE_DOCS, /usr/share/a/docs, /usr/local/share/a/docs, ./docs (a new string, null: none)
+public char* findDocsDir() {
+    char* e = getenv("AIDE_DOCS");
+    if (e != null && e[0] != 0 && asys.isDir(e)) { return asys.strDup(e); }
+    if (asys.isDir("/usr/share/a/docs")) { return asys.strDup("/usr/share/a/docs"); }
+    if (asys.isDir("/usr/local/share/a/docs")) { return asys.strDup("/usr/local/share/a/docs"); }
+    if (asys.isFile("docs/LANGUAGE.md")) { return asys.strDup("docs"); }
+    return null;
+}
+
+public class DocPageList : RowList {
+    public char** names;
+    public char** paths;
+    public int count;
+    private int cap;
+
+    public DocPageList() {
+        super();
+        bgCol = atheme.Col.Sidebar;
+        fgCol = atheme.Col.SidebarText;
+        rowH = 22;
+        cap = 16;
+        names = (char**) calloc(cap, 8);
+        paths = (char**) calloc(cap, 8);
+        emptyText = "No documentation found";
+    }
+
+    public virtual int rowCount() { return count; }
+    public virtual int prefW() { return 150; }
+
+    public void add(char* name, char* path) {
+        if (count == cap) {
+            cap = cap * 2;
+            names = (char**) realloc((char*) names, cap * 8);
+            paths = (char**) realloc((char*) paths, cap * 8);
+        }
+        names[count] = asys.strDup(name);
+        paths[count] = asys.strDup(path);
+        count++;
+        invalidate();
+    }
+
+    public virtual void paintItem(gfx.Surface* s, int x, int y, int rw, int i, bool sel) {
+        int c = look->col(sel ? atheme.Col.Foreground : atheme.Col.SidebarText);
+        s->text(gfx.sans(), x + 8, y + (rowH - gfx.sans()->height) / 2, names[i], c);
+    }
+}
+
+public class DocView : BarBox {
+    public DocPageList* pages;
+    public ghtml.HtmlView* view;
+    public char* current;                    // the path of the page that is shown ("" when none)
+    public func onOpenFile;                  // int f(int docview): a link points to a source file: openPath (the user may want to open it in the editor)
+    public char* openPath;
+    public int pageCount;
+    private char** history;
+    private int nhist;
+    private char* dir;
+    public bool quiet;                       // pages->select was called by the program, not by the user
+
+    public DocView() {
+        super(false, 0, 0);
+        flex = 1;
+        bgCol = atheme.Col.Background;
+        current = asys.strDup("");
+        openPath = asys.strDup("");
+        history = (char**) calloc(64, 8);
+        pages = new DocPageList();
+        pages->onSelect = docSelected;
+        pages->userData = (int) this;
+        view = new ghtml.HtmlView();
+        view->flex = 1;
+        view->onLink = docLink;
+        view->userData = (int) this;
+        add(pages);
+        add(view);
+    }
+
+    public virtual int prefH() { return 300; }
+
+    // lists the files of the documentation folder (and the manual of AIDE); returns how many pages there are
+    public int openDocs() {
+        pages->count = 0;
+        dir = findDocsDir();
+        if (dir != null) {
+            asys.DirList dl;
+            if (asys.listDir(dir, &dl) >= 0) {
+                char* order[8];
+                order[0] = "LANGUAGE"; order[1] = "CLIB"; order[2] = "GUI"; order[3] = "AIDE"; order[4] = "TUI"; order[5] = "TARGETS"; order[6] = "INTERNALS"; order[7] = "TLS";
+                for (int k = 0; k < 8; k++) { addIfThere(&dl, order[k]); }
+                for (int i = 0; i < dl.count; i++) {
+                    char* nm = dl.name(i);
+                    int l = strlen(nm);
+                    if (l > 3 && streq(&nm[l - 3], ".md") && !listed(nm)) {
+                        char* base = asys.strDupN(nm, l - 3);
+                        char* full = asys.join(dir, nm);
+                        pages->add(base, full);
+                        asys.free(base);
+                        asys.free(full);
+                    }
+                }
+                dl.dispose();
+            }
+        }
+        // the manual of AIDE, wherever it was installed
+        if (asys.isFile("/usr/share/aide/aide.md") && !hasPage("AIDE")) { pages->add("AIDE (the IDE)", "/usr/share/aide/aide.md"); }
+        pageCount = pages->count;
+        if (pageCount > 0) {
+            quiet = true;
+            pages->select(0);
+            quiet = false;
+            showPage(pages->paths[0], false);
+        } else {
+            view->setPlain("No documentation was found.\n\nThe documentation of the language is in /usr/share/a/docs (or in the folder named by the environment variable AIDE_DOCS).", "");
+        }
+        return pageCount;
+    }
+
+    private bool listed(char* fileName) {
+        for (int i = 0; i < pages->count; i++) {
+            char* b = baseName(pages->paths[i]);
+            if (streq(b, fileName)) { return true; }
+        }
+        return false;
+    }
+
+    private bool hasPage(char* name) {
+        for (int i = 0; i < pages->count; i++) {
+            if (startsWith(pages->names[i], name)) { return true; }
+        }
+        return false;
+    }
+
+    private void addIfThere(asys.DirList* dl, char* base) {
+        char fn[80];
+        format(&fn[0], 80, "%s.md", base);
+        for (int i = 0; i < dl->count; i++) {
+            if (streq(dl->name(i), &fn[0])) {
+                char* full = asys.join(dir, &fn[0]);
+                pages->add(base, full);
+                asys.free(full);
+                return;
+            }
+        }
+    }
+
+    // shows a file: Markdown as a page, other text as plain text; false when it cannot be read
+    public bool showPage(char* path, bool remember) {
+        int len = 0;
+        char* t = asys.readFile(path, &len, 8388608, null);
+        if (t == null) { return false; }
+        if (remember && current[0] != 0 && nhist < 64) {
+            history[nhist] = asys.strDup(current);
+            nhist++;
+        }
+        char* base = dirNameOf(path);
+        if (len > 3 && streq(&path[strlen(path) - 3], ".md")) { view->setMarkdown(t, base); }
+        else { view->setPlain(t, base); }
+        asys.free(base);
+        asys.free(t);
+        asys.free(current);
+        current = asys.strDup(path);
+        view->scrollY = 0;
+        view->invalidate();
+        return true;
+    }
+
+    public bool back() {
+        if (nhist == 0) { return false; }
+        nhist--;
+        char* p = history[nhist];
+        history[nhist] = null;
+        bool ok = showPage(p, false);
+        asys.free(p);
+        return ok;
+    }
+
+    private char* dirNameOf(char* p) {
+        int at = 0;
+        for (int i = 0; p[i] != 0; i++) { if (p[i] == '/') { at = i; } }
+        return asys.strDupN(p, at);
+    }
+
+    // a link was clicked: another page of the documentation, an anchor in this one, a file; web addresses are not followed
+    public void linkClicked(char* href) {
+        if (href == null || href[0] == 0) { return; }
+        if (href[0] == '#') {
+            view->scrollToAnchor(&href[1]);
+            return;
+        }
+        if (startsWith(href, "http:") || startsWith(href, "https:") || startsWith(href, "mailto:")) { return; }
+        char* h = asys.strDup(href);
+        char* anchor = null;
+        int hash = indexOf(h, '#');
+        if (hash >= 0) { anchor = &h[hash + 1]; h[hash] = 0; }
+        char* base = dirNameOf(current);
+        char* full = (h[0] == '/') ? asys.strDup(h) : asys.join(base, h);
+        asys.free(base);
+        if (h[0] != 0) {
+            int fl = strlen(full);
+            if (fl > 3 && streq(&full[fl - 3], ".md")) {
+                if (showPage(full, true)) {
+                    quiet = true;
+                    for (int i = 0; i < pages->count; i++) {
+                        if (streq(pages->paths[i], full)) { pages->select(i); }
+                    }
+                    quiet = false;
+                }
+            } else if (asys.isFile(full)) {
+                asys.free(openPath);
+                openPath = asys.strDup(full);
+                if (onOpenFile != null) { onOpenFile(this); }
+            }
+        }
+        if (anchor != null && anchor[0] != 0) { view->scrollToAnchor(anchor); }
+        asys.free(full);
+        asys.free(h);
+    }
+}
+
+int docSelected(int list) {
+    DocPageList* l = (DocPageList*) list;
+    DocView* d = (DocView*) l->userData;
+    if (!d->quiet && l->selected >= 0 && l->selected < l->count) { d->showPage(l->paths[l->selected], true); }
+    return 0;
+}
+
+int docLink(int view) {
+    ghtml.HtmlView* v = (ghtml.HtmlView*) view;
+    DocView* d = (DocView*) v->userData;
+    d->linkClicked(v->linkHref);
+    return 0;
+}
