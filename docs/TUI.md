@@ -78,10 +78,21 @@ terminal supports and the program wants. `restore()` (also `leave()` and `close(
 * when you call `leave()` / `close()`, and from `App.stop()`,
 * from the `exit()` hook, so `exit(3)` deep inside the program restores the terminal,
 * from the signal handlers of SIGINT, SIGQUIT, SIGHUP, SIGTERM, SIGSEGV, SIGBUS, SIGFPE, SIGILL and SIGABRT: the terminal is restored, the
-  signal is re-raised with the default action (so the shell sees the right exit status), and for crashes `fatal signal N` is printed,
+  signal is re-raised with the default action (so the shell sees the right exit status), and for crashes `fatal signal N` is printed.
+  The same handler is put on SIGUSR1, SIGUSR2, SIGPIPE, SIGALRM, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF and SIGSYS, but only when the
+  program has not given the signal a handler of its own (or ignored it) before. (`asys` ignores SIGPIPE for good when the first child
+  process is started, so that a write to a closed pipe is an error and not a death.)
 * when the terminal goes away (hang up): `Terminal.eof` becomes true and an `EV_HUP` event arrives.
 
 A stack overflow cannot run a handler (A does not use `sigaltstack`): after such a crash type `reset`.
+
+**Saving work on a hang up or a kill.** `Terminal.softExit(true)` changes SIGHUP, SIGTERM and SIGINT (SIGINT only from outside: in raw mode the keyboard sends none): the handler no longer restores the
+terminal and kills the program, it only notes the signal, and an `EV_HUP` event arrives (`key` = the signal number; `App.run` returns when it sees one). The program can then save its
+work, leave full screen mode and exit by itself. `App.hupSignal` tells which signal ended `run()` (0: the terminal itself went away), and `term.exitBySignal(sig)` ends
+the program the way that signal would have (terminal restored, default action, so the parent sees "killed by SIGTERM" and not a normal exit). A second signal that arrives
+while the first one has not been looked at yet (the program is stuck outside its event loop) is not soft: it restores the terminal and kills the program. A program that does not
+call `softExit` keeps the default: the terminal is restored and the program dies the way the signal says. (AIDE uses it so that a closed terminal window does not lose the unsaved
+documents. Test `t237`.)
 
 The signal handlers need a small page of machine code made at run time (the kernel calls handlers with the C calling convention, A functions
 use their own). It is mapped writable and executable, and the processor is told about the new code (ARM64: data cache clean and instruction
@@ -391,9 +402,10 @@ Use the theme styles instead of fixed colours so that the widget looks right at 
 | `t226` | key names, `parseKey`, the key encoder and a round trip over 500 key combinations |
 | `t227` .. `t235` | widgets, input, lists, tree and table (also sorting 20000 rows), menus, dialogs, layout and splitter, text pane, the application loop (all through `initHeadless`) |
 | `t236` | `DirList` (symbolic links, FIFOs, `stat` helpers) and the file dialogs on a directory tree the test makes (Linux; `.out.windows` says so) |
-| `t237` | the real terminal layer on a pseudo terminal the test creates (raw mode, the sequences written, keys and mouse read from a real pty, Esc timeout, a burst of 3000 keys, SIGWINCH, absurd sizes, title cleaning, restore) |
+| `t237` | the real terminal layer on a pseudo terminal the test creates (raw mode, the sequences written, keys and mouse read from a real pty, Esc timeout, a burst of 3000 keys, SIGWINCH, absurd sizes, title cleaning, restore; `softExit`: SIGTERM becomes an event, a second SIGTERM kills a stuck program with the terminal put back) |
 | `t238` | `Process`: a child with a pipe, exit status, kill of a process group, several children, `setenv` seen by children |
 | `t239` | a random session of 2500 keys, clicks, drags, pastes and resizes against a UI with every widget; invariants after each step |
+| `t271` | modal dialogs and mouse clicks: a click on a dialog under another modal dialog is swallowed, a popup above a dialog still gets its clicks |
 
 They are ordinary tests (`tests/run.sh t22`, `t23`) and run on all five targets with the same expected output (`t236`, `t237`, `t238` print one line on Windows).
 **`tests/tui.sh`** is the second layer: it compiles `tests/tui/probe.a`, `examples/tui/gallery.a` and `examples/tui/files.a`, starts them in a
@@ -436,7 +448,7 @@ Everything else the toolkit uses exists on AOS: `ioctl` (TCGETS, TCSETSW, TIOCGW
 `pipe2`, `dup2`, `kill` (also to process groups), `getdents64` with the file type. The GUI terminal `gterm` (used by `aterm`) understands the sequences the toolkit
 writes: colours (16, 256 and 24 bit), cursor movement, erasing, scroll regions, the alternate screen, bracketed paste, window titles, and **mouse reporting
 (1000, 1002, 1003, 1006 and the old form, focus reports 1004, `CSI 18 t`)**, added for this toolkit (Shift + mouse still selects text). What `gterm` does not have:
-double width cells for wide characters (CJK and emoji take one cell there, so the toolkit's layout is off by one cell per wide character: use `TUI_ASCII=1` or avoid them), OSC 52,
+double width cells for wide characters (CJK and emoji take one cell there, so the toolkit's layout is off by one cell per wide character: use `TUI_ASCII=1` or avoid them), glyphs outside Latin-1 (it draws box drawing, block elements, the bullet and arrows / triangles itself; ellipsis, curly quotes, check marks and similar get a plain ASCII stand-in, anything else shows `?`), OSC 52,
 the `CSI 22 t` title stack (ignored) and colon separated SGR parameters.
 
 ---

@@ -4,9 +4,12 @@ AIDE is the integrated development environment of the A language. It will run as
 program (`aide-gui`), both on Linux and on AOS, and both are built on the same libraries. This document describes those
 libraries (they are part of the A standard library, in `lib/`) and how the two front ends are meant to use them.
 
-**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`). The two front ends
-(`user/aide.a` and `user/gui/aide-gui.a` in the AOS repository) do not exist yet. The libraries contain no user interface code:
-everything that draws or reads the keyboard is the front end's job.
+**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`). The terminal front end exists: `user/aide.a` in the
+AOS repository (`aide`, about 6000 lines, one file; manual `docs/AIDE.md` there) runs on the AOS terminals (serial console, `aterm`, `telnetd`) and on
+Linux terminals, and uses everything below: `asys`, `acode`, `asyntax`, `atheme`, `aproject`, `afind` and the toolkit of [TUI.md](TUI.md). It has its own tests
+(`tests/aide_tui_test.py` in the AOS repository: 90 tests in pseudo terminals, among them a random session of 500 keys, mouse events and resizes; and
+the QEMU tests `aide` and `aide-gui`). The GUI front end (`user/gui/aide-gui.a`) does not exist yet. The libraries contain no user interface code: everything
+that draws or reads the keyboard is the front end's job.
 
 Contents
 
@@ -95,10 +98,15 @@ The temp name must fit the file system: if `.NAME.tmp-<12 hex>` would be longer 
 whole path must also stay within 255) the NAME part is cut, at a character boundary and never the random part (an earlier version cut
 the end, so for a 255 byte name every save used the same temp name and one stale file of that name made all saves fail with `-EEXIST`,
 and on AOS every name of 38 to 55 bytes failed with `-ENOSPC`).
-What a rename based save does that an in-place write would not (it is the same as `mv` and most editors' default): **hard links
-are broken** (the other names keep the old content), the **owner and group** of the new file are those of the process, and the
-**write permission bit does not protect** a file (a 0444 file is replaced and stays 0444; a front end that wants to protect read-only
-files must look at the mode itself).
+**The identity of the file is kept** (Linux; `Stat` has `gid` for this): the temp file is given the owner and group of the old file
+(`fchown`, then the permissions are put back, because `fchown` clears set-user-id bits). When the process may not give a file away
+(a normal user saving a file of somebody else that it may write) or when the file has **several hard links**, the old file is
+**overwritten in place** instead of replaced: the owner, the group and every hard link name keep working, but the save is not atomic
+(a crash in the middle leaves a short file) and the permissions of the old file decide (`-EACCES` when it is not writable: then nothing
+is changed and no temp file stays). A file with one link and the owner of the process is still replaced by rename. What stays as it
+was: the **write permission bit does not protect** such a file (a 0444 file is replaced and stays 0444; a front end that wants to
+protect read-only files must look at the mode itself). Extended attributes and ACLs are not copied. (Before this, a save changed the
+owner and group to those of the process and broke hard links. Test `t270`.)
 
 **Processes.** `Process.start` forks, sets up the pipes (all `O_CLOEXEC`, parent ends non-blocking, descriptors below 3 are moved
 away before `dup2`), searches `PATH` itself, and reports a failing `exec` *synchronously* (`-ENOENT`, `-EACCES`) through a
@@ -279,7 +287,9 @@ Both front ends do the same things; only drawing and input differ.
    destructors): call `dispose()` on everything you are done with.
 2. Draw: for each visible line `i` get the text with `b.linePtr(i, &len)` and the spans with `h.tokens(i, tok, 256)`; colours
    from `t->tokenColor(kind)`. Selections and carets are `e.cur[k].anchor/.pos`; columns with `b.visualCol(i, offset, e.tabWidth)`
-   (and `offsetAtCol` for mouse clicks). Bracket highlight: `e.matchNearCaret(&at)`.
+   (and `offsetAtCol` for mouse clicks). `visualCol` remembers the answer for the last offset of a line, so asking for the caret's column
+   after every key stays O(1) at the end of a long line (and while typing in its middle); a scan from the line start is only needed after
+   an edit before the remembered offset (test `t273`). Bracket highlight: `e.matchNearCaret(&at)`.
 3. Keys call `Editor` commands (`typeChar`, `newline`, `backspace`, `moveLeft(shift)`, `undo`, ...). To know when to redraw compare
    `b.version` (or register a listener: the `Change` says which lines moved).
 4. Files: `b.checkExternal()` on focus, `e.saveFile(path, flags, s.trimOnSave, s.finalNewline)`.
@@ -328,10 +338,16 @@ Missing in AOS, and what asys does:
   working directory, so the image had it as `/build/ac` and the tests were started from `/`): `t200` to `t219` all pass (`t202` and `t219` print one
   extra line on the console, the kernel's note about the unimplemented `fchmod` that the compiler `ac` calls, and `t202` the AOS
   shell's complaint about `exec 0<&-`; both are not part of the test's standard output, which equals the `.out` file), 20 000
-  cycles of `alloc(300000)` + `free` fit in 2 MB, and file names of 38 to 55 bytes are saved atomically. The libraries do not
-  have a front end on AOS yet (`aide` / `aide-gui` do not exist), so no interactive session was run. The whole AOS image was also built
+  cycles of `alloc(300000)` + `free` fit in 2 MB, and file names of 38 to 55 bytes are saved atomically. At that time there was no front end; see
+  the next paragraph for what was run with AIDE. The whole AOS image was also built
   with this compiler and its own boot tests `boot`, `shell`, `coreutils`, `processes` and `torture` pass (the `grep` of the AOS shell
   was checked by hand: `grep 'main()'` finds `main()` only, `grep 'a|b'` finds the text `a|b`, `^b$` and `ma.n` work).
+
+* **AIDE on AOS** (stage "aidetui"; QEMU without KVM): `aide` runs on the serial console (read through a terminal emulator that also answers the
+  size queries), in `aterm` (screenshot) and as the real thing for typing, saving, building with the in-OS compiler (`/bin/ac`, a fraction of a second), running the
+  result, a compile error in the Problems list, Ctrl+F5 (the program on the real terminal and back), and quitting with the shell normal again. What AOS needed for it
+  (a pty output queue that drops what does not fit, a kernel log line that tore the console screen) was fixed in the AOS repository, see its `docs/ARCHITECTURE.md`.
+  The liveness mark of a running AIDE and the recovery copies need `/tmp` and `/home`; the lock is in `/tmp` on AOS so that nothing is written to the disk every few seconds.
 
 ## 11. Tests and measurements
 
@@ -357,6 +373,8 @@ Missing in AOS, and what asys does:
 | `t217_acode_perf` | 100 000 lines inserted at the end / start / random places, 50 000 typed characters, 2000 cursors, a 3 MB file |
 | `t218_regressions` | temp file permissions and names (also at the name limit), extreme tab widths, `dispose()` of every class, 24 MB cycles, bounded walks; exact undo / redo after the history was trimmed (model based), whole-line paste into several cursors, out-of-range line numbers, glob worst cases, find in files `exceeded`, the old regex dialect |
 | `t219_aide_session` | a whole session through all modules: project, ignore rules, tree, quick open, find in files, buffer, editor, highlighter, symbols, completion, rename with undo, save, external change, watcher, settings, a real build with an error, the fix, the run |
+| `t270_asys_identity` | `AtomicFile` keeps hard links together and the owner, group and set-user-id bits of the file it replaces; a second user (the test forks and calls `setuid`) overwrites a foreign file in place and gets `-EACCES` for one it may not write; a new file is made as before (needs root for the owner checks) |
+| `t273_acode_visualcol` | `visualCol` against a plain scan after 4000 random edits (tabs, wide, combining, newlines, undo), set text, and typing 60000 characters into one line with a column query after every key |
 
 All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine) and, as
 plain x86-64 executables, in an AOS image (see section 10; `t202` and `t213` use other shell commands there: `seq` instead of
@@ -403,4 +421,4 @@ distances).
 * On Windows the allocator cannot give big blocks back (the compiler's import table has no `VirtualFree`): freed big blocks are
   kept in size-class free lists and reused. After a 24 MB text was edited and dropped, about 90 MB stayed mapped (in use: 0).
 * Processes need `fork`/`execve`: not on Windows. `Job` merges standard error into standard output.
-* Not tested here: AOS (see section 10), terminals and GUIs (there is no front end yet), files over 2 GiB (`maxLoad` defaults to 1 GiB).
+* Not tested here: files over 2 GiB (`maxLoad` defaults to 1 GiB), real ARM64 / RISC-V / LoongArch hardware (everything runs under qemu-user).

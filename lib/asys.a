@@ -872,6 +872,7 @@ public struct Stat {
     int mtimeNs;
     int uid;
     int nlink;
+    int gid;
 
     bool isFile() { return (mode & 0xF000) == 0x8000; }
     bool isDir() { return (mode & 0xF000) == 0x4000; }
@@ -900,6 +901,7 @@ private void fillStat(char* raw, Stat* st) {
         st->nlink = rd64(raw, 16);
         st->mode = rd32(raw, 24);
         st->uid = rd32(raw, 28);
+        st->gid = rd32(raw, 32);
         st->size = rd64(raw, 48);
         st->mtime = rd64(raw, 88);
         st->mtimeNs = rd64(raw, 96);
@@ -909,6 +911,7 @@ private void fillStat(char* raw, Stat* st) {
         st->mode = rd32(raw, 16);
         st->nlink = rd32(raw, 20);
         st->uid = rd32(raw, 24);
+        st->gid = rd32(raw, 28);
         st->size = rd64(raw, 48);
         st->mtime = rd64(raw, 88);
         st->mtimeNs = rd64(raw, 96);
@@ -928,6 +931,7 @@ private int statxCall(int dirfd, char* path, int flags, Stat* st) {
     st->mode = rd16(&sx[0], 28);
     st->nlink = rd32(&sx[0], 16);
     st->uid = rd32(&sx[0], 20);
+    st->gid = rd32(&sx[0], 24);
     st->size = rd64(&sx[0], 40);
     st->mtime = rd64(&sx[0], 112);
     st->mtimeNs = rd32(&sx[0], 120);
@@ -1206,6 +1210,11 @@ private int fchmodFd(int fd, int mode) {
     }
     return sys(91, 52, fd, mode);
 }
+
+// the effective user and group of this process, and giving a file to a user and group (Linux; used to keep the owner when a file is replaced)
+private int procUid() { return sys(107, 175); }
+private int procGid() { return sys(108, 177); }
+private int fchownFd(int fd, int uid, int gid) { return sys(93, 55, fd, uid, gid); }
 
 // true where symbolic links and FIFOs exist (Linux); AOS and Windows have neither
 public bool hasLinks() {
@@ -1547,12 +1556,14 @@ private int copyFile(char* from, char* to, int mode) {
 //   abort():  removes the temp file.
 // If no temp file can be created (EACCES, EROFS, EPERM, ENAMETOOLONG) and W_INPLACE_OK is set, the file is overwritten in
 // place instead (not atomic).
-// Things a rename based save does that an in-place write would not (like `mv` and most editors' default): a file with several
-// hard links gets new content under the saved name only (the other names keep the old content); the owner and group of the
-// new file are those of the process, not of the old file; the write permission bit of the old file does not stop the save (the
-// permissions are copied, so a 0444 file stays 0444, but its content is replaced: a front end that wants to protect read-only
-// files has to look at the mode itself). The temp file's name is ".<name>.tmp-<12 hex digits>", the name part cut when the
-// result would be longer than the file system allows (55 bytes on AOS).
+// The identity of an existing file is kept (Linux): the temp file gets the owner and group of the old file (fchown; the permissions are
+// copied too, so a 0444 file stays 0444). When that is not possible (the process is not allowed to give the file away) or when the file
+// has several hard links, the old file is overwritten in place instead (not atomic: a crash in the middle leaves a short file), so the
+// owner, the group and every hard link name keep working; then the permissions of the old file decide (EACCES when it is not writable).
+// For a file with one link and the owner of the process the rename is used as before: the write permission bit of the old file does
+// not stop the save (a front end that wants to protect read-only files has to look at the mode itself). Extended attributes and ACLs are
+// not copied. The temp file's name is ".<name>.tmp-<12 hex digits>", the name part cut when the result would be longer than the file
+// system allows (55 bytes on AOS).
 public class AtomicFile {
     private int fd;
     private char* tmp;
@@ -1583,6 +1594,9 @@ public class AtomicFile {
         Stat st;
         int perm = mode & 0xFFF;
         bool existed = false;
+        int ownUid = -1;
+        int ownGid = -1;
+        int links = 1;
         if (lstat(target, &st) == 0 && st.isLink()) {
             free(target);                                        // realpath gave up after 32 links: a loop
             target = null;
@@ -1596,6 +1610,9 @@ public class AtomicFile {
             }
             perm = st.mode & 0xFFF;
             existed = true;
+            ownUid = st.uid;
+            ownGid = st.gid;
+            links = st.nlink;
         }
         if (existed && (fl & W_BACKUP) != 0) {
             char* bak = concat3(target, "~", "");
@@ -1606,6 +1623,11 @@ public class AtomicFile {
                 target = null;
                 return br;
             }
+        }
+        bool owners = existed && fileHasMode(0);
+        if (owners && links > 1) {
+            // several names for the file: a new file would break them apart
+            return openInPlace(perm);
         }
         int sl = lastSlash(target);
         char* dir = (sl < 0) ? strDup(".") : (sl == 0 ? strDup("/") : strDupN(target, sl));
@@ -1661,12 +1683,37 @@ public class AtomicFile {
             target = null;
             return e;
         }
+        if (owners && (ownUid != procUid() || ownGid != procGid())) {
+            // the new file belongs to the old file's owner and group (this clears set-user-id bits: the mode is put back below)
+            if (fchownFd(fd, ownUid, ownGid) < 0) {
+                fileClose(fd);
+                fd = -1;
+                unlink(tmp);
+                free(tmp);
+                tmp = null;
+                return openInPlace(perm);
+            }
+        }
         // the umask may have removed permission bits: put them back (nothing else can see the file yet)
         Stat fs;
         if (fstat(fd, &fs) == 0 && (fs.mode & 0xFFF) != perm && fileHasMode(fd)) {
             fchmodFd(fd, perm);
         }
         return 0;
+    }
+
+    // overwrites the old file in place (open() decided that a rename would lose its owner, group or hard links): 0 or -errno
+    private int openInPlace(int perm) {
+        fd = fileOpen(target, F_WRITE | F_TRUNC | F_CLOEXEC, perm);
+        if (fd >= 0) {
+            inplace = true;
+            return 0;
+        }
+        int e = fd;
+        fd = -1;
+        free(target);
+        target = null;
+        return e;
     }
 
     // appends data: n or -errno (after an error every later call returns the same error)

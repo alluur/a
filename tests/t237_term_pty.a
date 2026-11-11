@@ -109,6 +109,34 @@ void child() {
     t->leave();
     t->close();
     result("R:done");
+
+    // softExit: a kill from outside becomes an event (the program can save its work); a second kill while the program is stuck outside
+    // its event loop still ends it, with the terminal put back first
+    term.Terminal* s = new term.Terminal();
+    s->open();
+    s->caps.colors = term.COLORS_TRUE;
+    s->caps.altScreen = true;
+    s->caps.utf8 = true;
+    s->enter();
+    s->softExit(true);
+    result("R:soft ready");
+    int hup = 0;
+    guard = 0;
+    while (hup == 0 && guard < 60) {
+        guard++;
+        s->wait(500);
+        while (s->next(&e)) {
+            if (e.kind == term.EV_HUP) { hup = e.key; }
+        }
+    }
+    int during2 = lflagOf(0);
+    format(&buf[0], 80, "R:soft: EV_HUP for signal %d, the terminal is still raw: %d", hup, (during2 & 10) == 0, 0);
+    result(&buf[0]);
+    result("R:stuck ready");
+    int t0 = millis();
+    while (millis() - t0 < 6000) { sleepMs(20); }            // no event loop here
+    result("R:stuck survived");
+    s->close();
 }
 
 // ---- the parent: the terminal emulator side --------------------------------------------------------------------------------------------------
@@ -232,9 +260,30 @@ int main() {
     printf("absurd size cut: %d\n", rs);
     bool fin = waitFor(master, rfd, "R:done");
     printf("child finished: %d\n", fin);
-    for (int i = 0; i < 10; i++) { drain(master, rfd, 20); }
+    println("-- softExit: SIGTERM is an event, a second SIGTERM kills a stuck program");
+    bool sr = waitFor(master, rfd, "R:soft ready");
+    printf("soft exit started: %d\n", sr);
+    sys(62, 129, pid, 15, 0, 0);                               // kill(child, SIGTERM)
+    bool got = waitFor(master, rfd, "R:soft: EV_HUP");
+    printf("SIGTERM arrived as an event: %d\n", got);
+    bool stuck = waitFor(master, rfd, "R:stuck ready");
+    printf("stuck program started: %d\n", stuck);
+    int mark = outLen;
+    sys(62, 129, pid, 15, 0, 0);                               // first signal: only noted (the program cannot look at it)
+    for (int i = 0; i < 15; i++) { drain(master, rfd, 20); }
+    sys(62, 129, pid, 15, 0, 0);                               // second signal: the program dies
     int status = 0;
-    sys(61, 260, pid, (int) &status, 0, 0);
+    bool dead = false;
+    for (int i = 0; i < 150 && !dead; i++) {
+        drain(master, rfd, 50);
+        int w = sys(61, 260, pid, (int) &status, 1, 0);        // wait4(WNOHANG)
+        if (w == pid) { dead = true; }
+    }
+    printf("the stuck program was killed by the second signal: %d\n", dead);
+    printf("it died from signal %d (not by its own exit)\n", status & 127);
+    out[outLen] = 0;
+    printf("the signal handler put the terminal back (alternate screen left after the second signal): %d\n", find(&out[mark], "\e[?1049l") >= 0);
+    printf("the program did not get past the stuck loop: %d\n", !outHas("stuck survived") && find(&res[0], "R:stuck survived") < 0);
     println("-- what the child reported");
     int pos = 0;
     while (pos < resLen) {
@@ -255,6 +304,5 @@ int main() {
     printf("the order is right (enter before leave): %d\n", find(&out[0], "\e[?1049h") < find(&out[0], "\e[?1049l"));
     lflag = lflagOf(master);
     printf("restored at the end (ICANON and ECHO are back): %d\n", (lflag & 10) == 10);
-    printf("exit status of the child: %d\n", (status >> 8) & 255);
     return 0;
 }
