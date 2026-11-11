@@ -2527,7 +2527,10 @@ class BufInfo {
     public char** words;
     public int nwords;
     public int wcap;
+    public int scanLen;                 // the length of the text that the words and symbols were taken from
 }
+
+const BIG_SCAN = 1000000;               // a buffer of this many bytes is not scanned again after every edit (see Completer.refresh)
 
 // Candidates for what is being typed: keywords of the language, symbols and the words found in the registered buffers.
 public class Completer {
@@ -2588,7 +2591,17 @@ public class Completer {
         if (bi->version == bi->buf->version) {
             return;
         }
+        // A big buffer costs 100 ms and more per scan: while it is edited the words and symbols of the text as it was a few edits
+        // ago are good enough (a scan follows after 25 edits, or when the length changed by 2000 bytes, or for a new language).
+        int len = bi->buf->length();
+        if (bi->version >= 0 && bi->syms != null && len >= BIG_SCAN) {
+            int dv = bi->buf->version - bi->version;
+            int dl = len - bi->scanLen;
+            if (dl < 0) { dl = -dl; }
+            if (dv >= 0 && dv < 25 && dl < 2000) { return; }
+        }
         freeInfo(bi);
+        bi->scanLen = len;
         bi->version = bi->buf->version;
         bi->syms = new SymbolList();
         symbols(bi->buf, bi->lang, bi->syms);
@@ -2671,9 +2684,23 @@ public class Completer {
         nres = 0;
     }
 
+    // adds a candidate (the text stays where it is: it is only copied when the candidate is given out)
+    private Candidate* addCand(Candidate* all, int* n, int* cap, char* text, int kind, int score) {
+        if (*n == *cap) {
+            *cap = *cap * 2;
+            all = (Candidate*) asys.realloc((char*) all, *cap * sizeof(Candidate));
+        }
+        all[*n].text = text;
+        all[*n].kind = kind;
+        all[*n].score = score;
+        *n = *n + 1;
+        return all;
+    }
+
     // Fills out with at most max candidates for the typed prefix, best first: exact-case prefix matches before case-insensitive
     // ones, then symbols, keywords, words; shorter names first, then alphabetical. A candidate equal to the prefix itself is left
-    // out. lang selects the keywords.
+    // out. lang selects the keywords. The work is linear in the number of words that start with the prefix (a hash table removes
+    // the duplicates, only the best max candidates are kept sorted), so a big file does not make a key press slow.
     public int complete(char* prefix, int lang, Candidate* out, int max) {
         clearResults();
         int plen = strlen(prefix);
@@ -2687,11 +2714,7 @@ public class Completer {
                 if (ws->words[i] != null) {
                     int sc = matchScore(prefix, plen, ws->words[i]);
                     if (sc >= 0 && !streq(ws->words[i], prefix)) {
-                        if (n == cap) { cap = cap * 2; all = (Candidate*) asys.realloc((char*) all, cap * sizeof(Candidate)); }
-                        all[n].text = asys.strDup(ws->words[i]);
-                        all[n].kind = 1;
-                        all[n].score = sc + 20;
-                        n++;
+                        all = addCand(all, &n, &cap, ws->words[i], 1, sc + 20);
                     }
                 }
             }
@@ -2703,74 +2726,76 @@ public class Completer {
                 char* nm = bi->syms->items[i].name;
                 int sc = matchScore(prefix, plen, nm);
                 if (sc >= 0 && !streq(nm, prefix)) {
-                    if (n == cap) { cap = cap * 2; all = (Candidate*) asys.realloc((char*) all, cap * sizeof(Candidate)); }
-                    all[n].text = asys.strDup(nm);
-                    all[n].kind = 0;
-                    all[n].score = sc + 30;
-                    n++;
+                    all = addCand(all, &n, &cap, nm, 0, sc + 30);
                 }
             }
             for (int i = 0; i < bi->nwords; i++) {
                 char* nm = bi->words[i];
                 int sc = matchScore(prefix, plen, nm);
                 if (sc >= 0 && !streq(nm, prefix)) {
-                    if (n == cap) { cap = cap * 2; all = (Candidate*) asys.realloc((char*) all, cap * sizeof(Candidate)); }
-                    all[n].text = asys.strDup(nm);
-                    all[n].kind = 2;
-                    all[n].score = sc;
-                    n++;
+                    all = addCand(all, &n, &cap, nm, 2, sc);
                 }
             }
         }
-        // remove duplicates (keep the best score), then sort
-        for (int i = 0; i < n; i++) {
-            if (all[i].text == null) { continue; }
-            for (int j = i + 1; j < n; j++) {
-                if (all[j].text != null && streq(all[i].text, all[j].text)) {
-                    if (all[j].score > all[i].score) {
-                        all[i].score = all[j].score;
-                        all[i].kind = all[j].kind;
-                    }
-                    asys.free(all[j].text);
-                    all[j].text = null;
-                }
-            }
-        }
+        // remove duplicates (keep the best score; the first one wins a tie): a table of the indexes of the names seen so far
+        int tcap = 64;
+        while (tcap < n * 2) { tcap = tcap * 2; }
+        int* tab = (int*) asys.alloc(tcap * 8);
         int w = 0;
         for (int i = 0; i < n; i++) {
-            if (all[i].text != null) {
+            char* nm = all[i].text;
+            int h = hashWord(nm, strlen(nm)) & (tcap - 1);
+            bool dup = false;
+            while (tab[h] != 0) {
+                Candidate* o = &all[tab[h] - 1];
+                if (streq(o->text, nm)) {
+                    if (all[i].score > o->score) {
+                        o->score = all[i].score;
+                        o->kind = all[i].kind;
+                    }
+                    dup = true;
+                    break;
+                }
+                h = (h + 1) & (tcap - 1);
+            }
+            if (!dup) {
                 all[w] = all[i];
+                tab[h] = w + 1;
                 w++;
             }
         }
+        asys.free((char*) tab);
         n = w;
-        // insertion sort is fine for the few hundred candidates
-        for (int i = 1; i < n; i++) {
-            Candidate c = all[i];
-            int j = i - 1;
-            while (j >= 0 && better(&c, &all[j])) {
-                all[j + 1] = all[j];
-                j--;
+        // the best `give` of them, in order: a sorted list that every candidate that is better than its last entry is inserted into
+        int give = imin(imin(n, max), 1024);
+        if (give < 0) { give = 0; }
+        Candidate* top = (Candidate*) asys.alloc((give + 1) * sizeof(Candidate));
+        int nt = 0;
+        for (int i = 0; i < n && give > 0; i++) {
+            if (nt == give && !better(&all[i], &top[nt - 1])) { continue; }
+            int lo = 0;
+            int hi = (nt < give) ? nt : nt - 1;         // the position is searched in [0, hi]; the last entry falls out when full
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (better(&all[i], &top[mid])) { hi = mid; } else { lo = mid + 1; }
             }
-            all[j + 1] = c;
+            int last = (nt < give) ? nt : nt - 1;       // the index that is overwritten by the shift
+            for (int j = last; j > lo; j--) { top[j] = top[j - 1]; }
+            top[lo] = all[i];
+            if (nt < give) { nt++; }
         }
-        int give = imin(n, max);
         if (results == null || nres < 0) {
             results = (char**) asys.alloc(1024 * 8);
         }
-        for (int i = 0; i < give; i++) {
-            out[i] = all[i];
+        for (int i = 0; i < nt; i++) {
+            out[i] = top[i];
+            out[i].text = asys.strDup(top[i].text);
+            results[nres] = out[i].text;
+            nres++;
         }
-        for (int i = 0; i < n; i++) {
-            if (i < give && i < 1024) {
-                results[nres] = all[i].text;
-                nres++;
-            } else {
-                asys.free(all[i].text);
-            }
-        }
+        asys.free((char*) top);
         asys.free((char*) all);
-        return give;
+        return nt;
     }
 
     // a before b?
