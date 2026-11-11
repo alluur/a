@@ -105,3 +105,23 @@ void wheelWd(gui.Window* gw, gui.Widget* wd, int x, int y, int delta) {
 int shot(gui.Window* gw) {
     return gw->surf->checksum();
 }
+
+// deletes a directory tree (the tests clean up what an earlier run left in build/tests)
+void rmtree(char* path) {
+    asys.Stat st;
+    if (asys.lstat(path, &st) != 0) { return; }
+    if (st.isDir()) {
+        asys.DirList dl();
+        if (asys.listDir(path, &dl) >= 0) {
+            for (int i = 0; i < dl.count; i++) {
+                char* child = asys.join(path, dl.name(i));
+                rmtree(child);
+                asys.free(child);
+            }
+            dl.dispose();
+        }
+        asys.rmdir(path);
+    } else {
+        asys.unlink(path);
+    }
+}
