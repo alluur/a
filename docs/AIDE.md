@@ -237,13 +237,20 @@ searches the flattened text. Templates: `$0`..`$9`, `${n}`, `$$`, `\n \t \\` in 
 Rules from earlier reviews, each with a test: `count` / `matches` do not disturb the current match; the groups used by
 `replaceCurrent` belong to the match being replaced (it is matched again, anchored at its start, so `findPrev` makes no
 difference); the current match becomes invalid when the buffer changes (`currentValid()`); `replaceAll` is one undo step and
-handles empty matches like Python 3.7 (`re.sub`).
+handles empty matches like Python 3.7 (`re.sub`): an empty match is not allowed right after an empty match, so a pattern where the
+empty match has priority (`a*?`, `x*|b`) finds `a` or `b` at the same place on the next round, and that match is re-matched under the
+same rule for its groups (an earlier version lost the matched text: `a*?` on `aab` with `[$0]` gave `[][][][][]b[]` instead of
+`[][a][][a][]b[]`). `exceeded` says that a regular expression hit its step limit (see section 8) during the last
+`findNext` / `findPrev` / `count` / `matches` / `replaceAll`: the result is then incomplete (`replaceAll` replaces the matches found
+before the search gave up), and a front end should say so.
 
 ## 8. regex
 
 `import regex;` was rewritten for AIDE. The old four functions (`matches`, `search`, `test`, `replaceAll`) keep their old simple
 dialect (`F_SIMPLE`, also usable with `compile(pattern, F_SIMPLE)`): `( ) | { }` are plain characters, a `^` that is not first and a `$`
-that is not last are plain characters, everything else as before (`grep "main()"` of the AOS shell relies on this). The new
+that is not last are plain characters, `.` also matches a line break and `$` matches only at the very end of the text (not
+before a final line break), everything else as before (`grep "main()"` of the AOS shell relies on this). Matching is UTF-8 aware
+there too (`.` takes a whole character, `\w` includes non-ASCII letters), which the old functions were not. The new
 syntax is for `compile()` and `replaceGroups`. The engine is a backtracking engine with Perl / Python
 semantics: groups (up to 32) and non-capturing groups, named groups, alternation, greedy and lazy `* + ? {n,m}`, back
 references, `^ $ \A \Z \b \B`, classes with ranges, POSIX classes and the shorthands, look-ahead `(?= )` `(?! )`, flags `(?i) (?s)
@@ -256,8 +263,11 @@ errors with a message and a position (back reference to a missing or open group,
 repeat", "multiple repeat", a program over 400 000 instructions, nesting over 150). The matcher is a loop with an explicit stack
 (no recursion per character: `.*Z` over a million characters works) and stops after 5 million steps (`exceeded`) so `(a+)+b` cannot
 hang an editor. `tests/gen/gen_regex_test.py` runs 168 patterns through Python's `re` and compares search, group positions,
-fullmatch and `sub`. In addition 240 000 random patterns (groups, alternation, lazy and bounded quantifiers, back references,
-look-ahead, flags, UTF-8) were compared with Python 3.13 while reviewing this module: the only difference is `\B` in an empty text.
+fullmatch and `sub`. In addition about 340 000 random patterns (groups, alternation, lazy and bounded quantifiers, back references,
+look-ahead, flags, UTF-8; 3 texts each) were compared with Python 3.13 while reviewing this module and fixing the review findings:
+the only differences are `\B` in an empty text and patterns where this engine's step limit is reached before Python
+finishes (those are reported through `exceeded`, never silently). `afind.Finder.replaceAll` was compared with `re.sub` on about
+200 000 of the same cases (single-line, non-empty texts) with no difference outside the step limit.
 
 ## 9. Writing a front end
 
