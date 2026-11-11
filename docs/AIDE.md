@@ -128,6 +128,8 @@ work on all cursors from the last to the first, inside one undo group. Highlight
   `duplicateLines`, `joinLines`, `deleteLines`; `toggleLineComment` comments at the shallowest indentation and uncomments exactly;
   `copy` / `cut` / `paste` with a ring (`Clipboard`); with several cursors the pieces are remembered, so pasting into the same
   number of cursors puts one piece into each; copying without a selection copies whole lines and pastes above the caret line.
+* `selectEnclosingBrackets` selects the content of the innermost bracket pair around the selection; called again it grows to the
+  brackets themselves, then to the next pair outwards, and returns false when there is none.
 * `tabWidth` / `indentWidth` below 1 mean 4 and above 64 mean 64; nothing divides by them unchecked.
 
 ## 4. asyntax - highlighting, symbols, completion
