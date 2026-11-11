@@ -1,0 +1,385 @@
+// acode.Buffer: loading and saving files (line endings, BOM, binary data byte for byte, atomic saves, backups, external
+// changes, FIFOs and directories), listeners, memory
+import acode;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+bool linksOk;
+void checkL(bool ok, char* what) { check(!linksOk || ok, what); }
+
+char* dir = "build/tests/t207_work";
+
+char* path(char* name) {
+    return asys.join(dir, name);
+}
+
+void put(char* name, char* data, int n) {
+    char* p = path(name);
+    asys.writeFile(p, data, n);
+    asys.free(p);
+}
+
+// the file content; *len gets its length
+char* get(char* name, int* len) {
+    char* p = path(name);
+    int e = 0;
+    *len = 0;
+    char* d = asys.readFile(p, len, -1, &e);
+    asys.free(p);
+    if (d == null) { return asys.strDup(""); }
+    return d;
+}
+
+// is the file byte for byte equal to data?
+bool fileIs(char* name, char* data, int n) {
+    int len = 0;
+    char* d = get(name, &len);
+    bool ok = len == n && asys.bytesEqual(d, data, n);
+    asys.free(d);
+    return ok;
+}
+
+// load the file, save it under another name without touching it: the copy must be identical to the original
+bool roundTrip(char* data, int n, acode.Buffer* b) {
+    put("rt-in", data, n);
+    char* p = path("rt-in");
+    int r = b->load(p);
+    asys.free(p);
+    if (r < 0) { return false; }
+    char* q = path("rt-out");
+    r = b->save(q, 0);
+    asys.free(q);
+    if (r < 0) { return false; }
+    return fileIs("rt-out", data, n);
+}
+
+int seed = 99;
+int rnd(int n) {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return ((seed >> 8) & 0xFFFFFF) % n;
+}
+
+int lastChange;
+int calls1;
+int calls2;
+int listener1(int user, acode.Change* c) { calls1 = calls1 + 1; lastChange = c->insLen; return 0; }
+int listener2(int user, acode.Change* c) { calls2 = calls2 + user; return 0; }
+
+int main() {
+    linksOk = asys.hasLinks();
+    asys.mkdirs(dir);
+    int baseMem = asys.memInUse();
+
+    // ---- LF text
+    {
+        acode.Buffer b();
+        check(roundTrip("line1\nline2\n", 12, &b), "LF text round trip");
+        checkEq(b.lineCount(), 3, "three lines (the last one empty)");
+        check(b.eol == acode.EOL_LF && !b.eolMixed && !b.hasBom && !b.binary, "plain flags");
+        check(!b.modified(), "a loaded file is not modified");
+        b.edit(0, 0, "X", 1);
+        check(b.modified(), "an edit makes it modified");
+        char* q = path("rt-in");
+        checkEq(b.save(q, 0), 0, "save");
+        asys.free(q);
+        check(fileIs("rt-in", "Xline1\nline2\n", 13), "the edit was written");
+        check(!b.modified(), "saved: not modified");
+        int dummy[8];
+        b.undo(&dummy[0], 8);
+        check(b.modified(), "undo after the save: modified again");
+        b.redo(&dummy[0], 8);
+        check(!b.modified(), "redo back to the saved state: not modified");
+    }
+    // ---- CRLF, CR, mixed, lone CR
+    {
+        acode.Buffer b();
+        check(roundTrip("a\r\nb\r\n", 6, &b), "CRLF round trip");
+        check(b.eol == acode.EOL_CRLF && !b.eolMixed, "CRLF detected");
+        checkEq(b.length(), 4, "the buffer holds LF only");
+        checkEq(b.lineCount(), 3, "three lines");
+        acode.Editor e(&b);
+        e.setCursor(b.length());
+        e.insertString("c\r\nd");
+        char* q = path("rt-in");
+        b.save(q, 0);
+        asys.free(q);
+        check(fileIs("rt-in", "a\r\nb\r\nc\r\nd", 10), "pasted line breaks are written as CRLF");
+        e.dispose();
+    }
+    {
+        acode.Buffer b();
+        check(roundTrip("a\rb\rc", 5, &b), "CR round trip");
+        check(b.eol == acode.EOL_CR && b.lineCount() == 3, "old Mac line endings");
+    }
+    {
+        acode.Buffer b();
+        put("mixed", "a\r\nb\nc\r\n", 8);
+        char* p = path("mixed");
+        b.load(p);
+        asys.free(p);
+        check(b.eol == acode.EOL_CRLF && b.eolMixed, "mixed endings: dominant style, flagged");
+        char* q = path("mixed-out");
+        b.save(q, 0);
+        asys.free(q);
+        check(fileIs("mixed-out", "a\r\nb\r\nc\r\n", 9), "mixed endings are saved with the dominant style");
+        put("mixed2", "a\nb\nc\r\n", 7);
+        p = path("mixed2");
+        b.load(p);
+        asys.free(p);
+        check(b.eol == acode.EOL_LF && b.eolMixed, "LF dominant");
+        q = path("mixed2-out");
+        b.save(q, 0);
+        asys.free(q);
+        check(fileIs("mixed2-out", "a\nb\nc\n", 6), "saved with LF");
+    }
+    {
+        acode.Buffer b();
+        check(roundTrip("a\rb\nc\n", 6, &b), "a lone CR inside LF text is data and survives");
+        checkEq(b.byteAt(1), 13, "it is in the buffer");
+    }
+    // ---- BOM
+    {
+        acode.Buffer b();
+        check(roundTrip("\xef\xbb\xbfhello\n", 9, &b), "BOM round trip");
+        check(b.hasBom && b.length() == 6, "BOM detected and not part of the text");
+        check(roundTrip("\xef\xbb\xbfa\r\nb\r\n", 9, &b), "BOM with CRLF round trip");
+        check(b.hasBom && b.eol == acode.EOL_CRLF, "both detected");
+    }
+    // ---- binary data byte for byte
+    {
+        acode.Buffer b();
+        char all[256];
+        for (int i = 0; i < 256; i++) { all[i] = i; }
+        check(roundTrip(&all[0], 256, &b), "all 256 byte values round trip");
+        check(b.binary, "a file with NUL bytes is binary");
+        check(roundTrip("\x00\x01\xef\xbb\xbf\r\n  \n\xff\r", 11, &b), "binary data with BOM-like bytes, CRs and white space");
+        check(b.binary && !b.hasBom && b.eol == acode.EOL_LF, "no BOM or line ending handling for binary data");
+        acode.Editor e(&b);
+        checkEq(e.trimTrailingWhitespace(), 0, "binary buffers are not trimmed");
+        check(!e.ensureFinalNewline(), "nor given a final newline");
+        e.dispose();
+        char* big = asys.alloc(20000);
+        for (int i = 0; i < 20000; i++) { big[i] = rnd(256); }
+        big[5] = 0;
+        check(roundTrip(big, 20000, &b), "20000 pseudo random bytes round trip");
+        asys.free(big);
+        check(roundTrip("\xff\xfe" "ab", 4, &b) && b.binary, "UTF-16 BOM: treated as binary data");
+        check(roundTrip("\xfe\xff" "ab", 4, &b) && b.binary, "UTF-16 BE BOM too");
+        check(roundTrip("caf\xe9\n", 5, &b) && !b.binary, "invalid UTF-8 is text and survives byte for byte");
+        check(roundTrip("", 0, &b) && b.length() == 0 && b.lineCount() == 1, "an empty file");
+        check(roundTrip("\n", 1, &b) && b.lineCount() == 2, "a single line break");
+        check(roundTrip("abc", 3, &b) && b.lineCount() == 1, "no final newline");
+        char* spaces = "x  \n\t\n  ";
+        check(roundTrip(spaces, 8, &b), "trailing white space is preserved until the user trims");
+    }
+    // ---- external changes
+    {
+        acode.Buffer b();
+        put("ext", "one", 3);
+        char* p = path("ext");
+        b.load(p);
+        checkEq(b.checkExternal(), acode.EXT_NONE, "nothing changed yet");
+        put("ext", "one two", 7);
+        checkEq(b.checkExternal(), acode.EXT_CHANGED, "a different size is a change");
+        b.acknowledgeExternal();
+        checkEq(b.checkExternal(), acode.EXT_NONE, "acknowledged");
+        put("ext", "ONE TWO", 7);
+        asys.setMtime(p, 1400000000);
+        checkEq(b.checkExternal(), acode.EXT_CHANGED, "a different modification time is a change");
+        checkEq(b.reload(), 0, "reload");
+        char* t = b.getText(0, b.length());
+        check(streq(t, "ONE TWO") && !b.modified(), "reloaded content, not modified");
+        asys.free(t);
+        checkEq(b.checkExternal(), acode.EXT_NONE, "reload cleared the change");
+        b.edit(0, 0, "x", 1);
+        checkEq(b.save(null, 0), 0, "save to the own path");
+        checkEq(b.checkExternal(), acode.EXT_NONE, "our own save is not an external change");
+        asys.unlink(p);
+        checkEq(b.checkExternal(), acode.EXT_DELETED, "a deleted file is reported");
+        checkEq(b.save(null, 0), 0, "saving recreates it");
+        checkEq(b.checkExternal(), acode.EXT_NONE, "and it is in sync again");
+        acode.Buffer fresh();
+        checkEq(fresh.checkExternal(), acode.EXT_NONE, "a buffer without a file never reports changes");
+        asys.free(p);
+    }
+    // ---- save as, backup, permissions
+    {
+        acode.Buffer b();
+        put("orig", "original", 8);
+        char* p = path("orig");
+        b.load(p);
+        b.edit(8, 0, "!", 1);
+        char* q = path("copy");
+        checkEq(b.save(q, 0), 0, "save as");
+        check(fileIs("copy", "original!", 9) && fileIs("orig", "original", 8), "the copy has the edit, the original is untouched");
+        check(streq(b.path, q), "the buffer now belongs to the new file");
+        b.edit(0, 0, ">", 1);
+        checkEq(b.save(null, asys.W_BACKUP), 0, "save with backup");
+        check(fileIs("copy", ">original!", 10), "new content");
+        check(fileIs("copy~", "original!", 9), "the backup has the previous content");
+        asys.free(p);
+        asys.free(q);
+        if (asys.platform() != asys.OS_WINDOWS) {
+            put("perm", "secret", 6);
+            p = path("perm");
+            asys.chmod(p, 384);
+            b.load(p);
+            b.edit(0, 0, "x", 1);
+            b.save(null, 0);
+            asys.Stat st;
+            asys.stat(p, &st);
+            checkL(st.perm() == 384, "saving keeps the permissions (0600)");
+            asys.free(p);
+        } else {
+            checks++;
+        }
+        // no temp files are left in the directory
+        asys.DirList dl();
+        asys.listDir(dir, &dl);
+        bool stray = false;
+        for (int i = 0; i < dl.count; i++) {
+            if (contains(dl.name(i), ".tmp-")) { stray = true; }
+        }
+        check(!stray, "no temp files left");
+        dl.dispose();
+    }
+    // ---- loading something that is not a regular file, or too big
+    {
+        acode.Buffer b();
+        b.setText("keep me", 7);
+        char* p = path("nothing-here");
+        checkEq(b.load(p), -asys.ENOENT, "a missing file");
+        asys.free(p);
+        check(b.length() == 7, "the buffer is unchanged after a failed load");
+        checkEq(b.load(dir), -asys.ENOTREG, "a directory");
+        char* fifo = path("a-fifo");
+        int mk = asys.mkfifo(fifo, 420);
+        if (mk == 0) {
+            checkEq(b.load(fifo), -asys.ENOTREG, "a FIFO is refused without waiting for a writer");
+        } else {
+            checks++;
+        }
+        asys.unlink(fifo);
+        asys.free(fifo);
+        put("sized", "0123456789", 10);
+        p = path("sized");
+        b.maxLoad = 5;
+        checkEq(b.load(p), -asys.ETOOBIG, "bigger than maxLoad");
+        b.maxLoad = 1000;
+        checkEq(b.load(p), 0, "within maxLoad");
+        asys.free(p);
+        check(b.length() == 10, "loaded");
+        b.readOnly = true;
+        check(!b.edit(0, 0, "x", 1), "a read-only buffer refuses edits");
+        check(b.save(null, 0) == 0, "but can be saved");
+    }
+    // ---- listeners: no fixed limit
+    {
+        acode.Buffer b();
+        calls1 = 0;
+        calls2 = 0;
+        int ids[200];
+        for (int i = 0; i < 200; i++) { ids[i] = b.addListener(listener2, 1); }
+        b.addListener(listener1, 0);
+        checkEq(b.listenerCount(), 201, "201 listeners are fine");
+        b.edit(0, 0, "abc", 3);
+        checkEq(calls2, 200, "every listener was called");
+        checkEq(calls1, 1, "the other one too");
+        checkEq(lastChange, 3, "with the change description");
+        for (int i = 0; i < 200; i = i + 2) { b.removeListener(ids[i]); }
+        calls2 = 0;
+        b.edit(0, 0, "d", 1);
+        checkEq(calls2, 100, "after removing 100 listeners");
+        check(!b.inNotify, "not inside a notification");
+        b.setText("replaced", 8);
+        checkEq(calls1, 3, "setText notifies as well");
+        checkEq(lastChange, 8, "the whole text was replaced");
+        b.dispose();
+        check(b.length() == 0 && b.lineCount() == 1, "dispose leaves an empty buffer");
+    }
+    // ---- big text and memory
+    {
+        int before = asys.memInUse();
+        acode.Buffer b();
+        int n = 0;
+        int cap = 9 * 1024 * 1024;
+        char* big = asys.alloc(cap);
+        for (int l = 0; l < 200000 && n < cap - 50; l++) {
+            int len = 5 + (l % 40);
+            for (int k = 0; k < len; k++) { big[n] = 'a' + (k % 26); n++; }
+            big[n] = 10;
+            n++;
+        }
+        b.setText(big, n);
+        checkEq(b.lineCount(), 200001, "200000 lines");
+        check(asys.memInUse() - before > 5 * 1024 * 1024, "a big text uses memory");
+        char* p = path("big");
+        checkEq(b.save(p, asys.W_NOSYNC), 0, "save it");
+        asys.free(p);
+        check(fileIs("big", big, n), "the saved file is identical");
+        b.setText("tiny", 4);
+        asys.free(big);
+        int after = asys.memInUse();
+        check(after - before < 256 * 1024, "after replacing the big text by a tiny one nearly nothing is left");
+        for (int cycle = 0; cycle < 3; cycle++) {
+            char* big2 = asys.alloc(4 * 1024 * 1024);
+            for (int i = 0; i < 4 * 1024 * 1024; i++) { big2[i] = (i % 61 == 60) ? 10 : 'x'; }
+            b.setText(big2, 4 * 1024 * 1024);
+            asys.free(big2);
+            b.edit(100, 0, "inserted\n", 9);
+            b.edit(0, b.length() / 2, null, 0);
+            int dummy[4];
+            b.undo(&dummy[0], 4);
+            b.setText("t", 1);
+        }
+        check(asys.memInUse() - before < 256 * 1024, "three load / edit / undo cycles of 4 MB leave nothing behind");
+        b.dispose();
+        check(asys.memInUse() - before < 8 * 1024, "dispose frees everything");
+        asys.unlink(path("big"));
+    }
+    // ---- history limit with a big edit and the save point
+    {
+        acode.Buffer b();
+        b.setText("start", 5);
+        b.setHistoryLimit(2048);
+        char* chunk = asys.alloc(100000);
+        for (int i = 0; i < 100000; i++) { chunk[i] = 'q'; }
+        b.edit(5, 0, chunk, 100000);
+        check(b.modified(), "modified");
+        check(!b.canUndo(), "an edit bigger than the history limit cannot be undone (the history was dropped)");
+        check(b.modified(), "and the buffer stays modified");
+        b.edit(0, 0, "x", 1);
+        check(b.canUndo(), "new small edits are recorded again");
+        asys.free(chunk);
+    }
+    // ---- clean up
+    asys.DirList dl();
+    asys.listDir(dir, &dl);
+    for (int i = 0; i < dl.count; i++) {
+        char* p = path(dl.name(i));
+        asys.unlink(p);
+        asys.free(p);
+    }
+    dl.dispose();
+    asys.rmdir(dir);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
