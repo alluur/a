@@ -524,8 +524,8 @@ User themes are `NAME.ini` files in `gcode.themeDirectory()` (`<config dir>/them
 * Key values that are not text (surrogates, above 0x10FFFF, control characters; a VNC client can send any 32 bit value) are ignored by
   `CodeEditor` and `gui.TextBox` (`gui.isTextChar`), so the text stays valid UTF-8.
 * Performance that is worse than "like a small file": the first completion in a 5 MB file scans it (about 0.35 s); typing in a 3 MB file that is
-  one single line costs about 150 ms per key; the Outline of a 100 000 line file (25 000 symbols) is rebuilt in about 230 ms after each pause of
-  250 ms in the typing; with `completeDelayMs = 0` every key of a 5 MB file waits for a scan.
+  one single line costs about 150 ms per key; the Outline of a 100 000 line file (25 000 symbols) is rebuilt in about 230 ms after a pause in the typing (250 ms; up to
+  2 s for documents over 500 KB, so that it happens less often); with `completeDelayMs = 0` every key of a 5 MB file waits for a scan.
 * Small windows: from about 320 x 240 on the demo is usable (the panels give way); below that nothing breaks (checked from 40 x 30 to 2400 x 1600)
   but there is no room left for text.
 * The test pattern: `tests/gcode_harness.inc` runs the display server in the test process (`Headless`), moves the pointer, types and takes
