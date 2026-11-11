@@ -7,22 +7,40 @@ gui.Display* d;
 
 int stepServer(int unused) { srv->step(0); return 0; }
 
+int pingCount = 0;
+
+// Lets the client and the server exchange everything that is pending. A ping travels behind everything the client has sent: when the
+// answer is back the server has handled it all (big windows take many rounds: their pixels go through a socket); then a few more
+// rounds let the client answer what the server just did. Three times, because the answers can cause new drawing.
 void settle() {
     d->sync();
-    for (int i = 0; i < 30; i++) {
-        srv->step(0);
-        d->pump(0);
+    for (int round = 0; round < 3; round++) {
+        pingCount++;
+        d->ping(pingCount);
+        for (int i = 0; i < 4000 && d->lastPong != pingCount; i++) {
+            srv->step(0);
+            d->pump(0);
+        }
+        for (int i = 0; i < 10; i++) {
+            srv->step(0);
+            d->pump(0);
+        }
     }
 }
 
-void startServer(int port, char* name) {
-    hb = new wsrv.Headless(900, 700);
+// the display has the given size (windows that are taller than the screen cannot be clicked everywhere)
+void startServerSized(int port, char* name, int screenW, int screenH) {
+    hb = new wsrv.Headless(screenW, screenH);
     srv = new wsrv.Server(hb, port);
     srv->allowScreenshots = true;
     gui.idleHook = stepServer;
     char spec[16];
     format(&spec[0], 16, "%d", port);
     d = gui.connectAs(&spec[0], name);
+}
+
+void startServer(int port, char* name) {
+    startServerSized(port, name, 900, 700);
 }
 
 void key(int k, int uni) {
