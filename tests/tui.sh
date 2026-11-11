@@ -4,6 +4,7 @@
 # capabilities, and that the terminal is restored at the end.
 # Usage: tests/tui.sh [test-name-substring ...]      needs python3 and a built compiler (make)
 cd "$(dirname "$0")/.."
+if ! command -v python3 >/dev/null; then echo "tui tests skipped (no python3)"; exit 0; fi
 AC=./build/ac
 OUT=build/tests/tui
 mkdir -p $OUT

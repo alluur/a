@@ -330,6 +330,61 @@ def size_asked_from_the_terminal():
     s.close()
 
 
+@test
+def size_asked_with_a_cursor_position_report():
+    # the terminal does not know CSI 18 t: the program falls back to "move the cursor far away and ask where it is"
+    s = Session([PROBE], cols=88, rows=31, env={"TUI_PROBE": "1", "LINES": None, "COLUMNS": None}, kernel_size=(0, 0), answer_18t=False)
+    check(s.wait_for("size:", 8), "no start")
+    s.wait_idle()
+    check("size: 88x31" in s.screen_text(), "the cursor position report was not used:\n" + s.screen_text())
+    check(b"\x1b[6n" in bytes(s.raw_output), "the program did not ask for the cursor position")
+    s.key("\x11")
+    s.wait_exit(3)
+    s.close()
+
+
+@test
+def standard_output_may_be_redirected():
+    # stdout goes to a pipe: the program draws on the terminal it finds through /dev/tty
+    s = Session(["/bin/sh", "-c", PROBE + " | cat > /dev/null"], cols=80, rows=24)
+    check(s.wait_for("size: 80x24", 5), "the program did not draw on the terminal:\n" + s.screen_text())
+    s.key("\x11")
+    eq(s.wait_exit(3), 0, "exit")
+    sane(s, "redirected output")
+    s.close()
+
+
+@test
+def stop_and_continue_like_a_shell():
+    import re
+    s = start()
+    s.send("\x1a")                                   # Ctrl+Z arrives as a key; the program stops itself after putting the terminal back
+    stopped = False
+    end = time.time() + 4
+    while time.time() < end:
+        s.pump(0.05)
+        pid, status = os.waitpid(s.proc.pid, os.WNOHANG | os.WUNTRACED)
+        if pid != 0 and os.WIFSTOPPED(status):
+            stopped = True
+            break
+    check(stopped, "the program did not stop")
+    s.pump(0.2)
+    sane(s, "while stopped")
+    os.kill(s.proc.pid, signal.SIGCONT)
+    check(s.wait_for("last: resumed", 5), "the program did not come back after SIGCONT:\n" + s.screen_text())
+    s.wait_idle()
+    check(s.is_raw() and s.emu.on_alt, "raw mode and the alternate screen are back")
+    check("size: 80x24" in s.screen_text() and " File  Edit" in s.screen_text(), "the screen was not redrawn")
+    s.key("\x11")
+    s.exited = None
+    end = time.time() + 3
+    while time.time() < end and s.proc.poll() is None:
+        s.pump(0.05)
+    eq(s.proc.poll(), 0, "exit")
+    sane(s, "after resume")
+    s.close()
+
+
 # ---- suspend to a shell and come back ----------------------------------------------------------------------------------------------------------
 @test
 def suspend_to_shell_and_resume():

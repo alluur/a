@@ -34,6 +34,7 @@ test: build/ac
 	tests/link.sh
 	tests/gui.sh
 	tests/https.sh
+	tests/tui.sh
 
 test-all: build/ac
 	@for t in linux windows linux-arm64 android android-x64 linux-riscv64 android-riscv64 linux-loongarch64; do \
@@ -42,7 +43,7 @@ test-all: build/ac
 examples: build/ac
 	@mkdir -p build/examples
 	@for t in linux windows linux-arm64 android android-x64 linux-riscv64 android-riscv64 linux-loongarch64; do \
-	    for f in examples/*.a examples/gui/*.a; do \
+	    for f in examples/*.a examples/gui/*.a examples/tui/*.a; do \
 	        ./build/ac -t $$t $$f -v $(VERSION_CODE) -r $(RELEASE) -o build/examples/$$(basename $$f .a)-$$t.out || exit 1; \
 	    done; echo "examples compiled for $$t"; done
 
@@ -57,7 +58,7 @@ deb: build/ac
 	    build/deb/usr/share/doc/a-lang/examples build/deb/usr/share/man/man1
 	install -m 0755 build/ac build/deb/usr/bin/ac
 	strip build/deb/usr/bin/ac
-	cp README.md docs/LANGUAGE.md docs/TARGETS.md docs/INTERNALS.md docs/CLIB.md build/deb/usr/share/doc/a-lang/
+	cp README.md docs/LANGUAGE.md docs/TARGETS.md docs/INTERNALS.md docs/CLIB.md docs/TUI.md build/deb/usr/share/doc/a-lang/
 	cp -r examples/* build/deb/usr/share/doc/a-lang/examples/
 	gzip -9n -c docs/ac.1 > build/deb/usr/share/man/man1/ac.1.gz
 	printf 'Package: a-lang\nVersion: $(VERSION_NAME)\nSection: devel\nPriority: optional\nArchitecture: amd64\nMaintainer: Aytict (https://aytict.fi)\nHomepage: https://aytict.fi\nDescription: A - a small C-like systems language\n The "A" compiler is written in x86-64 assembly and produces native\n executables for Linux (x86-64, ARM64, RISC-V 64, LoongArch64), Windows (x86-64) and\n Android (ARM64, x86-64, RISC-V 64) without any external assembler, linker or libc.\n' > build/deb/DEBIAN/control

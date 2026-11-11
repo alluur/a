@@ -81,6 +81,7 @@ class Emu:
         self.buf = ""
         self.pending = b""
         self.log_errors = []
+        self.answer_18t = True       # False: like a terminal that does not know CSI 18 t (the program must fall back to the cursor position report)
 
     def _grid(self, cols, rows):
         return [[Cell() for _ in range(cols)] for _ in range(rows)]
@@ -311,7 +312,7 @@ class Emu:
             elif p[0] == 5:
                 self.replies += b"\x1b[0n"
         elif f == "t":
-            if p[0] == 18:
+            if p[0] == 18 and self.answer_18t:
                 self.replies += ("\x1b[8;%d;%dt" % (self.rows, self.cols)).encode()
             elif p[0] == 22:
                 self.title_stack.append(self.title)
@@ -423,10 +424,11 @@ class Emu:
 
 
 class Session:
-    def __init__(self, argv, cols=80, rows=24, env=None, cwd=None, kernel_size=None):
+    def __init__(self, argv, cols=80, rows=24, env=None, cwd=None, kernel_size=None, answer_18t=True):
         """kernel_size: what the system reports as the window size, (0, 0) for "unknown" (like a serial console); default: cols x rows."""
         self.cols, self.rows = cols, rows
         self.emu = Emu(cols, rows)
+        self.emu.answer_18t = answer_18t
         self.raw_output = bytearray()
         master, slave = pty.openpty()
         kc, kr = kernel_size if kernel_size is not None else (cols, rows)
