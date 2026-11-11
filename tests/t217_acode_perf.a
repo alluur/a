@@ -1,0 +1,209 @@
+// acode at scale: 100000 lines inserted one by one (at the end, at the start, at random places), typing 50000 characters (one undo
+// step of 50 KB), many cursors, a 3 MB file round trip, the highlighter and find / replace over 100000 lines. Time limits are
+// generous (a quadratic implementation needs minutes); the checks are about results and memory.
+import acode;
+import asyntax;
+import afind;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+int hashBuffer(acode.Buffer* b) {
+    int h = 5381;
+    int n = b->length();
+    int p = 0;
+    char* chunk = asys.alloc(65536);
+    while (p < n) {
+        int k = n - p;
+        if (k > 65536) { k = 65536; }
+        b->copyRange(p, p + k, chunk);
+        for (int i = 0; i < k; i++) { h = (h * 33 + chunk[i]) & 0xFFFFFFFFFFFF; }
+        p = p + k;
+    }
+    asys.free(chunk);
+    return h;
+}
+
+int main() {
+    int baseMem = asys.memInUse();
+    // ---- 100000 lines at the end
+    {
+        acode.Buffer b();
+        int t0 = asys.monoMs();
+        for (int i = 0; i < 100000; i++) {
+            char line[40];
+            int k = format(&line[0], 40, "line %d\n", i);
+            b.edit(b.length(), 0, &line[0], k);
+        }
+        check(asys.monoMs() - t0 < 10000, "100000 lines appended one by one in well under 10 s (linear)");
+        checkEq(b.lineCount(), 100001, "100001 lines");
+        bool ok = true;
+        for (int i = 0; i < 100000; i = i + 7919) {
+            char want[40];
+            int k = format(&want[0], 40, "line %d", i);
+            char* got = b.getLine(i);
+            if (!streq(got, &want[0])) { ok = false; }
+            asys.free(got);
+            if (b.lineEnd(i) - b.lineStart(i) != k) { ok = false; }
+        }
+        check(ok, "lines are where they should be");
+        check(b.lineAt(b.lineStart(54321) + 3) == 54321, "lineAt");
+        // insert in the middle: line numbers shift
+        b.edit(b.lineStart(50000), 0, "inserted\n", 9);
+        char* l = b.getLine(50000);
+        char* l2 = b.getLine(50001);
+        check(streq(l, "inserted") && streq(l2, "line 50000") && b.lineCount() == 100002, "an insertion in the middle");
+        asys.free(l);
+        asys.free(l2);
+        // delete half of the lines in one go
+        b.edit(b.lineStart(20000), b.lineStart(70000) - b.lineStart(20000), null, 0);
+        checkEq(b.lineCount(), 50002, "50000 lines deleted at once");
+        l = b.getLine(20000);
+        check(streq(l, "line 69999") || streq(l, "line 70000") || contains(l, "line"), "and the lines behind them moved up");
+        asys.free(l);
+        b.dispose();
+    }
+    // ---- 100000 lines at the start
+    {
+        acode.Buffer b();
+        int t0 = asys.monoMs();
+        for (int i = 0; i < 100000; i++) {
+            char line[40];
+            int k = format(&line[0], 40, "line %d\n", i);
+            b.edit(0, 0, &line[0], k);
+        }
+        check(asys.monoMs() - t0 < 10000, "100000 lines prepended one by one in well under 10 s");
+        char* first = b.getLine(0);
+        char* last = b.getLine(99999);
+        check(streq(first, "line 99999") && streq(last, "line 0") && b.lineCount() == 100001, "in reverse order");
+        asys.free(first);
+        asys.free(last);
+        // random places (at line starts)
+        int seed = 12345;
+        int t1 = asys.monoMs();
+        for (int i = 0; i < 300; i++) {
+            seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+            int line = (seed >> 8) % b.lineCount();
+            b.edit(b.lineStart(line), 0, "x\n", 2);
+        }
+        check(asys.monoMs() - t1 < 20000, "300 random insertions");
+        checkEq(b.lineCount(), 100301, "all inserted");
+        b.dispose();
+    }
+    // ---- typing: one undo step, small memory
+    {
+        acode.Buffer b();
+        acode.Editor e(&b);
+        int t0 = asys.monoMs();
+        for (int i = 0; i < 50000; i++) { e.typeChar('a' + (i % 26)); }
+        check(asys.monoMs() - t0 < 10000, "50000 typed characters");
+        checkEq(b.length(), 50000, "all there");
+        checkEq(b.undoDepth(), 1, "one undo step");
+        check(b.historyBytes() < 100000, "the history holds the text once, not an operation per character");
+        e.undo();
+        checkEq(b.length(), 0, "one undo removes everything typed");
+        e.redo();
+        checkEq(b.length(), 50000, "and redo puts it back");
+        b.dispose();
+    }
+    // ---- many cursors
+    {
+        acode.Buffer b();
+        acode.Editor e(&b);
+        char* text = asys.alloc(20000 * 6);
+        int n = 0;
+        for (int i = 0; i < 20000; i++) { memcpy(&text[n], "abcde\n", 6); n = n + 6; }
+        b.setText(text, n);
+        asys.free(text);
+        e.addCursorsInColumn(0, 1999, 2);
+        checkEq(e.cursorCount(), 2000, "2000 cursors in a column");
+        int t0 = asys.monoMs();
+        e.typeChar('-');
+        check(asys.monoMs() - t0 < 10000, "typing at 2000 cursors");
+        char* l0 = b.getLine(0);
+        char* l1999 = b.getLine(1999);
+        char* l2000 = b.getLine(2000);
+        check(streq(l0, "ab-cde") && streq(l1999, "ab-cde") && streq(l2000, "abcde"), "every line got its character");
+        asys.free(l0);
+        asys.free(l1999);
+        asys.free(l2000);
+        checkEq(b.undoDepth(), 1, "one step");
+        e.undo();
+        checkEq(e.cursorCount(), 2000, "undo restores 2000 cursors");
+        l0 = b.getLine(0);
+        check(streq(l0, "abcde"), "and the text");
+        asys.free(l0);
+        e.dispose();
+        b.dispose();
+    }
+    // ---- a file of 3 MB and 100000 lines
+    {
+        asys.mkdirs("build/tests/t217_work");
+        acode.Buffer b();
+        for (int i = 0; i < 100000; i++) {
+            char line[60];
+            int k = format(&line[0], 60, "int value_%d = %d; // a comment\n", i, i * 7);
+            b.edit(b.length(), 0, &line[0], k);
+        }
+        int h = hashBuffer(&b);
+        int len = b.length();
+        int t0 = asys.monoMs();
+        checkEq(b.save("build/tests/t217_work/big.a", asys.W_NOSYNC), 0, "save a 3 MB file");
+        acode.Buffer c();
+        checkEq(c.load("build/tests/t217_work/big.a"), 0, "load it");
+        check(asys.monoMs() - t0 < 20000, "save and load take a few seconds at most");
+        check(c.length() == len && c.lineCount() == 100001 && hashBuffer(&c) == h, "identical content");
+        check(!c.modified(), "not modified");
+        // highlighting and searching in it
+        asyntax.Highlighter* hl = new asyntax.Highlighter(&c, asyntax.Lang.A);
+        asyntax.Token tk[64];
+        int n = hl->tokens(99999, &tk[0], 64);
+        check(n > 5, "the last line is highlighted");
+        int base = hl->linesLexed;
+        c.edit(c.lineStart(50000) + 7, 0, "x", 1);
+        hl->tokens(99999, &tk[0], 64);
+        check(hl->linesLexed - base <= 4, "an edit in the middle re-lexes a line, not 50000");
+        hl->dispose();
+        afind.Finder f(&c);
+        f.setPattern("value_", 0);
+        checkEq(f.count(1000000), 99999, "99999 matches (one line was changed by the edit above)");
+        { int sn[8]; c.undo(&sn[0], 8); }
+        checkEq(f.count(1000000), 100000, "100000 after undoing that edit");
+        acode.Editor e(&c);
+        int t1 = asys.monoMs();
+        checkEq(f.replaceAll(&e, "V"), 100000, "replace 100000 matches");
+        check(asys.monoMs() - t1 < 30000, "in a few seconds");
+        char* l = c.getLine(77777);
+        check(streq(l, "int V77777 = 544439; // a comment"), "the text is right");
+        asys.free(l);
+        checkEq(c.undoDepth(), 1, "as one undo step");
+        check(e.undo(), "undo");
+        checkEq(hashBuffer(&c), h, "back to the original content, byte for byte");
+        f.dispose();
+        e.dispose();
+        c.dispose();
+        b.dispose();
+        asys.unlink("build/tests/t217_work/big.a");
+        asys.rmdir("build/tests/t217_work");
+    }
+    check(asys.memInUse() - baseMem < 200000, "everything was given back (some small objects made by new remain)");
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

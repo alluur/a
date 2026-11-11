@@ -1,0 +1,543 @@
+// =============================================================================
+//  afind - search and replace in a Buffer                                                          import afind;
+//
+//    afind.Finder f(&buffer);
+//    f.setPattern("(\\w+)@(\\w+)", afind.OPT_REGEX);          // OPT_REGEX OPT_ICASE OPT_WORD (OPT_NOWRAP)
+//    if (f.findNext(editor.caret())) editor.setSelection(f.curStart, f.curEnd);
+//    f.findPrev(offset);   f.count();   f.matches(&list[0], 100);
+//    f.replaceCurrent(&editor, "$2 at $1");                    // the match found last, expanded with ITS groups
+//    int n = f.replaceAll(&editor, "<$0>");                    // ONE undo step
+//
+//  Plain text, case insensitive, whole word and regular expressions (module regex: groups, back references, lazy quantifiers,
+//  anchors, classes). A match never spans lines, except when the pattern itself contains a line break ("\n"): then the whole text is
+//  searched with ^ and $ at every line. In a regular expression replacement $0 .. $9 and ${n} are the groups of the match that is
+//  replaced, $$ is a dollar sign, \n \t \\ are a line break, a tab and a backslash. A plain replacement is used as it is.
+//
+//  Rules (each one has a test):
+//    * count() and matches() do not change the current match;
+//    * the groups used in a replacement always belong to the match that is replaced (the match is matched again, anchored at its
+//      start, so findPrev / findNext make no difference);
+//    * the current match is forgotten as soon as the buffer changes (currentValid());
+//    * replaceAll is one undo step, replaces every match once (an empty match right after a non-empty one is replaced as well,
+//      as in Python) and counts what it replaced.
+// =============================================================================
+import asys;
+import acode;
+import regex;
+module afind;
+
+public const OPT_REGEX = 1;
+public const OPT_ICASE = 2;
+public const OPT_WORD = 4;            // plain text: the match must not touch word characters at its edges; regex: \b is put around it
+public const OPT_NOWRAP = 8;          // findNext / findPrev stop at the end / start of the text instead of wrapping around
+
+public struct Match {
+    int start;
+    int end;
+}
+
+private int imin(int a, int b) {
+    if (a < b) { return a; }
+    return b;
+}
+
+private bool isWordByte(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c >= 128;
+}
+
+public class Finder {
+    public acode.Buffer* buf;
+    public bool ok;                     // the pattern compiled
+    public char* error;                 // why not
+    public int options;
+    public int curStart;                // the current match (valid when currentValid())
+    public int curEnd;
+    public int rangeFrom;               // search only inside this range (-1: the whole text)
+    public int rangeTo;
+    public bool exceeded;               // a regular expression hit its step limit during the last search
+
+    private char* pattern;
+    private regex.Regex* re;
+    private bool multiline;
+    private bool hasCur;
+    private int curVersion;
+    private bool plain;
+    private int firstLine;
+
+    public Finder(acode.Buffer* b) {
+        buf = b;
+        rangeFrom = -1;
+        rangeTo = -1;
+        error = "";
+    }
+
+    public void dispose() {
+        if (re != null) { re->dispose(); }
+        re = null;
+        asys.free(pattern);
+        pattern = null;
+        ok = false;
+    }
+
+    // Sets what to look for. Returns false (and ok is false, error says why) for a bad regular expression or an empty pattern.
+    public bool setPattern(char* pat, int opts) {
+        if (re != null) { re->dispose(); }
+        re = null;
+        asys.free(pattern);
+        pattern = asys.strDup(pat);
+        options = opts;
+        hasCur = false;
+        ok = false;
+        error = "";
+        if (pat[0] == 0) {
+            error = "empty pattern";
+            return false;
+        }
+        plain = (opts & OPT_REGEX) == 0;
+        char* src = pattern;
+        char* quoted = null;
+        if (plain) {
+            quoted = regex.quote(pattern);
+            src = quoted;
+        }
+        multiline = false;
+        for (int i = 0; src[i] != 0; i++) {
+            if (src[i] == 10) { multiline = true; }
+            if (src[i] == 92 && src[i + 1] == 'n') { multiline = true; }
+        }
+        char* wrapped = null;
+        if (!plain && (opts & OPT_WORD) != 0) {
+            wrapped = asys.concat3("\\b(?:", src, ")\\b");
+            src = wrapped;
+        }
+        int fl = ((opts & OPT_ICASE) != 0) ? regex.F_ICASE : 0;
+        if (multiline) { fl = fl | regex.F_MULTILINE; }
+        re = regex.compile(src, fl);
+        asys.free(quoted);
+        asys.free(wrapped);
+        if (!re->ok) {
+            error = re->error;
+            return false;
+        }
+        ok = true;
+        return true;
+    }
+
+    // restricts the search to [from, to) (an "in selection" search); setRange(-1, -1) searches everything
+    public void setRange(int from, int to) {
+        rangeFrom = from;
+        rangeTo = to;
+        hasCur = false;
+    }
+
+    public bool currentValid() {
+        return hasCur && curVersion == buf->version;
+    }
+
+    public void clearCurrent() {
+        hasCur = false;
+    }
+
+    // ---- searching one line (or the whole text in multi-line mode) ------------------------------------------------------------------
+    // the first match of the pattern in text[from..len) that passes the word test: its start or -1; caps gets the groups
+    private int scan(char* text, int len, int from, int* caps) {
+        int pos = from;
+        while (pos <= len) {
+            int at = re->search(text, len, pos, caps);
+            if (at < 0) {
+                exceeded = exceeded || re->exceeded;
+                return -1;
+            }
+            if (wordOk(text, len, caps[0], caps[1])) {
+                return at;
+            }
+            pos = at + 1;
+            if (pos > len) { break; }
+            // stay on a character boundary
+            while (pos < len && (text[pos] & 0xC0) == 0x80) { pos++; }
+        }
+        return -1;
+    }
+
+    private bool wordOk(char* text, int len, int s, int e) {
+        if (!plain || (options & OPT_WORD) == 0) { return true; }
+        if (e <= s) { return true; }
+        if (isWordByte(text[s]) && s > 0 && isWordByte(text[s - 1])) { return false; }
+        if (isWordByte(text[e - 1]) && e < len && isWordByte(text[e])) { return false; }
+        return true;
+    }
+
+    // does the pattern match exactly at pos (anchored)? Returns the end or -1.
+    private int anchored(char* text, int len, int pos, int* caps) {
+        int e = re->matchAt(text, len, pos, caps);
+        if (e >= 0 && !wordOk(text, len, pos, e)) { return -1; }
+        return e;
+    }
+
+    private int lo() {
+        return (rangeFrom < 0) ? 0 : rangeFrom;
+    }
+
+    private int hi() {
+        return (rangeTo < 0) ? buf->length() : rangeTo;
+    }
+
+    // the first match that starts at or after offset `from` and ends inside the range, without wrapping: sets s / e (absolute offsets)
+    private bool nextFrom(int from, int* s, int* e) {
+        int len = buf->length();
+        if (from < lo()) { from = lo(); }
+        if (from > hi()) { return false; }
+        int caps[66];
+        if (multiline) {
+            char* all = buf->flatten();
+            int at = scan(all, len, from, &caps[0]);
+            while (at >= 0 && caps[1] > hi()) {
+                return false;
+            }
+            if (at < 0) { return false; }
+            *s = caps[0];
+            *e = caps[1];
+            return true;
+        }
+        int line = buf->lineAt(from);
+        int nl = buf->lineCount();
+        for (int l = line; l < nl; l++) {
+            int ls = buf->lineStart(l);
+            if (ls > hi()) { return false; }
+            int tl = 0;
+            char* t = buf->linePtr(l, &tl);
+            int col = (l == line) ? from - ls : 0;
+            int at = scan(t, tl, col, &caps[0]);
+            while (at >= 0) {
+                int ms = ls + caps[0];
+                int me = ls + caps[1];
+                if (ms >= lo() && me <= hi()) {
+                    *s = ms;
+                    *e = me;
+                    return true;
+                }
+                if (ms > hi()) { return false; }
+                at = scan(t, tl, caps[0] + 1, &caps[0]);
+            }
+        }
+        return false;
+    }
+
+    // the last match (of the left to right, non-overlapping matches of the text) that starts before offset `before`, without wrapping
+    private bool prevBefore(int before, int* s, int* e) {
+        int len = buf->length();
+        int caps[66];
+        bool found = false;
+        if (before <= lo()) { return false; }
+        if (multiline) {
+            char* all = buf->flatten();
+            int pos = lo();
+            bool noEmpty = false;
+            while (pos <= hi()) {
+                int at = re->searchAdv(all, len, pos, &caps[0], noEmpty);
+                if (at < 0 || caps[0] >= before) { break; }
+                if (!wordOk(all, len, caps[0], caps[1])) { pos = at + 1; noEmpty = false; continue; }
+                if (caps[1] > hi()) { break; }
+                *s = caps[0];
+                *e = caps[1];
+                found = true;
+                pos = caps[1];
+                noEmpty = caps[1] == caps[0];
+            }
+            return found;
+        }
+        int start = imin(before - 1, len);
+        int line = buf->lineAt(start);
+        for (int l = line; l >= 0 && !found; l--) {
+            int ls = buf->lineStart(l);
+            if (buf->lineEnd(l) < lo()) { return false; }
+            int tl = 0;
+            char* t = buf->linePtr(l, &tl);
+            int pos = (l == buf->lineAt(lo()) && lo() > ls) ? lo() - ls : 0;
+            bool noEmpty = false;
+            while (pos <= tl) {
+                int at = re->searchAdv(t, tl, pos, &caps[0], noEmpty);
+                if (at < 0 || ls + caps[0] >= before) { break; }
+                if (!wordOk(t, tl, caps[0], caps[1])) { pos = at + 1; noEmpty = false; continue; }
+                if (ls + caps[1] > hi()) { break; }
+                *s = ls + caps[0];
+                *e = ls + caps[1];
+                found = true;
+                pos = caps[1];
+                noEmpty = caps[1] == caps[0];
+            }
+        }
+        return found;
+    }
+
+    private void setCurrent(int s, int e) {
+        curStart = s;
+        curEnd = e;
+        hasCur = true;
+        curVersion = buf->version;
+    }
+
+    // Finds the first match that starts at or after offset `from` (wrapping around to the start of the text unless OPT_NOWRAP) and
+    // makes it the current match. Returns false when there is none.
+    public bool findNext(int from) {
+        if (!ok) { return false; }
+        exceeded = false;
+        int s = 0;
+        int e = 0;
+        if (nextFrom(from, &s, &e)) {
+            setCurrent(s, e);
+            return true;
+        }
+        if ((options & OPT_NOWRAP) == 0 && from > lo()) {
+            if (nextFrom(lo(), &s, &e) && s < from + 1) {
+                setCurrent(s, e);
+                return true;
+            }
+        }
+        hasCur = false;
+        return false;
+    }
+
+    // Finds the last match that starts before offset `before` (wrapping around from the end of the text unless OPT_NOWRAP).
+    public bool findPrev(int before) {
+        if (!ok) { return false; }
+        exceeded = false;
+        int s = 0;
+        int e = 0;
+        if (prevBefore(before, &s, &e)) {
+            setCurrent(s, e);
+            return true;
+        }
+        if ((options & OPT_NOWRAP) == 0 && before <= hi()) {
+            if (prevBefore(hi() + 1, &s, &e) && s >= before - 1) {
+                setCurrent(s, e);
+                return true;
+            }
+        }
+        hasCur = false;
+        return false;
+    }
+
+    // ---- counting and listing: the current match is not touched -------------------------------------------------------------------------------
+    // Calls fn(user, start, end) for every non-overlapping match from left to right (an empty match right after a non-empty one
+    // counts, an empty match is followed by a step of one character). Stops after limit matches. Returns how many.
+    private int walk(func fn, int user, int limit) {
+        if (!ok) { return 0; }
+        int len = buf->length();
+        int n = 0;
+        int caps[66];
+        exceeded = false;
+        if (multiline) {
+            char* all = buf->flatten();
+            int pos = lo();
+            bool noEmpty = false;
+            while (pos <= hi() && n < limit) {
+                int at = re->searchAdv(all, len, pos, &caps[0], noEmpty);
+                if (at < 0) { break; }
+                if (!wordOk(all, len, caps[0], caps[1])) {
+                    pos = at + 1;
+                    noEmpty = false;
+                    continue;
+                }
+                if (caps[1] > hi()) { break; }
+                func f = fn;
+                f(user, caps[0], caps[1]);
+                n++;
+                pos = caps[1];
+                noEmpty = caps[1] == caps[0];
+            }
+            return n;
+        }
+        int nl = buf->lineCount();
+        int firstL = buf->lineAt(lo());
+        for (int l = firstL; l < nl && n < limit; l++) {
+            int ls = buf->lineStart(l);
+            if (ls > hi()) { break; }
+            int tl = 0;
+            char* t = buf->linePtr(l, &tl);
+            int pos = (l == firstL && lo() > ls) ? lo() - ls : 0;
+            bool noEmpty = false;
+            while (pos <= tl && n < limit) {
+                int at = re->searchAdv(t, tl, pos, &caps[0], noEmpty);
+                if (at < 0) { break; }
+                if (!wordOk(t, tl, caps[0], caps[1])) {
+                    pos = at + 1;
+                    noEmpty = false;
+                    continue;
+                }
+                if (ls + caps[1] > hi()) { break; }
+                func f = fn;
+                f(user, ls + caps[0], ls + caps[1]);
+                n++;
+                pos = caps[1];
+                noEmpty = caps[1] == caps[0];
+            }
+        }
+        return n;
+    }
+
+    // the number of matches (at most limit); does not change the current match
+    public int count(int limit) {
+        return walk(countFn, 0, limit);
+    }
+
+    // fills out with up to max matches (start, end) from left to right; returns how many. Does not change the current match.
+    public int matches(Match* out, int max) {
+        MatchSink sink;
+        sink.out = out;
+        sink.max = max;
+        sink.n = 0;
+        walk(sinkFn, (int) &sink, max);
+        return sink.n;
+    }
+
+    // ---- replacing --------------------------------------------------------------------------------------------------------------------------------
+    // Expands a replacement template for a match of text: $0..$9, ${n}, $$ and the escapes \n \t \\ (regex mode); plain mode: as it is.
+    // caps: the group offsets in text, groups: the number of groups. Returns a new string (asys memory).
+    private char* expandTemplate(char* repl, char* text, int* caps, int groups) {
+        int rl = strlen(repl);
+        if (plain) {
+            return asys.strDupN(repl, rl);
+        }
+        int cap = rl + 64;
+        char* out = asys.alloc(cap);
+        int o = 0;
+        for (int i = 0; i < rl; i++) {
+            int c = repl[i];
+            char* piece = null;
+            int pl = 0;
+            char one[4];
+            if (c == '$' && i + 1 < rl) {
+                int d = repl[i + 1];
+                int g = -1;
+                int adv = 1;
+                if (d >= '0' && d <= '9') {
+                    g = d - '0';
+                } else if (d == '{') {
+                    int j = i + 2;
+                    int v = 0;
+                    while (j < rl && repl[j] >= '0' && repl[j] <= '9') { v = v * 10 + (repl[j] - '0'); j++; }
+                    if (j < rl && repl[j] == '}' && j > i + 2) { g = v; adv = j - i; }
+                } else if (d == '$') {
+                    one[0] = '$';
+                    piece = &one[0];
+                    pl = 1;
+                    i++;
+                }
+                if (g >= 0) {
+                    if (g <= groups && caps[2 * g] >= 0) {
+                        piece = &text[caps[2 * g]];
+                        pl = caps[2 * g + 1] - caps[2 * g];
+                    } else {
+                        piece = "";
+                        pl = 0;
+                    }
+                    i = i + adv;
+                }
+            } else if (c == 92 && i + 1 < rl) {
+                int d = repl[i + 1];
+                if (d == 'n') { one[0] = 10; piece = &one[0]; pl = 1; i++; }
+                else if (d == 't') { one[0] = 9; piece = &one[0]; pl = 1; i++; }
+                else if (d == 92) { one[0] = 92; piece = &one[0]; pl = 1; i++; }
+            }
+            if (piece == null) {
+                one[0] = c;
+                piece = &one[0];
+                pl = 1;
+            }
+            if (o + pl + 1 > cap) {
+                cap = (o + pl) * 2 + 16;
+                char* nb = asys.realloc(out, cap);
+                if (nb == null) { break; }
+                out = nb;
+            }
+            memcpy(&out[o], piece, pl);
+            o = o + pl;
+        }
+        out[o] = 0;
+        return out;
+    }
+
+    // the replacement text for the match [s, e) in the buffer: the groups are those of THIS match (it is matched again, anchored at
+    // its start). A new string.
+    private char* replacementFor(int s, int e, char* repl) {
+        int caps[66];
+        if (plain) {
+            return expandTemplate(repl, null, &caps[0], 0);
+        }
+        if (multiline) {
+            char* all = buf->flatten();
+            int me = re->matchAt(all, buf->length(), s, &caps[0]);
+            if (me < 0) { caps[0] = s; caps[1] = e; for (int i = 2; i < 66; i++) { caps[i] = -1; } }
+            return expandTemplate(repl, all, &caps[0], re->groups);
+        }
+        int line = buf->lineAt(s);
+        int ls = buf->lineStart(line);
+        int tl = 0;
+        char* t = buf->linePtr(line, &tl);
+        int me = re->matchAt(t, tl, s - ls, &caps[0]);
+        if (me < 0) { caps[0] = s - ls; caps[1] = e - ls; for (int i = 2; i < 66; i++) { caps[i] = -1; } }
+        return expandTemplate(repl, t, &caps[0], re->groups);
+    }
+
+    // Replaces the current match (it must still be valid: nothing was edited since it was found) by the replacement template; one
+    // undo step; the cursor of the editor goes to the end of the new text. Returns false when there is no valid current match.
+    public bool replaceCurrent(acode.Editor* ed, char* repl) {
+        if (!ok || !currentValid() || buf->readOnly) { return false; }
+        char* r = replacementFor(curStart, curEnd, repl);
+        int s = curStart;
+        int e = curEnd;
+        int n = strlen(r);
+        ed->beginGroup(acode.KEY_NONE);
+        buf->edit(s, e - s, r, n);
+        ed->setCursor(s + n);
+        ed->endGroup();
+        asys.free(r);
+        hasCur = false;
+        return true;
+    }
+
+    // Replaces every match (inside the range, if one is set) as ONE undo step. Returns how many were replaced.
+    public int replaceAll(acode.Editor* ed, char* repl) {
+        if (!ok || buf->readOnly) { return 0; }
+        // first all matches and their replacement texts (the text is not changed yet), then the edits from the end to the start
+        int total = count(2000000);
+        if (total == 0) { return 0; }
+        Match* ms = (Match*) asys.alloc(total * sizeof(Match) + 16);
+        int n = matches(ms, total);
+        char** reps = (char**) asys.alloc(n * 8 + 8);
+        for (int i = 0; i < n; i++) {
+            reps[i] = replacementFor(ms[i].start, ms[i].end, repl);
+        }
+        ed->beginGroup(acode.KEY_NONE);
+        for (int i = n - 1; i >= 0; i--) {
+            buf->edit(ms[i].start, ms[i].end - ms[i].start, reps[i], strlen(reps[i]));
+        }
+        ed->endGroup();
+        for (int i = 0; i < n; i++) { asys.free(reps[i]); }
+        asys.free((char*) reps);
+        asys.free((char*) ms);
+        hasCur = false;
+        return n;
+    }
+}
+
+struct MatchSink {
+    Match* out;
+    int max;
+    int n;
+}
+
+int countFn(int user, int s, int e) {
+    return 0;
+}
+
+int sinkFn(int user, int s, int e) {
+    MatchSink* k = (MatchSink*) user;
+    if (k->n < k->max) {
+        k->out[k->n].start = s;
+        k->out[k->n].end = e;
+        k->n++;
+    }
+    return 0;
+}

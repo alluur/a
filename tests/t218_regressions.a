@@ -1,0 +1,350 @@
+// Regression tests for the problems found in earlier reviews of this code: atomic saves (temp file permissions and names), extreme
+// tab and indent widths, dispose() that really frees, big text cycles that must not leave memory behind, bounded directory walks
+import acode;
+import asyntax;
+import atheme;
+import afind;
+import aproject;
+import regex;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+bool permOk;
+
+// the name of a temp file in dir (".<name>.tmp-xxxx"), or null
+char* tempIn(char* dir) {
+    asys.DirList dl();
+    asys.listDir(dir, &dl);
+    char* r = null;
+    for (int i = 0; i < dl.count; i++) {
+        if (contains(dl.name(i), ".tmp-")) { r = asys.strDup(dl.name(i)); }
+    }
+    dl.dispose();
+    return r;
+}
+
+void rmFiles(char* dir) {
+    asys.DirList dl();
+    asys.listDir(dir, &dl);
+    for (int i = 0; i < dl.count; i++) {
+        char* p = asys.join(dir, dl.name(i));
+        asys.unlink(p);
+        asys.free(p);
+    }
+    dl.dispose();
+    asys.rmdir(dir);
+}
+
+int main() {
+    permOk = asys.platform() == asys.OS_LINUX;
+    char* dir = "build/tests/t218_work";
+    asys.mkdirs(dir);
+
+    // ---- atomic save: the temp file has the final permissions from its first byte, a random name, and never survives a failure
+    {
+        char* f = "build/tests/t218_work/secret.txt";
+        asys.writeFile(f, "old", 3);
+        asys.chmod(f, 384);
+        asys.AtomicFile a1();
+        asys.AtomicFile a2();
+        checkEq(a1.open(f, 420, 0), 0, "open the first writer");
+        checkEq(a2.open(f, 420, 0), 0, "and a second one at the same time (different temp files)");
+        a1.write("new", 3);
+        asys.DirList dl();
+        asys.listDir(dir, &dl);
+        int temps = 0;
+        bool modesOk = true;
+        char* name1 = null;
+        for (int i = 0; i < dl.count; i++) {
+            if (contains(dl.name(i), ".tmp-")) {
+                temps++;
+                char* p = asys.join(dir, dl.name(i));
+                asys.Stat st;
+                asys.stat(p, &st);
+                if (permOk && st.perm() != 384) { modesOk = false; }
+                if (name1 == null) { name1 = asys.strDup(dl.name(i)); }
+                asys.free(p);
+            }
+        }
+        dl.dispose();
+        checkEq(temps, 2, "two temp files while two writers are open");
+        check(modesOk, "both have the permissions of the old file (0600) while they are still empty or partly written");
+        check(name1 != null && strlen(name1) >= strlen(".secret.txt.tmp-") + 12, "the names carry 12 random hex digits");
+        a2.abort();
+        check(a1.commit() == 0, "commit the first");
+        check(tempIn(dir) == null, "no temp file remains after abort and commit");
+        char* t = asys.readFile(f, null, -1, null);
+        check(streq(t, "new"), "the committed content");
+        asys.free(t);
+        asys.Stat st;
+        asys.stat(f, &st);
+        check(!permOk || st.perm() == 384, "the permissions survived");
+        // the names differ between runs
+        asys.AtomicFile b1();
+        asys.AtomicFile b2();
+        b1.open(f, 420, 0);
+        char* n1 = tempIn(dir);
+        b1.abort();
+        b2.open(f, 420, 0);
+        char* n2 = tempIn(dir);
+        b2.abort();
+        check(n1 != null && n2 != null && !streq(n1, n2), "two temp names in a row are different");
+        // a write that fails leaves nothing behind
+        check(asys.writeFileAtomic("build/tests/t218_work/missing-dir/x", "a", 1, 420, 0) < 0, "a failing write");
+        check(tempIn(dir) == null, "leaves no temp file");
+        // a buffer that cannot be saved because the target is a directory
+        acode.Buffer b();
+        b.setText("data", 4);
+        check(b.save("build/tests/t218_work", 0) < 0, "saving over a directory fails");
+        check(tempIn(dir) == null && b.modified() == false, "cleanly (and the buffer keeps its state)");
+        asys.free(name1);
+        asys.free(n1);
+        asys.free(n2);
+    }
+
+    // ---- extreme tab and indent widths: nothing divides by zero, nothing overflows
+    {
+        int widths[7];
+        widths[0] = 0; widths[1] = -1; widths[2] = -100; widths[3] = 1000000; widths[4] = 1; widths[5] = 64; widths[6] = 65;
+        bool survived = true;
+        for (int wi = 0; wi < 7; wi++) {
+            acode.Buffer b();
+            b.setText("  a\n\tb\n        c {\n    \n\xe4\xb8\xad\td\n", 32);
+            acode.Editor* e = new acode.Editor(&b);
+            e->setTabWidth(widths[wi]);
+            e->setIndentWidth(widths[wi]);
+            e->setLanguage("c");
+            for (int round = 0; round < 2; round++) {
+                e->useTabs = round == 1;
+                e->setCursor(10);
+                e->tab();
+                e->backtab();
+                e->selectAll();
+                e->indentLines();
+                e->outdentLines();
+                e->toggleLineComment();
+                e->toggleLineComment();
+                e->setCursor(b.length());
+                e->newline();
+                e->typeChar('}');
+                e->backspace();
+                e->backspace();
+                e->moveUp(false);
+                e->moveDown(false);
+                e->moveHome(false);
+                e->moveEnd(false);
+                e->gotoLine(2, 9);
+                e->addCursorsInColumn(0, 3, 5);
+                e->moveVertical(2, true);
+                e->clearExtraCursors();
+                e->convertIndentation(round == 0);
+                e->detectIndent(true);
+                e->selectAll();
+                e->moveLinesDown();
+                e->duplicateLines();
+                e->deleteLines();
+                int col = e->caretCol();
+                if (col < 0) { survived = false; }
+                int vc = b.visualCol(0, b.lineEnd(0), widths[wi]);
+                int oc = b.offsetAtCol(1, 7, widths[wi]);
+                if (vc < 0 || oc < 0) { survived = false; }
+                e->undo();
+                e->undo();
+                e->redo();
+            }
+            e->dispose();
+            b.dispose();
+        }
+        check(survived, "every indentation command works with tab and indent widths of 0, -1, -100, 1000000, 1, 64 and 65");
+    }
+
+    // ---- dispose() frees: create, use and dispose each kind of object repeatedly; nothing may accumulate
+    {
+        int before = asys.memInUse();
+        for (int cycle = 0; cycle < 21; cycle++) {
+            if (cycle == 1) { before = asys.memInUse(); }        // the first round creates the lazily built tables (keyword sets, environment)
+            acode.Buffer b();
+            acode.Editor e(&b);
+            e.insertString("hello world\nsecond line\nthird\n");
+            e.typeString("typed text");
+            e.copy();
+            e.selectAll();
+            e.paste();
+            e.undo();
+            e.dispose();
+            b.dispose();
+            acode.Buffer c();
+            c.setText("int main() { return 1; }\n// note\n", 33);
+            asyntax.Highlighter* h = new asyntax.Highlighter(&c, asyntax.Lang.C);
+            asyntax.Token tk[16];
+            h->tokens(0, &tk[0], 16);
+            h->tokens(1, &tk[0], 16);
+            h->dispose();
+            asyntax.SymbolList sl();
+            asyntax.symbols(&c, asyntax.Lang.C, &sl);
+            sl.dispose();
+            asyntax.Completer cp();
+            cp.addBuffer(&c, asyntax.Lang.C);
+            asyntax.Candidate cand[8];
+            cp.complete("ma", asyntax.Lang.C, &cand[0], 8);
+            cp.dispose();
+            afind.Finder f(&c);
+            f.setPattern("(\\w+) ", afind.OPT_REGEX);
+            f.count(100);
+            f.findNext(0);
+            f.dispose();
+            c.dispose();
+            regex.Regex* r = regex.compile("(a|b)+c{2,3}[x-z]", 0);
+            int caps[66];
+            r->search("abcc", 4, 0, &caps[0]);
+            r->dispose();
+            atheme.Theme* t = atheme.builtin("nord");
+            char* ini = t->toIni();
+            asys.free(ini);
+            t->dispose();
+            atheme.Warnings w();
+            w.add("x");
+            w.dispose();
+            atheme.Settings s();
+            s.addRecentFile("/a");
+            s.setBinding("a", "b");
+            char* si = s.toIni();
+            asys.free(si);
+            s.dispose();
+            aproject.Ignore ig();
+            ig.addBuiltin();
+            ig.addPattern("x/", "");
+            ig.dispose();
+            aproject.Recent rc();
+            rc.add("a");
+            rc.add("b");
+            rc.dispose();
+            aproject.Watcher wt();
+            wt.watch("build/tests/t218_work");
+            aproject.WatchEvent ev[4];
+            wt.poll(&ev[0], 4);
+            wt.dispose();
+            aproject.QuickOpen q();
+            q.index("build/tests/t218_work", null);
+            q.dispose();
+            aproject.FileTree* ft = new aproject.FileTree("build/tests/t218_work", null);
+            ft->load(ft->root);
+            ft->dispose();
+            aproject.FindJob* fj = new aproject.FindJob();
+            fj->start("build/tests/t218_work", "x", 0, null, 1);
+            while (fj->step(10) == aproject.FIND_RUNNING) { }
+            fj->dispose();
+            asys.DirList dl();
+            asys.listDir("build/tests/t218_work", &dl);
+            dl.dispose();
+            if (asys.canSpawn()) {
+                aproject.RunJob* rj = new aproject.RunJob();
+                rj->startShell("echo hi", null);
+                rj->wait(5000);
+                rj->dispose();
+                aproject.BuildJob* bj = new aproject.BuildJob();
+                bj->startShell("echo 'a.c:1: error: e'", null);
+                bj->wait(5000);
+                bj->dispose();
+            }
+        }
+        checkEq(asys.memInUse(), before, "20 cycles over every class leave exactly nothing allocated through asys");
+        checkEq(asys.memBadFrees(), 0, "and no bad free was made anywhere");
+    }
+
+    // ---- big text cycles: the memory goes back (24 MB here; the full 50 MB cycle was measured separately)
+    {
+        int before = asys.memInUse();
+        int mappedBefore = asys.memMapped();
+        int n = 24 * 1024 * 1024;
+        char* big = asys.alloc(n);
+        for (int i = 0; i < n; i++) { big[i] = (i % 64 == 63) ? 10 : 'a' + (i % 20); }
+        acode.Buffer b();
+        b.setText(big, n);
+        asys.free(big);
+        check(b.memoryUsed() >= n, "the buffer holds the text");
+        acode.Editor e(&b);
+        e.setCursor(100);
+        e.insertString("x");
+        e.selectAll();
+        e.deleteForward();
+        check(b.length() == 0, "everything deleted");
+        b.clearHistory();
+        check(b.memoryUsed() < 2 * 1024 * 1024, "and without history almost nothing is held");
+        b.setText("tiny", 4);
+        e.dispose();
+        b.dispose();
+        check(asys.memInUse() - before < 1024 * 1024, "after the cycle less than 1 MB is in use");
+        check(asys.memMapped() - mappedBefore < 8 * 1024 * 1024, "and the big blocks were returned to the system");
+    }
+
+    // ---- directory walks are bounded: a chain of 80 directories
+    {
+        char* path = asys.strDup("build/tests/t218_work/deep");
+        asys.mkdir(path, 493);
+        for (int i = 0; i < 80; i++) {
+            char* np = asys.join(path, "d");
+            asys.free(path);
+            path = np;
+            asys.mkdir(path, 493);
+        }
+        char* leaf = asys.join(path, "found.txt");
+        asys.writeFile(leaf, "needle", 6);
+        asys.free(leaf);
+        aproject.FindJob* fj = new aproject.FindJob();
+        fj->start("build/tests/t218_work", "needle", 0, null, 0);
+        int guard = 0;
+        while (fj->step(50) == aproject.FIND_RUNNING && guard < 10000) { guard++; }
+        check(guard < 10000 && fj->status() == aproject.FIND_DONE, "the walk of an 80 level deep chain ends");
+        check(fj->dirsSkipped >= 1, "below the depth limit directories are skipped and counted");
+        fj->dispose();
+        aproject.FileTree* ft = new aproject.FileTree("build/tests/t218_work", null);
+        ft->maxDepth = 10;
+        ft->load(ft->root);
+        aproject.TreeNode* n = ft->root;
+        for (int i = 0; i < 12 && n != null; i++) {
+            ft->expand(n);
+            n = (n->nkids > 0) ? n->kids[0] : null;
+        }
+        check(ft->truncated, "the tree stops at maxDepth and says so");
+        ft->dispose();
+        // remove the chain again (deepest first)
+        char* p2 = asys.strDup("build/tests/t218_work/deep");
+        char* parts[90];
+        int np = 0;
+        parts[np] = asys.strDup(p2);
+        np++;
+        for (int i = 0; i < 80; i++) {
+            char* q = asys.join(parts[np - 1], "d");
+            parts[np] = q;
+            np++;
+        }
+        char* lf = asys.join(parts[np - 1], "found.txt");
+        asys.unlink(lf);
+        asys.free(lf);
+        for (int i = np - 1; i >= 0; i--) { asys.rmdir(parts[i]); asys.free(parts[i]); }
+        asys.free(p2);
+        asys.free(path);
+    }
+    rmFiles(dir);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

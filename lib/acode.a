@@ -130,6 +130,11 @@ const S_SEALED = 9;
 const S_DATA = 10;          // start of this step's bytes in the data arena
 const SREC = 12;            // ints per step record
 
+// The storage of a buffer that holds nothing and has been given nothing: it points here instead of at heap memory, so that an empty
+// or disposed buffer costs no allocation (the first edit allocates).
+char emptyData[16];
+int emptyLs[4];
+
 // A text buffer: a gap buffer for the bytes (UTF-8, always '\n' between lines in text mode), a line index that is a gap array
 // as well (so inserting 100 000 lines one by one, anywhere near the previous edit, costs nothing), undo / redo history with
 // cursor snapshots, change listeners and file load / save.
@@ -208,14 +213,38 @@ public class Buffer {
         histLimit = 33554432;
         grpStep = -1;
         eol = EOL_LF;
-        resetStorage(null, 0, 0);
+        toEmpty();
     }
 
     // ---- storage -------------------------------------------------------------------------------------------------------------------
+    // the state of a buffer without text and without memory
+    private void toEmpty() {
+        data = &emptyData[0];
+        cap = 0;
+        gs = 0;
+        ge = 0;
+        ls = &emptyLs[0];
+        emptyLs[0] = 0;
+        lcap = 1;
+        lgs = 1;
+        lge = 1;
+        lshift = 0;
+        nlines = 1;
+    }
+
+    // gives an empty buffer real storage before something is written into it
+    private void own() {
+        if (data == &emptyData[0] || data == null) {
+            data = null;
+            ls = null;
+            resetStorage(null, 0, 0);
+        }
+    }
+
     // installs blk (an asys block holding len bytes at its start, capacity bcap) as the text and builds the line index
     private void resetStorage(char* blk, int len, int bcap) {
-        asys.free(data);
-        asys.free((char*) ls);
+        if (data != &emptyData[0]) { asys.free(data); }
+        if (ls != &emptyLs[0]) { asys.free((char*) ls); }
         asys.free(scratch);
         scratch = null;
         scratchCap = 0;
@@ -251,10 +280,10 @@ public class Buffer {
         lshift = 0;
     }
 
-    // frees everything: the buffer is empty afterwards (and can be used again)
+    // frees everything: the buffer is empty afterwards (it can be used again, the next edit allocates)
     public void dispose() {
-        asys.free(data);
-        asys.free((char*) ls);
+        if (data != &emptyData[0]) { asys.free(data); }
+        if (ls != &emptyLs[0]) { asys.free((char*) ls); }
         asys.free(scratch);
         asys.free((char*) lfn);
         asys.free((char*) luser);
@@ -269,7 +298,7 @@ public class Buffer {
         hcurs = null; pendSnap = null; path = null;
         cap = 0; scratchCap = 0; ln = 0; lcapL = 0; nsteps = 0; top = 0; stepsCap = 0; nops = 0; opsCap = 0; hlen = 0; hcap = 0;
         hclen = 0; hccap = 0; pendN = 0; pendCap = 0; diskKnown = false;
-        resetStorage(null, 0, 0);
+        toEmpty();
         version++;
     }
 
@@ -450,6 +479,7 @@ public class Buffer {
     // Moves the gap to the end and returns the whole text as one contiguous block (valid until the next edit). The block is
     // NUL terminated. Use it for searches that cross lines.
     public char* flatten() {
+        own();
         textMoveGap(length());
         if (ge - gs < 1) {
             textEnsure(1);
@@ -1236,12 +1266,12 @@ public class Buffer {
             maxLoad = 1073741824;
             histOn = true;
             histLimit = 33554432;
-            grpStep = -1;
-            resetStorage(null, 0, 0);                // a zeroed object that never saw its constructor
+            grpStep = -1;                            // a zeroed object that never saw its constructor
         }
         if (readOnly || inNotify) {
             return false;
         }
+        own();
         int len = length();
         if (off < 0 || delLen < 0 || insLen < 0 || off > len || delLen > len - off) {
             return false;
@@ -1734,7 +1764,8 @@ public class Editor {
     public Cursor* cur;
     public int ncur;
     public int primary;                 // the cursor a view follows (index into cur)
-    public Clipboard* clip;
+    public Clipboard* clip;             // the clipboard ring (an editor makes its own; assign a shared one to share copies between editors)
+    private Clipboard* ownClip;
     // settings (tabWidth and indentWidth below 1 are treated as 4, above 64 as 64)
     public int tabWidth;
     public int indentWidth;
@@ -1771,6 +1802,7 @@ public class Editor {
         ncur = 1;
         cur[0].goal = -1;
         clip = new Clipboard();
+        ownClip = clip;
         listenerId = buf->addListener(editorOnChange, (int) this);
     }
 
@@ -1784,6 +1816,10 @@ public class Editor {
         asys.free(lineComment);
         asys.free(blockOpen);
         asys.free(blockClose);
+        if (ownClip != null) {
+            ownClip->dispose();                      // the clipboard this editor made itself (a shared one is not ours to free)
+            ownClip = null;
+        }
         cur = null;
         snap = null;
         lineComment = null;
@@ -2122,6 +2158,16 @@ public class Editor {
         normalize();
         int n = snapshot();
         buf->endGroup(snap, n);
+    }
+
+    // Opens / closes an undo group around edits made directly on the buffer (find and replace, scripts): everything between the calls is
+    // one undo step, and undo restores the cursors as they are now.
+    public void beginGroup(int key) {
+        beginEdit(key);
+    }
+
+    public void endGroup() {
+        endEdit();
     }
 
     // Closes the current undo step so that the next typing starts a new one (call it when the user pauses or the view
