@@ -26,6 +26,7 @@
 //  Linux, Android and AOS (all of them through the Linux system call interface). On Windows only the pure parts work.
 //  Key codes: a character key is its Unicode code point (Ctrl+S is 's' with MOD_CTRL); named keys start at KEY_BASE.
 // =============================================================================
+import cstdlib;
 module term;
 
 // ---- key codes, modifiers, event kinds --------------------------------------------------------------------------------------------------
@@ -79,6 +80,10 @@ public const MA_RELEASE = 2;
 public const MA_DRAG = 3;                // moved with a button held
 public const MA_MOVE = 4;                // moved with no button (only when the terminal reports all motion)
 public const MA_WHEEL = 5;
+
+// the biggest window size the toolkit accepts: larger values (a broken terminal, LINES=99999999) are cut to it, so the screen buffers stay small
+public const MAX_COLS = 1000;
+public const MAX_ROWS = 500;
 
 public const POLL_IN = 1;
 public const POLL_OUT = 4;
@@ -181,8 +186,10 @@ const ST_X10 = 5;
 const ST_PASTE = 6;
 const ST_LINUXF = 7;
 
-const QSIZE = 128;
+const QSIZE = 128;                      // initial size of the event queue (it grows)
+const QMAX = 1048576;                    // events the queue may hold at most (a safety limit; the oldest is dropped beyond it)
 const PASTE_MAX = 4194304;
+const PASTE_RATE = 256;                 // a paste that brings fewer bytes than this in 3 seconds is taken for typing
 const FKCODES = 20;
 
 // Turns the bytes a terminal sends into events. feed() one byte at a time (feedBytes / feedText for more), read the events with next().
@@ -191,7 +198,7 @@ const FKCODES = 20;
 public class Decoder {
     public int state;
     public bool expectCpr;            // set while a cursor position report (CSI 6 n) is awaited: CSI r;c R is not F3 then
-    public bool crNul;                // a NUL right after CR is dropped (telnet sends CR NUL for Enter); default true
+    public bool crNul;                // a NUL right after CR is dropped when it comes in the same read (telnet sends CR NUL for Enter); default true
     public int escMs;                 // how long an Esc waits for the rest of a sequence (default 40)
     private int params[16];
     private int np;
@@ -213,14 +220,17 @@ public class Decoder {
     private int pasteLen;
     private int pasteCap;
     private int pasteMatch;
-    private Event* q[128];
+    private Event** q;
+    private int qcap;
     private int qh;
     private int qn;
 
     public Decoder() {
         crNul = true;
         escMs = 40;
-        for (int i = 0; i < QSIZE; i++) { q[i] = new Event(); }
+        qcap = QSIZE;
+        q = (Event**) alloc(qcap * 8);
+        for (int i = 0; i < qcap; i++) { q[i] = new Event(); }
     }
 
     // ---- the queue ----------------------------------------------------------------------------------------------------------------------
@@ -230,16 +240,31 @@ public class Decoder {
     public bool next(Event* out) {
         if (qn == 0) { return false; }
         out->copyFrom(q[qh]);
-        qh = (qh + 1) % QSIZE;
+        qh = (qh + 1) % qcap;
         qn--;
         return true;
     }
 
     public void clearEvents() { qh = 0; qn = 0; }
 
+    // the queue doubles when it is full, so a burst of input (a paste without bracketed paste mode, a script sending keys) loses nothing
+    private void grow() {
+        int ncap = qcap * 2;
+        Event** nq = (Event**) alloc(ncap * 8);
+        for (int i = 0; i < qn; i++) { nq[i] = q[(qh + i) % qcap]; }
+        for (int i = qn; i < qcap; i++) { nq[i] = q[(qh + i) % qcap]; }
+        for (int i = qcap; i < ncap; i++) { nq[i] = new Event(); }
+        q = nq;
+        qh = 0;
+        qcap = ncap;
+    }
+
     private Event* slot() {
-        if (qn == QSIZE) { qh = (qh + 1) % QSIZE; qn--; }          // full: the oldest event is lost
-        Event* e = q[(qh + qn) % QSIZE];
+        if (qn == qcap) {
+            if (qcap >= QMAX) { qh = (qh + 1) % qcap; qn--; }       // the safety limit: the oldest event is lost
+            else { grow(); }
+        }
+        Event* e = q[(qh + qn) % qcap];
         qn++;
         e->clear();
         return e;
@@ -257,12 +282,12 @@ public class Decoder {
     // removes the first event of that kind from the queue and copies it to out
     public bool take(int kind, Event* out) {
         for (int i = 0; i < qn; i++) {
-            Event* e = q[(qh + i) % QSIZE];
+            Event* e = q[(qh + i) % qcap];
             if (e->kind == kind) {
                 out->copyFrom(e);
                 for (int k = i; k < qn - 1; k++) {
-                    Event* a = q[(qh + k) % QSIZE];
-                    Event* b = q[(qh + k + 1) % QSIZE];
+                    Event* a = q[(qh + k) % qcap];
+                    Event* b = q[(qh + k + 1) % qcap];
                     a->copyFrom(b);
                 }
                 qn--;
@@ -288,6 +313,10 @@ public class Decoder {
     public void feedText(char* s) {
         for (int i = 0; s[i] != 0; i++) { feed(s[i]); }
     }
+
+    // Call it when everything one read from the terminal returned has been fed (Terminal does). The CR NUL rule (crNul) only joins a CR and a
+    // NUL of the same read: a Ctrl+Space (which sends NUL) typed as the next key after Enter is a key of its own.
+    public void endRead() { crSeen = false; }
 
     // how many milliseconds to wait for more input before flush(); 0 when nothing is pending
     public int flushDelay() {
@@ -1030,60 +1059,14 @@ private bool localeUtf8(char* v) {
 }
 
 // ---- the environment -----------------------------------------------------------------------------------------------------------------------
-char* envBuf;
-char** envPtrs;
-int envCount;
-
-private void envLoad() {
-    if (envPtrs != null) { return; }
-    int cap = 65536;
-    envBuf = alloc(cap + 2);
-    int len = 0;
-    if (__OS != 1) {
-        int fd = __open("/proc/self/environ", 0);
-        if (fd >= 0) {
-            while (len < cap) {
-                int got = __read(fd, &envBuf[len], cap - len);
-                if (got <= 0) { break; }
-                len = len + got;
-            }
-            __close(fd);
-        }
-    }
-    int n = 0;
-    for (int k = 0; k < len; k++) { if (envBuf[k] == 0) { n++; } }
-    if (len > 0 && envBuf[len - 1] != 0) { n++; }
-    envPtrs = (char**) alloc((n + 1) * 8);
-    int idx = 0;
-    int start = 0;
-    for (int k = 0; k < len; k++) {
-        if (envBuf[k] == 0) {
-            if (k > start) { envPtrs[idx] = &envBuf[start]; idx++; }
-            start = k + 1;
-        }
-    }
-    if (start < len) { envPtrs[idx] = &envBuf[start]; idx++; }
-    envPtrs[idx] = null;
-    envCount = idx;
-}
-
-// the value of an environment variable (as it was when the program started), null if unset. Windows: always null
+// the value of an environment variable as it is now (changes made with setenv of cstdlib are seen), null if unset
 public char* env(char* name) {
-    envLoad();
-    int nl = strlen(name);
-    for (int i = 0; i < envCount; i++) {
-        char* e = envPtrs[i];
-        int k = 0;
-        while (k < nl && e[k] == name[k]) { k++; }
-        if (k == nl && e[nl] == '=') { return &e[nl + 1]; }
-    }
-    return null;
+    return getenv(name);
 }
 
-// the environment as a NULL terminated array of "NAME=value" strings (for starting programs)
+// the environment as a NULL terminated array of "NAME=value" strings (for starting programs; setenv changes are included)
 public char** environment() {
-    envLoad();
-    return envPtrs;
+    return environ();
 }
 
 // fills caps from TERM, COLORTERM, LC_ALL / LC_CTYPE / LANG and NO_COLOR, then applies TUI_COLORS, TUI_MOUSE, TUI_ASCII and TUI_SYNC
@@ -1149,8 +1132,23 @@ private void put32le(char* p, int off, int v) {
     p[off] = v; p[off + 1] = v >> 8; p[off + 2] = v >> 16; p[off + 3] = v >> 24;
 }
 
+// Makes the processor see the machine code that was just written to [start, start + n): the thunks of the signal handlers are made at run time.
+// ARM64 cleans the data cache and invalidates the instruction cache line by line (4 byte steps are fine: the operations act on the whole line),
+// RISC-V asks the kernel (riscv_flush_icache, all harts) and executes fence.i, LoongArch executes ibar; x86-64 needs nothing.
+private void syncCode(char* start, int n) {
+    if (__ARCH == 2) { __syscall(259, (int) start, (int) start + n, 0, 0, 0, 0); }
+    asm(start, n) {
+        x64: 0x90;
+        arm64: 0x8B010001, 0xAA0003E3, 0xD50B7B23, 0x91001063, 0xEB01007F, 0x54FFFFA3, 0xD5033B9F,
+               0xAA0003E3, 0xD50B7523, 0x91001063, 0xEB01007F, 0x54FFFFA3, 0xD5033B9F, 0xD5033FDF;
+        riscv64: 0x0000100F;
+        loongarch64: 0x38728000;
+    }
+}
+
 // An executable page with one small thunk per signal that calls the A function with the signal number on the stack (the kernel calls handlers
-// with the platform's C calling convention), and the x86-64 signal return code at offset 0.
+// with the platform's C calling convention), and the x86-64 signal return code at offset 0. Null when the page cannot be mapped
+// (a system that forbids writable and executable memory): the handlers are not installed then (Terminal.hooksOk is false).
 private char* thunkFor(int sig, func handler) {
     if (sigPage == null) {
         int p = __syscall(sysnr(9, 222), 0, 4096, 7, 0x22, -1, 0);       // mmap(RWX, anonymous)
@@ -1159,6 +1157,7 @@ private char* thunkFor(int sig, func handler) {
         if (__ARCH == 0) {
             char* r = sigPage;
             r[0] = 0xB8; r[1] = 15; r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 0x0F; r[6] = 0x05;       // mov eax, 15 ; syscall (rt_sigreturn)
+            syncCode(r, 16);
         }
     }
     char* t = &sigPage[64 + 48 * sig];
@@ -1180,6 +1179,7 @@ private char* thunkFor(int sig, func handler) {
         put32le(t, 0, 0xA9BF7BFD); put32le(t, 4, 0xF81F0FE0); put32le(t, 8, 0x580000D0); put32le(t, 12, 0xD63F0200);
         put32le(t, 16, 0x910043FF); put32le(t, 20, 0xA8C17BFD); put32le(t, 24, 0xD65F03C0);
     }
+    syncCode(t, 48);
     return t;
 }
 
@@ -1240,24 +1240,58 @@ void atExitRestore() {
     if (t != null) { t->restore(); }
 }
 
-private void installHooks() {
-    if (hookInstalled || __OS == 1) { return; }
+private bool hooksResult;
+
+// installs the exit hook and the signal handlers; true when every handler that restores the terminal could be installed (only the first
+// call does the work, later calls return what it found)
+private bool installHooks() {
+    if (hookInstalled || __OS == 1) { return hooksResult; }
     hookInstalled = true;
     if (__atexit_n < 32) {
         __atexit_fn[__atexit_n] = atExitRestore;
         __atexit_n++;
     }
-    setHandler(2, onFatal, 0);          // SIGINT
-    setHandler(1, onFatal, 0);          // SIGHUP
-    setHandler(3, onFatal, 0);          // SIGQUIT
-    setHandler(15, onFatal, 0);         // SIGTERM
-    setHandler(11, onFatal, 0);         // SIGSEGV
-    setHandler(7, onFatal, 0);          // SIGBUS
-    setHandler(8, onFatal, 0);          // SIGFPE
-    setHandler(4, onFatal, 0);          // SIGILL
-    setHandler(6, onFatal, 0);          // SIGABRT
+    bool ok = true;
+    if (!setHandler(2, onFatal, 0)) { ok = false; }                // SIGINT
+    if (!setHandler(1, onFatal, 0)) { ok = false; }                // SIGHUP
+    if (!setHandler(3, onFatal, 0)) { ok = false; }                // SIGQUIT
+    if (!setHandler(15, onFatal, 0)) { ok = false; }               // SIGTERM
+    if (!setHandler(11, onFatal, 0)) { ok = false; }               // SIGSEGV
+    if (!setHandler(7, onFatal, 0)) { ok = false; }                // SIGBUS
+    if (!setHandler(8, onFatal, 0)) { ok = false; }                // SIGFPE
+    if (!setHandler(4, onFatal, 0)) { ok = false; }                // SIGILL
+    if (!setHandler(6, onFatal, 0)) { ok = false; }                // SIGABRT
     setHandler(28, onWinch, 0x10000000);        // SIGWINCH
     setHandler(18, onCont, 0x10000000);         // SIGCONT
+    hooksResult = ok;
+    return ok;
+}
+
+// copies text for a window title: no control characters (C0, DEL, C1) and no invalid UTF-8; at most max bytes. Returns the length (no NUL written)
+public int cleanTitle(char* text, char* out, int max) {
+    int n = 0;
+    int i = 0;
+    while (text[i] != 0) {
+        int b = text[i] & 255;
+        int need = 0;
+        if (b < 0x20 || b == 0x7F) { i++; continue; }
+        if (b < 0x80) { need = 0; }
+        else if (b >= 0xC2 && b < 0xE0) { need = 1; }
+        else if (b >= 0xE0 && b < 0xF0) { need = 2; }
+        else if (b >= 0xF0 && b < 0xF5) { need = 3; }
+        else { i++; continue; }                                              // a stray continuation byte or an invalid lead byte
+        bool good = true;
+        for (int k = 1; k <= need; k++) {
+            int c = text[i + k] & 255;
+            if (text[i + k] == 0 || c < 0x80 || c > 0xBF) { good = false; break; }
+        }
+        if (good && b == 0xC2 && (text[i + 1] & 255) < 0xA0) { good = false; }        // U+0080..U+009F: C1 controls
+        if (!good) { i++; continue; }
+        if (n + need + 1 > max) { break; }
+        for (int k = 0; k <= need; k++) { out[n] = text[i + k]; n++; }
+        i = i + need + 1;
+    }
+    return n;
 }
 
 // ---- the terminal ----------------------------------------------------------------------------------------------------------------------------
@@ -1273,6 +1307,8 @@ public class Terminal {
     public bool useAlt;              // use the alternate screen when the terminal has one (default true)
     public bool useMouse;            // enable mouse reporting when the terminal has it (default true)
     public bool usePaste;            // enable bracketed paste when the terminal has it (default true)
+    public bool useDevTty;           // open() may use /dev/tty when standard input or output is redirected (default true; never on AOS)
+    public bool hooksOk;             // enter() installed the signal handlers that restore the terminal (false: only exit() and leave() restore it)
     public Caps caps;
     public Decoder dec;
     private char saved[40];
@@ -1285,6 +1321,9 @@ public class Terminal {
     private int watchFd[16];
     private int watchN;
     private int lastInput;
+    private bool inPaste;               // the decoder is inside a bracketed paste ...
+    private int pasteWinStart;          // ... and the current 3 second window started then,
+    private int pasteWinBytes;          // with this many bytes arriving in it so far
     private int lastSizeCheck;
     private bool ownTtyFd;
     private bool sizeKnown;
@@ -1298,23 +1337,36 @@ public class Terminal {
         useAlt = true;
         useMouse = true;
         usePaste = true;
+        useDevTty = true;
         dec = new Decoder();
     }
 
     // checks that there is a terminal (standard input and output, else /dev/tty), reads the capabilities and the window size.
-    // Returns false when there is no terminal.
+    // Returns false when there is no terminal. When standard input or output is redirected the program talks to the terminal through
+    // /dev/tty; on AOS /dev/tty is the serial console, not the terminal of the session, so there (and when useDevTty is false, or the
+    // environment variable TUI_DEVTTY is 0) it uses whichever of the descriptors 0, 1, 2 is a terminal instead.
     public bool open() {
         if (__OS == 1) { return false; }
         char tmp[40];
+        bool onAos = runsOnAos();
+        bool devTty = useDevTty && !onAos;
+        char* dv = env("TUI_DEVTTY");                           // TUI_DEVTTY=0: never use /dev/tty, 1: use it (also on AOS)
+        if (dv != null && dv[0] != 0) { devTty = !same(dv, "0"); }
         isTty = sysIoctl(0, 0x5401, &tmp[0]) == 0;
         if (isTty) {
             inFd = 0;
             outFd = 1;
             if (sysIoctl(1, 0x5401, &tmp[0]) != 0) {
-                int fd = __open("/dev/tty", 2);
-                if (fd >= 0) { outFd = fd; ownTtyFd = true; } else { return false; }
+                if (devTty) {
+                    int fd = __open("/dev/tty", 2);
+                    if (fd >= 0) { outFd = fd; ownTtyFd = true; } else { return false; }
+                } else if (sysIoctl(2, 0x5401, &tmp[0]) == 0) {
+                    outFd = 2;
+                } else {
+                    outFd = 0;                          // stdin is a terminal, and terminals can be written to
+                }
             }
-        } else {
+        } else if (devTty) {
             int fd = __open("/dev/tty", 2);
             if (fd < 0) { return false; }
             if (sysIoctl(fd, 0x5401, &tmp[0]) != 0) { __close(fd); return false; }
@@ -1322,9 +1374,16 @@ public class Terminal {
             outFd = fd;
             ownTtyFd = true;
             isTty = true;
+        } else {
+            int fd = 1;
+            if (sysIoctl(1, 0x5401, &tmp[0]) != 0) { fd = 2; }
+            if (sysIoctl(fd, 0x5401, &tmp[0]) != 0) { return false; }
+            inFd = fd;
+            outFd = fd;
+            isTty = true;
         }
         capsFromEnv(&caps);
-        caps.aos = runsOnAos();
+        caps.aos = onAos;
         pollSize = caps.aos;
         updateSize();
         return true;
@@ -1360,6 +1419,8 @@ public class Terminal {
             nr = 24;
             nc = 80;
         }
+        if (nr > MAX_ROWS) { nr = MAX_ROWS; }
+        if (nc > MAX_COLS) { nc = MAX_COLS; }
         sizeKnown = true;
         if (nr == rows && nc == cols) { return false; }
         rows = nr;
@@ -1381,8 +1442,8 @@ public class Terminal {
         }
         dec.expectCpr = false;
         if (got == 0 || e.x <= 0 || e.y <= 0) { return false; }
-        rows = e.y;
-        cols = e.x;
+        rows = e.y > MAX_ROWS ? MAX_ROWS : e.y;
+        cols = e.x > MAX_COLS ? MAX_COLS : e.x;
         sizeKnown = true;
         return true;
     }
@@ -1422,7 +1483,7 @@ public class Terminal {
     public bool enter() {
         if (!isTty) { return false; }
         if (raw) { return true; }
-        installHooks();
+        hooksOk = installHooks();
         if (!haveSaved) {
             if (sysIoctl(inFd, 0x5401, &saved[0]) != 0) { return false; }
             haveSaved = true;
@@ -1495,10 +1556,16 @@ public class Terminal {
         }
     }
 
+    // sets the window title (OSC 0). The text is cleaned first: control characters (below 0x20, DEL, and the C1 range U+0080..U+009F) are dropped,
+    // so a title made from untrusted text (a file name) cannot end the sequence early and smuggle escape sequences to the terminal;
+    // invalid UTF-8 bytes are dropped too, and the title is cut at 400 bytes.
     public void setTitle(char* title) {
         if (!raw || !caps.title) { return; }
+        char clean[420];
+        int n = cleanTitle(title, &clean[0], 400);
+        clean[n] = 0;
         writeStr("\e]0;");
-        writeStr(title);
+        writeStr(&clean[0]);
         writeStr("\x07");
     }
 
@@ -1552,6 +1619,13 @@ public class Terminal {
         }
         lastInput = millis();
         dec.feedBytes(&buf[0], n);
+        dec.endRead();
+        if (dec.state == ST_PASTE) {
+            if (!inPaste) { inPaste = true; pasteWinStart = lastInput; pasteWinBytes = 0; }
+            pasteWinBytes = pasteWinBytes + n;
+        } else {
+            inPaste = false;
+        }
         return n;
     }
 
@@ -1570,7 +1644,17 @@ public class Terminal {
             int fd = dec.flushDelay();
             if (fd > 0) {
                 int idle = fd - (millis() - lastInput);
-                if (idle <= 0) { dec.flush(); continue; }
+                if (dec.state == ST_PASTE && inPaste) {
+                    // a paste that is not finished is given up after fd ms of silence, or when a whole fd ms window brought fewer than
+                    // PASTE_RATE bytes (somebody typing, not a paste: an unterminated paste must not swallow the keys for ever)
+                    int win = fd - (millis() - pasteWinStart);
+                    if (win <= 0) {
+                        if (pasteWinBytes >= PASTE_RATE) { pasteWinStart = millis(); pasteWinBytes = 0; win = fd; }
+                        else { idle = 0; }
+                    }
+                    if (win < idle) { idle = win; }
+                }
+                if (idle <= 0) { dec.flush(); inPaste = false; continue; }
                 if (left < 0 || idle < left) { left = idle; }
             }
             if (pollSize && raw && (left < 0 || left > 200)) { left = 200; }
@@ -1581,7 +1665,7 @@ public class Terminal {
                 if (updateSize()) { dec.push(EV_RESIZE, 0, cols, rows); }
             }
             if (timeoutMs >= 0 && millis() - start >= timeoutMs) {
-                if (dec.flushDelay() > 0 && millis() - lastInput >= dec.flushDelay()) { dec.flush(); }
+                if (dec.flushDelay() > 0 && millis() - lastInput >= dec.flushDelay()) { dec.flush(); inPaste = false; }
                 return dec.count();
             }
         }

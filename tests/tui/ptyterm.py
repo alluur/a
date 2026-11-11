@@ -201,6 +201,8 @@ class Emu:
 
     def _put(self, ch):
         w = char_width(ch)
+        if w == 2 and self.cols < 2:
+            w = 1                              # a wide character cannot be shown in a one column terminal: it takes the one cell there is
         if w == 0:
             # a combining mark joins the previous cell
             px = self.x - 1
@@ -425,8 +427,9 @@ class Emu:
 
 
 class Session:
-    def __init__(self, argv, cols=80, rows=24, env=None, cwd=None, kernel_size=None, answer_18t=True, answer_cpr=True):
-        """kernel_size: what the system reports as the window size, (0, 0) for "unknown" (like a serial console); default: cols x rows."""
+    def __init__(self, argv, cols=80, rows=24, env=None, cwd=None, kernel_size=None, answer_18t=True, answer_cpr=True, ctty=True):
+        """kernel_size: what the system reports as the window size, (0, 0) for "unknown" (like a serial console); default: cols x rows.
+        ctty: False starts the program in a session without a controlling terminal (standard input is the pty, /dev/tty cannot be opened)."""
         self.cols, self.rows = cols, rows
         self.emu = Emu(cols, rows)
         self.emu.answer_18t = answer_18t
@@ -451,7 +454,8 @@ class Session:
 
         def child_setup():
             os.setsid()
-            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            if ctty:
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
         self.proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, close_fds=True, env=e, cwd=cwd, preexec_fn=child_setup)
         os.close(slave)

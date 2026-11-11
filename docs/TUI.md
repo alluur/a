@@ -63,7 +63,7 @@ Things to know about A when using it:
 
 ```c
 term.Terminal t;                       // or new term.Terminal()
-if (!t.open()) { return 1; }           // looks at stdin / stdout (else /dev/tty), reads the capabilities and the window size
+if (!t.open()) { return 1; }           // looks at stdin / stdout (else /dev/tty, see below), reads the capabilities and the window size
 t.enter();                             // raw mode, alternate screen, hidden cursor, mouse, bracketed paste
 term.Event e;
 for (;;) {
@@ -83,6 +83,18 @@ terminal supports and the program wants. `restore()` (also `leave()` and `close(
 
 A stack overflow cannot run a handler (A does not use `sigaltstack`): after such a crash type `reset`.
 
+The signal handlers need a small page of machine code made at run time (the kernel calls handlers with the C calling convention, A functions
+use their own). It is mapped writable and executable, and the processor is told about the new code (ARM64: data cache clean and instruction
+cache invalidate, RISC-V: `riscv_flush_icache` and `fence.i`, LoongArch: `ibar`; x86-64 needs nothing). That part could only be run on the
+emulators (qemu-user) here, never on real ARM64, RISC-V or LoongArch hardware. A system that refuses writable and executable memory (SELinux on
+Android, some hardened kernels) makes the installation fail: `Terminal.hooksOk` is then false and only `leave()` / `close()` and the `exit()` hook restore
+the terminal, a fatal signal does not (the same limitation as the `signal()` function of `cunistd`, which uses the same trick).
+
+**Which terminal.** `open()` uses standard input and output when they are terminals. When one of them is redirected (`prog > file`) it talks to the
+terminal through `/dev/tty` (the controlling terminal) instead. **On AOS `/dev/tty` is the serial console, not the terminal of an aterm or telnet
+session**, so there (and when `Terminal.useDevTty` is false, or the environment variable `TUI_DEVTTY` is `0`) it never opens `/dev/tty` and uses whichever
+of the descriptors 0, 1 and 2 is a terminal; if none is, `open()` returns false. `TUI_DEVTTY=1` forces `/dev/tty` also on AOS.
+
 **What `enter()` writes:** `CSI 22;0 t` (save the window title), `CSI ? 25 l` (hide the cursor), `CSI ? 7 l` (no auto wrap), `CSI ? 1049 h`
 (alternate screen), `CSI ? 1002 h` / `1000 h` / `1006 h` (mouse), `CSI ? 2004 h` (bracketed paste), and clears the screen. Only what the terminal
 supports (`Caps`); `useAlt`, `useMouse`, `usePaste` switch parts off, `caps.mouseMotion` asks for all mouse motion (1003), `caps.focusEvents`
@@ -90,7 +102,8 @@ for focus in / out reports (1004). `leave()` writes the inverse (and clears the 
 
 **Window size.** The order is: `ioctl(TIOCGWINSZ)`; when the system reports no size (zeros: a serial console on Linux, a pipe to `/dev/tty`) `App.start()` **asks the
 terminal** with `CSI 18 t` and, when that gets no answer within 250 ms, with a cursor position report (`ESC 7 CSI 9999;9999 H CSI 6 n ESC 8`); when that fails too, `LINES` and
-`COLUMNS`; then 80x24. `Terminal.updateSize()` does the first, third and fourth step (and sets `sizeFromIoctl`), `Terminal.probeSize(ms)` the second. Set `TUI_PROBE=1` (or
+`COLUMNS`; then 80x24. **A size is never accepted above `term.MAX_COLS` x `term.MAX_ROWS` (1000 x 500)**: a broken terminal that reports 65535 x 65535 (or `LINES=99999999`) is cut
+to that, so the screen buffers (48 bytes per cell) stay at about 24 MB at most; before this limit such a size ended in `fatal: out of memory`. `Terminal.updateSize()` does the first, third and fourth step (and sets `sizeFromIoctl`), `Terminal.probeSize(ms)` the second. Set `TUI_PROBE=1` (or
 `App.probeSize = true`) to ask the terminal even when the system reports a size (AOS' serial console always says 24x80), `TUI_PROBE=0` never to ask. Changes arrive as
 `EV_RESIZE` events: from SIGWINCH where it works, and by polling the size every 200 ms where it does not (AOS, see below).
 
@@ -110,7 +123,8 @@ p.kill(15);                                          // to the child's whole pro
 
 `Terminal.runProgram(argv)` / `runShell(cmd)` leave full screen mode, run the program in the foreground with the terminal in its normal mode, wait
 for it and come back (raw mode again; the caller must redraw: `App.runShell` does that). While the child runs, Ctrl+C reaches the child and
-not the toolkit's handler. `suspendSelf()` stops the program like Ctrl+Z in a shell (SIGSTOP) and redraws after `fg`.
+not the toolkit's handler. The environment of a child is the program's **current** one: `setenv` / `unsetenv` (of `cstdlib`) before `start` are seen by the
+child, and `term.env(name)` reads the same current environment. `suspendSelf()` stops the program like Ctrl+Z in a shell (SIGSTOP) and redraws after `fg`.
 
 ---
 
@@ -141,7 +155,8 @@ Understood: UTF-8; Ctrl+letters; Alt+key as an Esc prefix (`ESC ESC [ A` is Alt+
 `ESC [ 1 ~` forms; `Insert Delete PgUp PgDn`; F1 to F20 in the xterm, VT220, Linux console (`ESC [ [ A`) and rxvt forms; the modifier forms
 `CSI 1 ; m A`, `CSI n ; m ~`; Shift+Tab (`CSI Z`); the keypad in application mode; the fixterms / kitty `CSI code ; m u` and xterm
 `modifyOtherKeys` (`CSI 27 ; m ; code ~`) forms. Enter is CR; LF is reported as Enter with `MOD_CTRL` (`Event.isEnter()` is true for both);
-a NUL right after CR (telnet) is dropped. A terminal cannot tell some keys apart: **Ctrl+H is Backspace, Ctrl+I is Tab, Ctrl+M is Enter, Ctrl+[ is Esc,
+a NUL right after CR in the **same read** is dropped (telnet sends CR NUL for Enter; `Decoder.crNul` switches this off): a Ctrl+Space (it sends NUL) typed as the next key after Enter
+is a key of its own, because `Terminal` calls `Decoder.endRead()` after every read (a program that feeds a decoder itself calls it at the end of each chunk). A terminal cannot tell some keys apart: **Ctrl+H is Backspace, Ctrl+I is Tab, Ctrl+M is Enter, Ctrl+[ is Esc,
 Ctrl+J is Enter, Ctrl+/ and Ctrl+_ are the same byte (reported as Ctrl+/)**. Do not give them different meanings. Raw mode switches the terminal's signal keys off (`ISIG`): **Ctrl+C, Ctrl+Z and Ctrl+\ arrive as ordinary keys**, nothing
 sends SIGINT / SIGTSTP / SIGQUIT any more. A program that wants Ctrl+C to quit must say so (`app->addShortcut("Ctrl+C", doQuit)`), and Ctrl+Z can call `app->suspendProcess()`.
 
@@ -152,8 +167,12 @@ sends SIGINT / SIGTSTP / SIGQUIT any more. A program that wants Ctrl+C to quit m
 MB_WHEEL_UP MB_WHEEL_DOWN MB_WHEEL_LEFT MB_WHEEL_RIGHT`; `action`: `MA_PRESS MA_RELEASE MA_DRAG MA_MOVE MA_WHEEL`. Motion without a button only arrives
 when `caps.mouseMotion` is set.
 
-**Paste.** With bracketed paste on, pasted text arrives as one `EV_PASTE` event (a Ctrl+Q inside a paste does not quit). A paste that never ends
-is delivered after 3 seconds without input.
+**Paste.** With bracketed paste on, pasted text arrives as one `EV_PASTE` event (a Ctrl+Q inside a paste does not quit). A paste that never ends (the
+end marker `ESC [ 201 ~` got lost) is given up, and what has arrived is delivered as a paste, after 3 seconds without any input **or** when a whole 3 second
+window brings fewer than 256 bytes (somebody typing, not a paste): a user who keeps pressing keys gets out after 3 seconds, while a long paste that keeps
+coming is never cut. The keys typed in those 3 seconds are part of the delivered text. Without bracketed paste (the Linux console, tmux `send-keys`, a serial
+line, a script) a paste is just many key events: **the event queue grows as needed, nothing is lost** (it used to drop the oldest events beyond 128; the hard
+limit is now a million events).
 
 ---
 
@@ -279,7 +298,7 @@ that fills the background. `useDark()`, `useLight()`, `useClassic()`, `useMono()
 ```c
 tui.App* app = new tui.App();
 app->start();                 // false: no terminal (a pipe, TERM=dumb); nothing was changed
-app->setTitle("my IDE");      // window title (restored when the program ends)
+app->setTitle("my IDE");      // window title (restored when the program ends); control characters are removed first (see below)
 app->setMenuBar(mb);  app->setRoot(w);
 app->addShortcut("Ctrl+S", save, userData);      // int f(int userData)
 app->addCommand("File: Save", "Ctrl+S", save);   // listed in the command palette; the key is registered as well
@@ -320,7 +339,7 @@ returns the screen as text. `app->screen` holds the cells (`styleAt` for colours
 | | |
 |---|---|
 | `TreeView` | `addNode(parent, text, data, lazy)`, node 0 is the invisible root. A lazy node shows an arrow and `onExpand(tree, node)` fills it the first time. Keys: arrows, Right / Left (expand, collapse, go to child / parent), Enter / Space, `+ - *`; `select(node)`, `removeChildren`, `clear`, `onSelect`, `onActivate` |
-| `Table` | `addColumn(title, width, align)` (width 0: flexible), `addRow(...)` (up to 8 cells), click a header to sort (numbers as numbers, text without regard to case), `sortBy`, `selectedRow`, `onSelect`, `onActivate` |
+| `Table` | `addColumn(title, width, align)` (width 0: flexible), `addRow(...)` (up to 8 cells), click a header to sort (numbers as numbers, text without regard to case), `sortBy` (a stable merge sort: 40000 rows in well under a second; rows added to a sorted table are inserted at their place by binary search), `selectedRow`, `onSelect`, `onActivate` |
 | `TextPane` | program output: `append(text)` (partial lines stay open until the newline, `\r\n` is one newline), `appendLine`, `appendBytes`; ANSI colour sequences are shown as colours; follows the end until you scroll up; `onLineClick` / `onLineActivate` with `clickedLine`; `selectable`, a line limit (`maxLines`), sideways scrolling, a scroll bar |
 | `messageBox(app, title, text, b1, b2, b3)` | returns the button number (1..3), 0 for Esc; the text is word wrapped |
 | `askYesNo`, `askYesNoCancel`, `prompt(app, title, label, initial)` | `prompt` returns a copy of the text or null |
@@ -328,7 +347,7 @@ returns the screen as text. `app->screen` holds the cells (`styleAt` for colours
 | `colorDialog(app, initial)` | the 256 colour palette (arrows, mouse) and R / G / B sliders with gradient tracks and a hex field; returns `idx(n)` for a palette colour, `rgb(...)` otherwise, `COL_DEFAULT` for the Default button, -1 when cancelled; `newColorDialog` + `colorDialogResult` |
 | `commandPalette(app)` | text field and a list of the app's commands with fuzzy matching and the matched letters highlighted; runs the chosen command; `newCommandPalette` |
 | `fuzzyScore(pattern, text, positions, max)` | subsequence match with a score (consecutive letters and word starts score higher; shorter texts win) |
-| `DirList` | read a directory with `getdents`: `load(dir, hidden, withSizes)`, `sort()` (directories first, then by name), `name(i)`, `isDir(i)`, `sizeOf(i)`; `joinPath`, `parentPath`, `cleanPath`, `currentDir`, `fileSizeOf`; works on Linux, Android and AOS (Windows: `load` returns false) |
+| `DirList` | read a directory with `getdents`: `load(dir, hidden, withSizes)`, `sort()` (directories first, then by name), `name(i)`, `isDir(i)` (a link to a directory counts), `isLink(i)` (the entry is a symbolic link), `sizeOf(i)`; `joinPath`, `parentPath`, `cleanPath`, `currentDir`, `fileSizeOf`; `fileMode(path, follow)`, `isDirectory`, `isRegularFile`, `isSymlink`, `sameFile` (stat / lstat, device and inode: nothing is ever opened, so a FIFO or a link to one cannot make them wait); works on Linux, Android and AOS (Windows: `load` returns false) |
 
 ---
 
@@ -366,13 +385,13 @@ Use the theme styles instead of fixed colours so that the widget looks right at 
 
 | Test | What it covers |
 |---|---|
-| `tests/t220` .. `t221` | the decoder: every key sequence, modifiers, Esc handling, mouse, paste, focus, replies, the queue |
-| `t222` .. `t225` | colours and their downgrade, capabilities by `TERM`, character widths, drawing primitives, the diff renderer (exact escape strings, and 720 random frames replayed through a tiny terminal emulator at every colour depth and without UTF-8) |
+| `tests/t220` .. `t221` | the decoder: every key sequence, modifiers, Esc handling, CR NUL, mouse, paste, focus, replies, the growing queue (1000 events in one burst), window title cleaning |
+| `t222` .. `t225` | colours and their downgrade, capabilities by `TERM`, character widths, drawing primitives (and that `Screen.resize` reuses its arrays), the diff renderer (exact escape strings, and 720 random frames replayed through a tiny terminal emulator at every colour depth and without UTF-8) |
 | `t226` | key names, `parseKey`, the key encoder and a round trip over 500 key combinations |
-| `t227` .. `t235` | widgets, input, lists, tree and table, menus, dialogs, layout and splitter, text pane, the application loop (all through `initHeadless`) |
-| `t236` | `DirList` and the file dialogs on a directory tree the test makes (Linux; `.out.windows` says so) |
-| `t237` | the real terminal layer on a pseudo terminal the test creates (raw mode, the sequences written, keys and mouse read from a real pty, Esc timeout, SIGWINCH, restore) |
-| `t238` | `Process`: a child with a pipe, exit status, kill of a process group, several children |
+| `t227` .. `t235` | widgets, input, lists, tree and table (also sorting 20000 rows), menus, dialogs, layout and splitter, text pane, the application loop (all through `initHeadless`) |
+| `t236` | `DirList` (symbolic links, FIFOs, `stat` helpers) and the file dialogs on a directory tree the test makes (Linux; `.out.windows` says so) |
+| `t237` | the real terminal layer on a pseudo terminal the test creates (raw mode, the sequences written, keys and mouse read from a real pty, Esc timeout, a burst of 3000 keys, SIGWINCH, absurd sizes, title cleaning, restore) |
+| `t238` | `Process`: a child with a pipe, exit status, kill of a process group, several children, `setenv` seen by children |
 | `t239` | a random session of 2500 keys, clicks, drags, pastes and resizes against a UI with every widget; invariants after each step |
 
 They are ordinary tests (`tests/run.sh t22`, `t23`) and run on all five targets with the same expected output (`t236`, `t237`, `t238` print one line on Windows).
@@ -380,8 +399,9 @@ They are ordinary tests (`tests/run.sh t22`, `t23`) and run on all five targets 
 pseudo terminal of a given size, sends keystrokes, mouse events, pastes and signals, and checks the screen rebuilt by a terminal emulator written in
 Python (`tests/tui/ptyterm.py`: CSI, SGR with 256 and 24 bit colours, the alternate screen, wide characters, modes, titles, OSC 52). It checks typing, menus, mouse,
 resizing (`TIOCSWINSZ` + SIGWINCH), paste, suspend to a shell and back, the unusual Esc timing, the size fallbacks (`LINES` / `COLUMNS`, `CSI 18 t`), crashes and
-signals (the terminal must be back to normal afterwards), `TERM=linux`, `TERM=dumb`, no terminal at all, the colour depths, `NO_COLOR`, ASCII mode and the
-file manager working on real files. Run one test with `tests/tui.sh name`.
+signals (the terminal must be back to normal afterwards), `TERM=linux`, `TERM=dumb`, no terminal at all, the colour depths, `NO_COLOR`, ASCII mode, bursts of 3000 keys in one
+write, unterminated and long pastes, Ctrl+Space after Enter, absurd window sizes, no `/dev/tty`, and the file manager working on real files (also: copying a file onto itself, deleting
+a link to a directory, copying a directory into itself, copying trees with links and FIFOs). Run one test with `tests/tui.sh name`.
 
 ---
 
@@ -403,6 +423,7 @@ Differences from Linux that the toolkit works around, from reading `kernel/tty.a
 | the serial console reports 24x80 whatever the real terminal is | `TUI_PROBE=1` / `App.probeSize` asks the terminal with `CSI 18 t`, then with a cursor position report (only a terminal emulator at the other end can answer) |
 | no `sigaltstack` | not used (it would be logged as an unknown system call); also on Linux |
 | no job control: SIGSTOP / SIGTSTP / SIGCONT are ignored | `suspendProcess()` returns at once: use `runShell` (suspend to a shell) |
+| `/dev/tty` is the serial console (`DEV_CONSOLE`), not the controlling terminal of an aterm or telnet session | `Terminal.open()` never falls back to `/dev/tty` on AOS: with `prog > file` it uses the descriptor 2 (or 0) that is a terminal; `TUI_DEVTTY=1` brings the old behaviour back |
 | `rt_sigprocmask` does nothing | no signal masks are used |
 | `setpgid(pid, pgid)` ignores its first argument | only `setpgid(0, 0)` is called, in the child |
 | the default `TERM` is `linux` on the console (`/etc/rc` exports `xterm`, `telnetd` too, `gterm` `xterm-256color` with `COLORTERM=truecolor`) | `linux`: 16 colours, no mouse, no alternate screen (the screen is cleared on exit); set `TERM` for more |
@@ -424,6 +445,12 @@ the `CSI 22 t` title stack (ignored) and colon separated SGR parameters.
 * Windows consoles are not supported (`Terminal.open()` is false); the decoder, screen, widgets and headless `App` do compile and run there.
 * The Linux console has no mouse (no `gpm` support).
 * Scrolling a large area is done by redrawing the rows that changed (no `CSI S` / `T` or scroll regions), which is fine except on very slow links.
-* Memory is never freed (A's `new`); dialogs created for every use leak a few kilobytes each: create them once and show them again.
+* Memory is never freed (A's `new`); dialogs created for every use leak a few kilobytes each: create them once and show them again. The screen buffers are the exception that matters
+  most: `Screen.resize` keeps its arrays while the new size fits and otherwise grows them by half, so dragging a window edge does not eat memory (it did: 1.4 MB per resize at 300x100);
+  the total stays under about three times the biggest size ever used.
 * A stack overflow crash cannot restore the terminal (no `sigaltstack`).
+* **Window titles are cleaned**: `Terminal.setTitle` / `App.setTitle` drop control characters (below 0x20, DEL, U+0080 .. U+009F) and invalid UTF-8 and cut the title at 400 bytes, because the
+  title is written inside an OSC sequence that a BEL or ESC in a file name would otherwise end early (`term.cleanTitle` does the cleaning). Text you write yourself with `writeStr` is not filtered.
+* The key decoder asks for a pause of `escMs` (40 ms) after an Esc and gives up an unfinished paste after 3 s (see Paste); a Ctrl+Space right after Enter in the **same read** is dropped
+  if it looks like telnet's CR NUL (set `dec.crNul = false` for a terminal that never does that).
 * Mouse hover (menus following the pointer) needs a terminal that reports all motion (`TUI_MOTION=1`); by default only drags are reported, which keeps the link quiet.

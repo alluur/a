@@ -522,6 +522,137 @@ def no_terminal_at_all():
     check(b"needs a terminal" in p.stdout, "message missing")
 
 
+# ---- input bursts, pastes, Ctrl+Space, absurd sizes, no /dev/tty -------------------------------------------------------------------------
+def event_count(s):
+    import re
+    m = re.search(r"events: (\d+)", s.screen_text())
+    return int(m.group(1)) if m else -1
+
+
+@test
+def burst_of_keys_is_not_lost():
+    # without bracketed paste (the Linux console, tmux send-keys, a script, a serial line) a paste is just many keys: none may be lost
+    # (the decoder queue used to hold 128 events and dropped the oldest)
+    s = start(cols=200, rows=30, env={"TERM": "linux"})
+    focus_input(s)
+    n0 = event_count(s)
+    for n in (129, 1000):
+        before = event_count(s)
+        s.send("".join(chr(ord("a") + i % 26) for i in range(n)))
+        s.wait_idle(quiet=0.4, timeout=10)
+        eq(event_count(s) - before, n, "keys that arrived out of a burst of %d" % n)
+    s.send("".join(chr(ord("a") + i % 26) for i in range(3000)))
+    s.wait_idle(quiet=0.5, timeout=15)
+    eq(event_count(s) - n0, 129 + 1000 + 3000, "keys that arrived in total")
+    # the text field holds the end of what was typed
+    row = line(s, 5)
+    tail = "".join(chr(ord("a") + i % 26) for i in range(3000))[-10:]
+    check(row.rstrip().endswith(tail), "the end of the text is missing: %r" % row[-30:])
+    s.key("\x11")
+    eq(s.wait_exit(3), 0, "exit")
+    s.close()
+
+
+@test
+def unterminated_paste_does_not_swallow_keys_for_ever():
+    # ESC [ 200 ~ without ESC [ 201 ~ : a user who keeps pressing Ctrl+Q must get out after the 3 second paste time-out
+    s = start()
+    s.send("\x1b[200~abc")
+    s.pump(0.1)
+    t0 = time.time()
+    while time.time() - t0 < 7 and s.proc.poll() is None:
+        s.send("\x11")
+        s.pump(0.1)
+    took = time.time() - t0
+    check(s.proc.poll() is not None, "the program is still swallowing the keys after 7 s of Ctrl+Q presses")
+    check(took > 2.0, "the paste was given up too early (%.1f s)" % took)
+    s.close()
+
+
+@test
+def long_fast_paste_is_one_paste():
+    # a real paste keeps coming: it must not be cut after 3 seconds, so a quit key in its late part is still text
+    s = start()
+    focus_input(s)
+    s.send("\x1b[200~start")
+    t0 = time.time()
+    while time.time() - t0 < 3.7:
+        s.send("x" * 400)
+        s.pump(0.1)
+    s.send("a\x11b\x1b[201~")
+    s.wait_idle(quiet=0.3, timeout=5)
+    check(s.proc.poll() is None, "a Ctrl+Q inside a long paste quit the program")
+    s.key("\x11")
+    eq(s.wait_exit(3), 0, "exit")
+    s.close()
+
+
+@test
+def ctrl_space_after_enter_is_a_key():
+    # CR NUL is Enter in telnet, but only in the same read: the first Ctrl+Space typed after Enter is a key of its own
+    s = start()
+    focus_input(s)
+    n0 = event_count(s)
+    s.send("\r\x00")
+    s.wait_idle()
+    eq(event_count(s) - n0, 1, "CR NUL sent together")
+    n0 = event_count(s)
+    s.key("\r")
+    s.key("\x00")
+    eq(event_count(s) - n0, 2, "Enter, then Ctrl+Space later")
+    check("Ctrl+Space" in s.screen_text(), "the Ctrl+Space key did not arrive:\n" + s.screen_text())
+    s.key("\x11")
+    s.wait_exit(3)
+    s.close()
+
+
+@test
+def absurd_window_sizes_are_cut():
+    # a kernel size of 65535x65535 or LINES / COLUMNS = 99999999 used to end in 'fatal: out of memory' (measured under ulimit -v 3000000)
+    for label, kw in (("kernel size", dict(kernel_size=(65535, 65535))),
+                      ("LINES and COLUMNS", dict(kernel_size=(0, 0), answer_18t=False, answer_cpr=False, env={"LINES": "99999999", "COLUMNS": "99999999"}))):
+        s = Session(["bash", "-c", "ulimit -v 3000000; exec " + PROBE], cols=80, rows=24, **kw)
+        check(s.wait_for("size:", 10), label + ": no start:\n" + s.screen_text())
+        s.wait_idle(quiet=0.5, timeout=10)
+        check("size: 1000x500" in s.screen_text(), label + ": the size was not cut:\n" + s.screen_text()[:300])
+        s.key("\x11")
+        eq(s.wait_exit(5), 0, label + ": exit")
+        sane(s, label)
+        s.close()
+
+
+@test
+def no_controlling_terminal_uses_the_descriptors_instead_of_dev_tty():
+    # stdout redirected and no /dev/tty (AOS: /dev/tty is the serial console, not your terminal): TUI_DEVTTY=0 uses the descriptor that is a terminal
+    import subprocess
+    s = Session(["sh", "-c", "exec %s > /dev/null" % PROBE], ctty=False)
+    code = s.wait_exit(5)
+    eq(code, 1, "without /dev/tty and with the default, the program needs a terminal")
+    s.close()
+    s = Session(["sh", "-c", "exec %s > /dev/null" % PROBE], ctty=False, env={"TUI_DEVTTY": "0"})
+    check(s.wait_for("size:", 5), "TUI_DEVTTY=0: no start:\n" + s.screen_text())
+    s.wait_idle()
+    check("events: 0" in s.screen_text(), "the screen is not drawn on the terminal:\n" + s.screen_text())
+    s.key("\x11")
+    eq(s.wait_exit(3), 0, "exit")
+    sane(s, "descriptors instead of /dev/tty")
+    s.close()
+
+
+@test
+def emulator_handles_wide_characters_in_a_one_column_terminal():
+    # a bug of the test emulator itself: a double width character in a terminal that is 1 column wide raised IndexError
+    from ptyterm import Emu
+    for cols in (1, 2):
+        e = Emu(cols, 3)
+        e.feed("\u4e2d\u6587ab\r\n\u4e2d".encode())
+        e.resize(1, 3)
+        e.feed("\u4e2dx".encode())
+    e = Emu(1, 3)
+    e.feed("\x1b[?7l\u4e2d\u4e2d".encode())
+
+
+
 # ---- the gallery ---------------------------------------------------------------------------------------------------------------------------------
 @test
 def gallery_tabs_dialogs_palette():
@@ -650,6 +781,170 @@ def file_manager_copy_mkdir_delete_view():
         s.close()
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def fm_select(s, name, panel_x=0, rows=30):
+    for y in range(rows):
+        t = line(s, y)
+        k = t.find(name, panel_x)
+        if k >= 0:
+            s.click(k + 1, y)
+            return
+    raise AssertionError("%s not on the screen:\n%s" % (name, s.screen_text()))
+
+
+@test
+def file_manager_never_destroys_data():
+    import shutil
+    import tempfile
+    root = tempfile.mkdtemp(prefix="tuifm2")
+    try:
+        # 1. copy and move onto itself: both panels show the same directory (what happens when files starts with one argument)
+        a = os.path.join(root, "same")
+        os.makedirs(a)
+        open(os.path.join(a, "a.txt"), "w").write("important content\n")
+        s = Session([FILES, a], cols=100, rows=30, env={"PAGER": "cat"})
+        check(s.wait_for("a.txt", 5), "listing:\n" + s.screen_text())
+        s.wait_idle()
+        fm_select(s, "a.txt")
+        s.key("\x1b[15~")                                    # F5
+        check("same file" in s.screen_text(), "no message when copying a file onto itself:\n" + s.screen_text())
+        s.key("\r")
+        eq(open(os.path.join(a, "a.txt")).read(), "important content\n", "the file after F5 onto itself")
+        s.key("\x1b[17~")                                    # F6
+        check("same file" in s.screen_text(), "no message when moving a file onto itself:\n" + s.screen_text())
+        s.key("\r")
+        eq(open(os.path.join(a, "a.txt")).read(), "important content\n", "the file after F6 onto itself")
+        check(sorted(os.listdir(a)) == ["a.txt"], "something was left behind: %r" % os.listdir(a))
+        # a hard link is the same file under another name
+        b = os.path.join(root, "other")
+        os.makedirs(b)
+        os.link(os.path.join(a, "a.txt"), os.path.join(b, "a.txt"))
+        s.key("\x11")
+        eq(s.wait_exit(3), 0, "exit")
+        s.close()
+        s = Session([FILES, a, b], cols=100, rows=30)
+        check(s.wait_for("a.txt", 5), "listing")
+        s.wait_idle()
+        fm_select(s, "a.txt")
+        s.key("\x1b[15~")
+        check("same file" in s.screen_text(), "no message for a hard link to the same file:\n" + s.screen_text())
+        s.key("\r")
+        eq(open(os.path.join(a, "a.txt")).read(), "important content\n", "the file after F5 onto its hard link")
+        s.key("\x11")
+        s.wait_exit(3)
+        s.close()
+
+        # 2. deleting a symbolic link to a directory must not touch the directory
+        panel = os.path.join(root, "panel")
+        outside = os.path.join(root, "outside")
+        os.makedirs(os.path.join(panel, "x"))
+        os.makedirs(os.path.join(outside, "subdir"))
+        open(os.path.join(outside, "important1.txt"), "w").write("a\n")
+        open(os.path.join(outside, "subdir", "deep.txt"), "w").write("b\n")
+        os.symlink("../outside", os.path.join(panel, "zlink"))
+        os.symlink("../outside/important1.txt", os.path.join(panel, "zfilelink"))
+        s = Session([FILES, panel, b], cols=100, rows=30)
+        check(s.wait_for("zlink", 5), "listing:\n" + s.screen_text())
+        s.wait_idle()
+        fm_select(s, "zlink")
+        s.key("\x1b[19~")                                    # F8
+        check("Delete the link zlink" in s.screen_text(), "delete confirmation:\n" + s.screen_text())
+        s.key("\r")
+        s.wait_idle()
+        check(not os.path.lexists(os.path.join(panel, "zlink")), "the link was not deleted")
+        check(os.path.exists(os.path.join(outside, "important1.txt")) and os.path.exists(os.path.join(outside, "subdir", "deep.txt")),
+              "the directory the link pointed to lost its files: %r" % sorted(os.listdir(outside)))
+        fm_select(s, "zfilelink")
+        s.key("\x1b[19~")
+        s.key("\r")
+        s.wait_idle()
+        check(not os.path.lexists(os.path.join(panel, "zfilelink")), "the file link was not deleted")
+        eq(open(os.path.join(outside, "important1.txt")).read(), "a\n", "the file the link pointed to")
+        s.key("\x11")
+        s.wait_exit(3)
+        s.close()
+
+        # 3. a directory cannot be copied or moved into itself
+        P = os.path.join(root, "P")
+        os.makedirs(os.path.join(P, "X", "sub"))
+        open(os.path.join(P, "X", "f.txt"), "w").write("f\n")
+        s = Session([FILES, P, os.path.join(P, "X", "sub")], cols=100, rows=30)
+        check(s.wait_for("/X ", 5), "listing:\n" + s.screen_text())
+        s.wait_idle()
+        fm_select(s, "/X ")
+        s.key("\x1b[15~")                                    # F5
+        check("into itself" in s.screen_text(), "no message when copying a directory into itself:\n" + s.screen_text())
+        s.key("\r")
+        s.key("\x1b[17~")                                    # F6
+        check("into itself" in s.screen_text(), "no message when moving a directory into itself:\n" + s.screen_text())
+        s.key("\r")
+        s.wait_idle()
+        check(os.listdir(os.path.join(P, "X", "sub")) == [], "something was created inside: %r" % os.listdir(os.path.join(P, "X", "sub")))
+        check(os.path.exists(os.path.join(P, "X", "f.txt")), "the source directory was damaged")
+        s.key("\x11")
+        s.wait_exit(3)
+        s.close()
+
+        # 4. copying a tree with links and a FIFO: links stay links, the FIFO is skipped (and nothing waits for it)
+        src = os.path.join(root, "tree")
+        dst = os.path.join(root, "dest")
+        os.makedirs(os.path.join(src, "t", "sub"))
+        os.makedirs(dst)
+        open(os.path.join(src, "t", "real.txt"), "w").write("real\n")
+        open(os.path.join(src, "t", "sub", "s.txt"), "w").write("s\n")
+        os.symlink("real.txt", os.path.join(src, "t", "link"))
+        os.symlink("sub", os.path.join(src, "t", "dirlink"))
+        os.symlink(".", os.path.join(src, "t", "loop"))
+        os.mkfifo(os.path.join(src, "t", "fifo"))
+        s = Session([FILES, src, dst], cols=100, rows=30)
+        check(s.wait_for("/t ", 5), "listing:\n" + s.screen_text())
+        s.wait_idle()
+        fm_select(s, "/t ")
+        s.key("\x1b[15~")                                    # F5
+        check(s.wait_for("Copying failed", 8), "the copy did not finish (a FIFO or a link loop?):\n" + s.screen_text())
+        s.key("\r")
+        s.wait_idle()
+        d = os.path.join(dst, "t")
+        eq(open(os.path.join(d, "real.txt")).read(), "real\n", "copied file")
+        eq(open(os.path.join(d, "sub", "s.txt")).read(), "s\n", "copied file in a subdirectory")
+        check(os.path.islink(os.path.join(d, "link")) and os.readlink(os.path.join(d, "link")) == "real.txt", "a link was not copied as a link")
+        check(os.path.islink(os.path.join(d, "dirlink")) and os.readlink(os.path.join(d, "dirlink")) == "sub", "a link to a directory was not copied as a link")
+        check(os.path.islink(os.path.join(d, "loop")), "a link loop was not copied as a link")
+        check(not os.path.lexists(os.path.join(d, "fifo")), "the FIFO was copied")
+        check(not any(n.endswith(".~copy~") for _, _, fs in os.walk(dst) for n in fs), "a temporary file was left behind")
+        # the other direction of Delete: the copy is removed with its links, the sources stay
+        s.key("\x11")
+        s.wait_exit(3)
+        s.close()
+        s = Session([FILES, dst, src], cols=100, rows=30)
+        check(s.wait_for("/t ", 5), "listing")
+        s.wait_idle()
+        fm_select(s, "/t ")
+        s.key("\x1b[19~")                                    # F8
+        s.key("\r")
+        s.wait_idle(quiet=0.4, timeout=8)
+        check(not os.path.lexists(d), "the copy was not deleted")
+        check(os.path.exists(os.path.join(src, "t", "real.txt")) and os.path.exists(os.path.join(src, "t", "sub", "s.txt")), "deleting the copy touched the source")
+        s.key("\x11")
+        s.wait_exit(3)
+        s.close()
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@test
+def file_manager_help_names_the_right_key():
+    s = Session([FILES, "/"], cols=100, rows=30)
+    check(s.wait_for("Quit", 5), "no start")
+    s.wait_idle()
+    s.key("\x1bOP")                                      # F1
+    txt = s.screen_text()
+    check("Alt+. shows hidden files" in txt and "Ctrl+H" not in txt, "help text:\n" + txt)
+    s.key("\r")
+    s.key("\x11")
+    s.wait_exit(3)
+    s.close()
 
 
 def main():

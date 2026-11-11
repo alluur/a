@@ -137,57 +137,137 @@ bool removeEmptyDir(char* path) {
     return __syscall(35, -100, (int) path, 0x200, 0, 0, 0) == 0;
 }
 
+// Symbolic links are never followed by copy, move or delete: a link is copied as a link and deleted as a link (the target stays as it is).
+// Only ordinary files are read: a FIFO, a device or a socket is skipped (opening a FIFO would wait for ever).
+char* readLink(char* path) {
+    char buf[4100];
+    int r;
+    if (__ARCH == 0) { r = __syscall(89, (int) path, (int) &buf[0], 4096, 0, 0, 0); }
+    else { r = __syscall(78, -100, (int) path, (int) &buf[0], 4096, 0, 0); }
+    if (r <= 0 || r > 4096) { return null; }
+    char* t = alloc(r + 1);
+    memcpy(t, &buf[0], r);
+    t[r] = 0;
+    return t;
+}
+
+bool makeLink(char* target, char* path) {
+    if (__ARCH == 0) { return __syscall(88, (int) target, (int) path, 0, 0, 0, 0) == 0; }
+    return __syscall(36, (int) target, -100, (int) path, 0, 0, 0) == 0;
+}
+
+// does something exist at path? (a dangling link counts; nothing is opened)
+bool exists(char* path) { return tuix.fileMode(path, false) >= 0; }
+
+// is dir itself, or the path below it, the same place as `inner`: inner is dir or somewhere inside it? Compares by device and inode, so
+// different spellings and links to the directory are recognised
+bool isInside(char* inner, char* dir) {
+    char* p = inner;
+    for (int guard = 0; guard < 200; guard++) {
+        if (tuix.sameFile(p, dir)) { return true; }
+        char* up = tuix.parentPath(p);
+        if (streq(up, p)) { return false; }
+        p = up;
+    }
+    return false;
+}
+
+// the destination of the copy being made: a directory that is found again while copying is skipped (copying a directory into itself
+// through links or odd paths must not run for ever)
+char* copyRoot;
+
+// copies the file's bytes to a temporary name next to the target and renames it over the target, so the source is never truncated, even if
+// source and target are the same file under two names (hard links)
 bool copyFile(char* from, char* to) {
+    if (!tuix.isRegularFile(from)) { return false; }
+    if (tuix.sameFile(from, to)) { return false; }
+    char* tmp = alloc(strlen(to) + 16);
+    format(tmp, strlen(to) + 16, "%s.~copy~", to, 0, 0, 0);
     int in = fileOpen(from, FILE_READ);
     if (in < 0) { return false; }
-    int out = fileOpen(to, FILE_WRITE);
+    int out = fileOpen(tmp, FILE_WRITE);
     if (out < 0) { fileClose(in); return false; }
     char* buf = alloc(65536);
     bool ok = true;
     for (;;) {
         int n = fileRead(in, buf, 65536);
-        if (n <= 0) { break; }
+        if (n < 0) { ok = false; break; }
+        if (n == 0) { break; }
         if (fileWrite(out, buf, n) != n) { ok = false; break; }
     }
     fileClose(in);
     fileClose(out);
+    if (ok && !os.rename(tmp, to)) { ok = false; }
+    if (!ok) { fileDelete(tmp); }
     return ok;
 }
 
+bool copyLink(char* from, char* to) {
+    char* target = readLink(from);
+    if (target == null) { return false; }
+    if (exists(to)) {
+        if (tuix.isDirectory(to) && !tuix.isSymlink(to)) { return false; }
+        if (!fileDelete(to)) { return false; }
+    }
+    return makeLink(target, to);
+}
+
 bool copyTree(char* from, char* to) {
+    if (tuix.isSymlink(from)) { return copyLink(from, to); }
     tuix.DirList d;
     d.load(from, true, false);
     if (!d.ok) { return copyFile(from, to); }
     makeDir(to);
+    if (copyRoot == null) { copyRoot = to; }
     bool ok = true;
     for (int i = 0; i < d.count; i++) {
         char* a = tuix.joinPath(from, d.name(i));
         char* b = tuix.joinPath(to, d.name(i));
-        if (d.isDir(i)) { if (!copyTree(a, b)) { ok = false; } }
+        if (d.isLink(i)) { if (!copyLink(a, b)) { ok = false; } }
+        else if (d.isDir(i)) {
+            if (tuix.sameFile(a, copyRoot)) { continue; }                  // that is where we are copying to
+            if (!copyTree(a, b)) { ok = false; }
+        }
         else if (!copyFile(a, b)) { ok = false; }
     }
     return ok;
 }
 
 bool deleteTree(char* path) {
+    if (tuix.isSymlink(path)) { return fileDelete(path); }              // the link, never what it points to
     tuix.DirList d;
     d.load(path, true, false);
     if (!d.ok) { return fileDelete(path); }
     bool ok = true;
     for (int i = 0; i < d.count; i++) {
         char* a = tuix.joinPath(path, d.name(i));
-        if (d.isDir(i)) { if (!deleteTree(a)) { ok = false; } }
+        if (!d.isLink(i) && d.isDir(i)) { if (!deleteTree(a)) { ok = false; } }
         else if (!fileDelete(a)) { ok = false; }
     }
     return removeEmptyDir(path) && ok;
+}
+
+// the checks that go before copying or moving src to dst; says why and returns false when it must not be done
+bool allowed(char* title, char* src, char* dst) {
+    if (streq(src, dst) || tuix.sameFile(src, dst)) {
+        say(title, "The source and the target are the same file.");
+        return false;
+    }
+    if (tuix.isDirectory(src) && !tuix.isSymlink(src) && isInside(dst, src)) {
+        say(title, "A directory cannot be put into itself.");
+        return false;
+    }
+    return true;
 }
 
 int doCopy(int x) {
     char* src = selectedPath(active);
     if (src == null) { return 0; }
     char* dst = tuix.joinPath(other()->path.str(), selectedName(active));
-    if (fileExists(dst) && !tuix.askYesNo(app, "Copy", "The target exists already. Replace it?")) { return 0; }
-    if (!copyTree(src, dst)) { say("Copy", "Copying failed."); }
+    if (!allowed("Copy", src, dst)) { return 0; }
+    if (exists(dst) && !tuix.askYesNo(app, "Copy", "The target exists already. Replace it?")) { return 0; }
+    copyRoot = null;
+    if (!copyTree(src, dst)) { say("Copy", "Copying failed, or some items (devices, FIFOs) could not be copied."); }
     reload(other());
     reload(active);
     return 0;
@@ -197,9 +277,11 @@ int doMove(int x) {
     char* src = selectedPath(active);
     if (src == null) { return 0; }
     char* dst = tuix.joinPath(other()->path.str(), selectedName(active));
-    if (fileExists(dst) && !tuix.askYesNo(app, "Move", "The target exists already. Replace it?")) { return 0; }
+    if (!allowed("Move", src, dst)) { return 0; }
+    if (exists(dst) && !tuix.askYesNo(app, "Move", "The target exists already. Replace it?")) { return 0; }
     if (!os.rename(src, dst)) {
-        // another file system: copy and delete
+        // another file system: copy and delete (the source is only deleted when everything was copied)
+        copyRoot = null;
         if (!copyTree(src, dst) || !deleteTree(src)) { say("Move", "Moving failed."); }
     }
     reload(other());
@@ -219,7 +301,8 @@ int doDelete(int x) {
     char* p = selectedPath(active);
     if (p == null) { return 0; }
     char msg[400];
-    format(&msg[0], 400, "Delete %s ?", selectedName(active), 0, 0, 0);
+    if (tuix.isSymlink(p)) { format(&msg[0], 400, "Delete the link %s ?", selectedName(active), 0, 0, 0); }
+    else { format(&msg[0], 400, "Delete %s ?", selectedName(active), 0, 0, 0); }
     if (!tuix.askYesNo(app, "Delete", &msg[0])) { return 0; }
     if (!deleteTree(p)) { say("Delete", "Deleting failed."); }
     reload(active);
@@ -268,7 +351,7 @@ int doSwitch(int x) {
 
 int doHelp(int x) {
     tuix.messageBox(app, "Help",
-        "Tab switches panels, Enter opens, Backspace goes up.\nF3 view, F4 edit, F5 copy, F6 move, F7 new directory, F8 delete.\nCtrl+H shows hidden files, Ctrl+O runs a shell, F10 quits.\nThe mouse works too.");
+        "Tab switches panels, Enter opens, Backspace goes up.\nF3 view, F4 edit, F5 copy, F6 move, F7 new directory, F8 delete.\nAlt+. shows hidden files, Ctrl+O runs a shell, F10 quits.\nLinks are copied and deleted as links.\nThe mouse works too.");
     return 0;
 }
 

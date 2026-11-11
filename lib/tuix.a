@@ -449,6 +449,8 @@ public:
     int* cells;                     // ncols entries per row: pool offsets
     int* ud;
     int* order;                     // row order after sorting: order[display row] = row index
+    int* tmp;                       // scratch space of the merge sort
+    int tmpCap;
     int nrows;
     int cap;
     int sel;                        // selected display row
@@ -508,7 +510,7 @@ public:
         ud[nrows] = 0;
         order[nrows] = nrows;
         nrows++;
-        if (sortCol >= 0) { sortBy(sortCol, sortDesc); }
+        if (sortCol >= 0 && sortCol < ncols) { insertSorted(nrows - 1); }
         invalidate();
         return nrows - 1;
     }
@@ -546,25 +548,51 @@ public:
         return x[i] == 0 ? -1 : 1;
     }
 
-    // sorts the display order (stable) by a column
+    // puts the new last row at its place in the sorted display order (binary search, after the rows that compare equal), keeping the selection
+    private void insertSorted(int row) {
+        int lo = 0;
+        int hi = row;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            int c = compare(order[mid], row, sortCol);
+            if (sortDesc) { c = -c; }
+            if (c <= 0) { lo = mid + 1; } else { hi = mid; }
+        }
+        for (int i = row; i > lo; i--) { order[i] = order[i - 1]; }
+        order[lo] = row;
+        if (row > 0 && sel < row && sel >= lo) { sel++; ensureVisible(); }       // the same row stays selected, and in view
+    }
+
+    // sorts the display order (stable: equal rows keep their order) by a column. A merge sort, O(n log n): 20000 rows take a fraction of a second
     void sortBy(int col, bool desc) {
         sortCol = col;
         sortDesc = desc;
         int keep = selectedRow();
-        // insertion sort on the order array keeps equal rows in their original order
         for (int i = 0; i < nrows; i++) { order[i] = i; }
-        if (col >= 0 && col < ncols) {
-            for (int i = 1; i < nrows; i++) {
-                int v = order[i];
-                int j = i - 1;
-                while (j >= 0) {
-                    int c = compare(order[j], v, col);
-                    if (desc) { c = -c; }
-                    if (c <= 0) { break; }
-                    order[j + 1] = order[j];
-                    j--;
+        if (col >= 0 && col < ncols && nrows > 1) {
+            if (tmpCap < nrows) {
+                tmpCap = imax(32, cap);
+                tmp = (int*) alloc(tmpCap * 8);
+            }
+            int n = nrows;
+            for (int w = 1; w < n; w = w * 2) {
+                for (int lo = 0; lo < n; lo = lo + 2 * w) {
+                    int mid = imin(lo + w, n);
+                    int hi = imin(lo + 2 * w, n);
+                    int i = lo;
+                    int j = mid;
+                    int k = lo;
+                    while (i < mid && j < hi) {
+                        int c = compare(order[j], order[i], col);          // take the right one only when it is strictly smaller
+                        if (desc) { c = -c; }
+                        if (c < 0) { tmp[k] = order[j]; j++; }
+                        else { tmp[k] = order[i]; i++; }
+                        k++;
+                    }
+                    while (i < mid) { tmp[k] = order[i]; i++; k++; }
+                    while (j < hi) { tmp[k] = order[j]; j++; k++; }
                 }
-                order[j + 1] = v;
+                for (int i = 0; i < n; i++) { order[i] = tmp[i]; }
             }
         }
         if (keep >= 0) { for (int i = 0; i < nrows; i++) { if (order[i] == keep) { sel = i; } } }
@@ -1106,15 +1134,73 @@ public char* prompt(tui.App* app, char* title, char* label, char* initial = "") 
 // =============================================================================
 private int sysGetdents() { if (__ARCH == 0) { return 217; } return 61; }
 
-// is path a directory that can be read?
+// Examines a path with stat (symbolic links are followed) or lstat (follow = false: the link itself). Fills the mode, the device and the inode;
+// returns 0, or -1 when the path cannot be examined. x86-64 (and AOS) uses stat / lstat, the other CPUs statx (the generic system call table
+// has no stat; LoongArch has no newfstatat either). Never opens the file, so a FIFO cannot make it wait.
+private int statRaw(char* path, bool follow, int* mode, int* dev, int* ino) {
+    if (__OS == 1) { return -1; }
+    char st[256];
+    int r;
+    if (__ARCH == 0) {
+        r = -38;
+        if (!follow) { r = __syscall(6, (int) path, (int) &st[0], 0, 0, 0, 0); }                    // lstat
+        if (r == -38) { r = __syscall(4, (int) path, (int) &st[0], 0, 0, 0, 0); }                    // stat (also when lstat does not exist)
+        if (r != 0) { return -1; }
+        *mode = (st[24] & 255) | ((st[25] & 255) << 8) | ((st[26] & 255) << 16);
+        *dev = 0;
+        *ino = 0;
+        for (int i = 7; i >= 0; i--) { *dev = (*dev << 8) | (st[i] & 255); *ino = (*ino << 8) | (st[8 + i] & 255); }
+    } else {
+        int flags = follow ? 0 : 0x100;                                                              // AT_SYMLINK_NOFOLLOW
+        r = __syscall(291, -100, (int) path, flags, 0x7FF, (int) &st[0], 0);                         // statx(AT_FDCWD, path, flags, STATX_BASIC_STATS, &st)
+        if (r != 0) { return -1; }
+        *mode = (st[28] & 255) | ((st[29] & 255) << 8);
+        *ino = 0;
+        for (int i = 7; i >= 0; i--) { *ino = (*ino << 8) | (st[32 + i] & 255); }
+        *dev = (((st[136] & 255) | ((st[137] & 255) << 8) | ((st[138] & 255) << 16) | ((st[139] & 255) << 24)) << 32)
+             | ((st[140] & 255) | ((st[141] & 255) << 8) | ((st[142] & 255) << 16) | ((st[143] & 255) << 24));
+    }
+    return 0;
+}
+
+// the file type and permission bits (st_mode) of a path, -1 if it cannot be examined; follow: through symbolic links (stat), else the link
+// itself (lstat). The type is mode & 0xF000: 0x4000 directory, 0x8000 regular file, 0xA000 symbolic link, 0x1000 FIFO, 0x2000 / 0x6000 devices.
+public int fileMode(char* path, bool follow = true) {
+    int mode = 0;
+    int dev = 0;
+    int ino = 0;
+    if (statRaw(path, follow, &mode, &dev, &ino) != 0) { return -1; }
+    return mode;
+}
+
+// is path a directory (a symbolic link to one counts)? Does not open anything
+public bool isDirectory(char* path) { int m = fileMode(path, true); return m >= 0 && (m & 0xF000) == 0x4000; }
+
+// is path an ordinary file (a symbolic link to one counts)?
+public bool isRegularFile(char* path) { int m = fileMode(path, true); return m >= 0 && (m & 0xF000) == 0x8000; }
+
+// is path itself a symbolic link (the link is not followed)? Always false where there are no links (AOS)
+public bool isSymlink(char* path) { int m = fileMode(path, false); return m >= 0 && (m & 0xF000) == 0xA000; }
+
+// do the two paths lead to the same file (same device and inode, links followed)? False when one cannot be examined or the system gives no inode numbers
+public bool sameFile(char* a, char* b) {
+    int ma = 0;
+    int da = 0;
+    int ia = 0;
+    int mb = 0;
+    int db = 0;
+    int ib = 0;
+    if (statRaw(a, true, &ma, &da, &ia) != 0 || statRaw(b, true, &mb, &db, &ib) != 0) { return false; }
+    return ia != 0 && ia == ib && da == db;
+}
+
+// is path a directory that can be read? (stat first: a FIFO or another special file is never opened)
 private bool isDirPath(char* path) {
-    if (__OS == 1) { return false; }
+    if (!isDirectory(path)) { return false; }
     int fd = __open(path, 0);
     if (fd < 0) { return false; }
-    char buf[64];
-    int r = __syscall(sysGetdents(), fd, (int) &buf[0], 64, 0, 0, 0);
     __close(fd);
-    return r >= 0;
+    return true;
 }
 
 // the size in bytes of a file (stat), -1 if it cannot be examined. x86-64 uses stat (AOS has only that), the other CPUs statx (the generic
@@ -1141,7 +1227,8 @@ public class DirList {
 public:
     tui.Pool names;
     int* off;
-    int* kind;                      // 1 directory, 0 file
+    int* kind;                      // 1 directory (a symbolic link to one counts), 0 anything else
+    int* lnk;                       // 1 for a symbolic link (the entry itself, not what it points to)
     int* size;                      // bytes (files; -1 unknown)
     int* order;
     int* tmp;
@@ -1155,6 +1242,7 @@ public:
         cap = 8192;
         off = (int*) alloc(cap * 8);
         kind = (int*) alloc(cap * 8);
+        lnk = (int*) alloc(cap * 8);
         size = (int*) alloc(cap * 8);
         order = (int*) alloc(cap * 8);
         tmp = (int*) alloc(cap * 8);
@@ -1168,6 +1256,7 @@ public:
         truncated = false;
         ok = false;
         if (__OS == 1) { return false; }
+        if (!isDirectory(dir)) { return false; }                // not a directory (or a FIFO): never opened
         int fd = __open(dir, 0);
         if (fd < 0) { return false; }
         ok = true;
@@ -1186,10 +1275,21 @@ public:
                     if (count >= cap) { truncated = true; }
                     else {
                         bool isDir = dtype == 4;
+                        bool isLink = dtype == 10;
                         char* full = null;
-                        if (dtype == 10 || dtype == 0) { full = joinPath(dir, name); isDir = isDirPath(full); }
+                        if (dtype == 0) {                                // the file system does not tell: ask (lstat)
+                            full = joinPath(dir, name);
+                            int m = fileMode(full, false);
+                            isLink = m >= 0 && (m & 0xF000) == 0xA000;
+                            isDir = m >= 0 && (m & 0xF000) == 0x4000;
+                        }
+                        if (isLink) {                                    // what does the link point to? (stat does not open it: a FIFO is no problem)
+                            full = joinPath(dir, name);
+                            isDir = isDirectory(full);
+                        }
                         off[count] = names.add(name);
                         kind[count] = isDir ? 1 : 0;
+                        lnk[count] = isLink ? 1 : 0;
                         size[count] = -1;
                         if (withSizes && !isDir) {
                             if (full == null) { full = joinPath(dir, name); }
@@ -1208,6 +1308,7 @@ public:
 
     char* name(int i) { return names.at(off[order[i]]); }
     bool isDir(int i) { return kind[order[i]] == 1; }
+    bool isLink(int i) { return lnk[order[i]] == 1; }       // the entry is a symbolic link (isDir tells what it points to)
     int sizeOf(int i) { return size[order[i]]; }
 
     private int compare(int a, int b) {
