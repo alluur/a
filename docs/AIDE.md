@@ -4,9 +4,12 @@ AIDE is the integrated development environment of the A language. It will run as
 program (`aide-gui`), both on Linux and on AOS, and both are built on the same libraries. This document describes those
 libraries (they are part of the A standard library, in `lib/`) and how the two front ends are meant to use them.
 
-**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`). The two front ends
-(`user/aide.a` and `user/gui/aide-gui.a` in the AOS repository) do not exist yet. The libraries contain no user interface code:
-everything that draws or reads the keyboard is the front end's job.
+**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`). The terminal front end exists: `user/aide.a` in the
+AOS repository (`aide`, about 6000 lines, one file; manual `docs/AIDE.md` there) runs on the AOS terminals (serial console, `aterm`, `telnetd`) and on
+Linux terminals, and uses everything below: `asys`, `acode`, `asyntax`, `atheme`, `aproject`, `afind` and the toolkit of [TUI.md](TUI.md). It has its own tests
+(`tests/aide_tui_test.py` in the AOS repository: about 65 tests in pseudo terminals, among them a random session of 500 keys, mouse events and resizes; and
+the QEMU tests `aide` and `aide-gui`). The GUI front end (`user/gui/aide-gui.a`) does not exist yet. The libraries contain no user interface code: everything
+that draws or reads the keyboard is the front end's job.
 
 Contents
 
@@ -328,10 +331,16 @@ Missing in AOS, and what asys does:
   working directory, so the image had it as `/build/ac` and the tests were started from `/`): `t200` to `t219` all pass (`t202` and `t219` print one
   extra line on the console, the kernel's note about the unimplemented `fchmod` that the compiler `ac` calls, and `t202` the AOS
   shell's complaint about `exec 0<&-`; both are not part of the test's standard output, which equals the `.out` file), 20 000
-  cycles of `alloc(300000)` + `free` fit in 2 MB, and file names of 38 to 55 bytes are saved atomically. The libraries do not
-  have a front end on AOS yet (`aide` / `aide-gui` do not exist), so no interactive session was run. The whole AOS image was also built
+  cycles of `alloc(300000)` + `free` fit in 2 MB, and file names of 38 to 55 bytes are saved atomically. At that time there was no front end; see
+  the next paragraph for what was run with AIDE. The whole AOS image was also built
   with this compiler and its own boot tests `boot`, `shell`, `coreutils`, `processes` and `torture` pass (the `grep` of the AOS shell
   was checked by hand: `grep 'main()'` finds `main()` only, `grep 'a|b'` finds the text `a|b`, `^b$` and `ma.n` work).
+
+* **AIDE on AOS** (stage "aidetui"; QEMU without KVM): `aide` runs on the serial console (read through a terminal emulator that also answers the
+  size queries), in `aterm` (screenshot) and as the real thing for typing, saving, building with the in-OS compiler (`/bin/ac`, a fraction of a second), running the
+  result, a compile error in the Problems list, Ctrl+F5 (the program on the real terminal and back), and quitting with the shell normal again. What AOS needed for it
+  (a pty output queue that drops what does not fit, a kernel log line that tore the console screen) was fixed in the AOS repository, see its `docs/ARCHITECTURE.md`.
+  The liveness mark of a running AIDE and the recovery copies need `/tmp` and `/home`; the lock is in `/tmp` on AOS so that nothing is written to the disk every few seconds.
 
 ## 11. Tests and measurements
 
@@ -403,4 +412,4 @@ distances).
 * On Windows the allocator cannot give big blocks back (the compiler's import table has no `VirtualFree`): freed big blocks are
   kept in size-class free lists and reused. After a 24 MB text was edited and dropped, about 90 MB stayed mapped (in use: 0).
 * Processes need `fork`/`execve`: not on Windows. `Job` merges standard error into standard output.
-* Not tested here: AOS (see section 10), terminals and GUIs (there is no front end yet), files over 2 GiB (`maxLoad` defaults to 1 GiB).
+* Not tested here: files over 2 GiB (`maxLoad` defaults to 1 GiB), real ARM64 / RISC-V / LoongArch hardware (everything runs under qemu-user).

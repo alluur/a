@@ -83,6 +83,11 @@ terminal supports and the program wants. `restore()` (also `leave()` and `close(
 
 A stack overflow cannot run a handler (A does not use `sigaltstack`): after such a crash type `reset`.
 
+**Saving work on a hang up or a kill.** `Terminal.softExit(true)` changes SIGHUP, SIGTERM and SIGINT (SIGINT only from outside: in raw mode the keyboard sends none): the handler no longer restores the
+terminal and kills the program, it only notes the signal, and an `EV_HUP` event arrives (`key` = the signal number; `App.run` returns when it sees one). The program can then save its
+work, leave full screen mode and exit by itself. A program that does not call it keeps the default: the terminal is restored and the program dies the way the signal says. (AIDE uses it
+so that a closed terminal window does not lose the unsaved documents.)
+
 The signal handlers need a small page of machine code made at run time (the kernel calls handlers with the C calling convention, A functions
 use their own). It is mapped writable and executable, and the processor is told about the new code (ARM64: data cache clean and instruction
 cache invalidate, RISC-V: `riscv_flush_icache` and `fence.i`, LoongArch: `ibar`; x86-64 needs nothing). That part could only be run on the
@@ -436,7 +441,7 @@ Everything else the toolkit uses exists on AOS: `ioctl` (TCGETS, TCSETSW, TIOCGW
 `pipe2`, `dup2`, `kill` (also to process groups), `getdents64` with the file type. The GUI terminal `gterm` (used by `aterm`) understands the sequences the toolkit
 writes: colours (16, 256 and 24 bit), cursor movement, erasing, scroll regions, the alternate screen, bracketed paste, window titles, and **mouse reporting
 (1000, 1002, 1003, 1006 and the old form, focus reports 1004, `CSI 18 t`)**, added for this toolkit (Shift + mouse still selects text). What `gterm` does not have:
-double width cells for wide characters (CJK and emoji take one cell there, so the toolkit's layout is off by one cell per wide character: use `TUI_ASCII=1` or avoid them), OSC 52,
+double width cells for wide characters (CJK and emoji take one cell there, so the toolkit's layout is off by one cell per wide character: use `TUI_ASCII=1` or avoid them), glyphs outside Latin-1 (it draws box drawing, block elements, the bullet and arrows / triangles itself; ellipsis, curly quotes, check marks and similar get a plain ASCII stand-in, anything else shows `?`), OSC 52,
 the `CSI 22 t` title stack (ignored) and colon separated SGR parameters.
 
 ---
