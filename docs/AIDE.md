@@ -272,6 +272,7 @@ Missing in AOS, and what asys does:
 | `t200_asys_mem` | allocator: zeroing, classes, big blocks, realloc, counters, double free, `moveBytes` |
 | `t201_asys_files` | files, atomic writes (permissions, backup, streaming, links, loops), listing, FIFOs, names, time, random |
 | `t202_asys_proc` | pipes, exit codes, environment, cwd, exec errors, 1 MB through `cat`, full pipes, `EPIPE`, floods, group kill |
+| `t203_asys_fuzz` | 6000 random alloc / realloc / free operations (1 byte to 3 MB) checked against block patterns, zeroing, overlap and the counters |
 | `t204_acode_diff` | 10 000 random edits + grouped undo / redo with cursor snapshots against a reference model; line index; UTF-8 |
 | `t205_acode_cursor` | exact cursor restoration (merged typing, backspace, delete, backwards selections, 4 cursors), motions, UTF-8, tab width 0 |
 | `t206_acode_lineops` | move / duplicate / join / delete lines, indentation, comments, auto-indent, brackets, clipboard, clean-ups |
@@ -287,6 +288,7 @@ Missing in AOS, and what asys does:
 | `t216_regex_more` | flags, POSIX classes, 32 groups, errors, limits, big inputs, `quote` |
 | `t217_acode_perf` | 100 000 lines inserted at the end / start / random places, 50 000 typed characters, 2000 cursors, a 3 MB file |
 | `t218_regressions` | temp file permissions and names, extreme tab widths, `dispose()` of every class, 24 MB cycles, bounded walks |
+| `t219_aide_session` | a whole session through all modules: project, ignore rules, tree, quick open, find in files, buffer, editor, highlighter, symbols, completion, rename with undo, save, external change, watcher, settings, a real build with an error, the fix, the run |
 
 All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine). On Windows
 `t202` and `t213` print that processes are not supported (`.out.windows`); the other tests run unchanged.

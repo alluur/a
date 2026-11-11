@@ -1,0 +1,165 @@
+// asys allocator fuzz: 6000 random alloc / realloc / free operations on up to 100 live blocks of all size classes (1 byte to 3 MB),
+// checked against a pattern that every block carries: contents survive realloc (grow and shrink, small <-> big), fresh memory
+// and the part added by realloc is zero, nothing overlaps, blockSize is at least what was asked, and when everything is freed the
+// counters are back where they started. Deterministic (a fixed seed).
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+const SLOTS = 100;
+
+char* blk[100];
+int sz[100];
+int tag[100];
+
+int seed = 987654321;
+
+int rnd() {
+    seed = (seed * 6364136223846793005 + 1442695040888963407);
+    return (seed >> 33) & 0x7FFFFFFF;
+}
+
+// a size from a mix: mostly small, some medium, a few big (blocks above 128 KiB are mapped separately)
+int pickSize() {
+    int r = rnd() % 100;
+    if (r < 60) { return 1 + rnd() % 300; }
+    if (r < 85) { return 1 + rnd() % 5000; }
+    if (r < 96) { return 1 + rnd() % 70000; }
+    if (r < 99) { return 100000 + rnd() % 300000; }
+    return 1000000 + rnd() % 2000000;
+}
+
+int patternByte(int t, int i) {
+    return (t * 31 + i * 7 + (i >> 8)) & 255;
+}
+
+void fill(int s) {
+    char* p = blk[s];
+    int t = tag[s];
+    for (int i = 0; i < sz[s]; i++) { p[i] = patternByte(t, i); }
+}
+
+// the first n bytes carry the pattern of the tag (big blocks are sampled)
+bool verify(int s, int n) {
+    char* p = blk[s];
+    int t = tag[s];
+    int step = (n > 200000) ? 61 : 1;
+    for (int i = 0; i < n; i = i + step) {
+        if (p[i] != patternByte(t, i)) { return false; }
+    }
+    return true;
+}
+
+// bytes [from, to) are zero (big ranges are sampled)
+bool zeroRange(char* p, int from, int to) {
+    int step = (to - from > 200000) ? 61 : 1;
+    for (int i = from; i < to; i = i + step) {
+        if (p[i] != 0) { return false; }
+    }
+    return to <= from || p[to - 1] == 0;
+}
+
+int main() {
+    int baseUse = asys.memInUse();
+    int baseBlocks = asys.memBlocks();
+    int baseMapped = asys.memMapped();
+    bool patternsOk = true;
+    bool zeroOk = true;
+    bool sizeOk = true;
+    bool overlapOk = true;
+    int allocs = 0;
+    int reallocs = 0;
+    int frees = 0;
+    int bigOps = 0;
+    for (int op = 0; op < 6000; op++) {
+        int s = rnd() % SLOTS;
+        int kind = rnd() % 10;
+        if (blk[s] == null) {
+            if (kind < 7) {
+                int n = pickSize();
+                if (n > 128 * 1024) { bigOps++; if (bigOps > 12) { n = 1 + n % 5000; } }
+                char* p = asys.alloc(n);
+                if (p == null) { sizeOk = false; continue; }
+                if (!zeroRange(p, 0, n)) { zeroOk = false; }
+                if (asys.blockSize(p) < n) { sizeOk = false; }
+                blk[s] = p;
+                sz[s] = n;
+                tag[s] = rnd() & 255;
+                fill(s);
+                allocs++;
+            }
+        } else if (kind < 5) {
+            // realloc to a different size
+            int n = pickSize();
+            if (n > 128 * 1024) { bigOps++; if (bigOps > 12) { n = 1 + n % 5000; } }
+            int old = sz[s];
+            char* p = asys.realloc(blk[s], n);
+            if (p == null) { sizeOk = false; continue; }
+            blk[s] = p;
+            int keep = (n < old) ? n : old;
+            sz[s] = n;
+            if (!verify(s, keep)) { patternsOk = false; }
+            if (n > old && !zeroRange(p, old, n)) { zeroOk = false; }
+            if (asys.blockSize(p) < n) { sizeOk = false; }
+            tag[s] = rnd() & 255;
+            fill(s);
+            reallocs++;
+        } else if (kind < 8) {
+            if (!verify(s, sz[s])) { patternsOk = false; }
+            asys.free(blk[s]);
+            blk[s] = null;
+            sz[s] = 0;
+            frees++;
+        } else {
+            // a neighbour check: the first and last byte of every live block still carry their pattern (an overlap would break one)
+            for (int j = 0; j < SLOTS; j++) {
+                if (blk[j] != null && sz[j] > 0) {
+                    char* p = blk[j];
+                    int last = sz[j] - 1;
+                    if (p[0] != patternByte(tag[j], 0) || p[last] != patternByte(tag[j], last)) { overlapOk = false; }
+                }
+            }
+        }
+    }
+    check(allocs > 500 && reallocs > 500 && frees > 500, "the run did many allocations, reallocations and frees");
+    check(patternsOk, "the contents of blocks survive realloc and are never disturbed");
+    check(zeroOk, "fresh memory and memory added by realloc is zero, also after reuse");
+    check(sizeOk, "blockSize is at least the requested size, nothing ran out of memory");
+    check(overlapOk, "no two live blocks overlap");
+    // everything still live is intact, then freed
+    bool allIntact = true;
+    int live = 0;
+    for (int s = 0; s < SLOTS; s++) {
+        if (blk[s] != null) {
+            live++;
+            if (!verify(s, sz[s])) { allIntact = false; }
+            asys.free(blk[s]);
+            blk[s] = null;
+        }
+    }
+    check(allIntact && live > 10, "the blocks that were still live are intact");
+    checkEq(asys.memInUse(), baseUse, "memInUse is back");
+    checkEq(asys.memBlocks(), baseBlocks, "memBlocks is back");
+    int grown = asys.memMapped() - baseMapped;
+    check(asys.platform() == asys.OS_WINDOWS || (grown % 2097152 == 0 && grown <= 16 * 1024 * 1024), "only whole 2 MiB chunks of small blocks stay mapped: every big block went back to the system");
+    checkEq(asys.memBadFrees(), 0, "no bad frees");
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
