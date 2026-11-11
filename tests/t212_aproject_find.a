@@ -1,0 +1,234 @@
+// aproject.FindJob: plain, case insensitive, whole word and regex searches with context, in steps, cancellable; binary files, FIFOs,
+// symbolic link loops, size and result limits, ignore rules, file name filters
+import aproject;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (got == null || !streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got == null ? "(null)" : got, want);
+    }
+}
+
+bool linksOk;
+
+char* root = "build/tests/t212_work";
+
+void put(char* rel, char* content, int n) {
+    char* f = asys.join(root, rel);
+    asys.writeFile(f, content, n);
+    asys.free(f);
+}
+
+void rmTree(char* path) {
+    asys.DirList dl();
+    if (asys.listDir(path, &dl) >= 0) {
+        for (int i = 0; i < dl.count; i++) {
+            char* c = asys.join(path, dl.name(i));
+            if (dl.kind(i) == asys.K_DIR) { rmTree(c); } else { asys.unlink(c); }
+            asys.free(c);
+        }
+    }
+    dl.dispose();
+    asys.rmdir(path);
+}
+
+// runs a search to the end
+int run(aproject.FindJob* j, char* pat, int flags, aproject.Ignore* ign, int ctx) {
+    int r = j->start(root, pat, flags, ign, ctx);
+    if (r < 0) { return r; }
+    int guard = 0;
+    while (j->step(50) == aproject.FIND_RUNNING && guard < 100000) { guard++; }
+    return j->count;
+}
+
+// "file:line:col " for hit i
+char hitText[300];
+char* hit(aproject.FindJob* j, int i) {
+    format(&hitText[0], 300, "%s:%d:%d", j->results[i].path, j->results[i].line, j->results[i].col);
+    return &hitText[0];
+}
+
+// all hits joined: "a.txt:1:0 a.txt:2:6 ..."
+char allText[3000];
+char* hits(aproject.FindJob* j) {
+    int w = 0;
+    for (int i = 0; i < j->count; i++) {
+        if (i > 0) { allText[w] = ' '; w++; }
+        char* h = hit(j, i);
+        int l = strlen(h);
+        memcpy(&allText[w], h, l);
+        w = w + l;
+    }
+    allText[w] = 0;
+    return &allText[0];
+}
+
+int main() {
+    linksOk = asys.hasLinks();
+    rmTree(root);
+    asys.mkdirs(root);
+    asys.mkdirs("build/tests/t212_work/sub");
+    asys.mkdirs("build/tests/t212_work/ignored");
+    put("a.txt", "alpha beta\nTODO fix this\ngamma TODO\n", 36);
+    char big[300];
+    for (int i = 0; i < 200; i++) { big[i] = 'x'; }
+    memcpy(&big[200], " TODO\n", 6);
+    put("big.txt", &big[0], 206);
+    put("crlf.txt", "first TODO\r\nsecond\r\n", 20);
+    put("ignored/x.txt", "TODO", 4);
+    put("sub/b.a", "int x; // todo later\nTODO\n\n", 27);
+    put("sub/c.bin", "TODO\x00binary", 11);
+    put("sub/word.txt", "TODOS todo_x xTODO TODO.\n", 25);
+    char* ff = asys.join(root, "pipe.txt");
+    asys.mkfifo(ff, 420);
+    char* lk = asys.join(root, "sub/loop");
+    asys.symlink("..", lk);
+    int baseMem = asys.memInUse();
+
+    aproject.Ignore ign();
+    ign.addPattern("ignored/", "");
+
+    // ---- plain search
+    {
+        aproject.FindJob* j = new aproject.FindJob();
+        int n = run(j, "TODO", 0, &ign, 0);
+        checkEq(n, 8, "eight hits for TODO");
+        checkStr(hits(j), "a.txt:1:0 a.txt:2:6 big.txt:0:201 crlf.txt:0:6 sub/b.a:1:0 sub/word.txt:0:0 sub/word.txt:0:14 sub/word.txt:0:19", "where they are (traversal in name order, ignored directory left out)");
+        checkStr(j->results[0].text, "TODO fix this", "the line");
+        checkStr(j->results[3].text, "first TODO", "a CR at the end of the line is not part of it");
+        checkEq(j->results[1].len, 4, "the match length");
+        checkEq(j->filesSearched, 5, "five files were searched");
+        checkEq(j->filesSkipped, linksOk ? 2 : 1, "the binary file and the FIFO were skipped, nothing hung");
+        check(!j->truncated && !j->regexError, "no limits hit");
+        check(j->status() == aproject.FIND_DONE, "done");
+        checkStr(j->results[0].before, "", "no context asked for");
+        j->dispose();
+        check(j->count == 0 && j->results == null, "dispose frees the results");
+    }
+    {
+        aproject.FindJob* j = new aproject.FindJob();
+        int n = run(j, "TODO", 0, null, 0);
+        checkEq(n, 9, "without ignore rules the ignored directory is searched too");
+        j->dispose();
+    }
+    // ---- case, words, regular expressions
+    {
+        aproject.FindJob* j = new aproject.FindJob();
+        run(j, "todo", aproject.FIND_ICASE, &ign, 0);
+        checkStr(hits(j), "a.txt:1:0 a.txt:2:6 big.txt:0:201 crlf.txt:0:6 sub/b.a:0:10 sub/b.a:1:0 sub/word.txt:0:0 sub/word.txt:0:6 sub/word.txt:0:14 sub/word.txt:0:19", "case insensitive");
+        run(j, "TODO", aproject.FIND_WORD, &ign, 0);
+        checkStr(hits(j), "a.txt:1:0 a.txt:2:6 big.txt:0:201 crlf.txt:0:6 sub/b.a:1:0 sub/word.txt:0:19", "whole words only");
+        run(j, "todo", aproject.FIND_WORD | aproject.FIND_ICASE, &ign, 0);
+        checkStr(hits(j), "a.txt:1:0 a.txt:2:6 big.txt:0:201 crlf.txt:0:6 sub/b.a:0:10 sub/b.a:1:0 sub/word.txt:0:19", "whole words, case insensitive (todo_x is one word)");
+        run(j, "T[A-Z]+O\\b", aproject.FIND_REGEX, &ign, 0);
+        checkEq(j->count, 7, "a regular expression: T[A-Z]+O at the end of a word (also inside xTODO)");
+        checkEq(j->results[0].len, 4, "its match length");
+        run(j, "(\\w+) TODO", aproject.FIND_REGEX, &ign, 0);
+        checkStr(hits(j), "a.txt:2:0 big.txt:0:0 crlf.txt:0:0 sub/word.txt:0:13", "a regular expression with a group: the match starts at the word before");
+        checkEq(j->results[0].len, 10, "gamma TODO is ten bytes");
+        run(j, "t.d.", aproject.FIND_REGEX | aproject.FIND_ICASE, &ign, 0);
+        check(j->count >= 8, "regex with the case flag");
+        checkEq(run(j, "(", aproject.FIND_REGEX, &ign, 0), -asys.EINVAL, "a bad regular expression is refused");
+        check(j->regexError, "and flagged");
+        checkEq(run(j, "", 0, &ign, 0), -asys.EINVAL, "an empty pattern is refused");
+        checkEq(j->start("build/tests/t212_work/nothing", "x", 0, null, 0), -asys.ENOENT, "a missing start directory");
+        j->dispose();
+    }
+    // ---- context lines
+    {
+        aproject.FindJob* j = new aproject.FindJob();
+        run(j, "gamma", 0, &ign, 1);
+        checkEq(j->count, 1, "one hit");
+        checkStr(j->results[0].before, "TODO fix this", "one line before");
+        checkStr(j->results[0].after, "", "and the empty last line after");
+        run(j, "TODO fix", 0, &ign, 2);
+        checkStr(j->results[0].before, "alpha beta", "two lines of context are asked for, only one exists above");
+        checkStr(j->results[0].after, "gamma TODO\n", "and the lines below");
+        run(j, "first", 0, &ign, 3);
+        checkStr(j->results[0].before, "", "no lines above the first");
+        checkStr(j->results[0].after, "second\n", "context stops at the end of the file");
+        j->dispose();
+    }
+    // ---- steps and cancel
+    {
+        aproject.FindJob* j = new aproject.FindJob();
+        j->start(root, "TODO", 0, &ign, 0);
+        int steps = 0;
+        while (j->step(0) == aproject.FIND_RUNNING && steps < 1000) { steps++; }
+        check(steps >= 6 && steps < 1000, "step(0) does one directory entry at a time");
+        checkEq(j->count, 8, "the same result in steps");
+        j->start(root, "TODO", 0, &ign, 0);
+        j->step(0);
+        j->step(0);
+        int soFar = j->count;
+        j->cancel();
+        checkEq(j->status(), aproject.FIND_CANCELLED, "cancelled");
+        checkEq(j->step(100), aproject.FIND_CANCELLED, "steps after a cancel do nothing");
+        checkEq(j->count, soFar, "and find nothing more");
+        j->cancel();
+        j->dispose();
+    }
+    // ---- limits
+    {
+        aproject.FindJob* j = new aproject.FindJob();
+        j->maxResults = 3;
+        run(j, "TODO", 0, &ign, 0);
+        check(j->count == 3 && j->truncated, "maxResults stops the search and says so");
+        j->dispose();
+        aproject.FindJob* k = new aproject.FindJob();
+        k->maxFileSize = 100;
+        run(k, "TODO", 0, &ign, 0);
+        checkEq(k->count, 7, "a file over maxFileSize is skipped");
+        k->dispose();
+        aproject.FindJob* f = new aproject.FindJob();
+        f->fileFilter = "*.a";
+        run(f, "TODO", 0, &ign, 0);
+        checkStr(hits(f), "sub/b.a:1:0", "a file name filter");
+        f->dispose();
+        // a single file as the start
+        aproject.FindJob* s = new aproject.FindJob();
+        char* one = asys.join(root, "a.txt");
+        checkEq(s->start(one, "TODO", 0, null, 0), 0, "a file as the start");
+        check(s->status() == aproject.FIND_DONE && s->count == 2, "found at once");
+        s->dispose();
+        asys.free(one);
+    }
+    // ---- link loops
+    {
+        aproject.FindJob* j = new aproject.FindJob();
+        run(j, "TODO", aproject.FIND_FOLLOW, &ign, 0);
+        check(j->status() == aproject.FIND_DONE, "following links ends in the presence of a loop");
+        check(!linksOk || j->dirsSkipped >= 1, "the loop was detected (device and inode)");
+        checkEq(j->count, 8, "and nothing was found twice");
+        j->dispose();
+    }
+    rmTree(root);
+    asys.unlink(ff);
+    asys.free(ff);
+    asys.free(lk);
+    ign.dispose();
+    checkEq(asys.memInUse() - baseMem < 4096 ? 1 : 0, 1, "the jobs gave their memory back");
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

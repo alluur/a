@@ -1,0 +1,396 @@
+// aproject: diagnostics parsing, BuildJob / RunJob (incremental output, exit status, input that never blocks, timeouts, kill,
+// floods, the A compiler's real messages)
+import aproject;
+import asys;
+
+int checks;
+int fails;
+
+void check(bool ok, char* what) {
+    checks++;
+    if (!ok) {
+        fails++;
+        printf("FAIL: %s\n", what);
+    }
+}
+
+void checkEq(int got, int want, char* what) {
+    checks++;
+    if (got != want) {
+        fails++;
+        printf("FAIL: %s: got %d want %d\n", what, got, want);
+    }
+}
+
+void checkStr(char* got, char* want, char* what) {
+    checks++;
+    if (got == null || !streq(got, want)) {
+        fails++;
+        printf("FAIL: %s: got '%s' want '%s'\n", what, got == null ? "(null)" : got, want);
+    }
+}
+
+// parses a line and renders the result as  path|line|col|severity|message  or "-"
+char rendered[600];
+char* diag(char* line) {
+    aproject.Problem p;
+    if (!aproject.parseDiagnostic(line, strlen(line), &p)) {
+        return "-";
+    }
+    format(&rendered[0], 600, "%s|%d|%d|%s|%s", p.path, p.line, p.col, aproject.severityName(p.severity), p.message);
+    asys.free(p.path);
+    asys.free(p.message);
+    return &rendered[0];
+}
+
+int main() {
+    // ---- diagnostics
+    checkStr(diag("main.a:3: error: expected ';'"), "main.a|3|0|error|expected ';'", "the A compiler");
+    checkStr(diag("lib/x.a:12: error: undeclared identifier 'foo'"), "lib/x.a|12|0|error|undeclared identifier 'foo'", "a path with a directory");
+    checkStr(diag("src/a.c:10:5: warning: unused variable 'x' [-Wunused]"), "src/a.c|10|5|warning|unused variable 'x' [-Wunused]", "GCC with a column");
+    checkStr(diag("a.c:1:1: fatal error: stdio.h: No such file or directory"), "a.c|1|1|error|stdio.h: No such file or directory", "fatal error");
+    checkStr(diag("a.c:5:3: note: declared here"), "a.c|5|3|note|declared here", "a note");
+    checkStr(diag("a.cpp:7:1: Error: shouting"), "a.cpp|7|1|error|shouting", "severity words ignore case");
+    checkStr(diag("/abs/path/with space/x.c:2:3: error: msg"), "/abs/path/with space/x.c|2|3|error|msg", "an absolute path with a space");
+    checkStr(diag("C:\\proj\\x.c:12:4: error: bad thing"), "C:\\proj\\x.c|12|4|error|bad thing", "a Windows drive letter");
+    checkStr(diag("C:/proj/x.c:9: warning: w"), "C:/proj/x.c|9|0|warning|w", "a drive letter with forward slashes");
+    checkStr(diag("\x1b[1mmain.a:3:\x1b[0m \x1b[31merror:\x1b[0m coloured"), "main.a|3|0|error|coloured", "colour escape codes are ignored");
+    checkStr(diag("main.a:3: error: line ending\r"), "main.a|3|0|error|line ending", "a CR at the end");
+    checkStr(diag("In file included from lib/x.h:4:"), "lib/x.h|4|0|note|included from here", "In file included from");
+    checkStr(diag("foo.c(42): error C2065: 'x': undeclared identifier"), "foo.c|42|0|error|'x': undeclared identifier", "Visual C");
+    checkStr(diag("foo.c(42,7): warning C4100: unreferenced"), "foo.c|42|7|warning|unreferenced", "Visual C with a column");
+    checkStr(diag("  File \"/tmp/x.py\", line 3, in <module>"), "/tmp/x.py|3|0|note|<module>", "a Python traceback line");
+    checkStr(diag("grep: some text 12:34: nothing"), "-", "not a diagnostic");
+    checkStr(diag("make: *** [all] Error 1"), "-", "make's own error line");
+    checkStr(diag("12:30:45 something happened"), "-", "a time stamp is not a diagnostic");
+    checkStr(diag("src/x.c:12:34:text without a severity"), "-", "no severity word, no diagnostic");
+    checkStr(diag(""), "-", "an empty line");
+    checkStr(diag("      return x;"), "-", "a source line");
+    checkStr(diag("      ^"), "-", "a caret line");
+    checkStr(diag("a.c:xx: error: nope"), "-", "a line number must be a number");
+    checkStr(diag("a.c:12 error: nope"), "-", "colons are needed");
+    checkStr(diag("done in 3:20: ok"), "-", "a ratio");
+    checkStr(diag("path:1: error:"), "path|1|0|error|", "an empty message");
+
+    if (!asys.canSpawn()) {
+        println("processes are not supported on this system");
+        return 0;
+    }
+
+    // ---- a command with incremental output
+    {
+        aproject.RunJob* j = new aproject.RunJob();
+        checkEq(j->startShell("echo first; sleep 0.4; echo second; exit 3", null), 0, "start a shell command");
+        check(j->started && j->running, "running");
+        int t0 = asys.monoMs();
+        char buf[200];
+        int firstAt = -1;
+        int guard = 0;
+        char got[200];
+        int gl = 0;
+        while (j->poll() && guard < 3000) {
+            int n = j->read(&buf[0], 200);
+            if (n > 0) {
+                if (firstAt < 0) { firstAt = asys.monoMs() - t0; check(j->running, "the first line arrives while the command still runs"); }
+                memcpy(&got[gl], &buf[0], n);
+                gl = gl + n;
+            }
+            asys.sleepMs(5);
+            guard++;
+        }
+        int n = j->read(&buf[0], 200);
+        if (n > 0) { memcpy(&got[gl], &buf[0], n); gl = gl + n; }
+        got[gl] = 0;
+        checkStr(&got[0], "first\nsecond\n", "all the output");
+        check(firstAt >= 0 && firstAt < 350, "output is available before the command ends (not only at the end)");
+        check(!j->running && j->exited && j->exitCode == 3 && j->termSignal == 0, "exit code 3");
+        check(!j->timedOut && !j->killed, "neither timed out nor killed");
+        check(j->elapsedMs() >= 350, "elapsed time is measured");
+        checkEq(j->totalBytes, 13, "total bytes");
+        check(!j->poll(), "a finished job stays finished");
+        j->dispose();
+    }
+    // ---- stderr is merged
+    {
+        aproject.RunJob* j = new aproject.RunJob();
+        j->startShell("echo out; echo err 1>&2", null);
+        j->wait(5000);
+        char* all = j->readAll();
+        checkStr(all, "out\nerr\n", "stdout and stderr in order");
+        asys.free(all);
+        j->dispose();
+    }
+    // ---- a program that does not exist
+    {
+        aproject.RunJob* j = new aproject.RunJob();
+        check(j->startProgram("/no/such/program", null, null) == -asys.ENOENT, "a missing program is reported by start");
+        check(!j->started && !j->poll(), "nothing runs");
+        j->dispose();
+    }
+    // ---- RunJob.startProgram with arguments and a working directory
+    {
+        aproject.RunJob* j = new aproject.RunJob();
+        char* args[3];
+        args[0] = "-c";
+        args[1] = "echo \"$0|$1\"";
+        args[2] = null;
+        j->startProgram("/bin/sh", args, null);
+        j->wait(5000);
+        char* all = j->readAll();
+        check(contains(all, "|") && j->exitCode == 0, "arguments reach the program");
+        asys.free(all);
+        j->dispose();
+    }
+    // ---- input: queued, never blocking
+    {
+        aproject.RunJob* j = new aproject.RunJob();
+        char* argv[2];
+        argv[0] = "cat";
+        argv[1] = null;
+        checkEq(j->start(&argv[0], null, null), 0, "start cat");
+        check(j->sendInput("hello ", 6), "queue input");
+        check(j->sendInput("world\n", 6), "queue more");
+        j->closeInput();
+        check(!j->sendInput("late", 4), "no input after closeInput");
+        j->wait(5000);
+        char* all = j->readAll();
+        checkStr(all, "hello world\n", "cat echoes what was sent");
+        asys.free(all);
+        check(j->exitCode == 0, "cat ended by itself");
+        j->dispose();
+    }
+    {
+        // 3 MB through cat with the output being read: nothing lost
+        aproject.RunJob* j = new aproject.RunJob();
+        char* argv[2];
+        argv[0] = "cat";
+        argv[1] = null;
+        j->maxInput = 4 * 1024 * 1024;
+        j->start(&argv[0], null, null);
+        char* chunk = asys.alloc(65536);
+        for (int i = 0; i < 65536; i++) { chunk[i] = 'a' + (i % 26); }
+        int sent = 0;
+        for (int i = 0; i < 48; i++) {
+            if (j->sendInput(chunk, 65536)) { sent = sent + 65536; }
+        }
+        j->closeInput();
+        int got = 0;
+        char* rb = asys.alloc(65536);
+        int guard = 0;
+        while ((j->poll() || j->available() > 0) && guard < 100000) {
+            int n = j->read(rb, 65536);
+            if (n > 0) { got = got + n; }
+            guard++;
+        }
+        checkEq(sent, 48 * 65536, "3 MB were accepted");
+        checkEq(got + j->droppedBytes, sent, "3 MB came back (nothing lost; what the cap dropped is counted)");
+        j->dispose();
+        asys.free(chunk);
+        asys.free(rb);
+    }
+    {
+        // a command that never reads its input: sendInput returns, the queue is capped, nothing blocks
+        aproject.RunJob* j = new aproject.RunJob();
+        char* argv[3];
+        argv[0] = "sleep";
+        argv[1] = "5";
+        argv[2] = null;
+        j->start(&argv[0], null, null);
+        char* chunk = asys.alloc(65536);
+        int t0 = asys.monoMs();
+        int accepted = 0;
+        for (int i = 0; i < 80; i++) {
+            if (j->sendInput(chunk, 65536)) { accepted++; }
+            j->poll();
+        }
+        check(asys.monoMs() - t0 < 2000, "sending 5 MB to a process that does not read takes no time");
+        check(accepted >= 16 && accepted < 80, "the input queue has a cap (1 MB plus what the pipe holds)");
+        j->killNow();
+        j->wait(2000);
+        check(j->termSignal == 9 && j->killed, "killed");
+        j->dispose();
+        asys.free(chunk);
+    }
+    {
+        // a command that closes its input early: no SIGPIPE for us
+        aproject.RunJob* j = new aproject.RunJob();
+        j->startShell("exec 0<&-; sleep 1", null);
+        asys.sleepMs(300);
+        bool broke = false;
+        for (int i = 0; i < 100 && !broke; i++) {
+            j->sendInput("data data data data\n", 20);
+            j->poll();
+            if (j->inputBroken) { broke = true; }
+            asys.sleepMs(10);
+        }
+        check(broke, "the broken pipe is noticed (inputBroken)");
+        check(!j->sendInput("x", 1), "and further input is refused");
+        j->kill();
+        j->wait(3000);
+        j->dispose();
+    }
+    // ---- floods: the memory stays bounded and the command is never stalled
+    {
+        aproject.RunJob* j = new aproject.RunJob();
+        j->maxOutput = 100000;
+        int before = asys.memInUse();
+        j->startShell("yes 0123456789abcdef | head -c 20000000", null);
+        int guard = 0;
+        int taken = 0;
+        while (j->poll() && guard < 200000) {
+            guard++;
+            if (guard % 50 == 0) { char b[10]; taken = taken + j->read(&b[0], 10); }
+        }
+        check(j->exitCode == 0, "the flooding command ran to its end");
+        check(j->totalBytes == 20000000, "all 20 MB were drained from the pipe");
+        check(j->droppedBytes > 19000000, "nearly everything was dropped");
+        check(j->available() <= 100000, "the queue never exceeds its cap");
+        check(asys.memInUse() - before < 700000, "memory stayed bounded");
+        j->dispose();
+    }
+    // ---- timeout and kill: the exit status stays the real one
+    {
+        aproject.RunJob* j = new aproject.RunJob();
+        j->timeoutMs = 300;
+        char* argv[3];
+        argv[0] = "sleep";
+        argv[1] = "30";
+        argv[2] = null;
+        j->start(&argv[0], null, null);
+        j->wait(5000);
+        check(!j->running, "the timeout ended the command");
+        check(j->timedOut, "timedOut is set");
+        check(!j->exited && j->termSignal == 15, "killed by SIGTERM: the real end status, not overwritten");
+        check(j->elapsedMs() >= 280 && j->elapsedMs() < 3000, "after about the timeout");
+        j->dispose();
+    }
+    {
+        // a command that ignores SIGTERM is killed hard after the grace period
+        aproject.RunJob* j = new aproject.RunJob();
+        j->timeoutMs = 200;
+        j->graceMs = 200;
+        j->startShell("trap '' TERM; while true; do sleep 1; done", null);
+        j->wait(5000);
+        check(!j->running && j->timedOut, "stubborn command ended");
+        check(j->termSignal == 9, "by SIGKILL");
+        j->dispose();
+    }
+    {
+        // a command that finishes just before its timeout is not marked timed out
+        aproject.RunJob* j = new aproject.RunJob();
+        j->timeoutMs = 2000;
+        j->startShell("exit 4", null);
+        j->wait(5000);
+        check(!j->timedOut && j->exited && j->exitCode == 4, "exit code 4, no timeout");
+        j->kill();
+        check(j->exitCode == 4 && !j->killed, "kill after the end changes nothing");
+        j->dispose();
+    }
+    {
+        // kill() ends the whole tree
+        aproject.RunJob* j = new aproject.RunJob();
+        j->startShell("sleep 30 & sleep 30 & wait", null);
+        asys.sleepMs(200);
+        j->kill();
+        int t0 = asys.monoMs();
+        j->wait(5000);
+        check(!j->running && j->killed && !j->timedOut, "kill() ended the shell");
+        check(asys.monoMs() - t0 < 3000 && !j->poll(), "and its children: the output stream closed at once");
+        j->dispose();
+    }
+    // ---- BuildJob: diagnostics from a running command
+    {
+        aproject.BuildJob* b = new aproject.BuildJob();
+        char* script = "echo 'a.c:1:5: warning: first'; sleep 0.2; echo 'src/b.c:7: error: second'; echo '      ^'; echo 'x.c:2:2: note: third'; echo 'plain line'; exit 1";
+        checkEq(b->startCommand(null, null) < 0 ? 1 : 0, 1, "a null command line is refused");
+        char* argv[4];
+        argv[0] = "/bin/sh"; argv[1] = "-c"; argv[2] = script; argv[3] = null;
+        checkEq(b->startCommand(&argv[0], null), 0, "start a build");
+        int seen1 = 0;
+        int guard = 0;
+        while (b->poll() && guard < 2000) {
+            if (b->problemCount >= 1 && seen1 == 0) {
+                seen1 = 1;
+                check(b->running, "the first problem is known while the build still runs");
+                checkStr(b->problems[0].path, "a.c", "its file");
+            }
+            asys.sleepMs(5);
+            guard++;
+        }
+        checkEq(b->problemCount, 3, "three problems");
+        check(b->problems[1].line == 7 && b->problems[1].severity == aproject.SEV_ERROR && streq(b->problems[1].message, "second") && streq(b->problems[1].path, "src/b.c"), "the second problem");
+        checkEq(b->countOf(aproject.SEV_WARNING), 1, "one warning");
+        checkEq(b->countOf(aproject.SEV_ERROR), 1, "one error");
+        checkEq(b->countOf(aproject.SEV_NOTE), 1, "one note");
+        check(b->exited && b->exitCode == 1, "the build's exit code");
+        b->clearProblems();
+        checkEq(b->problemCount, 0, "clearProblems");
+        b->dispose();
+    }
+    {
+        // Rust style messages and a partial last line without a line break
+        aproject.BuildJob* b = new aproject.BuildJob();
+        char* argv[4];
+        argv[0] = "/bin/sh"; argv[1] = "-c"; argv[2] = "echo 'error[E0425]: cannot find value'; echo '  --> src/main.rs:3:5'; printf 'last.c:9:1: error: no newline'"; argv[3] = null;
+        b->startCommand(&argv[0], null);
+        b->wait(5000);
+        checkEq(b->problemCount, 2, "a Rust header plus its location, and a last line without a newline");
+        check(b->problemCount == 2 && streq(b->problems[0].path, "src/main.rs") && b->problems[0].line == 3 && b->problems[0].col == 5 && streq(b->problems[0].message, "cannot find value"), "the Rust problem");
+        check(b->problemCount == 2 && streq(b->problems[1].path, "last.c") && streq(b->problems[1].message, "no newline"), "the partial line is flushed at the end");
+        b->dispose();
+    }
+    {
+        // the problem list is capped, a line of 100 KB does not break anything
+        aproject.BuildJob* b = new aproject.BuildJob();
+        b->maxProblems = 50;
+        char* argv[4];
+        argv[0] = "/bin/sh"; argv[1] = "-c"; argv[2] = "i=0; while [ $i -lt 200 ]; do echo \"f.c:$i: error: e$i\"; i=$((i+1)); done; head -c 100000 /dev/zero | tr '\\0' x; echo; echo 'g.c:1: error: after the long line'"; argv[3] = null;
+        b->startCommand(&argv[0], null);
+        b->wait(10000);
+        check(b->problemCount == 50, "at most maxProblems problems are kept");
+        b->maxProblems = 1000;
+        b->dispose();
+    }
+    // ---- the real A compiler
+    {
+        asys.mkdirs("build/tests/t213_work");
+        asys.writeFile("build/tests/t213_work/bad.a", "int main() {\n    int x = 5\n    return x;\n}\n", 43);
+        aproject.BuildJob* b = new aproject.BuildJob();
+        char* argv[6];
+        argv[0] = "build/ac"; argv[1] = "build/tests/t213_work/bad.a"; argv[2] = "-o"; argv[3] = "build/tests/t213_work/bad.out"; argv[4] = null;
+        if (asys.isFile("build/ac")) {
+            checkEq(b->startCommand(&argv[0], null), 0, "start the compiler");
+            b->wait(20000);
+            check(b->exitCode == 1, "the compiler failed with exit code 1");
+            check(b->problemCount == 1, "one problem from the compiler");
+            if (b->problemCount == 1) {
+                checkStr(b->problems[0].path, "build/tests/t213_work/bad.a", "the file");
+                checkEq(b->problems[0].line, 3, "the line");
+                check(b->problems[0].severity == aproject.SEV_ERROR && streq(b->problems[0].message, "expected ';'"), "the message");
+            } else {
+                checks = checks + 3;
+            }
+            asys.writeFile("build/tests/t213_work/good.a", "int main() { return 7; }\n", 25);
+            argv[1] = "build/tests/t213_work/good.a";
+            argv[3] = "build/tests/t213_work/good.out";
+            checkEq(b->startCommand(&argv[0], null), 0, "compile a good program");
+            b->wait(20000);
+            check(b->exitCode == 0 && b->problemCount == 0, "no problems, exit code 0");
+            aproject.RunJob* r = new aproject.RunJob();
+            checkEq(r->startProgram("build/tests/t213_work/good.out", null, null), 0, "run the program that was built");
+            r->wait(10000);
+            check(r->exited && r->exitCode == 7, "its exit code is 7");
+            r->dispose();
+        } else {
+            checks = checks + 12;
+        }
+        b->dispose();
+        asys.unlink("build/tests/t213_work/bad.a");
+        asys.unlink("build/tests/t213_work/good.a");
+        asys.unlink("build/tests/t213_work/good.out");
+        asys.unlink("build/tests/t213_work/bad.out");
+        asys.rmdir("build/tests/t213_work");
+    }
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
