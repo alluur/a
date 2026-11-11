@@ -170,6 +170,28 @@ try:
         fail("aterm with a command did not end (%s)" % term2.poll())
     print("terminal command ok")
 
+    # codedemo: the editor made of the gcode widgets (dark theme): the editor, the side panel and a typed text must show up on the screen
+    env_demo = dict(env, AIDE_HOME=bindir)
+    demo = subprocess.Popen([os.path.join(bindir, "codedemo"), bindir], env=env_demo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    procs.append(demo)
+    time.sleep(2.0)
+    c.grab()
+    if demo.poll() is not None:
+        fail("codedemo ended by itself (%s)" % demo.poll())
+    if not c.find_color((30, 30, 30), tol=1):
+        fail("the editor of codedemo (dark background 1e1e1e) was not found")
+    if not c.find_color((37, 37, 38), tol=1):
+        fail("the side panel / tab bar of codedemo (252526) was not found")
+    before_demo = bytes(c.fb)
+    c.type_text("int x;")
+    time.sleep(0.8)
+    c.grab()
+    if bytes(c.fb) == before_demo:
+        fail("typing into codedemo changed nothing")
+    print("codedemo ok")
+    demo.kill()
+    demo.wait()
+
     # a protected display: cookie authentication for clients and a VNC password
     from rfbclient import AuthFailed
     cookie_file = os.path.join(bindir, "cookie.txt")

@@ -81,7 +81,7 @@ ac -o /tmp/hello hello.a                     # exactly /tmp/hello
 Example programs live in [`examples/`](examples/): `greet`, `calc` (interactive REPL), `wordcount`, `cat`, `todo`,
 `table`, `colors`, `wordfreq`, `clock`, `checksums`, `primes`, `jsonpretty`, `grep`, `bignum`, `dirlist`, `quiz`, `bank`, `modules`, `net_server` / `net_client` and more.
 Built-in modules: `math`, `bigint`, `decimal`, `random`, `sort`, `collections`, `strings`, `regex` (groups, back references, lazy quantifiers, look-ahead), `utf8`, `json`, `csv`,
-`path`, `os`, `datetime`, `encoding`, `hash` (CRC-32, MD5, SHA-1/2, HMAC), `zlib` (gzip / zlib / deflate), `tar`, `ini`, `bits`, `bytebuf` (byte buffers, endian readers, sizes), `algo` (sorting, searching, graphs, string algorithms), `arith` (checked arithmetic, number theory, fractions), `cli`, `log`, `testing`, `asys` (system layer: freeable memory, atomic file writes, directory listing, child processes), the editor core of AIDE (`acode` text buffer and editor, `asyntax` highlighting, `atheme` themes, `aproject` project tree, search and build jobs, `afind` search and replace; see [`docs/AIDE.md`](docs/AIDE.md)), `net` (TCP, UDP, DNS, poll), `http`, `netaddr`, `packet` (ARP / IP / ICMP / UDP / TCP / pcap), `netif` (interfaces, ARP table, routes, sockets), `dns`, `conn`, `websocket`, `netutil` (ping, Wake-on-LAN, NTP), `rawnet`, `fixed`, `nn` (perceptron, MLP, autoencoder, Hopfield, SOM, Elman, LSTM, CNN), `codec` (text / binary / image converters), and **the C standard library** (`import clib;`):
+`path`, `os`, `datetime`, `encoding`, `hash` (CRC-32, MD5, SHA-1/2, HMAC), `zlib` (gzip / zlib / deflate), `tar`, `ini`, `bits`, `bytebuf` (byte buffers, endian readers, sizes), `algo` (sorting, searching, graphs, string algorithms), `arith` (checked arithmetic, number theory, fractions), `cli`, `log`, `testing`, `asys` (system layer: freeable memory, atomic file writes, directory listing, child processes), the editor core of AIDE (`acode` text buffer and editor, `asyntax` highlighting, `atheme` themes, `aproject` project tree, search and build jobs, `afind` search and replace; see [`docs/AIDE.md`](docs/AIDE.md)), `gcode` (the GUI widgets of the AIDE code editor: `CodeEditor`, file explorer, tabs, find / replace, output and problems, terminal pane, colour picker, theme editor, settings, docking layout, command palette; see [`docs/GUI.md`](docs/GUI.md#the-code-editor-widgets-gcode); `examples/gui/codedemo.a` is a small editor built from them), `net` (TCP, UDP, DNS, poll), `http`, `netaddr`, `packet` (ARP / IP / ICMP / UDP / TCP / pcap), `netif` (interfaces, ARP table, routes, sockets), `dns`, `conn`, `websocket`, `netutil` (ping, Wake-on-LAN, NTP), `rawnet`, `fixed`, `nn` (perceptron, MLP, autoencoder, Hopfield, SOM, Elman, LSTM, CNN), `codec` (text / binary / image converters), and **the C standard library** (`import clib;`):
 `ctype errno limits string stdlib stdio time math (correctly rounded libm) complex unistd signal locale wchar` with the C names,
 see [`docs/CLIB.md`](docs/CLIB.md).
 
@@ -183,7 +183,8 @@ same programs compiled by GCC, on every target (see [`docs/INTERNALS.md`](docs/I
 
 `tests/tui.sh` runs the terminal toolkit's programs in a pseudo terminal and checks the screen with a terminal emulator written in
 Python (typing, menus, mouse, resize, paste, suspend to a shell, signals, `TERM` variants); `tests/gui.sh` tests the graphical stack,
-`tests/https.sh` the TLS code.
+`tests/https.sh` the TLS code. The gcode widgets (`t240` ... `t267`) are tested in-process: the display server runs inside the test program on
+its Headless backend, the test types, clicks and drags through it and compares pixels, so the same checks run on all five targets.
 
 ## Limitations and roadmap
 

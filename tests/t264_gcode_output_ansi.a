@@ -1,0 +1,149 @@
+// gcode.OutputView escape sequences: a colour run after multi-byte UTF-8 text is drawn right after the text (the runs are byte offsets,
+// the glyphs are not bytes), colon-form colours (38:2:r:g:b, 38:5:n), background colours that must not turn into a foreground colour,
+// OSC / DCS strings (window title, hyperlinks) and character set selections are swallowed, a sequence cut short by a line end, and a
+// line that never ends is cut after 4000 bytes at a character boundary
+import wsrv;
+import gui;
+import guix;
+import gcode;
+import asys;
+import adp;
+import gfx;
+#include "gcode_harness.inc"
+
+gcode.OutputView* mk(gui.Window** wout, char* title) {
+    gui.Window* w = d->createWindow(title, 400, 120, 0);
+    gcode.OutputView* v = new gcode.OutputView();
+    gui.Box* col = gui.vbox(0, 0);
+    col->add(v);
+    w->setRoot(col);
+    *wout = w;
+    return v;
+}
+
+bool validUtf8(char* s) {
+    int i = 0;
+    while (s[i] != 0) {
+        int c = s[i] & 255;
+        int k = 0;
+        if (c < 0x80) { k = 0; }
+        else if ((c & 0xE0) == 0xC0) { k = 1; }
+        else if ((c & 0xF0) == 0xE0) { k = 2; }
+        else if ((c & 0xF8) == 0xF0) { k = 3; }
+        else { return false; }
+        for (int j = 1; j <= k; j++) {
+            if ((s[i + j] & 0xC0) != 0x80) { return false; }
+        }
+        i = i + k + 1;
+    }
+    return true;
+}
+
+int main() {
+    gcode.theLook()->setThemeName("dark");
+    startServer(7364, "t264");
+
+    // 1. a run after multi-byte text: the same pixels as the line without the (colour-neutral) sequence
+    gui.Window* wa;
+    gui.Window* wb;
+    gui.Window* wc;
+    gcode.OutputView* va = mk(&wa, "plain");
+    gcode.OutputView* vb = mk(&wb, "split");
+    gcode.OutputView* vc = mk(&wc, "coloured");
+    settle();
+    va->append("\xc3\xa9\xc3\xa9\xc3\xa9 red after utf8 end\n");
+    vb->append("\xc3\xa9\xc3\xa9\xc3\xa9 \x1b[39mred after utf8\x1b[0m end\n");
+    vc->append("\xc3\xa9\xc3\xa9\xc3\xa9 \x1b[31mred after utf8\x1b[0m end\n");
+    settle();
+    printf("a run after 3 two-byte characters starts where the text is: %d\n", shot(wa) == shot(wb));
+    printf("and a coloured run does draw differently: %d\n", shot(wa) != shot(wc));
+    va->append("\xe2\x82\xac\xe2\x82\xac x\n");                  // three-byte characters (drawn as ? by the font)
+    vb->append("\xe2\x82\xac\xe2\x82\xac \x1b[39mx\x1b[0m\n");
+    settle();
+    printf("the same after 3-byte characters: %d\n", shot(wa) == shot(wb));
+
+    // 2. colours: semicolon and colon forms give the same colour; a background colour is not a foreground colour
+    gui.Window* w;
+    gcode.OutputView* v = mk(&w, "colours");
+    settle();
+    v->append("\x1b[38;2;255;128;0morange\x1b[0m\n");
+    v->append("\x1b[38:2:255:128:0morange\x1b[0m\n");
+    v->append("\x1b[38:2::255:128:0morange\x1b[0m\n");
+    v->append("\x1b[38;5;196mred196\x1b[0m\n");
+    v->append("\x1b[38:5:196mred196\x1b[0m\n");
+    v->append("\x1b[48;5;31mbackground\x1b[0m\n");
+    v->append("\x1b[48:2:1:2:3mbackground\x1b[0m\n");
+    v->append("\x1b[48;2;10;20;30;31mred on a colour\x1b[0m\n");
+    v->append("\x1b[4:3;31mcurly red\x1b[0m\n");
+    v->append("\x1b[1;32mbold green\x1b[0m\n");
+    v->append("\x1b[91mbright red\x1b[0m\n");
+    for (int i = 0; i < v->lineCount(); i++) {
+        printf("%d [%s] colour at 0: %x\n", i, v->lineText(i), v->colorAt(i, 0));
+    }
+
+    // 3. strings and other sequences that are not colours disappear
+    gcode.OutputView* v2 = mk(&w, "strings");
+    settle();
+    v2->append("\x1b]0;window title\x07visible\n");
+    v2->append("\x1b]8;;http://example.org\x1b\\link\x1b]8;;\x1b\\ after\n");
+    v2->append("\x1bP+q544e\x1b\\dcs gone\n");
+    v2->append("\x1b(Bcharset\x1b)0 more\n");
+    v2->append("\x1b[?25l\x1b[2Jcursor and clear\x1b[?25h\n");
+    v2->append("\x1b[3\nbroken sequence\n");                    // the line end cuts it short
+    v2->append("\x1b[31;1\x1b[0mlost\n");
+    v2->append("a\x1b[38:2:1:2:3\xc3\xa9z\n");                  // a byte that cannot be part of a sequence is text
+    v2->append("x\x1b]0;never ended");
+    char* longStr = (char*) asys.alloc(2300);
+    memset(longStr, 'q', 2200);
+    longStr[2200] = 0;
+    v2->append(longStr);                                         // the string is dropped after 2000 bytes
+    v2->append("\n");
+    asys.free(longStr);
+    for (int i = 0; i < v2->lineCount(); i++) {
+        char* t = v2->lineText(i);
+        if (strlen(t) > 60) { printf("%d [%d bytes: %.4s...]\n", i, strlen(t), t); }
+        else { printf("%d [%s]\n", i, t); }
+    }
+
+    // 4. a line that never ends
+    gcode.OutputView* v3 = mk(&w, "long");
+    settle();
+    char* big = (char*) asys.alloc(10001);
+    memset(big, 'x', 10000);
+    big[10000] = 0;
+    v3->append(big);
+    printf("10000 bytes without a line end: %d lines already\n", v3->lineCount());
+    v3->append("\n");
+    printf("then the line end: %d lines, lengths", v3->lineCount());
+    for (int i = 0; i < v3->lineCount(); i++) { printf(" %d", strlen(v3->lineText(i))); }
+    printf("\n");
+    asys.free(big);
+    // the cut falls inside a two-byte character: it moves after it
+    gcode.OutputView* v4 = mk(&w, "utf8");
+    settle();
+    char* u = (char*) asys.alloc(4100);
+    memset(u, 'x', 3999);
+    u[3999] = 0;
+    v4->append(u);
+    v4->append("\xc3\xa9\xc3\xa9\xc3\xa9\n");
+    asys.free(u);
+    printf("a long line with characters at the cut: %d lines, lengths", v4->lineCount());
+    bool ok = true;
+    for (int i = 0; i < v4->lineCount(); i++) { printf(" %d", strlen(v4->lineText(i))); if (!validUtf8(v4->lineText(i))) { ok = false; } }
+    printf(", every line valid UTF-8: %d\n", ok);
+    settle();
+
+    // 5. the view still paints (clipped lines of 4000 bytes, a cut in a character at the right edge)
+    gcode.OutputView* v5 = mk(&w, "paint");
+    settle();
+    char* wide = (char*) asys.alloc(1000);
+    for (int i = 0; i < 200; i++) { wide[i * 2] = 0xC3; wide[i * 2 + 1] = 0xA9; }
+    wide[400] = 0;
+    v5->append("\x1b[31m");
+    v5->append(wide);
+    v5->append("\x1b[0m end\n");
+    asys.free(wide);
+    settle();
+    printf("a line of 200 two-byte characters is painted: %d\n", v5->lineCount());
+    return 0;
+}

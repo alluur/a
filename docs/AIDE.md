@@ -9,7 +9,8 @@ AOS repository (`aide`, about 6000 lines, one file; manual `docs/AIDE.md` there)
 Linux terminals, and uses everything below: `asys`, `acode`, `asyntax`, `atheme`, `aproject`, `afind` and the toolkit of [TUI.md](TUI.md). It has its own tests
 (`tests/aide_tui_test.py` in the AOS repository: 90 tests in pseudo terminals, among them a random session of 500 keys, mouse events and resizes; and
 the QEMU tests `aide` and `aide-gui`). The GUI front end (`user/gui/aide-gui.a`) does not exist yet. The libraries contain no user interface code: everything
-that draws or reads the keyboard is the front end's job.
+that draws or reads the keyboard is the front end's job. The widgets of the GUI front end are the module `gcode` (section 13; tests `t240` ... `t267`),
+and `examples/gui/codedemo.a` assembles them into a small working editor.
 
 Contents
 
@@ -25,6 +26,7 @@ Contents
 10. [AOS notes](#10-aos-notes)
 11. [Tests and measurements](#11-tests-and-measurements)
 12. [Known limitations](#12-known-limitations)
+13. [The GUI widgets: gcode](#13-the-gui-widgets-gcode)
 
 ---
 
@@ -422,3 +424,57 @@ distances).
   kept in size-class free lists and reused. After a 24 MB text was edited and dropped, about 90 MB stayed mapped (in use: 0).
 * Processes need `fork`/`execve`: not on Windows. `Job` merges standard error into standard output.
 * Not tested here: files over 2 GiB (`maxLoad` defaults to 1 GiB), real ARM64 / RISC-V / LoongArch hardware (everything runs under qemu-user).
+
+## 13. The GUI widgets: gcode
+
+`import gcode;` puts the engine above on the screen as widgets of the A toolkit (`gui`, `guix`, `gfx`): the full description of every widget,
+its keys and its callbacks is in [GUI.md](GUI.md#the-code-editor-widgets-gcode). Here is how the pieces fit together.
+
+```
+ CodeEditor ---- Doc ---- acode.Buffer + acode.Editor (cursors, undo)      Look: atheme.Theme, font, preferences
+   draws only      |       asyntax.Highlighter (tokens of visible lines)       |  every widget registers with it:
+   the visible     |       markers (diagnostics), bookmarks                    |  a theme change repaints them all
+   lines           +--- asyntax.Completer (words of every open Doc)
+ FindBar -- afind.Finder      Outline -- asyntax.symbols      EditorStatus -- Buffer fields (eol, bom, binary)
+ FileTree -- aproject.FileTree + Ignore + Watcher             OutputPane -- aproject.Job / BuildJob + Problem
+ Palette -- aproject.QuickOpen (files) or your own list       ThemeEditor / SettingsDialog -- atheme.Theme / Settings
+```
+
+The way a front end is written with them (this is `examples/gui/codedemo.a`):
+
+1. One `Doc` per open file; the tab bar holds the `Doc*` as the user data of each tab, and the editor shows the selected one (`editor->setDoc`).
+2. The editor tells the others through `editor->observe(f, user)` (events `EV_CHANGE`, `EV_CURSOR`, `EV_SCROLL`, `EV_DOC`): the status bar, the
+   outline and the modified dot of the tab follow it without the editor knowing about them.
+3. Files open from `FileTree.onOpen`, from the palette (`Palette.showFiles` on an `aproject.QuickOpen` index) or from a dialog. Saving is
+   `doc->save(null)`; the Look decides whether trailing white space is trimmed and a final line break is added.
+4. A build is an `aproject.BuildJob` that `OutputPane.attachBuild` follows from the event loop (a timer, never blocking); when it ends the problems
+   become markers in the open documents (`doc->addMark`), and a click on a problem opens the file and calls `editor->gotoLine`.
+5. Keys that belong to the whole window (Ctrl+S, Ctrl+Shift+P ...) are commands in a `Commands` registry that `install(window)` puts in front of the
+   focused widget; the user's own bindings come from the `[keys]` section of `settings.ini`.
+6. Settings and themes: `Look.applySettings` at start, `SettingsDialog` and `ThemeEditor` change the Look live, `Look.storeSettings` +
+   `Settings.save` at exit; user themes are files in the theme directory.
+
+Performance facts (checked by `t243`): drawing and lexing touch only the rows in view (`Highlighter.tokens` per visible line), an edit
+repaints only the rows it changed (or the rows below when the lexer state at the start of the next line changed), the word highlight scans
+the visible lines (no regular expression), the bracket match is looked up only when a bracket is next to the caret, and the completion popup
+is computed after a 100 ms pause (it reads the whole document) and then filtered locally while the user types. Opening a 100 000 line file,
+jumping to its end and typing at several places lexes each line once.
+
+The tests: `t240` typing / selecting / undo / clipboard / multiple cursors, `t241` mouse, `t242` drawing (pixel checks of every highlight, wrap,
+guides, two themes), `t243` 100 000 lines and a 100 000 character line, `t244` completion, `t245` the Look (nine themes, fonts, settings),
+`t246` file tree on a temporary project, `t247` tab bar, `t248` find / replace / go to line, `t249` status bar and outline, `t250` output pane
+and a real build job, `t251` terminal pane, `t252` colour picker, `t253` theme editor, `t254` settings dialog, `t255` dock, `t256` commands and
+palette, `t257` the whole `codedemo` application driven like a user (open, edit, save, find, palette, build with errors, jump, close with a
+question), `t258` random input with invariants and undo, `t259` columns of odd characters against `acode`, shared documents, CRLF saving. Added after the review: `t260` the find bar follows a tab
+switch / a closed tab, `t261` fonts that cannot be used (no height, damaged) and odd fonts, `t262` completion in big files (linear time, the
+rescan rule, duplicates, order), `t263` dialogs that are opened and closed leave nothing behind (documents, Look users, `onClosed`),
+`t264` escape sequences and colour runs after UTF-8 in the output view, `t265` key values that are not text, the tab wheel, multi-letter
+type-ahead, `t266` the terminal pane collects its programs (no zombies), `t267` small windows (the dock, the find bar, the demo).
+All of them run the display server inside the test (Headless backend), type and click through it, and compare pixels and checksums; they pass on
+the five targets (the ones that start processes print "processes can be started: 0" on Windows: `.out.windows`).
+
+Known limitations of the GUI widgets (in addition to section 12): no code folding or minimap; word wrap breaks at a column; two editors on one
+`Doc` share cursors; the font is the 13 pixel DejaVu (or the configured font file) and characters above Latin-1 are drawn as `?`; the menu bar
+and the standard dialogs of `guix` are not themed; the completion candidates come from `asyntax.Completer` (words, symbols, keywords: no type
+information); `FileTree` deletes files and empty folders only; the terminal pane needs a pseudo terminal (Linux and Android).
+

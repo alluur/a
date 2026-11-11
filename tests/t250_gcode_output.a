@@ -1,0 +1,191 @@
+// gcode.OutputPane: build output with ANSI colours, long and partial lines, following the end, the list of problems, click to jump
+// (from a problem and from an output line), a real build job (stdout, stderr, diagnostics, exit code, Stop), Clear
+import wsrv;
+import gui;
+import guix;
+import gcode;
+import aproject;
+import atheme;
+import asys;
+import adp;
+import gfx;
+#include "gcode_harness.inc"
+
+gcode.OutputPane* pane;
+gui.Window* w;
+gcode.Look* look;
+int jumps = 0;
+int finished = 0;
+
+int onJump(int p) { jumps++; return 0; }
+int onFinished(int p) { finished++; return 0; }
+
+// the centre of a row of the output view / problems list
+int rowY(gcode.RowList* l, int i) { return l->headerH + (i - l->top) * l->rowH + l->rowH / 2; }
+
+// does a row contain a pixel of a colour (somewhere in its first 560 pixels)?
+bool rowHas(gcode.RowList* l, int i, int color) {
+    int y0 = l->absY() + l->headerH + (i - l->top) * l->rowH;
+    for (int y = y0; y < y0 + l->rowH; y++) {
+        for (int x = l->absX(); x < l->absX() + 560; x++) {
+            if (w->surf->get(x, y) == color) { return true; }
+        }
+    }
+    return false;
+}
+
+void dump(char* label) {
+    printf("%s: %d lines\n", label, pane->output->lineCount());
+    for (int i = 0; i < pane->output->lineCount() && i < 12; i++) {
+        printf("  %d [%s] severity %d\n", i, pane->output->lineText(i), pane->output->lineSeverity(i));
+    }
+}
+
+int main() {
+    startServer(7350, "t250");
+    w = d->createWindow("Output", 640, 300, 0);
+    look = gcode.theLook();
+    look->setThemeName("dark");
+    pane = new gcode.OutputPane();
+    pane->onJump = onJump;
+    pane->onFinished = onFinished;
+    gui.Box* col = gui.vbox(0, 0);
+    col->add(pane);
+    w->setRoot(col);
+    settle();
+    printf("the Output view is shown, Problems hidden: %d %d\n", pane->output->visible, !pane->problems->visible);
+
+    // text arrives in pieces; a line is finished by its line break
+    pane->append("abc");
+    pane->append("def\nsecond");
+    dump("two pieces of text");
+    pane->append(" line\n");
+    printf("lines now %d, line 2 is [%s]\n", pane->output->lineCount(), pane->output->lineText(1));
+    pane->clear();
+    pane->append("progress 10%\rprogress 100%\r\ndone\tx\n");
+    dump("a carriage return writes over the line; tabs become spaces");
+
+    // colours: ANSI codes are not shown; the colour is used (31 = red = the error colour of the theme)
+    pane->clear();
+    pane->append("plain \x1b[31mred\x1b[0m plain \x1b[1;32mgreen bold\x1b[0m \x1b[38;2;10;200;250mtrue colour\x1b[0m \x1b[38;5;208morange\x1b[0m\n");
+    dump("colours");
+    settle();
+    printf("red text drawn in the error colour: %d\n", rowHas(pane->output, 0, look->col(atheme.Col.Error)));
+    printf("24 bit colour drawn: %d\n", rowHas(pane->output, 0, 0xFF0AC8FA));
+    printf("256 colour (orange 208 = ff8700): %d\n", rowHas(pane->output, 0, 0xFFFF8700));
+
+    // diagnostics are recognised
+    pane->clear();
+    pane->append("compiling main.a\nmain.a:3:5: error: unknown name\nutil.a:10: warning: unused variable\nnote: all done\n");
+    dump("diagnostic lines");
+    settle();
+    printf("error line drawn in the error colour: %d, warning colour: %d\n", rowHas(pane->output, 1, look->col(atheme.Col.Error)), rowHas(pane->output, 2, look->col(atheme.Col.Warning)));
+
+    // a click on a diagnostic line (double click or Enter) jumps there
+    pane->output->dblMs = 100000;
+    clickWd(w, pane->output, 100, rowY(pane->output, 1));
+    printf("a single click selects: jumps %d, selected %d\n", jumps, pane->output->selected);
+    hb->click(screenX(w, pane->output, 100), screenY(w, pane->output, rowY(pane->output, 1)));
+    settle();
+    printf("double click: jumps %d, path %s, line %d, column %d\n", jumps, pane->jumpPath, pane->jumpLine, pane->jumpCol);
+    pane->output->select(2);
+    key(adp.KEY_ENTER, 13);
+    printf("Enter on the warning: path %s, line %d, column %d\n", pane->jumpPath, pane->jumpLine, pane->jumpCol);
+    pane->output->select(0);
+    key(adp.KEY_ENTER, 13);
+    printf("Enter on a line without a place: jumps %d\n", jumps);
+
+    // many lines: the oldest are dropped; the view follows the end
+    pane->clear();
+    pane->output->maxLines = 100;
+    for (int i = 1; i <= 250; i++) {
+        char l[40];
+        format(&l[0], 40, "line %d\n", i);
+        pane->append(&l[0]);
+    }
+    settle();
+    printf("250 lines with a limit of 100: %d kept, the first is [%s], the last [%s]\n", pane->output->lineCount(), pane->output->lineText(0), pane->output->lineText(pane->output->lineCount() - 1));
+    printf("the view shows the end: %d\n", pane->output->top + pane->output->visibleRows() >= pane->output->lineCount());
+    wheelWd(w, pane->output, 100, 100, 3);
+    int t0 = pane->output->top;
+    pane->append("one more\n");
+    printf("scrolled up by hand: new text does not scroll (top %d -> %d)\n", t0, pane->output->top);
+    pane->output->maxLines = 5000;
+
+    // problems
+    pane->clear();
+    pane->addProblem("src/main.a", 3, 5, gcode.SEV_ERROR, "unknown name");
+    pane->addProblem("src/util.a", 10, 0, gcode.SEV_WARNING, "unused variable");
+    pane->addProblem("src/main.a", 20, 1, gcode.SEV_ERROR, "missing semicolon");
+    pane->addProblem("docs/x.md", 2, 0, gcode.SEV_NOTE, "a note");
+    printf("problems: %d errors, %d warnings\n", pane->errorCount(), pane->warningCount());
+    clickWd(w, pane->bProb, 20, 12);
+    printf("the Problems tab: shown %d, output hidden %d, rows %d\n", pane->problemsShown(), !pane->output->visible, pane->problems->rowCount());
+    int jumpsBefore = jumps;
+    clickWd(w, pane->problems, 100, rowY(pane->problems, 2));
+    printf("a click on a problem jumps: %d, %s line %d column %d\n", jumps - jumpsBefore, pane->jumpPath, pane->jumpLine, pane->jumpCol);
+    pane->problems->select(1);
+    key(adp.KEY_ENTER, 13);
+    printf("Enter: %s line %d\n", pane->jumpPath, pane->jumpLine);
+    printf("error icon drawn in the error colour: %d, warning: %d\n", rowHas(pane->problems, 0, look->col(atheme.Col.Error)), rowHas(pane->problems, 1, look->col(atheme.Col.Warning)));
+    clickWd(w, pane->bOut, 20, 12);
+    printf("back to Output: %d\n", pane->output->visible);
+
+    // a real build: stdout and stderr in the output, diagnostics in the problems, the exit code
+    printf("processes can be started: %d\n", asys.canSpawn());
+    if (asys.canSpawn()) {
+        pane->clear();
+        aproject.BuildJob* job = new aproject.BuildJob();
+        char* argv[5];
+        argv[0] = "/bin/sh";
+        argv[1] = "-c";
+        argv[2] = "echo compiling; echo 'main.a:3:5: error: unknown name' >&2; echo 'main.a:8: warning: unused'; exit 3";
+        argv[3] = null;
+        int r = job->startCommand(&argv[0], null);
+        printf("started: %d\n", r);
+        pane->attachBuild(job);
+        printf("running: %d, Stop is enabled: %d\n", pane->jobRunning, pane->bStop->enabled);
+        for (int i = 0; i < 400 && pane->jobRunning; i++) { d->pump(25); }
+        settle();
+        printf("finished: %d, running %d, exit code %d\n", finished, pane->jobRunning, pane->exitCode);
+        dump("job output");
+        printf("problems: %d errors, %d warnings, first: %s:%d\n", pane->errorCount(), pane->warningCount(), pane->problems->pathAt(0), pane->problems->lineAt(0));
+        printf("status: [%s], Problems tab: [%s], Stop enabled %d\n", pane->status->text, pane->bProb->text, pane->bStop->enabled);
+
+        // Stop: a job that would run for a long time
+        pane->clear();
+        aproject.BuildJob* job2 = new aproject.BuildJob();
+        argv[0] = "/bin/sh";
+        argv[1] = "-c";
+        argv[2] = "echo started; sleep 30";
+        argv[3] = null;
+        job2->startCommand(&argv[0], null);
+        pane->attachBuild(job2);
+        for (int i = 0; i < 100 && pane->output->lineCount() == 0; i++) { d->pump(25); }
+        printf("running, first line [%s]\n", pane->output->lineText(0));
+        clickWd(w, pane->bStop, 20, 12);
+        for (int i = 0; i < 400 && pane->jobRunning; i++) { d->pump(25); }
+        printf("after Stop: running %d, finished %d, last line [%s]\n", pane->jobRunning, finished, pane->output->lineText(pane->output->lineCount() - 1));
+        pane->detachJob();
+        job->dispose();
+        job2->dispose();
+    }
+
+    // Clear
+    pane->append("something\n");
+    pane->addProblem("a.a", 1, 1, gcode.SEV_ERROR, "x");
+    clickWd(w, pane->bClear, 20, 12);
+    printf("Clear: %d lines, %d problems\n", pane->output->lineCount(), pane->problems->problemCount());
+
+    // pictures in two themes
+    pane->append("plain\n\x1b[31mred error text\x1b[0m\n\x1b[32mgreen\x1b[0m \x1b[33myellow\x1b[0m \x1b[34mblue\x1b[0m\nmain.a:3:5: error: unknown name\nutil.a:10: warning: unused variable\n");
+    pane->addProblem("src/main.a", 3, 5, gcode.SEV_ERROR, "unknown name");
+    pane->updateStatus();
+    settle();
+    printf("dark screenshot %u\n", shot(w));
+    look->setThemeName("light");
+    settle();
+    printf("light screenshot %u\n", shot(w));
+    look->setThemeName("dark");
+    return 0;
+}
