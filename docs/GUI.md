@@ -36,10 +36,11 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `tls`, `x509` | TLS 1.3 client and server and certificate checking, for `https://` in `gnet.Fetch` and `abrowse` (see [TLS.md](TLS.md)) |
 | `gimg` | colour images: load PNG, BMP and PPM, save PNG, smooth scaling |
 | `gterm` | a terminal emulator widget (pseudo terminal, ANSI/xterm escape sequences) |
+| `gcode` | the widgets of the AIDE code editor: `CodeEditor`, `FileTree`, `TabBar`, `FindBar`, `GotoBar`, `StatusBar`, `OutputPane`, `TerminalPane`, `Outline`, `ColorPicker`, `ThemeEditor`, `SettingsDialog`, `Dock`, `Commands`, `Palette` (see [below](#the-code-editor-widgets-gcode)) |
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t129`, `tests/gui.sh`, `tests/https.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t129`, `t240`-`t259` (gcode), `tests/gui.sh`, `tests/https.sh`.
 
 ## Quick start
 
@@ -149,6 +150,10 @@ text widgets use Ctrl+A / C / X / V. `gui.messageBox(d, title, text)` shows a sm
 `onKey`, `prefW`, `prefH`; see `Swatch` in `examples/gui/paint.a`.
 
 **Your own loop**: instead of `d->run()` call `d->pump(ms)` (handles events for up to `ms`) in a loop.
+
+**Small extras**: `d->ping(n)` asks the server to answer with the same number (`d->lastPong`): when it arrives the server has handled everything
+the client sent before (the gcode tests use it to wait for big windows); a `TextBox` has optional colours (`colBack colText colSel colBorder
+colAccent colDim`, 0 = the standard theme) and inserts any Unicode code point.
 
 ## More widgets: `guix`
 
@@ -421,6 +426,91 @@ runs a command and closes when it ends. Ctrl+Shift+N opens another window, Ctrl+
 Two small additions to `gui` made it possible: `d->watch(fd, f, arg)` calls `int f(int arg)` whenever a file descriptor
 (a pipe, a pseudo terminal, a socket) is readable inside the event loop (`d->unwatch(fd)`), and `d->requestPasteTo(widget)`
 asks the clipboard and calls `widget->onPaste(text)`.
+
+## The code editor widgets: `gcode`
+
+`import gcode;` - the widgets of the AIDE code editor (see [AIDE.md](AIDE.md) for the engine they sit on: `acode` buffers and editors,
+`asyntax` highlighting, `atheme` themes, `aproject` project tree and build jobs, `afind` search). `examples/gui/codedemo.a` assembles all of
+them into a small editor window (menu bar, sidebar with files and outline, tabs, editor, find / go to line bars, build output, terminal, status
+bar, command palette, theme editor and settings); it is the base of the real AIDE GUI.
+
+```c
+import gui;  import gcode;
+gui.Display* d = gui.connect(null);
+gui.Window* w = d->createWindow("Editor", 800, 500, 0);
+gcode.CodeEditor* e = new gcode.CodeEditor();       // has an empty document of its own
+e->open("main.a");                                  // 0 or -errno; language and indentation are detected
+gui.Box* col = gui.vbox(0, 0);   col->add(e);   w->setRoot(col);   w->setFocus(e);
+gcode.theLook()->setThemeName("monokai");           // every gcode widget changes its colours at once
+d->run();
+```
+
+All widgets take their colours (and the editors their font) from a `gcode.Look`; `gcode.theLook()` is the shared one. A theme change
+(`look->setThemeName("nord")`, `look->setTheme(t)`, or edit `look->theme` and call `look->refresh()`) repaints every registered widget at once;
+`look->setFontIndex(gcode.FONT_SANS)` or `setFontFile(path)` changes the font, `look->setLineGap(n)` the line spacing. Preferences (`tabWidth
+insertSpaces lineNumbers wordWrap autoIndent trimOnSave finalNewline showWhitespace indentGuides highlightLine highlightWord matchBrackets blink
+autoComplete`) are fields of the Look; `look->changed()` tells the editors to copy them. `look->applySettings(settings)` / `storeSettings` convert
+to and from `atheme.Settings` (which has a `font` entry for this: `mono`, `sans`, `sansbold` or the path of a font file).
+User themes are `NAME.ini` files in `gcode.themeDirectory()` (`<config dir>/themes`, or the directory given to `setThemeDirectory`).
+
+### Documents and the editor
+
+* **`Doc`**: a buffer, its `acode.Editor` (cursors, undo), an `asyntax.Highlighter`, the language, diagnostics and bookmarks. `doc->open(path)`,
+  `save(path or null)` (atomic; trims / adds the final newline according to the Look), `setText`, `setLanguage`, `isModified()`,
+  `addMark(line, col, len, SEV_ERROR, "text")` (gutter marker + squiggle), `toggleBookmark(line)`. Markers and bookmarks follow the lines when
+  text is inserted or deleted above them. The tabs of an IDE are Docs: `editor->setDoc(doc)` shows another one and keeps the scroll position of the
+  old one in it. All Docs share one `gcode.completer()`.
+* **`CodeEditor`** (a `gui.Widget`, flex 1): gutter with line numbers (current line lit), bookmark and error / warning markers; syntax colours from
+  the theme; blinking caret; selections, current line, find matches, other uses of the word at the caret and the matching bracket drawn behind
+  the text; inline squiggles; indentation guides and white space marks (options); horizontal scroll or word wrap (`setWordWrap`); scroll bars
+  and wheel; a completion popup; a context menu (`editor->menu`, add your own items); read-only mode (`setReadOnly`). Only the visible lines are
+  drawn and lexed, and an edit repaints only the rows that changed: a 100 000 line file scrolls and takes input like a small one.
+* **Keys**: arrows, Shift extends, Ctrl = by word, Home / End (smart), Ctrl+Home / End, PgUp / PgDn, Tab / Shift+Tab (indent / outdent a
+  selection of lines), Enter (auto indent), Backspace / Delete (Ctrl: by word), Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z, Ctrl+C / X / V (the display
+  server's clipboard), Ctrl+A, Ctrl+D (next occurrence), Ctrl+L (line), Ctrl+/ and Ctrl+Shift+/ (comments), Ctrl+] / [ (indent), Ctrl+Shift+D
+  (duplicate), Ctrl+Shift+K (delete line), Ctrl+J (join), Alt+Up / Down (move lines), Alt+Shift+Up / Down (copy lines), Ctrl+Alt+Up / Down (more
+  cursors), Ctrl+Up / Down (scroll), Ctrl+Space (completion), Ctrl+F2 / F2 / Shift+F2 (bookmarks), Esc (extra cursors, selection, popup). UTF-8 text
+  of any code point can be typed. Keys the editor does not use (Ctrl+S, Ctrl+F ...) go on to the window: see `Commands` below.
+* **Mouse**: click, double click (word), triple click (line), drag (a double or triple click then drag selects by words or lines), Shift+click,
+  Ctrl+click (another cursor), Alt+drag (rectangular selection), wheel (Shift: sideways), scroll bar thumbs and tracks, gutter (left strip:
+  bookmark; numbers: select line, drag for several), right click (context menu), dragging outside scrolls. `doubleClickMs` is the click interval.
+* **Callbacks and observers**: `onChange`, `onCursor`, `onScroll`, `onGutter`, `onContextMenu` (`int f(int editor)`); several widgets can listen
+  at once through `editor->observe(f, user)` with `f(user, editor, event)` and `EV_CHANGE | EV_CURSOR | EV_SCROLL | EV_DOC`.
+* **Completion**: Ctrl+Space, or by itself (`autoComplete`, after `completeDelayMs` = 100 ms of silence, two letters). Candidates are the keywords of the
+  language, the symbols and the words of every open Doc; Up / Down / PgUp / PgDn / Tab / Enter / Esc, a click on a row; typing narrows the list.
+* **Programmatic use**: `gotoLine(line, col)`, `select(a, b)`, `revealCaret()`, `centerLine`, `setFindHighlight(pattern, afind options)`, `scrollRows`,
+  `setFirstLine`, `cmdCopy / cmdPaste / cmdUndo ...`, `getText()`, `getSelectedText()`, `pointOfOffset(off, &x, &y)` and `offsetAtPoint(x, y)`
+  (used by the tests), `touch()` after you changed the buffer or the cursors yourself.
+
+### Panels and bars
+
+| Widget | What it does |
+|---|---|
+| `FileTree` | project explorer on `aproject.FileTree`: lazy folders, `.gitignore` rules, icons by file type drawn with gfx primitives, keyboard (arrows, Right / Left, Enter, Home / End, type-ahead, F2 rename, Del delete, F5), filter box (also searches folders that were never opened), inline name field for new file / new folder / rename, delete with a confirmation dialog (non-empty folders are refused), context menu, refresh by polling (`pollNow()`; a timer calls it every 1.5 s), `onOpen(tree)` with `tree->openedPath`, `revealRel("src/main.a")` |
+| `TabBar` | tabs (`addTab(title, userData)`), modified dot, close buttons, middle click closes, `onClose` can veto, neighbour selection after a close, drag to reorder (`onMove`), overflow arrows + list of all tabs, right click (`onTabContext`) |
+| `FindBar` | find / replace panel on `afind`: incremental, Enter / Shift+Enter, "3 of 12" count, case / whole word / regular expression / in selection toggles (Alt+C / W / R), invalid expression shown, Replace, Replace All (one undo step), highlights in the editor, Esc closes; follows the document the editor shows |
+| `GotoBar` | `12`, `12:5`, `+10`, `-3` (`gcode.parseGoto`) |
+| `StatusBar` + `EditorStatus` | sections with clicks; the editor status shows position, selection / cursors, tabs or spaces (click toggles), encoding, line ends (click cycles), language, read-only |
+| `Outline` | the symbols of the document (`asyntax.symbols`): kind badges, filter box, click jumps, follows the caret, refreshes after edits and when the document or its language changes |
+| `OutputPane` | build output with ANSI colours (16, 256 and 24-bit), carriage returns, a line limit, follow-the-end; diagnostics are recognised and coloured; **Problems** list; click or Enter on a problem (or a `file:line:col:` line) calls `onJump(pane)` with `jumpPath / jumpLine / jumpCol` (1 based); `attachBuild(aproject.BuildJob*)` follows a running job (Stop, Clear, exit code) |
+| `TerminalPane` | a `gterm.Terminal` in the colours of the theme: `start(display, command)`, `feed`, `send`, `stop`, `onExit` (Linux and Android) |
+| `PanelTabs`, `Dock` | tabs over pages; the docking layout sidebar \| centre / bottom panel with draggable dividers (minimum sizes, `showSidebar`, `showBottom`, `onLayout`) |
+| `Commands`, `Palette` | a registry of commands (`add(id, title, "ctrl+shift+p", f, user)`, `setKeys` with conflict check, `applySettings` / `storeSettings` for the user's `[keys]`), `install(window)` makes the window offer keys to the registry first (a menu bar keeps working behind it); `Palette` is the overlay for commands, files (`showFiles(window, aproject.QuickOpen*)`) or your own list, with fuzzy matching |
+| `ColorPicker` | hue bar, saturation / value square, R G B H S V sliders, hex field (`#rrggbb`, `0x`, names), swatches, old / new preview; `gcode.pickColor(display, title, rgb, f)` is a dialog |
+| `ThemeEditor` | a window that lists every theme colour and syntax style, edits them with the picker, shows a live preview editor and the contrast warnings of `Theme.validate`, loads / saves / duplicates / deletes user themes (built-in ones are protected), reverts, and applies every change to all open editors at once (`live`) |
+| `SettingsDialog` | tab width, spaces or tabs, line numbers, wrap, auto indent, trim on save, final newline, white space, guides, highlights, blink, completion, font, theme, line spacing: every control applies at once to the Look and the open documents, and updates the `atheme.Settings` |
+| `RowList`, `FlatButton`, `LineEdit`, `BarBox`, `BarLabel` | the themed building blocks (a list with scroll bar, a flat / toggle button, a `gui.TextBox` with theme colours and `onSpecial` for Esc / Up / Down / Tab / Alt+letter) |
+
+### Notes and limits
+
+* The editor draws on a grid of cells (the font's widest glyph); with `mono` (the default) every glyph fits, with `sans` the glyphs are centred
+  in their cells. Wide (CJK) characters take two cells, combining marks none; characters above Latin-1 show as `?` (the font has only Latin-1).
+  Bold is drawn by striking the text twice, italic is not drawn (the colour is).
+* Word wrap breaks at a column, not at a word. Code folding, a minimap, split views with separate cursors (two editors on one `Doc` share
+  its cursors) and bidirectional text are not there.
+* `guix.MenuBar` and the dialogs of `guix` keep the standard (light) look; the `gcode` widgets are themed.
+* The test pattern: `tests/gcode_harness.inc` runs the display server in the test process (`Headless`), moves the pointer, types and takes
+  window checksums; `settle()` sends a ping behind everything the client wrote, so big windows are finished before the test looks.
 
 ## The display server: `wsrv`
 
