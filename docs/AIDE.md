@@ -7,7 +7,7 @@ libraries (they are part of the A standard library, in `lib/`) and how the two f
 **State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`). The terminal front end exists: `user/aide.a` in the
 AOS repository (`aide`, about 6000 lines, one file; manual `docs/AIDE.md` there) runs on the AOS terminals (serial console, `aterm`, `telnetd`) and on
 Linux terminals, and uses everything below: `asys`, `acode`, `asyntax`, `atheme`, `aproject`, `afind` and the toolkit of [TUI.md](TUI.md). It has its own tests
-(`tests/aide_tui_test.py` in the AOS repository: about 80 tests in pseudo terminals, among them a random session of 500 keys, mouse events and resizes; and
+(`tests/aide_tui_test.py` in the AOS repository: 90 tests in pseudo terminals, among them a random session of 500 keys, mouse events and resizes; and
 the QEMU tests `aide` and `aide-gui`). The GUI front end (`user/gui/aide-gui.a`) does not exist yet. The libraries contain no user interface code: everything
 that draws or reads the keyboard is the front end's job.
 
