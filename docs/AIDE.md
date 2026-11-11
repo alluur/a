@@ -308,13 +308,28 @@ Missing in AOS, and what asys does:
 * Freed big blocks stay in the allocator (the kernel never takes `mmap` address space back); see the Memory paragraph of section 2.
 * `setMtime` is `-ENOSYS` and the AOS file system stores whole seconds: `Buffer.checkExternal` compares size and modification time,
   so a same-size rewrite within the same second as the load or save is not noticed. (`t207` waits a second on AOS for this reason.)
-* The AOS shell tools have no `head -c` and no `wc -c`; `t202` uses `head -n` and `wc -l`.
+* The AOS shell and its tools (`user/sh.a`, `user/box.a`) are small, which matters for `Job.startShell`, `RunJob` and the tests
+  that run shell commands: `sleep` takes whole seconds, `head` / `tail` have `-n` only (no `head -c`), `yes` never ends, `wc` pads
+  its numbers to a width of 7 (`wc -c` exists but prints `" 588895"`), and `head`, `tail`, `wc`, `sort` and the other filters read at most
+  1 MiB - 1 byte of their input first. The shell has no `$((..))` arithmetic, no `trap`, no `<&-`; it has `for ... in $(...)`,
+  `while`, `if`, `case`, pipes and redirections. `t202` and `t213` are written with these limits in mind (see below).
 * `execve` runs ELF files and `#!` scripts only (no fallback to the shell for a script without `#!`); `Job.startShell` needs
   `/bin/sh` to exist and to understand `-c`.
 * `fork` on AOS is a full copy of the address space (the kernel says so in `sys.a`: "a full copy is fine"), so starting a job from
   a big editor is slower than on Linux.
-* **What was not run on AOS**: the libraries were developed and tested on Linux (including all four CPU back ends under
-  qemu-user); the syscall list above was compared with the kernel source, not executed in an AOS image.
+* A process has at most 32 memory areas (`NVMA` in `kernel/proc.a`; the kernel never merges neighbours), and the image, the stack and
+  every `mmap` use one each. asys therefore maps its small-block chunks 2, 4, 8, 16, 32 MiB (the sizes double, then stay at
+  32 MiB) and carves blocks up to a quarter of a chunk (512 KiB growing to 8 MiB) from them; every live block that is bigger takes
+  one area of its own and freed ones are kept (not unmapped), so about 25 different big blocks can exist over the lifetime of a process
+  before `alloc` falls back to reusing a bigger free block or returns `null`. A front end that edits many huge files at once on AOS
+  should keep the number of 8 MiB+ blocks low (one `Buffer` needs a few: text, line index, history).
+* **What was run on AOS** (review round 2, QEMU without KVM, an image with the test programs and the compiler in it; the test
+  programs are the ordinary Linux x86-64 executables, AOS runs them unchanged; `t213` and `t219` find the compiler as `build/ac` in the
+  working directory, so the image had it as `/build/ac` and the tests were started from `/`): `t200` to `t219` all pass (`t202` and `t219` print one
+  extra line on the console, the kernel's note about the unimplemented `fchmod` that the compiler `ac` calls, and `t202` the AOS
+  shell's complaint about `exec 0<&-`; both are not part of the test's standard output, which equals the `.out` file), 20 000
+  cycles of `alloc(300000)` + `free` fit in 2 MB, and file names of 38 to 55 bytes are saved atomically. The libraries do not
+  have a front end on AOS yet (`aide` / `aide-gui` do not exist), so no interactive session was run.
 
 ## 11. Tests and measurements
 
@@ -341,7 +356,9 @@ Missing in AOS, and what asys does:
 | `t218_regressions` | temp file permissions and names (also at the name limit), extreme tab widths, `dispose()` of every class, 24 MB cycles, bounded walks; exact undo / redo after the history was trimmed (model based), whole-line paste into several cursors, out-of-range line numbers, glob worst cases, find in files `exceeded`, the old regex dialect |
 | `t219_aide_session` | a whole session through all modules: project, ignore rules, tree, quick open, find in files, buffer, editor, highlighter, symbols, completion, rename with undo, save, external change, watcher, settings, a real build with an error, the fix, the run |
 
-All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine). On Windows
+All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine) and, as
+plain x86-64 executables, in an AOS image (see section 10; `t202` and `t213` use other shell commands there: `seq` instead of
+`yes | head -c`, whole second sleeps, no `trap`, so a few numbers differ, the checks do not). On Windows
 `t202` and `t213` print that processes are not supported (`.out.windows`); the other tests run unchanged.
 
 Measured natively on one core of the development machine (x86-64, a virtual machine; the numbers vary by 30 % from run to
