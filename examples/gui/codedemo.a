@@ -1,0 +1,646 @@
+// A small code editor made of the gcode widgets: the base of the AIDE GUI.   ADISPLAY=0 ./codedemo [file or folder]
+//   Sidebar: file explorer and outline.  Centre: tabs, the editor, find / replace and go to line bars.  Bottom: build output and
+//   problems, a terminal.  Menu bar, status bar, command palette (Ctrl+Shift+P), quick open (Ctrl+P), go to symbol (Ctrl+Shift+O),
+//   theme editor and settings (View menu).  Ctrl+N new, Ctrl+O open, Ctrl+S save, Ctrl+W close, Ctrl+F find, Ctrl+H replace,
+//   Ctrl+G go to line, F7 build the current file with the A compiler, F5 build and run in the terminal, Ctrl+B / Ctrl+J show or
+//   hide the sidebar / bottom panel, Ctrl+Q quit.
+import gui;
+import guix;
+import adp;
+import asys;
+import acode;
+import asyntax;
+import atheme;
+import aproject;
+import gcode;
+
+class CodeDemo {
+    public gui.Display* display;
+    public gui.Window* win;
+    public gcode.CodeEditor* editor;
+    public gcode.TabBar* tabs;
+    public gcode.FileTree* tree;
+    public gcode.Outline* outline;
+    public gcode.OutputPane* output;
+    public gcode.TerminalPane* terminal;
+    public gcode.PanelTabs* sidePanel;
+    public gcode.PanelTabs* bottomPanel;
+    public gcode.Dock* dock;
+    public gcode.FindBar* find;
+    public gcode.GotoBar* gotoBar;
+    public gcode.EditorStatus* status;
+    public gcode.Commands* commands;
+    public gcode.Palette* palette;
+    public atheme.Settings* settings;
+    public char* settingsPath;
+    public char* projectDir;
+    public aproject.QuickOpen* quick;
+    public aproject.Ignore* ignore;
+    public aproject.BuildJob* job;
+    public int untitled;
+    public int builds;
+    public bool runAfterBuild;
+    public char* builtProgram;
+    public char* compilerPath;              // the A compiler to run (null: ac is looked for in $AC, $PATH and the usual places)
+    private gcode.Doc* closing;             // the document that is about to be closed (waiting for the answer to a question)
+    private bool quitting;
+    private char* menuIds[40];              // the command behind every menu item (the item's id is its index + 1)
+    private int nMenu;
+
+    // the application: a window in the display, with the project in dir (or null) and the settings in settingsFile (or null)
+    public CodeDemo(gui.Display* d, char* dir, char* settingsFile) {
+        display = d;
+        settings = new atheme.Settings();
+        settingsPath = (settingsFile != null) ? asys.strDup(settingsFile) : null;
+        if (settingsPath != null) { settings->load(settingsPath); }
+        gcode.Look* look = gcode.theLook();
+        look->applySettings(settings);
+        projectDir = asys.strDup((dir != null) ? dir : ".");
+        build();
+        projectChanged();
+    }
+
+    // ---- building the window ------------------------------------------------------------------------------------------------------------
+    private void build() {
+        win = display->createWindow("codedemo", 1000, 700, 0);
+        win->userData = (int) this;
+        win->onClose = demoClose;
+        editor = new gcode.CodeEditor();
+        tabs = new gcode.TabBar();
+        tabs->onSelect = demoTabSelected;
+        tabs->onClose = demoTabClose;
+        tabs->userData = (int) this;
+        find = new gcode.FindBar(editor);
+        gotoBar = new gcode.GotoBar(editor);
+        status = new gcode.EditorStatus(editor);
+        editor->onChange = demoEdited;
+        editor->userData = (int) this;
+        // the sidebar
+        tree = new gcode.FileTree();
+        tree->onOpen = demoTreeOpen;
+        tree->userData = (int) this;
+        outline = new gcode.Outline(editor);
+        sidePanel = new gcode.PanelTabs();
+        sidePanel->addPage("Files", tree);
+        sidePanel->addPage("Outline", outline);
+        // the bottom panel
+        output = new gcode.OutputPane();
+        output->onJump = demoJump;
+        output->onFinished = demoBuildDone;
+        output->userData = (int) this;
+        terminal = new gcode.TerminalPane();
+        bottomPanel = new gcode.PanelTabs();
+        bottomPanel->addPage("Output", output);
+        bottomPanel->addPage("Terminal", terminal);
+        // the centre
+        gui.Box* centre = gui.vbox(0, 0);
+        centre->add(tabs);
+        centre->add(editor);
+        centre->add(find);
+        centre->add(gotoBar);
+        dock = new gcode.Dock();
+        dock->setSidebar(sidePanel);
+        dock->setCenter(centre);
+        dock->setBottom(bottomPanel);
+        dock->bottomH = 180;
+        // commands, the menu bar and the palette
+        commands = new gcode.Commands();
+        addCommands();
+        commands->applySettings(settings);
+        gui.Box* root = gui.vbox(0, 0);
+        root->add(makeMenuBar());
+        root->add(dock);
+        root->add(status->bar);
+        win->setRoot(root);
+        commands->install(win);
+        palette = new gcode.Palette();
+        win->setFocus(editor);
+    }
+
+    private void cmd(char* id, char* title, char* keys, func f) {
+        commands->add(id, title, keys, f, (int) this);
+    }
+
+    private void addCommands() {
+        cmd("file.new", "File: New", "ctrl+n", cmdNew);
+        cmd("file.open", "File: Open...", "ctrl+o", cmdOpen);
+        cmd("file.save", "File: Save", "ctrl+s", cmdSave);
+        cmd("file.saveas", "File: Save As...", "ctrl+shift+s", cmdSaveAs);
+        cmd("file.close", "File: Close Tab", "ctrl+w", cmdClose);
+        cmd("file.quit", "File: Quit", "ctrl+q", cmdQuit);
+        cmd("edit.find", "Edit: Find", "ctrl+f", cmdFind);
+        cmd("edit.replace", "Edit: Replace", "ctrl+h", cmdReplace);
+        cmd("edit.goto", "Edit: Go to Line...", "ctrl+g", cmdGoto);
+        cmd("edit.comment", "Edit: Toggle Line Comment", "", cmdComment);
+        cmd("edit.bookmark", "Edit: Toggle Bookmark", "", cmdBookmark);
+        cmd("view.sidebar", "View: Toggle Sidebar", "ctrl+b", cmdSidebar);
+        cmd("view.bottom", "View: Toggle Bottom Panel", "ctrl+j", cmdBottom);
+        cmd("view.terminal", "View: Show Terminal", "ctrl+`", cmdTerminal);
+        cmd("view.wrap", "View: Toggle Word Wrap", "alt+z", cmdWrap);
+        cmd("view.theme", "View: Theme Editor...", "", cmdThemeEditor);
+        cmd("view.settings", "View: Settings...", "", cmdSettings);
+        cmd("go.commands", "Go: Command Palette", "ctrl+shift+p", cmdPalette);
+        cmd("go.files", "Go: Open File by Name...", "ctrl+p", cmdQuickOpen);
+        cmd("go.symbol", "Go: Symbol in File...", "ctrl+shift+o", cmdSymbols);
+        cmd("run.build", "Run: Build", "f7", cmdBuild);
+        cmd("run.run", "Run: Build and Run", "f5", cmdRun);
+    }
+
+    private gui.Widget* makeMenuBar() {
+        guix.MenuBar* bar = new guix.MenuBar();
+        guix.Menu* file = bar->addMenu("&File");
+        item(file, "New", "file.new");
+        item(file, "Open...", "file.open");
+        item(file, "Save", "file.save");
+        item(file, "Save As...", "file.saveas");
+        item(file, "Close Tab", "file.close");
+        file->addSeparator();
+        item(file, "Quit", "file.quit");
+        guix.Menu* edit = bar->addMenu("&Edit");
+        item(edit, "Find", "edit.find");
+        item(edit, "Replace", "edit.replace");
+        item(edit, "Go to Line...", "edit.goto");
+        edit->addSeparator();
+        item(edit, "Toggle Line Comment", "edit.comment");
+        item(edit, "Toggle Bookmark", "edit.bookmark");
+        guix.Menu* view = bar->addMenu("&View");
+        item(view, "Sidebar", "view.sidebar");
+        item(view, "Bottom Panel", "view.bottom");
+        item(view, "Terminal", "view.terminal");
+        item(view, "Word Wrap", "view.wrap");
+        view->addSeparator();
+        item(view, "Theme Editor...", "view.theme");
+        item(view, "Settings...", "view.settings");
+        guix.Menu* go = bar->addMenu("&Go");
+        item(go, "Command Palette", "go.commands");
+        item(go, "Open File by Name...", "go.files");
+        item(go, "Symbol in File...", "go.symbol");
+        guix.Menu* run = bar->addMenu("&Run");
+        item(run, "Build", "run.build");
+        item(run, "Build and Run", "run.run");
+        return bar;
+    }
+
+    private void item(guix.Menu* m, char* text, char* id) {
+        guix.MenuItem* it = m->add(text, demoMenuItem);
+        it->userData = (int) this;
+        gcode.Command* c = commands->find(id);
+        if (c != null && c->keys[0] != 0) { it->accelText = c->keys; }
+        menuIds[nMenu] = id;
+        nMenu++;
+        it->setId(nMenu);
+    }
+
+    public char* menuCommand(int id) { return (id >= 1 && id <= nMenu) ? menuIds[id - 1] : ""; }
+
+    // ---- documents --------------------------------------------------------------------------------------------------------------------
+    public gcode.Doc* currentDoc() { return (gcode.Doc*) tabs->dataOf(tabs->selected); }
+
+    public gcode.Doc* findDoc(char* path) {
+        for (int i = 0; i < tabs->tabCount(); i++) {
+            gcode.Doc* dd = (gcode.Doc*) tabs->dataOf(i);
+            if (dd->buf->path != null && streq(dd->buf->path, path)) { return dd; }
+        }
+        return null;
+    }
+
+    // opens a file in a tab (or shows the tab it is in already); returns false when it cannot be read
+    public bool openFile(char* path) {
+        gcode.Doc* have = findDoc(path);
+        if (have != null) {
+            tabs->select(tabs->indexOfData((int) have));
+            return true;
+        }
+        gcode.Doc* dd = new gcode.Doc();
+        int r = dd->open(path);
+        if (r < 0) {
+            status->setMessage(asys.errText(r));
+            dd->dispose();
+            return false;
+        }
+        int i = tabs->addTab(dd->title, (int) dd);
+        tabs->select(i);
+        showDoc(dd);
+        settings->addRecentFile(path);
+        return true;
+    }
+
+    public void newFile() {
+        gcode.Doc* dd = new gcode.Doc();
+        untitled++;
+        char name[40];
+        format(&name[0], 40, "untitled-%d", untitled);
+        dd->setTitle(&name[0]);
+        int i = tabs->addTab(dd->title, (int) dd);
+        tabs->select(i);
+        showDoc(dd);
+    }
+
+    // the editor shows a document, the window title follows
+    public void showDoc(gcode.Doc* dd) {
+        editor->setDoc(dd);
+        char t[300];
+        format(&t[0], 300, "%s - codedemo", dd->title);
+        win->setTitle(&t[0]);
+        editor->focusMe();
+    }
+
+    public void tabSelected() {
+        gcode.Doc* dd = currentDoc();
+        if (dd != null) { showDoc(dd); }
+    }
+
+    // the text of a document changed: the tab shows the modified marker
+    public void edited() {
+        int i = tabs->indexOfData((int) editor->doc);
+        if (i >= 0) { tabs->setModified(i, editor->doc->isModified()); }
+    }
+
+    public bool save() {
+        gcode.Doc* dd = currentDoc();
+        if (dd == null) { return false; }
+        if (dd->buf->path == null) {
+            saveAs();
+            return false;
+        }
+        int r = dd->save(null);
+        if (r < 0) {
+            status->setMessage(asys.errText(r));
+            return false;
+        }
+        edited();
+        status->setMessage("Saved");
+        return true;
+    }
+
+    public void saveAs() {
+        gcode.Doc* dd = currentDoc();
+        if (dd == null) { return; }
+        guix.saveFileArg(display, "Save as", projectDir, dd->title, demoSaveAnswer, (int) this);
+    }
+
+    // a tab is closed (the question is asked first when the document was changed); true when it is gone
+    public bool closeTab(int i) {
+        gcode.Doc* dd = (gcode.Doc*) tabs->dataOf(i);
+        if (dd == null) { return false; }
+        if (dd->isModified()) {
+            closing = dd;
+            char q[200];
+            format(&q[0], 200, "Close %s and lose the changes?", dd->title);
+            guix.confirmArg(display, "Unsaved changes", &q[0], demoCloseAnswer, (int) this);
+            return false;
+        }
+        dropTab(i);
+        return true;
+    }
+
+    public void dropTab(int i) {
+        gcode.Doc* dd = (gcode.Doc*) tabs->dataOf(i);
+        tabs->removeTab(i);
+        if (tabs->tabCount() == 0) { newFile(); }
+        if (dd != null && dd != editor->doc) { dd->dispose(); }
+    }
+
+    public void closeAnswered(bool yes) {
+        gcode.Doc* dd = closing;
+        closing = null;
+        if (!yes || dd == null) { return; }
+        int i = tabs->indexOfData((int) dd);
+        if (i < 0) { return; }
+        // the document shown in the editor may not be freed while the editor shows it: the editor moves to another one first
+        tabs->removeTab(i);
+        if (tabs->tabCount() == 0) { newFile(); }
+        if (dd != editor->doc) { dd->dispose(); }
+    }
+
+    public bool anyModified() {
+        for (int i = 0; i < tabs->tabCount(); i++) {
+            gcode.Doc* dd = (gcode.Doc*) tabs->dataOf(i);
+            if (dd->isModified()) { return true; }
+        }
+        return false;
+    }
+
+    // ---- the project ---------------------------------------------------------------------------------------------------------------------
+    private void projectChanged() {
+        tree->setRoot(projectDir);
+        ignore = new aproject.Ignore();
+        ignore->addBuiltin();
+        quick = new aproject.QuickOpen();
+        quick->index(projectDir, ignore);
+        newFile();
+        editor->setText("// Welcome to codedemo\nint main() {\n    println(\"Hello from A\");\n    return 0;\n}\n");
+        editor->doc->setLanguage(asyntax.Lang.A);
+        editor->doc->buf->markSaved();
+        edited();
+    }
+
+    // ---- commands ---------------------------------------------------------------------------------------------------------------------
+    public void openDialog() {
+        guix.openFileArg(display, "Open file", projectDir, demoOpenAnswer, (int) this);
+    }
+
+    public void showFind(bool replace) {
+        gotoBar->visible = false;
+        find->open(replace);
+    }
+
+    public void showGoto() {
+        find->visible = false;
+        gotoBar->open();
+    }
+
+    public void toggleSidebar() { dock->toggleSidebar(); }
+    public void toggleBottom() { dock->toggleBottom(); }
+
+    public void showTerminal() {
+        dock->showBottom(true);
+        bottomPanel->select(1);
+        if (!terminal->running()) { terminal->start(display, null); }
+        terminal->term->focusMe();
+    }
+
+    public void paletteCommands() { palette->showCommands(win, commands); }
+
+    public void paletteFiles() {
+        palette->onChoose = demoFileChosen;
+        palette->userData = (int) this;
+        palette->showFiles(win, quick);
+    }
+
+    public void paletteSymbols() {
+        outline->rebuild();
+        palette->clearItems();
+        char t[200];
+        for (int i = 0; i < outline->rowCount(); i++) {
+            outline->rowText(i, &t[0]);
+            palette->addItem(&t[0], asyntax.symKindName(outline->rowKind(i)), outline->rowLine(i));
+        }
+        palette->onChoose = demoSymbolChosen;
+        palette->onQuery = null;
+        palette->userData = (int) this;
+        palette->show(win, "Go to symbol");
+    }
+
+    // ---- building -----------------------------------------------------------------------------------------------------------------------
+    // compiles the current file with the A compiler; the messages go to the output pane, the errors become markers in the gutter
+    public bool startBuild(bool andRun) {
+        gcode.Doc* dd = currentDoc();
+        if (dd == null || dd->buf->path == null) {
+            status->setMessage("Save the file first");
+            return false;
+        }
+        if (dd->isModified() && !save()) { return false; }
+        for (int i = 0; i < tabs->tabCount(); i++) { ((gcode.Doc*) tabs->dataOf(i))->clearMarks(); }
+        output->clear();
+        dock->showBottom(true);
+        bottomPanel->select(0);
+        job = new aproject.BuildJob();
+        char exe[300];
+        format(&exe[0], 300, "%s.out", dd->buf->path);
+        asys.free(builtProgram);
+        builtProgram = asys.strDup(&exe[0]);
+        int r = -asys.ENOENT;
+        char* ac = (compilerPath != null) ? asys.strDup(compilerPath) : job->findCompiler();
+        if (ac != null) {
+            char* argv[6];
+            argv[0] = ac;
+            argv[1] = dd->buf->path;
+            argv[2] = "-o";
+            argv[3] = &exe[0];
+            argv[4] = null;
+            r = job->startCommand(&argv[0], null);
+            asys.free(ac);
+        }
+        if (r < 0) {
+            output->append("Cannot start the compiler (ac)\n");
+            return false;
+        }
+        runAfterBuild = andRun;
+        builds++;
+        output->attachBuild(job);
+        return true;
+    }
+
+    // the build ended: problems become markers in the open documents; a successful build is run when asked for
+    public void buildDone() {
+        for (int i = 0; i < output->problems->problemCount(); i++) {
+            gcode.Doc* dd = findDoc(output->problems->pathAt(i));
+            if (dd != null) {
+                dd->addMark(output->problems->lineAt(i) - 1, 0, 0, output->problems->severityAt(i), output->problems->messageAt(i));
+            }
+        }
+        if (output->errorCount() > 0) { output->showProblems(); }
+        if (runAfterBuild && output->exitCode == 0 && builtProgram != null) {
+            showTerminal();
+            terminal->stop();
+            terminal->start(display, builtProgram);
+        }
+        runAfterBuild = false;
+    }
+
+    // a place in a message of the compiler: open the file and go there (line and column 1 based)
+    public void jumpTo(char* path, int line, int col) {
+        if (!openFile(path)) { return; }
+        editor->gotoLine(line - 1, (col > 0) ? col - 1 : 0);
+    }
+
+    // ---- quitting --------------------------------------------------------------------------------------------------------------------------
+    public void saveSettings() {
+        gcode.theLook()->storeSettings(settings);
+        commands->storeSettings(settings);
+        if (settingsPath != null) { settings->save(settingsPath); }
+    }
+
+    public bool quit() {
+        if (anyModified() && !quitting) {
+            quitting = true;
+            guix.confirmArg(display, "Quit", "Some files have unsaved changes. Quit anyway?", demoQuitAnswer, (int) this);
+            return false;
+        }
+        saveSettings();
+        win->close();
+        return true;
+    }
+
+    public void quitAnswered(bool yes) {
+        if (!yes) { quitting = false; return; }
+        saveSettings();
+        win->close();
+    }
+}
+
+// ---- callbacks (the toolkit calls plain functions  int f(int arg)) ---------------------------------------------------------------------------------------
+CodeDemo* appOf(int widgetOrItem) {
+    gui.Widget* wd = (gui.Widget*) widgetOrItem;
+    return (CodeDemo*) wd->userData;
+}
+
+int demoMenuItem(int item) {
+    guix.MenuItem* it = (guix.MenuItem*) item;
+    CodeDemo* app = (CodeDemo*) it->userData;
+    app->commands->run(app->menuCommand(it->id));
+    return 0;
+}
+
+int cmdNew(int a) { ((CodeDemo*) a)->newFile(); return 0; }
+int cmdOpen(int a) { ((CodeDemo*) a)->openDialog(); return 0; }
+int cmdSave(int a) { ((CodeDemo*) a)->save(); return 0; }
+int cmdSaveAs(int a) { ((CodeDemo*) a)->saveAs(); return 0; }
+int cmdClose(int a) { CodeDemo* app = (CodeDemo*) a; app->closeTab(app->tabs->selected); return 0; }
+int cmdQuit(int a) { ((CodeDemo*) a)->quit(); return 0; }
+int cmdFind(int a) { ((CodeDemo*) a)->showFind(false); return 0; }
+int cmdReplace(int a) { ((CodeDemo*) a)->showFind(true); return 0; }
+int cmdGoto(int a) { ((CodeDemo*) a)->showGoto(); return 0; }
+int cmdComment(int a) { ((CodeDemo*) a)->editor->cmdToggleComment(); return 0; }
+int cmdBookmark(int a) { ((CodeDemo*) a)->editor->cmdToggleBookmark(); return 0; }
+int cmdSidebar(int a) { ((CodeDemo*) a)->toggleSidebar(); return 0; }
+int cmdBottom(int a) { ((CodeDemo*) a)->toggleBottom(); return 0; }
+int cmdTerminal(int a) { ((CodeDemo*) a)->showTerminal(); return 0; }
+int cmdWrap(int a) { CodeDemo* app = (CodeDemo*) a; app->editor->setWordWrap(!app->editor->wordWrap); return 0; }
+int cmdPalette(int a) { ((CodeDemo*) a)->paletteCommands(); return 0; }
+int cmdQuickOpen(int a) { ((CodeDemo*) a)->paletteFiles(); return 0; }
+int cmdSymbols(int a) { ((CodeDemo*) a)->paletteSymbols(); return 0; }
+int cmdBuild(int a) { ((CodeDemo*) a)->startBuild(false); return 0; }
+int cmdRun(int a) { ((CodeDemo*) a)->startBuild(true); return 0; }
+
+int cmdThemeEditor(int a) {
+    CodeDemo* app = (CodeDemo*) a;
+    gcode.ThemeEditor* te = new gcode.ThemeEditor();
+    te->show(app->display);
+    return 0;
+}
+
+int demoSettingsApplied(int dlg) {
+    CodeDemo* app = (CodeDemo*) ((gcode.SettingsDialog*) dlg)->userData;
+    app->saveSettings();
+    return 0;
+}
+
+int cmdSettings(int a) {
+    CodeDemo* app = (CodeDemo*) a;
+    gcode.SettingsDialog* sd = new gcode.SettingsDialog(app->settings);
+    sd->userData = (int) app;
+    sd->onApply = demoSettingsApplied;
+    sd->show(app->display);
+    return 0;
+}
+
+int demoTabSelected(int bar) {
+    appOf(bar)->tabSelected();
+    return 0;
+}
+
+int demoTabClose(int bar) {
+    CodeDemo* app = appOf(bar);
+    // closing may need an answer: the tab bar must not remove the tab by itself
+    app->closeTab(app->tabs->closeIndex);
+    return 1;
+}
+
+int demoEdited(int ed) {
+    appOf(ed)->edited();
+    return 0;
+}
+
+int demoTreeOpen(int t) {
+    CodeDemo* app = appOf(t);
+    app->openFile(app->tree->openedPath);
+    return 0;
+}
+
+int demoJump(int pane) {
+    CodeDemo* app = appOf(pane);
+    app->jumpTo(app->output->jumpPath, app->output->jumpLine, app->output->jumpCol);
+    return 0;
+}
+
+int demoBuildDone(int pane) {
+    appOf(pane)->buildDone();
+    return 0;
+}
+
+int demoClose(int window) {
+    gui.Window* w = (gui.Window*) window;
+    CodeDemo* app = (CodeDemo*) w->userData;
+    return app->quit() ? 0 : 1;
+}
+
+int demoOpenAnswer(int p) {
+    CodeDemo* app = (CodeDemo*) guix.dialogArg;
+    if (p != 0) { app->openFile((char*) p); }
+    return 0;
+}
+
+int demoSaveAnswer(int p) {
+    CodeDemo* app = (CodeDemo*) guix.dialogArg;
+    if (p != 0) {
+        gcode.Doc* dd = app->currentDoc();
+        int r = dd->save((char*) p);
+        if (r < 0) {
+            app->status->setMessage(asys.errText(r));
+        } else {
+            int i = app->tabs->indexOfData((int) dd);
+            app->tabs->setTitle(i, dd->title);
+            app->tabs->setModified(i, false);
+            app->status->setMessage("Saved");
+        }
+    }
+    return 0;
+}
+
+int demoCloseAnswer(int yes) {
+    CodeDemo* app = (CodeDemo*) guix.dialogArg;
+    app->closeAnswered(yes != 0);
+    return 0;
+}
+
+int demoQuitAnswer(int yes) {
+    CodeDemo* app = (CodeDemo*) guix.dialogArg;
+    app->quitAnswered(yes != 0);
+    return 0;
+}
+
+int demoFileChosen(int pal) {
+    gcode.Palette* p = (gcode.Palette*) pal;
+    CodeDemo* app = (CodeDemo*) p->userData;
+    char* rel = p->chosenPath();
+    char* full = asys.join(app->projectDir, rel);
+    app->openFile(full);
+    asys.free(full);
+    return 0;
+}
+
+int demoSymbolChosen(int pal) {
+    gcode.Palette* p = (gcode.Palette*) pal;
+    CodeDemo* app = (CodeDemo*) p->userData;
+    app->editor->gotoLine(p->chosenData, 0);
+    app->editor->focusMe();
+    return 0;
+}
+
+#ifndef CODEDEMO_NOMAIN
+int main(int argc, char** argv) {
+    gui.Display* d = gui.connectAs(null, "codedemo");
+    if (d == null) {
+        println("codedemo: no display server (start adisplayd and set ADISPLAY)");
+        return 1;
+    }
+    char* target = (argc > 1) ? argv[1] : ".";
+    char* dir = target;
+    char* file = null;
+    if (asys.isFile(target)) {
+        file = target;
+        dir = asys.strDup(target);
+        int slash = -1;
+        for (int i = 0; dir[i] != 0; i++) { if (dir[i] == '/') { slash = i; } }
+        if (slash > 0) { dir[slash] = 0; } else { dir = "."; }
+    }
+    char* cfg = atheme.configDir();
+    char* settingsFile = asys.join(cfg, "settings.ini");
+    CodeDemo* app = new CodeDemo(d, dir, settingsFile);
+    if (file != null) { app->openFile(file); }
+    d->run();
+    return 0;
+}
+#endif
