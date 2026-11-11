@@ -79,8 +79,8 @@ ac -o /tmp/hello hello.a                     # exactly /tmp/hello
 
 Example programs live in [`examples/`](examples/): `greet`, `calc` (interactive REPL), `wordcount`, `cat`, `todo`,
 `table`, `colors`, `wordfreq`, `clock`, `checksums`, `primes`, `jsonpretty`, `grep`, `bignum`, `dirlist`, `quiz`, `bank`, `modules`, `net_server` / `net_client` and more.
-Built-in modules: `math`, `bigint`, `decimal`, `random`, `sort`, `collections`, `strings`, `regex`, `utf8`, `json`, `csv`,
-`path`, `os`, `datetime`, `encoding`, `hash` (CRC-32, MD5, SHA-1/2, HMAC), `zlib` (gzip / zlib / deflate), `tar`, `ini`, `bits`, `bytebuf` (byte buffers, endian readers, sizes), `algo` (sorting, searching, graphs, string algorithms), `arith` (checked arithmetic, number theory, fractions), `cli`, `log`, `testing`, `net` (TCP, UDP, DNS, poll), `http`, `netaddr`, `packet` (ARP / IP / ICMP / UDP / TCP / pcap), `netif` (interfaces, ARP table, routes, sockets), `dns`, `conn`, `websocket`, `netutil` (ping, Wake-on-LAN, NTP), `rawnet`, `fixed`, `nn` (perceptron, MLP, autoencoder, Hopfield, SOM, Elman, LSTM, CNN), `codec` (text / binary / image converters), and **the C standard library** (`import clib;`):
+Built-in modules: `math`, `bigint`, `decimal`, `random`, `sort`, `collections`, `strings`, `regex` (groups, back references, lazy quantifiers, look-ahead), `utf8`, `json`, `csv`,
+`path`, `os`, `datetime`, `encoding`, `hash` (CRC-32, MD5, SHA-1/2, HMAC), `zlib` (gzip / zlib / deflate), `tar`, `ini`, `bits`, `bytebuf` (byte buffers, endian readers, sizes), `algo` (sorting, searching, graphs, string algorithms), `arith` (checked arithmetic, number theory, fractions), `cli`, `log`, `testing`, `asys` (system layer: freeable memory, atomic file writes, directory listing, child processes), the editor core of AIDE (`acode` text buffer and editor, `asyntax` highlighting, `atheme` themes, `aproject` project tree, search and build jobs, `afind` search and replace; see [`docs/AIDE.md`](docs/AIDE.md)), `net` (TCP, UDP, DNS, poll), `http`, `netaddr`, `packet` (ARP / IP / ICMP / UDP / TCP / pcap), `netif` (interfaces, ARP table, routes, sockets), `dns`, `conn`, `websocket`, `netutil` (ping, Wake-on-LAN, NTP), `rawnet`, `fixed`, `nn` (perceptron, MLP, autoencoder, Hopfield, SOM, Elman, LSTM, CNN), `codec` (text / binary / image converters), and **the C standard library** (`import clib;`):
 `ctype errno limits string stdlib stdio time math (correctly rounded libm) complex unistd signal locale wchar` with the C names,
 see [`docs/CLIB.md`](docs/CLIB.md).
 
@@ -163,7 +163,7 @@ lib/std.a       standard library (written in A, embedded into the compiler)
 lib/*.a         built-in modules, among them the C library (cstdio.a, cmath.a ...)
 examples/       example programs
 tests/          regression tests + runner (tests/run.sh)
-docs/           language reference, targets guide, compiler internals, man page
+docs/           language reference, targets guide, compiler internals, AIDE editor core, man page
 ```
 
 ## Testing

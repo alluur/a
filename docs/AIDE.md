@@ -1,0 +1,331 @@
+# AIDE - the A IDE: the editor core libraries
+
+AIDE is the integrated development environment of the A language. It will run as a terminal program (`aide`) and as a GUI
+program (`aide-gui`), both on Linux and on AOS, and both are built on the same libraries. This document describes those
+libraries (they are part of the A standard library, in `lib/`) and how the two front ends are meant to use them.
+
+**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t218`). The two front ends
+(`user/aide.a` and `user/gui/aide-gui.a` in the AOS repository) do not exist yet. The libraries contain no user interface code:
+everything that draws or reads the keyboard is the front end's job.
+
+Contents
+
+1. [Architecture](#1-architecture)
+2. [asys - the system layer](#2-asys---the-system-layer)
+3. [acode - buffer and editor](#3-acode---buffer-and-editor)
+4. [asyntax - highlighting, symbols, completion](#4-asyntax---highlighting-symbols-completion)
+5. [atheme - themes and settings](#5-atheme---themes-and-settings)
+6. [aproject - project files, search and jobs](#6-aproject---project-files-search-and-jobs)
+7. [afind - search and replace in a buffer](#7-afind---search-and-replace-in-a-buffer)
+8. [regex](#8-regex)
+9. [Writing a front end](#9-writing-a-front-end)
+10. [AOS notes](#10-aos-notes)
+11. [Tests and measurements](#11-tests-and-measurements)
+12. [Known limitations](#12-known-limitations)
+
+---
+
+## 1. Architecture
+
+```
+                   aide (terminal)            aide-gui (GUI)               <- the front ends (aos repository)
+                        |  draws cell grids        |  draws widgets
+        +---------------+--------------------------+---------------+
+        |                                                          |
+      atheme (colours, settings)                                   |
+        |                                                          |
+      asyntax (tokens, symbols, completion) --+                    |
+        |                                      |                   |
+      afind (find / replace)  aproject (tree, find in files, jobs) |
+        |                       |                                  |
+      acode (Buffer, Editor)    |                                  |
+        |                       |                                  |
+        +----------- regex -----+---------- asys (memory, files, processes) ------ the kernel
+```
+
+* Every library is an ordinary embedded module: `import acode;` ... The embedded list is in `src/main.asm`.
+* **No copying between layers.** A front end draws a line with `buffer.linePtr(i, &len)` (a pointer into the text, no copy) and
+  `highlighter.tokens(i, ...)`; it learns about edits through a change listener (`Buffer.addListener`) and the buffer's
+  `version`, so it only redraws what changed. Range queries (`lineStart`, `lineEnd`, `lineAt`, `copyRange`) are O(log n) or O(1).
+* **Memory** comes from `asys.alloc` and goes back with `asys.free`; `dispose()` of every class frees everything it holds
+  (the object itself is a few hundred bytes of `new` memory, which A never frees). Strings that the libraries return are asys
+  memory; free them with `asys.free`.
+* Objects with a constructor are declared with parentheses: `acode.Buffer b();` (a plain `acode.Buffer b;` is only zeroed).
+* Errors are `-errno` numbers (`-asys.ENOENT` ...); `asys.errText(code)` makes text of them.
+
+## 2. asys - the system layer
+
+`import asys;` - a small layer that works on Linux (x86-64, ARM64, RISC-V 64, LoongArch64) **and on AOS**, using only system calls
+that both have (see [section 10](#10-aos-notes)). On Windows everything except processes works.
+
+| Group | Functions |
+|---|---|
+| Memory | `alloc` (zeroed) `realloc` `free` `blockSize` `memInUse` `memBlocks` `memMapped` `memBadFrees` `moveBytes` (memmove) `fillBytes` `bytesEqual` `strDup` `strDupN` `join` `concat3` |
+| Files | `fileOpen(path, flags, mode)` `fileRead` `fileWrite` `fileClose` `fileSeek` `fileSync` `fileTruncate`; `readFile(path, &len, maxBytes, &err)` (regular files only: a FIFO, device or directory gives `-ENOTREG` and never blocks) `writeFile` `writeFileAtomic` class `AtomicFile` |
+| Paths | `stat` `lstat` `fstat` (`Stat`: dev ino mode size mtime mtimeNs, `isFile()` `isDir()` `isLink()` `isFifo()` `perm()`) `exists` `isFile` `isDir` `mkdir` `mkdirs` `rmdir` `unlink` `rename` `readlink` `realpath` `getcwd` `chmod` `setMtime` `symlink` `mkfifo` `validName` |
+| Directories | `listDir(path, DirList*)`: names and kinds from `getdents64` (no `stat` per entry), `DirList.sort(dirsFirst, ignoreCase)` |
+| Time, random, environment | `nowMs` `monoMs` `sleepMs` `randomBytes` `getenv` `environment` |
+| Processes | class `Process`: `start(argv, cwd, env, flags)` `read` `write` `closeIn` `tryWait` `wait` `signal` `signalGroup` `waitReadable` `dispose`; `pollFds` |
+| Platform | `platform()` (`OS_LINUX`, `OS_AOS`, `OS_WINDOWS`; AOS is recognised through `uname`) `canSpawn()` `hasLinks()` |
+
+**Memory.** Small blocks (up to 128 KiB) come from 2 MiB chunks in four size classes per doubling (at most 25 % waste) and are
+reused through free lists; bigger blocks are `mmap`ed and go back to the system with `munmap` when freed; a big block that shrinks
+moves to a smaller one; `realloc` of big blocks uses `mremap` on Linux. Blocks carry a header with a magic number, so a double
+free or a foreign pointer is detected, ignored and counted (`memBadFrees`). `memInUse()` makes leaks visible: the tests compare it
+before and after a cycle.
+
+**Atomic writing** (`AtomicFile`, `writeFileAtomic`, `Buffer.save`): a temp file `.NAME.tmp-<12 random hex digits>` is created next
+to the target with `O_CREAT | O_EXCL | O_NOFOLLOW` and *the permissions of the existing file from its first byte*
+(`fchmod` only repairs what the umask removed); data is written, flushed (`fsync`; `sync` on AOS), and renamed over the target.
+A symbolic link as target is resolved (the data goes where the link points; a loop of 32 links is `-ELOOP`); on any error the
+temp file is removed; `W_BACKUP` keeps the old content as `NAME~`; `W_INPLACE_OK` allows overwriting in place when no temp file
+can be created.
+
+**Processes.** `Process.start` forks, sets up the pipes (all `O_CLOEXEC`, parent ends non-blocking, descriptors below 3 are moved
+away before `dup2`), searches `PATH` itself, and reports a failing `exec` *synchronously* (`-ENOENT`, `-EACCES`) through a
+close-on-exec error pipe. `P_GROUP` makes the child a process group leader, so `signalGroup` reaches grandchildren. The parent
+ignores `SIGPIPE` (the child gets the default back), so `write` returns `-EPIPE` instead of killing the editor. After a signal
+the status is that of `wait4`: `termSignal` or `exitCode`, never overwritten.
+
+## 3. acode - buffer and editor
+
+`import acode;` - see the header of `lib/acode.a` for the full list. The design in short:
+
+**Buffer.** The text is a *gap buffer* (UTF-8 bytes; in text mode lines are separated by `\n` only). The line index is a second
+gap array of line start offsets; entries behind the gap are stored relative to a running shift, so inserting or deleting lines near
+the gap costs O(1) and moving the gap costs O(distance). Consequences, measured on one core (the table in section 11 has the numbers):
+100 000 lines appended or prepended one by one take about 50 ms; edits close to each other are free; an edit far away from the
+previous one costs the move of the two gaps over that distance, about 6 ms on average (17 ms for the longest jump) in a 120 MB
+file. A rope or piece table would make that O(log n) at the price of everything else being slower.
+
+* `linePtr(i, &len)` returns a pointer into the text when the line does not straddle the gap, else into a scratch copy - the
+  front end cannot tell and does not need to (the pointer is valid until the next edit or the next `linePtr` call that needs
+  the scratch copy). `flatten()` moves the gap to the end and returns the whole text contiguously.
+* **Line endings, BOM, binary.** `load` detects LF / CRLF / CR (lone CR only when the file has no LF), the dominant style wins
+  and `eolMixed` says that the file mixed them; the text in memory has `\n` only and `save` writes the detected style back.
+  A UTF-8 BOM is removed and remembered. A file with NUL bytes in the first 8000 bytes, or a UTF-16 byte order mark, is *binary*:
+  no conversion at all, byte for byte, not trimmed.
+* **Undo.** An operation record is `(offset, bytes deleted, bytes inserted)` with the bytes in one arena; consecutive insertions
+  (and forward deletions) are stored in one operation. `beginGroup(snapshot, n, key)` / `endGroup(snapshot, n)` make a step and record
+  the cursors before and after it. Steps with the same non-zero `key` merge when the previous step ended with exactly the cursors
+  the new one starts with (typing, backspace, delete). The history is capped (32 MiB by default, oldest steps dropped), and the
+  *modified* flag compares state numbers: it is correct after undo, redo, new edits on a branch and after the save point was dropped.
+  `setHistory(false)` forgets everything.
+* **Listeners** get a `Change` (offset, bytes removed / inserted, first line, lines removed / inserted, version, kind) after each
+  change - also for undo, redo and loading. There is no fixed number of listeners.
+* **Files.** `load` opens with `O_NONBLOCK`, checks `fstat` (regular files only), reads straight into the buffer storage, scans
+  once for the line index. `save` streams through `AtomicFile`. `checkExternal()` compares modification time (to the nanosecond)
+  and size with what was seen at load / save (`EXT_CHANGED`, `EXT_DELETED`); `reload()`, `acknowledgeExternal()`.
+
+**Editor.** A set of cursors `(anchor, pos, goal)`, kept sorted and merged (`normalize`), always on character boundaries. The
+editor listens to its buffer and moves its cursors through every change, so several editors on one buffer stay consistent. Commands
+work on all cursors from the last to the first, inside one undo group. Highlights:
+
+* `typeChar` merges into word sized steps; `newline` copies the indentation, opens a level after `{ ( [` (and `:` for Python),
+  splits `{|}` over three lines and empties a line that only holds indentation; typing `}` on a blank line aligns it with the line
+  of its opening bracket (`matchBracket`, which skips strings, character literals and comments of the current language).
+* `moveLines` moves the selection with its block (a selection that ends at column 0 of the next line moves that end too);
+  `duplicateLines`, `joinLines`, `deleteLines`; `toggleLineComment` comments at the shallowest indentation and uncomments exactly;
+  `copy` / `cut` / `paste` with a ring (`Clipboard`); with several cursors the pieces are remembered, so pasting into the same
+  number of cursors puts one piece into each; copying without a selection copies whole lines and pastes above the caret line.
+* `tabWidth` / `indentWidth` below 1 mean 4 and above 64 mean 64; nothing divides by them unchecked.
+
+## 4. asyntax - highlighting, symbols, completion
+
+`import asyntax;`
+
+* **Lexers** for A, C, C++, Python, shell, JSON, Markdown, INI, TOML, HTML, XML, Makefile and plain text. `lexLine(lang, state, text,
+  len, tokens, max, &endState)` is a pure function: spans `(start, len, kind)` that cover the line without gaps, kinds from the fixed
+  enum `Tok` (`Plain Keyword Type Builtin Constant Number String Char Escape Comment DocComment Preproc Operator Punct Function
+  Variable Tag Attribute Heading Emphasis Link Code Quote Error`). The state is a small integer (in block comment, in a triple
+  quoted string, in a here document - with a hash of its end word - in a Markdown fence, in an HTML script, ...).
+* **Highlighter** (class): keeps the state at every line start. A buffer listener repairs the table *at once* after each edit: it
+  lexes again from the changed line until the state at a following line start equals the state that was stored before (at most
+  120 lines per edit; the rest is lexed when somebody asks). Typing in a line of code therefore costs one line. Bursts of edits
+  (more than 64 between two requests) make the highlighter start over lazily. The tests compare the incremental result with a fresh
+  lex after random edits (and undo / redo) in every language, 40 000 rounds in a one-off run.
+* `detectLanguage(fileName, firstLine)` (extension, `Makefile`, `.bashrc`, `#!` lines, `<?xml`), `languageName`, `languageFromName`.
+* `symbols(buffer, lang, SymbolList*)`: for A and C - modules, classes, structs, enums, unions, typedefs, constants (`const`,
+  `#define`), functions and methods with their class; found from the token stream, so strings and comments never produce
+  symbols. Python: classes, functions, methods, UPPER_CASE constants. Markdown: headings. Shell: functions. Makefile: targets.
+* `Completer`: keywords of the language + symbols + words of the registered buffers, matched by prefix; exact-case matches
+  come before case-insensitive ones, then symbols, keywords, words; shorter names first, then alphabetical. Its caches follow
+  `Buffer.version`.
+
+## 5. atheme - themes and settings
+
+`import atheme;`
+
+* **Theme**: 24 named colours (`Col`) and a colour + style (bold / italic / underline) for each of the 24 token kinds. Built-in:
+  `dark light solarized-dark solarized-light monokai high-contrast gruvbox nord aos` (all nine pass their own validation; the
+  Solarized themes are slightly adjusted where the originals are too faint to read). `toIni` / `save` / `loadTheme` /
+  `parseTheme`: INI with `[theme] name base`, `[colors]`, `[tokens]`; a file only needs to name what it changes, the rest comes
+  from `base`. Corrupt input (random bytes, NUL bytes, a 10000 byte line, a file over 1 MB, a BOM, bad values) gives warnings and
+  the base theme, never a crash.
+* `Theme.validate(Warnings*)` warns about unreadable contrast: text against its background must reach 4.5:1 (WCAG AA), line
+  numbers, cursor, error / warning and syntax colours 3:1.
+* **Colour helpers**: `rgb red green blue parseColor formatColor mix lighten darken to256 from256 to16 from16 luminance contrast
+  readable`. `contrast` is the WCAG ratio times 100 (computed from a 256 entry linearisation table; checked against published values).
+* **Settings** (`tabWidth insertSpaces lineNumbers wordWrap fontSize autoIndent trimOnSave finalNewline theme`, window geometry,
+  recent files and projects (30 each, most recent first), key binding overrides `action = keys`): `$AIDE_HOME`, else `~/.aide`;
+  numbers are clamped, unknown entries counted, `save` creates the directory and writes atomically.
+
+## 6. aproject - project files, search and jobs
+
+`import aproject;`
+
+* **Ignore**: `.gitignore` rules (`*  ?  [a-z]  **  !  /anchor  dir/`), rules from nested files carry their directory, plus a
+  built-in list (`.git .hg .svn node_modules __pycache__ *.o *.obj *.pyc *.swp *~ ...`; `.a` files are *not* ignored).
+* **FileTree**: lazy; sorted folders first; ignore rules applied; symbolic links are entries of kind `K_LINK` and are **not
+  followed** unless `followLinks` is set, then a directory whose (device, inode) equals an ancestor's is marked `loop` and not
+  entered; `maxEntries` (200 000) and `maxDepth` (64) bound the walk (`truncated` says so); `create` / `rename` / `remove` validate
+  names (`-EBADNAME` for "", ".", "..", `/`, `\`, control characters, more than 255 bytes) and refresh the tree.
+* **Watcher**: polling: `watch(path)` / `unwatch(path)`, then `poll(events, max)` stats what is watched and reports created,
+  modified and deleted entries (a watched directory reports its children).
+* **FindJob**: plain / case-insensitive / whole word / regex search with context lines; `step(budgetMs)` does a bounded amount of
+  work and `cancel()` stops it; only regular files are opened (a FIFO is skipped, never read), binary files and files over
+  `maxFileSize` (5 MiB) are skipped, results are capped (`maxResults`, 10 000), symbolic links are not followed unless
+  `FIND_FOLLOW` is given (then loops are detected by device and inode), the walk is at most 64 directories deep.
+* **QuickOpen**: `index(root, ign)` then `query(text, out, max)`: fuzzy file name search (`"fmain"` finds `src/main.a`;
+  consecutive characters, component and word starts and file name hits score higher, ties go to the shorter path).
+  **Recent**: an MRU list with `add`, `indexOf`, `save(path)` and `load(path)`.
+* **Job / BuildJob / RunJob**: run a command with pipes *without ever blocking*: `poll()` reads what arrived (into a queue capped
+  at 4 MB, oldest bytes dropped and counted - the pipe is always emptied, so a program that floods its output never stalls),
+  feeds the input queue (`sendInput` never blocks, is capped at 1 MB, `closeInput` closes after the queue), notices the end,
+  enforces `timeoutMs` (SIGTERM to the process group, SIGKILL after `graceMs`; `timedOut` is a flag, the exit status stays the real
+  one), `kill()`, `killNow()`, `elapsedMs()`. `BuildJob` turns lines into `Problem`s (`path`, `line`, `col`, `severity`, `message`):
+  the A compiler and GCC / Clang (`file:line[:col]: error: message`), `In file included from`, Visual C `file(line): error C1234`,
+  Rust `error[E..]` + `--> file:line:col`, Python tracebacks; ANSI colours and Windows drive letters are handled.
+  `startCompiler(source, output, target)` finds `ac` (`$AC`, `PATH`, `/usr/local/bin`, `/usr/bin`, `/bin`).
+
+## 7. afind - search and replace in a buffer
+
+`import afind;` - class `Finder`: `setPattern(pattern, OPT_REGEX | OPT_ICASE | OPT_WORD | OPT_NOWRAP)`, `findNext(from)`,
+`findPrev(before)`, `count(limit)`, `matches(list, max)`, `replaceCurrent(editor, template)`, `replaceAll(editor, template)`,
+`setRange(from, to)` (search in the selection). Search is per line (fast, uses `linePtr`); a pattern that contains a line break
+searches the flattened text. Templates: `$0`..`$9`, `${n}`, `$$`, `\n \t \\` in regex mode, literal in plain mode.
+
+Rules from earlier reviews, each with a test: `count` / `matches` do not disturb the current match; the groups used by
+`replaceCurrent` belong to the match being replaced (it is matched again, anchored at its start, so `findPrev` makes no
+difference); the current match becomes invalid when the buffer changes (`currentValid()`); `replaceAll` is one undo step and
+handles empty matches like Python 3.7 (`re.sub`).
+
+## 8. regex
+
+`import regex;` was rewritten for AIDE; the old four functions keep working. A backtracking engine with Perl / Python
+semantics: groups (up to 32) and non-capturing groups, named groups, alternation, greedy and lazy `* + ? {n,m}`, back
+references, `^ $ \A \Z \b \B`, classes with ranges, POSIX classes and the shorthands, look-ahead `(?= )` `(?! )`, flags `(?i) (?s)
+(?m)` also scoped, UTF-8 aware (`.` and negated classes take a whole character; `\w` includes non-ASCII letters; case folding is
+ASCII only). A repeated group that matched the empty string ends its repetition (`(a*)*` on `b` matches once). Errors are compile
+errors with a message and a position (back reference to a missing or open group, unbalanced parentheses, bad ranges, "nothing to
+repeat", "multiple repeat", a program over 400 000 instructions, nesting over 150). The matcher is a loop with an explicit stack
+(no recursion per character: `.*Z` over a million characters works) and stops after 5 million steps (`exceeded`) so `(a+)+b` cannot
+hang an editor. `tests/gen/gen_regex_test.py` runs 144 patterns through Python's `re` and compares search, group positions,
+fullmatch and `sub`.
+
+## 9. Writing a front end
+
+Both front ends do the same things; only drawing and input differ.
+
+1. `acode.Buffer b(); acode.Editor e(&b); asyntax.Highlighter* h = new asyntax.Highlighter(&b, lang); atheme.Theme* t =
+   atheme.builtin("dark");` - open files with `b.load(path)`, language from `asyntax.detectLanguage(name, firstLine)`,
+   `e.setLanguage(asyntax.languageName(lang))`, tabs from `e.detectIndent(true)`. Nothing is freed automatically (A has no
+   destructors): call `dispose()` on everything you are done with.
+2. Draw: for each visible line `i` get the text with `b.linePtr(i, &len)` and the spans with `h.tokens(i, tok, 256)`; colours
+   from `t->tokenColor(kind)`. Selections and carets are `e.cur[k].anchor/.pos`; columns with `b.visualCol(i, offset, e.tabWidth)`
+   (and `offsetAtCol` for mouse clicks). Bracket highlight: `e.matchNearCaret(&at)`.
+3. Keys call `Editor` commands (`typeChar`, `newline`, `backspace`, `moveLeft(shift)`, `undo`, ...). To know when to redraw compare
+   `b.version` (or register a listener: the `Change` says which lines moved).
+4. Files: `b.checkExternal()` on focus, `e.saveFile(path, flags, s.trimOnSave, s.finalNewline)`.
+5. Project panel: `FileTree`; Ctrl+P: `QuickOpen`; Ctrl+Shift+F: `FindJob` stepped from the idle loop (`step(10)`); Ctrl+F:
+   `afind.Finder`; build: `BuildJob.startCompiler`, call `poll()` from the idle loop, show `problems`, jump to `file:line`;
+   run: `RunJob` with `sendInput` for a terminal pane.
+6. Long running things (search, jobs, watcher) never block: everything is polled from the front end's own loop.
+
+A terminal front end redraws a cell grid from the same data; the lines it needs are `linePtr`, `h.tokens`, `charWidth` (in
+`acode`) and `visualCol`.
+
+## 10. AOS notes
+
+asys uses only calls that `kernel/sys.a` of AOS implements: `read write openat(257, directory descriptor ignored) close lseek
+stat fstat lstat mmap munmap fcntl pipe2 dup2 fork execve wait4 kill poll rename mkdir rmdir unlink getdents64 getcwd chdir
+clock_gettime nanosleep getrandom uname setpgid rt_sigaction`.
+
+Missing in AOS, and what asys does:
+
+* `fchmod`, `chmod`, `fsync`, `mremap`, `ftruncate`, `utimensat`, `link`, `symlink`: never called on AOS (asys asks `uname` once);
+  `fsync` becomes `sync`, permissions are given when the file is created, `symlink` / `setMtime` return `-ENOSYS` and `hasLinks()` is false.
+* `statx` (not needed on x86-64), `pipe` with flags other than `O_NONBLOCK | O_CLOEXEC` (not used).
+* File names are limited to 55 bytes and paths to 255 bytes by the AOS file system; `validName` enforces the Linux limit of 255
+  and the file system reports longer names as an error.
+* `execve` runs ELF files and `#!` scripts only (no fallback to the shell for a script without `#!`); `Job.startShell` needs
+  `/bin/sh` to exist and to understand `-c`.
+* `fork` on AOS is a full copy of the address space (the kernel says so in `sys.a`: "a full copy is fine"), so starting a job from
+  a big editor is slower than on Linux.
+* **What was not run on AOS**: the libraries were developed and tested on Linux (including all four CPU back ends under
+  qemu-user); the syscall list above was compared with the kernel source, not executed in an AOS image.
+
+## 11. Tests and measurements
+
+| Test | What it checks |
+|---|---|
+| `t200_asys_mem` | allocator: zeroing, classes, big blocks, realloc, counters, double free, `moveBytes` |
+| `t201_asys_files` | files, atomic writes (permissions, backup, streaming, links, loops), listing, FIFOs, names, time, random |
+| `t202_asys_proc` | pipes, exit codes, environment, cwd, exec errors, 1 MB through `cat`, full pipes, `EPIPE`, floods, group kill |
+| `t204_acode_diff` | 10 000 random edits + grouped undo / redo with cursor snapshots against a reference model; line index; UTF-8 |
+| `t205_acode_cursor` | exact cursor restoration (merged typing, backspace, delete, backwards selections, 4 cursors), motions, UTF-8, tab width 0 |
+| `t206_acode_lineops` | move / duplicate / join / delete lines, indentation, comments, auto-indent, brackets, clipboard, clean-ups |
+| `t207_acode_file` | LF / CRLF / CR / mixed / BOM / binary / UTF-16 round trips, external changes, FIFO, listeners, 9 MB memory cycles |
+| `t208_asyntax_lex` | token dumps of 13 languages, language detection |
+| `t209_asyntax_inc` | incremental = fresh after random edits in 10 languages; work after an edit; symbols; completion |
+| `t210_atheme` | colour conversions and WCAG values, 9 themes validated, theme / settings round trips, corrupt files |
+| `t211_aproject_tree` | globs, ignore rules, tree (links, FIFOs, bounds, names), watcher, recent files, quick open |
+| `t212_aproject_find` | find in files: modes, context, steps, cancel, limits, FIFO, link loops |
+| `t213_aproject_job` | diagnostics (26 line formats and Rust's two line form), incremental output, input queue, timeout, kill, floods, the real `ac` |
+| `t214_afind` | find / replace rules above, Python comparison of `replace all` |
+| `t215_regex_python` | 144 patterns compared with Python's `re` (generated by `tests/gen/gen_regex_test.py`) |
+| `t216_regex_more` | flags, POSIX classes, 32 groups, errors, limits, big inputs, `quote` |
+| `t217_acode_perf` | 100 000 lines inserted at the end / start / random places, 50 000 typed characters, 2000 cursors, a 3 MB file |
+| `t218_regressions` | temp file permissions and names, extreme tab widths, `dispose()` of every class, 24 MB cycles, bounded walks |
+
+All of them pass on the five targets (x86-64, ARM64, RISC-V 64, LoongArch64 under qemu-user, Windows under Wine). On Windows
+`t202` and `t213` print that processes are not supported (`.out.windows`); the other tests run unchanged.
+
+Measured natively on one core of the development machine (x86-64, a virtual machine; the numbers vary by 30 % from run to
+run; the ARM64, RISC-V and LoongArch64 runs go through qemu-user and are 10 to 30 times slower, which the tests allow for):
+
+| | |
+|---|---|
+| append / prepend 100 000 lines one by one | 50 ms / 55 ms |
+| type 100 000 characters (one undo step, 100 KB of history) | 35 ms |
+| a 120 MB file (125 821 440 bytes, 2.18 million lines): load | 0.85 s, 146 MB of memory |
+| the same: 10 000 edits close together | 20 - 40 ms |
+| the same: 1000 edits at random lines (each one moves the gaps) | 6 s, so 6 ms per edit; the longest jump (104 MB) 17 ms |
+| the same: highlight line 1 000 000 for the first time (lexes 1 million lines) | 1.1 s |
+| the same: search the whole file for a word that is not there | 0.33 s |
+| the same: `setText("tiny")` afterwards (with highlighter attached) | 47 KB in use, 2 MB mapped |
+
+These come from a throw-away measuring program, not from the tests (the tests only check that nothing is quadratic and that the
+results are right). A previous version of the gap move copied backwards byte by byte when the distance was no multiple of 8:
+a 100 MB jump took 250 ms; `asys.moveBytes` now copies in blocks and the same jump takes 17 ms (`t200` checks the results of all
+distances).
+
+## 12. Known limitations
+
+* **Random edits in huge files** cost O(distance) because the text and the line index are gaps (6 ms per edit on average in a
+  120 MB file when the edits jump around; local edits are free). A piece table or rope would change that. Highlighting a line
+  far down a file that was never looked at lexes everything above it once (1.1 s for 2 million lines); the front end should keep
+  asking for visible lines only, which are cheap afterwards.
+* One cursor set per `Editor`; several views of one buffer are several `Editor`s (they stay consistent through the listener), but
+  there is no shared selection history.
+* Column selection is a set of cursors (`addCursorsInColumn`), not a rectangular selection object. No word wrap, no code folding,
+  no bidirectional text: those belong to the front end (the engine gives display columns, not visual lines).
+* Auto-indent knows `{ ( [` and `:`; there is no language specific smart indent beyond that, and no auto-closing of brackets.
+* The lexers are line based: nested languages (JavaScript in HTML, code in Markdown fences) are not highlighted, only the
+  container. Symbol extraction is heuristic (token patterns, no parser).
+* `regex` has no look-behind, no possessive quantifiers, no Unicode classes or case folding beyond ASCII; matching is on bytes
+  with UTF-8 aware `.` and sets.
+* `afind` does not search across lines unless the pattern contains a line break; `^` and `$` are line anchors in the per-line mode.
+* The watcher polls (no inotify), so it is only as fast as the caller's loop and costs one `stat` per watched entry.
+* Processes need `fork`/`execve`: not on Windows. `Job` merges standard error into standard output.
+* Not tested here: AOS (see section 10), terminals and GUIs (there is no front end yet), files over 2 GiB (`maxLoad` defaults to 1 GiB).
