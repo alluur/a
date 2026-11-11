@@ -200,6 +200,7 @@ limit is now a million events).
 | `TUI_SYNC=1` | wrap frames in synchronized output (`CSI ? 2026`) |
 | `TUI_MOTION=1` | ask for all mouse motion (menus then follow the pointer) |
 | `TUI_PROBE=1` | ask the terminal for its size at the start |
+| `TUI_DEVTTY=0` | never open `/dev/tty` when standard input or output is redirected (use descriptor 2 or 0); `1` forces it also on AOS |
 
 The fields of `caps` can be changed by hand after `open()`. Colours are always **downgraded to the nearest colour** the terminal has:
 24 bit to the 256 colour palette (the 6x6x6 cube and the gray ramp, nearest by a perceptual distance), to the 16 ANSI colours, to 8 (bright colours
@@ -411,7 +412,9 @@ The toolkit was run on AOS in QEMU (without KVM): the serial console with `TERM=
 mode, keys, the lone Esc, the menu, Ctrl+Q and the shell working again afterwards), the widget gallery and the file manager (listing real AOS directories, `getdents` with file
 types), and the pseudo terminal test `t237` (`tests/t237_term_pty.a`, which makes a pty with `/dev/ptmx`, forks a child that uses the toolkit on it and drives it) and the
 process test `t238`: `t237` prints exactly the same on AOS as on Linux (also compiled with `-DNO_SIGWINCH`, which proves that the size polling alone notices a window size
-change), `t238` differs only where AOS's own `sh` differs (exit status 126 for a missing program, no `${VAR:+x}`). No unknown system call was logged on the console.
+change), `t238` differs only where AOS's own `sh` differs (exit status 126 for a missing program, no `${VAR:+x}`). No unknown system call was logged on the console. After the fixes of the review the same was repeated on AOS in QEMU: `t237` (both builds, now with the 3000 key burst, the absurd size and the title cleaning) printed the Linux result,
+`t238` (with `setenv` seen by children) differed only in the two known places of AOS's `sh`, `probe > /dev/null` drew its screen through descriptor 2 and gave the shell back with the terminal restored, the file manager listed real directories, and
+`stat`, `lstat`, `DirList` and `sameFile` worked on AOS files (there are no symbolic links on AOS: `isSymlink` is false everywhere).
 To try it, build the programs with `ac` and put them into the RAM disk: `AC=ac tools/mkroot.sh --add /bin/gallery=gallery:755 --add /bin/files=files:755`, then pack the image
 as the AOS `Makefile` does (`tools/mkimage.py ...`) and run them on the console (`export TERM=xterm-256color; gallery`).
 Differences from Linux that the toolkit works around, from reading `kernel/tty.a`, `kernel/sys.a` and `kernel/devio.a`:

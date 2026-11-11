@@ -853,6 +853,7 @@ def file_manager_never_destroys_data():
         s.key("\r")
         s.wait_idle()
         check(not os.path.lexists(os.path.join(panel, "zlink")), "the link was not deleted")
+        check("zlink" not in s.screen_text(), "the deleted link is still on the screen (panel or status line):\n" + s.screen_text())
         check(os.path.exists(os.path.join(outside, "important1.txt")) and os.path.exists(os.path.join(outside, "subdir", "deep.txt")),
               "the directory the link pointed to lost its files: %r" % sorted(os.listdir(outside)))
         fm_select(s, "zfilelink")
