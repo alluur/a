@@ -36,11 +36,11 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `tls`, `x509` | TLS 1.3 client and server and certificate checking, for `https://` in `gnet.Fetch` and `abrowse` (see [TLS.md](TLS.md)) |
 | `gimg` | colour images: load PNG, BMP and PPM, save PNG, smooth scaling |
 | `gterm` | a terminal emulator widget (pseudo terminal, ANSI/xterm escape sequences) |
-| `gcode` | the widgets of the AIDE code editor: `CodeEditor`, `FileTree`, `TabBar`, `FindBar`, `GotoBar`, `StatusBar`, `OutputPane`, `TerminalPane`, `Outline`, `ColorPicker`, `ThemeEditor`, `SettingsDialog`, `Dock`, `Commands`, `Palette` (see [below](#the-code-editor-widgets-gcode)) |
+| `gcode` | the widgets of the AIDE code editor: `CodeEditor`, `FileTree`, `TabBar`, `FindBar`, `GotoBar`, `StatusBar`, `OutputPane`, `TerminalPane`, `SearchPane`, `RunPane`, `DocView`, `Outline`, `ColorPicker`, `ThemeEditor`, `SettingsDialog`, `Dock`, `Commands`, `Palette` (see [below](#the-code-editor-widgets-gcode)) |
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t129`, `t240`-`t267` (gcode), `tests/gui.sh`, `tests/https.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t129`, `t240`-`t267` and `t281`-`t282` (gcode, fonts, panels), `tests/gui.sh`, `tests/https.sh`.
 
 ## Quick start
 
@@ -85,6 +85,10 @@ s->savePPM("out.ppm");                                       // or saveBMP
   `gfx.sans()`, `sansBold()` and `mono()` use the files that the font configuration names: the file in `$AFONT_CONF`, else
   `/etc/fonts.conf`, with lines `sans=/path/font.afont`, `sansbold=...`, `mono=...` (`builtin` keeps DejaVu; a missing or
   damaged file also falls back to DejaVu). The AOS project makes such fonts with a generator written in A (`fonts/fontgen.a`).
+* **Other sizes** (`t281`): `gfx.scaleFont(font, percent)` makes a copy of a font at 20 to 400 percent (every glyph sampled again with an area average, integer arithmetic: the same pixels on every
+  target). `gfx.setFontScales(uiPercent, monoPercent)` scales the shared fonts **in place** (`sans()` and `sansBold()` by the first number, `mono()` by the second; `Font.assign` swaps the glyph data of the
+  object, so every widget that holds a pointer to `gfx.sans()` has the new size after its next layout; the terminal calls `remeasure()`), `gfx.setUiFont("mono" | "sans" | "/path/font.afont")` chooses
+  the font of sans and sansbold (false for a file that cannot be used), `uiFontScale()` / `monoFontScale()` read the sizes. 100 gives back the exact original fonts.
 * `checksum()` gives one number for the whole picture: the same program draws the same pixels on every target, which is how
   the tests compare Linux x64, ARM64, RISC-V, LoongArch and Windows.
 
@@ -218,6 +222,11 @@ col->add(bar);                                             // the bar goes at th
   1 warning, 2 error); it closes after `ms` or on a click, up to six at a time.
 * **Busy bar**: `progressBar->start()` / `stop()` animate a `gui.ProgressBar` for work of unknown length.
 * **Tooltips**: `widget->tooltip = "text";` (a field of every widget) shows the text when the pointer rests on it.
+
+* **Colours of a dark program**: the standard look is light. A program with a colour scheme sets the globals the widgets read when they paint: `gui.cBack cText cTextDim cAccent cAccentText cField cBorder cButton
+  cButtonHot cButtonDown cSelect`, the tool tips (`gui.cTipBack cTipBorder cTipText`), and for the widgets of `guix` `guix.cPanel` (menu popups), `cTabIdle`, `cTrack`, `cThumbOff` (scroll bars), `cHeadTop`,
+  `cHeadBottom`, `cStripe` (tables); `MenuBar.background` and `Toolbar.background` colour the bars. AIDE does this for every theme (`AideApp.applyChrome` in the AOS repository). More icons: `ICON_BUILD` (a hammer), `ICON_BUG`,
+  `ICON_FOLDER`, `ICON_PANEL`.
 
 **Dialogs** open a window, and when the user is done they call your function `int f(int result)` and close:
 
@@ -507,6 +516,9 @@ User themes are `NAME.ini` files in `gcode.themeDirectory()` (`<config dir>/them
 | `ColorPicker` | hue bar, saturation / value square, R G B H S V sliders, hex field (`#rrggbb`, `0x`, names), swatches, old / new preview; `gcode.pickColor(display, title, rgb, f)` is a dialog |
 | `ThemeEditor` | a window that lists every theme colour and syntax style, edits them with the picker, shows a live preview editor and the contrast warnings of `Theme.validate`, loads / saves / duplicates / deletes user themes (built-in ones are protected), reverts, and applies every change to all open editors at once (`live`); the window can be opened again and again: its preview editor, document and Looks are freed when it closes |
 | `SettingsDialog` | tab width, spaces or tabs, line numbers, wrap, auto indent, trim on save, final newline, white space, guides, highlights, blink, completion, font, theme, line spacing: every control applies at once to the Look and the open documents, and updates the `atheme.Settings` |
+| `SearchPane` (gcode_ide) | find in files: a query field, options (case, whole word, regular expression), a file name pattern, Search / Stop; the results are lines `path:line:col: text` in a list where **one click** calls `onJump(pane)` with `jumpPath` (as listed, relative to the root) / `jumpLine` / `jumpCol` (1 based); the search runs in steps from a timer (`step()` by hand in tests), `stepMs`, `matches`, `files` |
+| `RunPane` (gcode_ide) | the output of a program (`start(job, name)` follows a started `aproject.Job`) and an input line: Enter sends the line to the program's standard input (and shows it), Ctrl+D ends the input, Ctrl+C in the empty line stops the program; header with Stop and Clear; `onFinished(pane)` with `exitCode` / `signal` (`signalName`), a diagnostic-like line is clickable (`onJump`) |
+| `DocView` (gcode_ide) | a list of pages and a `ghtml.HtmlView`: `openDocs()` lists the Markdown files of the documentation folder (`$AIDE_DOCS`, `/usr/share/a/docs`, `/usr/local/share/a/docs`, `./docs`) and the AIDE manual (`/usr/share/aide/aide.md`); links between pages, anchors, `back()`, `onOpenFile` for links to source files (test `t282`) |
 | `RowList`, `FlatButton`, `LineEdit`, `BarBox`, `BarLabel` | the themed building blocks (a list with scroll bar, a flat / toggle button, a `gui.TextBox` with theme colours and `onSpecial` for Esc / Up / Down / Tab / Alt+letter) |
 
 ### Notes and limits
