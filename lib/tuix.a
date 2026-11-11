@@ -1,0 +1,1852 @@
+// =============================================================================
+//  tuix - the bigger widgets of the tui toolkit                                                    import tuix;
+//
+//    TreeView        a tree with lazily filled branches (expand hook), keyboard and mouse
+//    Table           columns with headers, sorting by clicking a header, row selection
+//    TextPane        a scrollable text area for program output: ANSI colours, follow the end, line click callbacks
+//    dialogs         message(), askYesNo(), prompt(), fileDialog(), colorDialog(), commandPalette(): modal, they return when the user answered
+//    fuzzyScore      the matching used by the command palette
+//
+//  They are built on tui (widgets, App, Dialog) and, like everything there, can be driven without a terminal (App.initHeadless).
+// =============================================================================
+import term;
+import tscreen;
+import tui;
+import utf8;
+module tuix;
+
+private int imin(int a, int b) { if (a < b) { return a; } return b; }
+private int imax(int a, int b) { if (a > b) { return a; } return b; }
+private int lowerOf(int c) { if (c >= 'A' && c <= 'Z') { return c + 32; } return c; }
+private bool isAlnum(int c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 128; }
+
+private int nextCh(char* s, int pos) {
+    if (s[pos] == 0) { return pos; }
+    pos++;
+    while (s[pos] != 0 && (s[pos] & 0xC0) == 0x80) { pos++; }
+    return pos;
+}
+
+// =============================================================================
+//  fuzzy matching
+// =============================================================================
+// Does pat match text as a subsequence (ASCII case insensitive)? Returns a score (higher is better; 0 for an empty pattern) or -1 for no match.
+// pos (optional, maxPos entries) receives the byte positions of the matched characters. Consecutive matches, matches at word starts and
+// short texts score higher.
+public int fuzzyScore(char* pat, char* text, int* pos, int maxPos) {
+    int pl = strlen(pat);
+    if (pl == 0) { return 0; }
+    int tl = strlen(text);
+    int best = -1;
+    int bestPos[64];
+    int cur[64];
+    if (pl > 64) { pl = 64; }
+    for (int start = 0; start < tl; start++) {
+        if (lowerOf(text[start] & 255) != lowerOf(pat[0] & 255)) { continue; }
+        int ti = start;
+        int pi = 0;
+        int score = 0;
+        int last = -2;
+        while (text[ti] != 0 && pi < pl) {
+            int tc = text[ti] & 255;
+            if (lowerOf(tc) == lowerOf(pat[pi] & 255)) {
+                int bonus = 1;
+                if (ti == last + 1) { bonus = bonus + 6; }
+                if (ti == 0 || !isAlnum(text[ti - 1] & 255) || (text[ti - 1] >= 'a' && text[ti - 1] <= 'z' && tc >= 'A' && tc <= 'Z')) { bonus = bonus + 5; }
+                if (tc == (pat[pi] & 255)) { bonus = bonus + 1; }
+                score = score + bonus;
+                cur[pi] = ti;
+                last = ti;
+                pi++;
+            }
+            ti++;
+        }
+        if (pi < pl) { break; }
+        score = score - (tl - pl) / 8 - cur[0] / 4;
+        if (score < 0) { score = 0; }
+        if (best < 0 || score > best) {
+            best = score;
+            for (int k = 0; k < pl; k++) { bestPos[k] = cur[k]; }
+        }
+    }
+    if (best >= 0 && pos != null) {
+        for (int k = 0; k < pl && k < maxPos; k++) { pos[k] = bestPos[k]; }
+    }
+    return best;
+}
+
+// word wraps text at width cells (explicit newlines are kept); a heap string
+public char* wrapText(char* text, int width) {
+    int n = strlen(text);
+    char* out = alloc(n * 2 + 16);
+    int o = 0;
+    int lineW = 0;
+    int i = 0;
+    while (i < n) {
+        if (text[i] == '\n') { out[o] = '\n'; o++; lineW = 0; i++; continue; }
+        // a word
+        int e = i;
+        while (e < n && text[e] != ' ' && text[e] != '\n') { e++; }
+        int ww = tscreen.textWidthN(&text[i], e - i);
+        if (lineW > 0 && lineW + 1 + ww > width) { out[o] = '\n'; o++; lineW = 0; }
+        else if (lineW > 0) { out[o] = ' '; o++; lineW++; }
+        // a word longer than the line is cut
+        int pos = i;
+        while (pos < e) {
+            int fit = tscreen.fitBytes(&text[pos], imax(1, width - lineW));
+            if (fit == 0) { fit = nextCh(text, pos) - pos; }
+            if (pos + fit > e) { fit = e - pos; }
+            memcpy(&out[o], &text[pos], fit);
+            o = o + fit;
+            lineW = lineW + tscreen.textWidthN(&text[pos], fit);
+            pos = pos + fit;
+            if (pos < e) { out[o] = '\n'; o++; lineW = 0; }
+        }
+        i = e;
+        if (i < n && text[i] == ' ') { i++; }
+    }
+    out[o] = 0;
+    return out;
+}
+
+// =============================================================================
+//  TreeView
+// =============================================================================
+const NF_EXPANDED = 1;
+const NF_LAZY = 2;
+const NF_LOADED = 4;
+
+// A tree. Node 0 is the invisible root: addNode(0, "top level") makes a top level node. A node added with lazy = true shows an expand
+// arrow although it has no children yet; onExpand(tree, node) is called the first time it is expanded and fills it in (addNode(node, ...)).
+// Keys: Up / Down / PgUp / PgDn / Home / End, Right expands (or goes to the first child), Left collapses (or goes to the parent), Enter or Space
+// toggles (a leaf calls onActivate), + and - expand and collapse, * expands everything below. The mouse: click the arrow to toggle.
+public class TreeView : tui.Widget {
+public:
+    tui.Pool pool;
+    int* ptext;
+    int* pud;
+    int* pparent;
+    int* pfirst;
+    int* plast;
+    int* pnext;
+    int* pflags;
+    int* pstyle;
+    int ncount;
+    int ncap;
+    int freeHead;
+    int* vis;
+    int nvis;
+    int viscap;
+    bool visDirty;
+    int sel;                        // selected row
+    int top;
+    func onSelect;                  // int f(int tree)
+    func onActivate;                // int f(int tree)  Enter / double click on a leaf
+    func onExpand;                  // int f(int tree, int node)
+    func onCollapse;                // int f(int tree, int node)
+    bool dragging;
+
+    TreeView() {
+        super();
+        focusable = true;
+        grow();
+        ncount = 1;                 // node 0: the root
+        pflags[0] = NF_EXPANDED | NF_LOADED;
+        pparent[0] = -1;
+        visDirty = true;
+    }
+
+    virtual int prefW() { return 24; }
+    virtual int prefH() { return 8; }
+
+    private void grow() {
+        if (ncount < ncap) { return; }
+        int nc = imax(32, ncap * 2);
+        int* a = (int*) alloc(nc * 8); int* b = (int*) alloc(nc * 8); int* c = (int*) alloc(nc * 8); int* d = (int*) alloc(nc * 8);
+        int* e = (int*) alloc(nc * 8); int* f = (int*) alloc(nc * 8); int* g = (int*) alloc(nc * 8); int* h2 = (int*) alloc(nc * 8);
+        for (int i = 0; i < ncount; i++) {
+            a[i] = ptext[i]; b[i] = pud[i]; c[i] = pparent[i]; d[i] = pfirst[i]; e[i] = plast[i]; f[i] = pnext[i]; g[i] = pflags[i]; h2[i] = pstyle[i];
+        }
+        ptext = a; pud = b; pparent = c; pfirst = d; plast = e; pnext = f; pflags = g; pstyle = h2;
+        ncap = nc;
+    }
+
+    // adds a node below parent (0 = top level); returns its id
+    int addNode(int parentNode, char* text, int data = 0, bool lazy = false) {
+        int id;
+        if (freeHead > 0) {
+            id = freeHead;
+            freeHead = pnext[id];
+        } else {
+            grow();
+            id = ncount;
+            ncount++;
+        }
+        ptext[id] = pool.add(text);
+        pud[id] = data;
+        pparent[id] = parentNode;
+        pfirst[id] = 0;
+        plast[id] = 0;
+        pnext[id] = 0;
+        pflags[id] = lazy ? NF_LAZY : 0;
+        pstyle[id] = 0;
+        if (pfirst[parentNode] == 0) { pfirst[parentNode] = id; } else { pnext[plast[parentNode]] = id; }
+        plast[parentNode] = id;
+        visDirty = true;
+        invalidate();
+        return id;
+    }
+
+    char* nodeText(int n) { return pool.at(ptext[n]); }
+    int nodeData(int n) { return pud[n]; }
+    int parentOf(int n) { return pparent[n]; }
+    int firstChild(int n) { return pfirst[n]; }
+    int nextSibling(int n) { return pnext[n]; }
+    bool isExpanded(int n) { return (pflags[n] & NF_EXPANDED) != 0; }
+    bool hasChildren(int n) { return pfirst[n] != 0 || (pflags[n] & NF_LAZY) != 0; }
+    void setStyle(int n, int st) { pstyle[n] = st; invalidate(); }
+    void setText(int n, char* t) { ptext[n] = pool.add(t); invalidate(); }
+    int childCount(int n) {
+        int c = 0;
+        for (int k = pfirst[n]; k != 0; k = pnext[k]) { c++; }
+        return c;
+    }
+
+    private void freeSubtree(int n) {
+        int k = pfirst[n];
+        while (k != 0) {
+            int nx = pnext[k];
+            freeSubtree(k);
+            pnext[k] = freeHead;
+            freeHead = k;
+            k = nx;
+        }
+        pfirst[n] = 0;
+        plast[n] = 0;
+    }
+
+    // removes all children of a node (a lazy node loads them again when expanded)
+    void removeChildren(int n) {
+        freeSubtree(n);
+        if ((pflags[n] & NF_LAZY) != 0) { pflags[n] = pflags[n] & ~(NF_LOADED | NF_EXPANDED); }
+        visDirty = true;
+        invalidate();
+    }
+
+    void clear() {
+        freeSubtree(0);
+        pool.reset();
+        ncount = 1;
+        freeHead = 0;
+        pfirst[0] = 0;
+        visDirty = true;
+        sel = 0;
+        top = 0;
+        invalidate();
+    }
+
+    // ---- the visible rows --------------------------------------------------------------------------------------------------------------
+    private void flatten(int n, int depth) {
+        for (int k = pfirst[n]; k != 0; k = pnext[k]) {
+            if (nvis == viscap) {
+                int nc = imax(64, viscap * 2);
+                int* nv = (int*) alloc(nc * 8);
+                for (int i = 0; i < nvis; i++) { nv[i] = vis[i]; }
+                vis = nv;
+                viscap = nc;
+            }
+            vis[nvis] = k;
+            nvis++;
+            if ((pflags[k] & NF_EXPANDED) != 0) { flatten(k, depth + 1); }
+        }
+    }
+
+    private void rebuild() {
+        if (!visDirty) { return; }
+        int keep = (sel >= 0 && sel < nvis) ? vis[sel] : 0;
+        nvis = 0;
+        flatten(0, 0);
+        visDirty = false;
+        if (keep != 0) { for (int i = 0; i < nvis; i++) { if (vis[i] == keep) { sel = i; } } }
+        if (sel >= nvis) { sel = imax(0, nvis - 1); }
+    }
+
+    private int depthOf(int n) {
+        int d = 0;
+        int p = pparent[n];
+        while (p > 0) { d++; p = pparent[p]; }
+        return d;
+    }
+
+    // the selected node (0 when the tree is empty)
+    int selected() {
+        rebuild();
+        if (sel < 0 || sel >= nvis) { return 0; }
+        return vis[sel];
+    }
+
+    private void fixScroll() {
+        rebuild();
+        if (sel < 0) { sel = 0; }
+        if (sel >= nvis) { sel = imax(0, nvis - 1); }
+        if (sel < top) { top = sel; }
+        if (sel >= top + h) { top = sel - h + 1; }
+        if (top > imax(0, nvis - h)) { top = imax(0, nvis - h); }
+        if (top < 0) { top = 0; }
+    }
+
+    private void setRow(int r) {
+        int old = sel;
+        sel = r;
+        fixScroll();
+        invalidate();
+        if (old != sel && onSelect != null) { onSelect((int) this); }
+    }
+
+    // makes a node the selection, expanding its ancestors
+    void select(int n) {
+        int p = pparent[n];
+        while (p > 0) { pflags[p] = pflags[p] | NF_EXPANDED; p = pparent[p]; }
+        visDirty = true;
+        rebuild();
+        for (int i = 0; i < nvis; i++) { if (vis[i] == n) { setRow(i); return; } }
+    }
+
+    void expand(int n) {
+        if (n <= 0 || !hasChildren(n) || isExpanded(n)) { return; }
+        if ((pflags[n] & NF_LAZY) != 0 && (pflags[n] & NF_LOADED) == 0) {
+            pflags[n] = pflags[n] | NF_LOADED;
+            if (onExpand != null) { onExpand((int) this, n); }
+        }
+        pflags[n] = pflags[n] | NF_EXPANDED;
+        visDirty = true;
+        invalidate();
+    }
+
+    void collapse(int n) {
+        if (n <= 0 || !isExpanded(n)) { return; }
+        pflags[n] = pflags[n] & ~NF_EXPANDED;
+        visDirty = true;
+        invalidate();
+        if (onCollapse != null) { onCollapse((int) this, n); }
+    }
+
+    void toggle(int n) { if (isExpanded(n)) { collapse(n); } else { expand(n); } }
+
+    void expandAll(int n) {
+        expand(n);
+        for (int k = pfirst[n]; k != 0; k = pnext[k]) { expandAll(k); }
+    }
+
+    // ---- painting and input ------------------------------------------------------------------------------------------------------------
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        fixScroll();
+        bool bar = nvis > h;
+        int cw = bar ? w - 1 : w;
+        for (int i = 0; i < h; i++) {
+            int row = top + i;
+            int yy = oy + i;
+            if (row >= nvis) { s->fill(ox, yy, cw, 1, ' ', tui.theme->text); continue; }
+            int n = vis[row];
+            bool isSel = row == sel;
+            int st = tui.theme->text;
+            if (isSel) { st = hasFocus() ? tui.theme->selection : tui.theme->selectionDim; }
+            else if (pstyle[n] != 0) { st = pstyle[n]; }
+            s->fill(ox, yy, cw, 1, ' ', st);
+            int d = depthOf(n);
+            int x = ox + 1 + d * 2;
+            if (hasChildren(n)) { s->put(x, yy, isExpanded(n) ? 0x25BE : 0x25B8, st); }
+            s->textEllipsis(x + 2, yy, pool.at(ptext[n]), imax(0, cw - (x + 2 - ox) - 1), st);
+        }
+        if (bar) { tui.drawVScroll(s, ox + w - 1, oy, h, nvis, h, top); }
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        fixScroll();
+        int k = e->key;
+        int n = selected();
+        if (k == term.KEY_UP) { setRow(imax(0, sel - 1)); return true; }
+        if (k == term.KEY_DOWN) { setRow(imin(nvis - 1, sel + 1)); return true; }
+        if (k == term.KEY_PGUP) { setRow(imax(0, sel - h + 1)); return true; }
+        if (k == term.KEY_PGDN) { setRow(imin(nvis - 1, sel + h - 1)); return true; }
+        if (k == term.KEY_HOME) { setRow(0); return true; }
+        if (k == term.KEY_END) { setRow(imax(0, nvis - 1)); return true; }
+        if (n == 0) { return false; }
+        if (k == term.KEY_RIGHT || k == '+') {
+            if (hasChildren(n) && !isExpanded(n)) { expand(n); }
+            else if (k == term.KEY_RIGHT && pfirst[n] != 0) { setRow(sel + 1); }
+            return true;
+        }
+        if (k == term.KEY_LEFT || k == '-') {
+            if (isExpanded(n)) { collapse(n); }
+            else if (k == term.KEY_LEFT && pparent[n] > 0) { select(pparent[n]); }
+            return true;
+        }
+        if (k == '*') { expandAll(n); return true; }
+        if (k == term.KEY_ENTER || k == ' ') {
+            if (hasChildren(n)) { toggle(n); }
+            else if (onActivate != null) { onActivate((int) this); }
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        fixScroll();
+        bool bar = nvis > h;
+        if (e->action == term.MA_WHEEL) {
+            if (e->button == term.MB_WHEEL_UP) { top = imax(0, top - 3); }
+            else if (e->button == term.MB_WHEEL_DOWN) { top = imax(0, imin(top + 3, nvis - h)); }
+            invalidate();
+            return true;
+        }
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            if (bar && lx == w - 1) {
+                dragging = true;
+                app->capture = this;
+                top = tui.scrollPosFor(ly, h, nvis, h);
+                invalidate();
+                return true;
+            }
+            int row = top + ly;
+            if (row >= 0 && row < nvis) {
+                int n = vis[row];
+                int ax = 1 + depthOf(n) * 2;
+                setRow(row);
+                if (hasChildren(n) && (lx == ax || lx == ax + 1)) { toggle(n); }
+                else if (app->clicks >= 2) {
+                    if (hasChildren(n)) { toggle(n); }
+                    else if (onActivate != null) { onActivate((int) this); }
+                }
+            }
+            return true;
+        }
+        if (dragging && e->action == term.MA_DRAG) { top = tui.scrollPosFor(ly, h, nvis, h); invalidate(); return true; }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// =============================================================================
+//  Table
+// =============================================================================
+// Columns are added with addColumn(title, width) (width 0: shares the free space). Rows are added with addRow("a", "b", ...) (up to 8 cells).
+// Clicking a header sorts by that column (numbers are compared as numbers). Keys and mouse as in a list.
+public class Table : tui.Widget {
+public:
+    tui.Pool pool;
+    tui.Text titles[8];
+    int widths[8];
+    int aligns[8];                  // 0 left, 1 centre, 2 right
+    int ncols;
+    int* cells;                     // ncols entries per row: pool offsets
+    int* ud;
+    int* order;                     // row order after sorting: order[display row] = row index
+    int nrows;
+    int cap;
+    int sel;                        // selected display row
+    int top;
+    int sortCol;                    // -1: unsorted
+    bool sortDesc;
+    bool sortable;
+    func onSelect;                  // int f(int table)
+    func onActivate;                // int f(int table)
+    bool dragging;
+
+    Table() {
+        super();
+        focusable = true;
+        sortCol = -1;
+        sortable = true;
+    }
+
+    virtual int prefW() { return 40; }
+    virtual int prefH() { return 8; }
+
+    void addColumn(char* title, int width = 0, int align = 0) {
+        if (ncols >= 8) { return; }
+        titles[ncols].set(title);
+        widths[ncols] = width;
+        aligns[ncols] = align;
+        ncols++;
+        invalidate();
+    }
+
+    void clear() {
+        pool.reset();
+        nrows = 0;
+        sel = 0;
+        top = 0;
+        invalidate();
+    }
+
+    private void growRows() {
+        if (nrows < cap) { return; }
+        int nc = imax(32, cap * 2);
+        int* a = (int*) alloc(nc * 8 * 8);
+        int* b = (int*) alloc(nc * 8);
+        int* c = (int*) alloc(nc * 8);
+        for (int i = 0; i < nrows * 8; i++) { a[i] = cells[i]; }
+        for (int i = 0; i < nrows; i++) { b[i] = ud[i]; c[i] = order[i]; }
+        cells = a; ud = b; order = c;
+        cap = nc;
+    }
+
+    // adds a row; returns its index (rows keep their index when the view is sorted)
+    int addRow(char* c0, char* c1 = "", char* c2 = "", char* c3 = "", char* c4 = "", char* c5 = "", char* c6 = "", char* c7 = "") {
+        growRows();
+        char* v[8];
+        v[0] = c0; v[1] = c1; v[2] = c2; v[3] = c3; v[4] = c4; v[5] = c5; v[6] = c6; v[7] = c7;
+        for (int i = 0; i < 8; i++) { cells[nrows * 8 + i] = pool.add(v[i]); }
+        ud[nrows] = 0;
+        order[nrows] = nrows;
+        nrows++;
+        if (sortCol >= 0) { sortBy(sortCol, sortDesc); }
+        invalidate();
+        return nrows - 1;
+    }
+
+    void setRowData(int row, int data) { if (row >= 0 && row < nrows) { ud[row] = data; } }
+    int rowData(int row) { if (row < 0 || row >= nrows) { return 0; } return ud[row]; }
+    char* cell(int row, int col) { if (row < 0 || row >= nrows || col < 0 || col >= 8) { return ""; } return pool.at(cells[row * 8 + col]); }
+    void setCell(int row, int col, char* t) { if (row >= 0 && row < nrows && col >= 0 && col < 8) { cells[row * 8 + col] = pool.add(t); invalidate(); } }
+
+    // the row index (as returned by addRow) of the selected row, -1 if none
+    int selectedRow() { if (sel < 0 || sel >= nrows) { return -1; } return order[sel]; }
+
+    void selectRow(int row) {
+        for (int i = 0; i < nrows; i++) { if (order[i] == row) { setSel(i); return; } }
+    }
+
+    private int compare(int a, int b, int col) {
+        char* x = cell(a, col);
+        char* y = cell(b, col);
+        int nx = 0;
+        int ny = 0;
+        if (parseInt(x, &nx) && parseInt(y, &ny)) {
+            if (nx < ny) { return -1; }
+            if (nx > ny) { return 1; }
+            return 0;
+        }
+        int i = 0;
+        while (x[i] != 0 && y[i] != 0) {
+            int cx = lowerOf(x[i] & 255);
+            int cy = lowerOf(y[i] & 255);
+            if (cx != cy) { return cx < cy ? -1 : 1; }
+            i++;
+        }
+        if (x[i] == 0 && y[i] == 0) { return 0; }
+        return x[i] == 0 ? -1 : 1;
+    }
+
+    // sorts the display order (stable) by a column
+    void sortBy(int col, bool desc) {
+        sortCol = col;
+        sortDesc = desc;
+        int keep = selectedRow();
+        // insertion sort on the order array keeps equal rows in their original order
+        for (int i = 0; i < nrows; i++) { order[i] = i; }
+        if (col >= 0 && col < ncols) {
+            for (int i = 1; i < nrows; i++) {
+                int v = order[i];
+                int j = i - 1;
+                while (j >= 0) {
+                    int c = compare(order[j], v, col);
+                    if (desc) { c = -c; }
+                    if (c <= 0) { break; }
+                    order[j + 1] = order[j];
+                    j--;
+                }
+                order[j + 1] = v;
+            }
+        }
+        if (keep >= 0) { for (int i = 0; i < nrows; i++) { if (order[i] == keep) { sel = i; } } }
+        fixScroll();
+        invalidate();
+    }
+
+    private int rowsVisible() { return imax(1, h - 1); }
+
+    private void fixScroll() {
+        int r = rowsVisible();
+        if (sel >= nrows) { sel = imax(0, nrows - 1); }
+        if (sel < 0) { sel = 0; }
+        if (sel < top) { top = sel; }
+        if (sel >= top + r) { top = sel - r + 1; }
+        if (top > imax(0, nrows - r)) { top = imax(0, nrows - r); }
+        if (top < 0) { top = 0; }
+    }
+
+    private void setSel(int r) {
+        int old = sel;
+        sel = r;
+        fixScroll();
+        invalidate();
+        if (old != sel && onSelect != null) { onSelect((int) this); }
+    }
+
+    // the width of column c in a table of total width tw (without the scroll bar)
+    private int colWidth(int c, int tw) {
+        if (widths[c] > 0) { return widths[c]; }
+        int fixedSum = 0;
+        int flexN = 0;
+        for (int i = 0; i < ncols; i++) { if (widths[i] > 0) { fixedSum = fixedSum + widths[i]; } else { flexN++; } }
+        int free = imax(0, tw - fixedSum);
+        int each = free / imax(1, flexN);
+        int idx = 0;
+        for (int i = 0; i < c; i++) { if (widths[i] == 0) { idx++; } }
+        if (idx == flexN - 1) { return free - each * (flexN - 1); }
+        return each;
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        fixScroll();
+        int r = rowsVisible();
+        bool bar = nrows > r;
+        int tw = bar ? w - 1 : w;
+        s->fill(ox, oy, tw, 1, ' ', tui.theme->header);
+        int x = ox;
+        for (int c = 0; c < ncols; c++) {
+            int cw = colWidth(c, tw);
+            char* t = titles[c].str();
+            int tx = x + 1;
+            int avail = imax(0, cw - 2);
+            if (c == sortCol) {
+                s->put(x + cw - 2, oy, sortDesc ? 0x25BC : 0x25B2, tui.theme->header);
+                avail = imax(0, cw - 4);
+            }
+            s->textMax(tx, oy, t, avail, tui.theme->header);
+            x = x + cw;
+        }
+        for (int i = 0; i < r; i++) {
+            int row = top + i;
+            int yy = oy + 1 + i;
+            if (row >= nrows) { s->fill(ox, yy, tw, 1, ' ', tui.theme->text); continue; }
+            bool isSel = row == sel;
+            int st = tui.theme->text;
+            if (isSel) { st = hasFocus() ? tui.theme->selection : tui.theme->selectionDim; }
+            s->fill(ox, yy, tw, 1, ' ', st);
+            int rx = ox;
+            for (int c = 0; c < ncols; c++) {
+                int cw = colWidth(c, tw);
+                char* t = cell(order[row], c);
+                int avail = imax(0, cw - 2);
+                int tx = rx + 1;
+                if (aligns[c] != 0) {
+                    int twid = tscreen.textWidth(t);
+                    if (twid < avail) { tx = rx + 1 + (aligns[c] == 2 ? avail - twid : (avail - twid) / 2); }
+                }
+                s->textMax(tx, yy, t, avail, st);
+                rx = rx + cw;
+            }
+        }
+        if (bar) { tui.drawVScroll(s, ox + w - 1, oy + 1, r, nrows, r, top); }
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        int k = e->key;
+        int r = rowsVisible();
+        if (k == term.KEY_UP) { setSel(imax(0, sel - 1)); return true; }
+        if (k == term.KEY_DOWN) { setSel(imin(nrows - 1, sel + 1)); return true; }
+        if (k == term.KEY_PGUP) { setSel(imax(0, sel - r + 1)); return true; }
+        if (k == term.KEY_PGDN) { setSel(imin(nrows - 1, sel + r - 1)); return true; }
+        if (k == term.KEY_HOME) { setSel(0); return true; }
+        if (k == term.KEY_END) { setSel(imax(0, nrows - 1)); return true; }
+        if (k == term.KEY_ENTER && e->mods == 0 && onActivate != null && nrows > 0) { onActivate((int) this); return true; }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        int r = rowsVisible();
+        bool bar = nrows > r;
+        if (e->action == term.MA_WHEEL) {
+            if (e->button == term.MB_WHEEL_UP) { top = imax(0, top - 3); }
+            else if (e->button == term.MB_WHEEL_DOWN) { top = imax(0, imin(top + 3, nrows - r)); }
+            invalidate();
+            return true;
+        }
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            if (ly == 0) {
+                if (!sortable) { return true; }
+                int tw = bar ? w - 1 : w;
+                int x = 0;
+                for (int c = 0; c < ncols; c++) {
+                    int cw = colWidth(c, tw);
+                    if (lx >= x && lx < x + cw) { sortBy(c, c == sortCol ? !sortDesc : false); return true; }
+                    x = x + cw;
+                }
+                return true;
+            }
+            if (bar && lx == w - 1) {
+                dragging = true;
+                app->capture = this;
+                top = tui.scrollPosFor(ly - 1, r, nrows, r);
+                invalidate();
+                return true;
+            }
+            int row = top + ly - 1;
+            if (row >= 0 && row < nrows) {
+                setSel(row);
+                if (app->clicks >= 2 && onActivate != null) { onActivate((int) this); }
+            }
+            return true;
+        }
+        if (dragging && e->action == term.MA_DRAG) { top = tui.scrollPosFor(ly - 1, r, nrows, r); invalidate(); return true; }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// =============================================================================
+//  TextPane: scrollable program output
+// =============================================================================
+// Append text with append() / appendLine(): complete lines are kept (the last MAX lines), a partial line is shown at the end until its newline
+// arrives. ANSI colour sequences (ESC [ ... m) in the text are shown as colours, other escape sequences are dropped. The pane follows the end of
+// the text until the user scrolls up (follow turns on again at the end). Click a line: onLineClick(pane) with clickedLine; Enter or a double
+// click: onLineActivate. Keys: Up / Down move the selected line (when selectable) or scroll, PgUp / PgDn, Home / End, Left / Right scroll sideways.
+public class TextPane : tui.Widget {
+public:
+    char* mem;                      // the text of the lines, one after the other (NUL terminated each)
+    int used;
+    int memCap;
+    int* loff;                      // per line (ring): offset into mem
+    int* llen;
+    int maxLines;
+    int head;                       // ring index of the oldest line
+    int nlines;
+    tui.Text partial;               // the unfinished last line
+    int top;                        // first visible line (counted from the oldest)
+    int hscroll;
+    bool follow;
+    bool selectable;
+    int selLine;                    // selected line (-1 none)
+    int clickedLine;
+    func onLineClick;               // int f(int pane)   clickedLine is set
+    func onLineActivate;            // int f(int pane)
+    bool dragging;
+    bool ansi;                      // interpret colour sequences (default true)
+
+    TextPane() {
+        super();
+        focusable = true;
+        maxLines = 5000;
+        follow = true;
+        selLine = -1;
+        ansi = true;
+        loff = (int*) alloc(maxLines * 8);
+        llen = (int*) alloc(maxLines * 8);
+        memCap = 1048576;
+        mem = alloc(memCap);
+    }
+
+    virtual int prefW() { return 40; }
+    virtual int prefH() { return 8; }
+
+    // the number of lines including the unfinished one
+    int lineCount() { return nlines + (partial.len > 0 ? 1 : 0); }
+
+    void clear() {
+        used = 0; head = 0; nlines = 0; top = 0; hscroll = 0; selLine = -1;
+        partial.clear();
+        follow = true;
+        invalidate();
+    }
+
+    // line i (0 is the oldest still kept) as stored (with escape sequences)
+    char* lineText(int i) {
+        if (i < 0 || i >= lineCount()) { return ""; }
+        if (i == nlines) { return partial.str(); }
+        return &mem[loff[(head + i) % maxLines]];
+    }
+
+    private void dropOldest(int n) {
+        if (n <= 0 || n > nlines) { n = nlines; }
+        head = (head + n) % maxLines;
+        nlines = nlines - n;
+        top = imax(0, top - n);
+        if (selLine >= 0) { selLine = selLine - n; }
+        if (nlines == 0) { used = 0; return; }
+        // move the text of the remaining lines to the start of mem
+        int start = loff[head];
+        int len = used - start;
+        if (start > 0) {
+            for (int i = 0; i < len; i++) { mem[i] = mem[start + i]; }
+            for (int i = 0; i < nlines; i++) { int k = (head + i) % maxLines; loff[k] = loff[k] - start; }
+            used = len;
+        }
+    }
+
+    private void pushLine(char* s, int n) {
+        if (nlines == maxLines) { dropOldest(maxLines / 4); }
+        if (used + n + 1 > memCap) { dropOldest(imax(1, nlines / 4)); }
+        if (used + n + 1 > memCap) { n = memCap - used - 1; if (n < 0) { return; } }
+        int k = (head + nlines) % maxLines;
+        loff[k] = used;
+        llen[k] = n;
+        memcpy(&mem[used], s, n);
+        mem[used + n] = 0;
+        used = used + n + 1;
+        nlines++;
+        if (follow) { top = 1 << 40; }
+    }
+
+    // adds text; newlines complete lines (\r\n counts as one newline, a lone \r is dropped)
+    void append(char* text) {
+        int n = strlen(text);
+        int start = 0;
+        for (int i = 0; i < n; i++) {
+            if (text[i] == '\n') {
+                int e = i;
+                if (e > start && text[e - 1] == '\r') { e--; }
+                if (partial.len > 0) {
+                    partial.insert(partial.len, &text[start], e - start);
+                    pushLine(partial.str(), partial.len);
+                    partial.clear();
+                } else {
+                    pushLine(&text[start], e - start);
+                }
+                start = i + 1;
+            }
+        }
+        if (start < n) {
+            int e = n;
+            if (text[e - 1] == '\r') { e--; }
+            partial.insert(partial.len, &text[start], e - start);
+        }
+        invalidate();
+    }
+
+    // adds a complete line
+    void appendLine(char* text) {
+        if (partial.len > 0) { pushLine(partial.str(), partial.len); partial.clear(); }
+        pushLine(text, strlen(text));
+        invalidate();
+    }
+
+    void appendBytes(char* b, int n) {
+        char tmp[1024];
+        int i = 0;
+        while (i < n) {
+            int m = imin(n - i, 1000);
+            memcpy(&tmp[0], &b[i], m);
+            tmp[m] = 0;
+            append(&tmp[0]);
+            i = i + m;
+        }
+    }
+
+    private int pageRows() { return imax(1, h); }
+
+    private void fixScroll() {
+        int total = lineCount();
+        int page = pageRows();
+        int maxTop = imax(0, total - page);
+        if (top > maxTop) { top = maxTop; }
+        if (top < 0) { top = 0; }
+        if (follow) { top = maxTop; }
+    }
+
+    void scrollTo(int line) {
+        top = line;
+        fixScroll();
+        follow = top >= imax(0, lineCount() - pageRows());
+        invalidate();
+    }
+
+    void scrollToEnd() { follow = true; fixScroll(); invalidate(); }
+
+    // the widest line in cells (without escape sequences), for the sideways scroll range
+    private int plainWidth(char* t) {
+        int w2 = 0;
+        int pos = 0;
+        while (t[pos] != 0) {
+            if (t[pos] == 27) {
+                pos++;
+                if (t[pos] == '[') { pos++; while (t[pos] != 0 && !(t[pos] >= 0x40 && t[pos] <= 0x7E)) { pos++; } if (t[pos] != 0) { pos++; } }
+                continue;
+            }
+            if (t[pos] == '\t') { w2 = w2 + 8 - (w2 % 8); pos++; continue; }
+            int cp;
+            pos = pos + utf8.decode(t, pos, &cp);
+            w2 = w2 + tscreen.runeWidth(cp);
+        }
+        return w2;
+    }
+
+    // draws one stored line at row yy, with colours; hs = columns scrolled away
+    private void drawLine(tscreen.Screen* s, int ox, int yy, int width, char* t, int base, int hs) {
+        int st = base;
+        int col = 0;
+        int pos = 0;
+        while (t[pos] != 0) {
+            int c = t[pos] & 255;
+            if (c == 27) {
+                pos++;
+                if (t[pos] == '[') {
+                    pos++;
+                    int params[16];
+                    int np = 0;
+                    int cur = 0;
+                    bool have = false;
+                    while (t[pos] != 0 && !(t[pos] >= 0x40 && t[pos] <= 0x7E)) {
+                        if (t[pos] >= '0' && t[pos] <= '9') { cur = cur * 10 + t[pos] - '0'; have = true; }
+                        else if (t[pos] == ';') { if (np < 16) { params[np] = cur; np++; } cur = 0; have = false; }
+                        pos++;
+                    }
+                    if (have || np > 0) { if (np < 16) { params[np] = cur; np++; } }
+                    if (t[pos] == 'm' && ansi) { st = applySgr(st, base, &params[0], np); }
+                    if (t[pos] != 0) { pos++; }
+                } else if (t[pos] != 0) {
+                    pos++;
+                }
+                continue;
+            }
+            int cp;
+            if (c == '\t') {
+                int sp = 8 - (col % 8);
+                for (int k = 0; k < sp; k++) {
+                    int cx = col - hs;
+                    if (cx >= 0 && cx < width) { s->put(ox + cx, yy, ' ', st); }
+                    col++;
+                }
+                pos++;
+                continue;
+            }
+            pos = pos + utf8.decode(t, pos, &cp);
+            int wd = tscreen.runeWidth(cp);
+            if (wd == 0) { s->put(ox + imax(0, col - hs - 1), yy, cp, st); continue; }
+            int cx = col - hs;
+            if (cx >= 0 && cx + wd <= width) { s->put(ox + cx, yy, cp, st); }
+            col = col + wd;
+            if (col - hs >= width) { break; }
+        }
+    }
+
+    private int applySgr(int st, int base, int* p, int n) {
+        if (n == 0) { return base; }
+        for (int i = 0; i < n; i++) {
+            int v = p[i];
+            if (v == 0) { st = base; }
+            else if (v == 1) { st = tscreen.addAttr(st, tscreen.A_BOLD); }
+            else if (v == 2) { st = tscreen.addAttr(st, tscreen.A_DIM); }
+            else if (v == 3) { st = tscreen.addAttr(st, tscreen.A_ITALIC); }
+            else if (v == 4) { st = tscreen.addAttr(st, tscreen.A_UNDERLINE); }
+            else if (v == 7) { st = tscreen.addAttr(st, tscreen.A_REVERSE); }
+            else if (v == 22) { st = tscreen.delAttr(st, tscreen.A_BOLD | tscreen.A_DIM); }
+            else if (v == 24) { st = tscreen.delAttr(st, tscreen.A_UNDERLINE); }
+            else if (v == 27) { st = tscreen.delAttr(st, tscreen.A_REVERSE); }
+            else if (v >= 30 && v <= 37) { st = tscreen.withFg(st, tscreen.idx(v - 30)); }
+            else if (v >= 90 && v <= 97) { st = tscreen.withFg(st, tscreen.idx(v - 90 + 8)); }
+            else if (v == 39) { st = tscreen.withFg(st, tscreen.fgOf(base)); }
+            else if (v >= 40 && v <= 47) { st = tscreen.withBg(st, tscreen.idx(v - 40)); }
+            else if (v >= 100 && v <= 107) { st = tscreen.withBg(st, tscreen.idx(v - 100 + 8)); }
+            else if (v == 49) { st = tscreen.withBg(st, tscreen.bgOf(base)); }
+            else if ((v == 38 || v == 48) && i + 2 < n && p[i + 1] == 5) {
+                int c = tscreen.idx(p[i + 2]);
+                if (v == 38) { st = tscreen.withFg(st, c); } else { st = tscreen.withBg(st, c); }
+                i = i + 2;
+            } else if ((v == 38 || v == 48) && i + 4 < n && p[i + 1] == 2) {
+                int c = tscreen.rgb(p[i + 2], p[i + 3], p[i + 4]);
+                if (v == 38) { st = tscreen.withFg(st, c); } else { st = tscreen.withBg(st, c); }
+                i = i + 4;
+            }
+        }
+        return st;
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        fixScroll();
+        int total = lineCount();
+        int page = pageRows();
+        bool bar = total > page;
+        int cw = bar ? w - 1 : w;
+        for (int i = 0; i < page; i++) {
+            int line = top + i;
+            int yy = oy + i;
+            int st = tui.theme->text;
+            if (line == selLine && selectable) { st = hasFocus() ? tui.theme->selection : tui.theme->selectionDim; }
+            s->fill(ox, yy, cw, 1, ' ', st);
+            if (line < total) { drawLine(s, ox, yy, cw, lineText(line), st, hscroll); }
+        }
+        if (bar) { tui.drawVScroll(s, ox + w - 1, oy, page, total, page, top); }
+    }
+
+    private void moveSel(int delta) {
+        int total = lineCount();
+        if (total == 0) { return; }
+        if (selLine < 0) { selLine = top; }
+        selLine = imax(0, imin(total - 1, selLine + delta));
+        if (selLine < top) { top = selLine; follow = false; }
+        if (selLine >= top + pageRows()) { top = selLine - pageRows() + 1; }
+        follow = top >= imax(0, total - pageRows()) && selLine >= total - 1;
+        invalidate();
+    }
+
+    private void click(int line) {
+        clickedLine = line;
+        if (selectable) { selLine = line; }
+        invalidate();
+        if (onLineClick != null) { onLineClick((int) this); }
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        int k = e->key;
+        int total = lineCount();
+        int page = pageRows();
+        if (k == term.KEY_UP) { if (selectable) { moveSel(-1); } else { scrollTo(top - 1); } return true; }
+        if (k == term.KEY_DOWN) { if (selectable) { moveSel(1); } else { scrollTo(top + 1); } return true; }
+        if (k == term.KEY_PGUP) { if (selectable) { moveSel(-page); } else { scrollTo(top - page + 1); } return true; }
+        if (k == term.KEY_PGDN) { if (selectable) { moveSel(page); } else { scrollTo(top + page - 1); } return true; }
+        if (k == term.KEY_HOME) { if (selectable) { moveSel(-total); } else { scrollTo(0); } return true; }
+        if (k == term.KEY_END) { if (selectable) { moveSel(total); } scrollToEnd(); return true; }
+        if (k == term.KEY_LEFT) { hscroll = imax(0, hscroll - 8); invalidate(); return true; }
+        if (k == term.KEY_RIGHT) { hscroll = hscroll + 8; invalidate(); return true; }
+        if (k == term.KEY_ENTER && e->mods == 0 && selectable && selLine >= 0 && onLineActivate != null) { onLineActivate((int) this); return true; }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        int total = lineCount();
+        int page = pageRows();
+        bool bar = total > page;
+        if (e->action == term.MA_WHEEL) {
+            if (e->button == term.MB_WHEEL_UP) { scrollTo(top - 3); }
+            else if (e->button == term.MB_WHEEL_DOWN) { scrollTo(top + 3); }
+            else if (e->button == term.MB_WHEEL_LEFT) { hscroll = imax(0, hscroll - 8); invalidate(); }
+            else if (e->button == term.MB_WHEEL_RIGHT) { hscroll = hscroll + 8; invalidate(); }
+            return true;
+        }
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            if (bar && lx == w - 1) {
+                dragging = true;
+                app->capture = this;
+                scrollTo(tui.scrollPosFor(ly, page, total, page));
+                return true;
+            }
+            int line = top + ly;
+            if (line >= 0 && line < total) {
+                click(line);
+                if (app->clicks >= 2 && onLineActivate != null) { onLineActivate((int) this); }
+            }
+            return true;
+        }
+        if (dragging && e->action == term.MA_DRAG) { scrollTo(tui.scrollPosFor(ly, page, total, page)); return true; }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// =============================================================================
+//  dialogs
+// =============================================================================
+// Shows a message with up to three buttons and waits. Returns the number of the button pressed (1, 2 or 3), 0 for Esc. The first button is the
+// default one. Long text is wrapped. In a headless App use app->showDialog and feed keys instead (this waits in a loop).
+public int messageBox(tui.App* app, char* title, char* text, char* b1 = "&OK", char* b2 = "", char* b3 = "") {
+    int width = imin(60, imax(20, app->cols - 12));
+    tui.Label* l = new tui.Label(wrapText(text, width));
+    tui.Dialog* d = new tui.Dialog(title, l);
+    d->addButton(b1, 1, true);
+    if (b2[0] != 0) { d->addButton(b2, 2); }
+    if (b3[0] != 0) { d->addButton(b3, 3); }
+    return app->runDialog(d);
+}
+
+public bool askYesNo(tui.App* app, char* title, char* text) {
+    return messageBox(app, title, text, "&Yes", "&No") == 1;
+}
+
+// Yes / No / Cancel: 1, 2, 0
+public int askYesNoCancel(tui.App* app, char* title, char* text) {
+    int r = messageBox(app, title, text, "&Yes", "&No", "&Cancel");
+    if (r == 3) { return 0; }
+    return r;
+}
+
+// Asks for a line of text. Returns a copy of what was typed, null when cancelled.
+public char* prompt(tui.App* app, char* title, char* label, char* initial = "") {
+    tui.Box* col = tui.vbox(1, 0);
+    col->add(new tui.Label(label));
+    tui.TextInput* ti = new tui.TextInput(initial);
+    ti->selectAll();
+    col->add(ti);
+    tui.Dialog* d = new tui.Dialog(title, col);
+    d->addButton("&OK", 1, true);
+    d->addButton("&Cancel", 0);
+    d->fit(46, 0);
+    int r = app->runDialog(d);
+    if (r != 1) { return null; }
+    char* t = ti->getText();
+    char* copy = alloc(strlen(t) + 1);
+    memcpy(copy, t, strlen(t) + 1);
+    return copy;
+}
+
+// =============================================================================
+//  the file picker
+// =============================================================================
+class FilePicker {
+public:
+    tui.App* app;
+    tui.Dialog* dlg;
+    tui.TextInput* pathIn;
+    tui.ListView* list;
+    tui.TextInput* nameIn;
+    tui.Label* info;
+    bool saveMode;
+    bool dirMode;
+    bool showHidden;
+    tui.Text cwd;
+    tui.Text result;
+    tui.Text pattern;               // "*.a", "*.txt" ...: only files that match are shown ("" = all)
+    tui.Pool names;
+    int* noff;
+    int* nkind;                     // 1 directory, 0 file
+    int* nsort;
+    int* ntmp;
+    int ncount;
+    int ncap;
+}
+
+private int sysGetdents() { if (__ARCH == 0) { return 217; } return 61; }
+
+// is path a directory that can be read?
+private bool isDirPath(char* path) {
+    if (__OS == 1) { return false; }
+    int fd = __open(path, 0);
+    if (fd < 0) { return false; }
+    char buf[64];
+    int r = __syscall(sysGetdents(), fd, (int) &buf[0], 64, 0, 0, 0);
+    __close(fd);
+    return r >= 0;
+}
+
+private int cmpEntry(FilePicker* p, int a, int b) {
+    if (p->nkind[a] != p->nkind[b]) { return p->nkind[a] > p->nkind[b] ? -1 : 1; }
+    char* x = p->names.at(p->noff[a]);
+    char* y = p->names.at(p->noff[b]);
+    int i = 0;
+    while (x[i] != 0 && y[i] != 0) {
+        int cx = lowerOf(x[i] & 255);
+        int cy = lowerOf(y[i] & 255);
+        if (cx != cy) { return cx < cy ? -1 : 1; }
+        i++;
+    }
+    if (x[i] == 0 && y[i] == 0) { return 0; }
+    return x[i] == 0 ? -1 : 1;
+}
+
+// a merge sort of the index array nsort[0 .. n)
+private void sortEntries(FilePicker* p, int n) {
+    for (int w = 1; w < n; w = w * 2) {
+        for (int lo = 0; lo < n; lo = lo + 2 * w) {
+            int mid = imin(lo + w, n);
+            int hi = imin(lo + 2 * w, n);
+            int i = lo;
+            int j = mid;
+            int k = lo;
+            while (i < mid && j < hi) {
+                if (cmpEntry(p, p->nsort[j], p->nsort[i]) < 0) { p->ntmp[k] = p->nsort[j]; j++; }
+                else { p->ntmp[k] = p->nsort[i]; i++; }
+                k++;
+            }
+            while (i < mid) { p->ntmp[k] = p->nsort[i]; i++; k++; }
+            while (j < hi) { p->ntmp[k] = p->nsort[j]; j++; k++; }
+        }
+        for (int i = 0; i < n; i++) { p->nsort[i] = p->ntmp[i]; }
+    }
+}
+
+// shell style pattern with a leading * only: "*.a" matches names that end in ".a"; "" matches everything
+private bool matchesPattern(char* name, char* pat) {
+    if (pat[0] == 0) { return true; }
+    if (pat[0] == '*') {
+        char* suf = &pat[1];
+        int nl = strlen(name);
+        int sl = strlen(suf);
+        if (sl > nl) { return false; }
+        for (int i = 0; i < sl; i++) { if (lowerOf(name[nl - sl + i] & 255) != lowerOf(suf[i] & 255)) { return false; } }
+        return true;
+    }
+    return tui.containsFold(name, pat);
+}
+
+private char* joinPath(char* dir, char* name) {
+    int dl = strlen(dir);
+    int nl = strlen(name);
+    char* r = alloc(dl + nl + 2);
+    memcpy(r, dir, dl);
+    int o = dl;
+    if (dl > 0 && dir[dl - 1] != '/') { r[o] = '/'; o++; }
+    memcpy(&r[o], name, nl + 1);
+    return r;
+}
+
+// the directory above a path ("/a/b" -> "/a", "/a" -> "/")
+private char* parentPath(char* p) {
+    int n = strlen(p);
+    while (n > 1 && p[n - 1] == '/') { n--; }
+    while (n > 1 && p[n - 1] != '/') { n--; }
+    while (n > 1 && p[n - 1] == '/') { n--; }
+    char* r = alloc(n + 2);
+    memcpy(r, p, n);
+    r[n] = 0;
+    if (n == 0) { r[0] = '/'; r[1] = 0; }
+    return r;
+}
+
+// makes a path absolute and removes . and .. and double slashes
+private char* cleanPath(char* base, char* p) {
+    char* full = p;
+    if (p[0] != '/') { full = joinPath(base, p); }
+    int n = strlen(full);
+    char* out = alloc(n + 2);
+    int o = 0;
+    int i = 0;
+    out[0] = '/';
+    o = 1;
+    while (i < n) {
+        while (i < n && full[i] == '/') { i++; }
+        int e = i;
+        while (e < n && full[e] != '/') { e++; }
+        int len = e - i;
+        if (len == 0) { break; }
+        if (len == 1 && full[i] == '.') { }
+        else if (len == 2 && full[i] == '.' && full[i + 1] == '.') {
+            while (o > 1 && out[o - 1] == '/') { o--; }
+            while (o > 1 && out[o - 1] != '/') { o--; }
+        } else {
+            if (o > 1 && out[o - 1] != '/') { out[o] = '/'; o++; }
+            memcpy(&out[o], &full[i], len);
+            o = o + len;
+        }
+        i = e;
+    }
+    out[o] = 0;
+    return out;
+}
+
+private char* currentDir() {
+    char buf[4096];
+    int r = __syscall(__ARCH == 0 ? 79 : 17, (int) &buf[0], 4096, 0, 0, 0, 0);
+    if (r <= 0) { return "/"; }
+    char* c = alloc(strlen(&buf[0]) + 1);
+    memcpy(c, &buf[0], strlen(&buf[0]) + 1);
+    return c;
+}
+
+// fills the list with the entries of dir
+private void fpLoad(FilePicker* p, char* dir) {
+    p->cwd.set(dir);
+    p->pathIn->setText(dir);
+    p->list->clear();
+    p->names.reset();
+    p->ncount = 0;
+    if (p->ncap == 0) {
+        p->ncap = 4096;
+        p->noff = (int*) alloc(p->ncap * 8);
+        p->nkind = (int*) alloc(p->ncap * 8);
+        p->nsort = (int*) alloc(p->ncap * 8);
+        p->ntmp = (int*) alloc(p->ncap * 8);
+    }
+    int fd = __open(dir, 0);
+    bool ok = fd >= 0;
+    if (ok) {
+        char buf[4096];
+        for (;;) {
+            int got = __syscall(sysGetdents(), fd, (int) &buf[0], 4096, 0, 0, 0);
+            if (got <= 0) { break; }
+            int pos = 0;
+            while (pos < got) {
+                int reclen = (buf[pos + 16] & 255) | ((buf[pos + 17] & 255) << 8);
+                int dtype = buf[pos + 18] & 255;
+                char* name = &buf[pos + 19];
+                if (reclen <= 0) { break; }
+                bool skip = streq(name, ".") || streq(name, "..") || (!p->showHidden && name[0] == '.') || p->ncount >= p->ncap;
+                if (!skip) {
+                    bool isDir = dtype == 4;
+                    if (dtype == 10 || dtype == 0) { isDir = isDirPath(joinPath(dir, name)); }
+                    if (isDir || (!p->dirMode && matchesPattern(name, p->pattern.str()))) {
+                        p->noff[p->ncount] = p->names.add(name);
+                        p->nkind[p->ncount] = isDir ? 1 : 0;
+                        p->nsort[p->ncount] = p->ncount;
+                        p->ncount++;
+                    }
+                }
+                pos = pos + reclen;
+            }
+        }
+        __close(fd);
+    }
+    sortEntries(p, p->ncount);
+    if (!streq(dir, "/")) { p->list->add("../", 2); }
+    for (int i = 0; i < p->ncount; i++) {
+        int k = p->nsort[i];
+        char* nm = p->names.at(p->noff[k]);
+        if (p->nkind[k] == 1) {
+            char tmp[1024];
+            format(&tmp[0], 1024, "%s/", nm, 0, 0, 0);
+            p->list->add(&tmp[0], 1);
+        } else {
+            p->list->add(nm, 0);
+        }
+    }
+    char msg[1100];
+    if (!ok) { format(&msg[0], 1100, "cannot read %s", dir, 0, 0, 0); }
+    else { format(&msg[0], 1100, "%d entries%s", p->ncount, p->showHidden ? " (hidden files shown)" : "", 0, 0); }
+    p->info->setText(&msg[0]);
+}
+
+// the user wants to finish: decides what happens (enter a directory, ask before overwriting, close the dialog)
+private void fpAccept(FilePicker* p) {
+    char* typed = p->saveMode ? p->nameIn->getText() : "";
+    char* full = null;
+    if (p->saveMode && typed[0] != 0) {
+        full = cleanPath(p->cwd.str(), typed);
+    } else if (p->dirMode) {
+        int sel = p->list->selected();
+        if (sel >= 0 && p->list->itemData(sel) == 1) {
+            char* nm = p->list->itemText(sel);
+            char tmp[1024];
+            int n = imin(strlen(nm) - 1, 1000);
+            memcpy(&tmp[0], nm, n);
+            tmp[n] = 0;
+            full = cleanPath(p->cwd.str(), &tmp[0]);
+        } else {
+            full = p->cwd.str();
+        }
+    } else {
+        int sel = p->list->selected();
+        if (sel < 0) { return; }
+        int kind = p->list->itemData(sel);
+        char* nm = p->list->itemText(sel);
+        if (kind == 2) { fpLoad(p, parentPath(p->cwd.str())); return; }
+        if (kind == 1) {
+            char tmp[1024];
+            int n = imin(strlen(nm) - 1, 1000);
+            memcpy(&tmp[0], nm, n);
+            tmp[n] = 0;
+            fpLoad(p, cleanPath(p->cwd.str(), &tmp[0]));
+            return;
+        }
+        full = cleanPath(p->cwd.str(), nm);
+    }
+    if (full == null) { return; }
+    if (p->saveMode && fileExists(full) && !isDirPath(full)) {
+        if (!askYesNo(p->app, "Overwrite", "That file exists already. Replace it?")) { return; }
+    }
+    if (p->saveMode && isDirPath(full)) { fpLoad(p, full); return; }
+    p->result.set(full);
+    p->dlg->close(1);
+}
+
+int fpOk(int button) {
+    tui.Button* b = (tui.Button*) button;
+    fpAccept((FilePicker*) b->userData);
+    return 0;
+}
+
+int fpActivate(int list) {
+    tui.ListView* l = (tui.ListView*) list;
+    FilePicker* p = (FilePicker*) l->userData;
+    if (p->saveMode) {
+        int sel = l->selected();
+        if (sel >= 0 && l->itemData(sel) == 0) {
+            p->nameIn->setText(l->itemText(sel));
+            return 0;
+        }
+    }
+    fpAccept(p);
+    return 0;
+}
+
+int fpSelect(int list) {
+    tui.ListView* l = (tui.ListView*) list;
+    FilePicker* p = (FilePicker*) l->userData;
+    if (p->saveMode) {
+        int sel = l->selected();
+        if (sel >= 0 && l->itemData(sel) == 0) { p->nameIn->setText(l->itemText(sel)); }
+    }
+    return 0;
+}
+
+int fpPathEnter(int input) {
+    tui.TextInput* t = (tui.TextInput*) input;
+    FilePicker* p = (FilePicker*) t->userData;
+    char* full = cleanPath(p->cwd.str(), t->getText());
+    if (isDirPath(full)) { fpLoad(p, full); p->list->focusMe(); }
+    else if (!p->saveMode && !p->dirMode && fileExists(full)) { p->result.set(full); p->dlg->close(1); }
+    else if (p->saveMode) {
+        char* dir = parentPath(full);
+        if (isDirPath(dir)) { fpLoad(p, dir); p->nameIn->setText(&full[strlen(dir) > 1 ? strlen(dir) + 1 : 1]); p->nameIn->focusMe(); }
+    }
+    return 0;
+}
+
+int fpNameEnter(int input) {
+    tui.TextInput* t = (tui.TextInput*) input;
+    fpAccept((FilePicker*) t->userData);
+    return 0;
+}
+
+int fpKey(int widget, int event) {
+    tui.Widget* wd = (tui.Widget*) widget;
+    term.Event* e = (term.Event*) event;
+    FilePicker* p = (FilePicker*) wd->userData;
+    if (e->key == 'h' && (e->mods & term.MOD_CTRL) != 0) {
+        p->showHidden = !p->showHidden;
+        fpLoad(p, p->cwd.str());
+        return 1;
+    }
+    return 0;
+}
+
+private FilePicker* fpMake(tui.App* app, char* title, char* startDir, char* pat, bool save, bool dirs, char* defaultName) {
+    FilePicker* p = new FilePicker();
+    p->app = app;
+    p->saveMode = save;
+    p->dirMode = dirs;
+    p->pattern.set(pat);
+    p->pathIn = new tui.TextInput("");
+    p->pathIn->userData = (int) p;
+    p->pathIn->onEnter = fpPathEnter;
+    p->pathIn->onKey = fpKey;
+    p->list = new tui.ListView();
+    p->list->userData = (int) p;
+    p->list->filterable = true;
+    p->list->flex = 1;
+    p->list->onActivate = fpActivate;
+    p->list->onSelect = fpSelect;
+    p->list->onKey = fpKey;
+    p->info = new tui.Label("");
+    p->info->setStyle(tui.theme->hint);
+    tui.Box* col = tui.vbox(0, 0);
+    col->add(p->pathIn);
+    col->add(p->list);
+    if (save) {
+        p->nameIn = new tui.TextInput(defaultName);
+        p->nameIn->userData = (int) p;
+        p->nameIn->onEnter = fpNameEnter;
+        tui.Box* row = tui.hbox(1, 0);
+        tui.Label* nl = new tui.Label("Name:");
+        row->add(nl);
+        p->nameIn->flex = 1;
+        row->add(p->nameIn);
+        col->add(row);
+    }
+    col->add(p->info);
+    col->fixedW = imin(64, app->cols - 6);
+    col->fixedH = imin(save ? 20 : 18, app->rows - 8);
+    p->dlg = new tui.Dialog(title, col);
+    tui.Button* ok = p->dlg->addButton(dirs ? "&Select" : (save ? "&Save" : "&Open"), 1, true);
+    ok->userData = (int) p;
+    ok->onClick = fpOk;
+    p->dlg->addButton("&Cancel", 0);
+    char* start = startDir;
+    if (start == null || start[0] == 0) { start = currentDir(); }
+    fpLoad(p, cleanPath("/", start));
+    return p;
+}
+
+// Choose a file to open. Returns the full path (a copy), null when cancelled. filter: "" or a suffix pattern like "*.a".
+// Keys: Enter opens a directory or picks a file, type to filter the list, Ctrl+H shows hidden files, the path field takes a typed path.
+public char* fileOpenDialog(tui.App* app, char* title, char* startDir = "", char* filter = "") {
+    FilePicker* p = fpMake(app, title, startDir, filter, false, false, "");
+    if (app->runDialog(p->dlg) != 1) { return null; }
+    char* r = p->result.str();
+    char* c = alloc(strlen(r) + 1);
+    memcpy(c, r, strlen(r) + 1);
+    return c;
+}
+
+// Choose a file name to save to (the file need not exist; an existing one is only replaced after asking). Returns the full path or null.
+public char* fileSaveDialog(tui.App* app, char* title, char* startDir = "", char* defaultName = "", char* filter = "") {
+    FilePicker* p = fpMake(app, title, startDir, filter, true, false, defaultName);
+    if (app->runDialog(p->dlg) != 1) { return null; }
+    char* r = p->result.str();
+    char* c = alloc(strlen(r) + 1);
+    memcpy(c, r, strlen(r) + 1);
+    return c;
+}
+
+// Choose a directory. Returns its full path or null.
+public char* directoryDialog(tui.App* app, char* title, char* startDir = "") {
+    FilePicker* p = fpMake(app, title, startDir, "", false, true, "");
+    if (app->runDialog(p->dlg) != 1) { return null; }
+    char* r = p->result.str();
+    char* c = alloc(strlen(r) + 1);
+    memcpy(c, r, strlen(r) + 1);
+    return c;
+}
+
+// =============================================================================
+//  the colour picker
+// =============================================================================
+// the 256 colour palette as a 32 x 8 grid of coloured cells; arrows move, Enter / click pick
+public class PaletteGrid : tui.Widget {
+public:
+    int cur;
+    func onChange;                  // int f(int grid)
+    bool dragging;
+
+    PaletteGrid() {
+        super();
+        focusable = true;
+    }
+
+    virtual int prefW() { return 32; }
+    virtual int prefH() { return 8; }
+
+    void setCur(int c) {
+        if (c < 0) { c = 0; }
+        if (c > 255) { c = 255; }
+        if (c == cur) { return; }
+        cur = c;
+        invalidate();
+        if (onChange != null) { onChange((int) this); }
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        for (int i = 0; i < 256; i++) {
+            int cx = i % 32;
+            int cy = i / 32;
+            int rgbv = tscreen.paletteRgb(i);
+            int lum = tscreen.redOf(rgbv) * 3 + tscreen.greenOf(rgbv) * 6 + tscreen.blueOf(rgbv);
+            int fg = lum > 1280 ? tscreen.BLACK : tscreen.WHITE;
+            s->put(ox + cx, oy + cy, i == cur ? '+' : ' ', tscreen.style(fg, tscreen.idx(i), 0));
+        }
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        int k = e->key;
+        if (k == term.KEY_LEFT) { setCur(cur - 1); return true; }
+        if (k == term.KEY_RIGHT) { setCur(cur + 1); return true; }
+        if (k == term.KEY_UP) { setCur(cur - 32); return true; }
+        if (k == term.KEY_DOWN) { setCur(cur + 32); return true; }
+        if (k == term.KEY_HOME) { setCur(0); return true; }
+        if (k == term.KEY_END) { setCur(255); return true; }
+        if (k == term.KEY_PGUP) { setCur(cur - 64); return true; }
+        if (k == term.KEY_PGDN) { setCur(cur + 64); return true; }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) { dragging = true; app->capture = this; setCur(ly * 32 + lx); return true; }
+        if (dragging && e->action == term.MA_DRAG) { if (lx >= 0 && lx < 32 && ly >= 0 && ly < 8) { setCur(ly * 32 + lx); } return true; }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+class ColorPicker {
+public:
+    tui.App* app;
+    tui.Dialog* dlg;
+    PaletteGrid* grid;
+    tui.Slider* sr;
+    tui.Slider* sg;
+    tui.Slider* sb;
+    tui.TextInput* hex;
+    tui.Label* preview;
+    tui.Label* mode;
+    bool useIdx;
+    bool updating;
+}
+
+private int cpColor(ColorPicker* p) {
+    if (p->useIdx) { return tscreen.idx(p->grid->cur); }
+    return tscreen.rgb(p->sr->value, p->sg->value, p->sb->value);
+}
+
+private void cpRefresh(ColorPicker* p) {
+    p->updating = true;
+    int c = cpColor(p);
+    int rgbv = tscreen.rgbOf(c);
+    char t[32];
+    format(&t[0], 32, "#%06X", rgbv, 0, 0, 0);
+    p->hex->setText(&t[0]);
+    p->preview->setStyle(tscreen.style(tscreen.WHITE, c, 0));
+    char m[64];
+    if (p->useIdx) { format(&m[0], 64, "palette colour %d", p->grid->cur, 0, 0, 0); }
+    else { format(&m[0], 64, "24 bit colour %d, %d, %d", p->sr->value, p->sg->value, p->sb->value, 0); }
+    p->mode->setText(&m[0]);
+    p->updating = false;
+}
+
+int cpGrid(int grid) {
+    PaletteGrid* g = (PaletteGrid*) grid;
+    ColorPicker* p = (ColorPicker*) g->userData;
+    int rgbv = tscreen.paletteRgb(g->cur);
+    p->useIdx = true;
+    p->updating = true;
+    p->sr->setValue(tscreen.redOf(rgbv));
+    p->sg->setValue(tscreen.greenOf(rgbv));
+    p->sb->setValue(tscreen.blueOf(rgbv));
+    p->updating = false;
+    p->useIdx = true;
+    cpRefresh(p);
+    return 0;
+}
+
+int cpSlider(int slider) {
+    tui.Slider* s = (tui.Slider*) slider;
+    ColorPicker* p = (ColorPicker*) s->userData;
+    if (p->updating) { return 0; }
+    p->useIdx = false;
+    cpRefresh(p);
+    return 0;
+}
+
+int cpHex(int input) {
+    tui.TextInput* t = (tui.TextInput*) input;
+    ColorPicker* p = (ColorPicker*) t->userData;
+    if (p->updating) { return 0; }
+    char* s = t->getText();
+    if (s[0] == '#') { s++; }
+    if (strlen(s) != 6) { return 0; }
+    int v = 0;
+    for (int i = 0; i < 6; i++) {
+        int c = lowerOf(s[i] & 255);
+        int d;
+        if (c >= '0' && c <= '9') { d = c - '0'; }
+        else if (c >= 'a' && c <= 'f') { d = c - 'a' + 10; }
+        else { return 0; }
+        v = v * 16 + d;
+    }
+    p->updating = true;
+    p->sr->setValue((v >> 16) & 255);
+    p->sg->setValue((v >> 8) & 255);
+    p->sb->setValue(v & 255);
+    p->updating = false;
+    p->useIdx = false;
+    p->preview->setStyle(tscreen.style(tscreen.WHITE, cpColor(p), 0));
+    char m[64];
+    format(&m[0], 64, "24 bit colour %d, %d, %d", p->sr->value, p->sg->value, p->sb->value, 0);
+    p->mode->setText(&m[0]);
+    return 0;
+}
+
+int cpTrackR(int slider, int pos) {
+    tui.Slider* s = (tui.Slider*) slider;
+    ColorPicker* p = (ColorPicker*) s->userData;
+    return tscreen.rgb(s->w > 1 ? pos * 255 / (s->w - 1) : 0, p->sg->value, p->sb->value);
+}
+int cpTrackG(int slider, int pos) {
+    tui.Slider* s = (tui.Slider*) slider;
+    ColorPicker* p = (ColorPicker*) s->userData;
+    return tscreen.rgb(p->sr->value, s->w > 1 ? pos * 255 / (s->w - 1) : 0, p->sb->value);
+}
+int cpTrackB(int slider, int pos) {
+    tui.Slider* s = (tui.Slider*) slider;
+    ColorPicker* p = (ColorPicker*) s->userData;
+    return tscreen.rgb(p->sr->value, p->sg->value, s->w > 1 ? pos * 255 / (s->w - 1) : 0);
+}
+
+private ColorPicker* cpMake(tui.App* app, char* title, int initial) {
+    ColorPicker* p = new ColorPicker();
+    p->app = app;
+    tui.Box* col = tui.vbox(0, 0);
+    p->grid = new PaletteGrid();
+    p->grid->userData = (int) p;
+    p->grid->onChange = cpGrid;
+    col->add(p->grid);
+    col->add(new tui.Spacer());
+    p->sr = new tui.Slider(); p->sg = new tui.Slider(); p->sb = new tui.Slider();
+    p->sr->max = 255; p->sg->max = 255; p->sb->max = 255;
+    p->sr->step = 5; p->sg->step = 5; p->sb->step = 5;
+    p->sr->userData = (int) p; p->sg->userData = (int) p; p->sb->userData = (int) p;
+    p->sr->onChange = cpSlider; p->sg->onChange = cpSlider; p->sb->onChange = cpSlider;
+    p->sr->trackColor = cpTrackR; p->sg->trackColor = cpTrackG; p->sb->trackColor = cpTrackB;
+    char* labels[3] = {"R", "G", "B"};
+    tui.Slider* sl[3];
+    sl[0] = p->sr; sl[1] = p->sg; sl[2] = p->sb;
+    for (int i = 0; i < 3; i++) {
+        tui.Box* row = tui.hbox(1, 0);
+        row->add(new tui.Label(labels[i]));
+        sl[i]->flex = 1;
+        row->add(sl[i]);
+        col->add(row);
+    }
+    tui.Box* row2 = tui.hbox(1, 0);
+    row2->add(new tui.Label("Hex"));
+    p->hex = new tui.TextInput("#000000");
+    p->hex->userData = (int) p;
+    p->hex->fixedW = 9;
+    p->hex->onChange = cpHex;
+    row2->add(p->hex);
+    p->preview = new tui.Label("      ");
+    row2->add(p->preview);
+    p->mode = new tui.Label("");
+    p->mode->flex = 1;
+    row2->add(p->mode);
+    col->add(row2);
+    int kind = (initial >> 24) & 3;
+    if (kind == 2) {
+        p->useIdx = true;
+        p->grid->cur = initial & 255;
+        int rgbv = tscreen.paletteRgb(initial & 255);
+        p->sr->value = tscreen.redOf(rgbv); p->sg->value = tscreen.greenOf(rgbv); p->sb->value = tscreen.blueOf(rgbv);
+    } else if (kind == 1) {
+        p->sr->value = tscreen.redOf(initial); p->sg->value = tscreen.greenOf(initial); p->sb->value = tscreen.blueOf(initial);
+    }
+    col->fixedW = 34;
+    p->dlg = new tui.Dialog(title, col);
+    p->dlg->addButton("&OK", 1, true);
+    p->dlg->addButton("&Default", 2);
+    p->dlg->addButton("&Cancel", 0);
+    cpRefresh(p);
+    return p;
+}
+
+// Lets the user choose a colour: the 256 colour palette, or red / green / blue sliders and a hex field. Returns the colour as a tscreen colour value
+// (idx(n) when picked from the palette, rgb(...) otherwise), COL_DEFAULT (0) for the "Default" button and -1 when cancelled.
+public int colorDialog(tui.App* app, int initial = 0, char* title = "Colour") {
+    ColorPicker* p = cpMake(app, title, initial);
+    int r = app->runDialog(p->dlg);
+    if (r == 1) { return cpColor(p); }
+    if (r == 2) { return tscreen.COL_DEFAULT; }
+    return -1;
+}
+
+// =============================================================================
+//  the command palette
+// =============================================================================
+class Palette {
+public:
+    tui.App* app;
+    tui.Dialog* dlg;
+    tui.TextInput* input;
+    tui.ListView* list;
+    int chosen;
+}
+
+public class PaletteList : tui.ListView {
+public:
+    PaletteList() { super(); }
+
+    virtual void drawItem(tscreen.Screen* s, int x, int y, int width, int item, bool selectedRow, int base) {
+        Palette* p = (Palette*) userData;
+        tui.Command* c = p->app->commands[ud[item]];
+        char* name = c->name.str();
+        char* keys = c->keys.str();
+        int kw = tscreen.textWidth(keys);
+        int pos[32];
+        for (int i = 0; i < 32; i++) { pos[i] = -1; }
+        char* q = p->input->getText();
+        int ql = strlen(q);
+        if (ql > 0) { fuzzyScore(q, name, &pos[0], 32); }
+        int maxName = imax(0, width - 3 - (kw > 0 ? kw + 2 : 0));
+        int col = 0;
+        int bp = 0;
+        while (name[bp] != 0 && col < maxName) {
+            int cp;
+            int l = utf8.decode(name, bp, &cp);
+            bool matched = false;
+            for (int i = 0; i < 32 && i < ql; i++) { if (pos[i] == bp) { matched = true; } }
+            int st = base;
+            if (matched) {
+                int hl = tscreen.fgOf(tui.theme->info);
+                if (hl == 0) { hl = tscreen.YELLOW; }
+                st = tscreen.addAttr(tscreen.withFg(base, selectedRow ? tscreen.BRIGHT_YELLOW : hl), tscreen.A_BOLD | tscreen.A_UNDERLINE);
+            }
+            s->put(x + 1 + col, y, cp, st);
+            col = col + tscreen.runeWidth(cp);
+            bp = bp + l;
+        }
+        if (kw > 0) { s->text(x + width - 1 - kw, y, keys, selectedRow ? base : tui.theme->hint); }
+    }
+}
+
+private void paletteFill(Palette* p) {
+    tui.App* app = p->app;
+    char* q = p->input->getText();
+    int n = app->ncommands;
+    int* score = (int*) alloc((n + 1) * 8);
+    int* idx = (int*) alloc((n + 1) * 8);
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        int sc = fuzzyScore(q, app->commands[i]->name.str(), null, 0);
+        if (sc >= 0) { score[m] = sc; idx[m] = i; m++; }
+    }
+    // stable insertion sort by score, best first
+    for (int i = 1; i < m; i++) {
+        int sv = score[i];
+        int iv = idx[i];
+        int j = i - 1;
+        while (j >= 0 && score[j] < sv) { score[j + 1] = score[j]; idx[j + 1] = idx[j]; j--; }
+        score[j + 1] = sv;
+        idx[j + 1] = iv;
+    }
+    p->list->clear();
+    for (int i = 0; i < m; i++) { p->list->add(app->commands[idx[i]]->name.str(), idx[i]); }
+}
+
+int palChanged(int input) {
+    tui.TextInput* t = (tui.TextInput*) input;
+    paletteFill((Palette*) t->userData);
+    return 0;
+}
+
+private void paletteRun(Palette* p) {
+    int sel = p->list->selected();
+    if (sel < 0) { return; }
+    p->chosen = p->list->itemData(sel);
+    p->dlg->close(1);
+}
+
+int palKey(int widget, int event) {
+    tui.TextInput* t = (tui.TextInput*) widget;
+    Palette* p = (Palette*) t->userData;
+    term.Event* e = (term.Event*) event;
+    int k = e->key;
+    if (k == term.KEY_UP || k == term.KEY_DOWN || k == term.KEY_PGUP || k == term.KEY_PGDN) {
+        p->list->onKeyPress(e);
+        return 1;
+    }
+    if (k == term.KEY_ENTER && e->mods == 0) { paletteRun(p); return 1; }
+    return 0;
+}
+
+int palActivate(int list) {
+    tui.ListView* l = (tui.ListView*) list;
+    paletteRun((Palette*) l->userData);
+    return 0;
+}
+
+// Opens the command palette: a text field and the list of the app's commands (App.addCommand), narrowed as you type with fuzzy matching.
+// Enter runs the selected command. Returns true when a command was run.
+public bool commandPalette(tui.App* app, char* title = "Command palette") {
+    Palette* p = new Palette();
+    p->app = app;
+    p->chosen = -1;
+    tui.Box* col = tui.vbox(1, 0);
+    p->input = new tui.TextInput("");
+    p->input->userData = (int) p;
+    p->input->onChange = palChanged;
+    p->input->onKey = palKey;
+    p->input->useHistory = false;
+    col->add(p->input);
+    PaletteList* l = new PaletteList();
+    l->userData = (int) p;
+    l->flex = 1;
+    l->onActivate = palActivate;
+    p->list = l;
+    col->add(l);
+    col->fixedW = imin(60, app->cols - 6);
+    col->fixedH = imin(14, app->rows - 8);
+    p->dlg = new tui.Dialog(title, col);
+    p->dlg->addButton("&Run", 1, true);
+    p->dlg->addButton("&Cancel", 0);
+    paletteFill(p);
+    if (app->runDialog(p->dlg) != 1 || p->chosen < 0) { return false; }
+    tui.Command* c = app->commands[p->chosen];
+    c->action(c->userData);
+    return true;
+}
