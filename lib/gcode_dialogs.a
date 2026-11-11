@@ -1,0 +1,1370 @@
+// =============================================================================
+//  gcode_dialogs - the colour picker, the theme editor and the settings dialog
+//  (part of the module gcode: use  import gcode;)
+//
+//    gcode.ColorPicker* cp = new gcode.ColorPicker();       // HSV square + hue bar + RGB / HSV sliders + hex field + swatches
+//    cp->setColor(0x3C78D8);  cp->onChange = picked;          // int picked(int picker): cp->color is 0xRRGGBB
+//    gcode.ThemeEditor* te = new gcode.ThemeEditor();         // every colour and token style, live preview, load / save / duplicate / delete
+//    te->show(display);                                       // changes reach every open editor at once (te->live)
+//    gcode.SettingsDialog* sd = new gcode.SettingsDialog(settings);   // tab width, spaces / tabs, line numbers, wrap, font ...
+//    sd->show(display);
+// =============================================================================
+import gui;
+import gfx;
+import adp;
+import asys;
+import acode;
+import asyntax;
+import atheme;
+import guix;
+import cstdlib;
+import gcode_core;
+import gcode_doc;
+import gcode_editor;
+import gcode_bars;
+module gcode;
+
+// =============================================================================
+//  colour conversions (integers only: the same result on every target)
+// =============================================================================
+// hue 0..359, saturation and value 0..100 -> 0xRRGGBB
+public int hsvToRgb(int hue, int sat, int val) {
+    hue = hue % 360;
+    if (hue < 0) { hue = hue + 360; }
+    sat = imax(0, imin(sat, 100));
+    val = imax(0, imin(val, 100));
+    int v = (val * 255 + 50) / 100;
+    int s = (sat * 255 + 50) / 100;
+    int region = hue / 60;
+    int rem = (hue % 60) * 255 / 60;
+    int p = v * (255 - s) / 255;
+    int q = v * (255 - s * rem / 255) / 255;
+    int t = v * (255 - s * (255 - rem) / 255) / 255;
+    int r = v;
+    int g = t;
+    int b = p;
+    if (region == 1) { r = q; g = v; b = p; }
+    else if (region == 2) { r = p; g = v; b = t; }
+    else if (region == 3) { r = p; g = q; b = v; }
+    else if (region == 4) { r = t; g = p; b = v; }
+    else if (region == 5) { r = v; g = p; b = q; }
+    return (r << 16) | (g << 8) | b;
+}
+
+// 0xRRGGBB -> hue 0..359, saturation 0..100, value 0..100
+public void rgbToHsv(int rgb, int* hue, int* sat, int* val) {
+    int r = (rgb >> 16) & 255;
+    int g = (rgb >> 8) & 255;
+    int b = rgb & 255;
+    int mx = imax(r, imax(g, b));
+    int mn = imin(r, imin(g, b));
+    int delta = mx - mn;
+    *val = (mx * 100 + 127) / 255;
+    *sat = (mx == 0) ? 0 : (delta * 100 + mx / 2) / mx;
+    int h = 0;
+    if (delta != 0) {
+        if (mx == r) { h = 60 * (g - b) / delta; if (h < 0) { h = h + 360; } }
+        else if (mx == g) { h = 60 * (b - r) / delta + 120; }
+        else { h = 60 * (r - g) / delta + 240; }
+    }
+    *hue = h % 360;
+}
+
+// =============================================================================
+//  the parts of the colour picker
+// =============================================================================
+public class SVPlane : gui.Widget {
+    public int hue;
+    public int sat;                         // 0..100
+    public int val;                         // 0..100
+    public func onPick;                     // int f(int plane): sat and val changed by the user
+    private gfx.Surface* cache;
+    private int cacheHue;
+    private bool dragging;
+
+    public SVPlane() {
+        super();
+        w = 168;
+        h = 128;
+        cacheHue = -1;
+    }
+
+    public virtual int prefW() { return 168; }
+    public virtual int prefH() { return 128; }
+
+    public void setHue(int hv) {
+        if (hv != hue) { hue = hv; invalidate(); }
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        if (cache == null || cache->w != w || cache->h != h) {
+            cache = new gfx.Surface(w, h);
+            cacheHue = -1;
+        }
+        if (cacheHue != hue) {
+            for (int y = 0; y < h; y++) {
+                int vv = 100 - y * 100 / (h - 1);
+                for (int x = 0; x < w; x++) {
+                    int ss = x * 100 / (w - 1);
+                    cache->put(x, y, 0xFF000000 | hsvToRgb(hue, ss, vv));
+                }
+            }
+            cacheHue = hue;
+        }
+        s->blit(cache, 0, 0, w, h, ox, oy);
+        int cx = ox + sat * (w - 1) / 100;
+        int cy = oy + (100 - val) * (h - 1) / 100;
+        s->circle(cx, cy, 5, 0xFF000000);
+        s->circle(cx, cy, 4, 0xFFFFFFFF);
+        s->rect(ox, oy, w, h, gui.cBorder);
+    }
+
+    private void pick(int mx, int my) {
+        int ss = mx * 100 / (w - 1);
+        int vv = 100 - my * 100 / (h - 1);
+        sat = imax(0, imin(ss, 100));
+        val = imax(0, imin(vv, 100));
+        invalidate();
+        if (onPick != null) { onPick(this); }
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (kind == adp.M_DOWN && button == 1) { dragging = true; pick(mx, my); }
+        else if (kind == adp.M_MOVE && dragging) { pick(mx, my); }
+        else if (kind == adp.M_UP) { dragging = false; }
+        return true;
+    }
+}
+
+public class HueBar : gui.Widget {
+    public int hue;
+    public func onPick;                     // int f(int bar)
+    private bool dragging;
+
+    public HueBar() {
+        super();
+        w = 22;
+        h = 128;
+    }
+
+    public virtual int prefW() { return 22; }
+    public virtual int prefH() { return 128; }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        for (int y = 0; y < h; y++) {
+            int hv = y * 359 / (h - 1);
+            s->fill(ox + 2, oy + y, w - 4, 1, 0xFF000000 | hsvToRgb(hv, 100, 100));
+        }
+        int my = oy + hue * (h - 1) / 359;
+        int xs[3];
+        int ys[3];
+        xs[0] = ox; ys[0] = my - 4;
+        xs[1] = ox; ys[1] = my + 4;
+        xs[2] = ox + 5; ys[2] = my;
+        s->fillPolygon(&xs[0], &ys[0], 3, 0xFF000000);
+        xs[0] = ox + w; xs[1] = ox + w; xs[2] = ox + w - 5;
+        s->fillPolygon(&xs[0], &ys[0], 3, 0xFF000000);
+    }
+
+    private void pick(int my) {
+        int hv = my * 359 / (h - 1);
+        hue = imax(0, imin(hv, 359));
+        invalidate();
+        if (onPick != null) { onPick(this); }
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (kind == adp.M_DOWN && button == 1) { dragging = true; pick(my); }
+        else if (kind == adp.M_MOVE && dragging) { pick(my); }
+        else if (kind == adp.M_UP) { dragging = false; }
+        return true;
+    }
+}
+
+public class SwatchRow : gui.Widget {
+    public int* colors;
+    public int count;
+    public int cell;
+    public int columns;
+    public func onPick;                     // int f(int row): picked holds the colour
+    public int picked;
+
+    public SwatchRow() {
+        super();
+        cell = 18;
+        columns = 8;
+        colors = (int*) calloc(64, 8);
+        // a small palette: greys, then the primary and secondary colours in two shades
+        int pal[16] = { 0x000000, 0x555555, 0xAAAAAA, 0xFFFFFF, 0xE03030, 0xF08030, 0xF0D030, 0x30B050,
+                        0x30B0B0, 0x3070E0, 0x7040D0, 0xD040A0, 0x802020, 0x806020, 0x207040, 0x204080 };
+        for (int i = 0; i < 16; i++) { colors[i] = pal[i]; }
+        count = 16;
+        w = columns * cell;
+        h = ((count + columns - 1) / columns) * cell;
+    }
+
+    public void setSwatches(int* list, int n) {
+        if (n > 64) { n = 64; }
+        for (int i = 0; i < n; i++) { colors[i] = list[i]; }
+        count = n;
+        h = ((count + columns - 1) / columns) * cell;
+        relayout();
+        invalidate();
+    }
+
+    public virtual int prefW() { return columns * cell; }
+    public virtual int prefH() { return ((count + columns - 1) / columns) * cell; }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        for (int i = 0; i < count; i++) {
+            int x = ox + (i % columns) * cell;
+            int y = oy + (i / columns) * cell;
+            s->fill(x + 1, y + 1, cell - 2, cell - 2, 0xFF000000 | colors[i]);
+            s->rect(x + 1, y + 1, cell - 2, cell - 2, gui.cBorder);
+        }
+    }
+
+    // the centre of swatch i (for tests)
+    public int centerX(int i) { return (i % columns) * cell + cell / 2; }
+    public int centerY(int i) { return (i / columns) * cell + cell / 2; }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (kind == adp.M_DOWN && button == 1) {
+            int i = (my / cell) * columns + mx / cell;
+            if (mx >= 0 && my >= 0 && i >= 0 && i < count && mx / cell < columns) {
+                picked = colors[i];
+                if (onPick != null) { onPick(this); }
+            }
+        }
+        return true;
+    }
+}
+
+// the old colour and the new one side by side
+public class PreviewPair : gui.Widget {
+    public int oldColor;
+    public int newColor;
+
+    public PreviewPair() {
+        super();
+        w = 70;
+        h = 36;
+    }
+
+    public virtual int prefW() { return 70; }
+    public virtual int prefH() { return 36; }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        s->fill(ox, oy, w / 2, h, 0xFF000000 | oldColor);
+        s->fill(ox + w / 2, oy, w - w / 2, h, 0xFF000000 | newColor);
+        s->rect(ox, oy, w, h, gui.cBorder);
+    }
+}
+
+// =============================================================================
+//  ColorPicker
+// =============================================================================
+public class ColorPicker : gui.Box {
+    public int color;                       // 0xRRGGBB
+    public int original;                    // the colour the picker was opened with (shown next to the new one)
+    public func onChange;                   // int f(int picker): the user changed the colour
+    public int hue;                         // 0..359
+    public int sat;                         // 0..100
+    public int val;                         // 0..100
+    public SVPlane* plane;
+    public HueBar* hueBar;
+    public gui.Slider* sliders[6];          // red, green, blue, hue, saturation, value
+    public gui.TextBox* hexBox;
+    public SwatchRow* swatches;
+    public PreviewPair* preview;
+    private gui.Label* values[6];
+    private bool busy;
+
+    public ColorPicker() {
+        super(true, 8, 0);
+        hue = 0;
+        sat = 100;
+        val = 100;
+        gui.Box* top = gui.hbox(10, 0);
+        plane = new SVPlane();
+        plane->onPick = pickerPlane;
+        plane->userData = (int) this;
+        hueBar = new HueBar();
+        hueBar->onPick = pickerHue;
+        hueBar->userData = (int) this;
+        top->add(plane);
+        top->add(hueBar);
+        gui.Box* side = gui.vbox(8, 0);
+        preview = new PreviewPair();
+        side->add(preview);
+        hexBox = new gui.TextBox();
+        hexBox->w = 80;
+        hexBox->onChange = pickerHex;
+        hexBox->userData = (int) this;
+        side->add(hexBox);
+        top->add(side);
+        add(top);
+        addRow(0, "R", 0, 255);
+        addRow(1, "G", 0, 255);
+        addRow(2, "B", 0, 255);
+        addRow(3, "H", 0, 359);
+        addRow(4, "S", 0, 100);
+        addRow(5, "V", 0, 100);
+        swatches = new SwatchRow();
+        swatches->onPick = pickerSwatch;
+        swatches->userData = (int) this;
+        add(swatches);
+        setColor(0x3C78D8);
+        original = color;
+        preview->oldColor = original;
+    }
+
+    private void addRow(int idx, char* name, int lo, int hi) {
+        gui.Box* row = gui.hbox(6, 0);
+        gui.Label* nm = new gui.Label(name);
+        nm->w = 14;
+        row->add(nm);
+        gui.Slider* sl = new gui.Slider(lo, hi);
+        sl->flex = 1;
+        sl->onChange = pickerSlider;
+        sl->userData = (int) this;
+        sliders[idx] = sl;
+        row->add(sl);
+        gui.Label* vl = new gui.Label("0");
+        vl->w = 30;
+        values[idx] = vl;
+        row->add(vl);
+        add(row);
+    }
+
+    public virtual int prefW() { return 330; }
+
+    public int red() { return (color >> 16) & 255; }
+    public int green() { return (color >> 8) & 255; }
+    public int blue() { return color & 255; }
+
+    // sets the colour without calling onChange
+    public void setColor(int rgb) {
+        color = rgb & 0xFFFFFF;
+        int h2 = 0;
+        int s2 = 0;
+        int v2 = 0;
+        rgbToHsv(color, &h2, &s2, &v2);
+        // a grey or black colour has no hue of its own: keep the one the user had
+        if (s2 != 0 && v2 != 0) { hue = h2; }
+        sat = s2;
+        val = v2;
+        syncControls();
+    }
+
+    // the colour the "old" half of the preview shows
+    public void setOriginal(int rgb) {
+        original = rgb & 0xFFFFFF;
+        preview->oldColor = original;
+        preview->invalidate();
+    }
+
+    private void notifyChange() {
+        syncControls();
+        if (onChange != null) { onChange(this); }
+    }
+
+    // every control shows the state
+    private void syncControls() {
+        busy = true;
+        sliders[0]->setValue(red());
+        sliders[1]->setValue(green());
+        sliders[2]->setValue(blue());
+        sliders[3]->setValue(hue);
+        sliders[4]->setValue(sat);
+        sliders[5]->setValue(val);
+        int nums[6];
+        nums[0] = red(); nums[1] = green(); nums[2] = blue(); nums[3] = hue; nums[4] = sat; nums[5] = val;
+        for (int i = 0; i < 6; i++) {
+            char t[12];
+            format(&t[0], 12, "%d", nums[i]);
+            values[i]->setText(&t[0]);
+        }
+        char hx[12];
+        format(&hx[0], 12, "#%06X", color);
+        if (!streq(hexBox->text(), &hx[0])) {
+            // do not rewrite the text while the user types a valid colour in another notation
+            int cc = 0;
+            if (!(atheme.parseColor(hexBox->text(), &cc) && cc == color)) { hexBox->setText(&hx[0]); }
+        }
+        plane->setHue(hue);
+        plane->sat = sat;
+        plane->val = val;
+        plane->invalidate();
+        hueBar->hue = hue;
+        hueBar->invalidate();
+        preview->newColor = color;
+        preview->invalidate();
+        busy = false;
+    }
+
+    public void userRgb(int rgb) {
+        setColor(rgb);
+        notifyChange();
+    }
+
+    public void userHsv(int hv, int sv, int vv) {
+        hue = imax(0, imin(hv, 359));
+        sat = imax(0, imin(sv, 100));
+        val = imax(0, imin(vv, 100));
+        color = hsvToRgb(hue, sat, val);
+        notifyChange();
+    }
+
+    public void sliderMoved(gui.Slider* sl) {
+        if (busy) { return; }
+        if (sl == sliders[0] || sl == sliders[1] || sl == sliders[2]) {
+            userRgb((sliders[0]->value << 16) | (sliders[1]->value << 8) | sliders[2]->value);
+        } else {
+            userHsv(sliders[3]->value, sliders[4]->value, sliders[5]->value);
+        }
+    }
+
+    public void planeMoved() {
+        if (busy) { return; }
+        userHsv(hue, plane->sat, plane->val);
+    }
+
+    public void hueMoved() {
+        if (busy) { return; }
+        userHsv(hueBar->hue, sat, val);
+    }
+
+    public void hexTyped() {
+        if (busy) { return; }
+        int c = 0;
+        if (atheme.parseColor(hexBox->text(), &c)) {
+            setColor(c);
+            if (onChange != null) { onChange(this); }
+        }
+    }
+}
+
+int pickerSlider(int sl) {
+    gui.Slider* s = (gui.Slider*) sl;
+    ColorPicker* p = (ColorPicker*) s->userData;
+    p->sliderMoved(s);
+    return 0;
+}
+
+int pickerPlane(int pl) {
+    SVPlane* s = (SVPlane*) pl;
+    ColorPicker* p = (ColorPicker*) s->userData;
+    p->planeMoved();
+    return 0;
+}
+
+int pickerHue(int hb) {
+    HueBar* s = (HueBar*) hb;
+    ColorPicker* p = (ColorPicker*) s->userData;
+    p->hueMoved();
+    return 0;
+}
+
+int pickerHex(int tb) {
+    gui.TextBox* t = (gui.TextBox*) tb;
+    ColorPicker* p = (ColorPicker*) t->userData;
+    p->hexTyped();
+    return 0;
+}
+
+int pickerSwatch(int row) {
+    SwatchRow* r = (SwatchRow*) row;
+    ColorPicker* p = (ColorPicker*) r->userData;
+    p->userRgb(r->picked);
+    return 0;
+}
+
+// a window with a picker and OK / Cancel; the callback gets 0xFFRRGGBB (0 when cancelled): the same as guix.chooseColor
+class PickState {
+    public gui.Window* win;
+    public ColorPicker* picker;
+    public func cb;
+    public bool done;
+}
+
+int pickOk(int b) {
+    gui.Button* bt = (gui.Button*) b;
+    PickState* st = (PickState*) bt->userData;
+    if (!st->done) {
+        st->done = true;
+        if (st->cb != null) { st->cb(0xFF000000 | st->picker->color); }
+    }
+    st->win->close();
+    return 0;
+}
+
+int pickCancel(int b) {
+    gui.Button* bt = (gui.Button*) b;
+    PickState* st = (PickState*) bt->userData;
+    if (!st->done) {
+        st->done = true;
+        if (st->cb != null) { st->cb(0); }
+    }
+    st->win->close();
+    return 0;
+}
+
+int pickClosed(int window) {
+    gui.Window* w = (gui.Window*) window;
+    PickState* st = (PickState*) w->userData;
+    if (!st->done) {
+        st->done = true;
+        if (st->cb != null) { st->cb(0); }
+    }
+    return 0;
+}
+
+// the colour dialog with the full picker; returns its window
+public gui.Window* pickColor(gui.Display* d, char* title, int initial, func cb) {
+    PickState* st = new PickState();
+    st->cb = cb;
+    gui.Window* w = d->createWindow(title, 360, 420, adp.F_FIXED);
+    st->win = w;
+    w->userData = (int) st;
+    w->onClose = pickClosed;
+    gui.Box* col = gui.vbox(10, 12);
+    st->picker = new ColorPicker();
+    st->picker->setColor(initial);
+    st->picker->setOriginal(initial);
+    col->add(st->picker);
+    gui.Box* row = gui.hbox(8, 0);
+    gui.Spacer* sp = new gui.Spacer(1);
+    sp->flex = 1;
+    row->add(sp);
+    gui.Button* ok = new gui.Button("OK");
+    ok->primary = true;
+    ok->onClick = pickOk;
+    ok->userData = (int) st;
+    gui.Button* cancel = new gui.Button("Cancel");
+    cancel->onClick = pickCancel;
+    cancel->userData = (int) st;
+    row->add(ok);
+    row->add(cancel);
+    col->add(row);
+    w->setRoot(col);
+    w->defaultButton = ok;
+    w->fit();
+    return w;
+}
+
+// =============================================================================
+//  ThemeEditor
+// =============================================================================
+// the list of the 24 colours and 24 token styles with a swatch for each
+public class ColorList : RowList {
+    public atheme.Theme* theme;
+    public int selectedEntry;
+
+    public ColorList() {
+        super();
+        rowH = 22;
+        bgCol = atheme.Col.Background;
+        fgCol = atheme.Col.Foreground;
+    }
+
+    public virtual int rowCount() { return 48; }
+
+    // the name of an entry: "Background" ... "Syntax: Keyword" ...
+    public char* entryName(int i, char* out) {
+        if (i < 24) { format(out, 60, "%s", atheme.Col.name(i)); }
+        else { format(out, 60, "Syntax: %s", asyntax.Tok.name(i - 24)); }
+        return out;
+    }
+
+    public virtual void paintItem(gfx.Surface* s, int x, int y, int rw, int i, bool sel) {
+        int c = (i < 24) ? theme->colors[i] : theme->tokColor[i - 24];
+        s->fill(x + 6, y + 3, 28, rowH - 6, 0xFF000000 | c);
+        s->rect(x + 6, y + 3, 28, rowH - 6, look->col(atheme.Col.Border));
+        char nm[60];
+        entryName(i, &nm[0]);
+        gfx.Font* f = gfx.sans();
+        s->text(f, x + 42, y + (rowH - f->height) / 2, &nm[0], look->col(fgCol));
+        char hx[12];
+        format(&hx[0], 12, "#%06X", c);
+        int hw = gfx.textWidth(f, &hx[0]);
+        s->text(f, x + rw - hw - 8, y + (rowH - f->height) / 2, &hx[0], look->col(atheme.Col.Whitespace));
+        if (i >= 24) {
+            int st = theme->tokStyle[i - 24];
+            char sty[8];
+            int n = 0;
+            if ((st & atheme.STYLE_BOLD) != 0) { sty[n] = 'B'; n++; }
+            if ((st & atheme.STYLE_ITALIC) != 0) { sty[n] = 'I'; n++; }
+            if ((st & atheme.STYLE_UNDERLINE) != 0) { sty[n] = 'U'; n++; }
+            sty[n] = 0;
+            s->text(f, x + rw - hw - 40, y + (rowH - f->height) / 2, &sty[0], look->col(atheme.Col.Info));
+        }
+    }
+}
+
+char* sampleCode() {
+    return "// A sample of the syntax colours\n#define LIMIT 100\nmodule demo;\nimport std;\n\n/* a block comment */\npublic class Counter {\n    private int total;\n    public Counter() { total = 0; }\n    public void add(int n) {\n        if (n > LIMIT) { return; }\n        total = total + n * 2;\n    }\n}\n\nint main() {\n    Counter c();\n    char* msg = \"total: \\t%d\\n\";\n    for (int i = 0; i < 10; i++) { c.add(i); }\n    printf(msg, 0x2A);   // call a builtin\n    return 'x';\n}\n";
+}
+
+// a box with a fixed preferred size (0: the natural one)
+public class SizedBox : gui.Box {
+    public int fixedW;
+    public int fixedH;
+
+    public SizedBox(bool vert, int space, int pad, int fw, int fh) {
+        super(vert, space, pad);
+        fixedW = fw;
+        fixedH = fh;
+    }
+
+    public virtual int prefW() { return (fixedW > 0) ? fixedW : super.prefW(); }
+    public virtual int prefH() { return (fixedH > 0) ? fixedH : super.prefH(); }
+}
+
+public class ThemeEditor {
+    public Look* target;                    // the Look that gets the theme (the shared one by default)
+    public Look* previewLook;               // the Look of the small preview editor
+    public atheme.Theme* work;              // the theme being edited
+    public char* themeDir;                  // where user themes are kept (NAME.ini)
+    public char* currentName;
+    public bool live;                       // changes reach the target Look at once (true)
+    public bool dirty;                      // changed since it was loaded or saved
+    public gui.Window* win;
+    public ColorPicker* picker;
+    public ColorList* list;
+    public CodeEditor* preview;
+    public guix.ComboBox* combo;
+    public gui.CheckBox* cbBold;
+    public gui.CheckBox* cbItalic;
+    public gui.CheckBox* cbUnderline;
+    public gui.CheckBox* cbLive;
+    public gui.Label* contrast;
+    public gui.Label* warnTitle;
+    public gui.ListBox* warnings;
+    public gui.Label* message;
+    public int entry;                       // the selected entry: 0..23 colours, 24..47 syntax
+    public int warningCount;
+    public func onChange;                   // int f(int editor): the theme was changed or loaded
+    private atheme.Theme* original;
+    private bool busy;
+    private gui.Display* display;
+
+    public ThemeEditor() {
+        target = theLook();
+        live = true;
+        work = atheme.builtin("dark");
+        original = atheme.builtin("dark");
+        currentName = asys.strDup("dark");
+        char* cd = atheme.configDir();
+        themeDir = asys.join(cd, "themes");
+        asys.free(cd);
+        previewLook = new Look();
+        previewLook->setTheme(target->theme);
+        work->copyFrom(target->theme);
+        original->copyFrom(target->theme);
+        asys.free(currentName);
+        currentName = asys.strDup(target->theme->name);
+    }
+
+    public void setThemeDir(char* dir) {
+        asys.free(themeDir);
+        themeDir = asys.strDup(dir);
+        if (combo != null) { reloadList(); }
+    }
+
+    // ---- themes on disk ----------------------------------------------------------------------------------------------------------------
+    public bool isBuiltin(char* name) {
+        atheme.Theme* t = atheme.builtin(name);
+        return t != null;
+    }
+
+    private char* fileFor(char* name) {
+        char* f = asys.alloc(strlen(themeDir) + strlen(name) + 16);
+        format(f, strlen(themeDir) + strlen(name) + 16, "%s/%s.ini", themeDir, name);
+        return f;
+    }
+
+    // letters, digits, space, '-' and '_' only
+    public bool validName(char* name) {
+        int n = strlen(name);
+        if (n == 0 || n > 40) { return false; }
+        for (int i = 0; i < n; i++) {
+            int c = name[i];
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ' || c == '-' || c == '_';
+            if (!ok) { return false; }
+        }
+        if (name[0] == ' ' || name[n - 1] == ' ') { return false; }
+        return true;
+    }
+
+    // the names of the themes: the built-in ones, then the files of the theme directory
+    public int themeNames(char** out, int max) {
+        int n = 0;
+        char* b = atheme.builtinNames();
+        int len = strlen(b);
+        int s = 0;
+        for (int i = 0; i <= len && n < max; i++) {
+            if (i == len || b[i] == ' ') {
+                if (i > s) { out[n] = asys.strDupN(&b[s], i - s); n++; }
+                s = i + 1;
+            }
+        }
+        asys.DirList dl();
+        if (asys.listDir(themeDir, &dl) >= 0) {
+            dl.sort(false, true);
+            for (int i = 0; i < dl.count && n < max; i++) {
+                char* nm = dl.name(i);
+                int l = strlen(nm);
+                if (l > 4 && streq(&nm[l - 4], ".ini") && dl.kind(i) == asys.K_FILE) {
+                    char* base = asys.strDupN(nm, l - 4);
+                    if (validName(base) && !isBuiltin(base)) { out[n] = base; n++; } else { asys.free(base); }
+                }
+            }
+            dl.dispose();
+        }
+        return n;
+    }
+
+    // loads a theme by name into the editor (and, when live, into the target)
+    public bool loadTheme(char* name) {
+        atheme.Theme* t = atheme.builtin(name);
+        if (t == null) {
+            char* f = fileFor(name);
+            if (asys.exists(f)) {
+                atheme.Warnings w();
+                t = atheme.loadTheme(f, &w);
+                w.dispose();
+            }
+            asys.free(f);
+        }
+        if (t == null) { return false; }
+        work->copyFrom(t);
+        work->setName(name);
+        asys.free(currentName);
+        currentName = asys.strDup(name);
+        dirty = false;
+        changed(false);
+        return true;
+    }
+
+    // Saves the theme under a name in the theme directory: 0 or -errno. Built-in names are refused (-EEXIST): duplicate first.
+    public int saveThemeAs(char* name) {
+        if (!validName(name)) { return -asys.EBADNAME; }
+        if (isBuiltin(name)) { return -asys.EEXIST; }
+        asys.mkdirs(themeDir);
+        work->setName(name);
+        char* f = fileFor(name);
+        int r = work->save(f);
+        asys.free(f);
+        if (r == 0) {
+            asys.free(currentName);
+            currentName = asys.strDup(name);
+            dirty = false;
+            if (combo != null) { reloadList(); }
+        }
+        return r;
+    }
+
+    // saves the theme under its current name (a built-in theme is refused)
+    public int save() {
+        return saveThemeAs(currentName);
+    }
+
+    // a copy of the theme under a new name (saved at once); false when the name is taken or not valid
+    public bool duplicate(char* name) {
+        if (!validName(name) || isBuiltin(name)) { return false; }
+        char* f = fileFor(name);
+        bool taken = asys.exists(f);
+        asys.free(f);
+        if (taken) { return false; }
+        return saveThemeAs(name) == 0;
+    }
+
+    // deletes the theme file of the current theme (user themes only) and goes back to the dark theme: 0 or -errno
+    public int deleteTheme() {
+        if (isBuiltin(currentName)) { return -asys.EPERM; }
+        char* f = fileFor(currentName);
+        int r = asys.unlink(f);
+        asys.free(f);
+        if (r == 0) {
+            loadTheme("dark");
+            if (combo != null) { reloadList(); }
+        }
+        return r;
+    }
+
+    // ---- editing ------------------------------------------------------------------------------------------------------------------------
+    public int entryColor(int i) { return (i < 24) ? work->colors[i] : work->tokColor[i - 24]; }
+    public int entryStyle(int i) { return (i < 24) ? 0 : work->tokStyle[i - 24]; }
+
+    // sets the colour of an entry (and the style of a syntax entry); everything follows
+    public void setEntry(int i, int rgb, int style) {
+        if (i < 0 || i >= 48) { return; }
+        if (i < 24) { work->setColor(i, rgb); }
+        else { work->setToken(i - 24, rgb, style); }
+        dirty = true;
+        changed(true);
+    }
+
+    public void selectEntry(int i) {
+        if (i < 0 || i >= 48) { return; }
+        entry = i;
+        if (list != null) { list->select(i); }
+        showEntry();
+    }
+
+    // the picker and the style boxes show the selected entry
+    private void showEntry() {
+        if (picker == null) { return; }
+        busy = true;
+        picker->setColor(entryColor(entry));
+        picker->setOriginal(entryColor(entry));
+        bool tok = entry >= 24;
+        cbBold->enabled = tok;
+        cbItalic->enabled = tok;
+        cbUnderline->enabled = tok;
+        int st = entryStyle(entry);
+        cbBold->checked = (st & atheme.STYLE_BOLD) != 0;
+        cbItalic->checked = (st & atheme.STYLE_ITALIC) != 0;
+        cbUnderline->checked = (st & atheme.STYLE_UNDERLINE) != 0;
+        cbBold->invalidate();
+        cbItalic->invalidate();
+        cbUnderline->invalidate();
+        busy = false;
+        updateContrast();
+    }
+
+    // the contrast of the selected colour against the background, as the text of the label
+    public void updateContrast() {
+        if (contrast == null) { return; }
+        char t[120];
+        int c = entryColor(entry);
+        int bg = work->colors[atheme.Col.Background];
+        if (entry == atheme.Col.Background) { c = work->colors[atheme.Col.Foreground]; }
+        int ratio = atheme.contrast(c, bg);
+        int need = (entry < 24 && entry != atheme.Col.Foreground && entry != atheme.Col.Background && entry != atheme.Col.StatusBarText && entry != atheme.Col.TabBarText && entry != atheme.Col.SidebarText && entry != atheme.Col.MenuText) ? 300 : 450;
+        if (entry == atheme.Col.StatusBar || entry == atheme.Col.StatusBarText || entry == atheme.Col.TabBar || entry == atheme.Col.TabBarText || entry == atheme.Col.Sidebar || entry == atheme.Col.SidebarText || entry == atheme.Col.Menu || entry == atheme.Col.MenuText) {
+            need = 450;
+        }
+        format(&t[0], 120, "Contrast with the background: %d.%02d : 1 (%s)", ratio / 100, ratio % 100, (ratio >= need) ? "readable" : "too low");
+        contrast->setText(&t[0]);
+    }
+
+    // after any change of the theme: preview, target, warnings, list
+    private void changed(bool fromUser) {
+        previewLook->setTheme(work);
+        if (live && target != null) { target->setTheme(work); }
+        refreshWarnings();
+        if (list != null) { list->theme = work; list->invalidate(); }
+        if (!fromUser) { showEntry(); }
+        else { updateContrast(); }
+        if (win != null) { win->setTitle(dirty ? "Theme Editor *" : "Theme Editor"); }
+        if (onChange != null) { onChange(this); }
+    }
+
+    public void refreshWarnings() {
+        atheme.Warnings w();
+        work->validate(&w);
+        warningCount = w.count;
+        if (warnings != null) {
+            warnings->clear();
+            for (int i = 0; i < w.count; i++) { warnings->addItem(w.items[i]); }
+            char t[60];
+            if (w.count == 0) { format(&t[0], 60, "No contrast warnings"); }
+            else { format(&t[0], 60, "%d contrast warning%s", w.count, (w.count == 1) ? "" : "s"); }
+            warnTitle->setText(&t[0]);
+        }
+        w.dispose();
+    }
+
+    public void revert() {
+        work->copyFrom(original);
+        dirty = false;
+        asys.free(currentName);
+        currentName = asys.strDup(original->name);
+        changed(false);
+    }
+
+    // ---- the window ---------------------------------------------------------------------------------------------------------------------
+    private void reloadList() {
+        char* names[96];
+        int n = themeNames(&names[0], 96);
+        busy = true;
+        combo->clear();
+        int at = -1;
+        for (int i = 0; i < n; i++) {
+            combo->addItem(names[i]);
+            if (streq(names[i], currentName)) { at = i; }
+            asys.free(names[i]);
+        }
+        if (at >= 0) { combo->selected = at; }
+        combo->invalidate();
+        busy = false;
+    }
+
+    public gui.Window* show(gui.Display* d) {
+        display = d;
+        win = d->createWindow("Theme Editor", 860, 790, 0);
+        win->userData = (int) this;
+        gui.Box* root = gui.vbox(8, 10);
+        gui.Box* top = gui.hbox(12, 0);
+        top->flex = 1;
+        // left: the theme chooser and the list of entries
+        gui.Box* left = new SizedBox(true, 6, 0, 250, 0);
+        combo = new guix.ComboBox();
+        combo->onChange = themeComboChanged;
+        combo->userData = (int) this;
+        left->add(combo);
+        gui.Box* btns = gui.hbox(6, 0);
+        gui.Button* bDup = new gui.Button("Duplicate");
+        bDup->onClick = themeDuplicateClicked;
+        bDup->userData = (int) this;
+        gui.Button* bSave = new gui.Button("Save");
+        bSave->onClick = themeSaveClicked;
+        bSave->userData = (int) this;
+        gui.Button* bDel = new gui.Button("Delete");
+        bDel->onClick = themeDeleteClicked;
+        bDel->userData = (int) this;
+        btns->add(bDup);
+        btns->add(bSave);
+        btns->add(bDel);
+        left->add(btns);
+        list = new ColorList();
+        Look* dl = new Look();
+        dl->setThemeName("light");
+        list->look = dl;
+        dl->use(list, null);
+        list->theme = work;
+        list->onSelect = themeEntrySelected;
+        list->userData = (int) this;
+        list->flex = 1;
+        left->add(list);
+        top->add(left);
+        // right: the picker, the style boxes, the contrast text
+        gui.Box* right = gui.vbox(8, 0);
+        right->flex = 1;
+        picker = new ColorPicker();
+        picker->onChange = themePickerChanged;
+        picker->userData = (int) this;
+        right->add(picker);
+        gui.Box* styles = gui.hbox(10, 0);
+        cbBold = new gui.CheckBox("Bold");
+        cbItalic = new gui.CheckBox("Italic");
+        cbUnderline = new gui.CheckBox("Underline");
+        cbBold->onChange = themeStyleChanged;
+        cbItalic->onChange = themeStyleChanged;
+        cbUnderline->onChange = themeStyleChanged;
+        cbBold->userData = (int) this;
+        cbItalic->userData = (int) this;
+        cbUnderline->userData = (int) this;
+        styles->add(cbBold);
+        styles->add(cbItalic);
+        styles->add(cbUnderline);
+        right->add(styles);
+        contrast = new gui.Label("");
+        right->add(contrast);
+        top->add(right);
+        root->add(top);
+        // the preview
+        preview = new CodeEditor();
+        preview->look = previewLook;
+        previewLook->use(preview, editorLookChanged);
+        preview->pullPrefs();
+        preview->blink = false;
+        preview->lineNumbers = true;
+        preview->highlightWord = false;
+        preview->setText(sampleCode());
+        preview->doc->setLanguage(asyntax.Lang.A);
+        preview->setReadOnly(true);
+        preview->wantH = 170;
+        preview->flex = 0;
+        root->add(preview);
+        warnTitle = new gui.Label("");
+        root->add(warnTitle);
+        warnings = new gui.ListBox();
+        warnings->flex = 1;
+        gui.Box* wbox = new SizedBox(true, 0, 0, 0, 70);
+        wbox->add(warnings);
+        root->add(wbox);
+        gui.Box* bottom = gui.hbox(10, 0);
+        cbLive = new gui.CheckBox("Apply to all editors while editing");
+        cbLive->checked = live;
+        cbLive->onChange = themeLiveChanged;
+        cbLive->userData = (int) this;
+        bottom->add(cbLive);
+        message = new gui.Label("");
+        message->flex = 1;
+        bottom->add(message);
+        gui.Button* bRevert = new gui.Button("Revert");
+        bRevert->onClick = themeRevertClicked;
+        bRevert->userData = (int) this;
+        gui.Button* bClose = new gui.Button("Close");
+        bClose->primary = true;
+        bClose->onClick = themeCloseClicked;
+        bClose->userData = (int) this;
+        bottom->add(bRevert);
+        bottom->add(bClose);
+        root->add(bottom);
+        win->setRoot(root);
+        reloadList();
+        changed(false);
+        selectEntry(0);
+        return win;
+    }
+
+    public void say(char* t) {
+        if (message != null) { message->setText(t); }
+    }
+
+    // ---- handlers called by the widgets ---------------------------------------------------------------------------------------------------
+    public void comboPicked() {
+        if (busy) { return; }
+        loadTheme(combo->text());
+    }
+
+    public void pickerMoved() {
+        if (busy) { return; }
+        int st = entryStyle(entry);
+        setEntry(entry, picker->color, st);
+    }
+
+    public void styleBoxChanged() {
+        if (busy || entry < 24) { return; }
+        int st = 0;
+        if (cbBold->checked) { st = st | atheme.STYLE_BOLD; }
+        if (cbItalic->checked) { st = st | atheme.STYLE_ITALIC; }
+        if (cbUnderline->checked) { st = st | atheme.STYLE_UNDERLINE; }
+        setEntry(entry, entryColor(entry), st);
+    }
+
+    public void entryPicked() {
+        if (list->selected >= 0) {
+            entry = list->selected;
+            showEntry();
+        }
+    }
+
+    public void saveClicked() {
+        int r = save();
+        if (r == -asys.EEXIST) { say("Built-in themes cannot be changed: use Duplicate"); }
+        else if (r < 0) { say(asys.errText(r)); }
+        else { say("Saved"); }
+    }
+
+    public void duplicateClicked() {
+        if (display == null) { return; }
+        char nm[80];
+        format(&nm[0], 80, "%s copy", currentName);
+        guix.promptArg(display, "Duplicate theme", "Name of the copy:", &nm[0], themeNamed, (int) this);
+    }
+
+    public void deleteClicked() {
+        if (display == null) { return; }
+        if (isBuiltin(currentName)) { say("Built-in themes cannot be deleted"); return; }
+        guix.confirmArg(display, "Delete theme", "Delete this theme file?", themeDeleteAnswer, (int) this);
+    }
+
+    public void liveChanged() {
+        live = cbLive->checked;
+        if (live) { target->setTheme(work); }
+    }
+
+    public void close() {
+        if (win != null) { win->close(); }
+    }
+}
+
+int themeComboChanged(int c) {
+    guix.ComboBox* cb = (guix.ComboBox*) c;
+    ThemeEditor* t = (ThemeEditor*) cb->userData;
+    t->comboPicked();
+    return 0;
+}
+
+int themePickerChanged(int p) {
+    ColorPicker* cp = (ColorPicker*) p;
+    ThemeEditor* t = (ThemeEditor*) cp->userData;
+    t->pickerMoved();
+    return 0;
+}
+
+int themeStyleChanged(int c) {
+    gui.CheckBox* cb = (gui.CheckBox*) c;
+    ThemeEditor* t = (ThemeEditor*) cb->userData;
+    t->styleBoxChanged();
+    return 0;
+}
+
+int themeEntrySelected(int l) {
+    ColorList* cl = (ColorList*) l;
+    ThemeEditor* t = (ThemeEditor*) cl->userData;
+    t->entryPicked();
+    return 0;
+}
+
+int themeSaveClicked(int b) {
+    gui.Button* bt = (gui.Button*) b;
+    ThemeEditor* t = (ThemeEditor*) bt->userData;
+    t->saveClicked();
+    return 0;
+}
+
+int themeDuplicateClicked(int b) {
+    gui.Button* bt = (gui.Button*) b;
+    ThemeEditor* t = (ThemeEditor*) bt->userData;
+    t->duplicateClicked();
+    return 0;
+}
+
+int themeDeleteClicked(int b) {
+    gui.Button* bt = (gui.Button*) b;
+    ThemeEditor* t = (ThemeEditor*) bt->userData;
+    t->deleteClicked();
+    return 0;
+}
+
+int themeRevertClicked(int b) {
+    gui.Button* bt = (gui.Button*) b;
+    ThemeEditor* t = (ThemeEditor*) bt->userData;
+    t->revert();
+    return 0;
+}
+
+int themeCloseClicked(int b) {
+    gui.Button* bt = (gui.Button*) b;
+    ThemeEditor* t = (ThemeEditor*) bt->userData;
+    t->close();
+    return 0;
+}
+
+int themeLiveChanged(int c) {
+    gui.CheckBox* cb = (gui.CheckBox*) c;
+    ThemeEditor* t = (ThemeEditor*) cb->userData;
+    t->liveChanged();
+    return 0;
+}
+
+int themeNamed(int text) {
+    ThemeEditor* t = (ThemeEditor*) guix.dialogArg;
+    if (text == 0) { return 0; }
+    char* name = (char*) text;
+    if (t->duplicate(name)) { t->say("Duplicated"); } else { t->say("That name cannot be used"); }
+    return 0;
+}
+
+int themeDeleteAnswer(int yes) {
+    ThemeEditor* t = (ThemeEditor*) guix.dialogArg;
+    if (yes != 0) {
+        int r = t->deleteTheme();
+        if (r < 0) { t->say(asys.errText(r)); } else { t->say("Deleted"); }
+    }
+    return 0;
+}
+
+// =============================================================================
+//  SettingsDialog
+// =============================================================================
+// applies the editor preferences of the Look to every document (tab width, spaces or tabs, auto indent)
+public void applyPrefsToDocs() {
+    Look* lk = theLook();
+    for (int i = 0; i < docCount(); i++) {
+        Doc* dd = docAt(i);
+        dd->ed->tabWidth = lk->tabWidth;
+        dd->ed->indentWidth = lk->tabWidth;
+        dd->ed->useTabs = !lk->insertSpaces;
+        dd->ed->autoIndent = lk->autoIndent;
+    }
+}
+
+public class SettingsDialog {
+    public Look* look;
+    public atheme.Settings* settings;       // updated with every change (may be null)
+    public func onApply;                    // int f(int dialog): the settings changed (save them)
+    public gui.Window* win;
+    public guix.SpinBox* tabSpin;
+    public gui.CheckBox* cbSpaces;
+    public gui.CheckBox* cbNumbers;
+    public gui.CheckBox* cbWrap;
+    public gui.CheckBox* cbAutoIndent;
+    public gui.CheckBox* cbTrim;
+    public gui.CheckBox* cbFinalNl;
+    public gui.CheckBox* cbWhitespace;
+    public gui.CheckBox* cbGuides;
+    public gui.CheckBox* cbHlLine;
+    public gui.CheckBox* cbHlWord;
+    public gui.CheckBox* cbBrackets;
+    public gui.CheckBox* cbBlink;
+    public gui.CheckBox* cbComplete;
+    public guix.ComboBox* fontCombo;
+    public guix.ComboBox* themeCombo;
+    public guix.SpinBox* gapSpin;
+    public int applied;                     // how many times the settings were applied (for tests)
+    private bool busy;
+
+    public SettingsDialog(atheme.Settings* st) {
+        look = theLook();
+        settings = st;
+    }
+
+    private gui.CheckBox* check(gui.Box* col, char* text, bool value) {
+        gui.CheckBox* cb = new gui.CheckBox(text);
+        cb->checked = value;
+        cb->onChange = settingsChanged;
+        cb->userData = (int) this;
+        col->add(cb);
+        return cb;
+    }
+
+    public gui.Window* show(gui.Display* d) {
+        win = d->createWindow("Settings", 420, 560, 0);
+        win->userData = (int) this;
+        gui.Box* col = gui.vbox(6, 14);
+        gui.Box* row = gui.hbox(8, 0);
+        row->add(new gui.Label("Tab width"));
+        tabSpin = new guix.SpinBox(1, 16);
+        tabSpin->value = look->tabWidth;
+        tabSpin->onChange = settingsChanged;
+        tabSpin->userData = (int) this;
+        row->add(tabSpin);
+        col->add(row);
+        cbSpaces = check(col, "Insert spaces instead of tabs", look->insertSpaces);
+        cbNumbers = check(col, "Show line numbers", look->lineNumbers);
+        cbWrap = check(col, "Wrap long lines", look->wordWrap);
+        cbAutoIndent = check(col, "Indent new lines automatically", look->autoIndent);
+        cbTrim = check(col, "Remove trailing spaces when saving", look->trimOnSave);
+        cbFinalNl = check(col, "End files with a line break when saving", look->finalNewline);
+        cbWhitespace = check(col, "Show spaces and tabs", look->showWhitespace);
+        cbGuides = check(col, "Show indentation guides", look->indentGuides);
+        cbHlLine = check(col, "Highlight the current line", look->highlightLine);
+        cbHlWord = check(col, "Highlight other uses of the word at the caret", look->highlightWord);
+        cbBrackets = check(col, "Highlight the matching bracket", look->matchBrackets);
+        cbBlink = check(col, "Blinking caret", look->blink);
+        cbComplete = check(col, "Suggest completions while typing", look->autoComplete);
+        gui.Box* r2 = gui.hbox(8, 0);
+        r2->add(new gui.Label("Font"));
+        fontCombo = new guix.ComboBox();
+        fontCombo->addItem("Mono");
+        fontCombo->addItem("Sans");
+        fontCombo->addItem("Sans bold");
+        fontCombo->selected = (look->fontIndex >= 0 && look->fontIndex <= 2) ? look->fontIndex : 0;
+        fontCombo->onChange = settingsChanged;
+        fontCombo->userData = (int) this;
+        r2->add(fontCombo);
+        col->add(r2);
+        gui.Box* r3 = gui.hbox(8, 0);
+        r3->add(new gui.Label("Theme"));
+        themeCombo = new guix.ComboBox();
+        char* names = atheme.builtinNames();
+        int len = strlen(names);
+        int s0 = 0;
+        int at = 0;
+        int k = 0;
+        for (int i = 0; i <= len; i++) {
+            if (i == len || names[i] == ' ') {
+                if (i > s0) {
+                    char* nm = asys.strDupN(&names[s0], i - s0);
+                    themeCombo->addItem(nm);
+                    if (streq(nm, look->theme->name)) { at = k; }
+                    k++;
+                    asys.free(nm);
+                }
+                s0 = i + 1;
+            }
+        }
+        themeCombo->selected = at;
+        themeCombo->onChange = settingsChanged;
+        themeCombo->userData = (int) this;
+        r3->add(themeCombo);
+        col->add(r3);
+        gui.Box* r4 = gui.hbox(8, 0);
+        r4->add(new gui.Label("Extra space between lines"));
+        gapSpin = new guix.SpinBox(0, 10);
+        gapSpin->value = look->lineGap;
+        gapSpin->onChange = settingsChanged;
+        gapSpin->userData = (int) this;
+        r4->add(gapSpin);
+        col->add(r4);
+        gui.Box* r5 = gui.hbox(8, 0);
+        gui.Spacer* sp = new gui.Spacer(1);
+        sp->flex = 1;
+        r5->add(sp);
+        gui.Button* ok = new gui.Button("Close");
+        ok->primary = true;
+        ok->onClick = settingsClose;
+        ok->userData = (int) this;
+        r5->add(ok);
+        col->add(r5);
+        win->setRoot(col);
+        win->defaultButton = ok;
+        win->fit();
+        return win;
+    }
+
+    // reads the controls into the Look (and the settings), repaints and tells the editors
+    public void apply() {
+        if (busy || tabSpin == null) { return; }
+        look->tabWidth = tabSpin->value;
+        look->insertSpaces = cbSpaces->checked;
+        look->lineNumbers = cbNumbers->checked;
+        look->wordWrap = cbWrap->checked;
+        look->autoIndent = cbAutoIndent->checked;
+        look->trimOnSave = cbTrim->checked;
+        look->finalNewline = cbFinalNl->checked;
+        look->showWhitespace = cbWhitespace->checked;
+        look->indentGuides = cbGuides->checked;
+        look->highlightLine = cbHlLine->checked;
+        look->highlightWord = cbHlWord->checked;
+        look->matchBrackets = cbBrackets->checked;
+        look->blink = cbBlink->checked;
+        look->autoComplete = cbComplete->checked;
+        look->setLineGap(gapSpin->value);
+        look->setFontIndex(fontCombo->selected);
+        char* tn = themeCombo->text();
+        if (tn[0] != 0 && !streq(tn, look->theme->name)) { look->setThemeName(tn); }
+        applyPrefsToDocs();
+        look->changed();
+        if (settings != null) { look->storeSettings(settings); }
+        applied++;
+        if (onApply != null) { onApply(this); }
+    }
+
+    // the controls show the Look again (after something else changed it)
+    public void reload() {
+        busy = true;
+        tabSpin->setValue(look->tabWidth);
+        cbSpaces->checked = look->insertSpaces;
+        cbNumbers->checked = look->lineNumbers;
+        cbWrap->checked = look->wordWrap;
+        cbAutoIndent->checked = look->autoIndent;
+        cbTrim->checked = look->trimOnSave;
+        cbFinalNl->checked = look->finalNewline;
+        cbWhitespace->checked = look->showWhitespace;
+        cbGuides->checked = look->indentGuides;
+        cbHlLine->checked = look->highlightLine;
+        cbHlWord->checked = look->highlightWord;
+        cbBrackets->checked = look->matchBrackets;
+        cbBlink->checked = look->blink;
+        cbComplete->checked = look->autoComplete;
+        gapSpin->setValue(look->lineGap);
+        busy = false;
+        win->invalidateAll();
+    }
+
+    public void close() {
+        if (win != null) { win->close(); }
+    }
+}
+
+int settingsChanged(int w) {
+    gui.Widget* wd = (gui.Widget*) w;
+    SettingsDialog* sd = (SettingsDialog*) wd->userData;
+    sd->apply();
+    return 0;
+}
+
+int settingsClose(int b) {
+    gui.Button* bt = (gui.Button*) b;
+    SettingsDialog* sd = (SettingsDialog*) bt->userData;
+    sd->close();
+    return 0;
+}

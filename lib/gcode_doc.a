@@ -1,0 +1,367 @@
+// =============================================================================
+//  gcode_doc - a document: the text, its editor state, syntax highlighter, markers and bookmarks
+//  (part of the module gcode: use  import gcode;)
+//
+//    gcode.Doc* d = new gcode.Doc();
+//    d->open("main.a");                       // 0 or -errno; language and indentation are detected
+//    d->addMark(11, 4, 3, gcode.SEV_ERROR, "undefined function");     // line 11 (0 based), byte column 4, 3 bytes
+//    d->toggleBookmark(20);
+//    d->save();                               // atomic (see acode.Buffer.save), with the trim / final newline preferences
+//
+//  One Doc is shown by one CodeEditor at a time (editor.setDoc(d)); the tabs of an IDE are Docs, and the scroll position
+//  of a Doc is kept in it. Markers and bookmarks follow the lines when text is inserted or deleted above them.
+// =============================================================================
+import gui;
+import gfx;
+import asys;
+import acode;
+import asyntax;
+import atheme;
+import cstdlib;
+import gcode_core;
+module gcode;
+
+class Doc;
+
+// one diagnostic of a document (shown as a marker in the gutter and a squiggle under the text)
+public struct Mark {
+    int line;               // 0 based
+    int col;                // byte offset in the line
+    int len;                // bytes to underline (0: the word at col, or the rest of the line)
+    int severity;           // SEV_ERROR ...
+    char* message;          // malloc memory owned by the Doc
+}
+
+asyntax.Completer* theCompleter;
+
+// the completer shared by all documents (keywords, symbols and the words of every open Doc)
+public asyntax.Completer* completer() {
+    if (theCompleter == null) {
+        theCompleter = new asyntax.Completer();
+    }
+    return theCompleter;
+}
+
+// the file name part of a path (a pointer into it)
+public char* baseName(char* path) {
+    int n = strlen(path);
+    while (n > 1 && path[n - 1] == '/') { n--; }
+    int at = 0;
+    for (int i = 0; i < n; i++) {
+        if (path[i] == '/' || path[i] == '\\') { at = i + 1; }
+    }
+    return &path[at];
+}
+
+// every Doc that was made and not disposed (for preferences that apply to all documents)
+Doc** docList;
+int docN;
+int docCap;
+
+public int docCount() { return docN; }
+public Doc* docAt(int i) {
+    if (i < 0 || i >= docN) { return null; }
+    return docList[i];
+}
+
+public class Doc {
+    public acode.Buffer* buf;
+    public acode.Editor* ed;
+    public asyntax.Highlighter* hl;
+    public int lang;                        // asyntax.Lang
+    public char* title;                     // the name shown on the tab
+    public int userData;
+    public Mark* marks;                     // sorted by line
+    public int nmarks;
+    public int* books;                      // bookmarked lines, sorted
+    public int nbooks;
+    public int topLine;                     // view state kept while another document is shown
+    public int topSub;
+    public int leftCol;
+    public int version0;                    // buffer version when the document was loaded or saved (for "changed since")
+    private int markCap;
+    private int bookCap;
+    private int listenerId;
+    private bool disposed;
+
+    public Doc() {
+        buf = new acode.Buffer();
+        ed = new acode.Editor(buf);
+        lang = asyntax.Lang.Text;
+        hl = new asyntax.Highlighter(buf, lang);
+        title = asys.strDup("untitled");
+        Look* lk = theLook();
+        ed->tabWidth = lk->tabWidth;
+        ed->indentWidth = lk->tabWidth;
+        ed->useTabs = !lk->insertSpaces;
+        ed->autoIndent = lk->autoIndent;
+        listenerId = buf->addListener(docChanged, (int) this);
+        completer()->addBuffer(buf, lang);
+        version0 = buf->version;
+        if (docN == docCap) {
+            docCap = (docCap == 0) ? 16 : docCap * 2;
+            docList = (Doc**) realloc((char*) docList, docCap * 8);
+        }
+        docList[docN] = this;
+        docN++;
+    }
+
+    // frees everything (the Doc must not be shown any more)
+    public void dispose() {
+        if (disposed) { return; }
+        disposed = true;
+        for (int i = 0; i < docN; i++) {
+            if (docList[i] == this) {
+                for (int j = i; j < docN - 1; j++) { docList[j] = docList[j + 1]; }
+                docN--;
+                break;
+            }
+        }
+        buf->removeListener(listenerId);
+        completer()->removeBuffer(buf);
+        clearMarks();
+        free((char*) marks);
+        free((char*) books);
+        marks = null;
+        books = null;
+        hl->dispose();
+        ed->dispose();
+        buf->dispose();
+    }
+
+    public void setTitle(char* t) {
+        asys.free(title);
+        title = asys.strDup(t);
+    }
+
+    // the language of the text: highlighting, comment tokens, completion keywords
+    public void setLanguage(int l) {
+        lang = l;
+        hl->setLanguage(l);
+        ed->setLanguage(asyntax.languageName(l));
+        completer()->addBuffer(buf, l);
+    }
+
+    // takes the first line of the text for detectLanguage (the file name may say nothing: "#!/bin/sh")
+    private void detect(char* name) {
+        int len = 0;
+        char* first = null;
+        if (buf->lineCount() > 0) {
+            int l1 = 0;
+            first = buf->linePtr(0, &l1);
+            len = l1;
+        }
+        char tmp[200];
+        char* fl = null;
+        if (first != null) {
+            int n = len;
+            if (n > 190) { n = 190; }
+            memcpy(&tmp[0], first, n);
+            tmp[n] = 0;
+            fl = &tmp[0];
+        }
+        setLanguage(asyntax.detectLanguage(name, fl));
+    }
+
+    // Loads a file: 0 or -errno. The title becomes the file name, the language is detected from the name and the first line, and
+    // the indentation style (tabs or spaces, width) from the text.
+    public int open(char* path) {
+        int r = buf->load(path);
+        if (r < 0) { return r; }
+        setTitle(baseName(path));
+        detect(baseName(path));
+        ed->detectIndent(true);
+        ed->setCursor(0);
+        clearMarks();
+        clearBookmarks();
+        topLine = 0;
+        topSub = 0;
+        leftCol = 0;
+        version0 = buf->version;
+        return 0;
+    }
+
+    // Saves to the file the document came from (path null) or to another one: 0 or -errno. The trim trailing whitespace and the
+    // final newline preferences of the Look are applied first (as undoable edits).
+    public int save(char* path) {
+        Look* lk = theLook();
+        int r = ed->saveFile(path, 0, lk->trimOnSave, lk->finalNewline);
+        if (r < 0) { return r; }
+        if (path != null) {
+            setTitle(baseName(path));
+            detect(baseName(path));
+        }
+        version0 = buf->version;
+        return 0;
+    }
+
+    // replaces the whole text; it is not a modification (no undo history, the document counts as saved)
+    public void setText(char* t) {
+        buf->setText(t, strlen(t));
+        buf->clearHistory();
+        buf->markSaved();
+        ed->setCursor(0);
+        version0 = buf->version;
+    }
+
+    public bool isModified() {
+        return buf->modified();
+    }
+
+    // ---- markers -----------------------------------------------------------------------------------------------------------------
+    public void clearMarks() {
+        for (int i = 0; i < nmarks; i++) { asys.free(marks[i].message); }
+        nmarks = 0;
+    }
+
+    // adds a diagnostic; the list stays sorted by line (marks of one line in the order they were added)
+    public void addMark(int line, int col, int len, int severity, char* message) {
+        if (nmarks == markCap) {
+            markCap = (markCap == 0) ? 16 : markCap * 2;
+            marks = (Mark*) realloc((char*) marks, markCap * sizeof(Mark));
+        }
+        int at = nmarks;
+        while (at > 0 && marks[at - 1].line > line) { at--; }
+        for (int i = nmarks; i > at; i--) { marks[i] = marks[i - 1]; }
+        marks[at].line = line;
+        marks[at].col = col;
+        marks[at].len = len;
+        marks[at].severity = severity;
+        marks[at].message = asys.strDup(message);
+        nmarks++;
+    }
+
+    // the index of the first mark on line `line` or later (nmarks when there is none)
+    public int firstMark(int line) {
+        int lo = 0;
+        int hi = nmarks;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (marks[mid].line < line) { lo = mid + 1; } else { hi = mid; }
+        }
+        return lo;
+    }
+
+    // the most serious severity on a line (SEV_ERROR is the most serious), or -1
+    public int worstMark(int line) {
+        int worst = -1;
+        for (int i = firstMark(line); i < nmarks && marks[i].line == line; i++) {
+            if (worst < 0 || marks[i].severity < worst) { worst = marks[i].severity; }
+        }
+        return worst;
+    }
+
+    // the message of the first mark on the line that covers byte column col (-1: any), or null
+    public char* markMessage(int line, int col) {
+        for (int i = firstMark(line); i < nmarks && marks[i].line == line; i++) {
+            if (col < 0) { return marks[i].message; }
+            int e = marks[i].col + ((marks[i].len > 0) ? marks[i].len : 1);
+            if (col >= marks[i].col && col < e) { return marks[i].message; }
+        }
+        return null;
+    }
+
+    // ---- bookmarks -------------------------------------------------------------------------------------------------------------------
+    public bool hasBookmark(int line) {
+        int lo = 0;
+        int hi = nbooks;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (books[mid] < line) { lo = mid + 1; } else { hi = mid; }
+        }
+        return lo < nbooks && books[lo] == line;
+    }
+
+    // sets or removes the bookmark of a line; returns true when it is set now
+    public bool toggleBookmark(int line) {
+        int lo = 0;
+        int hi = nbooks;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (books[mid] < line) { lo = mid + 1; } else { hi = mid; }
+        }
+        if (lo < nbooks && books[lo] == line) {
+            for (int i = lo; i < nbooks - 1; i++) { books[i] = books[i + 1]; }
+            nbooks--;
+            return false;
+        }
+        if (nbooks == bookCap) {
+            bookCap = (bookCap == 0) ? 16 : bookCap * 2;
+            books = (int*) realloc((char*) books, bookCap * 8);
+        }
+        for (int i = nbooks; i > lo; i--) { books[i] = books[i - 1]; }
+        books[lo] = line;
+        nbooks++;
+        return true;
+    }
+
+    public void clearBookmarks() {
+        nbooks = 0;
+    }
+
+    // the next bookmarked line after `line` (wraps around), or -1 when there are none
+    public int nextBookmark(int line) {
+        if (nbooks == 0) { return -1; }
+        for (int i = 0; i < nbooks; i++) {
+            if (books[i] > line) { return books[i]; }
+        }
+        return books[0];
+    }
+
+    public int prevBookmark(int line) {
+        if (nbooks == 0) { return -1; }
+        for (int i = nbooks - 1; i >= 0; i--) {
+            if (books[i] < line) { return books[i]; }
+        }
+        return books[nbooks - 1];
+    }
+
+    // called by the buffer listener: moves markers and bookmarks along with the lines
+    public void shiftLines(acode.Change* c) {
+        if (c->kind == acode.CH_RESET) {
+            clearMarks();
+            clearBookmarks();
+            return;
+        }
+        int delta = c->insLines - c->delLines;
+        if (delta == 0 && c->delLines == 0) { return; }
+        int first = c->line;                     // lines after this one are affected
+        int w = 0;
+        for (int i = 0; i < nmarks; i++) {
+            int l = marks[i].line;
+            if (l > first) {
+                if (c->delLines > 0 && l <= first + c->delLines && delta < 0) {
+                    // the line was deleted by this change (unless the change put new lines in its place)
+                    if (l > first + c->insLines) {
+                        asys.free(marks[i].message);
+                        continue;
+                    }
+                }
+                marks[i].line = l + delta;
+            }
+            marks[w] = marks[i];
+            w++;
+        }
+        nmarks = w;
+        int bw = 0;
+        for (int i = 0; i < nbooks; i++) {
+            int l = books[i];
+            if (l > first) {
+                if (c->delLines > 0 && l <= first + c->delLines && delta < 0 && l > first + c->insLines) {
+                    continue;
+                }
+                l = l + delta;
+            }
+            if (bw > 0 && books[bw - 1] == l) { continue; }
+            books[bw] = l;
+            bw++;
+        }
+        nbooks = bw;
+    }
+}
+
+int docChanged(int user, acode.Change* c) {
+    Doc* d = (Doc*) user;
+    d->shiftLines(c);
+    return 0;
+}

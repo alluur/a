@@ -1,0 +1,2108 @@
+// =============================================================================
+//  gcode_editor - the code editor widget over an acode buffer                         (part of the module gcode: import gcode;)
+//
+//    gcode.CodeEditor* ed = new gcode.CodeEditor();       // has an empty document of its own
+//    ed->open("main.a");                                  // or ed->setDoc(doc) to show another document
+//    ed->flex = 1;  col->add(ed);  window->setRoot(col);
+//    gcode.theLook()->setThemeName("monokai");            // every editor changes its colours at once
+//
+//  Draws only the visible lines (and lexes only those), so a file of 100 000 lines scrolls and takes input as fast as a small
+//  one. Gutter: line numbers (the current line is lit), bookmarks and error / warning markers. Syntax colours come from the
+//  atheme.Theme of the Look; selections, the current line, find matches, other uses of the word at the caret and the matching
+//  bracket are drawn behind the text; squiggles mark diagnostics (Doc.addMark). Keyboard: arrows (Shift extends, Ctrl = by word),
+//  Home / End (smart), PgUp / PgDn, Tab / Shift+Tab, Enter (auto indent), Ctrl+Z / Y / Shift+Z, Ctrl+C / X / V / A, Ctrl+D (next
+//  occurrence), Ctrl+L (line), Ctrl+/ (comment), Ctrl+] / [ (indent), Alt+Up / Down (move lines), Ctrl+Shift+K (delete line),
+//  Ctrl+Alt+Up / Down (more cursors), Ctrl+Space (completion), Ctrl+F2 / F2 / Shift+F2 (bookmarks). Mouse: click, double click
+//  (word), triple click (line), drag, Shift+click, Ctrl+click (another cursor), Alt+drag (rectangular selection), wheel (Shift:
+//  sideways), gutter click (bookmark in the left strip, line selection on the numbers), right click (context menu).
+//  Keys the editor does not use (Ctrl+S, Ctrl+F ...) are left to the window.
+// =============================================================================
+import gui;
+import gfx;
+import adp;
+import asys;
+import acode;
+import asyntax;
+import atheme;
+import afind;
+import guix;
+import cstdlib;
+import gcode_core;
+import gcode_doc;
+module gcode;
+
+public const EV_CHANGE = 1;     // observer events
+public const EV_CURSOR = 2;
+public const EV_SCROLL = 4;
+
+const SB = 14;                  // thickness of the scroll bars
+const MARKW = 16;               // the marker strip at the left of the gutter
+const TPAD = 4;                 // space between the gutter and the text
+const DRAG_NONE = 0;
+const DRAG_TEXT = 1;
+const DRAG_WORD = 2;
+const DRAG_LINE = 3;
+const DRAG_RECT = 4;
+const DRAG_VBAR = 5;
+const DRAG_HBAR = 6;
+const MAXTOK = 256;
+const MAXHL = 1024;             // highlighted matches per paint
+const POP_MAX = 64;             // completion candidates
+const POP_ROWS = 8;
+const POP_ROWH = 18;
+
+class CodeEditor;
+
+private bool isIdByte(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c >= 128;
+}
+
+// the thumb of a scroll bar: position and length inside the track
+private void thumbGeom(int total, int page, int value, int track, int* pos, int* len) {
+    if (total <= page || total <= 0 || track <= 0) {
+        *pos = 0;
+        *len = track;
+        return;
+    }
+    int l = track * page / total;
+    if (l < 20) { l = 20; }
+    if (l > track) { l = track; }
+    int maxv = total - page;
+    *len = l;
+    *pos = (track - l) * value / maxv;
+}
+
+public class CodeEditor : gui.Widget {
+    public Doc* doc;
+    public Look* look;
+    public acode.Buffer* buf;               // the buffer of the document
+    public acode.Editor* ed;                // its editor (cursors, commands)
+    // options: they start from the preferences of the Look
+    public bool lineNumbers;
+    public bool wordWrap;
+    public bool showWhitespace;
+    public bool indentGuides;
+    public bool highlightLine;
+    public bool highlightWord;
+    public bool matchBrackets;
+    public bool blink;                      // the caret blinks (false: always visible; tests use this)
+    public bool autoComplete;               // the completion popup opens while typing identifiers
+    public int minComplete;                 // characters before it opens by itself (2)
+    public int doubleClickMs;               // clicks closer in time than this count as double / triple clicks
+    public int wheelLines;                  // rows per notch of the wheel
+    public int wantW;                       // preferred size inside boxes (0: 480 x 320)
+    public int wantH;
+    // callbacks  int f(int editor)
+    public func onChange;                   // the text changed (typing, undo, replace, load ...)
+    public func onCursor;                   // the caret or the selection moved (also after a change)
+    public func onGutter;                   // the gutter was clicked: gutterLine (0 based) and gutterButton
+    public func onContextMenu;              // just before the context menu is shown (enable / add items)
+    public func onScroll;                   // the view scrolled
+    public int gutterLine;
+    public int gutterButton;
+    public guix.Menu* menu;                 // the context menu (add your own items to it)
+    // the view
+    private int topLine;
+    private int topSub;                     // row inside the top line (word wrap)
+    private int leftCol;
+    private int maxCols;                    // the widest line seen while drawing (for the horizontal scroll bar)
+    // geometry (updateGeometry)
+    private int gutterW;
+    private int textX;
+    private int textRight;
+    private int textH;
+    private int pageCols;
+    private int fullRows;
+    private int visRows;
+    private int digits;
+    // line cache for drawing
+    private char* lbuf;
+    private int lcap;
+    private int llen;
+    private int* lcols;
+    private int lcolCap;
+    private int cacheLine;
+    private int cacheVersion;
+    private int cacheTab;
+    private asyntax.Token* toks;
+    private int ntoks;
+    private int tokLine;
+    private int tokVersion;
+    // text run being drawn
+    private char* runBuf;
+    private int runN;
+    private int runX;
+    private int runCol;
+    private int runColor;
+    private int runStyle;
+    // state
+    private bool caretOn;
+    private bool focusedView;
+    private int blinkTimer;
+    private int autoTimer;
+    private int dragMode;
+    private int dragA;                      // fixed end of a drag selection (offset); for word / line drags the first unit's bounds
+    private int dragB;
+    private int dragLine;
+    private int dragCol;
+    private int grab;
+    private int mouseX;
+    private int mouseY;
+    private int lastClickMs;
+    private int lastClickX;
+    private int lastClickY;
+    private int clickCount;
+    private int shape;
+    private int lastCaret;
+    private int lastAnchor;
+    private int lastNcur;
+    private int lastVersion;
+    private int listenerId;
+    private acode.Buffer* listenBuf;
+    private int paintCount;
+    private func* obsFn;
+    private int* obsUser;
+    private int nobs;
+    private int obsCap;
+    // highlight caches
+    private afind.Finder* findF;
+    private char* findPat;
+    private int findOpts;
+    private int findGen;
+    private afind.Match* fm;
+    private int nfm;
+    private int fmVer;
+    private int fmFrom;
+    private int fmTo;
+    private int fmGen;
+    private afind.Finder* wordF;
+    private char* wordText;
+    private afind.Match* wm;
+    private int nwm;
+    private int wmVer;
+    private int wmFrom;
+    private int wmTo;
+    private int wmStart;
+    private int brA;
+    private int brB;
+    private int brVer;
+    private int brPos;
+    private bool brValid;
+    // completion
+    private bool popOn;
+    private int popSel;
+    private int popTop;
+    private int popCount;
+    private int popStart;
+    private asyntax.Candidate* cands;
+    // context menu items
+    private guix.MenuItem* miCut;
+    private guix.MenuItem* miCopy;
+    private guix.MenuItem* miPaste;
+    private guix.MenuItem* miUndo;
+    private guix.MenuItem* miRedo;
+    private guix.MenuItem* miComment;
+
+    public CodeEditor() {
+        super();
+        focusable = true;
+        flex = 1;
+        w = 480;
+        h = 320;
+        look = theLook();
+        doubleClickMs = 400;
+        wheelLines = 3;
+        minComplete = 2;
+        cacheLine = -1;
+        tokLine = -1;
+        lbuf = (char*) malloc(1024);
+        lcap = 1024;
+        lcols = (int*) malloc(1024 * 8);
+        lcolCap = 1024;
+        toks = (asyntax.Token*) malloc(MAXTOK * sizeof(asyntax.Token));
+        runBuf = (char*) malloc(600);
+        fm = (afind.Match*) malloc(MAXHL * sizeof(afind.Match));
+        wm = (afind.Match*) malloc(MAXHL * sizeof(afind.Match));
+        cands = (asyntax.Candidate*) malloc(POP_MAX * sizeof(asyntax.Candidate));
+        caretOn = true;
+        doc = new Doc();
+        bindDoc(doc);
+        pullPrefs();
+        look->use(this, editorLookChanged);
+        onContext = editorContext;
+        buildMenu();
+    }
+
+    // ---- observers: other widgets (status bar, find bar, outline) listen to the editor without using its single callback slots ----------------------
+    // f(user, editor, event) is called for EV_CHANGE, EV_CURSOR and EV_SCROLL (add them together for several events)
+    public void observe(func f, int user) {
+        if (nobs == obsCap) {
+            obsCap = (obsCap == 0) ? 8 : obsCap * 2;
+            obsFn = (func*) realloc((char*) obsFn, obsCap * 8);
+            obsUser = (int*) realloc((char*) obsUser, obsCap * 8);
+        }
+        obsFn[nobs] = f;
+        obsUser[nobs] = user;
+        nobs++;
+    }
+
+    public void unobserve(int user) {
+        int w2 = 0;
+        for (int i = 0; i < nobs; i++) {
+            if (obsUser[i] != user) {
+                obsFn[w2] = obsFn[i];
+                obsUser[w2] = obsUser[i];
+                w2++;
+            }
+        }
+        nobs = w2;
+    }
+
+    private void fire(int ev) {
+        if (ev == EV_CHANGE && onChange != null) { onChange(this); }
+        if (ev == EV_CURSOR && onCursor != null) { onCursor(this); }
+        if (ev == EV_SCROLL && onScroll != null) { onScroll(this); }
+        for (int i = 0; i < nobs; i++) {
+            func f = obsFn[i];
+            f(obsUser[i], (int) this, ev);
+        }
+    }
+
+    // ---- the document ----------------------------------------------------------------------------------------------------------------
+    private void bindDoc(Doc* d) {
+        if (listenBuf != null) {
+            listenBuf->removeListener(listenerId);
+        }
+        doc = d;
+        buf = d->buf;
+        ed = d->ed;
+        listenBuf = buf;
+        listenerId = buf->addListener(viewBufferChanged, (int) this);
+        topLine = d->topLine;
+        topSub = d->topSub;
+        leftCol = d->leftCol;
+        maxCols = 0;
+        cacheLine = -1;
+        tokLine = -1;
+        fmVer = -1;
+        wmVer = -1;
+        brValid = false;
+        popOn = false;
+        lastVersion = buf->version;
+        lastCaret = ed->caret();
+        lastAnchor = ed->cur[ed->primary].anchor;
+        lastNcur = ed->ncur;
+    }
+
+    // shows another document (the view of the one that was shown is kept in it)
+    public void setDoc(Doc* d) {
+        if (d == doc) { return; }
+        if (doc != null) {
+            doc->topLine = topLine;
+            doc->topSub = topSub;
+            doc->leftCol = leftCol;
+        }
+        bindDoc(d);
+        updateGeometry();
+        clampTop();
+        revealCaret();
+        invalidate();
+        fire(EV_CURSOR);
+        fire(EV_CHANGE);
+    }
+
+    public Doc* getDoc() { return doc; }
+
+    // loads a file into the document being shown: 0 or -errno
+    public int open(char* path) {
+        int r = doc->open(path);
+        if (r == 0) {
+            topLine = 0;
+            topSub = 0;
+            leftCol = 0;
+            maxCols = 0;
+            invalidate();
+        }
+        return r;
+    }
+
+    public void setText(char* t) {
+        doc->setText(t);
+        topLine = 0;
+        topSub = 0;
+        leftCol = 0;
+        maxCols = 0;
+        invalidate();
+    }
+
+    // the whole text as an asys string (free it with asys.free)
+    public char* getText() {
+        return buf->getText(0, buf->length());
+    }
+
+    public char* getSelectedText() {
+        return ed->selectedText(ed->primary);
+    }
+
+    public void setReadOnly(bool v) {
+        buf->readOnly = v;
+        invalidate();
+    }
+
+    public bool isReadOnly() { return buf->readOnly; }
+
+    // copies the preferences of the Look
+    public void pullPrefs() {
+        lineNumbers = look->lineNumbers;
+        wordWrap = look->wordWrap;
+        showWhitespace = look->showWhitespace;
+        indentGuides = look->indentGuides;
+        highlightLine = look->highlightLine;
+        highlightWord = look->highlightWord;
+        matchBrackets = look->matchBrackets;
+        blink = look->blink;
+        autoComplete = look->autoComplete;
+        if (wordWrap) { leftCol = 0; }
+    }
+
+    public void lookChanged() {
+        pullPrefs();
+        if (!blink) {
+            stopBlink();
+            caretOn = true;
+        } else {
+            armBlink();
+        }
+        cacheLine = -1;
+        tokLine = -1;
+        updateGeometry();
+        clampTop();
+        invalidate();
+    }
+
+    public void setWordWrap(bool v) {
+        wordWrap = v;
+        leftCol = 0;
+        topSub = 0;
+        updateGeometry();
+        clampTop();
+        revealCaret();
+        invalidate();
+    }
+
+    public void setLineNumbers(bool v) {
+        lineNumbers = v;
+        invalidate();
+    }
+
+    // ---- geometry --------------------------------------------------------------------------------------------------------------------
+    private int tabw() {
+        int t = ed->tabWidth;
+        if (t < 1) { t = 4; }
+        if (t > 64) { t = 64; }
+        return t;
+    }
+
+    private void updateGeometry() {
+        int lh = look->lineH;
+        int cw = look->cellW;
+        int n = buf->lineCount();
+        digits = 3;
+        int m = n;
+        int dg = 1;
+        while (m >= 10) { m = m / 10; dg++; }
+        if (dg > digits) { digits = dg; }
+        gutterW = MARKW + (lineNumbers ? digits * cw + 10 : 4);
+        textX = gutterW + TPAD;
+        textRight = w - SB;
+        textH = wordWrap ? h : h - SB;
+        if (textH < lh) { textH = lh; }
+        visRows = (textH + lh - 1) / lh;
+        fullRows = imax(1, textH / lh);
+        pageCols = imax(1, (textRight - textX) / cw);
+    }
+
+    public int lineHeight() { return look->lineH; }
+    public int cellWidth() { return look->cellW; }
+    public int gutterWidth() { updateGeometry(); return gutterW; }
+    public int firstLine() { return topLine; }
+    public int firstCol() { return leftCol; }
+    public int visibleRows() { updateGeometry(); return fullRows; }
+    public int columns() { updateGeometry(); return pageCols; }
+
+    // the last line that is (partly) visible
+    public int lastLine() {
+        updateGeometry();
+        int l = topLine;
+        int s = topSub;
+        for (int i = 1; i < visRows; i++) {
+            if (!stepDown(&l, &s)) { break; }
+        }
+        return l;
+    }
+
+    // ---- rows (a line is one row, or several when words wrap) -----------------------------------------------------------------------------
+    private int lineCols(int line) {
+        return buf->visualCol(line, buf->lineEnd(line), tabw());
+    }
+
+    private int rowsOf(int line) {
+        if (!wordWrap) { return 1; }
+        return lineCols(line) / pageCols + 1;
+    }
+
+    private bool stepDown(int* line, int* sub) {
+        if (wordWrap && *sub + 1 < rowsOf(*line)) {
+            *sub = *sub + 1;
+            return true;
+        }
+        if (*line + 1 < buf->lineCount()) {
+            *line = *line + 1;
+            *sub = 0;
+            return true;
+        }
+        return false;
+    }
+
+    private bool stepUp(int* line, int* sub) {
+        if (*sub > 0) {
+            *sub = *sub - 1;
+            return true;
+        }
+        if (*line > 0) {
+            *line = *line - 1;
+            *sub = wordWrap ? rowsOf(*line) - 1 : 0;
+            return true;
+        }
+        return false;
+    }
+
+    // keeps the first row inside the document and the last row at the bottom (no empty space when the text is long enough)
+    private void clampTop() {
+        int n = buf->lineCount();
+        if (topLine >= n) { topLine = n - 1; topSub = 0; }
+        if (topLine < 0) { topLine = 0; }
+        if (topSub < 0 || !wordWrap) { topSub = 0; }
+        if (topSub >= rowsOf(topLine)) { topSub = rowsOf(topLine) - 1; }
+        int l = topLine;
+        int s = topSub;
+        int avail = 1;
+        while (avail < fullRows && stepDown(&l, &s)) { avail++; }
+        int missing = fullRows - avail;
+        while (missing > 0 && stepUp(&topLine, &topSub)) { missing--; }
+        if (leftCol < 0) { leftCol = 0; }
+        if (wordWrap) { leftCol = 0; }
+    }
+
+    // moves the view by rows (negative: up)
+    public void scrollRows(int n) {
+        updateGeometry();
+        int before = topLine * 100000 + topSub;
+        while (n > 0 && stepDown(&topLine, &topSub)) { n--; }
+        while (n < 0 && stepUp(&topLine, &topSub)) { n++; }
+        clampTop();
+        if (topLine * 100000 + topSub != before) {
+            invalidate();
+            fire(EV_SCROLL);
+        }
+    }
+
+    public void setFirstLine(int line) {
+        updateGeometry();
+        int before = topLine * 100000 + topSub;
+        topLine = line;
+        topSub = 0;
+        clampTop();
+        if (topLine * 100000 + topSub != before) {
+            invalidate();
+            fire(EV_SCROLL);
+        }
+    }
+
+    public void setFirstCol(int col) {
+        if (wordWrap) { return; }
+        int before = leftCol;
+        leftCol = imax(0, col);
+        if (leftCol != before) {
+            invalidate();
+            fire(EV_SCROLL);
+        }
+    }
+
+    // scrolls so that the line is in the middle of the view
+    public void centerLine(int line) {
+        updateGeometry();
+        int before = topLine * 100000 + topSub;
+        topLine = imax(0, line - fullRows / 2);
+        topSub = 0;
+        clampTop();
+        if (topLine * 100000 + topSub != before) {
+            invalidate();
+            fire(EV_SCROLL);
+        }
+    }
+
+    // scrolls the least that makes the position (line, display column) visible
+    private void revealLineCol(int line, int col) {
+        int sub = wordWrap ? col / pageCols : 0;
+        int before = topLine * 100000 + topSub + leftCol;
+        if (line < topLine || (line == topLine && sub < topSub)) {
+            topLine = line;
+            topSub = sub;
+        } else {
+            int l = topLine;
+            int s = topSub;
+            bool found = false;
+            for (int i = 0; i < fullRows; i++) {
+                if (l == line && s == sub) { found = true; break; }
+                if (!stepDown(&l, &s)) { break; }
+            }
+            if (!found) {
+                l = line;
+                s = sub;
+                for (int i = 0; i < fullRows - 1; i++) {
+                    if (!stepUp(&l, &s)) { break; }
+                }
+                topLine = l;
+                topSub = s;
+            }
+        }
+        if (!wordWrap) {
+            int margin = imin(4, pageCols / 4);
+            if (col < leftCol) {
+                leftCol = imax(0, col - margin);
+            } else if (col + 1 > leftCol + pageCols) {
+                leftCol = col + 1 - pageCols + margin;
+            }
+        }
+        clampTop();
+        if (topLine * 100000 + topSub + leftCol != before) {
+            fire(EV_SCROLL);
+        }
+    }
+
+    // scrolls to show the caret
+    public void revealCaret() {
+        updateGeometry();
+        int p = ed->caret();
+        int line = buf->lineAt(p);
+        revealLineCol(line, buf->visualCol(line, p, tabw()));
+    }
+
+    public void revealOffset(int off) {
+        updateGeometry();
+        int line = buf->lineAt(off);
+        revealLineCol(line, buf->visualCol(line, off, tabw()));
+        invalidate();
+    }
+
+    // puts the caret on a line (0 based) and column (display column) and shows it (in the middle of the view when it was off screen)
+    public void gotoLine(int line, int col) {
+        updateGeometry();
+        line = imax(0, imin(line, buf->lineCount() - 1));
+        ed->gotoLine(line, col);
+        int l = lastLine();
+        if (line < topLine || line > l) {
+            centerLine(line);
+        }
+        revealCaret();
+        afterCommand(false);
+    }
+
+    // ---- positions and points ---------------------------------------------------------------------------------------------------------
+    // The line and row (word wrap) under a y coordinate of the widget; false when the point is below the last line.
+    private bool rowAtY(int my, int* line, int* sub) {
+        int lh = look->lineH;
+        int r = (my < 0) ? 0 : my / lh;
+        int l = topLine;
+        int s = topSub;
+        bool ok = true;
+        for (int i = 0; i < r; i++) {
+            if (!stepDown(&l, &s)) { ok = false; break; }
+        }
+        *line = l;
+        *sub = s;
+        return ok;
+    }
+
+    private int colAtX(int mx, int sub) {
+        int cw = look->cellW;
+        int d = mx - textX + cw / 2;
+        int c = (d < 0) ? 0 : d / cw;
+        if (wordWrap) { return sub * pageCols + imin(c, pageCols); }
+        return leftCol + c;
+    }
+
+    // the byte offset under a point of the widget (the end of the text below the last line)
+    public int offsetAtPoint(int mx, int my) {
+        updateGeometry();
+        int line = 0;
+        int sub = 0;
+        bool ok = rowAtY(my, &line, &sub);
+        if (!ok) { return buf->lineEnd(line); }
+        return buf->offsetAtCol(line, colAtX(mx, sub), tabw());
+    }
+
+    // The centre of the character cell at an offset, in widget coordinates; false when it is not visible.
+    public bool pointOfOffset(int off, int* px, int* py) {
+        updateGeometry();
+        int line = buf->lineAt(off);
+        int col = buf->visualCol(line, off, tabw());
+        int sub = wordWrap ? col / pageCols : 0;
+        int l = topLine;
+        int s = topSub;
+        int row = -1;
+        for (int i = 0; i < visRows; i++) {
+            if (l == line && s == sub) { row = i; break; }
+            if (!stepDown(&l, &s)) { break; }
+        }
+        if (row < 0) { return false; }
+        int cw = look->cellW;
+        int c = wordWrap ? col - sub * pageCols : col - leftCol;
+        if (c < 0 || c > pageCols) { return false; }
+        *px = textX + c * cw + cw / 2;
+        *py = row * look->lineH + look->lineH / 2;
+        return true;
+    }
+
+    // the gutter: the centre of the number of a line (widget coordinates); false when the line is not visible
+    public bool gutterPoint(int line, int* px, int* py) {
+        updateGeometry();
+        int l = topLine;
+        int s = topSub;
+        for (int i = 0; i < visRows; i++) {
+            if (l == line && s == 0) {
+                *px = MARKW + (gutterW - MARKW) / 2;
+                *py = i * look->lineH + look->lineH / 2;
+                return true;
+            }
+            if (!stepDown(&l, &s)) { break; }
+        }
+        return false;
+    }
+
+    // ---- change notification -----------------------------------------------------------------------------------------------------------
+    public void bufferChanged(acode.Change* c) {
+        cacheLine = -1;
+        tokLine = -1;
+        fmVer = -1;
+        wmVer = -1;
+        brValid = false;
+        if (c->kind == acode.CH_RESET) {
+            maxCols = 0;
+            popOn = false;
+        }
+        invalidate();
+        fire(EV_CHANGE);
+    }
+
+    // after a command: scroll to the caret, repaint, tell the program
+    private void afterCommand(bool reveal) {
+        int p = ed->caret();
+        int a = ed->cur[ed->primary].anchor;
+        bool moved = (p != lastCaret || a != lastAnchor || ed->ncur != lastNcur);
+        bool edited = (buf->version != lastVersion);
+        if (moved || edited) {
+            lastCaret = p;
+            lastAnchor = a;
+            lastNcur = ed->ncur;
+            lastVersion = buf->version;
+            caretOn = true;
+            restartBlink();
+            if (reveal) { revealCaret(); }
+            invalidate();
+            fire(EV_CURSOR);
+        }
+    }
+
+    // ---- the caret blinks ------------------------------------------------------------------------------------------------------------------
+    private void armBlink() {
+        if (blinkTimer == 0 && blink && focusedView && win != null) {
+            blinkTimer = win->display->after(530, editorBlinkTick, (int) this);
+        }
+    }
+
+    private void stopBlink() {
+        if (blinkTimer != 0 && win != null) {
+            win->display->cancel(blinkTimer);
+        }
+        blinkTimer = 0;
+    }
+
+    private void restartBlink() {
+        stopBlink();
+        armBlink();
+    }
+
+    public void blinkStep() {
+        blinkTimer = 0;
+        if (!focusedView || !blink || win == null) { return; }
+        caretOn = !caretOn;
+        invalidate();
+        armBlink();
+    }
+
+    public virtual void onFocus(bool gained) {
+        focusedView = gained;
+        caretOn = true;
+        if (gained) {
+            restartBlink();
+        } else {
+            stopBlink();
+            popOn = false;
+        }
+        invalidate();
+    }
+
+    public virtual bool wantsScroll() { return true; }
+    public virtual int prefW() { return (wantW > 0) ? wantW : 480; }
+    public virtual int prefH() { return (wantH > 0) ? wantH : 320; }
+
+    // ---- reading a line for drawing --------------------------------------------------------------------------------------------------------
+    // copies line `line` into lbuf and computes the display column of every byte (lcols[i] = column where the character that
+    // contains byte i starts, lcols[llen] = width of the line)
+    private void fetchLine(int line) {
+        if (cacheLine == line && cacheVersion == buf->version && cacheTab == tabw()) { return; }
+        int s = buf->lineStart(line);
+        int e = buf->lineEnd(line);
+        int n = e - s;
+        if (n + 8 > lcap) {
+            int nc = lcap;
+            while (nc < n + 8) { nc = nc * 2; }
+            lbuf = (char*) realloc(lbuf, nc);
+            lcap = nc;
+        }
+        if (n + 8 > lcolCap) {
+            int nc = lcolCap;
+            while (nc < n + 8) { nc = nc * 2; }
+            lcols = (int*) realloc((char*) lcols, nc * 8);
+            lcolCap = nc;
+        }
+        buf->copyRange(s, e, lbuf);
+        lbuf[n] = 0;
+        llen = n;
+        int tw = tabw();
+        int col = 0;
+        int i = 0;
+        while (i < n) {
+            int b = lbuf[i] & 255;
+            lcols[i] = col;
+            if (b < 0x80) {
+                if (b == 9) { col = col + tw - (col % tw); } else { col = col + 1; }
+                i++;
+                continue;
+            }
+            int sz = 1;
+            if (b >= 0xC2) {
+                int need = 1;
+                if (b < 0xE0) { need = 2; } else if (b < 0xF0) { need = 3; } else if (b < 0xF5) { need = 4; }
+                if (need > 1 && i + need <= n) {
+                    bool good = true;
+                    for (int k = 1; k < need; k++) {
+                        if ((lbuf[i + k] & 0xC0) != 0x80) { good = false; }
+                    }
+                    if (good) { sz = need; }
+                }
+            }
+            int cp = 0xFFFD;
+            if (sz > 1) {
+                cp = b & (0xFF >> (sz + 1));
+                for (int k = 1; k < sz; k++) { cp = (cp << 6) | (lbuf[i + k] & 0x3F); }
+            }
+            for (int k = 1; k < sz; k++) { lcols[i + k] = col; }
+            col = col + acode.charWidth(cp);
+            i = i + sz;
+        }
+        lcols[n] = col;
+        cacheLine = line;
+        cacheVersion = buf->version;
+        cacheTab = tw;
+        if (col + 1 > maxCols) { maxCols = col + 1; }
+    }
+
+    private void fetchTokens(int line) {
+        if (tokLine == line && tokVersion == buf->version) { return; }
+        ntoks = doc->hl->tokens(line, toks, MAXTOK);
+        tokLine = line;
+        tokVersion = buf->version;
+    }
+
+    // ---- highlights that depend on the visible range ---------------------------------------------------------------------------------------------
+    // Find matches: the pattern that the find bar uses (null removes the highlights)
+    public void setFindHighlight(char* pattern, int options) {
+        if (pattern == null || pattern[0] == 0) {
+            clearFindHighlight();
+            return;
+        }
+        if (findF == null) { findF = new afind.Finder(buf); }
+        if (findF->buf != buf) { findF->dispose(); findF = new afind.Finder(buf); }
+        asys.free(findPat);
+        findPat = asys.strDup(pattern);
+        findOpts = options;
+        findF->setPattern(pattern, options);
+        findGen++;
+        fmVer = -1;
+        invalidate();
+    }
+
+    public void clearFindHighlight() {
+        asys.free(findPat);
+        findPat = null;
+        nfm = 0;
+        fmVer = -1;
+        findGen++;
+        invalidate();
+    }
+
+    public bool hasFindHighlight() { return findPat != null; }
+
+    private void refreshHighlights(int from, int to) {
+        // the buffer of the finder may have changed with setDoc
+        if (findPat != null && findF != null && findF->buf != buf) {
+            findF = new afind.Finder(buf);
+            findF->setPattern(findPat, findOpts);
+            fmVer = -1;
+        }
+        if (findPat != null && findF != null && findF->ok) {
+            if (fmVer != buf->version || fmFrom != from || fmTo != to || fmGen != findGen) {
+                findF->setRange(from, to);
+                nfm = findF->matches(fm, MAXHL);
+                fmVer = buf->version;
+                fmFrom = from;
+                fmTo = to;
+                fmGen = findGen;
+            }
+        } else {
+            nfm = 0;
+        }
+        // the word at the caret
+        nwm = 0;
+        if (highlightWord && ed->ncur == 1) {
+            int a = ed->selStart(0);
+            int b = ed->selEnd(0);
+            int ws = a;
+            int we = b;
+            if (a == b) {
+                while (ws > 0 && isIdByte(buf->byteAt(ws - 1))) { ws--; }
+                while (we < buf->length() && isIdByte(buf->byteAt(we))) { we++; }
+            } else {
+                bool word = true;
+                for (int p = a; p < b; p++) {
+                    if (!isIdByte(buf->byteAt(p))) { word = false; break; }
+                }
+                if (!word) { ws = we = 0; }
+            }
+            if (we - ws >= 2 && we - ws < 200) {
+                if (wmVer != buf->version || wmFrom != from || wmTo != to || wmStart != ws || wordText == null) {
+                    asys.free(wordText);
+                    wordText = buf->getText(ws, we);
+                    if (wordF == null || wordF->buf != buf) { wordF = new afind.Finder(buf); }
+                    wordF->setPattern(wordText, afind.OPT_WORD);
+                    wordF->setRange(from, to);
+                    nwm = wordF->matches(wm, MAXHL);
+                    wmVer = buf->version;
+                    wmFrom = from;
+                    wmTo = to;
+                    wmStart = ws;
+                    wmCount = nwm;
+                } else {
+                    nwm = wmCount;
+                }
+            }
+        }
+        // the bracket next to the caret
+        brA = -1;
+        brB = -1;
+        if (matchBrackets && !ed->anySelection() && ed->ncur == 1) {
+            int p = ed->caret();
+            if (!brValid || brVer != buf->version || brPos != p) {
+                int at = -1;
+                int m = ed->matchNearCaret(&at);
+                brCacheA = (m >= 0) ? at : -1;
+                brCacheB = m;
+                brVer = buf->version;
+                brPos = p;
+                brValid = true;
+            }
+            brA = brCacheA;
+            brB = brCacheB;
+        }
+    }
+
+    private int wmCount;
+    private int brCacheA;
+    private int brCacheB;
+
+    // ---- painting ---------------------------------------------------------------------------------------------------------------------
+    // x of display column `col` in a row whose first column is colLo
+    private int colX(int ox, int col, int colLo) {
+        return ox + textX + (col - colLo) * look->cellW;
+    }
+
+    private void fillCols(gfx.Surface* s, int ox, int y, int c0, int c1, int colLo, int colHi, int color) {
+        if (c0 < colLo) { c0 = colLo; }
+        if (c1 > colHi) { c1 = colHi; }
+        if (c1 <= c0) { return; }
+        s->fill(colX(ox, c0, colLo), y, (c1 - c0) * look->cellW, look->lineH, color);
+    }
+
+    // a byte range of the cached line as columns
+    private void fillBytes(gfx.Surface* s, int ox, int y, int b0, int b1, int colLo, int colHi, int color) {
+        if (b0 < 0) { b0 = 0; }
+        if (b1 > llen) { b1 = llen; }
+        if (b1 <= b0) { return; }
+        fillCols(s, ox, y, lcols[b0], lcols[b1], colLo, colHi, color);
+    }
+
+    private void flushRun(gfx.Surface* s, int y) {
+        if (runN == 0) { return; }
+        runBuf[runN] = 0;
+        s->text(look->font, runX, y, runBuf, runColor);
+        if ((runStyle & atheme.STYLE_BOLD) != 0) {
+            s->text(look->font, runX + 1, y, runBuf, runColor);
+        }
+        if ((runStyle & atheme.STYLE_UNDERLINE) != 0) {
+            int wpx = gfx.textWidth(look->font, runBuf);
+            s->hline(runX, y + look->font->ascent + 2, wpx, runColor);
+        }
+        runN = 0;
+    }
+
+    // draws one character by itself (control characters, wide characters, non fixed fonts)
+    private void drawGlyph(gfx.Surface* s, int x, int y, char* bytes, int n, int cells, int color, int style) {
+        char t[8];
+        for (int i = 0; i < n && i < 7; i++) { t[i] = bytes[i]; }
+        t[imin(n, 7)] = 0;
+        int cw = look->cellW;
+        int px = x;
+        if (!look->monoFont || cells > 1) {
+            int pos = 0;
+            int code = gfx.nextCode(&t[0], &pos);
+            int adv = look->font->advance(code);
+            px = x + (cw * cells - adv) / 2;
+        }
+        s->text(look->font, px, y, &t[0], color);
+        if ((style & atheme.STYLE_BOLD) != 0) { s->text(look->font, px + 1, y, &t[0], color); }
+        if ((style & atheme.STYLE_UNDERLINE) != 0) { s->hline(x, y + look->font->ascent + 2, cw * cells, color); }
+    }
+
+    // the text of the cached line for one row, token by token
+    private void drawText(gfx.Surface* s, int ox, int y, int colLo, int colHi) {
+        int cw = look->cellW;
+        gfx.Font* font = look->font;
+        runN = 0;
+        bool done = false;
+        for (int t = 0; t < ntoks && !done; t++) {
+            int kind = toks[t].kind;
+            int color = look->tc[kind];
+            int style = look->ts[kind];
+            int i = toks[t].start;
+            int end = i + toks[t].len;
+            if (end > llen) { end = llen; }
+            // skip what is left of the view quickly
+            while (i < end && lcols[i] + 1 < colLo - 2) { i++; }
+            while (i < end) {
+                int cs = lcols[i];
+                if (cs >= colHi) { done = true; break; }
+                int b = lbuf[i] & 255;
+                int sz = 1;
+                if (b >= 0xC2) {
+                    // the end of this character: the next byte that starts a new column or is not a continuation byte
+                    int j = i + 1;
+                    while (j < end && (lbuf[j] & 0xC0) == 0x80 && lcols[j] == cs && j - i < 4) { j++; }
+                    sz = j - i;
+                }
+                int ce = lcols[i + sz];
+                if (ce <= colLo && !(ce == cs && cs >= colLo)) {
+                    i = i + sz;
+                    continue;
+                }
+                int x = colX(ox, cs, colLo);
+                if (b == 9) {
+                    flushRun(s, y);
+                    if (showWhitespace) {
+                        int mid = y + look->lineH / 2;
+                        int wsc = look->c[atheme.Col.Whitespace];
+                        int x1 = colX(ox, ce, colLo) - 3;
+                        s->hline(x + 2, mid, x1 - x - 1, wsc);
+                        s->line(x1, mid, x1 - 3, mid - 3, wsc);
+                        s->line(x1, mid, x1 - 3, mid + 3, wsc);
+                    }
+                    i++;
+                    continue;
+                }
+                if (b == ' ') {
+                    if (showWhitespace) {
+                        flushRun(s, y);
+                        int cx = x + cw / 2;
+                        int cy = y + look->lineH / 2;
+                        s->fill(cx - 1, cy - 1, 2, 2, look->c[atheme.Col.Whitespace]);
+                    } else if (runN > 0 && runCol == cs && runN < 500) {
+                        runBuf[runN] = ' ';
+                        runN++;
+                        runCol = cs + 1;
+                    }
+                    i++;
+                    continue;
+                }
+                if (b < 32 || b == 127) {
+                    flushRun(s, y);
+                    drawGlyph(s, x, y, "\xc2\xb7", 2, 1, look->c[atheme.Col.Whitespace], 0);
+                    i++;
+                    continue;
+                }
+                int cells = ce - cs;
+                bool plain = look->monoFont && sz <= 2 && cells == 1 && (sz == 1 || b == 0xC2 || b == 0xC3);
+                if (plain) {
+                    if (runN > 0 && (runCol != cs || runColor != color || runStyle != style || runN > 490)) { flushRun(s, y); }
+                    if (runN == 0) {
+                        runX = x;
+                        runColor = color;
+                        runStyle = style;
+                    }
+                    for (int k = 0; k < sz; k++) {
+                        runBuf[runN] = lbuf[i + k];
+                        runN++;
+                    }
+                    runCol = ce;
+                } else if (cells > 0) {
+                    flushRun(s, y);
+                    drawGlyph(s, x, y, &lbuf[i], sz, cells, color, style);
+                }
+                i = i + sz;
+            }
+            flushRun(s, y);
+        }
+    }
+
+    private void drawSquiggle(gfx.Surface* s, int x0, int x1, int y, int color) {
+        if (x1 <= x0) { return; }
+        int yb = y + look->lineH - 3;
+        for (int x = x0; x < x1; x++) {
+            int o = ((x - x0) / 2) % 2;
+            s->put(x, yb + o, color);
+            s->put(x, yb + o + 1, color);
+        }
+    }
+
+    private int sevColor(int sev) {
+        if (sev == SEV_ERROR) { return look->c[atheme.Col.Error]; }
+        if (sev == SEV_WARNING) { return look->c[atheme.Col.Warning]; }
+        return look->c[atheme.Col.Info];
+    }
+
+    // everything of one row: backgrounds, text, squiggles, carets
+    private void paintRow(gfx.Surface* s, int ox, int oy, int line, int sub, int ry, int caretLine, bool multiLineSel) {
+        int lh = look->lineH;
+        int cw = look->cellW;
+        int y = oy + ry;
+        fetchLine(line);
+        fetchTokens(line);
+        int ls = buf->lineStart(line);
+        int le = ls + llen;
+        bool hasNl = le < buf->length();
+        int colLo = wordWrap ? sub * pageCols : leftCol;
+        int colHi = colLo + pageCols + 1;
+        int rowEndCol = wordWrap ? (sub + 1) * pageCols : colHi;
+        if (wordWrap && colHi > rowEndCol) { colHi = rowEndCol; }
+        // the current line
+        if (highlightLine && line == caretLine && !multiLineSel) {
+            s->fill(ox + gutterW, y, textRight - gutterW, lh, look->c[atheme.Col.CurrentLine]);
+        }
+        // find matches and other uses of the word
+        if (nwm > 0) {
+            int cWord = gfx.mix(look->c[atheme.Col.Background], look->c[atheme.Col.Selection], 150);
+            for (int k = 0; k < nwm; k++) {
+                if (wm[k].end <= ls) { continue; }
+                if (wm[k].start > le) { break; }
+                fillBytes(s, ox, y, wm[k].start - ls, wm[k].end - ls, colLo, colHi, cWord);
+            }
+        }
+        if (nfm > 0) {
+            for (int k = 0; k < nfm; k++) {
+                if (fm[k].end <= ls && fm[k].start != fm[k].end) { continue; }
+                if (fm[k].start > le) { break; }
+                if (fm[k].start < ls) { continue; }
+                fillBytes(s, ox, y, fm[k].start - ls, fm[k].end - ls, colLo, colHi, look->c[atheme.Col.FindMatch]);
+            }
+        }
+        if (brA >= ls && brA < le) {
+            fillBytes(s, ox, y, brA - ls, brA - ls + 1, colLo, colHi, look->c[atheme.Col.BracketMatch]);
+        }
+        if (brB >= ls && brB < le) {
+            fillBytes(s, ox, y, brB - ls, brB - ls + 1, colLo, colHi, look->c[atheme.Col.BracketMatch]);
+        }
+        // selections
+        for (int k = 0; k < ed->ncur; k++) {
+            int a = ed->selStart(k);
+            int b = ed->selEnd(k);
+            if (a == b) { continue; }
+            if (b <= ls || a > le) { if (a > le) { break; } continue; }
+            int c0 = (a <= ls) ? 0 : lcols[a - ls];
+            int c1;
+            if (b > le) {
+                c1 = lcols[llen] + (hasNl ? 1 : 0);
+            } else {
+                c1 = lcols[b - ls];
+            }
+            fillCols(s, ox, y, c0, c1, colLo, colHi, look->c[atheme.Col.Selection]);
+        }
+        // indentation guides
+        if (indentGuides && llen > 0 && sub == 0) {
+            int lead = 0;
+            while (lead < llen && (lbuf[lead] == ' ' || lbuf[lead] == 9)) { lead++; }
+            if (lead < llen) {
+                int leadCols = lcols[lead];
+                int iw = imax(1, imin(ed->indentWidth > 0 ? ed->indentWidth : 4, 64));
+                for (int c = iw; c < leadCols; c = c + iw) {
+                    if (c >= colLo && c < colHi) {
+                        s->vline(colX(ox, c, colLo), y, lh, look->c[atheme.Col.Guide]);
+                    }
+                }
+            }
+        }
+        drawText(s, ox, y, colLo, colHi);
+        // diagnostics
+        if (doc->nmarks > 0) {
+            for (int m = doc->firstMark(line); m < doc->nmarks && doc->marks[m].line == line; m++) {
+                int bs = imin(doc->marks[m].col, llen);
+                int be = bs + doc->marks[m].len;
+                if (doc->marks[m].len <= 0) {
+                    be = bs;
+                    while (be < llen && isIdByte(lbuf[be] & 255)) { be++; }
+                    if (be == bs) { be = llen; bs = imin(bs, llen); }
+                }
+                if (be > llen) { be = llen; }
+                int c0 = lcols[bs];
+                int c1 = lcols[be];
+                if (c1 <= c0) { c1 = c0 + 1; }
+                c0 = imax(c0, colLo);
+                c1 = imin(c1, colHi);
+                if (c1 > c0) {
+                    drawSquiggle(s, colX(ox, c0, colLo), colX(ox, c1, colLo), y, sevColor(doc->marks[m].severity));
+                }
+            }
+        }
+        // carets
+        if (focusedView && caretOn) {
+            int cc = look->c[atheme.Col.Cursor];
+            for (int k = 0; k < ed->ncur; k++) {
+                int p = ed->cur[k].pos;
+                if (p < ls) { continue; }
+                if (p > le) { break; }
+                int col = lcols[p - ls];
+                int r = wordWrap ? col / pageCols : 0;
+                if (wordWrap && r != sub) { continue; }
+                if (!wordWrap && (col < colLo || col > colHi)) { continue; }
+                int x = colX(ox, col, colLo);
+                s->fill(x, y + 1, 2, lh - 2, cc);
+            }
+        }
+    }
+
+    private void paintGutterRow(gfx.Surface* s, int ox, int oy, int line, int sub, int ry, int caretLine) {
+        int lh = look->lineH;
+        int y = oy + ry;
+        if (sub > 0) { return; }
+        if (lineNumbers) {
+            char num[16];
+            format(&num[0], 16, "%d", line + 1);
+            int tw = gfx.textWidth(look->font, &num[0]);
+            int color = (line == caretLine) ? look->c[atheme.Col.LineNumberActive] : look->c[atheme.Col.LineNumber];
+            s->text(look->font, ox + gutterW - 8 - tw, y + (lh - look->font->height) / 2, &num[0], color);
+        }
+        int cx = ox + MARKW / 2;
+        int cy = y + lh / 2;
+        if (doc->nbooks > 0 && doc->hasBookmark(line)) {
+            int xs[4];
+            int ys[4];
+            xs[0] = ox + 3; ys[0] = cy - 5;
+            xs[1] = ox + MARKW - 4; ys[1] = cy - 5;
+            xs[2] = ox + MARKW - 4; ys[2] = cy + 5;
+            xs[3] = ox + 3; ys[3] = cy + 5;
+            s->fillPolygon(&xs[0], &ys[0], 4, look->c[atheme.Col.Info]);
+            s->fill(ox + 3, cy + 1, MARKW - 7, 4, look->c[atheme.Col.Background]);
+            int tx[3];
+            int ty[3];
+            tx[0] = ox + 3; ty[0] = cy + 5;
+            tx[1] = ox + MARKW - 4; ty[1] = cy + 5;
+            tx[2] = ox + MARKW / 2 - 0; ty[2] = cy;
+            s->fillPolygon(&tx[0], &ty[0], 3, look->c[atheme.Col.Info]);
+        }
+        if (doc->nmarks > 0) {
+            int sev = doc->worstMark(line);
+            if (sev >= 0) {
+                s->fillCircle(cx + 1, cy, 4, sevColor(sev));
+            }
+        }
+    }
+
+    private void drawScrollbars(gfx.Surface* s, int ox, int oy) {
+        int track = look->c[atheme.Col.Sidebar];
+        int thumbC = gfx.mix(look->c[atheme.Col.Background], look->c[atheme.Col.Foreground], 80);
+        int n = buf->lineCount();
+        // vertical
+        int vx = ox + w - SB;
+        s->fill(vx, oy, SB, textH, track);
+        int tp = 0;
+        int tl = 0;
+        thumbGeom(n, fullRows, topLine, textH, &tp, &tl);
+        if (n > fullRows) {
+            s->fillRoundRect(vx + 3, oy + tp + 1, SB - 6, tl - 2, 4, (dragMode == DRAG_VBAR) ? look->c[atheme.Col.Foreground] : thumbC);
+        }
+        if (!wordWrap) {
+            int hy = oy + h - SB;
+            s->fill(ox + gutterW, hy, w - SB - gutterW, SB, track);
+            s->fill(ox, hy, gutterW, SB, look->c[atheme.Col.Background]);
+            s->fill(vx, hy, SB, SB, track);
+            int total = imax(maxCols, leftCol + pageCols);
+            int hp = 0;
+            int hl = 0;
+            int trackW = w - SB - gutterW;
+            thumbGeom(total, pageCols, leftCol, trackW, &hp, &hl);
+            if (total > pageCols) {
+                s->fillRoundRect(ox + gutterW + hp + 1, hy + 3, hl - 2, SB - 6, 4, (dragMode == DRAG_HBAR) ? look->c[atheme.Col.Foreground] : thumbC);
+            }
+        }
+    }
+
+    private void drawPopup(gfx.Surface* s, int ox, int oy) {
+        if (!popOn || popCount == 0) { return; }
+        gfx.Font* f = gfx.sans();
+        int rows = imin(popCount, POP_ROWS);
+        int wpx = 80;
+        for (int i = 0; i < popCount && i < POP_MAX; i++) {
+            int tw = gfx.textWidth(look->font, cands[i].text) + 56;
+            if (tw > wpx) { wpx = tw; }
+        }
+        if (wpx > w - 20) { wpx = w - 20; }
+        int px = 0;
+        int py = 0;
+        popupRect(&px, &py, wpx, rows * POP_ROWH + 4);
+        int bg = look->c[atheme.Col.Menu];
+        s->fill(ox + px + 2, oy + py + 2, wpx, rows * POP_ROWH + 4, gfx.withAlpha(0xFF000000, 90));
+        s->fill(ox + px, oy + py, wpx, rows * POP_ROWH + 4, bg);
+        s->rect(ox + px, oy + py, wpx, rows * POP_ROWH + 4, look->c[atheme.Col.Border]);
+        for (int r = 0; r < rows; r++) {
+            int idx = popTop + r;
+            if (idx >= popCount) { break; }
+            int ry = oy + py + 2 + r * POP_ROWH;
+            if (idx == popSel) {
+                s->fill(ox + px + 1, ry, wpx - 2, POP_ROWH, look->c[atheme.Col.Selection]);
+            }
+            int kind = cands[idx].kind;
+            int kc = (kind == 0) ? look->tc[asyntax.Tok.Function] : (kind == 1) ? look->tc[asyntax.Tok.Keyword] : look->c[atheme.Col.LineNumber];
+            char* kn = (kind == 0) ? "sym" : (kind == 1) ? "key" : "txt";
+            s->text(look->font, ox + px + 6, ry + (POP_ROWH - look->font->height) / 2, cands[idx].text, look->c[atheme.Col.MenuText]);
+            s->text(f, ox + px + wpx - 30, ry + (POP_ROWH - f->height) / 2, kn, kc);
+        }
+    }
+
+    // where the popup goes: below the line of the word being completed (above it when there is no room)
+    private void popupRect(int* px, int* py, int wpx, int hpx) {
+        int cx = 0;
+        int cy = 0;
+        int line = buf->lineAt(popStart);
+        int col = buf->visualCol(line, popStart, tabw());
+        int sub = wordWrap ? col / pageCols : 0;
+        int row = 0;
+        int l = topLine;
+        int s = topSub;
+        for (int i = 0; i < visRows; i++) {
+            if (l == line && s == sub) { row = i; break; }
+            if (!stepDown(&l, &s)) { break; }
+        }
+        cx = textX + (col - (wordWrap ? sub * pageCols : leftCol)) * look->cellW;
+        cy = (row + 1) * look->lineH;
+        if (cx + wpx > w - SB) { cx = w - SB - wpx; }
+        if (cx < gutterW) { cx = gutterW; }
+        if (cy + hpx > textH && row * look->lineH - hpx >= 0) { cy = row * look->lineH - hpx; }
+        *px = cx;
+        *py = cy;
+    }
+
+    public virtual void paint(gfx.Surface* s, int ox, int oy) {
+        updateGeometry();
+        clampTop();
+        paintCount++;
+        int c0 = s->clipX0;
+        int c1 = s->clipY0;
+        int c2 = s->clipX1;
+        int c3 = s->clipY1;
+        int lh = look->lineH;
+        s->fill(ox, oy, w, h, look->c[atheme.Col.Background]);
+        // the visible range for the highlights
+        int lastL = lastLine();
+        int from = buf->lineStart(topLine);
+        int to = buf->lineEnd(lastL);
+        refreshHighlights(from, to);
+        int caretLine = buf->lineAt(ed->caret());
+        bool multiLineSel = false;
+        if (ed->ncur == 1 && ed->hasSelection(0)) {
+            multiLineSel = buf->lineAt(ed->selStart(0)) != buf->lineAt(ed->selEnd(0));
+        }
+        // the text area: rows are drawn clipped to it
+        int tx0 = ox + gutterW;
+        int ty1 = oy + textH;
+        // gutter background
+        s->fill(ox, oy, gutterW, textH, look->c[atheme.Col.Background]);
+        s->vline(ox + gutterW - 1, oy, textH, look->c[atheme.Col.Guide]);
+        int l = topLine;
+        int sb = topSub;
+        int ry = 0;
+        // clip the text drawing to the text area
+        int sx0 = (tx0 > c0) ? tx0 : c0;
+        int sx1 = (ox + textRight < c2) ? ox + textRight : c2;
+        int sy1 = (ty1 < c3) ? ty1 : c3;
+        for (int i = 0; i < visRows; i++) {
+            s->clipX0 = sx0;
+            s->clipX1 = sx1;
+            s->clipY1 = sy1;
+            paintRow(s, ox, oy, l, sb, ry, caretLine, multiLineSel);
+            s->clipX0 = c0;
+            s->clipX1 = c2;
+            s->clipY1 = sy1;
+            paintGutterRow(s, ox, oy, l, sb, ry, caretLine);
+            ry = ry + lh;
+            if (!stepDown(&l, &sb)) { break; }
+        }
+        s->clipX0 = c0;
+        s->clipX1 = c2;
+        s->clipY1 = c3;
+        drawScrollbars(s, ox, oy);
+        s->clipY0 = c1;
+        drawPopup(s, ox, oy);
+        s->clipX0 = c0;
+        s->clipY0 = c1;
+        s->clipX1 = c2;
+        s->clipY1 = c3;
+    }
+
+    // ---- completion -------------------------------------------------------------------------------------------------------------------------
+    public bool completionOpen() { return popOn; }
+    public int completionCount() { return popOn ? popCount : 0; }
+    public char* completionText(int i) {
+        if (!popOn || i < 0 || i >= popCount) { return null; }
+        return cands[i].text;
+    }
+    public int completionSelected() { return popSel; }
+
+    public void closeCompletion() {
+        if (popOn) {
+            popOn = false;
+            invalidate();
+        }
+    }
+
+    // opens (or updates) the popup for the identifier before the caret; minChars is the least number of characters
+    private void updateCompletion(int minChars) {
+        if (ed->ncur != 1 || ed->anySelection() || buf->readOnly) {
+            closeCompletion();
+            return;
+        }
+        int p = ed->caret();
+        int st = asyntax.prefixStart(buf, p);
+        if (p - st < minChars || p - st > 120) {
+            closeCompletion();
+            return;
+        }
+        char* pre = buf->getText(st, p);
+        int n = completer()->complete(pre, doc->lang, cands, POP_MAX);
+        asys.free(pre);
+        if (n <= 0) {
+            closeCompletion();
+            return;
+        }
+        popOn = true;
+        popCount = n;
+        popStart = st;
+        popSel = 0;
+        popTop = 0;
+        invalidate();
+    }
+
+    // opens the popup now (Ctrl+Space), also for an empty prefix
+    public void cmdComplete() {
+        updateCompletion(0);
+    }
+
+    private void acceptCompletion() {
+        if (!popOn || popSel < 0 || popSel >= popCount) { return; }
+        char* t = asys.strDup(cands[popSel].text);
+        int st = popStart;
+        int p = ed->caret();
+        popOn = false;
+        ed->setSelection(st, p);
+        ed->insertString(t);
+        asys.free(t);
+        afterCommand(true);
+        invalidate();
+    }
+
+    private void popupMove(int d) {
+        popSel = popSel + d;
+        if (popSel < 0) { popSel = popCount - 1; }
+        if (popSel >= popCount) { popSel = 0; }
+        if (popSel < popTop) { popTop = popSel; }
+        if (popSel >= popTop + POP_ROWS) { popTop = popSel - POP_ROWS + 1; }
+        invalidate();
+    }
+
+    // ---- commands ---------------------------------------------------------------------------------------------------------------------------
+    private void publishClip() {
+        if (win != null && ed->clip->count() > 0) {
+            win->display->setClipboard(ed->clip->text(0));
+        }
+    }
+
+    public void cmdCopy() {
+        ed->copy();
+        publishClip();
+        afterCommand(false);
+    }
+
+    public void cmdCut() {
+        if (buf->readOnly) {
+            ed->copy();
+        } else {
+            ed->cut();
+        }
+        publishClip();
+        afterCommand(true);
+    }
+
+    public void cmdPaste() {
+        if (buf->readOnly) { return; }
+        if (win == null) {
+            ed->paste();
+            afterCommand(true);
+            return;
+        }
+        win->display->requestPasteTo(this);
+    }
+
+    // text from the display's clipboard (Display.requestPasteTo)
+    public virtual void onPaste(char* t) {
+        if (buf->readOnly || t[0] == 0) { return; }
+        if (ed->clip->count() > 0 && streq(ed->clip->text(0), t)) {
+            ed->pasteEntry(0);
+        } else {
+            ed->insertString(t);
+        }
+        closeCompletion();
+        afterCommand(true);
+    }
+
+    public void cmdUndo() { ed->undo(); closeCompletion(); afterCommand(true); }
+    public void cmdRedo() { ed->redo(); closeCompletion(); afterCommand(true); }
+    public void cmdSelectAll() { ed->selectAll(); afterCommand(false); }
+    public void cmdSelectLine() { ed->selectLine(); afterCommand(true); }
+    public void cmdToggleComment() { ed->toggleLineComment(); afterCommand(true); }
+    public void cmdToggleBlockComment() { ed->toggleBlockComment(); afterCommand(true); }
+    public void cmdIndent() { ed->indentLines(); afterCommand(true); }
+    public void cmdOutdent() { ed->outdentLines(); afterCommand(true); }
+    public void cmdDuplicateLines() { ed->duplicateLines(); afterCommand(true); }
+    public void cmdDeleteLines() { ed->deleteLines(); afterCommand(true); }
+    public void cmdMoveLinesUp() { ed->moveLinesUp(); afterCommand(true); }
+    public void cmdMoveLinesDown() { ed->moveLinesDown(); afterCommand(true); }
+    public void cmdJoinLines() { ed->joinLines(); afterCommand(true); }
+    public void cmdAddNextOccurrence() { ed->addNextOccurrence(); afterCommand(true); }
+    public void cmdUpperCase() { ed->changeCase(true); afterCommand(true); }
+    public void cmdLowerCase() { ed->changeCase(false); afterCommand(true); }
+    public void cmdTrimWhitespace() { ed->trimTrailingWhitespace(); afterCommand(true); }
+
+    public void cmdToggleBookmark() {
+        doc->toggleBookmark(ed->caretLine());
+        invalidate();
+    }
+
+    public void cmdNextBookmark() {
+        int l = doc->nextBookmark(ed->caretLine());
+        if (l >= 0) { gotoLine(l, 0); }
+    }
+
+    public void cmdPrevBookmark() {
+        int l = doc->prevBookmark(ed->caretLine());
+        if (l >= 0) { gotoLine(l, 0); }
+    }
+
+    // call it after you changed the buffer or the cursors yourself (reveals the caret, repaints, tells the observers)
+    public void touch() {
+        afterCommand(true);
+    }
+
+    // puts the selection on a byte range and shows it
+    public void select(int anchor, int pos) {
+        ed->setSelection(anchor, pos);
+        afterCommand(true);
+    }
+
+    // adds a cursor above (-1) or below (1) the primary one at the same column
+    private void addCursorVertical(int dir) {
+        int p = ed->caret();
+        int line = buf->lineAt(p);
+        int col = buf->visualCol(line, p, tabw());
+        int nl = line + dir;
+        if (nl < 0 || nl >= buf->lineCount()) { return; }
+        int np = buf->offsetAtCol(nl, col, tabw());
+        ed->addCursor(np, np);
+    }
+
+    // Up and Down in wrapped text move by rows
+    private bool moveVisual(int dir, bool extend) {
+        if (!wordWrap || ed->ncur != 1) { return false; }
+        int p = ed->caret();
+        int line = buf->lineAt(p);
+        int col = buf->visualCol(line, p, tabw());
+        int row = col / pageCols;
+        int within = col % pageCols;
+        int nl = line;
+        int ncol = 0;
+        if (dir < 0) {
+            if (row > 0) {
+                ncol = (row - 1) * pageCols + within;
+            } else if (line > 0) {
+                nl = line - 1;
+                ncol = (rowsOf(nl) - 1) * pageCols + within;
+            } else {
+                return false;
+            }
+        } else {
+            if (row + 1 < rowsOf(line)) {
+                ncol = (row + 1) * pageCols + within;
+            } else if (line + 1 < buf->lineCount()) {
+                nl = line + 1;
+                ncol = within;
+            } else {
+                return false;
+            }
+        }
+        int np = buf->offsetAtCol(nl, ncol, tabw());
+        int anchor = extend ? ed->cur[ed->primary].anchor : np;
+        ed->setSelection(anchor, np);
+        return true;
+    }
+
+    // ---- keyboard ---------------------------------------------------------------------------------------------------------------------------
+    public virtual bool onKey(int dn, int key, int uni, int mods) {
+        if (dn == 0 || !enabled) { return false; }
+        if (key >= adp.KEY_SHIFT && key <= adp.KEY_CAPS) { return true; }
+        bool ctrl = (mods & adp.MOD_CTRL) != 0;
+        bool alt = (mods & adp.MOD_ALT) != 0;
+        bool shift = (mods & adp.MOD_SHIFT) != 0;
+        bool meta = (mods & adp.MOD_META) != 0;
+        caretOn = true;
+        restartBlink();
+        // the completion popup takes its own keys
+        if (popOn) {
+            if (key == adp.KEY_UP) { popupMove(-1); return true; }
+            if (key == adp.KEY_DOWN) { popupMove(1); return true; }
+            if (key == adp.KEY_PGUP) { popupMove(-POP_ROWS); return true; }
+            if (key == adp.KEY_PGDN) { popupMove(POP_ROWS); return true; }
+            if (key == adp.KEY_ENTER || key == adp.KEY_TAB) { acceptCompletion(); return true; }
+            if (key == adp.KEY_ESCAPE) { closeCompletion(); return true; }
+        }
+        bool handled = true;
+        bool reveal = true;
+        bool completeAfter = false;
+        bool closePop = true;
+        if (ctrl && !alt && !meta) {
+            handled = ctrlKey(key, shift);
+            if (key == ' ' && handled) { closePop = false; }
+        } else if (key == adp.KEY_LEFT) {
+            if (alt) { handled = false; } else if (ctrl) { ed->moveWordLeft(shift); } else { ed->moveLeft(shift); }
+        } else if (key == adp.KEY_RIGHT) {
+            if (alt) { handled = false; } else if (ctrl) { ed->moveWordRight(shift); } else { ed->moveRight(shift); }
+        } else if (key == adp.KEY_UP) {
+            if (ctrl && alt) { addCursorVertical(-1); }
+            else if (alt && shift) { ed->duplicateLines(); }
+            else if (alt) { ed->moveLinesUp(); }
+            else if (!moveVisual(-1, shift)) { ed->moveUp(shift); }
+        } else if (key == adp.KEY_DOWN) {
+            if (ctrl && alt) { addCursorVertical(1); }
+            else if (alt && shift) { ed->duplicateLines(); }
+            else if (alt) { ed->moveLinesDown(); }
+            else if (!moveVisual(1, shift)) { ed->moveDown(shift); }
+        } else if (key == adp.KEY_HOME) {
+            ed->moveHome(shift);
+        } else if (key == adp.KEY_END) {
+            ed->moveEnd(shift);
+        } else if (key == adp.KEY_PGUP || key == adp.KEY_PGDN) {
+            int n = imax(1, fullRows - 1);
+            if (key == adp.KEY_PGUP) { n = -n; }
+            ed->moveVertical(n, shift);
+            scrollRows(n);
+        } else if (key == adp.KEY_BACKSPACE) {
+            ed->backspace();
+            completeAfter = autoComplete && popOn;
+            closePop = false;
+        } else if (key == adp.KEY_DELETE) {
+            ed->deleteForward();
+        } else if (key == adp.KEY_ENTER) {
+            ed->newline();
+        } else if (key == adp.KEY_TAB) {
+            if (shift) {
+                ed->backtab();
+            } else if (ed->ncur == 1 && ed->hasSelection(0) && buf->lineAt(ed->selStart(0)) != buf->lineAt(ed->selEnd(0))) {
+                ed->indentLines();
+            } else {
+                ed->tab();
+            }
+        } else if (key == adp.KEY_ESCAPE) {
+            if (ed->ncur > 1) { ed->clearExtraCursors(); }
+            else if (ed->anySelection()) { ed->collapse(); }
+            else { handled = false; }
+            reveal = false;
+        } else if (key == adp.KEY_F1 + 1 && !alt) {
+            if (shift) { cmdPrevBookmark(); } else { cmdNextBookmark(); }
+            return true;
+        } else if (uni >= 32 && uni != 127 && ((mods & (adp.MOD_CTRL | adp.MOD_ALT | adp.MOD_META)) == 0 || (mods & (adp.MOD_CTRL | adp.MOD_ALT)) == (adp.MOD_CTRL | adp.MOD_ALT))) {
+            if (buf->readOnly) {
+                handled = false;
+            } else {
+                ed->typeChar(uni);
+                completeAfter = autoComplete && isIdByte(uni);
+                closePop = !completeAfter && !(popOn && isIdByte(uni));
+                if (popOn && isIdByte(uni)) { completeAfter = true; }
+            }
+        } else {
+            handled = false;
+        }
+        if (handled) {
+            if (closePop && popOn && !completeAfter) { popOn = false; invalidate(); }
+            afterCommand(reveal);
+            if (completeAfter) {
+                updateCompletion(popOn ? 1 : minComplete);
+            }
+        }
+        return handled;
+    }
+
+    // Ctrl combinations; false when the key is not ours
+    private bool ctrlKey(int key, bool shift) {
+        if (key == 'a') { ed->selectAll(); }
+        else if (key == 'c') { cmdCopy(); return true; }
+        else if (key == 'x') { cmdCut(); return true; }
+        else if (key == 'v') { cmdPaste(); return true; }
+        else if (key == 'z') { if (shift) { ed->redo(); } else { ed->undo(); } }
+        else if (key == 'y') { ed->redo(); }
+        else if (key == 'd') { if (shift) { ed->duplicateLines(); } else { ed->addNextOccurrence(); } }
+        else if (key == 'l') { ed->selectLine(); }
+        else if (key == 'k' && shift) { ed->deleteLines(); }
+        else if (key == 'j') { ed->joinLines(); }
+        else if (key == '/' || key == '?') { if (shift) { ed->toggleBlockComment(); } else { ed->toggleLineComment(); } }
+        else if (key == ']') { ed->indentLines(); }
+        else if (key == '[') { ed->outdentLines(); }
+        else if (key == ' ') { updateCompletion(0); return true; }
+        else if (key == adp.KEY_LEFT) { ed->moveWordLeft(shift); }
+        else if (key == adp.KEY_RIGHT) { ed->moveWordRight(shift); }
+        else if (key == adp.KEY_UP) { scrollRows(-1); return true; }
+        else if (key == adp.KEY_DOWN) { scrollRows(1); return true; }
+        else if (key == adp.KEY_HOME) { ed->moveDocStart(shift); }
+        else if (key == adp.KEY_END) { ed->moveDocEnd(shift); }
+        else if (key == adp.KEY_BACKSPACE) { ed->deleteWordBack(); }
+        else if (key == adp.KEY_DELETE) { ed->deleteWordForward(); }
+        else if (key == adp.KEY_ENTER) { if (shift) { ed->moveHome(false); ed->newline(); ed->moveUp(false); } else { ed->moveEnd(false); ed->newline(); } }
+        else if (key == adp.KEY_F1 + 1) { cmdToggleBookmark(); return true; }
+        else { return false; }
+        return true;
+    }
+
+    // ---- mouse ------------------------------------------------------------------------------------------------------------------------------
+    private void setShape(int sh) {
+        if (win != null && sh != shape) {
+            shape = sh;
+            win->setCursor(sh);
+        }
+    }
+
+    public virtual void onHover(bool inside) {
+        if (!inside && dragMode == DRAG_NONE) { setShape(adp.CURSOR_ARROW); }
+    }
+
+    // the selection of a rectangle between (line0, col0) and (line1, col1), one cursor with a selection per line
+    private void rectSelect(int line0, int col0, int line1, int col1) {
+        int a = imin(line0, line1);
+        int b = imax(line0, line1);
+        int c0 = imin(col0, col1);
+        int c1 = imax(col0, col1);
+        if (b - a > 20000) { b = a + 20000; }
+        ed->addCursorsInColumn(a, b, c0);
+        int tw = tabw();
+        for (int i = 0; i < ed->ncur; i++) {
+            int l = a + i;
+            if (l > b) { break; }
+            ed->cur[i].anchor = buf->offsetAtCol(l, c0, tw);
+            ed->cur[i].pos = buf->offsetAtCol(l, c1, tw);
+        }
+        ed->normalize();
+    }
+
+    private void wordBounds(int off, int* lo, int* hi) {
+        ed->setCursor(off);
+        ed->selectWord();
+        *lo = ed->selStart(0);
+        *hi = ed->selEnd(0);
+    }
+
+    private void lineBounds(int off, int* lo, int* hi) {
+        int l = buf->lineAt(off);
+        *lo = buf->lineStart(l);
+        *hi = (l + 1 < buf->lineCount()) ? buf->lineStart(l + 1) : buf->length();
+    }
+
+    // the drag: selection from the fixed end to the point under the mouse
+    private void dragTo(int mx, int my) {
+        updateGeometry();
+        if (dragMode == DRAG_TEXT) {
+            int off = offsetAtPoint(mx, my);
+            ed->setSelection(dragA, off);
+        } else if (dragMode == DRAG_WORD) {
+            int off = offsetAtPoint(mx, my);
+            int lo = 0;
+            int hi = 0;
+            wordBounds(off, &lo, &hi);
+            if (off < dragA) { ed->setSelection(dragB, lo); } else { ed->setSelection(dragA, hi); }
+        } else if (dragMode == DRAG_LINE) {
+            int off = offsetAtPoint(mx, my);
+            int lo = 0;
+            int hi = 0;
+            lineBounds(off, &lo, &hi);
+            if (off < dragA) { ed->setSelection(dragB, lo); } else { ed->setSelection(dragA, hi); }
+        } else if (dragMode == DRAG_RECT) {
+            int line = 0;
+            int sub = 0;
+            if (!rowAtY(my, &line, &sub)) { line = buf->lineCount() - 1; }
+            if (my < 0) { line = topLine; }
+            int col = colAtX(mx, sub);
+            rectSelect(dragLine, dragCol, line, col);
+        } else if (dragMode == DRAG_VBAR) {
+            int n = buf->lineCount();
+            int tp = 0;
+            int tl = 0;
+            thumbGeom(n, fullRows, topLine, textH, &tp, &tl);
+            int range = textH - tl;
+            if (range > 0 && n > fullRows) {
+                setFirstLine((my - grab) * (n - fullRows) / range);
+            }
+        } else if (dragMode == DRAG_HBAR) {
+            int total = imax(maxCols, leftCol + pageCols);
+            int hp = 0;
+            int hl = 0;
+            int trackW = w - SB - gutterW;
+            thumbGeom(total, pageCols, leftCol, trackW, &hp, &hl);
+            int range = trackW - hl;
+            if (range > 0 && total > pageCols) {
+                setFirstCol((mx - gutterW - grab) * (total - pageCols) / range);
+            }
+        }
+        if (dragMode >= DRAG_TEXT && dragMode <= DRAG_RECT) {
+            autoScroll(mx, my);
+            afterCommand(true);
+        }
+    }
+
+    // dragging outside the text scrolls
+    private void autoScroll(int mx, int my) {
+        int lh = look->lineH;
+        int dy = 0;
+        int dx = 0;
+        if (my < 0) { dy = -(1 + (-my) / lh); }
+        else if (my >= textH) { dy = 1 + (my - textH) / lh; }
+        if (!wordWrap) {
+            if (mx < gutterW) { dx = -(1 + (gutterW - mx) / look->cellW); }
+            else if (mx >= textRight) { dx = 1 + (mx - textRight) / look->cellW; }
+        }
+        if (dy != 0 || dx != 0) {
+            if (dy != 0) { scrollRows(dy); }
+            if (dx != 0) { setFirstCol(leftCol + dx); }
+            if (autoTimer == 0 && win != null) {
+                autoTimer = win->display->after(60, editorAutoTick, (int) this);
+            }
+        }
+    }
+
+    public void autoStep() {
+        autoTimer = 0;
+        if (dragMode == DRAG_NONE) { return; }
+        dragTo(mouseX, mouseY);
+    }
+
+    private void stopAuto() {
+        if (autoTimer != 0 && win != null) { win->display->cancel(autoTimer); }
+        autoTimer = 0;
+    }
+
+    private int nowMs() {
+        return asys.monoMs();
+    }
+
+    public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (!enabled) { return true; }
+        updateGeometry();
+        bool shift = (mods & adp.MOD_SHIFT) != 0;
+        bool ctrl = (mods & adp.MOD_CTRL) != 0;
+        bool alt = (mods & adp.MOD_ALT) != 0;
+        if (kind == adp.M_SCROLL) {
+            int rows = button * wheelLines;
+            if (shift && !wordWrap) {
+                setFirstCol(leftCol - rows * 2);
+            } else {
+                scrollRows(-rows);
+            }
+            return true;
+        }
+        mouseX = mx;
+        mouseY = my;
+        if (kind == adp.M_MOVE) {
+            if (dragMode != DRAG_NONE) {
+                dragTo(mx, my);
+            } else {
+                bool inText = mx >= gutterW && mx < textRight && my < textH;
+                setShape(inText ? adp.CURSOR_TEXT : adp.CURSOR_ARROW);
+            }
+            return true;
+        }
+        if (kind == adp.M_UP) {
+            if (dragMode != DRAG_NONE) {
+                dragMode = DRAG_NONE;
+                stopAuto();
+                invalidate();
+            }
+            return true;
+        }
+        if (kind != adp.M_DOWN) { return true; }
+        if (button == 3) { return true; }
+        if (button != 1) { return true; }
+        // the completion popup
+        if (popOn) {
+            int rows = imin(popCount, POP_ROWS);
+            int wpx = 80;
+            for (int i = 0; i < popCount && i < POP_MAX; i++) {
+                int tw = gfx.textWidth(look->font, cands[i].text) + 56;
+                if (tw > wpx) { wpx = tw; }
+            }
+            if (wpx > w - 20) { wpx = w - 20; }
+            int px = 0;
+            int py = 0;
+            popupRect(&px, &py, wpx, rows * POP_ROWH + 4);
+            if (mx >= px && mx < px + wpx && my >= py && my < py + rows * POP_ROWH + 4) {
+                int r = (my - py - 2) / POP_ROWH;
+                if (r >= 0 && popTop + r < popCount) {
+                    popSel = popTop + r;
+                    acceptCompletion();
+                }
+                return true;
+            }
+            closeCompletion();
+        }
+        // scroll bars
+        if (mx >= w - SB && my < textH) {
+            int n = buf->lineCount();
+            int tp = 0;
+            int tl = 0;
+            thumbGeom(n, fullRows, topLine, textH, &tp, &tl);
+            if (my >= tp && my < tp + tl) {
+                dragMode = DRAG_VBAR;
+                grab = my - tp;
+                invalidate();
+            } else if (my < tp) {
+                scrollRows(-imax(1, fullRows - 1));
+            } else {
+                scrollRows(imax(1, fullRows - 1));
+            }
+            return true;
+        }
+        if (!wordWrap && my >= textH && mx >= gutterW && mx < w - SB) {
+            int total = imax(maxCols, leftCol + pageCols);
+            int hp = 0;
+            int hl = 0;
+            int trackW = w - SB - gutterW;
+            thumbGeom(total, pageCols, leftCol, trackW, &hp, &hl);
+            int along = mx - gutterW;
+            if (along >= hp && along < hp + hl) {
+                dragMode = DRAG_HBAR;
+                grab = along - hp;
+                invalidate();
+            } else if (along < hp) {
+                setFirstCol(leftCol - pageCols + 2);
+            } else {
+                setFirstCol(leftCol + pageCols - 2);
+            }
+            return true;
+        }
+        if (my >= textH) { return true; }
+        // the gutter
+        if (mx < gutterW) {
+            int line = 0;
+            int sub = 0;
+            if (!rowAtY(my, &line, &sub)) { return true; }
+            gutterLine = line;
+            gutterButton = button;
+            if (mx < MARKW) {
+                doc->toggleBookmark(line);
+                invalidate();
+            } else {
+                int lo = 0;
+                int hi = 0;
+                lineBounds(buf->lineStart(line), &lo, &hi);
+                if (shift) {
+                    int a = ed->cur[ed->primary].anchor;
+                    ed->setSelection(a, (hi > a) ? hi : lo);
+                    dragA = a;
+                } else {
+                    ed->setSelection(lo, hi);
+                    dragA = lo;
+                    dragB = hi;
+                }
+                dragMode = DRAG_LINE;
+                afterCommand(true);
+            }
+            if (onGutter != null) { onGutter(this); }
+            return true;
+        }
+        // the text: count the clicks
+        int now = nowMs();
+        int ddx = mx - lastClickX;
+        int ddy = my - lastClickY;
+        if (ddx < 0) { ddx = -ddx; }
+        if (ddy < 0) { ddy = -ddy; }
+        if (doubleClickMs > 0 && now - lastClickMs <= doubleClickMs && ddx <= 4 && ddy <= 4 && clickCount > 0) {
+            clickCount++;
+            if (clickCount > 3) { clickCount = 1; }
+        } else {
+            clickCount = 1;
+        }
+        lastClickMs = now;
+        lastClickX = mx;
+        lastClickY = my;
+        int off = offsetAtPoint(mx, my);
+        if (alt) {
+            int line = 0;
+            int sub = 0;
+            if (!rowAtY(my, &line, &sub)) { line = buf->lineCount() - 1; }
+            dragLine = line;
+            dragCol = colAtX(mx, sub);
+            dragMode = DRAG_RECT;
+            rectSelect(dragLine, dragCol, dragLine, dragCol);
+        } else if (ctrl && !shift) {
+            ed->addCursor(off, off);
+            dragMode = DRAG_NONE;
+        } else if (clickCount == 2) {
+            int lo = 0;
+            int hi = 0;
+            wordBounds(off, &lo, &hi);
+            dragA = lo;
+            dragB = hi;
+            dragMode = DRAG_WORD;
+        } else if (clickCount == 3) {
+            int lo = 0;
+            int hi = 0;
+            lineBounds(off, &lo, &hi);
+            ed->setSelection(lo, hi);
+            dragA = lo;
+            dragB = hi;
+            dragMode = DRAG_LINE;
+        } else if (shift) {
+            int a = ed->cur[ed->primary].anchor;
+            ed->setSelection(a, off);
+            dragA = a;
+            dragMode = DRAG_TEXT;
+        } else {
+            ed->setSelection(off, off);
+            dragA = off;
+            dragMode = DRAG_TEXT;
+        }
+        afterCommand(true);
+        return true;
+    }
+
+    // ---- the context menu ------------------------------------------------------------------------------------------------------------------------
+    private void buildMenu() {
+        menu = new guix.Menu();
+        miUndo = menu->add("Undo", cmUndo)->accel("Ctrl+Z");
+        miRedo = menu->add("Redo", cmRedo)->accel("Ctrl+Y");
+        menu->addSeparator();
+        miCut = menu->add("Cut", cmCut)->accel("Ctrl+X");
+        miCopy = menu->add("Copy", cmCopy)->accel("Ctrl+C");
+        miPaste = menu->add("Paste", cmPaste)->accel("Ctrl+V");
+        menu->addSeparator();
+        menu->add("Select All", cmSelectAll)->accel("Ctrl+A");
+        miComment = menu->add("Toggle Comment", cmComment)->accel("Ctrl+/");
+        for (int i = 0; i < menu->count; i++) {
+            menu->items[i]->userData = (int) this;
+        }
+    }
+
+    // shows the context menu at the position of the last click (the caret moves there when it is outside the selection)
+    public void showContextMenu() {
+        if (win == null) { return; }
+        updateGeometry();
+        int mx = win->lastMouseX - absX();
+        int my = win->lastMouseY - absY();
+        if (mx >= gutterW && mx < textRight && my >= 0 && my < textH) {
+            int off = offsetAtPoint(mx, my);
+            bool inside = false;
+            for (int k = 0; k < ed->ncur; k++) {
+                if (ed->hasSelection(k) && off >= ed->selStart(k) && off <= ed->selEnd(k)) { inside = true; }
+            }
+            if (!inside) {
+                ed->setCursor(off);
+                afterCommand(false);
+            }
+        }
+        bool sel = ed->anySelection();
+        miCut->enabled = sel && !buf->readOnly;
+        miCopy->enabled = true;
+        miPaste->enabled = !buf->readOnly;
+        miUndo->enabled = buf->canUndo() && !buf->readOnly;
+        miRedo->enabled = buf->canRedo() && !buf->readOnly;
+        miComment->enabled = !buf->readOnly;
+        if (onContextMenu != null) { onContextMenu(this); }
+        menu->popup(win, win->lastMouseX, win->lastMouseY);
+    }
+}
+
+// ---- callbacks (plain functions: the toolkit calls  int f(int arg)) ------------------------------------------------------------------------------------
+int editorLookChanged(int self) {
+    CodeEditor* e = (CodeEditor*) self;
+    e->lookChanged();
+    return 0;
+}
+
+int editorContext(int self) {
+    CodeEditor* e = (CodeEditor*) self;
+    e->showContextMenu();
+    return 0;
+}
+
+int editorBlinkTick(int self) {
+    CodeEditor* e = (CodeEditor*) self;
+    e->blinkStep();
+    return 0;
+}
+
+int editorAutoTick(int self) {
+    CodeEditor* e = (CodeEditor*) self;
+    e->autoStep();
+    return 0;
+}
+
+int viewBufferChanged(int user, acode.Change* c) {
+    CodeEditor* e = (CodeEditor*) user;
+    e->bufferChanged(c);
+    return 0;
+}
+
+CodeEditor* menuEditor(int item) {
+    guix.MenuItem* it = (guix.MenuItem*) item;
+    return (CodeEditor*) it->userData;
+}
+
+int cmUndo(int item) { menuEditor(item)->cmdUndo(); return 0; }
+int cmRedo(int item) { menuEditor(item)->cmdRedo(); return 0; }
+int cmCut(int item) { menuEditor(item)->cmdCut(); return 0; }
+int cmCopy(int item) { menuEditor(item)->cmdCopy(); return 0; }
+int cmPaste(int item) { menuEditor(item)->cmdPaste(); return 0; }
+int cmSelectAll(int item) { menuEditor(item)->cmdSelectAll(); return 0; }
+int cmComment(int item) { menuEditor(item)->cmdToggleComment(); return 0; }
