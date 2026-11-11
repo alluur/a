@@ -88,6 +88,7 @@ public class CodeEditor : gui.Widget {
     public bool blink;                      // the caret blinks (false: always visible; tests use this)
     public bool autoComplete;               // the completion popup opens while typing identifiers
     public int minComplete;                 // characters before it opens by itself (2)
+    public int completeDelayMs;             // the popup opens this long after the last key (100; 0: at once, tests use this)
     public int doubleClickMs;               // clicks closer in time than this count as double / triple clicks
     public int wheelLines;                  // rows per notch of the wheel
     public int wantW;                       // preferred size inside boxes (0: 480 x 320)
@@ -198,7 +199,12 @@ public class CodeEditor : gui.Widget {
     private int popTop;
     private int popCount;
     private int popStart;
+    private int completeTimer;
     private asyntax.Candidate* cands;
+    private int lcLine;                     // the width of the last line asked for (lineCols cache)
+    private int lcVersion;
+    private int lcTab;
+    private int lcValue;
     // context menu items
     private guix.MenuItem* miCut;
     private guix.MenuItem* miCopy;
@@ -217,8 +223,10 @@ public class CodeEditor : gui.Widget {
         doubleClickMs = 400;
         wheelLines = 3;
         minComplete = 2;
+        completeDelayMs = 100;
         cacheLine = -1;
         tokLine = -1;
+        lcLine = -1;
         lbuf = (char*) malloc(1024);
         lcap = 1024;
         lcols = (int*) malloc(1024 * 8);
@@ -441,11 +449,13 @@ public class CodeEditor : gui.Widget {
         pageCols = imax(1, (textRight - textX) / cw);
     }
 
+    public int paints() { return paintCount; }
     public int lineHeight() { return look->lineH; }
     public int cellWidth() { return look->cellW; }
     public int gutterWidth() { updateGeometry(); return gutterW; }
     public int firstLine() { return topLine; }
     public int firstCol() { return leftCol; }
+    public int firstSubRow() { return topSub; }
     public int visibleRows() { updateGeometry(); return fullRows; }
     public int columns() { updateGeometry(); return pageCols; }
 
@@ -462,7 +472,14 @@ public class CodeEditor : gui.Widget {
 
     // ---- rows (a line is one row, or several when words wrap) -----------------------------------------------------------------------------
     private int lineCols(int line) {
-        return buf->visualCol(line, buf->lineEnd(line), tabw());
+        int tw = tabw();
+        if (lcLine == line && lcVersion == buf->version && lcTab == tw && lcValue >= 0) { return lcValue; }
+        int v = buf->visualCol(line, buf->lineEnd(line), tw);
+        lcLine = line;
+        lcVersion = buf->version;
+        lcTab = tw;
+        lcValue = v;
+        return v;
     }
 
     private int rowsOf(int line) {
@@ -1584,10 +1601,68 @@ public class CodeEditor : gui.Widget {
     public int completionSelected() { return popSel; }
 
     public void closeCompletion() {
+        if (completeTimer != 0 && win != null) {
+            win->display->cancel(completeTimer);
+            completeTimer = 0;
+        }
         if (popOn) {
             popOn = false;
             invalidate();
         }
+    }
+
+    // The popup follows the typing: at once while it is open (the candidates are filtered by the longer prefix), after a pause when
+    // it is closed (finding the candidates reads the whole document).
+    private void scheduleCompletion() {
+        if (completeDelayMs <= 0 || win == null) {
+            updateCompletion(popOn ? 1 : minComplete);
+            return;
+        }
+        if (popOn && refineCompletion()) { return; }
+        if (completeTimer != 0) { win->display->cancel(completeTimer); }
+        completeTimer = win->display->after(completeDelayMs, editorCompleteTick, (int) this);
+    }
+
+    public void completeStep() {
+        completeTimer = 0;
+        if (!focusedView) { return; }
+        updateCompletion(minComplete);
+    }
+
+    // keeps the candidates that start with the (longer) prefix; false when that cannot be done (the prefix is shorter or the same)
+    private bool refineCompletion() {
+        int p = ed->caret();
+        int st = asyntax.prefixStart(buf, p);
+        if (st != popStart || p - st < 1 || ed->ncur != 1) { return false; }
+        char* pre = buf->getText(st, p);
+        int pl = strlen(pre);
+        int w2 = 0;
+        for (int i = 0; i < popCount; i++) {
+            char* t = cands[i].text;
+            bool ok = true;
+            for (int k = 0; k < pl; k++) {
+                int a = t[k];
+                int b = pre[k];
+                if (a == 0) { ok = false; break; }
+                if (a >= 'A' && a <= 'Z') { a = a + 32; }
+                if (b >= 'A' && b <= 'Z') { b = b + 32; }
+                if (a != b) { ok = false; break; }
+            }
+            if (ok && !streq(t, pre)) {
+                cands[w2] = cands[i];
+                w2++;
+            }
+        }
+        asys.free(pre);
+        if (w2 == 0) {
+            closeCompletion();
+            return true;
+        }
+        popCount = w2;
+        popSel = 0;
+        popTop = 0;
+        invalidate();
+        return true;
     }
 
     // opens (or updates) the popup for the identifier before the caret; minChars is the least number of characters
@@ -1868,7 +1943,7 @@ public class CodeEditor : gui.Widget {
             if (closePop && popOn && !completeAfter) { popOn = false; invalidate(); }
             afterCommand(reveal);
             if (completeAfter) {
-                updateCompletion(popOn ? 1 : minComplete);
+                scheduleCompletion();
             }
         }
         return handled;
@@ -2275,6 +2350,12 @@ int editorContext(int self) {
 int editorBlinkTick(int self) {
     CodeEditor* e = (CodeEditor*) self;
     e->blinkStep();
+    return 0;
+}
+
+int editorCompleteTick(int self) {
+    CodeEditor* e = (CodeEditor*) self;
+    e->completeStep();
     return 0;
 }
 
