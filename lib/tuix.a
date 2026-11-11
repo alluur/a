@@ -1088,31 +1088,8 @@ public char* prompt(tui.App* app, char* title, char* label, char* initial = "") 
 }
 
 // =============================================================================
-//  the file picker
+//  DirList: the entries of a directory
 // =============================================================================
-class FilePicker {
-public:
-    tui.App* app;
-    tui.Dialog* dlg;
-    tui.TextInput* pathIn;
-    tui.ListView* list;
-    tui.TextInput* nameIn;
-    tui.Label* info;
-    bool saveMode;
-    bool dirMode;
-    bool showHidden;
-    tui.Text cwd;
-    tui.Text result;
-    tui.Text pattern;               // "*.a", "*.txt" ...: only files that match are shown ("" = all)
-    tui.Pool names;
-    int* noff;
-    int* nkind;                     // 1 directory, 0 file
-    int* nsort;
-    int* ntmp;
-    int ncount;
-    int ncap;
-}
-
 private int sysGetdents() { if (__ARCH == 0) { return 217; } return 61; }
 
 // is path a directory that can be read?
@@ -1126,57 +1103,136 @@ private bool isDirPath(char* path) {
     return r >= 0;
 }
 
-private int cmpEntry(FilePicker* p, int a, int b) {
-    if (p->nkind[a] != p->nkind[b]) { return p->nkind[a] > p->nkind[b] ? -1 : 1; }
-    char* x = p->names.at(p->noff[a]);
-    char* y = p->names.at(p->noff[b]);
-    int i = 0;
-    while (x[i] != 0 && y[i] != 0) {
-        int cx = lowerOf(x[i] & 255);
-        int cy = lowerOf(y[i] & 255);
-        if (cx != cy) { return cx < cy ? -1 : 1; }
-        i++;
-    }
-    if (x[i] == 0 && y[i] == 0) { return 0; }
-    return x[i] == 0 ? -1 : 1;
+// the size in bytes of a file (stat), -1 if it cannot be examined
+public int fileSizeOf(char* path) {
+    if (__OS == 1) { return -1; }
+    char st[256];
+    int r;
+    if (__ARCH == 0) { r = __syscall(4, (int) path, (int) &st[0], 0, 0, 0, 0); }
+    else { r = __syscall(79, -100, (int) path, (int) &st[0], 0, 0, 0); }
+    if (r != 0) { return -1; }
+    int v = 0;
+    for (int i = 7; i >= 0; i--) { v = (v << 8) | (st[48 + i] & 255); }
+    return v;
 }
 
-// a merge sort of the index array nsort[0 .. n)
-private void sortEntries(FilePicker* p, int n) {
-    for (int w = 1; w < n; w = w * 2) {
-        for (int lo = 0; lo < n; lo = lo + 2 * w) {
-            int mid = imin(lo + w, n);
-            int hi = imin(lo + 2 * w, n);
-            int i = lo;
-            int j = mid;
-            int k = lo;
-            while (i < mid && j < hi) {
-                if (cmpEntry(p, p->nsort[j], p->nsort[i]) < 0) { p->ntmp[k] = p->nsort[j]; j++; }
-                else { p->ntmp[k] = p->nsort[i]; i++; }
-                k++;
+// A directory read with getdents: names, kinds (directory or not) and sizes. load() reads, sort() puts directories first and sorts by name
+// (case insensitive); the entries are then order[0 .. count). Works on Linux, Android and AOS.
+public class DirList {
+public:
+    tui.Pool names;
+    int* off;
+    int* kind;                      // 1 directory, 0 file
+    int* size;                      // bytes (files; -1 unknown)
+    int* order;
+    int* tmp;
+    int count;
+    int cap;
+    bool ok;                        // the directory could be read
+    bool truncated;                 // more than 8192 entries: the rest is not listed
+
+    private void room() {
+        if (cap > 0) { return; }
+        cap = 8192;
+        off = (int*) alloc(cap * 8);
+        kind = (int*) alloc(cap * 8);
+        size = (int*) alloc(cap * 8);
+        order = (int*) alloc(cap * 8);
+        tmp = (int*) alloc(cap * 8);
+    }
+
+    // reads dir; hidden: also names that start with a dot. withSizes: ask for the size of every file. Returns false if it cannot be read.
+    bool load(char* dir, bool hidden, bool withSizes = false) {
+        room();
+        names.reset();
+        count = 0;
+        truncated = false;
+        ok = false;
+        if (__OS == 1) { return false; }
+        int fd = __open(dir, 0);
+        if (fd < 0) { return false; }
+        ok = true;
+        char buf[4096];
+        for (;;) {
+            int got = __syscall(sysGetdents(), fd, (int) &buf[0], 4096, 0, 0, 0);
+            if (got < 0) { ok = false; }                      // not a directory (ENOTDIR)
+            if (got <= 0) { break; }
+            int pos = 0;
+            while (pos < got) {
+                int reclen = (buf[pos + 16] & 255) | ((buf[pos + 17] & 255) << 8);
+                int dtype = buf[pos + 18] & 255;
+                char* name = &buf[pos + 19];
+                if (reclen <= 0) { break; }
+                if (!(streq(name, ".") || streq(name, "..") || (!hidden && name[0] == '.'))) {
+                    if (count >= cap) { truncated = true; }
+                    else {
+                        bool isDir = dtype == 4;
+                        char* full = null;
+                        if (dtype == 10 || dtype == 0) { full = joinPath(dir, name); isDir = isDirPath(full); }
+                        off[count] = names.add(name);
+                        kind[count] = isDir ? 1 : 0;
+                        size[count] = -1;
+                        if (withSizes && !isDir) {
+                            if (full == null) { full = joinPath(dir, name); }
+                            size[count] = fileSizeOf(full);
+                        }
+                        order[count] = count;
+                        count++;
+                    }
+                }
+                pos = pos + reclen;
             }
-            while (i < mid) { p->ntmp[k] = p->nsort[i]; i++; k++; }
-            while (j < hi) { p->ntmp[k] = p->nsort[j]; j++; k++; }
         }
-        for (int i = 0; i < n; i++) { p->nsort[i] = p->ntmp[i]; }
-    }
-}
-
-// shell style pattern with a leading * only: "*.a" matches names that end in ".a"; "" matches everything
-private bool matchesPattern(char* name, char* pat) {
-    if (pat[0] == 0) { return true; }
-    if (pat[0] == '*') {
-        char* suf = &pat[1];
-        int nl = strlen(name);
-        int sl = strlen(suf);
-        if (sl > nl) { return false; }
-        for (int i = 0; i < sl; i++) { if (lowerOf(name[nl - sl + i] & 255) != lowerOf(suf[i] & 255)) { return false; } }
+        __close(fd);
         return true;
     }
-    return tui.containsFold(name, pat);
+
+    char* name(int i) { return names.at(off[order[i]]); }
+    bool isDir(int i) { return kind[order[i]] == 1; }
+    int sizeOf(int i) { return size[order[i]]; }
+
+    private int compare(int a, int b) {
+        if (kind[a] != kind[b]) { return kind[a] > kind[b] ? -1 : 1; }
+        char* x = names.at(off[a]);
+        char* y = names.at(off[b]);
+        int i = 0;
+        while (x[i] != 0 && y[i] != 0) {
+            int cx = lowerOf(x[i] & 255);
+            int cy = lowerOf(y[i] & 255);
+            if (cx != cy) { return cx < cy ? -1 : 1; }
+            i++;
+        }
+        if (x[i] == 0 && y[i] == 0) { return 0; }
+        return x[i] == 0 ? -1 : 1;
+    }
+
+    // directories first, then by name (a merge sort)
+    void sort() {
+        int n = count;
+        for (int i = 0; i < n; i++) { order[i] = i; }
+        for (int w = 1; w < n; w = w * 2) {
+            for (int lo = 0; lo < n; lo = lo + 2 * w) {
+                int mid = imin(lo + w, n);
+                int hi = imin(lo + 2 * w, n);
+                int i = lo;
+                int j = mid;
+                int k = lo;
+                while (i < mid && j < hi) {
+                    if (compare(order[j], order[i]) < 0) { tmp[k] = order[j]; j++; }
+                    else { tmp[k] = order[i]; i++; }
+                    k++;
+                }
+                while (i < mid) { tmp[k] = order[i]; i++; k++; }
+                while (j < hi) { tmp[k] = order[j]; j++; k++; }
+            }
+            for (int i = 0; i < n; i++) { order[i] = tmp[i]; }
+        }
+    }
 }
 
-private char* joinPath(char* dir, char* name) {
+// path helpers (the same ones the file dialogs use)
+// base/name with one slash between
+public char* joinPath(char* dir, char* name) {
     int dl = strlen(dir);
     int nl = strlen(name);
     char* r = alloc(dl + nl + 2);
@@ -1188,7 +1244,7 @@ private char* joinPath(char* dir, char* name) {
 }
 
 // the directory above a path ("/a/b" -> "/a", "/a" -> "/")
-private char* parentPath(char* p) {
+public char* parentPath(char* p) {
     int n = strlen(p);
     while (n > 1 && p[n - 1] == '/') { n--; }
     while (n > 1 && p[n - 1] != '/') { n--; }
@@ -1200,8 +1256,8 @@ private char* parentPath(char* p) {
     return r;
 }
 
-// makes a path absolute and removes . and .. and double slashes
-private char* cleanPath(char* base, char* p) {
+// makes a path absolute (relative to base) and removes . and .. and double slashes
+public char* cleanPath(char* base, char* p) {
     char* full = p;
     if (p[0] != '/') { full = joinPath(base, p); }
     int n = strlen(full);
@@ -1231,7 +1287,8 @@ private char* cleanPath(char* base, char* p) {
     return out;
 }
 
-private char* currentDir() {
+// the current directory of the program (a heap string)
+public char* currentDir() {
     char buf[4096];
     int r = __syscall(__ARCH == 0 ? 79 : 17, (int) &buf[0], 4096, 0, 0, 0, 0);
     if (r <= 0) { return "/"; }
@@ -1240,65 +1297,64 @@ private char* currentDir() {
     return c;
 }
 
+// =============================================================================
+//  the file picker
+// =============================================================================
+class FilePicker {
+public:
+    tui.App* app;
+    tui.Dialog* dlg;
+    tui.TextInput* pathIn;
+    tui.ListView* list;
+    tui.TextInput* nameIn;
+    tui.Label* info;
+    bool saveMode;
+    bool dirMode;
+    bool showHidden;
+    tui.Text cwd;
+    tui.Text result;
+    tui.Text pattern;               // "*.a", "*.txt" ...: only files that match are shown ("" = all)
+    DirList dl;
+}
+
+// shell style pattern with a leading * only: "*.a" matches names that end in ".a"; "" matches everything
+private bool matchesPattern(char* name, char* pat) {
+    if (pat[0] == 0) { return true; }
+    if (pat[0] == '*') {
+        char* suf = &pat[1];
+        int nl = strlen(name);
+        int sl = strlen(suf);
+        if (sl > nl) { return false; }
+        for (int i = 0; i < sl; i++) { if (lowerOf(name[nl - sl + i] & 255) != lowerOf(suf[i] & 255)) { return false; } }
+        return true;
+    }
+    return tui.containsFold(name, pat);
+}
+
 // fills the list with the entries of dir
 private void fpLoad(FilePicker* p, char* dir) {
     p->cwd.set(dir);
     p->pathIn->setText(dir);
     p->list->clear();
-    p->names.reset();
-    p->ncount = 0;
-    if (p->ncap == 0) {
-        p->ncap = 4096;
-        p->noff = (int*) alloc(p->ncap * 8);
-        p->nkind = (int*) alloc(p->ncap * 8);
-        p->nsort = (int*) alloc(p->ncap * 8);
-        p->ntmp = (int*) alloc(p->ncap * 8);
-    }
-    int fd = __open(dir, 0);
-    bool ok = fd >= 0;
-    if (ok) {
-        char buf[4096];
-        for (;;) {
-            int got = __syscall(sysGetdents(), fd, (int) &buf[0], 4096, 0, 0, 0);
-            if (got <= 0) { break; }
-            int pos = 0;
-            while (pos < got) {
-                int reclen = (buf[pos + 16] & 255) | ((buf[pos + 17] & 255) << 8);
-                int dtype = buf[pos + 18] & 255;
-                char* name = &buf[pos + 19];
-                if (reclen <= 0) { break; }
-                bool skip = streq(name, ".") || streq(name, "..") || (!p->showHidden && name[0] == '.') || p->ncount >= p->ncap;
-                if (!skip) {
-                    bool isDir = dtype == 4;
-                    if (dtype == 10 || dtype == 0) { isDir = isDirPath(joinPath(dir, name)); }
-                    if (isDir || (!p->dirMode && matchesPattern(name, p->pattern.str()))) {
-                        p->noff[p->ncount] = p->names.add(name);
-                        p->nkind[p->ncount] = isDir ? 1 : 0;
-                        p->nsort[p->ncount] = p->ncount;
-                        p->ncount++;
-                    }
-                }
-                pos = pos + reclen;
-            }
-        }
-        __close(fd);
-    }
-    sortEntries(p, p->ncount);
+    bool ok = p->dl.load(dir, p->showHidden);
+    p->dl.sort();
     if (!streq(dir, "/")) { p->list->add("../", 2); }
-    for (int i = 0; i < p->ncount; i++) {
-        int k = p->nsort[i];
-        char* nm = p->names.at(p->noff[k]);
-        if (p->nkind[k] == 1) {
+    int shown = 0;
+    for (int i = 0; i < p->dl.count; i++) {
+        char* nm = p->dl.name(i);
+        if (p->dl.isDir(i)) {
             char tmp[1024];
             format(&tmp[0], 1024, "%s/", nm, 0, 0, 0);
             p->list->add(&tmp[0], 1);
-        } else {
+            shown++;
+        } else if (!p->dirMode && matchesPattern(nm, p->pattern.str())) {
             p->list->add(nm, 0);
+            shown++;
         }
     }
     char msg[1100];
     if (!ok) { format(&msg[0], 1100, "cannot read %s", dir, 0, 0, 0); }
-    else { format(&msg[0], 1100, "%d entries%s", p->ncount, p->showHidden ? " (hidden files shown)" : "", 0, 0); }
+    else { format(&msg[0], 1100, "%d entries%s", shown, p->showHidden ? " (hidden files shown)" : "", 0, 0); }
     p->info->setText(&msg[0]);
 }
 
