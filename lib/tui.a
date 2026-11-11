@@ -1,0 +1,3793 @@
+// =============================================================================
+//  tui - a terminal user interface toolkit: widgets, menus, dialogs-in-tuix, the application loop         import tui;
+//
+//    import tui;
+//
+//    int onQuit(int button) { tui.app->quit(0); return 0; }
+//
+//    int main() {
+//        tui.App* app = new tui.App();
+//        if (!app->start()) { println("this program needs a terminal"); return 1; }      // raw mode, alternate screen, mouse ...
+//        tui.Box* col = tui.vbox(1, 1);
+//        col->add(new tui.Label("Hello from A"));
+//        tui.Button* b = new tui.Button("&Quit");
+//        b->onClick = onQuit;
+//        col->add(b);
+//        app->setRoot(col);
+//        return app->run();                                                             // until quit(); the terminal is restored
+//    }
+//
+//  Parts
+//    term        keys, mouse, capabilities, the terminal itself          (import term;)
+//    tscreen     cells, colours, drawing, the diff renderer              (import tscreen;)
+//    tui         Widget, Box, Frame, Label, Button, CheckBox, TextInput, ListView, TabView, Splitter, ProgressBar, Slider, StatusBar,
+//                ScrollBar, MenuBar, PopupMenu, Theme, App (event loop, focus, timers, shortcuts, overlays, suspend to shell)
+//    tuix        TreeView, Table, TextPane, dialogs (message box, confirm, prompt, file picker, colour picker), command palette
+//
+//  Widgets form a tree; positions are cells relative to the parent. Painting happens into a tscreen.Screen and only the difference
+//  is written to the terminal. A widget is a class with virtual methods (prefW prefH layout paint onKey onMouse onFocus onPaste); apps
+//  react through callback fields such as  button->onClick = f;  where  int f(int widget)  gets the widget (as an int) back.
+//  The App can also run without a terminal (initHeadless) with bytes fed by feed(): that is how the tests drive it.
+//
+//  Remember: objects with a constructor must be declared  tui.Label l("x");  or created with  new  - a plain  tui.Label l;  does not run it.
+// =============================================================================
+import term;
+import tscreen;
+import utf8;
+module tui;
+
+class App;
+class Widget;
+class MenuBar;
+class PopupMenu;
+
+// =============================================================================
+//  helpers
+// =============================================================================
+private int imin(int a, int b) { if (a < b) { return a; } return b; }
+private int imax(int a, int b) { if (a > b) { return a; } return b; }
+
+private int lowerOf(int c) {
+    if (c >= 'A' && c <= 'Z') { return c + 32; }
+    return c;
+}
+
+// copies text into a heap buffer that stays valid
+private char* copyStr(char* s) {
+    if (s == null) { s = ""; }
+    int n = strlen(s);
+    char* r = alloc(n + 1);
+    memcpy(r, s, n + 1);
+    return r;
+}
+
+// ---- a growable UTF-8 text buffer (the memory is reused, not leaked, as long as the text does not grow beyond its capacity) ---------------------
+public class Text {
+public:
+    char* b;
+    int len;
+    int cap;
+
+    void reserve(int n) {
+        if (cap >= n + 1) { return; }
+        int nc = imax(32, cap * 2);
+        while (nc < n + 1) { nc = nc * 2; }
+        char* nb = alloc(nc);
+        if (b != null) { memcpy(nb, b, len + 1); }
+        b = nb;
+        cap = nc;
+    }
+
+    void set(char* s) {
+        if (s == null) { s = ""; }
+        int n = strlen(s);
+        reserve(n);
+        memcpy(b, s, n + 1);
+        len = n;
+    }
+
+    void clear() { len = 0; if (b != null) { b[0] = 0; } }
+
+    char* str() { if (b == null) { return ""; } return b; }
+
+    void insert(int pos, char* s, int n) {
+        if (pos < 0) { pos = 0; }
+        if (pos > len) { pos = len; }
+        reserve(len + n);
+        for (int i = len; i >= pos; i--) { b[i + n] = b[i]; }
+        memcpy(&b[pos], s, n);
+        len = len + n;
+    }
+
+    void append(char* s) { insert(len, s, strlen(s)); }
+
+    void erase(int pos, int n) {
+        if (pos < 0 || pos >= len || n <= 0) { return; }
+        if (pos + n > len) { n = len - pos; }
+        for (int i = pos; i + n <= len; i++) { b[i] = b[i + n]; }
+        len = len - n;
+    }
+}
+
+// ---- an arena for strings: add() returns an offset, at(offset) the text; reset() forgets all of it and reuses the memory -------------------------------
+public class Pool {
+public:
+    char* mem;
+    int used;
+    int cap;
+
+    int add(char* s) {
+        if (s == null) { s = ""; }
+        int n = strlen(s) + 1;
+        if (used + n > cap) {
+            int nc = imax(4096, cap * 2);
+            while (nc < used + n) { nc = nc * 2; }
+            char* nm = alloc(nc);
+            if (mem != null) { memcpy(nm, mem, used); }
+            mem = nm;
+            cap = nc;
+        }
+        memcpy(&mem[used], s, n);
+        int off = used;
+        used = used + n;
+        return off;
+    }
+
+    char* at(int off) { if (mem == null || off < 0) { return ""; } return &mem[off]; }
+    void reset() { used = 0; }
+}
+
+// the position of the first byte of the character that ends at byte pos (pos > 0)
+private int prevChar(char* s, int pos) {
+    if (pos <= 0) { return 0; }
+    pos--;
+    while (pos > 0 && (s[pos] & 0xC0) == 0x80) { pos--; }
+    return pos;
+}
+
+// the position after the character that starts at pos
+private int nextChar(char* s, int pos) {
+    if (s[pos] == 0) { return pos; }
+    pos++;
+    while (s[pos] != 0 && (s[pos] & 0xC0) == 0x80) { pos++; }
+    return pos;
+}
+
+// the mnemonic of a label: the lower case character after the first single '&' (0 if there is none)
+public int mnemonicOf(char* text) {
+    for (int i = 0; text[i] != 0; i++) {
+        if (text[i] == '&') {
+            if (text[i + 1] == '&') { i++; continue; }
+            if (text[i + 1] == 0) { return 0; }
+            int cp;
+            utf8.decode(text, i + 1, &cp);
+            return lowerOf(cp);
+        }
+    }
+    return 0;
+}
+
+// the cells a label takes without its & marks
+public int labelWidth(char* text) {
+    int w = 0;
+    int pos = 0;
+    while (text[pos] != 0) {
+        if (text[pos] == '&') {
+            if (text[pos + 1] == '&') { w++; pos = pos + 2; continue; }
+            pos++;
+            continue;
+        }
+        int cp;
+        pos = pos + utf8.decode(text, pos, &cp);
+        w = w + tscreen.runeWidth(cp);
+    }
+    return w;
+}
+
+// draws a label with its & mnemonic in the hot style; returns the cells used. maxW cuts it. "&&" is a literal &.
+public int drawLabel(tscreen.Screen* s, int x, int y, char* text, int maxW, int normal, int hot) {
+    int used = 0;
+    int pos = 0;
+    bool marked = false;
+    while (text[pos] != 0) {
+        int st = normal;
+        if (text[pos] == '&') {
+            if (text[pos + 1] == '&') { pos++; }
+            else if (!marked) { marked = true; pos++; st = hot; }
+            else { pos++; }
+            if (text[pos] == 0) { break; }
+        }
+        int cp;
+        int l = utf8.decode(text, pos, &cp);
+        int wd = tscreen.runeWidth(cp);
+        if (used + wd > maxW) { break; }
+        s->put(x + used, y, cp, st);
+        used = used + wd;
+        pos = pos + l;
+    }
+    return used;
+}
+
+// =============================================================================
+//  the theme
+// =============================================================================
+public class Theme {
+public:
+    int desktopRune;                // the character that fills the background
+    int desktop;                    // the background of the program
+    int window;                     // panels, dialogs and labels
+    int hint;                       // secondary text
+    int title;                      // frame and dialog titles
+    int border;                     // frames
+    int borderFocus;                // a frame that holds the focus
+    int text;                       // lists, panes and text fields
+    int selection;                  // the selected item of the focused widget
+    int selectionDim;               // the selected item of a widget without focus
+    int input;                      // text fields
+    int inputFocus;
+    int inputSel;                   // selected text in a text field
+    int button;
+    int buttonFocus;
+    int buttonDisabled;
+    int hot;                        // the underlined mnemonic letter
+    int menubar;
+    int menubarSel;
+    int menu;                       // drop down menus
+    int menuSel;
+    int menuDisabled;
+    int menuAccel;                  // the shortcut text in a menu
+    int status;
+    int scrollTrack;
+    int scrollThumb;
+    int tab;
+    int tabSel;
+    int header;                     // table headers
+    int progressTrack;
+    int progressFill;
+    int error;
+    int warn;
+    int ok;
+    int info;
+    int shadow;
+    int disabled;
+
+    Theme() { useDark(); }
+
+    // a dark theme with 24 bit colours (downgraded automatically on terminals with fewer)
+    void useDark() {
+        int bg = tscreen.rgb(30, 33, 40);
+        int panel = tscreen.rgb(40, 44, 52);
+        int fg = tscreen.rgb(212, 216, 224);
+        int dim = tscreen.rgb(128, 136, 150);
+        int accent = tscreen.rgb(86, 156, 214);
+        int sel = tscreen.rgb(52, 84, 132);
+        desktopRune = ' ';
+        desktop = tscreen.style(fg, bg, 0);
+        window = tscreen.style(fg, panel, 0);
+        hint = tscreen.style(dim, panel, 0);
+        title = tscreen.style(tscreen.rgb(255, 255, 255), panel, tscreen.A_BOLD);
+        border = tscreen.style(tscreen.rgb(98, 108, 126), panel, 0);
+        borderFocus = tscreen.style(accent, panel, 0);
+        text = tscreen.style(fg, bg, 0);
+        selection = tscreen.style(tscreen.rgb(255, 255, 255), sel, 0);
+        selectionDim = tscreen.style(fg, tscreen.rgb(58, 64, 78), 0);
+        input = tscreen.style(fg, tscreen.rgb(24, 26, 31), 0);
+        inputFocus = tscreen.style(tscreen.rgb(255, 255, 255), tscreen.rgb(20, 22, 27), 0);
+        inputSel = tscreen.style(tscreen.rgb(255, 255, 255), sel, 0);
+        button = tscreen.style(fg, tscreen.rgb(70, 76, 92), 0);
+        buttonFocus = tscreen.style(tscreen.rgb(16, 18, 22), accent, tscreen.A_BOLD);
+        buttonDisabled = tscreen.style(dim, tscreen.rgb(50, 54, 64), 0);
+        hot = tscreen.style(tscreen.rgb(255, 200, 90), tscreen.COL_KEEP, tscreen.A_UNDERLINE);
+        menubar = tscreen.style(fg, tscreen.rgb(52, 57, 68), 0);
+        menubarSel = tscreen.style(tscreen.rgb(255, 255, 255), accent, 0);
+        menu = tscreen.style(fg, tscreen.rgb(46, 50, 60), 0);
+        menuSel = tscreen.style(tscreen.rgb(255, 255, 255), sel, 0);
+        menuDisabled = tscreen.style(dim, tscreen.rgb(46, 50, 60), 0);
+        menuAccel = tscreen.style(dim, tscreen.COL_KEEP, 0);
+        status = tscreen.style(tscreen.rgb(235, 238, 245), tscreen.rgb(38, 79, 120), 0);
+        scrollTrack = tscreen.style(tscreen.rgb(60, 66, 80), bg, 0);
+        scrollThumb = tscreen.style(tscreen.rgb(120, 130, 150), bg, 0);
+        tab = tscreen.style(dim, tscreen.rgb(36, 39, 46), 0);
+        tabSel = tscreen.style(tscreen.rgb(255, 255, 255), panel, tscreen.A_BOLD);
+        header = tscreen.style(tscreen.rgb(255, 255, 255), tscreen.rgb(58, 64, 78), tscreen.A_BOLD);
+        progressTrack = tscreen.style(fg, tscreen.rgb(60, 66, 80), 0);
+        progressFill = tscreen.style(tscreen.rgb(16, 18, 22), tscreen.rgb(98, 184, 120), 0);
+        error = tscreen.style(tscreen.rgb(240, 100, 100), tscreen.COL_KEEP, 0);
+        warn = tscreen.style(tscreen.rgb(230, 190, 80), tscreen.COL_KEEP, 0);
+        ok = tscreen.style(tscreen.rgb(110, 200, 130), tscreen.COL_KEEP, 0);
+        info = tscreen.style(accent, tscreen.COL_KEEP, 0);
+        shadow = tscreen.style(tscreen.GRAY, tscreen.BLACK, 0);
+        disabled = tscreen.style(dim, tscreen.COL_KEEP, 0);
+    }
+
+    // a light theme with 24 bit colours
+    void useLight() {
+        int bg = tscreen.rgb(250, 250, 250);
+        int panel = tscreen.rgb(236, 238, 242);
+        int fg = tscreen.rgb(36, 40, 48);
+        int dim = tscreen.rgb(110, 118, 130);
+        int accent = tscreen.rgb(0, 102, 190);
+        int sel = tscreen.rgb(190, 215, 245);
+        desktopRune = ' ';
+        desktop = tscreen.style(fg, bg, 0);
+        window = tscreen.style(fg, panel, 0);
+        hint = tscreen.style(dim, panel, 0);
+        title = tscreen.style(tscreen.rgb(0, 0, 0), panel, tscreen.A_BOLD);
+        border = tscreen.style(tscreen.rgb(140, 148, 160), panel, 0);
+        borderFocus = tscreen.style(accent, panel, 0);
+        text = tscreen.style(fg, bg, 0);
+        selection = tscreen.style(tscreen.rgb(0, 0, 0), sel, 0);
+        selectionDim = tscreen.style(fg, tscreen.rgb(220, 224, 232), 0);
+        input = tscreen.style(fg, tscreen.rgb(255, 255, 255), 0);
+        inputFocus = tscreen.style(tscreen.rgb(0, 0, 0), tscreen.rgb(255, 255, 255), 0);
+        inputSel = tscreen.style(tscreen.rgb(0, 0, 0), sel, 0);
+        button = tscreen.style(fg, tscreen.rgb(214, 218, 226), 0);
+        buttonFocus = tscreen.style(tscreen.rgb(255, 255, 255), accent, tscreen.A_BOLD);
+        buttonDisabled = tscreen.style(dim, tscreen.rgb(224, 226, 232), 0);
+        hot = tscreen.style(tscreen.rgb(190, 60, 0), tscreen.COL_KEEP, tscreen.A_UNDERLINE);
+        menubar = tscreen.style(fg, tscreen.rgb(224, 228, 236), 0);
+        menubarSel = tscreen.style(tscreen.rgb(255, 255, 255), accent, 0);
+        menu = tscreen.style(fg, tscreen.rgb(244, 245, 248), 0);
+        menuSel = tscreen.style(tscreen.rgb(0, 0, 0), sel, 0);
+        menuDisabled = tscreen.style(dim, tscreen.rgb(244, 245, 248), 0);
+        menuAccel = tscreen.style(dim, tscreen.COL_KEEP, 0);
+        status = tscreen.style(tscreen.rgb(255, 255, 255), accent, 0);
+        scrollTrack = tscreen.style(tscreen.rgb(220, 224, 232), bg, 0);
+        scrollThumb = tscreen.style(tscreen.rgb(150, 158, 172), bg, 0);
+        tab = tscreen.style(dim, tscreen.rgb(224, 228, 236), 0);
+        tabSel = tscreen.style(tscreen.rgb(0, 0, 0), panel, tscreen.A_BOLD);
+        header = tscreen.style(tscreen.rgb(0, 0, 0), tscreen.rgb(214, 218, 226), tscreen.A_BOLD);
+        progressTrack = tscreen.style(fg, tscreen.rgb(214, 218, 226), 0);
+        progressFill = tscreen.style(tscreen.rgb(255, 255, 255), tscreen.rgb(40, 150, 80), 0);
+        error = tscreen.style(tscreen.rgb(190, 30, 30), tscreen.COL_KEEP, 0);
+        warn = tscreen.style(tscreen.rgb(160, 110, 0), tscreen.COL_KEEP, 0);
+        ok = tscreen.style(tscreen.rgb(20, 130, 60), tscreen.COL_KEEP, 0);
+        info = tscreen.style(accent, tscreen.COL_KEEP, 0);
+        shadow = tscreen.style(tscreen.GRAY, tscreen.BLACK, 0);
+        disabled = tscreen.style(dim, tscreen.COL_KEEP, 0);
+    }
+
+    // the classic 16 colour look: blue desktop, cyan and white windows. Works on every colour terminal.
+    void useClassic() {
+        desktopRune = 0x2591;
+        desktop = tscreen.style(tscreen.CYAN, tscreen.BLUE, 0);
+        window = tscreen.style(tscreen.BLACK, tscreen.WHITE, 0);
+        hint = tscreen.style(tscreen.GRAY, tscreen.WHITE, 0);
+        title = tscreen.style(tscreen.BLACK, tscreen.WHITE, tscreen.A_BOLD);
+        border = tscreen.style(tscreen.BLACK, tscreen.WHITE, 0);
+        borderFocus = tscreen.style(tscreen.BLUE, tscreen.WHITE, tscreen.A_BOLD);
+        text = tscreen.style(tscreen.BRIGHT_WHITE, tscreen.BLUE, 0);
+        selection = tscreen.style(tscreen.BLACK, tscreen.CYAN, 0);
+        selectionDim = tscreen.style(tscreen.BRIGHT_WHITE, tscreen.GRAY, 0);
+        input = tscreen.style(tscreen.BRIGHT_WHITE, tscreen.BLUE, 0);
+        inputFocus = tscreen.style(tscreen.BRIGHT_WHITE, tscreen.BLACK, 0);
+        inputSel = tscreen.style(tscreen.BLACK, tscreen.CYAN, 0);
+        button = tscreen.style(tscreen.BLACK, tscreen.GREEN, 0);
+        buttonFocus = tscreen.style(tscreen.BRIGHT_WHITE, tscreen.GREEN, tscreen.A_BOLD);
+        buttonDisabled = tscreen.style(tscreen.GRAY, tscreen.WHITE, 0);
+        hot = tscreen.style(tscreen.RED, tscreen.COL_KEEP, 0);
+        menubar = tscreen.style(tscreen.BLACK, tscreen.WHITE, 0);
+        menubarSel = tscreen.style(tscreen.BRIGHT_WHITE, tscreen.BLACK, 0);
+        menu = tscreen.style(tscreen.BLACK, tscreen.WHITE, 0);
+        menuSel = tscreen.style(tscreen.BLACK, tscreen.GREEN, 0);
+        menuDisabled = tscreen.style(tscreen.GRAY, tscreen.WHITE, 0);
+        menuAccel = tscreen.style(tscreen.GRAY, tscreen.COL_KEEP, 0);
+        status = tscreen.style(tscreen.BLACK, tscreen.CYAN, 0);
+        scrollTrack = tscreen.style(tscreen.CYAN, tscreen.BLUE, 0);
+        scrollThumb = tscreen.style(tscreen.BLACK, tscreen.CYAN, 0);
+        tab = tscreen.style(tscreen.BLACK, tscreen.CYAN, 0);
+        tabSel = tscreen.style(tscreen.BRIGHT_WHITE, tscreen.BLUE, tscreen.A_BOLD);
+        header = tscreen.style(tscreen.BLACK, tscreen.CYAN, 0);
+        progressTrack = tscreen.style(tscreen.BRIGHT_WHITE, tscreen.BLUE, 0);
+        progressFill = tscreen.style(tscreen.BLACK, tscreen.GREEN, 0);
+        error = tscreen.style(tscreen.BRIGHT_RED, tscreen.COL_KEEP, 0);
+        warn = tscreen.style(tscreen.BRIGHT_YELLOW, tscreen.COL_KEEP, 0);
+        ok = tscreen.style(tscreen.BRIGHT_GREEN, tscreen.COL_KEEP, 0);
+        info = tscreen.style(tscreen.BRIGHT_CYAN, tscreen.COL_KEEP, 0);
+        shadow = tscreen.style(tscreen.GRAY, tscreen.BLACK, 0);
+        disabled = tscreen.style(tscreen.GRAY, tscreen.COL_KEEP, 0);
+    }
+
+    // no colours at all: bold, reverse and underline only (for terminals without colour, and NO_COLOR)
+    void useMono() {
+        desktopRune = ' ';
+        desktop = 0;
+        window = 0;
+        hint = tscreen.style(0, 0, tscreen.A_DIM);
+        title = tscreen.style(0, 0, tscreen.A_BOLD);
+        border = 0;
+        borderFocus = tscreen.style(0, 0, tscreen.A_BOLD);
+        text = 0;
+        selection = tscreen.style(0, 0, tscreen.A_REVERSE);
+        selectionDim = tscreen.style(0, 0, tscreen.A_UNDERLINE);
+        input = tscreen.style(0, 0, tscreen.A_UNDERLINE);
+        inputFocus = tscreen.style(0, 0, tscreen.A_UNDERLINE | tscreen.A_BOLD);
+        inputSel = tscreen.style(0, 0, tscreen.A_REVERSE);
+        button = 0;
+        buttonFocus = tscreen.style(0, 0, tscreen.A_REVERSE | tscreen.A_BOLD);
+        buttonDisabled = tscreen.style(0, 0, tscreen.A_DIM);
+        hot = tscreen.style(0, tscreen.COL_KEEP, tscreen.A_UNDERLINE);
+        menubar = tscreen.style(0, 0, tscreen.A_REVERSE);
+        menubarSel = 0;
+        menu = tscreen.style(0, 0, tscreen.A_REVERSE);
+        menuSel = 0;
+        menuDisabled = tscreen.style(0, 0, tscreen.A_REVERSE | tscreen.A_DIM);
+        menuAccel = tscreen.style(0, tscreen.COL_KEEP, tscreen.A_DIM);
+        status = tscreen.style(0, 0, tscreen.A_REVERSE);
+        scrollTrack = tscreen.style(0, 0, tscreen.A_DIM);
+        scrollThumb = tscreen.style(0, 0, tscreen.A_BOLD);
+        tab = tscreen.style(0, 0, tscreen.A_DIM);
+        tabSel = tscreen.style(0, 0, tscreen.A_BOLD | tscreen.A_REVERSE);
+        header = tscreen.style(0, 0, tscreen.A_BOLD | tscreen.A_UNDERLINE);
+        progressTrack = 0;
+        progressFill = tscreen.style(0, 0, tscreen.A_REVERSE);
+        error = tscreen.style(0, tscreen.COL_KEEP, tscreen.A_BOLD);
+        warn = tscreen.style(0, tscreen.COL_KEEP, tscreen.A_BOLD);
+        ok = 0;
+        info = 0;
+        shadow = tscreen.style(0, 0, tscreen.A_DIM);
+        disabled = tscreen.style(0, tscreen.COL_KEEP, tscreen.A_DIM);
+    }
+}
+
+public Theme* theme;
+
+// the theme that suits a terminal: dark for 256 colours and more, classic for 16 and 8, mono without colours
+public Theme* themeFor(term.Caps* caps) {
+    Theme* t = new Theme();
+    if (caps->colors >= term.COLORS_256) { t->useDark(); }
+    else if (caps->colors >= term.COLORS_8) { t->useClassic(); }
+    else { t->useMono(); }
+    return t;
+}
+
+// =============================================================================
+//  Widget: the base of everything
+// =============================================================================
+public class Widget {
+public:
+    int x;                          // position relative to the parent (overlays: on the screen)
+    int y;
+    int w;
+    int h;
+    int flex;                       // share of the free space in a Box (0: the preferred size)
+    int fixedW;                     // forced size in a Box (0: use prefW / prefH)
+    int fixedH;
+    int halign;                     // in a vertical Box: 0 fill the width, 1 left, 2 centre, 3 right (at the preferred width)
+    int valign;                     // in a horizontal Box: 0 fill the height, 1 top, 2 middle, 3 bottom
+    int userData;
+    bool visible;
+    bool enabled;
+    bool focusable;
+    bool shadow;                    // overlays: draw a shadow
+    char* name;
+    func onKey;                     // key hook:  int f(int widget, int event)  - return 1 when the key was used (before the widget sees it)
+    func onFocusChange;             // int f(int widget)
+    func onContext;                 // right click: int f(int widget)   (app->mouseX / mouseY tell where)
+    Widget* parent;
+    App* app;
+    Widget** kids;
+    int nkids;
+    int capKids;
+
+    Widget() {
+        visible = true;
+        enabled = true;
+        w = 1;
+        h = 1;
+    }
+
+    // ---- the tree ------------------------------------------------------------------------------------------------------------------------
+    void add(Widget* k) { insert(nkids, k); }
+
+    void insert(int index, Widget* k) {
+        if (k->parent != null) { k->parent->remove(k); }
+        if (capKids == 0) {
+            capKids = 8;
+            kids = (Widget**) alloc(capKids * 8);
+        } else if (nkids == capKids) {
+            Widget** nk = (Widget**) alloc(capKids * 2 * 8);
+            for (int i = 0; i < nkids; i++) { nk[i] = kids[i]; }
+            kids = nk;
+            capKids = capKids * 2;
+        }
+        if (index < 0 || index > nkids) { index = nkids; }
+        for (int i = nkids; i > index; i--) { kids[i] = kids[i - 1]; }
+        kids[index] = k;
+        nkids++;
+        k->parent = this;
+        k->attach(app);
+        relayout();
+    }
+
+    void remove(Widget* k) {
+        int at = -1;
+        for (int i = 0; i < nkids; i++) { if (kids[i] == k) { at = i; } }
+        if (at < 0) { return; }
+        for (int i = at; i < nkids - 1; i++) { kids[i] = kids[i + 1]; }
+        nkids--;
+        if (app != null && app->focus != null && k->contains(app->focus)) { app->setFocus(null); }
+        k->parent = null;
+        k->attach(null);
+        relayout();
+    }
+
+    void removeAll() {
+        while (nkids > 0) { remove(kids[nkids - 1]); }
+    }
+
+    // tells the widget and its children which application they belong to
+    virtual void attach(App* a) {
+        app = a;
+        for (int i = 0; i < nkids; i++) { kids[i]->attach(a); }
+    }
+
+    // is w this widget or below it?
+    bool contains(Widget* o) {
+        while (o != null) {
+            if (o == this) { return true; }
+            o = o->parent;
+        }
+        return false;
+    }
+
+    Widget* root() {
+        Widget* r = this;
+        while (r->parent != null) { r = r->parent; }
+        return r;
+    }
+
+    int absX() {
+        int v = x;
+        Widget* p = parent;
+        while (p != null) { v = v + p->x; p = p->parent; }
+        return v;
+    }
+
+    int absY() {
+        int v = y;
+        Widget* p = parent;
+        while (p != null) { v = v + p->y; p = p->parent; }
+        return v;
+    }
+
+    // true when the widget and all its ancestors are visible
+    bool shown() {
+        Widget* p = this;
+        while (p != null) {
+            if (!p->visible) { return false; }
+            p = p->parent;
+        }
+        return true;
+    }
+
+    // ---- size ----------------------------------------------------------------------------------------------------------------------------
+    virtual int prefW() { return w; }
+    virtual int prefH() { return h; }
+    int getPrefW() { if (fixedW > 0) { return fixedW; } return prefW(); }
+    int getPrefH() { if (fixedH > 0) { return fixedH; } return prefH(); }
+
+    // positions the children (they have been given their sizes already, or compute them here)
+    virtual void layout() {
+        for (int i = 0; i < nkids; i++) { kids[i]->layout(); }
+    }
+
+    void setRect(int nx, int ny, int nw, int nh) {
+        x = nx; y = ny;
+        if (nw < 0) { nw = 0; }
+        if (nh < 0) { nh = 0; }
+        w = nw; h = nh;
+    }
+
+    // the layout is out of date: it is redone before the next frame
+    void relayout() {
+        if (app != null) { app->needLayout = true; app->dirty = true; }
+    }
+
+    // the picture is out of date
+    void invalidate() {
+        if (app != null) { app->dirty = true; }
+    }
+
+    // ---- painting and events -------------------------------------------------------------------------------------------------------------
+    // draws the widget; (ox, oy) is where its top left cell is on the screen. Children are drawn afterwards by paintTree.
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+    }
+
+    virtual bool onKeyPress(term.Event* e) { return false; }
+    virtual bool onMouse(term.Event* e, int lx, int ly) { return false; }
+    virtual void onFocus(bool gained) { }
+    virtual void onPaste(char* t, int n) { }
+    // the character that Alt+letter activates (0: none), and what happens then
+    virtual int mnemonicChar() { return 0; }
+    virtual void activate() { }
+    // Alt+letter (lower case) was pressed: use it and return true if it is this widget's mnemonic (the default: mnemonicChar() == c calls activate())
+    virtual bool handleMnemonic(int c) {
+        if (mnemonicChar() == c && c != 0) { activate(); return true; }
+        return false;
+    }
+    // does the widget want printable keys (a text field does: shortcuts without modifiers must not steal them)
+    virtual bool wantsText() { return false; }
+    // an overlay was clicked outside of: return true to swallow the click
+    virtual bool onOutside(term.Event* e) { return false; }
+    // the screen was resized
+    virtual void onResize(int cols, int rows) { }
+
+    void paintTree(tscreen.Screen* s, int ox, int oy) {
+        if (!visible) { return; }
+        s->pushClip(ox, oy, w, h);
+        paint(s, ox, oy);
+        for (int i = 0; i < nkids; i++) {
+            Widget* k = kids[i];
+            k->paintTree(s, ox + k->x, oy + k->y);
+        }
+        s->popClip();
+    }
+
+    // the deepest visible widget at (px, py) given relative to this widget; null if none
+    Widget* hit(int px, int py) {
+        if (!visible || px < 0 || py < 0 || px >= w || py >= h) { return null; }
+        for (int i = nkids - 1; i >= 0; i--) {
+            Widget* k = kids[i];
+            Widget* r = k->hit(px - k->x, py - k->y);
+            if (r != null) { return r; }
+        }
+        return this;
+    }
+
+    // ---- focus ---------------------------------------------------------------------------------------------------------------------------
+    bool canFocus() { return focusable && enabled && shown(); }
+    bool hasFocus() { return app != null && app->focus == this; }
+    bool containsFocus() { return app != null && app->focus != null && contains(app->focus); }
+    void focusMe() { if (app != null) { app->setFocus(this); } }
+
+    void setVisible(bool v) {
+        if (visible == v) { return; }
+        visible = v;
+        if (!v && app != null && app->focus != null && contains(app->focus)) { app->setFocus(null); }
+        relayout();
+    }
+
+    void setEnabled(bool v) {
+        enabled = v;
+        invalidate();
+    }
+
+    // runs the hook before the widget handles a key
+    bool hookKey(term.Event* e) {
+        if (onKey != null) { return onKey((int) this, (int) e) != 0; }
+        return false;
+    }
+
+    // the user data of the first ancestor (or itself) that is a widget of that name
+    Widget* find(char* nm) {
+        if (name != null && streq(name, nm)) { return this; }
+        for (int i = 0; i < nkids; i++) {
+            Widget* r = kids[i]->find(nm);
+            if (r != null) { return r; }
+        }
+        return null;
+    }
+}
+
+// fills the whole widget area
+private void fillWidget(tscreen.Screen* s, Widget* wd, int ox, int oy, int style) {
+    s->fill(ox, oy, wd->w, wd->h, ' ', style);
+}
+
+// =============================================================================
+//  containers: Box, Frame, Spacer, Separator
+// =============================================================================
+// A row or a column. Children with flex > 0 share the free space by their flex values; the others get their preferred size (or fixedW / fixedH).
+public class Box : Widget {
+public:
+    bool vertical;
+    int spacing;
+    int padding;
+    int style;                      // fill style (when paintBg is set)
+    bool paintBg;
+    bool themed;                    // fill with the theme's window colours (follows theme changes)
+
+    int count() {
+        int n = 0;
+        for (int i = 0; i < nkids; i++) { if (kids[i]->visible) { n++; } }
+        return n;
+    }
+
+    virtual int prefW() {
+        int total = 0;
+        int widest = 0;
+        for (int i = 0; i < nkids; i++) {
+            if (!kids[i]->visible) { continue; }
+            int pw = kids[i]->getPrefW();
+            total = total + pw;
+            widest = imax(widest, pw);
+        }
+        if (vertical) { return widest + 2 * padding; }
+        return total + spacing * imax(0, count() - 1) + 2 * padding;
+    }
+
+    virtual int prefH() {
+        int total = 0;
+        int tallest = 0;
+        for (int i = 0; i < nkids; i++) {
+            if (!kids[i]->visible) { continue; }
+            int ph = kids[i]->getPrefH();
+            total = total + ph;
+            tallest = imax(tallest, ph);
+        }
+        if (!vertical) { return tallest + 2 * padding; }
+        return total + spacing * imax(0, count() - 1) + 2 * padding;
+    }
+
+    virtual void layout() {
+        int n = count();
+        if (n == 0) { return; }
+        int inner = (vertical ? h : w) - 2 * padding;
+        int cross = (vertical ? w : h) - 2 * padding;
+        int fixedSum = 0;
+        int flexSum = 0;
+        for (int i = 0; i < nkids; i++) {
+            Widget* k = kids[i];
+            if (!k->visible) { continue; }
+            if (k->flex > 0) { flexSum = flexSum + k->flex; }
+            else { fixedSum = fixedSum + (vertical ? k->getPrefH() : k->getPrefW()); }
+        }
+        int free = inner - fixedSum - spacing * (n - 1);
+        if (free < 0) { free = 0; }
+        int pos = padding;
+        int flexLeft = flexSum;
+        int freeLeft = free;
+        for (int i = 0; i < nkids; i++) {
+            Widget* k = kids[i];
+            if (!k->visible) { continue; }
+            int size;
+            if (k->flex > 0) {
+                size = (flexLeft > 0) ? freeLeft * k->flex / flexLeft : 0;
+                freeLeft = freeLeft - size;
+                flexLeft = flexLeft - k->flex;
+            } else {
+                size = vertical ? k->getPrefH() : k->getPrefW();
+            }
+            if (pos + size > padding + inner) { size = imax(0, padding + inner - pos); }
+            if (vertical) {
+                int cw = cross;
+                int cx = padding;
+                if (k->halign != 0) {
+                    cw = imin(cross, k->getPrefW());
+                    cx = padding + (k->halign == 2 ? (cross - cw) / 2 : (k->halign == 3 ? cross - cw : 0));
+                }
+                k->setRect(cx, pos, cw, size);
+            } else {
+                int ch = cross;
+                int cy = padding;
+                if (k->valign != 0) {
+                    ch = imin(cross, k->getPrefH());
+                    cy = padding + (k->valign == 2 ? (cross - ch) / 2 : (k->valign == 3 ? cross - ch : 0));
+                }
+                k->setRect(pos, cy, size, ch);
+            }
+            pos = pos + size + spacing;
+            k->layout();
+        }
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        if (themed) { fillWidget(s, this, ox, oy, theme->window); }
+        else if (paintBg) { fillWidget(s, this, ox, oy, style); }
+    }
+}
+
+public Box* vbox(int spacing = 0, int padding = 0) {
+    Box* b = new Box();
+    b->vertical = true;
+    b->spacing = spacing;
+    b->padding = padding;
+    return b;
+}
+
+public Box* hbox(int spacing = 0, int padding = 0) {
+    Box* b = new Box();
+    b->vertical = false;
+    b->spacing = spacing;
+    b->padding = padding;
+    return b;
+}
+
+// a bordered area with a title around one child (more children are stacked on top of each other, all filling the inside)
+public class Frame : Widget {
+public:
+    Text title;
+    int kind;                       // tscreen.BOX_...
+    int pad;                        // extra space between border and content
+    bool useWindowStyle;            // fill the inside with the window style (default true)
+
+    Frame(char* t) {
+        super();
+        title.set(t);
+        kind = tscreen.BOX_SINGLE;
+        useWindowStyle = true;
+    }
+
+    void setTitle(char* t) { title.set(t); invalidate(); }
+
+    virtual int prefW() {
+        int pw = 0;
+        for (int i = 0; i < nkids; i++) { pw = imax(pw, kids[i]->getPrefW()); }
+        return imax(pw + 2 + 2 * pad, tscreen.textWidth(title.str()) + 6);
+    }
+
+    virtual int prefH() {
+        int ph = 0;
+        for (int i = 0; i < nkids; i++) { ph = imax(ph, kids[i]->getPrefH()); }
+        return ph + 2 + 2 * pad;
+    }
+
+    virtual void layout() {
+        for (int i = 0; i < nkids; i++) {
+            kids[i]->setRect(1 + pad, 1 + pad, w - 2 - 2 * pad, h - 2 - 2 * pad);
+            kids[i]->layout();
+        }
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        if (useWindowStyle) { fillWidget(s, this, ox, oy, theme->window); }
+        int bs = containsFocus() ? theme->borderFocus : theme->border;
+        s->box(ox, oy, w, h, kind, bs);
+        if (title.len > 0) {
+            int tw = tscreen.textWidth(title.str());
+            if (tw > w - 6) { tw = imax(0, w - 6); }
+            s->put(ox + 1, oy, ' ', bs);
+            s->textMax(ox + 2, oy, title.str(), tw, containsFocus() ? theme->borderFocus : theme->title);
+            s->put(ox + 2 + tw, oy, ' ', bs);
+        }
+    }
+}
+
+// empty space (fixedW / fixedH or flex give it a size)
+public class Spacer : Widget {
+public:
+    virtual int prefW() { return 1; }
+    virtual int prefH() { return 1; }
+}
+
+// a horizontal or vertical line
+public class Separator : Widget {
+public:
+    bool vertical;
+    virtual int prefW() { return 1; }
+    virtual int prefH() { return 1; }
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        if (vertical) { s->vline(ox, oy, h, 0x2502, theme->border); }
+        else { s->hline(ox, oy, w, 0x2500, theme->border); }
+    }
+}
+
+// =============================================================================
+//  Label
+// =============================================================================
+public class Label : Widget {
+public:
+    Text text;
+    int align;                      // 0 left, 1 centre, 2 right
+    bool custom;                    // use style instead of the theme's window style
+    int style;
+    bool ellipsis;                  // cut long text with a "..." (default: just cut)
+
+    Label(char* t) {
+        super();
+        text.set(t);
+    }
+
+    void setText(char* t) {
+        text.set(t);
+        relayout();
+    }
+
+    void setStyle(int st) { custom = true; style = st; invalidate(); }
+
+    private int lineCount() {
+        int n = 1;
+        char* t = text.str();
+        for (int i = 0; t[i] != 0; i++) { if (t[i] == '\n') { n++; } }
+        return n;
+    }
+
+    virtual int prefW() {
+        int best = 0;
+        char* t = text.str();
+        int pos = 0;
+        for (;;) {
+            int e = pos;
+            while (t[e] != 0 && t[e] != '\n') { e++; }
+            best = imax(best, tscreen.textWidthN(&t[pos], e - pos));
+            if (t[e] == 0) { break; }
+            pos = e + 1;
+        }
+        return best;
+    }
+
+    virtual int prefH() { return lineCount(); }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        int base = custom ? style : theme->window;
+        if (tscreen.bgOf(base) != tscreen.COL_KEEP) { s->fill(ox, oy, w, h, ' ', base); }
+        int st = enabled ? base : theme->disabled;
+        char* t = text.str();
+        int pos = 0;
+        int row = 0;
+        for (;;) {
+            int e = pos;
+            while (t[e] != 0 && t[e] != '\n') { e++; }
+            int tw = tscreen.textWidthN(&t[pos], e - pos);
+            int cx = ox;
+            if (align == 1) { cx = ox + imax(0, (w - tw) / 2); }
+            else if (align == 2) { cx = ox + imax(0, w - tw); }
+            if (row < h) {
+                if (tw > w && ellipsis) {
+                    char tmp[512];
+                    int n = imin(e - pos, 500);
+                    memcpy(&tmp[0], &t[pos], n);
+                    tmp[n] = 0;
+                    s->textEllipsis(ox, oy + row, &tmp[0], w, st);
+                } else {
+                    s->textn(cx, oy + row, &t[pos], e - pos, st);
+                }
+            }
+            row++;
+            if (t[e] == 0) { break; }
+            pos = e + 1;
+        }
+    }
+}
+
+// =============================================================================
+//  Button, CheckBox (and radio buttons)
+// =============================================================================
+public class Button : Widget {
+public:
+    Text text;
+    func onClick;                   // int f(int button)
+    bool isDefault;                 // drawn bold; Enter in a dialog presses it
+    bool pressed;
+    bool flat;                      // no brackets
+
+    Button(char* t) {
+        super();
+        text.set(t);
+        focusable = true;
+    }
+
+    void setText(char* t) { text.set(t); relayout(); }
+
+    virtual int prefW() { return labelWidth(text.str()) + (flat ? 2 : 4); }
+    virtual int prefH() { return 1; }
+    virtual int mnemonicChar() { return mnemonicOf(text.str()); }
+
+    // presses the button
+    void click() {
+        if (!enabled) { return; }
+        if (onClick != null) { onClick((int) this); }
+    }
+
+    virtual void activate() { click(); }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        int st = theme->button;
+        if (!enabled) { st = theme->buttonDisabled; }
+        else if (hasFocus() || pressed) { st = theme->buttonFocus; }
+        if (isDefault && enabled && !hasFocus()) { st = tscreen.addAttr(st, tscreen.A_BOLD); }
+        s->fill(ox, oy, w, h, ' ', st);
+        int tw = labelWidth(text.str());
+        int pad = flat ? 1 : 2;
+        int cx = ox + imax(pad, (w - tw) / 2);
+        if (!flat) {
+            s->put(ox, oy, '[', st);
+            s->put(ox + w - 1, oy, ']', st);
+        }
+        drawLabel(s, cx, oy, text.str(), imax(0, w - 2 * pad), st, enabled ? tscreen.withBg(theme->hot, tscreen.COL_KEEP) : st);
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        if (e->key == term.KEY_ENTER || (e->key == ' ' && e->mods == 0)) {
+            click();
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        if (e->button != term.MB_LEFT) { return false; }
+        if (e->action == term.MA_PRESS) {
+            pressed = true;
+            app->capture = this;
+            invalidate();
+            return true;
+        }
+        if (e->action == term.MA_RELEASE) {
+            bool inside = lx >= 0 && ly >= 0 && lx < w && ly < h;
+            bool was = pressed;
+            pressed = false;
+            invalidate();
+            if (was && inside) { click(); }
+            return true;
+        }
+        return pressed;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+public class CheckBox : Widget {
+public:
+    Text text;
+    bool checked;
+    bool radio;                     // a radio button: checking it unchecks the other radio buttons of the same parent
+    func onChange;                  // int f(int checkbox)
+
+    CheckBox(char* t) {
+        super();
+        text.set(t);
+        focusable = true;
+    }
+
+    virtual int prefW() { return labelWidth(text.str()) + 4; }
+    virtual int prefH() { return 1; }
+    virtual int mnemonicChar() { return mnemonicOf(text.str()); }
+
+    void setChecked(bool v) {
+        if (radio) {
+            if (!v) { return; }
+            if (parent != null) {
+                for (int i = 0; i < parent->nkids; i++) {
+                    Widget* k = parent->kids[i];
+                    if (k != this && k->userData == userData && k->name != null && name != null && streq(k->name, name)) {
+                        CheckBox* o = (CheckBox*) k;
+                        if (o->radio && o->checked) { o->checked = false; }
+                    }
+                }
+            }
+        }
+        if (checked == v) { return; }
+        checked = v;
+        invalidate();
+        if (onChange != null) { onChange((int) this); }
+    }
+
+    void toggle() {
+        if (!enabled) { return; }
+        setChecked(radio ? true : !checked);
+    }
+
+    virtual void activate() { toggle(); }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        int st = hasFocus() ? theme->selection : theme->window;
+        if (!enabled) { st = theme->disabled; }
+        s->fill(ox, oy, w, h, ' ', hasFocus() ? theme->selection : theme->window);
+        char* mark = radio ? (checked ? "(*)" : "( )") : (checked ? "[x]" : "[ ]");
+        s->text(ox, oy, mark, st);
+        drawLabel(s, ox + 4, oy, text.str(), imax(0, w - 4), st, enabled ? tscreen.withBg(theme->hot, tscreen.COL_KEEP) : st);
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        if (e->key == ' ' || e->key == term.KEY_ENTER) { toggle(); return true; }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) { toggle(); return true; }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// =============================================================================
+//  ProgressBar, Slider, StatusBar
+// =============================================================================
+public class ProgressBar : Widget {
+public:
+    int value;
+    int max;
+    bool showPercent;
+    bool indeterminate;             // a moving block; call step() from a timer
+    int phase;
+    int timerId;
+
+    ProgressBar() {
+        super();
+        max = 100;
+        showPercent = true;
+    }
+
+    virtual int prefW() { return 20; }
+    virtual int prefH() { return 1; }
+
+    void setValue(int v) {
+        if (v < 0) { v = 0; }
+        if (v > max) { v = max; }
+        if (v == value && !indeterminate) { return; }
+        value = v;
+        invalidate();
+    }
+
+    // moves the block of an indeterminate bar
+    void step() {
+        phase++;
+        invalidate();
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        if (w <= 0) { return; }
+        s->fill(ox, oy, w, 1, ' ', theme->progressTrack);
+        if (indeterminate) {
+            int bw = imax(2, w / 5);
+            int span = w + bw;
+            int at = (phase % span) - bw;
+            for (int i = 0; i < bw; i++) {
+                int cx = at + i;
+                if (cx >= 0 && cx < w) { s->put(ox + cx, oy, ' ', theme->progressFill); }
+            }
+            return;
+        }
+        int filled = (max > 0) ? value * w / max : 0;
+        for (int i = 0; i < filled; i++) { s->put(ox + i, oy, ' ', theme->progressFill); }
+        if (showPercent) {
+            char t[16];
+            int pct = (max > 0) ? value * 100 / max : 0;
+            format(&t[0], 16, "%d%%", pct, 0, 0, 0);
+            int tw = strlen(&t[0]);
+            int tx = (w - tw) / 2;
+            for (int i = 0; i < tw; i++) {
+                int cx = tx + i;
+                s->put(ox + cx, oy, t[i], cx < filled ? theme->progressFill : theme->progressTrack);
+            }
+        }
+    }
+}
+
+// a horizontal slider for a value from 0 to max. trackColor (optional): int f(int slider, int position) gives the colour of the track at a cell.
+public class Slider : Widget {
+public:
+    int value;
+    int max;
+    int step;
+    func onChange;                  // int f(int slider)
+    func trackColor;
+    bool dragging;
+
+    Slider() {
+        super();
+        max = 100;
+        step = 1;
+        focusable = true;
+    }
+
+    virtual int prefW() { return 24; }
+    virtual int prefH() { return 1; }
+
+    void setValue(int v) {
+        if (v < 0) { v = 0; }
+        if (v > max) { v = max; }
+        if (v == value) { return; }
+        value = v;
+        invalidate();
+        if (onChange != null) { onChange((int) this); }
+    }
+
+    private int thumbX() {
+        if (w <= 1 || max <= 0) { return 0; }
+        return value * (w - 1) / max;
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        int tx = thumbX();
+        for (int i = 0; i < w; i++) {
+            if (trackColor != null) {
+                int c = trackColor((int) this, i);
+                if (i == tx) { s->put(ox + i, oy, ' ', tscreen.style(c, tscreen.WHITE, tscreen.A_BOLD)); }
+                else { s->put(ox + i, oy, ' ', tscreen.style(tscreen.WHITE, c, 0)); }
+            } else if (i == tx) {
+                s->put(ox + i, oy, '|', hasFocus() ? theme->buttonFocus : theme->button);
+            } else {
+                s->put(ox + i, oy, i < tx ? '=' : '-', theme->window);
+            }
+        }
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        int k = e->key;
+        if (k == term.KEY_LEFT || k == term.KEY_DOWN) { setValue(value - step); return true; }
+        if (k == term.KEY_RIGHT || k == term.KEY_UP) { setValue(value + step); return true; }
+        if (k == term.KEY_PGDN) { setValue(value - imax(step, max / 10)); return true; }
+        if (k == term.KEY_PGUP) { setValue(value + imax(step, max / 10)); return true; }
+        if (k == term.KEY_HOME) { setValue(0); return true; }
+        if (k == term.KEY_END) { setValue(max); return true; }
+        return false;
+    }
+
+    private void setFromX(int lx) {
+        if (w <= 1) { return; }
+        if (lx < 0) { lx = 0; }
+        if (lx > w - 1) { lx = w - 1; }
+        setValue((lx * max + (w - 1) / 2) / (w - 1));
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) { dragging = true; app->capture = this; setFromX(lx); return true; }
+        if (dragging && (e->action == term.MA_DRAG || e->action == term.MA_MOVE)) { setFromX(lx); return true; }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        if (e->action == term.MA_WHEEL) {
+            if (e->button == term.MB_WHEEL_UP) { setValue(value + step); } else if (e->button == term.MB_WHEEL_DOWN) { setValue(value - step); }
+            return true;
+        }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// a one line bar of text segments: left aligned ones from the left, right aligned ones from the right
+public class StatusBar : Widget {
+public:
+    Text seg[8];
+    int segAlign[8];
+    int nseg;
+    int tempUntil;                  // a message() shown until this time (millis)
+    Text temp;
+
+    StatusBar() { super(); nseg = 1; }
+
+    virtual int prefW() { return 20; }
+    virtual int prefH() { return 1; }
+
+    // sets segment i (0 .. 7); align 0 left, 2 right. Segments are drawn in order, separated by two spaces.
+    void set(int i, char* t, int align = 0) {
+        if (i < 0 || i >= 8) { return; }
+        seg[i].set(t);
+        segAlign[i] = align;
+        if (i + 1 > nseg) { nseg = i + 1; }
+        invalidate();
+    }
+
+    // shows a message instead of the segments for ms milliseconds
+    void message(char* t, int ms) {
+        temp.set(t);
+        tempUntil = (app != null ? app->now() : millis()) + ms;
+        invalidate();
+        if (app != null) { app->wakeAt(tempUntil); }
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        s->fill(ox, oy, w, 1, ' ', theme->status);
+        if (tempUntil != 0 && (app != null ? app->now() : millis()) < tempUntil) {
+            s->textMax(ox + 1, oy, temp.str(), w - 2, theme->status);
+            return;
+        }
+        int left = ox + 1;
+        int right = ox + w - 1;
+        for (int i = 0; i < nseg; i++) {
+            char* t = seg[i].str();
+            if (t[0] == 0) { continue; }
+            int tw = tscreen.textWidth(t);
+            if (segAlign[i] == 2) {
+                right = right - tw;
+                s->textMax(right, oy, t, imax(0, tw), theme->status);
+                right = right - 2;
+            } else {
+                int used = s->textMax(left, oy, t, imax(0, right - left), theme->status);
+                left = left + used + 2;
+            }
+        }
+    }
+}
+
+// =============================================================================
+//  scroll bars
+// =============================================================================
+// draws a vertical scroll bar of height len at (x, y): total lines, page = visible lines, pos = first visible line
+public void drawVScroll(tscreen.Screen* s, int x, int y, int len, int total, int page, int pos) {
+    if (len <= 0) { return; }
+    int thumbLen = len;
+    int thumbPos = 0;
+    if (total > page && total > 0) {
+        thumbLen = imax(1, len * page / total);
+        int range = total - page;
+        thumbPos = (len - thumbLen) * pos / range;
+        if (thumbPos < 0) { thumbPos = 0; }
+        if (thumbPos > len - thumbLen) { thumbPos = len - thumbLen; }
+    }
+    for (int i = 0; i < len; i++) {
+        bool inThumb = total > page && i >= thumbPos && i < thumbPos + thumbLen;
+        if (inThumb) { s->put(x, y + i, 0x2588, theme->scrollThumb); }
+        else { s->put(x, y + i, 0x2591, theme->scrollTrack); }
+    }
+}
+
+public void drawHScroll(tscreen.Screen* s, int x, int y, int len, int total, int page, int pos) {
+    if (len <= 0) { return; }
+    int thumbLen = len;
+    int thumbPos = 0;
+    if (total > page && total > 0) {
+        thumbLen = imax(1, len * page / total);
+        int range = total - page;
+        thumbPos = (len - thumbLen) * pos / range;
+        if (thumbPos < 0) { thumbPos = 0; }
+        if (thumbPos > len - thumbLen) { thumbPos = len - thumbLen; }
+    }
+    for (int i = 0; i < len; i++) {
+        bool inThumb = total > page && i >= thumbPos && i < thumbPos + thumbLen;
+        if (inThumb) { s->put(x + i, y, 0x2588, theme->scrollThumb); }
+        else { s->put(x + i, y, 0x2591, theme->scrollTrack); }
+    }
+}
+
+// the first visible line that a click or drag at offset (0 .. len - 1) of a scroll bar means (the thumb centred there)
+public int scrollPosFor(int offset, int len, int total, int page) {
+    if (total <= page || len <= 0) { return 0; }
+    int thumbLen = imax(1, len * page / total);
+    int range = total - page;
+    int room = len - thumbLen;
+    if (room <= 0) { return 0; }
+    int p = (offset - thumbLen / 2) * range / room;
+    if (p < 0) { p = 0; }
+    if (p > range) { p = range; }
+    return p;
+}
+
+// a scroll bar as a widget of its own (one cell wide or high): set total / page / pos, react to onScroll
+public class ScrollBar : Widget {
+public:
+    bool vertical;
+    int total;
+    int page;
+    int pos;
+    func onScroll;                  // int f(int scrollbar)  (pos changed)
+    bool dragging;
+
+    ScrollBar() { super(); vertical = true; }
+
+    virtual int prefW() { return vertical ? 1 : 10; }
+    virtual int prefH() { return vertical ? 10 : 1; }
+
+    void setPos(int p) {
+        int maxp = imax(0, total - page);
+        if (p < 0) { p = 0; }
+        if (p > maxp) { p = maxp; }
+        if (p == pos) { return; }
+        pos = p;
+        invalidate();
+        if (onScroll != null) { onScroll((int) this); }
+    }
+
+    void setRange(int t, int pg, int p) {
+        total = t;
+        page = pg;
+        int maxp = imax(0, total - page);
+        pos = imax(0, imin(p, maxp));
+        invalidate();
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        if (vertical) { drawVScroll(s, ox, oy, h, total, page, pos); }
+        else { drawHScroll(s, ox, oy, w, total, page, pos); }
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        int off = vertical ? ly : lx;
+        int len = vertical ? h : w;
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            dragging = true;
+            app->capture = this;
+            setPos(scrollPosFor(off, len, total, page));
+            return true;
+        }
+        if (dragging && e->action == term.MA_DRAG) { setPos(scrollPosFor(off, len, total, page)); return true; }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        if (e->action == term.MA_WHEEL) {
+            if (e->button == term.MB_WHEEL_UP) { setPos(pos - 3); } else if (e->button == term.MB_WHEEL_DOWN) { setPos(pos + 3); }
+            return true;
+        }
+        return false;
+    }
+}
+
+// =============================================================================
+//  TextInput: a one line editor
+// =============================================================================
+Text killBuffer;
+
+private bool isWordChar(int c) {
+    if (c >= '0' && c <= '9') { return true; }
+    if (c >= 'a' && c <= 'z') { return true; }
+    if (c >= 'A' && c <= 'Z') { return true; }
+    return c == '_' || c >= 128;
+}
+
+// the length of the longest common prefix of n strings (byte count)
+private int commonPrefix(char** c, int n) {
+    if (n <= 0) { return 0; }
+    int len = strlen(c[0]);
+    for (int i = 1; i < n; i++) {
+        int k = 0;
+        while (k < len && c[i][k] == c[0][k]) { k++; }
+        len = k;
+    }
+    return len;
+}
+
+// Keys: characters, Backspace, Delete, Left / Right (Ctrl or Alt: by word), Home / End, Shift extends the selection, Ctrl+A selects all,
+// Ctrl+K / Ctrl+U delete to the end / start of the line, Ctrl+W deletes the word before the cursor, Ctrl+Y puts the last deletion back,
+// Ctrl+C / Ctrl+X / Ctrl+V and Ctrl+Insert / Shift+Delete / Shift+Insert use the clipboard, Up / Down walk through the history,
+// Tab asks the completion hook. The mouse sets the cursor and selects (double click: a word).
+public class TextInput : Widget {
+public:
+    Text text;
+    int cur;                        // byte offset of the cursor
+    int anchor;                     // byte offset of the other end of the selection (== cur: none)
+    int scroll;                     // first visible column
+    bool password;
+    bool readOnly;
+    int maxLen;                     // in bytes, 0 = unlimited
+    char* placeholder;              // shown in the hint style while empty
+    func onChange;                  // int f(int input)
+    func onEnter;                   // int f(int input)  - Enter pressed (when not set, Enter is left to the dialog's default button)
+    func completer;                 // int f(int input, char* word, char** out, int max): fills out with the candidates, returns how many
+    bool useHistory;
+    Text hist[32];
+    int histN;
+    int histPos;
+    Text draft;
+    bool dragging;
+
+    TextInput(char* t = "") {
+        super();
+        text.set(t);
+        cur = text.len;
+        anchor = cur;
+        focusable = true;
+        useHistory = true;
+        histPos = -1;
+    }
+
+    virtual int prefW() { return 20; }
+    virtual int prefH() { return 1; }
+    virtual bool wantsText() { return true; }
+
+    char* getText() { return text.str(); }
+
+    // replaces the text; the cursor goes to the end
+    void setText(char* t) {
+        text.set(t);
+        cur = text.len;
+        anchor = cur;
+        scroll = 0;
+        invalidate();
+        if (onChange != null) { onChange((int) this); }
+    }
+
+    bool hasSelection() { return anchor != cur; }
+    void selectAll() { anchor = 0; cur = text.len; invalidate(); }
+
+    private int selStart() { return imin(cur, anchor); }
+    private int selEnd() { return imax(cur, anchor); }
+
+    // the selected text, copied (heap)
+    char* selectedText() {
+        if (!hasSelection()) { return ""; }
+        int a = selStart();
+        int n = selEnd() - a;
+        char* r = alloc(n + 1);
+        memcpy(r, &text.b[a], n);
+        return r;
+    }
+
+    private void changed() {
+        invalidate();
+        if (onChange != null) { onChange((int) this); }
+    }
+
+    void deleteSelection() {
+        if (!hasSelection()) { return; }
+        int a = selStart();
+        text.erase(a, selEnd() - a);
+        cur = a;
+        anchor = a;
+    }
+
+    // inserts text at the cursor (replacing the selection)
+    void insertText(char* s, int n) {
+        if (readOnly) { return; }
+        deleteSelection();
+        if (maxLen > 0 && text.len + n > maxLen) { n = imax(0, maxLen - text.len); }
+        // never cut in the middle of a character
+        while (n > 0 && (s[n] & 0xC0) == 0x80) { n--; }
+        text.insert(cur, s, n);
+        cur = cur + n;
+        anchor = cur;
+        changed();
+    }
+
+    private void moveTo(int pos, bool extend) {
+        cur = pos;
+        if (!extend) { anchor = cur; }
+        invalidate();
+    }
+
+    private int wordLeft(int pos) {
+        char* t = text.str();
+        while (pos > 0 && !isWordChar(t[pos - 1] & 255)) { pos = prevChar(t, pos); }
+        while (pos > 0 && isWordChar(t[pos - 1] & 255)) { pos = prevChar(t, pos); }
+        return pos;
+    }
+
+    private int wordRight(int pos) {
+        char* t = text.str();
+        while (t[pos] != 0 && !isWordChar(t[pos] & 255)) { pos = nextChar(t, pos); }
+        while (t[pos] != 0 && isWordChar(t[pos] & 255)) { pos = nextChar(t, pos); }
+        return pos;
+    }
+
+    private int byteOfCol(int col) {
+        char* t = text.str();
+        int pos = 0;
+        int c = 0;
+        while (t[pos] != 0) {
+            int cp;
+            int l = utf8.decode(t, pos, &cp);
+            int wd = password ? 1 : tscreen.runeWidth(cp);
+            if (c + wd > col) {
+                if (wd == 2 && col - c >= 1) { return pos + l; }
+                return pos;
+            }
+            c = c + wd;
+            pos = pos + l;
+        }
+        return pos;
+    }
+
+    private int colOfByte(int pos) {
+        if (password) { return countChars(pos); }
+        return tscreen.textWidthN(text.str(), pos);
+    }
+
+    private int countChars(int pos) {
+        char* t = text.str();
+        int n = 0;
+        int p = 0;
+        while (p < pos && t[p] != 0) { p = nextChar(t, p); n++; }
+        return n;
+    }
+
+    // adds the text to the history (called on Enter)
+    void addHistory(char* t) {
+        if (t[0] == 0) { return; }
+        if (histN > 0 && streq(hist[histN - 1].str(), t)) { histPos = -1; return; }
+        if (histN == 32) {
+            for (int i = 0; i < 31; i++) { hist[i].set(hist[i + 1].str()); }
+            histN = 31;
+        }
+        hist[histN].set(t);
+        histN++;
+        histPos = -1;
+    }
+
+    private void browseHistory(int dir) {
+        if (histN == 0) { return; }
+        if (histPos < 0) {
+            if (dir > 0) { return; }
+            draft.set(text.str());
+            histPos = histN - 1;
+        } else {
+            histPos = histPos + dir;
+            if (histPos < 0) { histPos = 0; }
+            if (histPos >= histN) {
+                histPos = -1;
+                text.set(draft.str());
+                cur = text.len; anchor = cur;
+                changed();
+                return;
+            }
+        }
+        text.set(hist[histPos].str());
+        cur = text.len;
+        anchor = cur;
+        changed();
+    }
+
+    // ---- completion ----------------------------------------------------------------------------------------------------------------------
+    // replaces the word before the cursor (from the last space) with s
+    void replaceWord(char* s) {
+        char* t = text.str();
+        int ws = cur;
+        while (ws > 0 && t[ws - 1] != ' ') { ws--; }
+        text.erase(ws, cur - ws);
+        text.insert(ws, s, strlen(s));
+        cur = ws + strlen(s);
+        anchor = cur;
+        changed();
+    }
+
+    private void complete() {
+        if (completer == null || readOnly) { return; }
+        char* t = text.str();
+        int ws = cur;
+        while (ws > 0 && t[ws - 1] != ' ') { ws--; }
+        char word[256];
+        int wl = imin(cur - ws, 255);
+        memcpy(&word[0], &t[ws], wl);
+        word[wl] = 0;
+        char* cands[64];
+        int n = completer((int) this, &word[0], &cands[0], 64);
+        if (n <= 0) { return; }
+        if (n == 1) { replaceWord(cands[0]); return; }
+        int cp = commonPrefix(&cands[0], n);
+        if (cp > wl) {
+            char pre[256];
+            int k = imin(cp, 255);
+            memcpy(&pre[0], cands[0], k);
+            pre[k] = 0;
+            replaceWord(&pre[0]);
+            return;
+        }
+        if (app != null) { app->showChoices(this, &cands[0], n); }
+    }
+
+    // ---- painting ------------------------------------------------------------------------------------------------------------------------
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        bool focus = hasFocus();
+        int base = enabled ? (focus ? theme->inputFocus : theme->input) : theme->disabled;
+        s->fill(ox, oy, w, 1, ' ', base);
+        int cc = colOfByte(cur);
+        if (cc < scroll) { scroll = cc; }
+        if (cc >= scroll + w) { scroll = cc - w + 1; }
+        if (scroll < 0) { scroll = 0; }
+        char* t = text.str();
+        if (t[0] == 0 && placeholder != null && !focus) {
+            s->textMax(ox, oy, placeholder, w, theme->hint);
+        }
+        int a = selStart();
+        int b = selEnd();
+        int pos = 0;
+        int col = 0;
+        while (t[pos] != 0) {
+            int cp;
+            int l = utf8.decode(t, pos, &cp);
+            int wd = tscreen.runeWidth(cp);
+            if (password) { cp = '*'; wd = 1; }
+            int cx = col - scroll;
+            bool inSel = hasSelection() && pos >= a && pos < b;
+            int st = inSel ? theme->inputSel : base;
+            if (wd > 0 && cx >= 0 && cx + wd <= w) { s->put(ox + cx, oy, cp, st); }
+            else if (wd > 0 && cx + wd > 0 && cx < w) { s->put(ox + imax(0, imin(cx, w - 1)), oy, ' ', st); }
+            col = col + wd;
+            pos = pos + l;
+        }
+        if (focus && app->cursorOk(this)) { s->setCursor(ox + cc - scroll, oy, 0); }
+    }
+
+    // ---- keys ----------------------------------------------------------------------------------------------------------------------------
+    virtual bool onKeyPress(term.Event* e) {
+        int k = e->key;
+        bool shift = (e->mods & term.MOD_SHIFT) != 0;
+        bool ctrl = (e->mods & term.MOD_CTRL) != 0;
+        bool alt = (e->mods & term.MOD_ALT) != 0;
+        char* t = text.str();
+        if (e->isChar()) {
+            char u[8];
+            int n = utf8.encode(k, &u[0]);
+            insertText(&u[0], n);
+            return true;
+        }
+        if (k == term.KEY_LEFT) {
+            if (hasSelection() && !shift && !ctrl && !alt) { moveTo(selStart(), false); }
+            else { moveTo((ctrl || alt) ? wordLeft(cur) : prevChar(t, cur), shift); }
+            return true;
+        }
+        if (k == term.KEY_RIGHT) {
+            if (hasSelection() && !shift && !ctrl && !alt) { moveTo(selEnd(), false); }
+            else { moveTo((ctrl || alt) ? wordRight(cur) : nextChar(t, cur), shift); }
+            return true;
+        }
+        if (k == term.KEY_HOME) { moveTo(0, shift); return true; }
+        if (k == term.KEY_END || (k == 'e' && ctrl)) { moveTo(text.len, shift); return true; }
+        if (k == 'a' && ctrl) { selectAll(); return true; }
+        if (readOnly) {
+            if (k == 'c' && ctrl && hasSelection()) { app->setClipboard(selectedText()); return true; }
+            return false;
+        }
+        if (k == term.KEY_BACKSPACE) {
+            if (hasSelection()) { deleteSelection(); }
+            else if (ctrl || alt) { int p = wordLeft(cur); text.erase(p, cur - p); cur = p; anchor = p; }
+            else if (cur > 0) { int p = prevChar(t, cur); text.erase(p, cur - p); cur = p; anchor = p; }
+            else { return true; }
+            changed();
+            return true;
+        }
+        if (k == term.KEY_DELETE && shift) {
+            if (hasSelection()) { app->setClipboard(selectedText()); deleteSelection(); changed(); }
+            return true;
+        }
+        if (k == term.KEY_DELETE || (k == 'd' && alt)) {
+            if (hasSelection()) { deleteSelection(); }
+            else if (ctrl || alt) { int p = wordRight(cur); text.erase(cur, p - cur); }
+            else if (t[cur] != 0) { text.erase(cur, nextChar(t, cur) - cur); }
+            else { return true; }
+            changed();
+            return true;
+        }
+        if (k == 'w' && ctrl) {
+            int p = wordLeft(cur);
+            if (p < cur) {
+                killBuffer.clear();
+                killBuffer.insert(0, &t[p], cur - p);
+                text.erase(p, cur - p);
+                cur = p; anchor = p;
+                changed();
+            }
+            return true;
+        }
+        if (k == 'k' && ctrl) {
+            if (cur < text.len) {
+                killBuffer.clear();
+                killBuffer.insert(0, &t[cur], text.len - cur);
+                text.erase(cur, text.len - cur);
+                changed();
+            }
+            return true;
+        }
+        if (k == 'u' && ctrl) {
+            if (cur > 0) {
+                killBuffer.clear();
+                killBuffer.insert(0, t, cur);
+                text.erase(0, cur);
+                cur = 0; anchor = 0;
+                changed();
+            }
+            return true;
+        }
+        if (k == 'y' && ctrl) { insertText(killBuffer.str(), killBuffer.len); return true; }
+        if ((k == 'c' && ctrl) || (k == term.KEY_INSERT && ctrl)) {
+            if (hasSelection()) { app->setClipboard(selectedText()); }
+            return true;
+        }
+        if (k == 'x' && ctrl) {
+            if (hasSelection()) { app->setClipboard(selectedText()); deleteSelection(); changed(); }
+            return true;
+        }
+        if ((k == 'v' && ctrl) || (k == term.KEY_INSERT && shift)) {
+            char* c = app->clipboard.str();
+            onPaste(c, app->clipboard.len);
+            return true;
+        }
+        if (k == term.KEY_UP && useHistory && histN > 0) { browseHistory(-1); return true; }
+        if (k == term.KEY_DOWN && useHistory && histN > 0) { browseHistory(1); return true; }
+        if (k == term.KEY_TAB && completer != null && e->mods == 0) { complete(); return true; }
+        if (k == term.KEY_ENTER && onEnter != null) {
+            if (useHistory) { addHistory(text.str()); }
+            onEnter((int) this);
+            return true;
+        }
+        return false;
+    }
+
+    virtual void onPaste(char* s, int n) {
+        if (readOnly) { return; }
+        char tmp[1024];
+        int m = imin(n, 1000);
+        for (int i = 0; i < m; i++) {
+            int c = s[i] & 255;
+            tmp[i] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+        }
+        insertText(&tmp[0], m);
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            int pos = byteOfCol(lx + scroll);
+            if (app->clicks >= 2) {
+                int a = wordLeft(pos);
+                int b = wordRight(pos);
+                if (a == b) { a = pos; b = pos; }
+                anchor = a;
+                cur = b;
+                invalidate();
+                return true;
+            }
+            moveTo(pos, (e->mods & term.MOD_SHIFT) != 0);
+            dragging = true;
+            app->capture = this;
+            return true;
+        }
+        if (dragging && e->action == term.MA_DRAG) { moveTo(byteOfCol(lx + scroll), true); return true; }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// =============================================================================
+//  ListView: items with a selection, scrolling and filter-as-you-type
+// =============================================================================
+// true if text contains pat (ASCII case insensitive)
+public bool containsFold(char* text, char* pat) {
+    int pl = strlen(pat);
+    if (pl == 0) { return true; }
+    for (int i = 0; text[i] != 0; i++) {
+        int k = 0;
+        while (k < pl && text[i + k] != 0 && lowerOf(text[i + k] & 255) == lowerOf(pat[k] & 255)) { k++; }
+        if (k == pl) { return true; }
+    }
+    return false;
+}
+
+// A list of text items. add() items, then the user moves the selection with Up / Down / PgUp / PgDn / Home / End or the mouse; Enter or a
+// double click calls onActivate. With filterable set, typed characters narrow the list to the items that contain them.
+public class ListView : Widget {
+public:
+    Pool pool;
+    int* off;                       // text offsets in the pool
+    int* ud;                        // user data per item
+    int* sty;                       // style per item (0: the list's)
+    int count;
+    int cap;
+    int* shown;                     // indexes of the items that pass the filter
+    int nshown;
+    int sel;                        // selected row in the shown list
+    int top;                        // first visible row
+    Text filter;
+    bool filterable;
+    bool scrollbar;                 // show a scroll bar when the list is longer than the view (default true)
+    func onSelect;                  // int f(int list)  - the selection changed
+    func onActivate;                // int f(int list)  - Enter or double click
+    func matcher;                   // optional: int f(int list, int item, char* filter) -> nonzero if the item passes
+    bool dragging;
+
+    ListView() {
+        super();
+        focusable = true;
+        scrollbar = true;
+    }
+
+    virtual int prefW() { return 20; }
+    virtual int prefH() { return 6; }
+    virtual bool wantsText() { return filterable; }
+
+    void clear() {
+        pool.reset();
+        count = 0;
+        nshown = 0;
+        sel = 0;
+        top = 0;
+        invalidate();
+    }
+
+    private void grow() {
+        if (count < cap) { return; }
+        int nc = imax(16, cap * 2);
+        int* a = (int*) alloc(nc * 8);
+        int* b = (int*) alloc(nc * 8);
+        int* c = (int*) alloc(nc * 8);
+        int* d = (int*) alloc(nc * 8);
+        for (int i = 0; i < count; i++) { a[i] = off[i]; b[i] = ud[i]; c[i] = sty[i]; d[i] = shown[i]; }
+        off = a; ud = b; sty = c; shown = d;
+        cap = nc;
+    }
+
+    // adds an item; returns its index
+    int add(char* t, int data = 0, int style = 0) {
+        grow();
+        off[count] = pool.add(t);
+        ud[count] = data;
+        sty[count] = style;
+        int idx = count;
+        count++;
+        if (passes(idx)) { shown[nshown] = idx; nshown++; }
+        invalidate();
+        return idx;
+    }
+
+    char* itemText(int i) { if (i < 0 || i >= count) { return ""; } return pool.at(off[i]); }
+    int itemData(int i) { if (i < 0 || i >= count) { return 0; } return ud[i]; }
+
+    // the index of the selected item, -1 if none
+    int selected() { if (sel < 0 || sel >= nshown) { return -1; } return shown[sel]; }
+    char* selectedText() { return itemText(selected()); }
+    int selectedData() { return itemData(selected()); }
+
+    private bool passes(int i) {
+        if (filter.len == 0) { return true; }
+        if (matcher != null) { return matcher((int) this, i, filter.str()) != 0; }
+        return containsFold(pool.at(off[i]), filter.str());
+    }
+
+    // applies the filter again
+    void rebuild() {
+        int keep = selected();
+        nshown = 0;
+        for (int i = 0; i < count; i++) { if (passes(i)) { shown[nshown] = i; nshown++; } }
+        sel = 0;
+        for (int i = 0; i < nshown; i++) { if (shown[i] == keep) { sel = i; } }
+        ensureVisible();
+        invalidate();
+    }
+
+    void setFilter(char* f) {
+        filter.set(f);
+        rebuild();
+        if (onSelect != null) { onSelect((int) this); }
+    }
+
+    // makes item i (an index into the whole list) the selection
+    void select(int i) {
+        for (int r = 0; r < nshown; r++) {
+            if (shown[r] == i) { setRow(r); return; }
+        }
+    }
+
+    private int rows() { return imax(1, h - (filter.len > 0 ? 1 : 0)); }
+
+    // keeps the scroll position inside the list (the wheel and the scroll bar may leave the selection out of view)
+    private void clampScroll() {
+        int r = rows();
+        if (sel < 0) { sel = 0; }
+        if (sel >= nshown) { sel = imax(0, nshown - 1); }
+        if (top > imax(0, nshown - r)) { top = imax(0, nshown - r); }
+        if (top < 0) { top = 0; }
+    }
+
+    // scrolls so that the selected row is visible
+    private void ensureVisible() {
+        int r = rows();
+        clampScroll();
+        if (sel < top) { top = sel; }
+        if (sel >= top + r) { top = sel - r + 1; }
+        clampScroll();
+    }
+
+    private void setRow(int r) {
+        int old = sel;
+        sel = r;
+        ensureVisible();
+        invalidate();
+        if (sel != old && onSelect != null) { onSelect((int) this); }
+    }
+
+    // how a row is drawn (override it for your own look): x, y, width of the row, the item index, is it the selected row
+    virtual void drawItem(tscreen.Screen* s, int x, int y, int width, int item, bool selectedRow, int base) {
+        int st = base;
+        if (sty[item] != 0 && !selectedRow) { st = sty[item]; }
+        s->textEllipsis(x + 1, y, pool.at(off[item]), width - 2, st);
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        clampScroll();
+        int r = rows();
+        int cw = w;
+        bool bar = scrollbar && nshown > r;
+        if (bar) { cw = w - 1; }
+        for (int i = 0; i < r; i++) {
+            int row = top + i;
+            int yy = oy + i;
+            if (row < nshown) {
+                bool isSel = row == sel;
+                int st = theme->text;
+                if (isSel) { st = hasFocus() ? theme->selection : theme->selectionDim; }
+                s->fill(ox, yy, cw, 1, ' ', st);
+                drawItem(s, ox, yy, cw, shown[row], isSel, st);
+            } else {
+                s->fill(ox, yy, cw, 1, ' ', theme->text);
+            }
+        }
+        if (bar) { drawVScroll(s, ox + w - 1, oy, r, nshown, r, top); }
+        if (filter.len > 0) {
+            s->fill(ox, oy + h - 1, w, 1, ' ', theme->hint);
+            s->text(ox + 1, oy + h - 1, "filter: ", theme->hint);
+            s->textMax(ox + 9, oy + h - 1, filter.str(), imax(0, w - 10), theme->info);
+        }
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        int k = e->key;
+        int r = rows();
+        if (k == term.KEY_UP) { setRow(imax(0, sel - 1)); return true; }
+        if (k == term.KEY_DOWN) { setRow(imin(nshown - 1, sel + 1)); return true; }
+        if (k == term.KEY_PGUP) { setRow(imax(0, sel - r + 1)); return true; }
+        if (k == term.KEY_PGDN) { setRow(imin(nshown - 1, sel + r - 1)); return true; }
+        if (k == term.KEY_HOME) { setRow(0); return true; }
+        if (k == term.KEY_END) { setRow(imax(0, nshown - 1)); return true; }
+        if (k == term.KEY_ENTER && e->mods == 0) {
+            if (onActivate != null && selected() >= 0) { onActivate((int) this); return true; }
+            return false;
+        }
+        if (filterable) {
+            if (e->isChar()) {
+                char u[8];
+                int n = utf8.encode(k, &u[0]);
+                filter.insert(filter.len, &u[0], n);
+                rebuild();
+                if (onSelect != null) { onSelect((int) this); }
+                return true;
+            }
+            if (k == term.KEY_BACKSPACE && filter.len > 0) {
+                filter.erase(prevChar(filter.str(), filter.len), filter.len);
+                rebuild();
+                if (onSelect != null) { onSelect((int) this); }
+                return true;
+            }
+            if (k == term.KEY_ESC && filter.len > 0) {
+                filter.clear();
+                rebuild();
+                if (onSelect != null) { onSelect((int) this); }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        int r = rows();
+        bool bar = scrollbar && nshown > r;
+        if (e->action == term.MA_WHEEL) {
+            if (e->button == term.MB_WHEEL_UP) { top = imax(0, top - 3); }
+            else if (e->button == term.MB_WHEEL_DOWN) { top = imax(0, imin(top + 3, nshown - r)); }
+            invalidate();
+            return true;
+        }
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            if (bar && lx == w - 1) {
+                dragging = true;
+                app->capture = this;
+                top = scrollPosFor(ly, r, nshown, r);
+                invalidate();
+                return true;
+            }
+            if (ly >= 0 && ly < r && top + ly < nshown) {
+                setRow(top + ly);
+                if (app->clicks >= 2 && onActivate != null) { onActivate((int) this); }
+            }
+            return true;
+        }
+        if (dragging && e->action == term.MA_DRAG) { top = scrollPosFor(ly, r, nshown, r); invalidate(); return true; }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// =============================================================================
+//  TabBar, TabView
+// =============================================================================
+public class TabBar : Widget {
+public:
+    Text titles[16];
+    int n;
+    int selected;
+    bool closable;
+    func onChange;                  // int f(int tabbar)
+    func onClose;                   // int f(int tabbar)  closeIndex tells which one was closed (the bar does not remove it)
+    int closeIndex;
+
+    TabBar() { super(); focusable = true; }
+
+    virtual int prefW() { return 20; }
+    virtual int prefH() { return 1; }
+
+    int add(char* t) {
+        if (n >= 16) { return -1; }
+        titles[n].set(t);
+        n++;
+        invalidate();
+        return n - 1;
+    }
+
+    void setTitle(int i, char* t) { if (i >= 0 && i < n) { titles[i].set(t); invalidate(); } }
+
+    void select(int i) {
+        if (i < 0 || i >= n || i == selected) { return; }
+        selected = i;
+        invalidate();
+        if (onChange != null) { onChange((int) this); }
+    }
+
+    void remove(int i) {
+        if (i < 0 || i >= n) { return; }
+        for (int k = i; k < n - 1; k++) { titles[k].set(titles[k + 1].str()); }
+        n--;
+        if (selected >= n) { selected = imax(0, n - 1); }
+        invalidate();
+    }
+
+    // the width of tab i including its padding
+    private int tabWidth(int i) { return labelWidth(titles[i].str()) + 2 + (closable ? 2 : 0); }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        s->fill(ox, oy, w, 1, ' ', theme->tab);
+        int x = ox;
+        for (int i = 0; i < n; i++) {
+            int tw = tabWidth(i);
+            int st = (i == selected) ? theme->tabSel : theme->tab;
+            if (i == selected && hasFocus()) { st = theme->selection; }
+            s->fill(x, oy, tw, 1, ' ', st);
+            drawLabel(s, x + 1, oy, titles[i].str(), imax(0, tw - 2), st, tscreen.withBg(theme->hot, tscreen.COL_KEEP));
+            if (closable) { s->put(x + tw - 2, oy, 0xD7, st); }
+            x = x + tw;
+            if (x >= ox + w) { break; }
+        }
+    }
+
+    // Alt+letter selects the tab whose title has that mnemonic ("&Output")
+    virtual bool handleMnemonic(int c) {
+        for (int i = 0; i < n; i++) {
+            if (mnemonicOf(titles[i].str()) == c && c != 0) { select(i); return true; }
+        }
+        return false;
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        if (e->key == term.KEY_LEFT) { select(selected - 1); return true; }
+        if (e->key == term.KEY_RIGHT) { select(selected + 1); return true; }
+        if (e->key == term.KEY_HOME) { select(0); return true; }
+        if (e->key == term.KEY_END) { select(n - 1); return true; }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            int x = 0;
+            for (int i = 0; i < n; i++) {
+                int tw = tabWidth(i);
+                if (lx >= x && lx < x + tw) {
+                    if (closable && lx == x + tw - 2) {
+                        closeIndex = i;
+                        if (onClose != null) { onClose((int) this); }
+                    } else {
+                        select(i);
+                    }
+                    return true;
+                }
+                x = x + tw;
+            }
+        }
+        return false;
+    }
+
+    virtual void onFocus(bool gained) { invalidate(); }
+}
+
+// a tab bar with pages: addPage(widget, "Title"); only the selected page is shown
+public class TabView : Widget {
+public:
+    TabBar* bar;
+    func onChange;                  // int f(int tabview)
+
+    TabView() {
+        super();
+        bar = new TabBar();
+        bar->onChange = tabChanged;
+        bar->userData = (int) this;
+        add(bar);
+    }
+
+    virtual int prefW() {
+        int pw = 0;
+        for (int i = 1; i < nkids; i++) { pw = imax(pw, kids[i]->getPrefW()); }
+        return imax(pw, 20);
+    }
+
+    virtual int prefH() {
+        int ph = 0;
+        for (int i = 1; i < nkids; i++) { ph = imax(ph, kids[i]->getPrefH()); }
+        return ph + 1;
+    }
+
+    int pageCount() { return nkids - 1; }
+    int current() { return bar->selected; }
+    Widget* page(int i) { if (i < 0 || i + 1 >= nkids) { return null; } return kids[i + 1]; }
+
+    int addPage(Widget* p, char* title) {
+        int i = bar->add(title);
+        add(p);
+        p->visible = (i == bar->selected);
+        return i;
+    }
+
+    void selectPage(int i) { bar->select(i); showCurrent(); }
+
+    void closePage(int i) {
+        Widget* p = page(i);
+        if (p == null) { return; }
+        bar->remove(i);
+        remove(p);
+        showCurrent();
+    }
+
+    void showCurrent() {
+        bool lost = false;
+        for (int i = 1; i < nkids; i++) {
+            bool show = i - 1 == bar->selected;
+            if (!show && kids[i]->visible && app != null && app->focus != null && kids[i]->contains(app->focus)) { lost = true; }
+            kids[i]->visible = show;
+        }
+        if (lost) {
+            // the focus was in the page that went away: it moves to the first widget of the new page (else to the tab bar)
+            Widget* cur = page(bar->selected);
+            if (cur == null || !app->focusFirstIn(cur)) { app->setFocus(bar); }
+        }
+        relayout();
+        invalidate();
+    }
+
+    virtual void layout() {
+        bar->setRect(0, 0, w, 1);
+        for (int i = 1; i < nkids; i++) {
+            kids[i]->setRect(0, 1, w, imax(0, h - 1));
+            kids[i]->layout();
+        }
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        if (e->key == term.KEY_PGDN && (e->mods & term.MOD_CTRL) != 0) { selectPage((bar->selected + 1) % imax(1, bar->n)); return true; }
+        if (e->key == term.KEY_PGUP && (e->mods & term.MOD_CTRL) != 0) { selectPage((bar->selected + bar->n - 1) % imax(1, bar->n)); return true; }
+        if (e->key >= '1' && e->key <= '9' && (e->mods & term.MOD_ALT) != 0 && e->key - '1' < bar->n) { selectPage(e->key - '1'); return true; }
+        return false;
+    }
+}
+
+int tabChanged(int bar) {
+    TabBar* b = (TabBar*) bar;
+    TabView* v = (TabView*) b->userData;
+    v->showCurrent();
+    if (v->onChange != null) { v->onChange((int) v); }
+    return 0;
+}
+
+// =============================================================================
+//  Splitter: two panes with a divider the mouse can drag
+// =============================================================================
+public class Splitter : Widget {
+public:
+    bool sideBySide;                // true: left | right, false: top over bottom
+    int ratio;                      // size of the first pane in 1/1000 of the available space
+    int minFirst;
+    int minSecond;
+    bool dragging;
+    func onMove;                    // int f(int splitter)
+
+    Splitter(bool side) {
+        super();
+        sideBySide = side;
+        ratio = 500;
+        minFirst = 3;
+        minSecond = 3;
+    }
+
+    virtual int prefW() { return 40; }
+    virtual int prefH() { return 10; }
+
+    private int total() { return (sideBySide ? w : h) - 1; }
+
+    // the size of the first pane in cells
+    int firstSize() {
+        int t = total();
+        int f = t * ratio / 1000;
+        if (f < minFirst) { f = minFirst; }
+        if (f > t - minSecond) { f = t - minSecond; }
+        if (f < 0) { f = 0; }
+        return f;
+    }
+
+    void setFirstSize(int cells) {
+        int t = total();
+        if (t <= 0) { return; }
+        ratio = (cells * 1000 + t - 1) / t;
+        relayout();
+        if (onMove != null) { onMove((int) this); }
+    }
+
+    virtual void layout() {
+        int f = firstSize();
+        int t = total();
+        Widget* a = (nkids > 0) ? kids[0] : null;
+        Widget* b = (nkids > 1) ? kids[1] : null;
+        if (sideBySide) {
+            if (a != null) { a->setRect(0, 0, f, h); a->layout(); }
+            if (b != null) { b->setRect(f + 1, 0, imax(0, t - f), h); b->layout(); }
+        } else {
+            if (a != null) { a->setRect(0, 0, w, f); a->layout(); }
+            if (b != null) { b->setRect(0, f + 1, w, imax(0, t - f)); b->layout(); }
+        }
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        int f = firstSize();
+        int st = dragging ? theme->borderFocus : theme->border;
+        if (sideBySide) { s->vline(ox + f, oy, h, 0x2502, st); }
+        else { s->hline(ox, oy + f, w, 0x2500, st); }
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        int f = firstSize();
+        int pos = sideBySide ? lx : ly;
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            if (pos == f) { dragging = true; app->capture = this; invalidate(); return true; }
+            return false;
+        }
+        if (dragging && (e->action == term.MA_DRAG || e->action == term.MA_MOVE)) { setFirstSize(pos); return true; }
+        if (e->action == term.MA_RELEASE && dragging) { dragging = false; invalidate(); return true; }
+        return false;
+    }
+}
+
+// =============================================================================
+//  menus: MenuItem, Menu, MenuBar, PopupMenu
+// =============================================================================
+class Menu;
+
+public class MenuItem {
+public:
+    Text text;                      // "&Save"  (& marks the mnemonic)
+    Text accel;                     // "Ctrl+S": shown on the right, and the shortcut works whenever the menu bar belongs to the app
+    int accelKey;
+    int accelMods;
+    func action;                    // int f(int item)
+    int userData;
+    bool enabled;
+    bool checked;
+    bool checkable;                 // choosing the item flips checked before the action runs (Menu.addCheck makes such items)
+    bool separator;
+    Menu* sub;                      // a submenu (action is ignored)
+
+    MenuItem() { enabled = true; }
+
+    void setAccel(char* spec) {
+        accel.set(spec);
+        accelKey = -1;
+        accelMods = 0;
+        if (spec[0] != 0) { accelKey = term.parseKey(spec, &accelMods); }
+    }
+
+    void run() {
+        if (!enabled) { return; }
+        if (checkable) { checked = !checked; }
+        if (action != null) { action((int) this); }
+    }
+}
+
+public class Menu {
+public:
+    Text title;                     // for a menu bar entry: "&File"
+    MenuItem** items;
+    int n;
+    int cap;
+
+    Menu(char* t = "") { title.set(t); }
+
+    MenuItem* addItem(MenuItem* it) {
+        if (n == cap) {
+            int nc = imax(8, cap * 2);
+            MenuItem** ni = (MenuItem**) alloc(nc * 8);
+            for (int i = 0; i < n; i++) { ni[i] = items[i]; }
+            items = ni;
+            cap = nc;
+        }
+        items[n] = it;
+        n++;
+        return it;
+    }
+
+    // adds an item; accel is the shortcut text such as "Ctrl+S"
+    MenuItem* add(char* text, func action, char* accel = "", int userData = 0) {
+        MenuItem* it = new MenuItem();
+        it->text.set(text);
+        it->action = action;
+        it->userData = userData;
+        it->setAccel(accel);
+        return addItem(it);
+    }
+
+    MenuItem* addCheck(char* text, bool checked, func action, char* accel = "", int userData = 0) {
+        MenuItem* it = add(text, action, accel, userData);
+        it->checked = checked;
+        it->checkable = true;
+        return it;
+    }
+
+    MenuItem* addSeparator() {
+        MenuItem* it = new MenuItem();
+        it->separator = true;
+        return addItem(it);
+    }
+
+    // adds an item that opens a submenu; returns the submenu to fill
+    Menu* addSub(char* text) {
+        MenuItem* it = new MenuItem();
+        it->text.set(text);
+        Menu* m = new Menu(text);
+        it->sub = m;
+        addItem(it);
+        return m;
+    }
+
+    void clear() { n = 0; }
+
+    // the item with a shortcut key, searching submenus too
+    MenuItem* findAccel(int key, int mods) {
+        for (int i = 0; i < n; i++) {
+            MenuItem* it = items[i];
+            if (it->sub != null) {
+                MenuItem* r = it->sub->findAccel(key, mods);
+                if (r != null) { return r; }
+            } else if (it->accelKey >= 0 && it->enabled && term.keyMatches(key, mods, it->accelKey, it->accelMods)) {
+                return it;
+            }
+        }
+        return null;
+    }
+}
+
+// the drop down of a menu (also used for context menus: app->popupMenu(menu, x, y)). Keys: Up / Down, Home / End, Enter, Right opens a
+// submenu (or moves to the next menu of the bar), Left closes it, Esc closes, a letter picks the item with that mnemonic.
+public class PopupMenu : Widget {
+public:
+    Menu* menu;
+    int sel;
+    MenuBar* owner;                 // the bar this drop down belongs to (null for a context menu)
+    PopupMenu* parentPopup;
+    PopupMenu* child;
+    bool armed;                     // the mouse moved over an item with the button held: releasing it picks the item
+
+    PopupMenu(Menu* m) {
+        super();
+        menu = m;
+        focusable = true;
+        shadow = true;
+        sel = -1;
+        measure();
+        nextSel(1);
+    }
+
+    private bool selectable(int i) {
+        if (i < 0 || i >= menu->n) { return false; }
+        MenuItem* it = menu->items[i];
+        return !it->separator && it->enabled;
+    }
+
+    private void nextSel(int dir) {
+        if (menu->n == 0) { return; }
+        int i = sel;
+        for (int k = 0; k < menu->n; k++) {
+            i = i + dir;
+            if (i < 0) { i = menu->n - 1; }
+            if (i >= menu->n) { i = 0; }
+            if (selectable(i)) { sel = i; invalidate(); return; }
+        }
+    }
+
+    void measure() {
+        int tw = 0;
+        int aw = 0;
+        bool arrow = false;
+        for (int i = 0; i < menu->n; i++) {
+            MenuItem* it = menu->items[i];
+            if (it->separator) { continue; }
+            tw = imax(tw, labelWidth(it->text.str()));
+            aw = imax(aw, tscreen.textWidth(it->accel.str()));
+            if (it->sub != null) { arrow = true; }
+        }
+        w = tw + (aw > 0 ? aw + 2 : (arrow ? 2 : 0)) + 6;
+        h = menu->n + 2;
+    }
+
+    virtual int prefW() { return w; }
+    virtual int prefH() { return h; }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        s->panel(ox, oy, w, h, tscreen.BOX_SINGLE, theme->menu);
+        for (int i = 0; i < menu->n; i++) {
+            MenuItem* it = menu->items[i];
+            int yy = oy + 1 + i;
+            if (it->separator) {
+                s->put(ox, yy, 0x251C, theme->menu);
+                s->hline(ox + 1, yy, w - 2, 0x2500, theme->menu);
+                s->put(ox + w - 1, yy, 0x2524, theme->menu);
+                continue;
+            }
+            int st = theme->menu;
+            if (!it->enabled) { st = theme->menuDisabled; }
+            if (i == sel) { st = theme->menuSel; }
+            s->fill(ox + 1, yy, w - 2, 1, ' ', st);
+            if (it->checked) { s->put(ox + 2, yy, 0x2713, st); }
+            drawLabel(s, ox + 4, yy, it->text.str(), w - 6, st, it->enabled ? tscreen.withBg(theme->hot, tscreen.COL_KEEP) : st);
+            if (it->sub != null) { s->put(ox + w - 3, yy, 0x25BA, st); }
+            else if (it->accel.len > 0) {
+                int aw = tscreen.textWidth(it->accel.str());
+                int ast = (i == sel) ? st : tscreen.style(tscreen.fgOf(theme->menuAccel), tscreen.bgOf(st), tscreen.attrOf(theme->menuAccel));
+                s->text(ox + w - 3 - aw, yy, it->accel.str(), ast);
+            }
+        }
+    }
+
+    // closes this popup and everything it opened (the ones above)
+    void closeChain() {
+        if (child != null) { child->closeChain(); child = null; }
+        if (app != null) { app->closeOverlay(this); }
+    }
+
+    // closes the whole menu (this popup, its parents and the bar's state)
+    void closeAll() {
+        PopupMenu* top = this;
+        while (top->parentPopup != null) { top = top->parentPopup; }
+        top->closeChain();
+        if (owner != null) { owner->menuClosed(); }
+        else if (top->owner != null) { top->owner->menuClosed(); }
+    }
+
+    private void openSub() {
+        if (!selectable(sel)) { return; }
+        MenuItem* it = menu->items[sel];
+        if (it->sub == null) { return; }
+        if (child != null) { child->closeChain(); child = null; }
+        PopupMenu* p = new PopupMenu(it->sub);
+        p->parentPopup = this;
+        p->x = x + w - 1;
+        p->y = y + sel;
+        child = p;
+        app->showOverlay(p, false);
+        app->fitOverlay(p);
+    }
+
+    private void choose() {
+        if (!selectable(sel)) { return; }
+        MenuItem* it = menu->items[sel];
+        if (it->sub != null) { openSub(); return; }
+        closeAll();
+        it->run();
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        int k = e->key;
+        if (k == term.KEY_UP) { nextSel(-1); return true; }
+        if (k == term.KEY_DOWN) { nextSel(1); return true; }
+        if (k == term.KEY_HOME) { sel = -1; nextSel(1); return true; }
+        if (k == term.KEY_END) { sel = menu->n; nextSel(-1); return true; }
+        if (k == term.KEY_ENTER || k == ' ') { choose(); return true; }
+        if (k == term.KEY_RIGHT) {
+            if (selectable(sel) && menu->items[sel]->sub != null) { openSub(); return true; }
+            if (owner != null) { owner->switchMenu(1); return true; }
+            return true;
+        }
+        if (k == term.KEY_LEFT) {
+            if (parentPopup != null) {
+                PopupMenu* pp = parentPopup;
+                App* a = app;
+                pp->child = null;
+                a->closeOverlay(this);
+                a->setFocus(pp);
+                return true;
+            }
+            if (owner != null) { owner->switchMenu(-1); }
+            return true;
+        }
+        if (k == term.fkey(10) && e->mods == 0 && (owner == null || !owner->noF10)) { closeAll(); return true; }
+        if (k == term.KEY_ESC) {
+            if (parentPopup != null) {
+                PopupMenu* pp = parentPopup;
+                App* a = app;
+                pp->child = null;
+                a->closeOverlay(this);
+                a->setFocus(pp);
+                return true;
+            }
+            closeAll();
+            return true;
+        }
+        if (e->isChar() || ((e->mods & term.MOD_ALT) == 0 && k >= 32 && k < 128)) {
+            int c = lowerOf(k);
+            for (int i = 0; i < menu->n; i++) {
+                MenuItem* it = menu->items[i];
+                if (it->separator || !it->enabled) { continue; }
+                if (mnemonicOf(it->text.str()) == c) { sel = i; choose(); return true; }
+            }
+        }
+        return true;                // a menu swallows other keys
+    }
+
+    private int rowAt(int ly) {
+        int i = ly - 1;
+        if (i < 0 || i >= menu->n) { return -1; }
+        return i;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        int i = rowAt(ly);
+        bool inside = lx > 0 && lx < w - 1;
+        if (e->action == term.MA_DRAG || e->action == term.MA_MOVE) {
+            if (inside && i >= 0 && selectable(i)) {
+                armed = true;
+                if (i != sel) {
+                    sel = i;
+                    if (child != null) { child->closeChain(); child = null; }
+                    if (menu->items[i]->sub != null && e->action == term.MA_MOVE) { openSub(); }
+                    invalidate();
+                }
+            }
+            return true;
+        }
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            if (inside && i >= 0 && selectable(i)) { sel = i; choose(); }
+            return true;
+        }
+        if (e->action == term.MA_RELEASE && e->button == term.MB_LEFT) {
+            if (armed && inside && i >= 0 && selectable(i)) { sel = i; choose(); }
+            return true;
+        }
+        return true;
+    }
+
+    // a click outside closes the menu
+    virtual bool onOutside(term.Event* e) {
+        if (e->action != term.MA_PRESS) { return false; }
+        // a click inside one of the child popups is not outside
+        PopupMenu* c = child;
+        while (c != null) {
+            if (e->x >= c->x && e->x < c->x + c->w && e->y >= c->y && e->y < c->y + c->h) { return false; }
+            c = c->child;
+        }
+        if (parentPopup != null) { return false; }          // the top popup of the chain decides
+        if (owner != null) { owner->closedByClick(e); }
+        closeAll();
+        return false;
+    }
+}
+
+public class MenuBar : Widget {
+public:
+    Menu* menus[12];
+    int n;
+    int openIdx;                    // the open menu, -1 none
+    bool noF10;                     // set it when F10 means something else in your program (then call openMenu(0) from your own key)
+    int lastClosedSeq;              // the event that closed a menu by a click on the bar (so the same click does not reopen it)
+    int lastClosedIdx;
+    PopupMenu* popup;
+
+    MenuBar() {
+        super();
+        openIdx = -1;
+        lastClosedIdx = -1;
+    }
+
+    virtual int prefW() { return 20; }
+    virtual int prefH() { return 1; }
+
+    Menu* addMenu(char* title) {
+        if (n >= 12) { return null; }
+        Menu* m = new Menu(title);
+        menus[n] = m;
+        n++;
+        invalidate();
+        return m;
+    }
+
+    // x of the title of menu i (relative to the bar)
+    private int titleX(int i) {
+        int x = 1;
+        for (int k = 0; k < i; k++) { x = x + labelWidth(menus[k]->title.str()) + 2; }
+        return x;
+    }
+
+    private int titleAt(int lx) {
+        for (int i = 0; i < n; i++) {
+            int x0 = titleX(i) - 1;
+            int x1 = x0 + labelWidth(menus[i]->title.str()) + 2;
+            if (lx >= x0 && lx < x1) { return i; }
+        }
+        return -1;
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        s->fill(ox, oy, w, 1, ' ', theme->menubar);
+        for (int i = 0; i < n; i++) {
+            int x = ox + titleX(i);
+            int st = (i == openIdx) ? theme->menubarSel : theme->menubar;
+            s->fill(x - 1, oy, labelWidth(menus[i]->title.str()) + 2, 1, ' ', st);
+            drawLabel(s, x, oy, menus[i]->title.str(), w, st, tscreen.withBg(theme->hot, tscreen.COL_KEEP));
+        }
+    }
+
+    // opens menu i (a drop down below its title) and gives it the focus
+    void openMenu(int i) {
+        if (i < 0 || i >= n || app == null) { return; }
+        closeMenu();
+        openIdx = i;
+        PopupMenu* p = new PopupMenu(menus[i]);
+        p->owner = this;
+        p->x = absX() + titleX(i) - 1;
+        p->y = absY() + 1;
+        popup = p;
+        app->showOverlay(p, false);
+        app->fitOverlay(p);
+        invalidate();
+    }
+
+    void closeMenu() {
+        if (popup != null) {
+            popup->closeChain();
+            popup = null;
+        }
+        openIdx = -1;
+        invalidate();
+    }
+
+    // called by the popup after it closed itself
+    void menuClosed() {
+        popup = null;
+        openIdx = -1;
+        invalidate();
+    }
+
+    void closedByClick(term.Event* e) {
+        if (e->y == absY()) {
+            lastClosedSeq = app->eventSeq;
+            lastClosedIdx = titleAt(e->x - absX());
+        }
+    }
+
+    void switchMenu(int dir) {
+        if (n == 0 || openIdx < 0) { return; }
+        int i = (openIdx + dir + n) % n;
+        openMenu(i);
+    }
+
+    // F10, Alt+mnemonic and the menu items' own shortcuts; true when the key was used
+    bool shortcut(term.Event* e) {
+        if (e->key == term.fkey(10) && e->mods == 0 && !noF10) {
+            if (openIdx >= 0) { closeMenu(); } else { openMenu(0); }
+            return true;
+        }
+        if ((e->mods & term.MOD_ALT) != 0 && (e->mods & term.MOD_CTRL) == 0 && e->key < term.KEY_BASE) {
+            int c = lowerOf(e->key);
+            for (int i = 0; i < n; i++) {
+                if (mnemonicOf(menus[i]->title.str()) == c) { openMenu(i); return true; }
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            MenuItem* it = menus[i]->findAccel(e->key, e->mods);
+            if (it != null) {
+                it->run();
+                return true;
+            }
+        }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS) {
+            int i = titleAt(lx);
+            if (i >= 0) {
+                if (lastClosedSeq == app->eventSeq && lastClosedIdx == i) { return true; }
+                openMenu(i);
+            } else {
+                closeMenu();
+            }
+            return true;
+        }
+        if ((e->action == term.MA_MOVE || e->action == term.MA_DRAG) && openIdx >= 0) {
+            int i = titleAt(lx);
+            if (i >= 0 && i != openIdx) { openMenu(i); }
+            return true;
+        }
+        return false;
+    }
+}
+
+// =============================================================================
+//  Dialog and Toast (overlays)
+// =============================================================================
+// A modal window: a title, a content widget and a row of buttons. addButton() adds buttons that close the dialog with a result code;
+// Esc closes it with cancelResult, Enter presses the default button. app->runDialog(d) shows it and waits (a nested event loop).
+public class Dialog : Widget {
+public:
+    Text title;
+    Widget* content;
+    Box* buttons;
+    Widget* initialFocus;           // the widget that gets the focus when the dialog is shown (default: the first one in the content)
+    int result;
+    int cancelResult;
+    bool open;
+    func onClose;                   // int f(int dialog)
+    bool dragging;
+    int dragDx;
+    int dragDy;
+    bool useDouble;
+
+    Dialog(char* t, Widget* c) {
+        super();
+        title.set(t);
+        content = c;
+        buttons = hbox(2, 0);
+        shadow = true;
+        cancelResult = 0;
+        if (c != null) { add(c); }
+        add(buttons);
+    }
+
+    // adds a button; pressing it closes the dialog with this result. Returns the button.
+    Button* addButton(char* label, int resultCode, bool isDefault = false) {
+        Button* b = new Button(label);
+        b->userData = resultCode;
+        b->onClick = dialogButton;
+        b->isDefault = isDefault;
+        buttons->add(b);
+        return b;
+    }
+
+    Button* defaultButton() {
+        for (int i = 0; i < buttons->nkids; i++) {
+            Button* b = (Button*) buttons->kids[i];
+            if (b->isDefault) { return b; }
+        }
+        return null;
+    }
+
+    void close(int r) {
+        if (!open) { return; }
+        result = r;
+        open = false;
+        if (app != null) { app->closeOverlay(this); }
+        if (onClose != null) { onClose((int) this); }
+    }
+
+    // the size the dialog needs
+    void fit(int minW = 0, int minH = 0) {
+        int cw = content != null ? content->getPrefW() : 0;
+        int ch = content != null ? content->getPrefH() : 0;
+        int bw = buttons->prefW();
+        w = imax(imax(cw + 4, bw + 4), imax(tscreen.textWidth(title.str()) + 8, minW));
+        h = imax(ch + 5, minH);
+        if (app != null) {
+            w = imin(w, app->cols);
+            h = imin(h, app->rows);
+        }
+    }
+
+    virtual int prefW() { return w; }
+    virtual int prefH() { return h; }
+
+    virtual void layout() {
+        if (content != null) {
+            content->setRect(2, 1, imax(0, w - 4), imax(0, h - 5));
+            content->layout();
+        }
+        int bw = buttons->prefW();
+        buttons->setRect(imax(2, (w - bw) / 2), h - 2, imin(bw, w - 4), 1);
+        buttons->layout();
+    }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        s->fill(ox, oy, w, h, ' ', theme->window);
+        s->box(ox, oy, w, h, useDouble ? tscreen.BOX_DOUBLE : tscreen.BOX_SINGLE, theme->borderFocus);
+        if (title.len > 0) {
+            int tw = imin(tscreen.textWidth(title.str()), w - 6);
+            int tx = ox + (w - tw) / 2;
+            s->put(tx - 1, oy, ' ', theme->borderFocus);
+            s->textMax(tx, oy, title.str(), tw, theme->title);
+            s->put(tx + tw, oy, ' ', theme->borderFocus);
+        }
+    }
+
+    virtual bool onKeyPress(term.Event* e) {
+        if (e->key == term.KEY_ESC) { close(cancelResult); return true; }
+        if (e->key == term.KEY_ENTER && e->mods == 0) {
+            Button* d = defaultButton();
+            if (d != null && d->enabled) { d->click(); return true; }
+            return false;
+        }
+        // arrows move between buttons
+        if ((e->key == term.KEY_LEFT || e->key == term.KEY_RIGHT) && app->focus != null && app->focus->parent == buttons) {
+            app->focusNext(e->key == term.KEY_RIGHT);
+            return true;
+        }
+        return false;
+    }
+
+    virtual bool onMouse(term.Event* e, int lx, int ly) {
+        if (e->button == term.MB_LEFT && e->action == term.MA_PRESS && ly == 0) {
+            dragging = true;
+            dragDx = lx;
+            app->capture = this;
+            return true;
+        }
+        if (dragging && e->action == term.MA_DRAG) {
+            x = e->x - dragDx;
+            y = e->y;
+            app->fitOverlay(this);
+            invalidate();
+            return true;
+        }
+        if (e->action == term.MA_RELEASE) { dragging = false; return true; }
+        return true;                // a modal dialog swallows mouse events inside it that the widgets did not use
+    }
+
+    virtual void onResize(int cols, int rows) {
+        app->fitOverlay(this);
+    }
+}
+
+int dialogButton(int button) {
+    Button* b = (Button*) button;
+    Dialog* d = (Dialog*) b->parent->parent;       // the button row is a child of the dialog
+    d->close(b->userData);
+    return 0;
+}
+
+// a short message at the bottom right that goes away by itself
+public class Toast : Widget {
+public:
+    Text text;
+    int style;
+    int timerId;
+
+    virtual int prefW() { return w; }
+    virtual int prefH() { return 1; }
+
+    virtual void paint(tscreen.Screen* s, int ox, int oy) {
+        s->fill(ox, oy, w, h, ' ', style);
+        s->textMax(ox + 1, oy, text.str(), w - 2, style);
+    }
+}
+
+int toastDone(int ud) {
+    Toast* t = (Toast*) ud;
+    if (t->app != null) { t->app->closeOverlay(t); }
+    return 0;
+}
+
+// =============================================================================
+//  App
+// =============================================================================
+const MAX_OVERLAYS = 16;
+const MAX_TIMERS = 64;
+const MAX_FDS = 16;
+const MAX_SHORTCUTS = 192;
+
+public class Command {
+public:
+    Text name;
+    Text keys;
+    func action;                    // int f(int userData)
+    int userData;
+}
+
+private int b64chars[64] = {65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+    97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 43, 47};
+
+public class App {
+public:
+    term.Terminal* tm;
+    term.Decoder* dec;
+    tscreen.Screen* screen;
+    tscreen.Out* out;
+    term.Caps* caps;
+    Widget* root;
+    Widget* focus;
+    Widget* capture;                // gets mouse events until the button is released
+    MenuBar* menubar;
+    bool running;
+    bool dirty;
+    bool needLayout;
+    bool headless;
+    int exitCode;
+    int cols;
+    int rows;
+    int clicks;                     // 1, 2, 3 ... for the mouse press that is being handled (double click)
+    int mouseX;
+    int mouseY;
+    int eventSeq;
+    int lastClickTime;
+    int lastClickX;
+    int lastClickY;
+    int lastClickBtn;
+    Text clipboard;
+    bool osc52;                     // also hand copied text to the terminal's clipboard (OSC 52)
+    func onIdle;                    // int f(int app)   - after events were handled
+    func onResizeHook;              // int f(int app)
+    func onKeyHook;                 // int f(int app, int event)  - first look at every key; return 1 if used
+    func onSuspend;                 // int f(int app)  before running an external program
+    func onResume;                  // int f(int app)  after
+    int frames;                     // frames written
+    int bytesOut;                   // bytes written to the terminal
+
+    Widget* overlays[16];
+    bool ovModal[16];
+    Widget* ovFocus[16];
+    int nov;
+
+    int tmId[64];
+    int tmDue[64];
+    int tmEvery[64];
+    int tmUser[64];
+    func tmFn[64];
+    int ntm;
+    int nextTimer;
+    int wakeTime;                   // the loop wakes up at this time (millis) at the latest; 0 none
+
+    int fdFd[16];
+    int fdUser[16];
+    func fdFn[16];
+    int nfd;
+
+    int scKey[192];
+    int scMods[192];
+    int scUser[192];
+    func scFn[192];
+    int nsc;
+
+    Command* commands[128];
+    int ncommands;
+
+    bool fakeClock;
+    int clockNow;
+    Text title;
+    bool probeSize;                 // ask the terminal for its size in start() even when the system reports one (serial consoles report 24x80)
+    int lastOutBytes;
+
+    App() {
+        nextTimer = 1;
+        dirty = true;
+        needLayout = true;
+        clicks = 1;
+        osc52 = true;
+    }
+
+    // ---- start and stop -----------------------------------------------------------------------------------------------------------------
+    // takes over the terminal: raw mode, alternate screen, mouse and paste reporting. false when there is no usable terminal.
+    bool start() {
+        tm = new term.Terminal();
+        if (!tm->open()) { return false; }
+        if (!tm->caps.cursorAddr) { return false; }
+        if (!tm->enter()) { return false; }
+        // the window size: the system knows it (ioctl) - or else the terminal is asked (CSI 18 t, then a cursor position report), then LINES / COLUMNS
+        // and 80x24 stay (they were applied by open()). TUI_PROBE=1 asks even when the system knows, TUI_PROBE=0 never asks.
+        char* pr = term.env("TUI_PROBE");
+        bool force = probeSize || (pr != null && pr[0] == '1');
+        bool never = pr != null && pr[0] == '0';
+        if ((force || !tm->sizeFromIoctl) && !never) { tm->probeSize(250); }
+        dec = tm->dec;
+        caps = &tm->caps;
+        cols = tm->cols;
+        rows = tm->rows;
+        screen = new tscreen.Screen(cols, rows);
+        out = new tscreen.Out();
+        theme = themeFor(caps);
+        osc52 = caps->title;
+        if (title.len > 0) { tm->setTitle(title.str()); }
+        return true;
+    }
+
+    // an App without a terminal: events come from feed(), the screen can be read with text(). depth: colours of the pretend terminal
+    void initHeadless(int c, int r, int depth = 16777216) {
+        headless = true;
+        dec = new term.Decoder();
+        caps = new term.Caps();
+        term.capsFor(caps, "xterm-256color", null, true, false);
+        caps->colors = depth;
+        cols = c;
+        rows = r;
+        screen = new tscreen.Screen(cols, rows);
+        out = new tscreen.Out();
+        theme = themeFor(caps);
+        fakeClock = true;
+    }
+
+    // gives the terminal back (the screen as it was, the cursor, the colours)
+    void stop() {
+        if (tm != null) { tm->close(); }
+    }
+
+    void quit(int code = 0) {
+        running = false;
+        exitCode = code;
+    }
+
+    void setTitle(char* t) {
+        title.set(t);
+        if (tm != null) { tm->setTitle(t); }
+    }
+
+    void setRoot(Widget* r) {
+        root = r;
+        r->parent = null;
+        r->attach(this);
+        needLayout = true;
+        dirty = true;
+        if (menubar != null) { menubar->attach(this); }
+    }
+
+    // the menu bar whose shortcuts (F10, Alt+letter, accelerators) work everywhere
+    void setMenuBar(MenuBar* m) {
+        menubar = m;
+        m->attach(this);
+    }
+
+    // runs until quit() is called (or the terminal hangs up); restores the terminal; returns the exit code
+    int run() {
+        running = true;
+        while (pump(-1)) { }
+        stop();
+        return exitCode;
+    }
+
+    // ---- time ----------------------------------------------------------------------------------------------------------------------------
+    int now() {
+        if (fakeClock) { return clockNow; }
+        return millis();
+    }
+
+    // for tests: the clock stands still until advanceClock
+    void advanceClock(int ms) {
+        fakeClock = true;
+        clockNow = clockNow + ms;
+    }
+
+    int addTimer(int ms, func f, int userData, bool repeat = false) {
+        if (ntm >= MAX_TIMERS) { return -1; }
+        tmId[ntm] = nextTimer;
+        tmDue[ntm] = now() + ms;
+        tmEvery[ntm] = repeat ? imax(1, ms) : 0;
+        tmUser[ntm] = userData;
+        tmFn[ntm] = f;
+        ntm++;
+        nextTimer++;
+        return nextTimer - 1;
+    }
+
+    void cancelTimer(int id) {
+        for (int i = 0; i < ntm; i++) {
+            if (tmId[i] == id) {
+                for (int k = i; k < ntm - 1; k++) {
+                    tmId[k] = tmId[k + 1]; tmDue[k] = tmDue[k + 1]; tmEvery[k] = tmEvery[k + 1]; tmUser[k] = tmUser[k + 1]; tmFn[k] = tmFn[k + 1];
+                }
+                ntm--;
+                return;
+            }
+        }
+    }
+
+    // make the loop wake up at a time (millis) to repaint
+    void wakeAt(int t) {
+        if (wakeTime == 0 || t < wakeTime) { wakeTime = t; }
+    }
+
+    private void runTimers() {
+        int t = now();
+        int i = 0;
+        while (i < ntm) {
+            if (tmDue[i] <= t) {
+                func f = tmFn[i];
+                int ud = tmUser[i];
+                int id = tmId[i];
+                if (tmEvery[i] > 0) { tmDue[i] = t + tmEvery[i]; }
+                else { cancelTimer(id); i--; }
+                f(ud);
+            }
+            i++;
+        }
+        if (wakeTime != 0 && wakeTime <= t) { wakeTime = 0; dirty = true; }
+    }
+
+    // ---- watching descriptors (pipes of child programs, sockets, ...) -----------------------------------------------------------------
+    // calls f(fd, userData) when fd has something to read (or was closed by the other side)
+    bool watchFd(int fd, func f, int userData) {
+        if (nfd >= MAX_FDS || tm == null) { return false; }
+        for (int i = 0; i < nfd; i++) { if (fdFd[i] == fd) { fdFn[i] = f; fdUser[i] = userData; return true; } }
+        fdFd[nfd] = fd;
+        fdFn[nfd] = f;
+        fdUser[nfd] = userData;
+        nfd++;
+        tm->watch(fd);
+        return true;
+    }
+
+    void unwatchFd(int fd) {
+        for (int i = 0; i < nfd; i++) {
+            if (fdFd[i] == fd) {
+                for (int k = i; k < nfd - 1; k++) { fdFd[k] = fdFd[k + 1]; fdFn[k] = fdFn[k + 1]; fdUser[k] = fdUser[k + 1]; }
+                nfd--;
+                break;
+            }
+        }
+        if (tm != null) { tm->unwatch(fd); }
+    }
+
+    // ---- shortcuts and commands ----------------------------------------------------------------------------------------------------------
+    // "Ctrl+S", "F5", "Alt+X" ...: calls f(userData). Returns false for a bad key name.
+    bool addShortcut(char* spec, func f, int userData = 0) {
+        int m = 0;
+        int k = term.parseKey(spec, &m);
+        if (k < 0 || nsc >= MAX_SHORTCUTS) { return false; }
+        for (int i = 0; i < nsc; i++) {
+            if (scKey[i] == k && scMods[i] == m) { scFn[i] = f; scUser[i] = userData; return true; }
+        }
+        scKey[nsc] = k; scMods[nsc] = m; scFn[nsc] = f; scUser[nsc] = userData;
+        nsc++;
+        return true;
+    }
+
+    // a named command (listed by the command palette); keys may be "" or a shortcut that is registered as well
+    Command* addCommand(char* name, char* keys, func f, int userData = 0) {
+        if (ncommands >= 128) { return null; }
+        Command* c = new Command();
+        c->name.set(name);
+        c->keys.set(keys);
+        c->action = f;
+        c->userData = userData;
+        commands[ncommands] = c;
+        ncommands++;
+        if (keys[0] != 0) { addShortcut(keys, f, userData); }
+        return c;
+    }
+
+    private bool runShortcut(term.Event* e) {
+        for (int i = 0; i < nsc; i++) {
+            if (term.keyMatches(e->key, e->mods, scKey[i], scMods[i])) {
+                scFn[i](scUser[i]);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ---- the clipboard -------------------------------------------------------------------------------------------------------------------
+    // keeps the text for pasting into text fields, and offers it to the terminal's clipboard (OSC 52) where that is allowed
+    void setClipboard(char* s) {
+        clipboard.set(s);
+        if (osc52 && tm != null && strlen(s) > 0 && strlen(s) < 70000) {
+            int n = strlen(s);
+            char* enc = alloc(n * 4 / 3 + 8);
+            int o = 0;
+            for (int i = 0; i < n; i = i + 3) {
+                int b0 = s[i] & 255;
+                int b1 = (i + 1 < n) ? (s[i + 1] & 255) : 0;
+                int b2 = (i + 2 < n) ? (s[i + 2] & 255) : 0;
+                enc[o] = b64chars[b0 >> 2];
+                enc[o + 1] = b64chars[((b0 & 3) << 4) | (b1 >> 4)];
+                enc[o + 2] = (i + 1 < n) ? b64chars[((b1 & 15) << 2) | (b2 >> 6)] : '=';
+                enc[o + 3] = (i + 2 < n) ? b64chars[b2 & 63] : '=';
+                o = o + 4;
+            }
+            enc[o] = 0;
+            tm->writeStr("\e]52;c;");
+            tm->write(enc, o);
+            tm->writeStr("\x07");
+        }
+    }
+
+    // ---- focus ---------------------------------------------------------------------------------------------------------------------------
+    void setFocus(Widget* w) {
+        if (w == focus) { return; }
+        Widget* old = focus;
+        focus = w;
+        if (old != null) {
+            old->onFocus(false);
+            if (old->onFocusChange != null) { old->onFocusChange((int) old); }
+        }
+        if (w != null) {
+            w->onFocus(true);
+            if (w->onFocusChange != null) { w->onFocusChange((int) w); }
+        }
+        dirty = true;
+    }
+
+    private int collect(Widget* w, Widget** outList, int n, int max) {
+        if (!w->visible) { return n; }
+        if (w->focusable && w->enabled && n < max) { outList[n] = w; n++; }
+        for (int i = 0; i < w->nkids; i++) { n = collect(w->kids[i], outList, n, max); }
+        return n;
+    }
+
+    Widget* scopeRoot() {
+        if (nov > 0) { return overlays[nov - 1]; }
+        return root;
+    }
+
+    // the widgets that can take the focus in the focus scope (the top overlay, else the whole tree), in tab order
+    int focusList(Widget** list, int max) {
+        Widget* sc = scopeRoot();
+        if (sc == null) { return 0; }
+        return collect(sc, list, 0, max);
+    }
+
+    void focusFirst() {
+        Widget* list[256];
+        int n = focusList(&list[0], 256);
+        if (n > 0) { setFocus(list[0]); } else { setFocus(null); }
+    }
+
+    void focusNext(bool forward) {
+        Widget* list[256];
+        int n = focusList(&list[0], 256);
+        if (n == 0) { return; }
+        int at = -1;
+        for (int i = 0; i < n; i++) { if (list[i] == focus) { at = i; } }
+        int to;
+        if (at < 0) { to = forward ? 0 : n - 1; }
+        else { to = forward ? (at + 1) % n : (at + n - 1) % n; }
+        setFocus(list[to]);
+    }
+
+    // gives the focus to the first widget in w (or w itself) that can take it; false when there is none
+    bool focusFirstIn(Widget* w) {
+        Widget* list[64];
+        int n = collect(w, &list[0], 0, 64);
+        if (n == 0) { return false; }
+        setFocus(list[0]);
+        return true;
+    }
+
+    bool cursorOk(Widget* w) {
+        if (nov == 0) { return true; }
+        return overlays[nov - 1]->contains(w);
+    }
+
+    // ---- overlays: dialogs, menus ----------------------------------------------------------------------------------------------------
+    void showOverlay(Widget* w, bool modal) {
+        if (nov >= MAX_OVERLAYS) { return; }
+        w->parent = null;
+        w->attach(this);
+        w->visible = true;
+        overlays[nov] = w;
+        ovModal[nov] = modal;
+        ovFocus[nov] = focus;
+        nov++;
+        w->layout();
+        if (w->focusable) { setFocus(w); }
+        else {
+            Widget* list[64];
+            int n = collect(w, &list[0], 0, 64);
+            if (n > 0) { setFocus(list[0]); }
+        }
+        dirty = true;
+    }
+
+    void closeOverlay(Widget* w) {
+        int at = -1;
+        for (int i = 0; i < nov; i++) { if (overlays[i] == w) { at = i; } }
+        if (at < 0) { return; }
+        Widget* saved = ovFocus[at];
+        bool hadFocus = focus == null || w->contains(focus);
+        for (int i = at; i < nov - 1; i++) { overlays[i] = overlays[i + 1]; ovModal[i] = ovModal[i + 1]; ovFocus[i] = ovFocus[i + 1]; }
+        nov--;
+        if (capture != null && w->contains(capture)) { capture = null; }
+        w->attach(null);
+        if (hadFocus) {
+            if (saved != null && root != null && (root->contains(saved) || isOverlayMember(saved))) { setFocus(saved); }
+            else { focusFirst(); }
+        }
+        dirty = true;
+    }
+
+    private bool isOverlayMember(Widget* w) {
+        for (int i = 0; i < nov; i++) { if (overlays[i]->contains(w)) { return true; } }
+        return false;
+    }
+
+    // moves an overlay so that it is inside the screen (a popup that would run off the bottom is moved up)
+    void fitOverlay(Widget* w) {
+        if (w->x + w->w > cols) { w->x = cols - w->w; }
+        if (w->y + w->h > rows) { w->y = rows - w->h; }
+        if (w->x < 0) { w->x = 0; }
+        if (w->y < 0) { w->y = 0; }
+    }
+
+    void centerOverlay(Widget* w) {
+        w->x = (cols - w->w) / 2;
+        w->y = (rows - w->h) / 3;
+        fitOverlay(w);
+    }
+
+    // shows a dialog in the middle of the screen and runs the event loop until it is closed; returns its result
+    int runDialog(Dialog* d) {
+        d->fit();
+        centerOverlay(d);
+        d->open = true;
+        d->result = d->cancelResult;
+        showOverlay(d, true);
+        dialogFocus(d);
+        bool was = running;
+        if (!was) { running = true; }
+        while (d->open) {
+            if (headless && dec->count() == 0) { break; }          // nobody can answer any more: the dialog is cancelled
+            if (!pump(-1)) { break; }
+        }
+        if (d->open) { d->close(d->cancelResult); }
+        if (!was) { running = false; }
+        return d->result;
+    }
+
+    // shows a dialog without waiting; the dialog's onClose is called when it closes
+    void showDialog(Dialog* d) {
+        d->fit();
+        centerOverlay(d);
+        d->open = true;
+        d->result = d->cancelResult;
+        showOverlay(d, true);
+        dialogFocus(d);
+    }
+
+    // the first focus of a dialog: its initialFocus, else the first focusable widget of the content, else the default button
+    private void dialogFocus(Dialog* d) {
+        if (d->initialFocus != null && d->initialFocus->canFocus()) { setFocus(d->initialFocus); return; }
+        Widget* list[64];
+        int n = collect(d->content != null ? d->content : d, &list[0], 0, 64);
+        if (n > 0) { setFocus(list[0]); }
+        else if (d->defaultButton() != null) { setFocus(d->defaultButton()); }
+    }
+
+    void popupMenu(Menu* m, int px, int py) {
+        PopupMenu* p = new PopupMenu(m);
+        p->x = px;
+        p->y = py;
+        showOverlay(p, false);
+        fitOverlay(p);
+    }
+
+    // a short message at the bottom right for ms milliseconds
+    void toast(char* text, int ms = 2000, int style = 0) {
+        Toast* t = new Toast();
+        t->text.set(text);
+        t->style = style != 0 ? style : theme->status;
+        t->w = imin(cols, tscreen.textWidth(text) + 4);
+        t->h = 1;
+        t->x = cols - t->w - 1;
+        t->y = rows - 2;
+        if (t->x < 0) { t->x = 0; }
+        showOverlay(t, false);
+        // a toast must not steal the focus
+        addTimer(ms, toastDone, (int) t);
+    }
+
+    // the completion candidates of a text input as a drop down below it
+    void showChoices(TextInput* input, char** cands, int n) {
+        Menu* m = new Menu("");
+        for (int i = 0; i < n; i++) {
+            MenuItem* it = m->add(cands[i], choicePicked, "", (int) input);
+            it->text.set(cands[i]);
+        }
+        PopupMenu* p = new PopupMenu(m);
+        p->x = input->absX();
+        p->y = input->absY() + 1;
+        showOverlay(p, false);
+        fitOverlay(p);
+    }
+
+    // ---- events --------------------------------------------------------------------------------------------------------------------------
+    private bool handleKey(term.Event* e) {
+        eventSeq++;
+        if (onKeyHook != null && onKeyHook((int) this, (int) e) != 0) { return true; }
+        bool modal = nov > 0 && ovModal[nov - 1];
+        bool popupOpen = nov > 0 && !ovModal[nov - 1];
+        Widget* f = focus;
+        if (f == null) { f = scopeRoot(); }
+        bool mod = (e->mods & (term.MOD_CTRL | term.MOD_ALT)) != 0 || (e->key >= term.KEY_F1 && e->key <= term.KEY_F24);
+        bool wants = f != null && f->wantsText();
+        if (!modal && !popupOpen && menubar != null && menubar->shortcut(e)) { return true; }
+        if (!modal && !popupOpen && mod && runShortcut(e)) { return true; }
+        // the focused widget and its parents
+        Widget* w = f;
+        while (w != null) {
+            if (w->hookKey(e)) { return true; }
+            if (w->enabled && w->onKeyPress(e)) { return true; }
+            w = w->parent;
+        }
+        // mnemonics: Alt+letter presses the matching button
+        if ((e->mods & term.MOD_ALT) != 0 && e->key < term.KEY_BASE && scopeRoot() != null) {
+            if (tryMnemonic(scopeRoot(), lowerOf(e->key))) { return true; }
+        }
+        if (e->key == term.KEY_TAB && (e->mods & ~term.MOD_SHIFT) == 0) {
+            focusNext((e->mods & term.MOD_SHIFT) == 0);
+            return true;
+        }
+        if (!mod && !wants && !modal && !popupOpen && runShortcut(e)) { return true; }
+        return false;
+    }
+
+    private bool tryMnemonic(Widget* w, int c) {
+        if (!w->visible || !w->enabled) { return false; }
+        if (w->handleMnemonic(c)) { return true; }
+        for (int i = 0; i < w->nkids; i++) {
+            if (tryMnemonic(w->kids[i], c)) { return true; }
+        }
+        return false;
+    }
+
+    private void toLocal(Widget* w, term.Event* e, int* lx, int* ly) {
+        *lx = e->x - w->absX();
+        *ly = e->y - w->absY();
+    }
+
+    private bool handleMouse(term.Event* e) {
+        eventSeq++;
+        mouseX = e->x;
+        mouseY = e->y;
+        bool press = e->action == term.MA_PRESS;
+        if (press) {
+            int t = now();
+            if (e->button == lastClickBtn && e->x == lastClickX && e->y == lastClickY && t - lastClickTime < 450) { clicks++; } else { clicks = 1; }
+            lastClickTime = t;
+            lastClickX = e->x;
+            lastClickY = e->y;
+            lastClickBtn = e->button;
+        }
+        if (capture != null) {
+            Widget* c = capture;
+            int lx;
+            int ly;
+            toLocal(c, e, &lx, &ly);
+            if (e->action == term.MA_RELEASE) { capture = null; }
+            c->onMouse(e, lx, ly);
+            return true;
+        }
+        Widget* target = null;
+        for (int i = nov - 1; i >= 0 && target == null; i--) {
+            Widget* ov = overlays[i];
+            if (e->x >= ov->x && e->x < ov->x + ov->w && e->y >= ov->y && e->y < ov->y + ov->h) {
+                target = ov->hit(e->x - ov->x, e->y - ov->y);
+                if (target == null) { target = ov; }
+            }
+        }
+        if (target == null && nov > 0) {
+            // outside every overlay: popups close, a modal dialog swallows the click
+            Widget* snap[16];
+            bool mod[16];
+            int n = nov;
+            for (int i = 0; i < n; i++) { snap[i] = overlays[i]; mod[i] = ovModal[i]; }
+            for (int i = n - 1; i >= 0; i--) {
+                if (mod[i]) { return true; }
+                if (snap[i]->onOutside(e)) { return true; }
+            }
+        }
+        if (target == null && root != null) { target = root->hit(e->x, e->y); }
+        if (target == null) { return false; }
+        if (press) {
+            Widget* f = target;
+            while (f != null && !f->canFocus()) { f = f->parent; }
+            if (f != null) { setFocus(f); }
+        }
+        Widget* w = target;
+        while (w != null) {
+            if (w->enabled) {
+                int lx;
+                int ly;
+                toLocal(w, e, &lx, &ly);
+                if (w->onMouse(e, lx, ly)) { return true; }
+            }
+            w = w->parent;
+        }
+        if (press && e->button == term.MB_RIGHT) {
+            w = target;
+            while (w != null) {
+                if (w->onContext != null) { w->onContext((int) w); return true; }
+                w = w->parent;
+            }
+        }
+        return false;
+    }
+
+    private void handlePaste(term.Event* e) {
+        Widget* f = focus;
+        if (f != null && f->enabled) { f->onPaste(e->text, e->len); dirty = true; }
+    }
+
+    private void handleResize(int c, int r) {
+        if (c < 1 || r < 1) { return; }
+        cols = c;
+        rows = r;
+        screen->resize(c, r);
+        if (root != null) { root->setRect(0, 0, c, r); }
+        for (int i = 0; i < nov; i++) { overlays[i]->onResize(c, r); }
+        needLayout = true;
+        dirty = true;
+        if (onResizeHook != null) { onResizeHook((int) this); }
+    }
+
+    // sets the screen size as if the terminal had been resized (tests; with a terminal the size comes from the system)
+    void resizeTo(int c, int r) {
+        handleResize(c, r);
+    }
+
+    private void dispatch(term.Event* e) {
+        int k = e->kind;
+        if (k == term.EV_KEY) { handleKey(e); dirty = true; }
+        else if (k == term.EV_MOUSE) { handleMouse(e); }
+        else if (k == term.EV_PASTE) { handlePaste(e); }
+        else if (k == term.EV_RESIZE) { handleResize(e->x, e->y); }
+        else if (k == term.EV_FD) {
+            for (int i = 0; i < nfd; i++) {
+                if (fdFd[i] == e->key) { fdFn[i](fdFd[i], fdUser[i]); break; }
+            }
+        }
+        else if (k == term.EV_RESUME) { screen->invalidate(); dirty = true; }
+        else if (k == term.EV_HUP) { running = false; }
+    }
+
+    // ---- drawing -------------------------------------------------------------------------------------------------------------------------
+    // lays the widgets out and paints them (everything) into the screen buffer
+    void draw() {
+        if (needLayout) {
+            needLayout = false;
+            if (root != null) { root->setRect(0, 0, cols, rows); root->layout(); }
+            if (menubar != null && menubar->parent == null) { }
+            for (int i = 0; i < nov; i++) { overlays[i]->layout(); }
+        }
+        dirty = false;
+        if (focus == null && root != null && nov == 0) { focusFirst(); }
+        screen->resetClip();
+        screen->clear(theme->desktop);
+        if (theme->desktopRune != ' ') { screen->fill(0, 0, cols, rows, theme->desktopRune, theme->desktop); }
+        screen->hideCursor();
+        if (root != null) { root->paintTree(screen, root->x, root->y); }
+        for (int i = 0; i < nov; i++) {
+            Widget* ov = overlays[i];
+            if (ov->shadow) { screen->shadow(ov->x + 2, ov->y + 1, ov->w, ov->h); }
+            ov->paintTree(screen, ov->x, ov->y);
+        }
+    }
+
+    // writes the changes to the terminal; returns the number of bytes
+    int present() {
+        out->clear();
+        screen->render(out, caps);
+        lastOutBytes = out->n;
+        if (out->n > 0) {
+            frames++;
+            bytesOut = bytesOut + out->n;
+            if (tm != null) { tm->write(out->b, out->n); }
+        }
+        return out->n;
+    }
+
+    // the screen as plain text (for tests); paints first when something changed
+    char* text() {
+        if (dirty || needLayout) { draw(); }
+        return screen->dump();
+    }
+
+    // ---- the loop ------------------------------------------------------------------------------------------------------------------------
+    // One round: paint if needed, wait for events (at most maxWaitMs, -1 for ever, 0 only looks), handle them, run the timers.
+    // Returns false when the program should end.
+    bool pump(int maxWaitMs) {
+        if (dirty || needLayout) { draw(); present(); }
+        int wait = maxWaitMs;
+        if (tm != null) {
+            int t = now();
+            for (int i = 0; i < ntm; i++) {
+                int d = imax(0, tmDue[i] - t);
+                if (wait < 0 || d < wait) { wait = d; }
+            }
+            if (wakeTime != 0) {
+                int d = imax(0, wakeTime - t);
+                if (wait < 0 || d < wait) { wait = d; }
+            }
+            tm->wait(wait);
+            if (tm->eof) { running = false; }
+        }
+        term.Event e;
+        while (dec->next(&e)) { dispatch(&e); }
+        runTimers();
+        if (onIdle != null) { onIdle((int) this); }
+        if (dirty || needLayout) { draw(); present(); }
+        return running;
+    }
+
+    // stops the whole program like Ctrl+Z in a shell does (the terminal is put back first) and redraws when it is continued with fg. Does nothing
+    // useful where there is no job control (AOS): use runShell there.
+    void suspendProcess() {
+        if (tm == null) { return; }
+        tm->suspendSelf();
+        screen->invalidate();
+        dirty = true;
+    }
+
+    // ---- external programs ---------------------------------------------------------------------------------------------------------------
+    // leaves the full screen mode, runs the shell command (an interactive shell when command is null), comes back and redraws
+    int runShell(char* command) {
+        if (onSuspend != null) { onSuspend((int) this); }
+        int st = 0;
+        if (tm != null) { st = tm->runShell(command); }
+        screen->invalidate();
+        dirty = true;
+        if (onResume != null) { onResume((int) this); }
+        return st;
+    }
+
+    int runProgram(char** argv) {
+        if (onSuspend != null) { onSuspend((int) this); }
+        int st = 0;
+        if (tm != null) { st = tm->runProgram(argv); }
+        screen->invalidate();
+        dirty = true;
+        if (onResume != null) { onResume((int) this); }
+        return st;
+    }
+
+    // ---- driving the app from tests --------------------------------------------------------------------------------------------------
+    // feeds bytes as if the terminal had sent them (a lone Esc at the end is resolved) and handles the events
+    void feed(char* bytes) {
+        dec->feedText(bytes);
+        dec->flush();
+        bool was = running;
+        pump(0);
+        running = was;
+    }
+
+    // queues bytes like feed() but does not handle them yet (for code that blocks, like runDialog, in a test)
+    void inject(char* bytes) {
+        dec->feedText(bytes);
+        dec->flush();
+    }
+
+    // presses a key by name: "Ctrl+S", "Alt+F", "Down", "Shift+Tab", "x"
+    void press(char* spec) {
+        int m = 0;
+        int k = term.parseKey(spec, &m);
+        char buf[32];
+        int n = term.encodeKey(k, m, &buf[0]);
+        buf[n] = 0;
+        feed(&buf[0]);
+    }
+
+    // types text (UTF-8)
+    void type(char* s) { feed(s); }
+
+    // a mouse button press and release at a cell (button 1 left, 2 middle, 3 right)
+    void click(int x, int y, int button = 1) {
+        mouseDown(x, y, button);
+        mouseUp(x, y, button);
+    }
+
+    void mouseDown(int x, int y, int button = 1) {
+        char b[48];
+        format(&b[0], 48, "\e[<%d;%d;%dM", button - 1, x + 1, y + 1, 0);
+        feed(&b[0]);
+    }
+
+    void mouseUp(int x, int y, int button = 1) {
+        char b[48];
+        format(&b[0], 48, "\e[<%d;%d;%dm", button - 1, x + 1, y + 1, 0);
+        feed(&b[0]);
+    }
+
+    void mouseDrag(int x, int y, int button = 1) {
+        char b[48];
+        format(&b[0], 48, "\e[<%d;%d;%dM", button - 1 + 32, x + 1, y + 1, 0);
+        feed(&b[0]);
+    }
+
+    void wheel(int x, int y, bool up) {
+        char b[48];
+        format(&b[0], 48, "\e[<%d;%d;%dM", up ? 64 : 65, x + 1, y + 1, 0);
+        feed(&b[0]);
+    }
+
+    void paste(char* s) {
+        dec->feedText("\e[200~");
+        dec->feedText(s);
+        dec->feedText("\e[201~");
+        dec->flush();
+        bool was = running;
+        pump(0);
+        running = was;
+    }
+}
+
+int choicePicked(int item) {
+    MenuItem* it = (MenuItem*) item;
+    TextInput* t = (TextInput*) it->userData;
+    t->replaceWord(it->text.str());
+    return 0;
+}

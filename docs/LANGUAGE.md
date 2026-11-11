@@ -1000,6 +1000,7 @@ code only to programs that import them, and a file of the same name next to your
 | `log` | leveled logging with timestamps and colours: `debug info warn error` (+ `f` variants), `setLevel setFd setTimestamps` |
 | `testing` | `assertEq assertStrEq check summary` for unit tests |
 | `clib` (and `cctype climits cerrno cassert cstring cstdlib cstdio ctime cunistd cmath cfloat ccomplex clocale cwchar`) | the C standard library, see [12c](#12c-the-c-library) and [CLIB.md](CLIB.md) |
+| `term`, `tscreen`, `tui`, `tuix` | terminal user interfaces: keys, mouse and capabilities (`term`), cells, colours and the diff renderer (`tscreen`), widgets, menus, dialogs and the application loop (`tui`), tree, table, text pane, file / colour dialogs and the command palette (`tuix`); see [TUI.md](TUI.md) |
 | `net` | TCP / UDP networking and DNS, see [12a](#12a-networking) |
 | `http` | HTTP/1.1 client and server, see [12a](#12a-networking) |
 | `netaddr`, `packet`, `netif`, `dns`, `conn`, `websocket`, `netutil`, `rawnet` | addresses, packets (ARP, IP, ICMP, UDP, TCP, pcap), interfaces / ARP table / routes / connections, DNS records, buffered connections and a poller, WebSocket, ping / Wake-on-LAN / NTP, raw frames: see [12e](#12e-the-networking-modules) |

@@ -1,0 +1,1005 @@
+// =============================================================================
+//  tscreen - cells, colours, character widths, drawing primitives and the diff renderer          import tscreen;
+//
+//    tscreen.Screen s(80, 24);               // Screen* s = new tscreen.Screen(80, 24); also works
+//    s.clear(0);
+//    s.box(2, 1, 30, 5, tscreen.BOX_ROUND, tscreen.style(tscreen.CYAN, 0, 0));
+//    s.text(4, 2, "Hello, wide world: \xe4\xb8\x96\xe7\x95\x8c", tscreen.style(tscreen.rgb(255, 200, 0), 0, tscreen.A_BOLD));
+//    tscreen.Out out();  term.Caps caps();
+//    s.render(&out, &caps);                  // out.b / out.n: the escape sequences that bring the terminal up to date (only what changed)
+//    println(s.dump());                      // the screen as plain text (for tests)
+//
+//  A style is ONE int: foreground colour (26 bits) | background colour << 26 | attributes << 52. A colour is 0 (the terminal's default),
+//  rgb(r, g, b), or idx(n) (palette entry n; 0..15 are the ANSI colours: BLACK RED GREEN YELLOW BLUE MAGENTA CYAN WHITE and their
+//  BRIGHT_ versions). Colours are downgraded when the terminal cannot show them: truecolor -> 256 -> 16 -> 8 -> none, always to the
+//  nearest colour. As a background COL_KEEP means "whatever is there already" (text on top of a panel).
+//
+//  Everything that draws is clipped to the current clip rectangle (pushClip / popClip). Wide characters (CJK, emoji) take two cells,
+//  combining marks are attached to the cell before them (up to three), control characters are ignored. Ambiguous width counts as 1.
+// =============================================================================
+import term;
+import utf8;
+module tscreen;
+
+// ---- colours ---------------------------------------------------------------------------------------------------------------------------
+public const COL_DEFAULT = 0;
+public const COL_KEEP = 0x3000000;
+
+public const BLACK = 0x2000000;
+public const RED = 0x2000001;
+public const GREEN = 0x2000002;
+public const YELLOW = 0x2000003;
+public const BLUE = 0x2000004;
+public const MAGENTA = 0x2000005;
+public const CYAN = 0x2000006;
+public const WHITE = 0x2000007;
+public const GRAY = 0x2000008;
+public const BRIGHT_BLACK = 0x2000008;
+public const BRIGHT_RED = 0x2000009;
+public const BRIGHT_GREEN = 0x200000A;
+public const BRIGHT_YELLOW = 0x200000B;
+public const BRIGHT_BLUE = 0x200000C;
+public const BRIGHT_MAGENTA = 0x200000D;
+public const BRIGHT_CYAN = 0x200000E;
+public const BRIGHT_WHITE = 0x200000F;
+
+public const A_BOLD = 1;
+public const A_DIM = 2;
+public const A_ITALIC = 4;
+public const A_UNDERLINE = 8;
+public const A_REVERSE = 16;
+public const A_BLINK = 32;
+public const A_STRIKE = 64;
+
+public const BOX_NONE = 0;
+public const BOX_SINGLE = 1;
+public const BOX_DOUBLE = 2;
+public const BOX_ROUND = 3;
+public const BOX_HEAVY = 4;
+
+public int rgb(int r, int g, int b) { return 0x1000000 | ((r & 255) << 16) | ((g & 255) << 8) | (b & 255); }
+public int hex(int v) { return 0x1000000 | (v & 0xFFFFFF); }
+public int idx(int n) { return 0x2000000 | (n & 255); }
+
+public int style(int fg, int bg, int attr = 0) { return fg | (bg << 26) | (attr << 52); }
+public int fgOf(int s) { return s & 0x3FFFFFF; }
+public int bgOf(int s) { return (s >> 26) & 0x3FFFFFF; }
+public int attrOf(int s) { return (s >> 52) & 255; }
+public int withFg(int s, int c) { return (s & ~0x3FFFFFF) | c; }
+public int withBg(int s, int c) { return (s & ~(0x3FFFFFF << 26)) | (c << 26); }
+public int withAttr(int s, int a) { return (s & ~(255 << 52)) | (a << 52); }
+public int addAttr(int s, int a) { return s | (a << 52); }
+public int delAttr(int s, int a) { return s & ~(a << 52); }
+
+// the channels of an RGB colour
+public int redOf(int c) { return (c >> 16) & 255; }
+public int greenOf(int c) { return (c >> 8) & 255; }
+public int blueOf(int c) { return c & 255; }
+
+int pal16[16] = {0x000000, 0xCD0000, 0x00CD00, 0xCDCD00, 0x0000EE, 0xCD00CD, 0x00CDCD, 0xE5E5E5,
+                 0x7F7F7F, 0xFF0000, 0x00FF00, 0xFFFF00, 0x5C5CFF, 0xFF00FF, 0x00FFFF, 0xFFFFFF};
+
+// 0xRRGGBB of entry n of the xterm 256 colour palette
+public int paletteRgb(int n) {
+    n = n & 255;
+    if (n < 16) { return pal16[n]; }
+    if (n < 232) {
+        int v = n - 16;
+        int r = v / 36;
+        int g = (v / 6) % 6;
+        int b = v % 6;
+        r = (r == 0) ? 0 : 55 + r * 40;
+        g = (g == 0) ? 0 : 55 + g * 40;
+        b = (b == 0) ? 0 : 55 + b * 40;
+        return (r << 16) | (g << 8) | b;
+    }
+    int gray = 8 + (n - 232) * 10;
+    return (gray << 16) | (gray << 8) | gray;
+}
+
+// 0xRRGGBB of a colour value; -1 for the default colour (and COL_KEEP)
+public int rgbOf(int c) {
+    int kind = (c >> 24) & 3;
+    if (kind == 1) { return c & 0xFFFFFF; }
+    if (kind == 2) { return paletteRgb(c & 255); }
+    return -1;
+}
+
+// distance between two 0xRRGGBB colours (the "redmean" approximation of perceived difference)
+private int dist(int a, int b) {
+    int r1 = (a >> 16) & 255;
+    int g1 = (a >> 8) & 255;
+    int b1 = a & 255;
+    int dr = r1 - ((b >> 16) & 255);
+    int dg = g1 - ((b >> 8) & 255);
+    int db = b1 - (b & 255);
+    int rm = (r1 + ((b >> 16) & 255)) / 2;
+    return (((512 + rm) * dr * dr) >> 8) + 4 * dg * dg + (((767 - rm) * db * db) >> 8);
+}
+
+// the nearest of the 16 ANSI colours (0..15) for a 0xRRGGBB value
+public int nearest16(int c) {
+    int best = 0;
+    int bd = 0x7FFFFFFF;
+    for (int i = 0; i < 16; i++) {
+        int d = dist(c, pal16[i]);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+// the nearest entry (16..255) of the 6x6x6 colour cube or the gray ramp (the cube corners around the colour and the grays near its brightness are tried)
+public int nearest256(int c) {
+    int levels[6] = {0, 95, 135, 175, 215, 255};
+    int ch3[3];
+    ch3[0] = (c >> 16) & 255;
+    ch3[1] = (c >> 8) & 255;
+    ch3[2] = c & 255;
+    int lo[3];
+    for (int k = 0; k < 3; k++) {
+        int i = 0;
+        while (i < 4 && levels[i + 1] <= ch3[k]) { i++; }
+        lo[k] = i;
+    }
+    int best = 16;
+    int bd = 0x7FFFFFFF;
+    for (int m = 0; m < 8; m++) {
+        int ri = lo[0] + (m & 1);
+        int gi = lo[1] + ((m >> 1) & 1);
+        int bi = lo[2] + ((m >> 2) & 1);
+        if (ri > 5 || gi > 5 || bi > 5) { continue; }
+        int n = 16 + 36 * ri + 6 * gi + bi;
+        int d = dist(c, (levels[ri] << 16) | (levels[gi] << 8) | levels[bi]);
+        if (d < bd) { bd = d; best = n; }
+    }
+    int gray = (ch3[0] + ch3[1] + ch3[2]) / 3;
+    int g0 = (gray - 8) / 10;
+    for (int g = g0 - 1; g <= g0 + 1; g++) {
+        if (g < 0 || g > 23) { continue; }
+        int d = dist(c, paletteRgb(232 + g));
+        if (d < bd) { bd = d; best = 232 + g; }
+    }
+    return best;
+}
+
+// the colour as it will be shown by a terminal with that many colours (term.COLORS_...): a colour value again
+public int downgrade(int c, int depth) {
+    int kind = (c >> 24) & 3;
+    if (kind == 0 || kind == 3) { return c; }
+    if (depth == term.COLORS_NONE) { return COL_DEFAULT; }
+    if (depth >= term.COLORS_TRUE) { return c; }
+    if (kind == 2) {
+        int n = c & 255;
+        if (depth == term.COLORS_256 || n < 16) {
+            if (depth == term.COLORS_8 && n >= 8) { return idx(n - 8); }
+            return c;
+        }
+        c = paletteRgb(n);
+    } else {
+        c = c & 0xFFFFFF;
+    }
+    if (depth == term.COLORS_256) { return idx(nearest256(c)); }
+    int n16 = nearest16(c);
+    if (depth == term.COLORS_8 && n16 >= 8) { n16 = n16 - 8; }
+    return idx(n16);
+}
+
+// ---- character widths ------------------------------------------------------------------------------------------------------------------
+// BEGIN WIDTH TABLES (generated by docs/gen_width.py from Unicode 15.1.0)
+const ZERO_RANGES = 357;
+const WIDE_RANGES = 120;
+int zeroWLo[357] = {
+    0x300, 0x483, 0x591, 0x5BF, 0x5C1, 0x5C4, 0x5C7, 0x600, 0x610, 0x61C, 0x64B, 0x670, 0x6D6, 0x6DF, 0x6E7, 0x6EA, 0x70F, 0x711,
+    0x730, 0x7A6, 0x7EB, 0x7FD, 0x816, 0x81B, 0x825, 0x829, 0x859, 0x890, 0x898, 0x8CA, 0x93A, 0x93C, 0x941, 0x94D, 0x951, 0x962,
+    0x981, 0x9BC, 0x9C1, 0x9CD, 0x9E2, 0x9FE, 0xA01, 0xA3C, 0xA41, 0xA47, 0xA4B, 0xA51, 0xA70, 0xA75, 0xA81, 0xABC, 0xAC1, 0xAC7,
+    0xACD, 0xAE2, 0xAFA, 0xB01, 0xB3C, 0xB3F, 0xB41, 0xB4D, 0xB55, 0xB62, 0xB82, 0xBC0, 0xBCD, 0xC00, 0xC04, 0xC3C, 0xC3E, 0xC46,
+    0xC4A, 0xC55, 0xC62, 0xC81, 0xCBC, 0xCBF, 0xCC6, 0xCCC, 0xCE2, 0xD00, 0xD3B, 0xD41, 0xD4D, 0xD62, 0xD81, 0xDCA, 0xDD2, 0xDD6,
+    0xE31, 0xE34, 0xE47, 0xEB1, 0xEB4, 0xEC8, 0xF18, 0xF35, 0xF37, 0xF39, 0xF71, 0xF80, 0xF86, 0xF8D, 0xF99, 0xFC6, 0x102D,
+    0x1032, 0x1039, 0x103D, 0x1058, 0x105E, 0x1071, 0x1082, 0x1085, 0x108D, 0x109D, 0x1160, 0x135D, 0x1712, 0x1732, 0x1752,
+    0x1772, 0x17B4, 0x17B7, 0x17C6, 0x17C9, 0x17DD, 0x180B, 0x1885, 0x18A9, 0x1920, 0x1927, 0x1932, 0x1939, 0x1A17, 0x1A1B,
+    0x1A56, 0x1A58, 0x1A60, 0x1A62, 0x1A65, 0x1A73, 0x1A7F, 0x1AB0, 0x1B00, 0x1B34, 0x1B36, 0x1B3C, 0x1B42, 0x1B6B, 0x1B80,
+    0x1BA2, 0x1BA8, 0x1BAB, 0x1BE6, 0x1BE8, 0x1BED, 0x1BEF, 0x1C2C, 0x1C36, 0x1CD0, 0x1CD4, 0x1CE2, 0x1CED, 0x1CF4, 0x1CF8,
+    0x1DC0, 0x200B, 0x202A, 0x2060, 0x2066, 0x20D0, 0x2CEF, 0x2D7F, 0x2DE0, 0x302A, 0x3099, 0xA66F, 0xA674, 0xA69E, 0xA6F0,
+    0xA802, 0xA806, 0xA80B, 0xA825, 0xA82C, 0xA8C4, 0xA8E0, 0xA8FF, 0xA926, 0xA947, 0xA980, 0xA9B3, 0xA9B6, 0xA9BC, 0xA9E5,
+    0xAA29, 0xAA31, 0xAA35, 0xAA43, 0xAA4C, 0xAA7C, 0xAAB0, 0xAAB2, 0xAAB7, 0xAABE, 0xAAC1, 0xAAEC, 0xAAF6, 0xABE5, 0xABE8,
+    0xABED, 0xFB1E, 0xFE00, 0xFE20, 0xFEFF, 0xFFF9, 0x101FD, 0x102E0, 0x10376, 0x10A01, 0x10A05, 0x10A0C, 0x10A38, 0x10A3F,
+    0x10AE5, 0x10D24, 0x10EAB, 0x10EFD, 0x10F46, 0x10F82, 0x11001, 0x11038, 0x11070, 0x11073, 0x1107F, 0x110B3, 0x110B9, 0x110BD,
+    0x110C2, 0x110CD, 0x11100, 0x11127, 0x1112D, 0x11173, 0x11180, 0x111B6, 0x111C9, 0x111CF, 0x1122F, 0x11234, 0x11236, 0x1123E,
+    0x11241, 0x112DF, 0x112E3, 0x11300, 0x1133B, 0x11340, 0x11366, 0x11370, 0x11438, 0x11442, 0x11446, 0x1145E, 0x114B3, 0x114BA,
+    0x114BF, 0x114C2, 0x115B2, 0x115BC, 0x115BF, 0x115DC, 0x11633, 0x1163D, 0x1163F, 0x116AB, 0x116AD, 0x116B0, 0x116B7, 0x1171D,
+    0x11722, 0x11727, 0x1182F, 0x11839, 0x1193B, 0x1193E, 0x11943, 0x119D4, 0x119DA, 0x119E0, 0x11A01, 0x11A33, 0x11A3B, 0x11A47,
+    0x11A51, 0x11A59, 0x11A8A, 0x11A98, 0x11C30, 0x11C38, 0x11C3F, 0x11C92, 0x11CAA, 0x11CB2, 0x11CB5, 0x11D31, 0x11D3A, 0x11D3C,
+    0x11D3F, 0x11D47, 0x11D90, 0x11D95, 0x11D97, 0x11EF3, 0x11F00, 0x11F36, 0x11F40, 0x11F42, 0x13430, 0x13447, 0x16AF0, 0x16B30,
+    0x16F4F, 0x16F8F, 0x16FE4, 0x1BC9D, 0x1BCA0, 0x1CF00, 0x1CF30, 0x1D167, 0x1D173, 0x1D185, 0x1D1AA, 0x1D242, 0x1DA00, 0x1DA3B,
+    0x1DA75, 0x1DA84, 0x1DA9B, 0x1DAA1, 0x1E000, 0x1E008, 0x1E01B, 0x1E023, 0x1E026, 0x1E08F, 0x1E130, 0x1E2AE, 0x1E2EC, 0x1E4EC,
+    0x1E8D0, 0x1E944, 0xE0001, 0xE0020, 0xE0100
+};
+int zeroWHi[357] = {
+    0x36F, 0x489, 0x5BD, 0x5BF, 0x5C2, 0x5C5, 0x5C7, 0x605, 0x61A, 0x61C, 0x65F, 0x670, 0x6DD, 0x6E4, 0x6E8, 0x6ED, 0x70F, 0x711,
+    0x74A, 0x7B0, 0x7F3, 0x7FD, 0x819, 0x823, 0x827, 0x82D, 0x85B, 0x891, 0x89F, 0x902, 0x93A, 0x93C, 0x948, 0x94D, 0x957, 0x963,
+    0x981, 0x9BC, 0x9C4, 0x9CD, 0x9E3, 0x9FE, 0xA02, 0xA3C, 0xA42, 0xA48, 0xA4D, 0xA51, 0xA71, 0xA75, 0xA82, 0xABC, 0xAC5, 0xAC8,
+    0xACD, 0xAE3, 0xAFF, 0xB01, 0xB3C, 0xB3F, 0xB44, 0xB4D, 0xB56, 0xB63, 0xB82, 0xBC0, 0xBCD, 0xC00, 0xC04, 0xC3C, 0xC40, 0xC48,
+    0xC4D, 0xC56, 0xC63, 0xC81, 0xCBC, 0xCBF, 0xCC6, 0xCCD, 0xCE3, 0xD01, 0xD3C, 0xD44, 0xD4D, 0xD63, 0xD81, 0xDCA, 0xDD4, 0xDD6,
+    0xE31, 0xE3A, 0xE4E, 0xEB1, 0xEBC, 0xECE, 0xF19, 0xF35, 0xF37, 0xF39, 0xF7E, 0xF84, 0xF87, 0xF97, 0xFBC, 0xFC6, 0x1030,
+    0x1037, 0x103A, 0x103E, 0x1059, 0x1060, 0x1074, 0x1082, 0x1086, 0x108D, 0x109D, 0x11FF, 0x135F, 0x1714, 0x1733, 0x1753,
+    0x1773, 0x17B5, 0x17BD, 0x17C6, 0x17D3, 0x17DD, 0x180F, 0x1886, 0x18A9, 0x1922, 0x1928, 0x1932, 0x193B, 0x1A18, 0x1A1B,
+    0x1A56, 0x1A5E, 0x1A60, 0x1A62, 0x1A6C, 0x1A7C, 0x1A7F, 0x1ACE, 0x1B03, 0x1B34, 0x1B3A, 0x1B3C, 0x1B42, 0x1B73, 0x1B81,
+    0x1BA5, 0x1BA9, 0x1BAD, 0x1BE6, 0x1BE9, 0x1BED, 0x1BF1, 0x1C33, 0x1C37, 0x1CD2, 0x1CE0, 0x1CE8, 0x1CED, 0x1CF4, 0x1CF9,
+    0x1DFF, 0x200F, 0x202E, 0x2064, 0x206F, 0x20F0, 0x2CF1, 0x2D7F, 0x2DFF, 0x302D, 0x309A, 0xA672, 0xA67D, 0xA69F, 0xA6F1,
+    0xA802, 0xA806, 0xA80B, 0xA826, 0xA82C, 0xA8C5, 0xA8F1, 0xA8FF, 0xA92D, 0xA951, 0xA982, 0xA9B3, 0xA9B9, 0xA9BD, 0xA9E5,
+    0xAA2E, 0xAA32, 0xAA36, 0xAA43, 0xAA4C, 0xAA7C, 0xAAB0, 0xAAB4, 0xAAB8, 0xAABF, 0xAAC1, 0xAAED, 0xAAF6, 0xABE5, 0xABE8,
+    0xABED, 0xFB1E, 0xFE0F, 0xFE2F, 0xFEFF, 0xFFFB, 0x101FD, 0x102E0, 0x1037A, 0x10A03, 0x10A06, 0x10A0F, 0x10A3A, 0x10A3F,
+    0x10AE6, 0x10D27, 0x10EAC, 0x10EFF, 0x10F50, 0x10F85, 0x11001, 0x11046, 0x11070, 0x11074, 0x11081, 0x110B6, 0x110BA, 0x110BD,
+    0x110C2, 0x110CD, 0x11102, 0x1112B, 0x11134, 0x11173, 0x11181, 0x111BE, 0x111CC, 0x111CF, 0x11231, 0x11234, 0x11237, 0x1123E,
+    0x11241, 0x112DF, 0x112EA, 0x11301, 0x1133C, 0x11340, 0x1136C, 0x11374, 0x1143F, 0x11444, 0x11446, 0x1145E, 0x114B8, 0x114BA,
+    0x114C0, 0x114C3, 0x115B5, 0x115BD, 0x115C0, 0x115DD, 0x1163A, 0x1163D, 0x11640, 0x116AB, 0x116AD, 0x116B5, 0x116B7, 0x1171F,
+    0x11725, 0x1172B, 0x11837, 0x1183A, 0x1193C, 0x1193E, 0x11943, 0x119D7, 0x119DB, 0x119E0, 0x11A0A, 0x11A38, 0x11A3E, 0x11A47,
+    0x11A56, 0x11A5B, 0x11A96, 0x11A99, 0x11C36, 0x11C3D, 0x11C3F, 0x11CA7, 0x11CB0, 0x11CB3, 0x11CB6, 0x11D36, 0x11D3A, 0x11D3D,
+    0x11D45, 0x11D47, 0x11D91, 0x11D95, 0x11D97, 0x11EF4, 0x11F01, 0x11F3A, 0x11F40, 0x11F42, 0x13440, 0x13455, 0x16AF4, 0x16B36,
+    0x16F4F, 0x16F92, 0x16FE4, 0x1BC9E, 0x1BCA3, 0x1CF2D, 0x1CF46, 0x1D169, 0x1D182, 0x1D18B, 0x1D1AD, 0x1D244, 0x1DA36, 0x1DA6C,
+    0x1DA75, 0x1DA84, 0x1DA9F, 0x1DAAF, 0x1E006, 0x1E018, 0x1E021, 0x1E024, 0x1E02A, 0x1E08F, 0x1E136, 0x1E2AE, 0x1E2EF, 0x1E4EF,
+    0x1E8D6, 0x1E94A, 0xE0001, 0xE007F, 0xE01EF
+};
+int wideWLo[120] = {
+    0x1100, 0x231A, 0x2329, 0x23E9, 0x23F0, 0x23F3, 0x25FD, 0x2614, 0x2648, 0x267F, 0x2693, 0x26A1, 0x26AA, 0x26BD, 0x26C4,
+    0x26CE, 0x26D4, 0x26EA, 0x26F2, 0x26F5, 0x26FA, 0x26FD, 0x2705, 0x270A, 0x2728, 0x274C, 0x274E, 0x2753, 0x2757, 0x2795,
+    0x27B0, 0x27BF, 0x2B1B, 0x2B50, 0x2B55, 0x2E80, 0x2E9B, 0x2F00, 0x2FF0, 0x3041, 0x3099, 0x3105, 0x3131, 0x3190, 0x31EF,
+    0x3220, 0x3250, 0x4E00, 0xA490, 0xA960, 0xAC00, 0xF900, 0xFE10, 0xFE30, 0xFE54, 0xFE68, 0xFF01, 0xFFE0, 0x16FE0, 0x16FF0,
+    0x17000, 0x18800, 0x18D00, 0x1AFF0, 0x1AFF5, 0x1AFFD, 0x1B000, 0x1B132, 0x1B150, 0x1B155, 0x1B164, 0x1B170, 0x1F004, 0x1F0CF,
+    0x1F18E, 0x1F191, 0x1F200, 0x1F210, 0x1F240, 0x1F250, 0x1F260, 0x1F300, 0x1F32D, 0x1F337, 0x1F37E, 0x1F3A0, 0x1F3CF, 0x1F3E0,
+    0x1F3F4, 0x1F3F8, 0x1F440, 0x1F442, 0x1F4FF, 0x1F54B, 0x1F550, 0x1F57A, 0x1F595, 0x1F5A4, 0x1F5FB, 0x1F680, 0x1F6CC, 0x1F6D0,
+    0x1F6D5, 0x1F6DC, 0x1F6EB, 0x1F6F4, 0x1F7E0, 0x1F7F0, 0x1F90C, 0x1F93C, 0x1F947, 0x1FA70, 0x1FA80, 0x1FA90, 0x1FABF, 0x1FACE,
+    0x1FAE0, 0x1FAF0, 0x20000, 0x30000
+};
+int wideWHi[120] = {
+    0x115F, 0x231B, 0x232A, 0x23EC, 0x23F0, 0x23F3, 0x25FE, 0x2615, 0x2653, 0x267F, 0x2693, 0x26A1, 0x26AB, 0x26BE, 0x26C5,
+    0x26CE, 0x26D4, 0x26EA, 0x26F3, 0x26F5, 0x26FA, 0x26FD, 0x2705, 0x270B, 0x2728, 0x274C, 0x274E, 0x2755, 0x2757, 0x2797,
+    0x27B0, 0x27BF, 0x2B1C, 0x2B50, 0x2B55, 0x2E99, 0x2EF3, 0x2FD5, 0x303E, 0x3096, 0x30FF, 0x312F, 0x318E, 0x31E3, 0x321E,
+    0x3247, 0x4DBF, 0xA48C, 0xA4C6, 0xA97C, 0xD7A3, 0xFAFF, 0xFE19, 0xFE52, 0xFE66, 0xFE6B, 0xFF60, 0xFFE6, 0x16FE4, 0x16FF1,
+    0x187F7, 0x18CD5, 0x18D08, 0x1AFF3, 0x1AFFB, 0x1AFFE, 0x1B122, 0x1B132, 0x1B152, 0x1B155, 0x1B167, 0x1B2FB, 0x1F004, 0x1F0CF,
+    0x1F18E, 0x1F19A, 0x1F202, 0x1F23B, 0x1F248, 0x1F251, 0x1F265, 0x1F320, 0x1F335, 0x1F37C, 0x1F393, 0x1F3CA, 0x1F3D3, 0x1F3F0,
+    0x1F3F4, 0x1F43E, 0x1F440, 0x1F4FC, 0x1F53D, 0x1F54E, 0x1F567, 0x1F57A, 0x1F596, 0x1F5A4, 0x1F64F, 0x1F6C5, 0x1F6CC, 0x1F6D2,
+    0x1F6D7, 0x1F6DF, 0x1F6EC, 0x1F6FC, 0x1F7EB, 0x1F7F0, 0x1F93A, 0x1F945, 0x1F9FF, 0x1FA7C, 0x1FA88, 0x1FABD, 0x1FAC5, 0x1FADB,
+    0x1FAE8, 0x1FAF8, 0x2FFFD, 0x3FFFD
+};
+// END WIDTH TABLES
+
+private bool inTable(int cp, int* lo, int* hi, int n) {
+    int a = 0;
+    int b = n - 1;
+    while (a <= b) {
+        int m = (a + b) / 2;
+        if (cp < lo[m]) { b = m - 1; }
+        else if (cp > hi[m]) { a = m + 1; }
+        else { return true; }
+    }
+    return false;
+}
+
+// how many cells a character takes: 0 (controls and combining marks), 1 or 2 (East Asian wide and fullwidth, emoji)
+public int runeWidth(int cp) {
+    if (cp < 0x300) {
+        if (cp < 32 || (cp >= 0x7F && cp < 0xA0)) { return 0; }
+        return 1;
+    }
+    if (inTable(cp, &zeroWLo[0], &zeroWHi[0], ZERO_RANGES)) { return 0; }
+    if (cp >= 0x1100 && inTable(cp, &wideWLo[0], &wideWHi[0], WIDE_RANGES)) { return 2; }
+    return 1;
+}
+
+// the number of cells a UTF-8 text takes
+public int textWidth(char* s) {
+    int w = 0;
+    int pos = 0;
+    while (s[pos] != 0) {
+        int cp;
+        pos = pos + utf8.decode(s, pos, &cp);
+        w = w + runeWidth(cp);
+    }
+    return w;
+}
+
+// the same for the first n bytes
+public int textWidthN(char* s, int n) {
+    int w = 0;
+    int pos = 0;
+    while (pos < n && s[pos] != 0) {
+        int cp;
+        pos = pos + utf8.decode(s, pos, &cp);
+        w = w + runeWidth(cp);
+    }
+    return w;
+}
+
+// how many bytes of s fit into maxCells cells (the longest prefix that is at most that wide, never cutting a character)
+public int fitBytes(char* s, int maxCells) {
+    int w = 0;
+    int pos = 0;
+    while (s[pos] != 0) {
+        int cp;
+        int l = utf8.decode(s, pos, &cp);
+        int cw = runeWidth(cp);
+        if (w + cw > maxCells) { break; }
+        w = w + cw;
+        pos = pos + l;
+    }
+    return pos;
+}
+
+// ---- an output buffer ------------------------------------------------------------------------------------------------------------------
+public class Out {
+    public char* b;
+    public int n;
+    public int cap;
+
+    public Out() {
+        cap = 16384;
+        b = alloc(cap);
+    }
+
+    public void clear() { n = 0; b[0] = 0; }
+
+    private void room(int more) {
+        if (n + more + 1 <= cap) { return; }
+        int nc = cap * 2;
+        while (nc < n + more + 1) { nc = nc * 2; }
+        char* nb = alloc(nc);
+        memcpy(nb, b, n);
+        b = nb;
+        cap = nc;
+    }
+
+    public void putc(int c) { room(1); b[n] = c; n++; b[n] = 0; }
+
+    public void bytes(char* s, int len) {
+        room(len);
+        memcpy(&b[n], s, len);
+        n = n + len;
+        b[n] = 0;
+    }
+
+    public void str(char* s) { bytes(s, strlen(s)); }
+
+    public void num(int v) {
+        char t[24];
+        intToStr(v, &t[0]);
+        str(&t[0]);
+    }
+
+    // a character as UTF-8
+    public void rune(int cp) {
+        room(4);
+        if (cp < 0x80) { b[n] = cp; n++; }
+        else if (cp < 0x800) { b[n] = 0xC0 | (cp >> 6); b[n + 1] = 0x80 | (cp & 0x3F); n = n + 2; }
+        else if (cp < 0x10000) { b[n] = 0xE0 | (cp >> 12); b[n + 1] = 0x80 | ((cp >> 6) & 0x3F); b[n + 2] = 0x80 | (cp & 0x3F); n = n + 3; }
+        else { b[n] = 0xF0 | (cp >> 18); b[n + 1] = 0x80 | ((cp >> 12) & 0x3F); b[n + 2] = 0x80 | ((cp >> 6) & 0x3F); b[n + 3] = 0x80 | (cp & 0x3F); n = n + 4; }
+        b[n] = 0;
+    }
+
+    // moves the terminal cursor (0 based column and row)
+    public void cup(int col, int row) {
+        str("\e[");
+        num(row + 1);
+        putc(';');
+        num(col + 1);
+        putc('H');
+    }
+}
+
+// ---- how characters are shown when the terminal has no UTF-8 -------------------------------------------------------------------------
+// an ASCII stand-in for a character
+private int asciiFor(int cp) {
+    if (cp < 128) { return cp; }
+    if (cp >= 0x2500 && cp <= 0x257F) {
+        if (cp == 0x2500 || cp == 0x2501 || cp == 0x2504 || cp == 0x2505 || cp == 0x2508 || cp == 0x2509 || cp == 0x254C || cp == 0x254D || cp == 0x2550) { return '-'; }
+        if (cp == 0x2502 || cp == 0x2503 || cp == 0x2506 || cp == 0x2507 || cp == 0x250A || cp == 0x250B || cp == 0x254E || cp == 0x254F || cp == 0x2551) { return '|'; }
+        return '+';
+    }
+    if (cp >= 0x2580 && cp <= 0x259F) {
+        if (cp == 0x2591) { return '.'; }
+        if (cp == 0x2592) { return ':'; }
+        return '#';
+    }
+    if (cp == 0x2190 || cp == 0x25C4 || cp == 0x25C0 || cp == 0xAB || cp == 0x2039) { return '<'; }
+    if (cp == 0x2192 || cp == 0x25BA || cp == 0x25B6 || cp == 0xBB || cp == 0x203A) { return '>'; }
+    if (cp == 0x2191 || cp == 0x25B2) { return '^'; }
+    if (cp == 0x2193 || cp == 0x25BC) { return 'v'; }
+    if (cp == 0x2022 || cp == 0x25CF || cp == 0x25CB || cp == 0x2219) { return '*'; }
+    if (cp == 0xB7 || cp == 0x2026) { return '.'; }
+    if (cp == 0x2713 || cp == 0x2714) { return 'x'; }
+    if (cp == 0x2261 || cp == 0x2630) { return '='; }
+    if (cp == 0xA0) { return ' '; }
+    if (cp == 0x2018 || cp == 0x2019) { return '\''; }
+    if (cp == 0x201C || cp == 0x201D) { return '"'; }
+    if (cp == 0x2013 || cp == 0x2014 || cp == 0x2212) { return '-'; }
+    if (cp == 0x25A0 || cp == 0x25A1) { return '#'; }
+    return '?';
+}
+
+// ---- the screen -------------------------------------------------------------------------------------------------------------------------
+const CELL_WIDE = 0x1000000;            // in the flag bits of a cell's first word: the left half of a wide character
+const CELL_TAIL = 0x2000000;            // the right half (its character is 0)
+const CELL_MASK = 0xFFFFFF;
+
+private int boxRunes[30] = {
+    0, 0, 0, 0, 0, 0,
+    0x250C, 0x2510, 0x2514, 0x2518, 0x2500, 0x2502,
+    0x2554, 0x2557, 0x255A, 0x255D, 0x2550, 0x2551,
+    0x256D, 0x256E, 0x2570, 0x256F, 0x2500, 0x2502,
+    0x250F, 0x2513, 0x2517, 0x251B, 0x2501, 0x2503
+};
+
+public class Screen {
+    public int w;
+    public int h;
+    public int* ch;                 // per cell: character | CELL_WIDE / CELL_TAIL
+    public int* st;                 // per cell: style
+    public int* ex;                 // per cell: up to three combining characters, 21 bits each
+    public int* fch;                // what the terminal shows now (set by render)
+    public int* fst;
+    public int* fex;
+    public int cx0;                 // clip rectangle (x1, y1 exclusive)
+    public int cy0;
+    public int cx1;
+    public int cy1;
+    public int curX;                // where the cursor should be after render
+    public int curY;
+    public bool curShow;
+    public int curShape;            // 0 default, 1 block, 2 underline, 3 bar (blinking); 4..6 the same steady
+    private int cstack[256];
+    private int cn;
+    private bool full;
+    private int tx;                 // where the terminal's cursor is (-1: unknown)
+    private int ty;
+    private int tcur;               // the effective style the terminal is in now (-1: unknown)
+    private bool tshown;
+    private int tshape;
+    private int capCells;           // how many cells the six arrays can hold (they are reused by resize() when the new size fits)
+
+    public Screen(int cols, int rows) {
+        resize(cols, rows);
+    }
+
+    // a new size: everything is blank and the next render redraws the whole screen. The arrays are kept when the new size fits in them
+    // (memory from alloc is never freed, so a window that is dragged to and fro must not allocate every time); when it does not fit they
+    // grow by at least half, so the total allocated stays under about three times the biggest size ever used.
+    public void resize(int cols, int rows) {
+        if (cols < 1) { cols = 1; }
+        if (rows < 1) { rows = 1; }
+        w = cols;
+        h = rows;
+        int n = w * h;
+        if (n > capCells) {
+            int nc = capCells + capCells / 2;
+            if (nc < n) { nc = n; }
+            ch = (int*) alloc(nc * 8);
+            st = (int*) alloc(nc * 8);
+            ex = (int*) alloc(nc * 8);
+            fch = (int*) alloc(nc * 8);
+            fst = (int*) alloc(nc * 8);
+            fex = (int*) alloc(nc * 8);
+            capCells = nc;
+        } else {
+            for (int i = 0; i < n; i++) { fch[i] = 0; fst[i] = 0; fex[i] = 0; }
+        }
+        cx0 = 0; cy0 = 0; cx1 = w; cy1 = h;
+        cn = 0;
+        clear(0);
+        invalidate();
+    }
+
+    // the next render redraws everything (use after anything else wrote on the terminal)
+    public void invalidate() {
+        full = true;
+        tx = -1;
+        ty = -1;
+        tcur = -1;
+    }
+
+    public void setCursor(int x, int y, int shape = 0) {
+        curShow = true;
+        curX = x;
+        curY = y;
+        curShape = shape;
+    }
+
+    public void hideCursor() { curShow = false; }
+
+    // ---- clipping ------------------------------------------------------------------------------------------------------------------------
+    public void pushClip(int x, int y, int cw, int chh) {
+        if (cn < 64) {
+            cstack[cn * 4] = cx0; cstack[cn * 4 + 1] = cy0; cstack[cn * 4 + 2] = cx1; cstack[cn * 4 + 3] = cy1;
+        }
+        cn++;
+        int x1 = x + cw;
+        int y1 = y + chh;
+        if (x > cx0) { cx0 = x; }
+        if (y > cy0) { cy0 = y; }
+        if (x1 < cx1) { cx1 = x1; }
+        if (y1 < cy1) { cy1 = y1; }
+        if (cx1 < cx0) { cx1 = cx0; }
+        if (cy1 < cy0) { cy1 = cy0; }
+    }
+
+    public void popClip() {
+        if (cn == 0) { return; }
+        cn--;
+        if (cn < 64) {
+            cx0 = cstack[cn * 4]; cy0 = cstack[cn * 4 + 1]; cx1 = cstack[cn * 4 + 2]; cy1 = cstack[cn * 4 + 3];
+        }
+    }
+
+    public void resetClip() { cx0 = 0; cy0 = 0; cx1 = w; cy1 = h; cn = 0; }
+
+    public bool visible(int x, int y) { return x >= cx0 && x < cx1 && y >= cy0 && y < cy1; }
+
+    // ---- cells ---------------------------------------------------------------------------------------------------------------------------
+    // fills the whole buffer (ignoring the clip) with blanks of that style
+    public void clear(int s) {
+        int n = w * h;
+        for (int i = 0; i < n; i++) { ch[i] = ' '; st[i] = s; ex[i] = 0; }
+    }
+
+    // the character, style of a cell (0 / 0 outside the screen)
+    public int runeAt(int x, int y) {
+        if (x < 0 || y < 0 || x >= w || y >= h) { return 0; }
+        return ch[y * w + x] & CELL_MASK;
+    }
+    public int styleAt(int x, int y) {
+        if (x < 0 || y < 0 || x >= w || y >= h) { return 0; }
+        return st[y * w + x];
+    }
+
+    // when a cell that belongs to a wide character is overwritten, the other half becomes a blank
+    private void breakPair(int i) {
+        int f = ch[i] & ~CELL_MASK;
+        if (f == CELL_WIDE) {
+            if (i + 1 < w * h) { ch[i + 1] = ' '; ex[i + 1] = 0; }
+        } else if (f == CELL_TAIL) {
+            if (i > 0) { ch[i - 1] = ' '; ex[i - 1] = 0; }
+        }
+    }
+
+    private void combine(int x, int y, int cp) {
+        if (x < 0 || y < cy0 || y >= cy1) { return; }
+        int i = y * w + x;
+        if ((ch[i] & ~CELL_MASK) == CELL_TAIL && x > 0) { i--; }
+        if ((ch[i] & CELL_MASK) == 0) { return; }
+        int e = ex[i];
+        if ((e & 0x1FFFFF) == 0) { e = cp; }
+        else if (((e >> 21) & 0x1FFFFF) == 0) { e = e | (cp << 21); }
+        else if (((e >> 42) & 0x1FFFFF) == 0) { e = e | (cp << 42); }
+        ex[i] = e;
+    }
+
+    // puts one character at (x, y); false when it was clipped or is not shown. A background of COL_KEEP keeps the cell's background.
+    public bool put(int x, int y, int cp, int s) {
+        if (x < cx0 || x >= cx1 || y < cy0 || y >= cy1) { return false; }
+        int wd = runeWidth(cp);
+        if (wd == 0) {
+            if (cp >= 0x300) { combine(x - 1, y, cp); }
+            return false;
+        }
+        int i = y * w + x;
+        if (((s >> 26) & 0x3FFFFFF) == COL_KEEP) { s = (s & ~(0x3FFFFFF << 26)) | (st[i] & (0x3FFFFFF << 26)); }
+        if (wd == 2 && x + 1 >= cx1) { cp = ' '; wd = 1; }
+        breakPair(i);
+        if (wd == 2) {
+            breakPair(i + 1);
+            ch[i] = cp | CELL_WIDE;
+            ch[i + 1] = CELL_TAIL;
+            st[i] = s;
+            st[i + 1] = s;
+            ex[i] = 0;
+            ex[i + 1] = 0;
+        } else {
+            ch[i] = cp;
+            st[i] = s;
+            ex[i] = 0;
+        }
+        return true;
+    }
+
+    // draws UTF-8 text starting at (x, y); returns the column after the last character (even when clipped), so that texts can follow each other
+    public int text(int x, int y, char* s, int sty) {
+        int pos = 0;
+        while (s[pos] != 0) {
+            int cp;
+            pos = pos + utf8.decode(s, pos, &cp);
+            int wd = runeWidth(cp);
+            if (wd == 0) { put(x, y, cp, sty); continue; }
+            put(x, y, cp, sty);
+            x = x + wd;
+        }
+        return x;
+    }
+
+    // like text, but stops before the character that would not fit into maxCells cells; returns the number of cells used
+    public int textMax(int x, int y, char* s, int maxCells, int sty) {
+        int used = 0;
+        int pos = 0;
+        while (s[pos] != 0) {
+            int cp;
+            int l = utf8.decode(s, pos, &cp);
+            int wd = runeWidth(cp);
+            if (used + wd > maxCells) { break; }
+            pos = pos + l;
+            put(x + used, y, cp, sty);
+            used = used + wd;
+        }
+        return used;
+    }
+
+    // n bytes of text
+    public int textn(int x, int y, char* s, int n, int sty) {
+        int pos = 0;
+        while (pos < n && s[pos] != 0) {
+            int cp;
+            pos = pos + utf8.decode(s, pos, &cp);
+            int wd = runeWidth(cp);
+            put(x, y, cp, sty);
+            x = x + wd;
+        }
+        return x;
+    }
+
+    // text that is cut with a "…" (or "~" when there is no UTF-8 for it... the renderer replaces it) when it does not fit; returns the cells used
+    public int textEllipsis(int x, int y, char* s, int maxCells, int sty) {
+        if (maxCells <= 0) { return 0; }
+        if (textWidth(s) <= maxCells) { return text(x, y, s, sty) - x; }
+        int used = textMax(x, y, s, maxCells - 1, sty);
+        put(x + used, y, 0x2026, sty);
+        return used + 1;
+    }
+
+    public void fill(int x, int y, int fw, int fh, int cp, int sty) {
+        int x1 = x + fw;
+        int y1 = y + fh;
+        if (x < cx0) { x = cx0; }
+        if (y < cy0) { y = cy0; }
+        if (x1 > cx1) { x1 = cx1; }
+        if (y1 > cy1) { y1 = cy1; }
+        for (int yy = y; yy < y1; yy++) {
+            for (int xx = x; xx < x1; xx++) { put(xx, yy, cp, sty); }
+        }
+    }
+
+    public void hline(int x, int y, int len, int cp, int sty) {
+        for (int i = 0; i < len; i++) { put(x + i, y, cp, sty); }
+    }
+
+    public void vline(int x, int y, int len, int cp, int sty) {
+        for (int i = 0; i < len; i++) { put(x, y + i, cp, sty); }
+    }
+
+    // a border of the given kind (BOX_SINGLE, BOX_DOUBLE, BOX_ROUND, BOX_HEAVY); the inside is not touched
+    public void box(int x, int y, int bw, int bh, int kind, int sty) {
+        if (bw < 2 || bh < 2 || kind <= 0 || kind > 4) { return; }
+        int b = kind * 6;
+        put(x, y, boxRunes[b], sty);
+        put(x + bw - 1, y, boxRunes[b + 1], sty);
+        put(x, y + bh - 1, boxRunes[b + 2], sty);
+        put(x + bw - 1, y + bh - 1, boxRunes[b + 3], sty);
+        hline(x + 1, y, bw - 2, boxRunes[b + 4], sty);
+        hline(x + 1, y + bh - 1, bw - 2, boxRunes[b + 4], sty);
+        vline(x, y + 1, bh - 2, boxRunes[b + 5], sty);
+        vline(x + bw - 1, y + 1, bh - 2, boxRunes[b + 5], sty);
+    }
+
+    // a filled rectangle with a border
+    public void panel(int x, int y, int pw, int ph, int kind, int sty) {
+        fill(x, y, pw, ph, ' ', sty);
+        box(x, y, pw, ph, kind, sty);
+    }
+
+    // changes the style of existing cells (the characters stay); a COL_KEEP background keeps the old one
+    public void restyle(int x, int y, int rw, int rh, int sty) {
+        int x1 = x + rw;
+        int y1 = y + rh;
+        if (x < cx0) { x = cx0; }
+        if (y < cy0) { y = cy0; }
+        if (x1 > cx1) { x1 = cx1; }
+        if (y1 > cy1) { y1 = cy1; }
+        for (int yy = y; yy < y1; yy++) {
+            for (int xx = x; xx < x1; xx++) {
+                int i = yy * w + xx;
+                int s = sty;
+                if (((s >> 26) & 0x3FFFFFF) == COL_KEEP) { s = (s & ~(0x3FFFFFF << 26)) | (st[i] & (0x3FFFFFF << 26)); }
+                st[i] = s;
+            }
+        }
+    }
+
+    // adds and removes attributes of existing cells
+    public void attrs(int x, int y, int rw, int rh, int add, int remove) {
+        int x1 = x + rw;
+        int y1 = y + rh;
+        if (x < cx0) { x = cx0; }
+        if (y < cy0) { y = cy0; }
+        if (x1 > cx1) { x1 = cx1; }
+        if (y1 > cy1) { y1 = cy1; }
+        for (int yy = y; yy < y1; yy++) {
+            for (int xx = x; xx < x1; xx++) {
+                int i = yy * w + xx;
+                st[i] = (st[i] | (add << 52)) & ~(remove << 52);
+            }
+        }
+    }
+
+    // a shadow: the cells keep their characters but turn dark gray on black (what a dialog or menu throws on what is below)
+    public void shadow(int x, int y, int sw, int sh) {
+        restyle(x, y, sw, sh, style(GRAY, BLACK, 0));
+    }
+
+    // copies the cells of another screen of any size into this one at (x, y) (clipped)
+    public void blit(Screen* o, int x, int y) {
+        for (int yy = 0; yy < o->h; yy++) {
+            for (int xx = 0; xx < o->w; xx++) {
+                int i = yy * o->w + xx;
+                int f = o->ch[i] & ~CELL_MASK;
+                if (f == CELL_TAIL) { continue; }
+                put(x + xx, y + yy, o->ch[i] & CELL_MASK, o->st[i]);
+                if (o->ex[i] != 0) {
+                    int e = o->ex[i];
+                    int wd = (f == CELL_WIDE) ? 2 : 1;
+                    for (int k = 0; k < 3; k++) {
+                        int cp = (e >> (21 * k)) & 0x1FFFFF;
+                        if (cp != 0) { put(x + xx + wd, y + yy, cp, 0); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- text of the screen -------------------------------------------------------------------------------------------------------------
+    // row y as UTF-8 text without trailing blanks, written to out (NUL terminated, at most cap bytes); returns the length
+    public int rowText(int y, char* out, int cap) {
+        int n = 0;
+        int lastNonBlank = 0;
+        for (int x = 0; x < w; x++) {
+            int i = y * w + x;
+            int f = ch[i] & ~CELL_MASK;
+            if (f == CELL_TAIL) { continue; }
+            int cp = ch[i] & CELL_MASK;
+            if (cp == 0) { cp = ' '; }
+            if (n + 16 >= cap) { break; }
+            n = n + utf8.encode(cp, &out[n]);
+            int e = ex[i];
+            for (int k = 0; k < 3; k++) {
+                int c2 = (e >> (21 * k)) & 0x1FFFFF;
+                if (c2 != 0) { n = n + utf8.encode(c2, &out[n]); }
+            }
+            if (cp != ' ') { lastNonBlank = n; }
+        }
+        out[lastNonBlank] = 0;
+        return lastNonBlank;
+    }
+
+    // the whole screen as text: rows without trailing blanks, joined by newlines (a heap string)
+    public char* dump() {
+        char* out = alloc(h * (w * 4 + 16) + 2);
+        int n = 0;
+        for (int y = 0; y < h; y++) {
+            n = n + rowText(y, &out[n], w * 4 + 8);
+            out[n] = '\n';
+            n++;
+        }
+        out[n] = 0;
+        return out;
+    }
+
+    // ---- drawing the difference ------------------------------------------------------------------------------------------------------
+    // the style as the terminal will see it: colours downgraded for the colour depth, attributes the terminal lacks removed
+    private int effective(int s, term.Caps* caps) {
+        int fg = fgOf(s);
+        int bg = bgOf(s);
+        int at = attrOf(s);
+        int depth = caps->colors;
+        if (depth == term.COLORS_8 && fg != 0) {
+            int f16 = downgrade(fg, term.COLORS_16);
+            if ((f16 & 255) >= 8) { at = at | A_BOLD; }
+        }
+        fg = downgrade(fg, depth);
+        bg = downgrade(bg, depth);
+        if (!caps->italic) { at = at & ~A_ITALIC; }
+        return style(fg, bg, at);
+    }
+
+    private void colorParam(Out* o, int c, bool back) {
+        int kind = (c >> 24) & 3;
+        if (kind == 0) { o->str(back ? "49" : "39"); return; }
+        if (kind == 2) {
+            int n = c & 255;
+            if (n < 8) { o->num((back ? 40 : 30) + n); return; }
+            if (n < 16) { o->num((back ? 100 : 90) + n - 8); return; }
+            o->str(back ? "48;5;" : "38;5;");
+            o->num(n);
+            return;
+        }
+        o->str(back ? "48;2;" : "38;2;");
+        o->num((c >> 16) & 255);
+        o->putc(';');
+        o->num((c >> 8) & 255);
+        o->putc(';');
+        o->num(c & 255);
+    }
+
+    // writes the SGR sequence that changes the terminal from effective style cur (-1 unknown) to nw
+    private void sgr(Out* o, int cur, int nw) {
+        if (nw == 0) { o->str("\e[0m"); return; }
+        int at = attrOf(nw);
+        int curAt = 0;
+        int curFg = 0;
+        int curBg = 0;
+        bool reset = cur < 0 || (attrOf(cur) & ~at) != 0;
+        o->str("\e[");
+        bool first = true;
+        if (reset) {
+            o->putc('0');
+            first = false;
+        } else {
+            curAt = attrOf(cur);
+            curFg = fgOf(cur);
+            curBg = bgOf(cur);
+        }
+        int codes[8] = {1, 2, 3, 4, 7, 5, 9, 0};
+        int bits[7] = {A_BOLD, A_DIM, A_ITALIC, A_UNDERLINE, A_REVERSE, A_BLINK, A_STRIKE};
+        for (int k = 0; k < 7; k++) {
+            if ((at & bits[k]) != 0 && (curAt & bits[k]) == 0) {
+                if (!first) { o->putc(';'); }
+                o->num(codes[k]);
+                first = false;
+            }
+        }
+        if (fgOf(nw) != curFg) {
+            if (!first) { o->putc(';'); }
+            colorParam(o, fgOf(nw), false);
+            first = false;
+        }
+        if (bgOf(nw) != curBg) {
+            if (!first) { o->putc(';'); }
+            colorParam(o, bgOf(nw), true);
+            first = false;
+        }
+        o->putc('m');
+    }
+
+    private bool differs(int i) {
+        return ch[i] != fch[i] || st[i] != fst[i] || ex[i] != fex[i];
+    }
+
+    private void moveTo(Out* o, int x, int y) {
+        if (tx == x && ty == y) { return; }
+        if (tx >= 0 && ty == y && x > tx && x - tx <= 4) {
+            o->str("\e[");
+            if (x - tx > 1) { o->num(x - tx); }
+            o->putc('C');
+        } else if (tx >= 0 && ty == y && x == 0) {
+            o->putc('\r');
+        } else if (tx == x && ty >= 0 && y > ty && y - ty <= 3) {
+            o->str("\e[");
+            if (y - ty > 1) { o->num(y - ty); }
+            o->putc('B');
+        } else {
+            o->cup(x, y);
+        }
+        tx = x;
+        ty = y;
+    }
+
+    // writes cell i (a wide character takes the next cell as well) and records that the terminal shows it now
+    private void emitCell(Out* o, term.Caps* caps, int i, int x, int y) {
+        int c = ch[i];
+        int es = effective(st[i], caps);
+        if (es != tcur) {
+            sgr(o, tcur, es);
+            tcur = es;
+        }
+        int cp = c & CELL_MASK;
+        bool wide = (c & ~CELL_MASK) == CELL_WIDE;
+        if (cp == 0) { cp = ' '; }
+        if (caps->utf8) {
+            o->rune(cp);
+            int e = ex[i];
+            for (int k = 0; k < 3; k++) {
+                int c2 = (e >> (21 * k)) & 0x1FFFFF;
+                if (c2 != 0) { o->rune(c2); }
+            }
+        } else {
+            o->putc(asciiFor(cp));
+            if (wide) { o->putc('?'); }
+        }
+        fch[i] = ch[i];
+        fst[i] = st[i];
+        fex[i] = ex[i];
+        int adv = 1;
+        if (wide) {
+            fch[i + 1] = ch[i + 1];
+            fst[i + 1] = st[i + 1];
+            fex[i + 1] = ex[i + 1];
+            adv = 2;
+        }
+        tx = tx + adv;
+        if (x + adv >= w) { tx = -1; ty = -1; }
+    }
+
+    // Brings the terminal up to date: appends to o the bytes that change what the terminal shows into what the screen holds, and
+    // remembers that. Writes nothing when nothing changed. After a resize or invalidate() the whole screen is redrawn.
+    public int render(Out* o, term.Caps* caps) {
+        int start = o->n;
+        bool drew = false;
+        bool hidden = false;
+        if (full) {
+            if (caps->syncOutput) { o->str("\e[?2026h"); drew = true; }
+            if (tshown) { o->str("\e[?25l"); hidden = true; }
+            o->str("\e[0m\e[2J");
+            drew = true;
+            tcur = 0;
+            tx = -1;
+            ty = -1;
+            int n = w * h;
+            for (int i = 0; i < n; i++) { fch[i] = ' '; fst[i] = 0; fex[i] = 0; }
+            full = false;
+        }
+        for (int y = 0; y < h; y++) {
+            int row = y * w;
+            int x = 0;
+            while (x < w && !differs(row + x)) { x++; }
+            if (x == w) { continue; }
+            int last = w - 1;
+            while (last > x && !differs(row + last)) { last--; }
+            if (!drew) {
+                if (caps->syncOutput) { o->str("\e[?2026h"); }
+                drew = true;
+            }
+            if (tshown && !hidden) { o->str("\e[?25l"); hidden = true; }
+            int lastStyle = -1;
+            while (x <= last) {
+                int i = row + x;
+                if (!differs(i)) {
+                    int nx = x;
+                    while (nx <= last && !differs(row + nx)) { nx++; }
+                    if (nx > last) { break; }
+                    int gap = nx - x;
+                    bool fill = false;
+                    if (gap <= 3 && tx == x && ty == y && lastStyle >= 0) {
+                        fill = true;
+                        for (int k = x; k < nx; k++) {
+                            if ((ch[row + k] & ~CELL_MASK) != 0 || ex[row + k] != 0 || st[row + k] != lastStyle) { fill = false; }
+                        }
+                    }
+                    if (fill) {
+                        for (int k = x; k < nx; k++) { emitCell(o, caps, row + k, k, y); }
+                    }
+                    x = nx;
+                    continue;
+                }
+                if ((ch[i] & ~CELL_MASK) == CELL_TAIL && x > 0) { x--; i--; }
+                moveTo(o, x, y);
+                emitCell(o, caps, i, x, y);
+                lastStyle = st[i];
+                x = x + (((ch[i] & ~CELL_MASK) == CELL_WIDE) ? 2 : 1);
+            }
+        }
+        // the cursor
+        if (curShow) {
+            if (tx != curX || ty != curY || drew) {
+                if (tx != curX || ty != curY) { o->cup(curX, curY); tx = curX; ty = curY; }
+            }
+            if (!tshown || hidden) { o->str("\e[?25h"); tshown = true; }
+            if (caps->cursorShape && curShape != tshape) {
+                o->str("\e[");
+                o->num(curShape);
+                o->str(" q");
+                tshape = curShape;
+            }
+        } else if (tshown) {
+            if (!hidden) { o->str("\e[?25l"); }
+            tshown = false;
+        } else if (hidden) {
+            tshown = false;
+        }
+        if (drew && caps->syncOutput) { o->str("\e[?2026l"); }
+        return o->n - start;
+    }
+}

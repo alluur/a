@@ -30,6 +30,7 @@ int main() {
 | Compiler | ~9,000 lines of NASM assembly, a single binary of about 470 KB (it carries the source of the standard library and the C library), three passes with dead function elimination, direct machine-code generation, generated code about as fast as `gcc -O0` |
 | Targets | **Linux** x86-64, ARM64, RISC-V 64 and LoongArch64 · **Windows** x86-64 · **Android** ARM64, x86-64 and RISC-V 64 |
 | GUI | a display server with window manager, VNC and framebuffer backends, a widget toolkit (menus, tabs, dialogs, tables, trees, toolbars, calendar, notifications, ...), a taskbar, remote display with cookie authentication, a VNC password and a web browser backend, a LAN chat, a web browser (forms, cookies), a network tools app, a terminal emulator, a screen locker and a display manager, all written in A (see [docs/GUI.md](docs/GUI.md)) |
+| Terminal UI | a toolkit for full screen programs in the terminal: keys with all modifiers, mouse, paste, resize; colours downgraded to what the terminal has; a diff renderer that writes only what changed; menus, dialogs, lists, trees, tables, tabs, a file and a colour picker, a command palette, an event loop with timers and child process pipes. Works on Linux terminals and the AOS terminals (see [docs/TUI.md](docs/TUI.md), `examples/tui/`) |
 | Networking | TCP/UDP sockets, DNS, HTTP client and server, WebSocket, raw packets, and **TLS 1.3 written from scratch** (client and server, certificate checking, RSA/ECDSA/X25519, AES-GCM/ChaCha20-Poly1305): `https://` in `http`, `gnet` and the `abrowse` browser, `examples/httpsd.a` (see [docs/TLS.md](docs/TLS.md)) |
 | Output | static native executables (ELF64 / PE32+), typically 4–10 KB for a small program; relocatable objects (`.ao`) for separate compilation |
 | Status | version 0.1.0 — complete enough for real programs, see [Limitations](#limitations-and-roadmap) |
@@ -160,7 +161,7 @@ src/            the compiler (NASM assembly)
   main.asm        command line, imports, ELF and PE writers
   util.asm        errors, files, buffers
 lib/std.a       standard library (written in A, embedded into the compiler)
-lib/*.a         built-in modules, among them the C library (cstdio.a, cmath.a ...)
+lib/*.a         built-in modules, among them the C library (cstdio.a, cmath.a ...) and the terminal toolkit (term.a, tscreen.a, tui.a, tuix.a)
 examples/       example programs
 tests/          regression tests + runner (tests/run.sh)
 docs/           language reference, targets guide, compiler internals, man page
@@ -179,6 +180,10 @@ same programs compiled by GCC, on every target (see [`docs/INTERNALS.md`](docs/I
 `tests/run.sh` compiles every `tests/t*.a`, runs it and compares stdout and the exit code with the
 `.out` / `.exit` files next to it (`.err` files hold the expected text of a compile error).
 `TARGET=windows tests/run.sh`, `TARGET=linux-arm64 tests/run.sh`, … select another target.
+
+`tests/tui.sh` runs the terminal toolkit's programs in a pseudo terminal and checks the screen with a terminal emulator written in
+Python (typing, menus, mouse, resize, paste, suspend to a shell, signals, `TERM` variants); `tests/gui.sh` tests the graphical stack,
+`tests/https.sh` the TLS code.
 
 ## Limitations and roadmap
 

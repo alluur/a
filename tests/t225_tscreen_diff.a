@@ -1,0 +1,335 @@
+// tscreen: the diff renderer - exact escape sequences for small updates, and a randomised round trip through a tiny terminal emulator
+import tscreen;
+import term;
+import utf8;
+
+// ---- a very small terminal emulator: enough of CSI to replay what render() writes --------------------------------------------------------
+class Emu {
+    public int w; public int h;
+    public int* rune; public int* fg; public int* bg; public int* attr; public int* comb;
+    public int x; public int y;
+    public int cfg; public int cbg; public int cattr;
+    public bool curVisible;
+    public int bytes;
+    public bool bad;
+
+    public Emu(int cols, int rows) {
+        w = cols; h = rows;
+        rune = (int*) alloc(w * h * 8); fg = (int*) alloc(w * h * 8); bg = (int*) alloc(w * h * 8);
+        attr = (int*) alloc(w * h * 8); comb = (int*) alloc(w * h * 8);
+        wipe();
+    }
+
+    public void wipe() {
+        for (int i = 0; i < w * h; i++) { rune[i] = ' '; fg[i] = 0; bg[i] = 0; attr[i] = 0; comb[i] = 0; }
+    }
+
+    void putRune(int cp) {
+        int wd = tscreen.runeWidth(cp);
+        if (wd == 0) {
+            if (x > 0 && y < h) {
+                int i = y * w + x - 1;
+                if (rune[i] == -1 && x > 1) { i--; }
+                comb[i] = comb[i] * 4096 + 1 + (cp & 0xFFF);       // enough to compare: the sequence of marks
+            }
+            return;
+        }
+        if (x >= w || y >= h) { bad = true; return; }
+        int i = y * w + x;
+        rune[i] = cp; fg[i] = cfg; bg[i] = cbg; attr[i] = cattr; comb[i] = 0;
+        if (wd == 2) {
+            if (x + 1 >= w) { bad = true; return; }
+            rune[i + 1] = -1; fg[i + 1] = cfg; bg[i + 1] = cbg; attr[i + 1] = cattr; comb[i + 1] = 0;
+        }
+        x = x + wd;
+        if (x >= w) { x = w - 1; }              // no auto wrap (render switches it off in real life)
+    }
+
+    int params[16];
+    int np;
+
+    void sgr() {
+        if (np == 0) { np = 1; params[0] = 0; }
+        for (int i = 0; i < np; i++) {
+            int p = params[i];
+            if (p == 0) { cfg = 0; cbg = 0; cattr = 0; }
+            else if (p == 1) { cattr = cattr | tscreen.A_BOLD; }
+            else if (p == 2) { cattr = cattr | tscreen.A_DIM; }
+            else if (p == 3) { cattr = cattr | tscreen.A_ITALIC; }
+            else if (p == 4) { cattr = cattr | tscreen.A_UNDERLINE; }
+            else if (p == 5) { cattr = cattr | tscreen.A_BLINK; }
+            else if (p == 7) { cattr = cattr | tscreen.A_REVERSE; }
+            else if (p == 9) { cattr = cattr | tscreen.A_STRIKE; }
+            else if (p >= 30 && p <= 37) { cfg = tscreen.idx(p - 30); }
+            else if (p >= 90 && p <= 97) { cfg = tscreen.idx(p - 90 + 8); }
+            else if (p >= 40 && p <= 47) { cbg = tscreen.idx(p - 40); }
+            else if (p >= 100 && p <= 107) { cbg = tscreen.idx(p - 100 + 8); }
+            else if (p == 39) { cfg = 0; }
+            else if (p == 49) { cbg = 0; }
+            else if (p == 38 || p == 48) {
+                int c = 0;
+                if (params[i + 1] == 5) { c = tscreen.idx(params[i + 2]); i = i + 2; }
+                else if (params[i + 1] == 2) { c = tscreen.rgb(params[i + 2], params[i + 3], params[i + 4]); i = i + 4; }
+                else { bad = true; }
+                if (p == 38) { cfg = c; } else { cbg = c; }
+            }
+            else { bad = true; }
+        }
+    }
+
+    void csi(int f, bool priv) {
+        int n = (np > 0 && params[0] > 0) ? params[0] : 1;
+        if (priv) { if (f == 'h' || f == 'l') { if (params[0] == 25) { curVisible = f == 'h'; } } return; }
+        if (f == 'H') { y = (np > 0 && params[0] > 0 ? params[0] : 1) - 1; x = (np > 1 && params[1] > 0 ? params[1] : 1) - 1; if (x >= w || y >= h) { bad = true; } }
+        else if (f == 'C') { x = x + n; if (x >= w) { bad = true; } }
+        else if (f == 'B') { y = y + n; if (y >= h) { bad = true; } }
+        else if (f == 'm') { sgr(); }
+        else if (f == 'J') { if (np > 0 && params[0] == 2) { wipe(); } else { bad = true; } }
+        else if (f == 'q') { }
+        else { bad = true; }
+    }
+
+    // feeds the bytes
+    public void feed(char* s, int n) {
+        bytes = bytes + n;
+        int i = 0;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (c == 27 && i + 1 < n && s[i + 1] == '[') {
+                i = i + 2;
+                np = 0;
+                bool priv = false;
+                int cur = 0;
+                bool have = false;
+                while (i < n) {
+                    int d = s[i] & 255;
+                    if (d == '?') { priv = true; }
+                    else if (d >= '0' && d <= '9') { cur = cur * 10 + d - '0'; have = true; }
+                    else if (d == ';') { params[np] = cur; np++; cur = 0; have = false; }
+                    else if (d == ' ') { }
+                    else { break; }
+                    i++;
+                }
+                if (have || np > 0) { params[np] = cur; np++; }
+                csi(s[i] & 255, priv);
+                i++;
+            } else if (c == 27) {
+                i++;
+                if (i < n && (s[i] == '7' || s[i] == '8')) { i++; }       // not used
+                bad = true;
+            } else if (c == 13) { x = 0; i++; }
+            else if (c < 32) { bad = true; i++; }
+            else {
+                int cp;
+                i = i + utf8.decode(s, i, &cp);
+                putRune(cp);
+            }
+        }
+    }
+
+    // does the emulated terminal show what the screen holds? depth: what the terminal can show; ascii: no UTF-8
+    public bool matches(tscreen.Screen* sc, int depth, bool ascii, bool italic) {
+        if (bad) { return false; }
+        for (int yy = 0; yy < h; yy++) {
+            for (int xx = 0; xx < w; xx++) {
+                int i = yy * w + xx;
+                int c = sc->ch[i];
+                int cp = c & 0xFFFFFF;
+                int flag = c >> 24;
+                int wantRune = cp;
+                if (flag == 2) { wantRune = -1; }
+                if (cp == 0 && flag == 0) { wantRune = ' '; }
+                if (!ascii && rune[i] != wantRune) { return false; }
+                if (ascii && flag != 2 && wantRune < 128 && rune[i] != wantRune) { return false; }
+                if (ascii && wantRune >= 128 && rune[i] >= 128) { return false; }
+                int s = sc->st[i];
+                if (fg[i] != tscreen.downgrade(tscreen.fgOf(s), depth)) { return false; }
+                if (bg[i] != tscreen.downgrade(tscreen.bgOf(s), depth)) { return false; }
+                if (depth != term.COLORS_8) {
+                    int a = tscreen.attrOf(s);
+                    if (!italic) { a = a & ~tscreen.A_ITALIC; }
+                    if (attr[i] != a) { return false; }
+                }
+            }
+        }
+        return true;
+    }
+}
+
+int seed = 12345;
+int rnd(int n) {
+    seed = seed ^ (seed << 13);
+    seed = seed ^ ((seed >> 7) & 0x01FFFFFFFFFFFFFF);
+    seed = seed ^ (seed << 17);
+    int v = seed & 0x7FFFFFFF;
+    return v % n;
+}
+
+void show(tscreen.Out* o) {
+    for (int i = 0; i < o->n; i++) {
+        int c = o->b[i] & 255;
+        if (c == 27) print("\\e");
+        else if (c == 13) print("\\r");
+        else printChar(c);
+    }
+    println("");
+}
+
+int randomStyle(int depth) {
+    int k = rnd(8);
+    int fg = 0;
+    int bg = 0;
+    if (k == 1) { fg = tscreen.idx(rnd(16)); }
+    else if (k == 2) { fg = tscreen.idx(rnd(256)); bg = tscreen.idx(rnd(8)); }
+    else if (k == 3) { fg = tscreen.rgb(rnd(256), rnd(256), rnd(256)); }
+    else if (k == 4) { bg = tscreen.rgb(rnd(256), rnd(256), rnd(256)); fg = tscreen.WHITE; }
+    else if (k == 5) { bg = tscreen.idx(rnd(256)); }
+    return tscreen.style(fg, bg, rnd(4) == 0 ? rnd(128) : 0);
+}
+
+char* words[8] = {"hello", "w\xc3\xb6rld", "\xe4\xb8\x96\xe7\x95\x8c", "a\xcc\x81" "bc", "x", "\xf0\x9f\x98\x80!", "   ", "\xe2\x94\x82|"};
+
+void scribble(tscreen.Screen* s, int depth) {
+    int ops = 1 + rnd(6);
+    for (int k = 0; k < ops; k++) {
+        int op = rnd(6);
+        int x = rnd(s->w + 2) - 1;
+        int y = rnd(s->h);
+        int st = randomStyle(depth);
+        if (op == 0 || op == 1) { s->text(x, y, words[rnd(8)], st); }
+        else if (op == 2) { s->fill(x, y, rnd(6), rnd(3), 'a' + rnd(26), st); }
+        else if (op == 3) { s->box(x, y, 2 + rnd(8), 2 + rnd(3), 1 + rnd(4), st); }
+        else if (op == 4) { s->pushClip(x, y, 3 + rnd(8), 1 + rnd(3)); s->text(x - 2, y, "clipped text here", st); s->popClip(); }
+        else { s->put(x, y, 0xFF21 + rnd(3), st); }
+    }
+}
+
+int main() {
+    println("-- a plain frame, then small changes");
+    tscreen.Screen s(24, 6);
+    tscreen.Out out();
+    term.Caps caps();
+    caps.colors = term.COLORS_TRUE;
+    s.clear(0);
+    int title = tscreen.style(tscreen.WHITE, tscreen.BLUE, tscreen.A_BOLD);
+    s.text(0, 0, " File  Edit  View", title);
+    s.text(0, 1, "plain text", 0);
+    s.text(3, 3, "colour", tscreen.style(tscreen.rgb(10, 20, 30), tscreen.hex(0xFFEEDD), 0));
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    println("-- nothing changed: no output");
+    s.render(&out, &caps);
+    printlnInt(out.n);
+    println("-- one character");
+    s.put(11, 1, 'T', 0);
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    println("-- a gap of one cell is written, a bigger one is skipped with a cursor move");
+    s.put(5, 2, 'a', 0);
+    s.put(7, 2, 'b', 0);
+    s.put(12, 2, 'c', 0);
+    s.put(20, 2, 'd', 0);
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    println("-- same style continues without a new SGR, another row needs a move");
+    s.text(2, 4, "abc", title);
+    s.text(2, 5, "def", title);
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    println("-- cursor");
+    s.setCursor(5, 1, 0);
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    s.text(0, 1, "PLAIN", 0);
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    s.hideCursor();
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    println("-- the last cell of the screen");
+    s.put(23, 5, 'Z', 0);
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    println("-- wide characters and a combining mark");
+    s.text(0, 0, "\xe4\xb8\x96\xe7\x95\x8c" "e\xcc\x81", 0);
+    s.render(&out, &caps);
+    show(&out);
+    out.clear();
+    println("-- invalidate: everything is sent again");
+    s.invalidate();
+    s.render(&out, &caps);
+    printlnInt(out.n > 100 ? 1 : 0);
+    out.clear();
+    println("-- colour depths for one cell");
+    int depths[5] = {term.COLORS_TRUE, term.COLORS_256, term.COLORS_16, term.COLORS_8, term.COLORS_NONE};
+    for (int d = 0; d < 5; d++) {
+        tscreen.Screen one(3, 1);
+        one.put(0, 0, 'x', tscreen.style(tscreen.rgb(250, 120, 40), tscreen.rgb(20, 20, 90), tscreen.A_BOLD | tscreen.A_ITALIC));
+        term.Caps c2();
+        c2.italic = true;
+        c2.colors = depths[d];
+        tscreen.Out o2();
+        one.render(&o2, &c2);
+        show(&o2);
+    }
+    println("-- no UTF-8: ASCII stand-ins");
+    {
+        tscreen.Screen one(8, 2);
+        one.box(0, 0, 4, 2, tscreen.BOX_ROUND, 0);
+        one.text(4, 0, "\xe2\x86\x92\xe4\xb8\x96", 0);
+        term.Caps c2();
+        c2.utf8 = false;
+        tscreen.Out o2();
+        one.render(&o2, &c2);
+        show(&o2);
+    }
+
+    println("-- randomised round trip through the emulator");
+    int fails = 0;
+    int frames = 0;
+    int bytesTotal = 0;
+    int allCells = 0;
+    int cfgDepth[6] = {term.COLORS_TRUE, term.COLORS_256, term.COLORS_16, term.COLORS_8, term.COLORS_NONE, term.COLORS_TRUE};
+    for (int cfg = 0; cfg < 6; cfg++) {
+        tscreen.Screen rs(30, 8);
+        Emu emu(30, 8);
+        term.Caps rc();
+        rc.colors = cfgDepth[cfg];
+        rc.utf8 = cfg != 5;
+        tscreen.Out ro();
+        rc.italic = cfg != 2;
+        for (int it = 0; it < 120; it++) {
+            if (it == 60 && cfg == 0) { rs.invalidate(); }
+            if (it % 17 == 0) { rs.clear(0); }
+            scribble(&rs, cfgDepth[cfg]);
+            if (rnd(5) == 0) { rs.setCursor(rnd(30), rnd(8), 0); } else if (rnd(7) == 0) { rs.hideCursor(); }
+            ro.clear();
+            rs.render(&ro, &rc);
+            if (it == 60 && cfg == 0) { emu.wipe(); }
+            emu.feed(ro.b, ro.n);
+            frames++;
+            bytesTotal = bytesTotal + ro.n;
+            allCells = allCells + 240;
+            if (!emu.matches(&rs, rc.colors, !rc.utf8, rc.italic)) {
+                fails++;
+                if (fails < 4) { printf("MISMATCH cfg %d iteration %d\n", cfg, it); }
+                emu.bad = false;
+                rs.invalidate();
+                rs.render(&ro, &rc);
+                emu.wipe();
+                emu.feed(ro.b, ro.n);
+            }
+        }
+    }
+    printf("frames: %d, mismatches: %d\n", frames, fails);
+    println(bytesTotal < allCells ? "the diff output is smaller than redrawing everything" : "diff output too big");
+    return fails == 0 ? 0 : 1;
+}

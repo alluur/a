@@ -406,15 +406,17 @@ runs a command and closes when it ends. Ctrl+Shift+N opens another window, Ctrl+
   are drawn as lines and rectangles, other characters show as `?`), colours with 16, 256 and 24-bit values, bold, dim,
   underline, reverse; cursor movement, erasing, inserting and deleting characters and lines, scroll regions, tabs; the
   alternate screen (vim, less, top, nano, mc work); application cursor keys, bracketed paste, cursor reports and device
-  attributes, window titles (`OSC 0` and `OSC 2`; the window title follows unless `onTitle` is set). `TERM` is `xterm-256color`.
+  attributes, the size report (`CSI 18 t`), window titles (`OSC 0` and `OSC 2`; the window title follows unless `onTitle` is set),
+  and **mouse reporting for programs** (modes 1000, 1002, 1003 with the SGR form 1006 or the old form, wheel, drags; hold Shift to
+  select text instead) and focus reports (1004): what the [terminal toolkit](TUI.md) needs. `TERM` is `xterm-256color`.
 * **Keys**: arrows, Home/End, PageUp/Down, Insert/Delete, F1-F12 with the Shift/Alt/Ctrl variants, Ctrl+letters, Alt+key
   (sends Esc first), Shift+Tab. **History**: 2000 lines; mouse wheel or Shift+PageUp/PageDown. **Mouse**: select by dragging
   (a double click selects a word); a selection is copied to the clipboard when it is made, the middle button and
   Ctrl+Shift+V paste, Ctrl+Shift+C copies. The size of the pseudo terminal follows the widget (the program gets `SIGWINCH`).
 * **Without a program**: `t->feed("text\r\n")` writes to the screen as if a program had printed it, and what the user types
   is collected for `t->takeSent()`; `lineText(row)`, `cursorRow`, `cursorCol`, `selectedText()` read the screen back.
-* **Limits**: Linux and Android only (Windows has no pseudo terminals here: `start` returns false); no mouse reporting for
-  programs, no wide (CJK) characters, no italics, one font size.
+* **Limits**: Linux and Android only (Windows has no pseudo terminals here: `start` returns false); no wide (CJK) characters
+  (they take one cell), no italics, no clipboard sequence (`OSC 52`), one font size.
 
 Two small additions to `gui` made it possible: `d->watch(fd, f, arg)` calls `int f(int arg)` whenever a file descriptor
 (a pipe, a pseudo terminal, a socket) is readable inside the event loop (`d->unwatch(fd)`), and `d->requestPasteTo(widget)`

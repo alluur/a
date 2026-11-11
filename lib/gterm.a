@@ -9,7 +9,8 @@
 //
 //  The widget understands the usual ANSI/xterm escape sequences (colours with 16, 256 and 24-bit values, cursor movement,
 //  erasing, scroll regions, the alternate screen used by full-screen programs, UTF-8, box-drawing characters, bracketed
-//  paste, window title), keeps 2000 lines of history (mouse wheel, Shift+PageUp/PageDown), selects text with the mouse
+//  paste, mouse reporting (1000 / 1002 / 1003 with 1006 or the old form; Shift+mouse selects text as usual), focus reports (1004), window title, the
+//  size report CSI 18 t), keeps 2000 lines of history (mouse wheel, Shift+PageUp/PageDown), selects text with the mouse
 //  (copy goes to the clipboard, middle click or Ctrl+Shift+V pastes) and resizes the pseudo terminal with the widget.
 //  feed(text) writes text to the screen as if the program had printed it (used for tests and for a terminal without a
 //  program). onExit(terminal) is called when the program has ended (exitStatus holds its status).
@@ -169,6 +170,11 @@ public class Terminal : gui.Widget {
     private bool autoWrap;
     private bool appCursor;
     private bool bracketed;
+    private int mouseMode;          // what the program asked for: 0 nothing, 1000 buttons, 1002 buttons and drags, 1003 all motion
+    private bool mouseSgr;          // 1006: reports in the SGR form (else the old X10 form)
+    private bool focusReport;       // 1004: send ESC [ I / ESC [ O when the window gets or loses the focus
+    private int mouseHeld;          // the button that is held down (for drag reports)
+    private int lastMouseCell;
     private int curFlags;
     private int curFg;
     private int curBg;
@@ -530,6 +536,9 @@ public class Terminal : gui.Widget {
             else if (p == 7) { autoWrap = on; }
             else if (p == 25) { showCursor = on; }
             else if (p == 2004) { bracketed = on; }
+            else if (p == 1000 || p == 1002 || p == 1003) { mouseMode = on ? p : 0; mouseHeld = 0; }
+            else if (p == 1006) { mouseSgr = on; }
+            else if (p == 1004) { focusReport = on; }
             else if (p == 47 || p == 1047 || p == 1049) { switchScreen(on, p == 1049); }
         }
     }
@@ -645,6 +654,13 @@ public class Terminal : gui.Widget {
                 send("\x1b[?1;2c");
             }
         }
+        else if (final == 't') {
+            if (pget(0) == 18) {                                // the size of the text area in characters
+                char reply[32];
+                format(&reply[0], 32, "\x1b[8;%d;%dt", rows, cols);
+                send(&reply[0]);
+            }
+        }
         invalidate();
     }
 
@@ -689,6 +705,9 @@ public class Terminal : gui.Widget {
         autoWrap = true;
         appCursor = false;
         bracketed = false;
+        mouseMode = 0;
+        mouseSgr = false;
+        focusReport = false;
         showCursor = true;
         wrapPending = false;
     }
@@ -955,6 +974,7 @@ public class Terminal : gui.Widget {
 
     public virtual void onFocus(bool gained) {
         focused = gained;
+        if (focusReport) { send(gained ? "\x1b[I" : "\x1b[O"); }
         invalidate();
     }
 
@@ -1173,7 +1193,65 @@ public class Terminal : gui.Widget {
         return cp == '_' || cp == '-' || cp == '.' || cp == '/' || cp == '~' || cp == ':' || cp > 127;
     }
 
+    // tells the program about a mouse event (the program switched mouse reporting on); Shift keeps the mouse for selecting text, as in xterm
+    private bool reportMouse(int kind, int button, int mx, int my, int mods) {
+        if (mouseMode == 0 || (mods & adp.MOD_SHIFT) != 0) {
+            return false;
+        }
+        int col = (mx - 3) / cw;
+        int row = (my - 3) / chh;
+        if (col < 0) { col = 0; }
+        if (col >= cols) { col = cols - 1; }
+        if (row < 0) { row = 0; }
+        if (row >= rows) { row = rows - 1; }
+        int m = 0;
+        if ((mods & adp.MOD_ALT) != 0) { m = m + 8; }
+        if ((mods & adp.MOD_CTRL) != 0) { m = m + 16; }
+        int b = 0;
+        bool release = false;
+        if (kind == adp.M_SCROLL) {
+            b = (button > 0) ? 64 : 65;
+        } else if (kind == adp.M_DOWN) {
+            mouseHeld = button;
+            b = button - 1;
+        } else if (kind == adp.M_UP) {
+            b = button - 1;
+            release = true;
+            mouseHeld = 0;
+        } else if (kind == adp.M_MOVE) {
+            int cell = row * cols + col;
+            if (cell == lastMouseCell) {
+                return true;
+            }
+            lastMouseCell = cell;
+            if (mouseHeld != 0 && mouseMode >= 1002) { b = mouseHeld - 1 + 32; }
+            else if (mouseMode == 1003) { b = 35; }
+            else { return true; }
+        } else {
+            return false;
+        }
+        if (b < 0) { b = 0; }
+        char out[32];
+        int n;
+        if (mouseSgr) {
+            n = format(&out[0], 32, "\x1b[<%d;%d;%d%c", b + m, col + 1, row + 1, release ? 'm' : 'M');
+        } else {
+            int cb = release ? 3 : b;
+            if (cb != 3 && b >= 32) { cb = b; }
+            out[0] = 27; out[1] = '['; out[2] = 'M';
+            out[3] = 32 + cb + m;
+            out[4] = 33 + ((col > 222) ? 222 : col);
+            out[5] = 33 + ((row > 222) ? 222 : row);
+            n = 6;
+        }
+        sendBytes(&out[0], n);
+        return true;
+    }
+
     public virtual bool onMouse(int kind, int button, int mx, int my, int mods) {
+        if (reportMouse(kind, button, mx, my, mods)) {
+            return true;
+        }
         if (kind == adp.M_SCROLL) {
             scrollView(button * 3);
             return true;

@@ -1,0 +1,260 @@
+// term: the real terminal layer on a pseudo terminal made inside the test: raw mode, escape sequences written on enter and leave, key and mouse
+// decoding from real input, the Esc timeout, SIGWINCH and the window size, and that the terminal is restored. (Linux only: Windows has no terminals like this.)
+import term;
+
+int nr(int x, int g) { if (__ARCH == 0) { return x; } return g; }
+int sys(int x, int g, int a, int b, int c, int d) { return __syscall(nr(x, g), a, b, c, d, 0, 0); }
+int ioctl(int fd, int req, char* arg) { return sys(16, 29, fd, req, (int) arg, 0); }
+
+// open with real Linux flags (the builtin __open only knows read / write / append)
+int openFlags(char* path, int flags) {
+    if (__ARCH == 0) { return sys(2, 0, (int) path, flags, 0, 0); }
+    return sys(0, 56, -100, (int) path, flags, 0);
+}
+
+int resultFd;
+
+void result(char* line) {
+    __write(resultFd, line, strlen(line));
+    __write(resultFd, "\n", 1);
+}
+
+int lflagOf(int fd) {
+    char t[40];
+    if (ioctl(fd, 0x5401, &t[0]) != 0) { return -1; }
+    return (t[12] & 255) | ((t[13] & 255) << 8) | ((t[14] & 255) << 16) | ((t[15] & 255) << 24);
+}
+
+// ---- the child: the program that uses the terminal -------------------------------------------------------------------------------------------
+void child() {
+    term.Terminal* t = new term.Terminal();
+    bool ok = t->open();
+    result(ok ? "R:open ok" : "R:open failed");
+    // a terminal that can do everything, whatever TERM says where the tests run
+    t->caps.colors = term.COLORS_TRUE;
+    t->caps.mouse = true;
+    t->caps.altScreen = true;
+    t->caps.bracketedPaste = true;
+    t->caps.utf8 = true;
+    t->caps.title = true;
+    char buf[80];
+    format(&buf[0], 80, "R:size %dx%d", t->cols, t->rows, 0, 0);
+    result(&buf[0]);
+    int before = lflagOf(0);
+    t->enter();
+    int during = lflagOf(0);
+    format(&buf[0], 80, "R:icanon before %d, during %d; echo before %d, during %d", (before & 2) != 0, (during & 2) != 0, (before & 8) != 0, (during & 8) != 0);
+    result(&buf[0]);
+    format(&buf[0], 80, "R:signal handlers installed: %d", t->hooksOk, 0, 0, 0);
+    result(&buf[0]);
+    t->setTitle("pty test");
+    t->setTitle("evil\x07\e[31mINJECTED\e]0;second");       // control characters must not reach the terminal
+    t->writeStr("\e[1;1Hhello");
+    result("R:ready");
+    // events: wait for them like an application would
+    int seen = 0;
+    term.Event e;
+    int guard = 0;
+    while (seen < 8 && guard < 40) {
+        guard++;
+        t->wait(500);
+        while (t->next(&e)) {
+            char d[100];
+            term.describe(&e, &d[0], 100);
+            format(&buf[0], 100, "R:event %s", &d[0], 0, 0, 0);
+            result(&buf[0]);
+            seen++;
+        }
+    }
+    result("R:events done");
+    // a burst: 3000 keys written at once (a paste without bracketed paste mode, a script) must all arrive, in order (the queue used to hold 128)
+    result("R:burst ready");
+    int keys = 0;
+    guard = 0;
+    while (keys < 3000 && guard < 80) {
+        guard++;
+        t->wait(500);
+        while (t->next(&e)) {
+            if (e.kind == term.EV_KEY && e.key == 'a' + (keys % 26)) { keys++; }
+        }
+    }
+    format(&buf[0], 80, "R:burst: %d keys in order", keys, 0, 0, 0);
+    result(&buf[0]);
+    // a window size change arrives as an event (SIGWINCH) or by polling; absurd sizes are cut to term.MAX_COLS x term.MAX_ROWS
+    for (int round = 0; round < 2; round++) {
+        guard = 0;
+        bool got = false;
+        while (!got && guard < 40) {
+            guard++;
+            t->wait(250);
+            while (t->next(&e)) {
+                if (e.kind == term.EV_RESIZE) {
+                    format(&buf[0], 80, "R:resize %dx%d", e.x, e.y, 0, 0);
+                    result(&buf[0]);
+                    got = true;
+                }
+            }
+        }
+    }
+    // the timeout of wait: nothing happens
+    int start = millis();
+    int n = t->wait(120);
+    int took = millis() - start;
+    format(&buf[0], 80, "R:idle wait: %d events, took at least 100 ms: %d", n, took >= 100, 0, 0);
+    result(&buf[0]);
+    t->leave();
+    int after = lflagOf(0);
+    format(&buf[0], 80, "R:icanon after %d, echo after %d", (after & 2) != 0, (after & 8) != 0, 0, 0);
+    result(&buf[0]);
+    t->leave();
+    t->close();
+    result("R:done");
+}
+
+// ---- the parent: the terminal emulator side --------------------------------------------------------------------------------------------------
+char out[65536];
+int outLen;
+char res[8192];
+int resLen;
+
+void drain(int master, int rfd, int ms) {
+    char pf[16];
+    pf[0] = master; pf[1] = master >> 8; pf[2] = 0; pf[3] = 0; pf[4] = 1; pf[5] = 0; pf[6] = 0; pf[7] = 0;
+    pf[8] = rfd; pf[9] = rfd >> 8; pf[10] = 0; pf[11] = 0; pf[12] = 1; pf[13] = 0; pf[14] = 0; pf[15] = 0;
+    pf[6] = 0; pf[7] = 0; pf[14] = 0; pf[15] = 0;
+    int ts[2];
+    ts[0] = 0;
+    ts[1] = ms * 1000000;
+    int r = sys(271, 73, (int) &pf[0], 2, (int) &ts[0], 0);
+    if (r <= 0) { return; }
+    if ((pf[6] & 1) != 0 || (pf[7] & 0x10) != 0) {
+        int k = __read(master, &out[outLen], 65000 - outLen);
+        if (k > 0) { outLen = outLen + k; }
+    }
+    if ((pf[14] & 1) != 0 || (pf[15] & 0x10) != 0) {
+        int k = __read(rfd, &res[resLen], 8000 - resLen);
+        if (k > 0) { resLen = resLen + k; res[resLen] = 0; }
+    }
+}
+
+// waits until the result text contains the marker; false after about 15 seconds (an emulated machine is slow to start a child)
+bool waitFor(int master, int rfd, char* marker) {
+    for (int i = 0; i < 300; i++) {
+        res[resLen] = 0;
+        if (find(&res[0], marker) >= 0) { return true; }
+        drain(master, rfd, 50);
+    }
+    return false;
+}
+
+bool outHas(char* s) {
+    out[outLen] = 0;
+    return find(&out[0], s) >= 0;
+}
+
+int main() {
+    if (__OS == 1) {
+        println("skipped: no pseudo terminals on Windows");
+        return 0;
+    }
+    int master = openFlags("/dev/ptmx", 2 | 0x100);
+    if (master < 0) { println("no /dev/ptmx here"); return 1; }
+    int zero = 0;
+    ioctl(master, 0x40045431, (char*) &zero);                  // TIOCSPTLCK: unlock
+    int num = 0;
+    ioctl(master, 0x80045430, (char*) &num);                   // TIOCGPTN
+    num = num & 0xFFFFFFFF;
+    char name[40];
+    format(&name[0], 40, "/dev/pts/%d", num, 0, 0, 0);
+    char ws[8];
+    ws[0] = 30; ws[1] = 0; ws[2] = 100; ws[3] = 0; ws[4] = 0; ws[5] = 0; ws[6] = 0; ws[7] = 0;
+    ioctl(master, 0x5414, &ws[0]);                             // TIOCSWINSZ: 100 columns, 30 rows
+    char pp[8];
+    sys(293, 59, (int) &pp[0], 0, 0, 0);
+    int rfd = (pp[0] & 255) | ((pp[1] & 255) << 8);
+    int wfd = (pp[4] & 255) | ((pp[5] & 255) << 8);
+    int pid = __ARCH == 0 ? sys(57, 0, 0, 0, 0, 0) : sys(0, 220, 17, 0, 0, 0);
+    if (pid == 0) {
+        sys(112, 157, 0, 0, 0, 0);                             // setsid
+        int slave = openFlags(&name[0], 2);
+        ioctl(slave, 0x540E, null);                            // TIOCSCTTY
+        if (__ARCH == 0) { sys(33, 0, slave, 0, 0, 0); sys(33, 0, slave, 1, 0, 0); sys(33, 0, slave, 2, 0, 0); }
+        else { sys(0, 24, slave, 0, 0, 0); sys(0, 24, slave, 1, 0, 0); sys(0, 24, slave, 2, 0, 0); }
+        resultFd = wfd;
+        child();
+        __exit(0);
+    }
+    __close(wfd);
+    println("-- the program starts on the pseudo terminal");
+    bool started = waitFor(master, rfd, "R:ready");
+    printf("started: %d\n", started);
+    int lflag = lflagOf(master);
+    printf("raw while running (no ICANON, no ECHO) seen from the other side: %d\n", (lflag & 10) == 0);
+    println("-- keys and mouse sent from the terminal side");
+    // letters, a CSI key, a lone Esc (the child must wait for the timeout before it is sure), UTF-8, an SGR mouse report, a bracketed paste, Alt+x.
+    // Every piece is sent after the child has reported the previous one, so that the timing of the machine does not matter.
+    __write(master, "ab", 2);
+    waitFor(master, rfd, "R:event b");
+    __write(master, "\e[A", 3);
+    waitFor(master, rfd, "R:event Up");
+    __write(master, "\e", 1);
+    waitFor(master, rfd, "R:event Esc");
+    __write(master, "\xc3\xa9", 2);
+    waitFor(master, rfd, "R:event \xc3\xa9");
+    __write(master, "\e[<0;5;6M", 9);
+    waitFor(master, rfd, "R:event Mouse");
+    __write(master, "\e[200~xyz\e[201~", 15);
+    waitFor(master, rfd, "R:event Paste");
+    __write(master, "\ex", 2);
+    bool evs = waitFor(master, rfd, "R:events done");
+    printf("events done: %d\n", evs);
+    println("-- a burst of 3000 keys in one write");
+    waitFor(master, rfd, "R:burst ready");
+    char burst[3000];
+    for (int i = 0; i < 3000; i++) { burst[i] = 'a' + (i % 26); }
+    __write(master, &burst[0], 3000);
+    bool bs = waitFor(master, rfd, "R:burst:");
+    printf("burst reported: %d\n", bs);
+    println("-- the window changes size");
+    ws[0] = 25; ws[2] = 80;
+    ioctl(master, 0x5414, &ws[0]);
+#ifndef NO_SIGWINCH                                           // -DNO_SIGWINCH: only the size change itself (the size is polled; this is what AOS needs)
+    sys(62, 129, pid, 28, 0, 0);                               // kill(child, SIGWINCH)
+#endif
+    bool rs = waitFor(master, rfd, "R:resize 80x25");
+    printf("resize seen: %d\n", rs);
+    ws[0] = 0xA0; ws[1] = 0x0F; ws[2] = 0xB8; ws[3] = 0x0B;    // 4000 rows, 3000 columns
+    ioctl(master, 0x5414, &ws[0]);
+#ifndef NO_SIGWINCH
+    sys(62, 129, pid, 28, 0, 0);
+#endif
+    rs = waitFor(master, rfd, "R:resize 1000x500");
+    printf("absurd size cut: %d\n", rs);
+    bool fin = waitFor(master, rfd, "R:done");
+    printf("child finished: %d\n", fin);
+    for (int i = 0; i < 10; i++) { drain(master, rfd, 20); }
+    int status = 0;
+    sys(61, 260, pid, (int) &status, 0, 0);
+    println("-- what the child reported");
+    int pos = 0;
+    while (pos < resLen) {
+        int e = pos;
+        while (e < resLen && res[e] != '\n') { e++; }
+        res[e] = 0;
+        println(&res[pos]);
+        pos = e + 1;
+    }
+    println("-- what the child wrote to the terminal");
+    printf("alternate screen entered: %d, left: %d\n", outHas("\e[?1049h"), outHas("\e[?1049l"));
+    printf("mouse on: %d, off: %d\n", outHas("\e[?1000h") && outHas("\e[?1006h"), outHas("\e[?1000l") && outHas("\e[?1006l"));
+    printf("bracketed paste on: %d, off: %d\n", outHas("\e[?2004h"), outHas("\e[?2004l"));
+    printf("cursor hidden: %d, shown again: %d\n", outHas("\e[?25l"), outHas("\e[?25h"));
+    printf("title set: %d\n", outHas("\e]0;pty test\x07"));
+    printf("a title with control characters is cleaned: %d, nothing injected: %d\n", outHas("\e]0;evil[31mINJECTED]0;second\x07"), !outHas("\x07\e[31m") && !outHas("INJECTED\e"));
+    printf("the text it drew: %d\n", outHas("hello"));
+    printf("the order is right (enter before leave): %d\n", find(&out[0], "\e[?1049h") < find(&out[0], "\e[?1049l"));
+    lflag = lflagOf(master);
+    printf("restored at the end (ICANON and ECHO are back): %d\n", (lflag & 10) == 10);
+    printf("exit status of the child: %d\n", (status >> 8) & 255);
+    return 0;
+}

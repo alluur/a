@@ -1,0 +1,1913 @@
+// =============================================================================
+//  term - the terminal layer of the tui toolkit: keys, mouse, capabilities, raw mode        import term;
+//
+//    term.Terminal t;                       // one per program
+//    if (!t.open()) { println("not a terminal"); return 1; }
+//    t.enter();                             // raw mode, alternate screen, mouse, bracketed paste ... (leave() / exit restore it)
+//    term.Event e;
+//    for (;;) {
+//        t.wait(250);                       // waits for input, a watched descriptor, a resize, or 250 ms
+//        while (t.next(&e)) {
+//            if (e.kind == term.EV_KEY && e.key == 'q') { t.leave(); return 0; }
+//        }
+//    }
+//
+//  What is in here
+//    * Event, Decoder    bytes from the terminal -> key, mouse, paste, focus and resize events. Pure code (no system calls), so it
+//                        can be tested on every target: Decoder d; d.feedText("\e[1;5A"); d.next(&e);  // Ctrl+Up
+//    * keyName, parseKey "Ctrl+Shift+F5" <-> key code + modifiers
+//    * Caps              what the terminal can do (colours, mouse, alternate screen ...), from TERM, COLORTERM, locale, NO_COLOR and
+//                        a built-in table; TUI_COLORS=0|8|16|256|truecolor, TUI_MOUSE=0|1, TUI_ASCII=1 override it
+//    * Terminal          raw mode with a restore that also runs on exit() and on fatal signals, window size (ioctl, then CSI 18t / CPR,
+//                        then LINES / COLUMNS, then 80x24), SIGWINCH or polling, non-blocking input with timeout, polling of several
+//                        descriptors at once, suspend to a shell (or any program) and resume
+//    * Process           a child program whose output arrives through a pipe that can be watched together with the keyboard
+//
+//  Linux, Android and AOS (all of them through the Linux system call interface). On Windows only the pure parts work.
+//  Key codes: a character key is its Unicode code point (Ctrl+S is 's' with MOD_CTRL); named keys start at KEY_BASE.
+// =============================================================================
+import cstdlib;
+module term;
+
+// ---- key codes, modifiers, event kinds --------------------------------------------------------------------------------------------------
+public const KEY_BASE = 0x200000;
+public const KEY_ENTER = 0x200001;
+public const KEY_TAB = 0x200002;
+public const KEY_BACKSPACE = 0x200003;
+public const KEY_ESC = 0x200004;
+public const KEY_UP = 0x200005;
+public const KEY_DOWN = 0x200006;
+public const KEY_LEFT = 0x200007;
+public const KEY_RIGHT = 0x200008;
+public const KEY_HOME = 0x200009;
+public const KEY_END = 0x20000A;
+public const KEY_PGUP = 0x20000B;
+public const KEY_PGDN = 0x20000C;
+public const KEY_INSERT = 0x20000D;
+public const KEY_DELETE = 0x20000E;
+public const KEY_BEGIN = 0x20000F;
+public const KEY_F1 = 0x200010;          // F1 .. F24 are KEY_F1 + 0 .. 23, see fkey(n)
+public const KEY_F24 = 0x200027;
+public const KEY_LAST = 0x200027;
+
+public const MOD_SHIFT = 1;
+public const MOD_ALT = 2;
+public const MOD_CTRL = 4;
+public const MOD_META = 8;
+
+public const EV_NONE = 0;
+public const EV_KEY = 1;                 // key, mods
+public const EV_MOUSE = 2;               // x, y (cells, from 0), button, action, mods
+public const EV_PASTE = 3;               // text, len (bracketed paste; text is valid for ever)
+public const EV_RESIZE = 4;              // x = columns, y = rows
+public const EV_FOCUS = 5;               // key = 1 focus gained, 0 lost
+public const EV_FD = 6;                  // a watched descriptor: key = fd, x = revents (see POLL_*)
+public const EV_HUP = 7;                 // the terminal went away (input closed)
+public const EV_REPLY = 8;               // answer to a query: key = 'R' (cursor position: y = row, x = column) or 't' (size: y rows, x columns)
+public const EV_RESUME = 9;              // the program was continued after a stop (the screen must be redrawn)
+
+public const MB_NONE = 0;
+public const MB_LEFT = 1;
+public const MB_MIDDLE = 2;
+public const MB_RIGHT = 3;
+public const MB_WHEEL_UP = 4;
+public const MB_WHEEL_DOWN = 5;
+public const MB_WHEEL_LEFT = 6;
+public const MB_WHEEL_RIGHT = 7;
+
+public const MA_PRESS = 1;
+public const MA_RELEASE = 2;
+public const MA_DRAG = 3;                // moved with a button held
+public const MA_MOVE = 4;                // moved with no button (only when the terminal reports all motion)
+public const MA_WHEEL = 5;
+
+// the biggest window size the toolkit accepts: larger values (a broken terminal, LINES=99999999) are cut to it, so the screen buffers stay small
+public const MAX_COLS = 1000;
+public const MAX_ROWS = 500;
+
+public const POLL_IN = 1;
+public const POLL_OUT = 4;
+public const POLL_ERR = 8;
+public const POLL_HUP = 16;
+
+// the key code of function key n (1..24)
+public int fkey(int n) { return KEY_F1 + n - 1; }
+
+public class Event {
+    public int kind;
+    public int key;
+    public int mods;
+    public int x;
+    public int y;
+    public int button;
+    public int action;
+    public char* text;
+    public int len;
+
+    public void clear() {
+        kind = 0; key = 0; mods = 0; x = 0; y = 0; button = 0; action = 0; text = null; len = 0;
+    }
+    public void copyFrom(Event* o) {
+        kind = o->kind; key = o->key; mods = o->mods; x = o->x; y = o->y; button = o->button; action = o->action; text = o->text; len = o->len;
+    }
+    // true for the Enter key (also Ctrl+J, which many terminals send for it), without Alt
+    public bool isEnter() { return kind == EV_KEY && key == KEY_ENTER && (mods & MOD_ALT) == 0; }
+    // a printable character typed without Ctrl and Alt (what a text field inserts)
+    public bool isChar() { return kind == EV_KEY && key >= 32 && key < KEY_BASE && key != 127 && (mods & (MOD_CTRL | MOD_ALT)) == 0; }
+}
+
+// ---- small helpers (private) --------------------------------------------------------------------------------------------------------------
+private bool isDigit(int c) { return c >= '0' && c <= '9'; }
+
+private int lower(int c) {
+    if (c >= 'A' && c <= 'Z') { return c + 32; }
+    return c;
+}
+
+// true if text contains the lower case word (case insensitive)
+private bool has(char* text, char* word) {
+    if (text == null) { return false; }
+    int n = strlen(word);
+    for (int i = 0; text[i] != 0; i++) {
+        int k = 0;
+        while (k < n && text[i + k] != 0 && lower(text[i + k]) == word[k]) { k++; }
+        if (k == n) { return true; }
+    }
+    return false;
+}
+
+private bool starts(char* text, char* prefix) {
+    if (text == null) { return false; }
+    int n = strlen(prefix);
+    for (int i = 0; i < n; i++) {
+        if (lower(text[i]) != prefix[i]) { return false; }
+    }
+    return true;
+}
+
+private bool same(char* a, char* b) {
+    if (a == null || b == null) { return false; }
+    int i = 0;
+    while (a[i] != 0 && b[i] != 0) {
+        if (lower(a[i]) != lower(b[i])) { return false; }
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+private int putUtf8(char* out, int cp) {
+    if (cp < 0x80) { out[0] = cp; return 1; }
+    if (cp < 0x800) { out[0] = 0xC0 | (cp >> 6); out[1] = 0x80 | (cp & 0x3F); return 2; }
+    if (cp < 0x10000) { out[0] = 0xE0 | (cp >> 12); out[1] = 0x80 | ((cp >> 6) & 0x3F); out[2] = 0x80 | (cp & 0x3F); return 3; }
+    out[0] = 0xF0 | (cp >> 18); out[1] = 0x80 | ((cp >> 12) & 0x3F); out[2] = 0x80 | ((cp >> 6) & 0x3F); out[3] = 0x80 | (cp & 0x3F);
+    return 4;
+}
+
+// appends text to out (a NUL terminated buffer of cap bytes); returns the new length
+private int appendStr(char* out, int len, int cap, char* s) {
+    for (int i = 0; s[i] != 0 && len < cap - 1; i++) { out[len] = s[i]; len++; }
+    out[len] = 0;
+    return len;
+}
+
+private int appendInt(char* out, int len, int cap, int v) {
+    char tmp[24];
+    intToStr(v, &tmp[0]);
+    return appendStr(out, len, cap, &tmp[0]);
+}
+
+// ---- the decoder -----------------------------------------------------------------------------------------------------------------------------
+const ST_GROUND = 0;
+const ST_UTF8 = 1;
+const ST_ESC = 2;
+const ST_CSI = 3;
+const ST_SS3 = 4;
+const ST_X10 = 5;
+const ST_PASTE = 6;
+const ST_LINUXF = 7;
+
+const QSIZE = 128;                      // initial size of the event queue (it grows)
+const QMAX = 1048576;                    // events the queue may hold at most (a safety limit; the oldest is dropped beyond it)
+const PASTE_MAX = 4194304;
+const PASTE_RATE = 256;                 // a paste that brings fewer bytes than this in 3 seconds is taken for typing
+const FKCODES = 20;
+
+// Turns the bytes a terminal sends into events. feed() one byte at a time (feedBytes / feedText for more), read the events with next().
+// A lone Esc is ambiguous (it starts every escape sequence): after a few milliseconds without more input call flush(), which turns the
+// pending Esc into the Esc key. flushDelay() says how long to wait (0 = nothing pending); Terminal.wait does that for you.
+public class Decoder {
+    public int state;
+    public bool expectCpr;            // set while a cursor position report (CSI 6 n) is awaited: CSI r;c R is not F3 then
+    public bool crNul;                // a NUL right after CR is dropped when it comes in the same read (telnet sends CR NUL for Enter); default true
+    public int escMs;                 // how long an Esc waits for the rest of a sequence (default 40)
+    private int params[16];
+    private int np;
+    private int cur;
+    private bool haveCur;
+    private int marker;
+    private bool inter;
+    private bool skipSub;
+    private bool pendAlt;
+    private bool crSeen;
+    private int u8left;
+    private int u8cp;
+    private int u8min;
+    private int x10n;
+    private int x10b[3];
+    private int lastBtn;
+    private int ss3mod;
+    private char* paste;
+    private int pasteLen;
+    private int pasteCap;
+    private int pasteMatch;
+    private Event** q;
+    private int qcap;
+    private int qh;
+    private int qn;
+
+    public Decoder() {
+        crNul = true;
+        escMs = 40;
+        qcap = QSIZE;
+        q = (Event**) alloc(qcap * 8);
+        for (int i = 0; i < qcap; i++) { q[i] = new Event(); }
+    }
+
+    // ---- the queue ----------------------------------------------------------------------------------------------------------------------
+    public int count() { return qn; }
+
+    // takes the oldest event; false when there is none
+    public bool next(Event* out) {
+        if (qn == 0) { return false; }
+        out->copyFrom(q[qh]);
+        qh = (qh + 1) % qcap;
+        qn--;
+        return true;
+    }
+
+    public void clearEvents() { qh = 0; qn = 0; }
+
+    // the queue doubles when it is full, so a burst of input (a paste without bracketed paste mode, a script sending keys) loses nothing
+    private void grow() {
+        int ncap = qcap * 2;
+        Event** nq = (Event**) alloc(ncap * 8);
+        for (int i = 0; i < qn; i++) { nq[i] = q[(qh + i) % qcap]; }
+        for (int i = qn; i < qcap; i++) { nq[i] = q[(qh + i) % qcap]; }
+        for (int i = qcap; i < ncap; i++) { nq[i] = new Event(); }
+        q = nq;
+        qh = 0;
+        qcap = ncap;
+    }
+
+    private Event* slot() {
+        if (qn == qcap) {
+            if (qcap >= QMAX) { qh = (qh + 1) % qcap; qn--; }       // the safety limit: the oldest event is lost
+            else { grow(); }
+        }
+        Event* e = q[(qh + qn) % qcap];
+        qn++;
+        e->clear();
+        return e;
+    }
+
+    // queues an event made by the caller (resize, descriptor ready ...)
+    public void push(int kind, int key, int x, int y) {
+        Event* e = slot();
+        e->kind = kind;
+        e->key = key;
+        e->x = x;
+        e->y = y;
+    }
+
+    // removes the first event of that kind from the queue and copies it to out
+    public bool take(int kind, Event* out) {
+        for (int i = 0; i < qn; i++) {
+            Event* e = q[(qh + i) % qcap];
+            if (e->kind == kind) {
+                out->copyFrom(e);
+                for (int k = i; k < qn - 1; k++) {
+                    Event* a = q[(qh + k) % qcap];
+                    Event* b = q[(qh + k + 1) % qcap];
+                    a->copyFrom(b);
+                }
+                qn--;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void key(int k, int mods) {
+        if (pendAlt) { mods = mods | MOD_ALT; pendAlt = false; }
+        Event* e = slot();
+        e->kind = EV_KEY;
+        e->key = k;
+        e->mods = mods;
+    }
+
+    // ---- feeding -------------------------------------------------------------------------------------------------------------------------
+    public void feedBytes(char* b, int n) {
+        for (int i = 0; i < n; i++) { feed(b[i]); }
+    }
+
+    public void feedText(char* s) {
+        for (int i = 0; s[i] != 0; i++) { feed(s[i]); }
+    }
+
+    // Call it when everything one read from the terminal returned has been fed (Terminal does). The CR NUL rule (crNul) only joins a CR and a
+    // NUL of the same read: a Ctrl+Space (which sends NUL) typed as the next key after Enter is a key of its own.
+    public void endRead() { crSeen = false; }
+
+    // how many milliseconds to wait for more input before flush(); 0 when nothing is pending
+    public int flushDelay() {
+        if (state == ST_GROUND) { return 0; }
+        if (state == ST_PASTE) { return 3000; }
+        return escMs;
+    }
+
+    // no more input is coming (the Esc timeout expired): an unfinished sequence becomes plain keys
+    public void flush() {
+        if (state == ST_ESC) {
+            state = ST_GROUND;
+            key(KEY_ESC, 0);
+        } else if (state == ST_SS3) {
+            state = ST_GROUND;
+            pendAlt = true;
+            key('O', 0);
+        } else if (state == ST_CSI && np == 0 && !haveCur && marker == 0 && !inter) {
+            state = ST_GROUND;
+            pendAlt = true;
+            key('[', 0);
+        } else if (state == ST_PASTE) {
+            endPaste();
+        } else if (state == ST_UTF8) {
+            state = ST_GROUND;
+            key(0xFFFD, 0);
+        } else {
+            state = ST_GROUND;
+            pendAlt = false;
+        }
+    }
+
+    public void feed(int b) {
+        b = b & 255;
+        if (state == ST_GROUND) { ground(b); return; }
+        if (state == ST_UTF8) { utf8Cont(b); return; }
+        if (state == ST_ESC) { escByte(b); return; }
+        if (state == ST_CSI) { csiByte(b); return; }
+        if (state == ST_SS3) { ss3Byte(b); return; }
+        if (state == ST_X10) { x10Byte(b); return; }
+        if (state == ST_PASTE) { pasteByte(b); return; }
+        if (state == ST_LINUXF) {
+            state = ST_GROUND;
+            if (b >= 'A' && b <= 'E') { key(KEY_F1 + b - 'A', 0); }
+            return;
+        }
+        state = ST_GROUND;
+    }
+
+    private void ground(int b) {
+        if (crSeen) {
+            crSeen = false;
+            if (b == 0 && crNul) { return; }
+        }
+        if (b == 27) { state = ST_ESC; return; }
+        if (b >= 0xC2 && b < 0xF5) {
+            state = ST_UTF8;
+            if (b < 0xE0) { u8left = 1; u8cp = b & 0x1F; u8min = 0x80; }
+            else if (b < 0xF0) { u8left = 2; u8cp = b & 0x0F; u8min = 0x800; }
+            else { u8left = 3; u8cp = b & 0x07; u8min = 0x10000; }
+            return;
+        }
+        if (b >= 0x80) { key(0xFFFD, 0); return; }
+        if (b == 13) { crSeen = true; key(KEY_ENTER, 0); return; }
+        if (b == 10) { key(KEY_ENTER, MOD_CTRL); return; }
+        if (b == 9) { key(KEY_TAB, 0); return; }
+        if (b == 8 || b == 127) { key(KEY_BACKSPACE, 0); return; }
+        if (b == 0) { key(' ', MOD_CTRL); return; }
+        if (b < 27) { key('a' + b - 1, MOD_CTRL); return; }
+        if (b == 28) { key('\\', MOD_CTRL); return; }
+        if (b == 29) { key(']', MOD_CTRL); return; }
+        if (b == 30) { key('^', MOD_CTRL); return; }
+        if (b == 31) { key('/', MOD_CTRL); return; }
+        key(b, 0);
+    }
+
+    private void utf8Cont(int b) {
+        if ((b & 0xC0) != 0x80) {
+            state = ST_GROUND;
+            key(0xFFFD, 0);
+            ground(b);
+            return;
+        }
+        u8cp = (u8cp << 6) | (b & 0x3F);
+        u8left--;
+        if (u8left == 0) {
+            state = ST_GROUND;
+            if (u8cp < u8min || u8cp > 0x10FFFF || (u8cp >= 0xD800 && u8cp < 0xE000)) { u8cp = 0xFFFD; }
+            key(u8cp, 0);
+        }
+    }
+
+    private void escByte(int b) {
+        if (b == '[') { state = ST_CSI; np = 0; cur = 0; haveCur = false; marker = 0; inter = false; skipSub = false; return; }
+        if (b == 'O') { state = ST_SS3; ss3mod = 0; return; }
+        if (b == 27) { pendAlt = true; return; }
+        state = ST_GROUND;
+        pendAlt = true;
+        ground(b);
+    }
+
+    private int ss3Final(int b) {
+        if (b == 'A') { return KEY_UP; }
+        if (b == 'B') { return KEY_DOWN; }
+        if (b == 'C') { return KEY_RIGHT; }
+        if (b == 'D') { return KEY_LEFT; }
+        if (b == 'H') { return KEY_HOME; }
+        if (b == 'F') { return KEY_END; }
+        if (b == 'E') { return KEY_BEGIN; }
+        if (b >= 'P' && b <= 'S') { return KEY_F1 + b - 'P'; }
+        if (b == 'M') { return KEY_ENTER; }
+        if (b == 'I') { return KEY_TAB; }
+        if (b == 'X') { return '='; }
+        if (b == 'j') { return '*'; }
+        if (b == 'k') { return '+'; }
+        if (b == 'l') { return ','; }
+        if (b == 'm') { return '-'; }
+        if (b == 'n') { return '.'; }
+        if (b == 'o') { return '/'; }
+        if (b >= 'p' && b <= 'y') { return '0' + b - 'p'; }
+        return 0;
+    }
+
+    private void ss3Byte(int b) {
+        if (isDigit(b)) { ss3mod = ss3mod * 10 + b - '0'; return; }
+        if (b == ';') { return; }
+        state = ST_GROUND;
+        int k = ss3Final(b);
+        int mods = 0;
+        if (ss3mod > 1) { mods = (ss3mod - 1) & 15; }
+        if (k != 0) { key(k, mods); } else { pendAlt = false; }
+    }
+
+    private void commit() {
+        if (np < 16) { params[np] = haveCur ? cur : 0; }
+        if (np < 16) { np++; }
+        cur = 0;
+        haveCur = false;
+        skipSub = false;
+    }
+
+    private void csiByte(int b) {
+        if (isDigit(b)) {
+            if (!skipSub) {
+                cur = cur * 10 + b - '0';
+                if (cur > 1000000) { cur = 1000000; }
+                haveCur = true;
+            }
+            return;
+        }
+        if (b == ';') { commit(); return; }
+        if (b == ':') { skipSub = true; return; }
+        if (b == '<' || b == '?' || b == '>' || b == '=') {
+            if (np == 0 && !haveCur) { marker = b; }
+            return;
+        }
+        if (b == '[' && np == 0 && !haveCur && marker == 0 && !inter) { state = ST_LINUXF; return; }
+        if (b >= 0x20 && b <= 0x2F) { inter = true; return; }
+        if (b >= 0x40 && b <= 0x7E) {
+            if (haveCur || np > 0) { commit(); }
+            state = ST_GROUND;
+            csiDone(b);
+            return;
+        }
+        if (b == 27) { state = ST_ESC; pendAlt = false; return; }
+        state = ST_GROUND;                      // an unexpected control byte: the sequence is dropped
+    }
+
+    private int par(int i, int def) {
+        if (i >= np || params[i] == 0) { return def; }
+        return params[i];
+    }
+
+    private int modsOf(int i) {
+        if (i < np && params[i] > 1) { return (params[i] - 1) & 15; }
+        return 0;
+    }
+
+    private int tildeKey(int n) {
+        if (n == 1 || n == 7) { return KEY_HOME; }
+        if (n == 2) { return KEY_INSERT; }
+        if (n == 3) { return KEY_DELETE; }
+        if (n == 4 || n == 8) { return KEY_END; }
+        if (n == 5) { return KEY_PGUP; }
+        if (n == 6) { return KEY_PGDN; }
+        int codes[20] = {11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34};
+        for (int i = 0; i < FKCODES; i++) {
+            if (codes[i] == n) { return KEY_F1 + i; }
+        }
+        return 0;
+    }
+
+    // the key for a character code that arrives in CSI u / modifyOtherKeys form
+    private int plainKey(int code) {
+        if (code == 13) { return KEY_ENTER; }
+        if (code == 9) { return KEY_TAB; }
+        if (code == 27) { return KEY_ESC; }
+        if (code == 127 || code == 8) { return KEY_BACKSPACE; }
+        if (code >= 32 && code < KEY_BASE && (code < 0xE000 || code > 0xF8FF)) { return code; }
+        return 0;
+    }
+
+    private void csiDone(int f) {
+        if (inter) { pendAlt = false; return; }                     // DECRPM and friends: not for us
+        if (marker == '<' && (f == 'M' || f == 'm')) { sgrMouse(f); return; }
+        if (marker != 0) { pendAlt = false; return; }
+        int k = 0;
+        int mods = modsOf(1);
+        if ((f == 'A' || f == 'B' || f == 'C' || f == 'D' || f == 'H' || f == 'F' || f == 'E' || f == 'P' || f == 'Q' || f == 'R' || f == 'S')
+            && np > 0 && params[0] > 1) {
+            if (!(f == 'R' && expectCpr && np == 2)) { pendAlt = false; return; }       // CSI 24;80 H is a cursor move, not a key
+        }
+        if (f == 'A') { k = KEY_UP; }
+        else if (f == 'B') { k = KEY_DOWN; }
+        else if (f == 'C') { k = KEY_RIGHT; }
+        else if (f == 'D') { k = KEY_LEFT; }
+        else if (f == 'H') { k = KEY_HOME; }
+        else if (f == 'F') { k = KEY_END; }
+        else if (f == 'E') { k = KEY_BEGIN; }
+        else if (f == 'P') { k = KEY_F1; }
+        else if (f == 'Q') { k = KEY_F1 + 1; }
+        else if (f == 'S') { k = KEY_F1 + 3; }
+        else if (f == 'R') {
+            if (expectCpr && np == 2) {
+                expectCpr = false;
+                Event* e = slot();
+                e->kind = EV_REPLY;
+                e->key = 'R';
+                e->y = params[0];
+                e->x = params[1];
+                pendAlt = false;
+                return;
+            }
+            k = KEY_F1 + 2;
+        }
+        else if (f == 'Z') { k = KEY_TAB; mods = mods | MOD_SHIFT; }
+        else if (f == '~') {
+            int n = par(0, 0);
+            if (n == 200) { startPaste(); return; }
+            if (n == 201) { pendAlt = false; return; }
+            if (n == 27 && np >= 3) {                              // modifyOtherKeys:  CSI 27 ; mods ; code ~
+                int pk = plainKey(params[2]);
+                if (pk != 0) { key(pk, modsOf(1)); } else { pendAlt = false; }
+                return;
+            }
+            k = tildeKey(n);
+        }
+        else if (f == 'u') {                                       // CSI code ; mods u   (fixterms / kitty)
+            int pk = plainKey(par(0, 0));
+            if (pk != 0) { key(pk, modsOf(1)); } else { pendAlt = false; }
+            return;
+        }
+        else if (f == 'M' && np == 0) { state = ST_X10; x10n = 0; return; }
+        else if (f == 'I' && np == 0) { focusEvent(1); return; }
+        else if (f == 'O' && np == 0) { focusEvent(0); return; }
+        else if (f == 't' && np == 3 && params[0] == 8) {
+            Event* e = slot();
+            e->kind = EV_REPLY;
+            e->key = 't';
+            e->y = params[1];
+            e->x = params[2];
+            pendAlt = false;
+            return;
+        }
+        if (k != 0) { key(k, mods); } else { pendAlt = false; }
+    }
+
+    private void focusEvent(int gained) {
+        pendAlt = false;
+        Event* e = slot();
+        e->kind = EV_FOCUS;
+        e->key = gained;
+    }
+
+    // ---- mouse ---------------------------------------------------------------------------------------------------------------------------
+    private void mouseEvent(int b, int cx, int cy, bool release) {
+        int mods = 0;
+        if ((b & 4) != 0) { mods = mods | MOD_SHIFT; }
+        if ((b & 8) != 0) { mods = mods | MOD_ALT; }
+        if ((b & 16) != 0) { mods = mods | MOD_CTRL; }
+        Event* e = slot();
+        e->kind = EV_MOUSE;
+        e->x = cx;
+        e->y = cy;
+        e->mods = mods;
+        if ((b & 64) != 0) {
+            e->action = MA_WHEEL;
+            e->button = MB_WHEEL_UP + (b & 3);
+            return;
+        }
+        int btn = (b & 3) + 1;
+        if ((b & 32) != 0) {
+            if ((b & 3) == 3) { e->action = MA_MOVE; e->button = MB_NONE; }
+            else { e->action = MA_DRAG; e->button = btn; lastBtn = btn; }
+            return;
+        }
+        if (release || (b & 3) == 3) {
+            e->action = MA_RELEASE;
+            e->button = (b & 3) == 3 ? lastBtn : btn;
+            if (e->button == 0) { e->button = MB_LEFT; }
+            return;
+        }
+        e->action = MA_PRESS;
+        e->button = btn;
+        lastBtn = btn;
+    }
+
+    private void sgrMouse(int f) {
+        if (np < 3) { pendAlt = false; return; }
+        pendAlt = false;
+        mouseEvent(params[0], params[1] - 1, params[2] - 1, f == 'm');
+    }
+
+    private void x10Byte(int b) {
+        x10b[x10n] = b;
+        x10n++;
+        if (x10n == 3) {
+            state = ST_GROUND;
+            pendAlt = false;
+            mouseEvent(x10b[0] - 32, x10b[1] - 33, x10b[2] - 33, false);
+        }
+    }
+
+    // ---- bracketed paste -----------------------------------------------------------------------------------------------------------------
+    private void startPaste() {
+        state = ST_PASTE;
+        pasteLen = 0;
+        pasteMatch = 0;
+        pendAlt = false;
+        if (paste == null) { pasteCap = 65536; paste = alloc(pasteCap); }
+    }
+
+    private void pasteAdd(int b) {
+        if (pasteLen >= pasteCap - 1) {
+            if (pasteCap >= PASTE_MAX) { return; }                 // too much: the rest is dropped
+            char* nb = alloc(pasteCap * 2);
+            memcpy(nb, paste, pasteLen);
+            paste = nb;
+            pasteCap = pasteCap * 2;
+        }
+        paste[pasteLen] = b;
+        pasteLen++;
+    }
+
+    private void pasteByte(int b) {
+        char* end = "\e[201~";
+        if (b == end[pasteMatch]) {
+            pasteMatch++;
+            if (pasteMatch == 6) { endPaste(); }
+            return;
+        }
+        for (int i = 0; i < pasteMatch; i++) { pasteAdd(end[i]); }
+        pasteMatch = 0;
+        if (b == 27) { pasteMatch = 1; return; }
+        pasteAdd(b);
+    }
+
+    private void endPaste() {
+        state = ST_GROUND;
+        pasteMatch = 0;
+        char* t = alloc(pasteLen + 1);
+        memcpy(t, paste, pasteLen);
+        Event* e = slot();
+        e->kind = EV_PASTE;
+        e->text = t;
+        e->len = pasteLen;
+    }
+}
+
+// ---- key names ---------------------------------------------------------------------------------------------------------------------------
+private char* nameOfKey(int k) {
+    if (k == KEY_ENTER) { return "Enter"; }
+    if (k == KEY_TAB) { return "Tab"; }
+    if (k == KEY_BACKSPACE) { return "Backspace"; }
+    if (k == KEY_ESC) { return "Esc"; }
+    if (k == KEY_UP) { return "Up"; }
+    if (k == KEY_DOWN) { return "Down"; }
+    if (k == KEY_LEFT) { return "Left"; }
+    if (k == KEY_RIGHT) { return "Right"; }
+    if (k == KEY_HOME) { return "Home"; }
+    if (k == KEY_END) { return "End"; }
+    if (k == KEY_PGUP) { return "PgUp"; }
+    if (k == KEY_PGDN) { return "PgDn"; }
+    if (k == KEY_INSERT) { return "Insert"; }
+    if (k == KEY_DELETE) { return "Delete"; }
+    if (k == KEY_BEGIN) { return "Begin"; }
+    if (k == ' ') { return "Space"; }
+    return null;
+}
+
+// "Ctrl+Alt+Shift+Key" for a key code and modifiers, written to out (NUL terminated, at most cap bytes). Returns the length.
+public int keyName(int k, int mods, char* out, int cap) {
+    int n = 0;
+    out[0] = 0;
+    if ((mods & MOD_CTRL) != 0) { n = appendStr(out, n, cap, "Ctrl+"); }
+    if ((mods & MOD_ALT) != 0) { n = appendStr(out, n, cap, "Alt+"); }
+    if ((mods & MOD_SHIFT) != 0) { n = appendStr(out, n, cap, "Shift+"); }
+    if ((mods & MOD_META) != 0) { n = appendStr(out, n, cap, "Meta+"); }
+    char* nm = nameOfKey(k);
+    if (nm != null) { return appendStr(out, n, cap, nm); }
+    if (k >= KEY_F1 && k <= KEY_F24) {
+        n = appendStr(out, n, cap, "F");
+        return appendInt(out, n, cap, k - KEY_F1 + 1);
+    }
+    if (k > 32 && k < KEY_BASE) {
+        char u[8];
+        int len = putUtf8(&u[0], (mods & MOD_CTRL) != 0 && k >= 'a' && k <= 'z' ? k - 32 : k);
+        u[len] = 0;
+        return appendStr(out, n, cap, &u[0]);
+    }
+    return appendStr(out, n, cap, "?");
+}
+
+// a readable description of an event ("Ctrl+Up", "Mouse press left (10,5)", "Paste 12 bytes" ...), for logs and tests
+public int describe(Event* e, char* out, int cap) {
+    out[0] = 0;
+    int n = 0;
+    if (e->kind == EV_KEY) { return keyName(e->key, e->mods, out, cap); }
+    if (e->kind == EV_MOUSE) {
+        char* act = "press";
+        if (e->action == MA_RELEASE) { act = "release"; }
+        else if (e->action == MA_DRAG) { act = "drag"; }
+        else if (e->action == MA_MOVE) { act = "move"; }
+        else if (e->action == MA_WHEEL) { act = "wheel"; }
+        char* btn = "none";
+        if (e->button == MB_LEFT) { btn = "left"; }
+        else if (e->button == MB_MIDDLE) { btn = "middle"; }
+        else if (e->button == MB_RIGHT) { btn = "right"; }
+        else if (e->button == MB_WHEEL_UP) { btn = "up"; }
+        else if (e->button == MB_WHEEL_DOWN) { btn = "down"; }
+        else if (e->button == MB_WHEEL_LEFT) { btn = "left"; }
+        else if (e->button == MB_WHEEL_RIGHT) { btn = "right"; }
+        n = appendStr(out, n, cap, "Mouse ");
+        n = appendStr(out, n, cap, act);
+        n = appendStr(out, n, cap, " ");
+        n = appendStr(out, n, cap, btn);
+        n = appendStr(out, n, cap, " (");
+        n = appendInt(out, n, cap, e->x);
+        n = appendStr(out, n, cap, ",");
+        n = appendInt(out, n, cap, e->y);
+        n = appendStr(out, n, cap, ")");
+        if ((e->mods & MOD_SHIFT) != 0) { n = appendStr(out, n, cap, " +Shift"); }
+        if ((e->mods & MOD_ALT) != 0) { n = appendStr(out, n, cap, " +Alt"); }
+        if ((e->mods & MOD_CTRL) != 0) { n = appendStr(out, n, cap, " +Ctrl"); }
+        return n;
+    }
+    if (e->kind == EV_PASTE) {
+        n = appendStr(out, n, cap, "Paste ");
+        n = appendInt(out, n, cap, e->len);
+        return appendStr(out, n, cap, " bytes");
+    }
+    if (e->kind == EV_RESIZE) {
+        n = appendStr(out, n, cap, "Resize ");
+        n = appendInt(out, n, cap, e->x);
+        n = appendStr(out, n, cap, "x");
+        return appendInt(out, n, cap, e->y);
+    }
+    if (e->kind == EV_FOCUS) { return appendStr(out, n, cap, e->key != 0 ? "Focus in" : "Focus out"); }
+    if (e->kind == EV_FD) {
+        n = appendStr(out, n, cap, "Fd ");
+        return appendInt(out, n, cap, e->key);
+    }
+    if (e->kind == EV_HUP) { return appendStr(out, n, cap, "Hangup"); }
+    if (e->kind == EV_RESUME) { return appendStr(out, n, cap, "Resume"); }
+    if (e->kind == EV_REPLY) {
+        n = appendStr(out, n, cap, e->key == 'R' ? "Cursor position " : "Size report ");
+        n = appendInt(out, n, cap, e->y);
+        n = appendStr(out, n, cap, ";");
+        return appendInt(out, n, cap, e->x);
+    }
+    return appendStr(out, n, cap, "none");
+}
+
+// Parses "Ctrl+S", "Alt+F", "Shift+Tab", "F10", "ctrl-alt-del", "Esc", "x", "+" ... into key and modifier bits. Returns -1 when the text is
+// not a key (the key code, with the modifiers in *mods, otherwise). Letters are returned in lower case: "Ctrl+S" is 's' with MOD_CTRL.
+public int parseKey(char* spec, int* mods) {
+    int m = 0;
+    int i = 0;
+    int n = strlen(spec);
+    for (;;) {
+        // is there a modifier word followed by + or - ?
+        int e = i;
+        while (e < n && spec[e] != '+' && spec[e] != '-') { e++; }
+        if (e >= n || e == i) { break; }
+        char word[16];
+        int wl = e - i;
+        if (wl > 12) { return -1; }
+        for (int k = 0; k < wl; k++) { word[k] = spec[i + k]; }
+        word[wl] = 0;
+        if (same(&word[0], "ctrl") || same(&word[0], "control") || same(&word[0], "c")) { m = m | MOD_CTRL; }
+        else if (same(&word[0], "alt") || same(&word[0], "a")) { m = m | MOD_ALT; }
+        else if (same(&word[0], "shift") || same(&word[0], "s")) { m = m | MOD_SHIFT; }
+        else if (same(&word[0], "meta") || same(&word[0], "super") || same(&word[0], "m")) { m = m | MOD_META; }
+        else { return -1; }
+        i = e + 1;
+    }
+    char* name = &spec[i];
+    *mods = m;
+    if (name[0] == 0) { return -1; }
+    int len = strlen(name);
+    int k = -1;
+    if (same(name, "enter") || same(name, "return") || same(name, "cr")) { k = KEY_ENTER; }
+    else if (same(name, "tab")) { k = KEY_TAB; }
+    else if (same(name, "backspace") || same(name, "bs")) { k = KEY_BACKSPACE; }
+    else if (same(name, "esc") || same(name, "escape")) { k = KEY_ESC; }
+    else if (same(name, "up")) { k = KEY_UP; }
+    else if (same(name, "down")) { k = KEY_DOWN; }
+    else if (same(name, "left")) { k = KEY_LEFT; }
+    else if (same(name, "right")) { k = KEY_RIGHT; }
+    else if (same(name, "home")) { k = KEY_HOME; }
+    else if (same(name, "end")) { k = KEY_END; }
+    else if (same(name, "pgup") || same(name, "pageup")) { k = KEY_PGUP; }
+    else if (same(name, "pgdn") || same(name, "pagedown")) { k = KEY_PGDN; }
+    else if (same(name, "insert") || same(name, "ins")) { k = KEY_INSERT; }
+    else if (same(name, "delete") || same(name, "del")) { k = KEY_DELETE; }
+    else if (same(name, "begin")) { k = KEY_BEGIN; }
+    else if (same(name, "space")) { k = ' '; }
+    else if (same(name, "plus")) { k = '+'; }
+    else if (same(name, "minus")) { k = '-'; }
+    else if ((name[0] == 'f' || name[0] == 'F') && len >= 2 && len <= 3 && isDigit(name[1]) && (len == 2 || isDigit(name[2]))) {
+        int v = name[1] - '0';
+        if (len == 3) { v = v * 10 + name[2] - '0'; }
+        if (v >= 1 && v <= 24) { k = KEY_F1 + v - 1; }
+    }
+    else {
+        // one character (UTF-8)
+        int cp = name[0];
+        int used = 1;
+        if (cp >= 0xC2 && cp < 0xE0 && len >= 2) { cp = ((cp & 0x1F) << 6) | (name[1] & 0x3F); used = 2; }
+        else if (cp >= 0xE0 && cp < 0xF0 && len >= 3) { cp = ((cp & 0x0F) << 12) | ((name[1] & 0x3F) << 6) | (name[2] & 0x3F); used = 3; }
+        else if (cp >= 0xF0 && len >= 4) { cp = ((cp & 0x07) << 18) | ((name[1] & 0x3F) << 12) | ((name[2] & 0x3F) << 6) | (name[3] & 0x3F); used = 4; }
+        if (used == len) { k = lower(cp); }
+    }
+    return k;
+}
+
+// true if the event is the key described by spec (see parseKey). An upper case letter in the event counts as Shift + the lower case
+// letter, so "Alt+Shift+F" matches the Alt+F that arrives as ESC F.
+public bool keyIs(Event* e, char* spec) {
+    if (e->kind != EV_KEY) { return false; }
+    int m = 0;
+    int k = parseKey(spec, &m);
+    if (k < 0) { return false; }
+    return keyMatches(e->key, e->mods, k, m);
+}
+
+public bool keyMatches(int ek, int emods, int k, int m) {
+    if (ek >= 'A' && ek <= 'Z') { ek = ek + 32; emods = emods | MOD_SHIFT; }
+    if (k >= 'A' && k <= 'Z') { k = k + 32; m = m | MOD_SHIFT; }
+    // punctuation typed with Shift (like '?' or '+') carries no Shift bit in the terminal's report
+    if (ek < 0x80 && !((ek >= 'a' && ek <= 'z') || (ek >= '0' && ek <= '9')) && ek >= 33) { emods = emods & ~MOD_SHIFT; m = m & ~MOD_SHIFT; }
+    return ek == k && (emods & 15) == (m & 15);
+}
+
+// The bytes a terminal of the xterm family sends for a key (what the Decoder reads back): used to drive programs from tests. Returns the
+// length (the bytes are not NUL terminated; out needs 16). Combinations a terminal cannot express in a simple way use the CSI u form.
+public int encodeKey(int key, int mods, char* out) {
+    int n = 0;
+    int m = mods & 15;
+    int mp = m + 1;
+    if (key < KEY_BASE) {
+        int c = key;
+        bool ok = true;
+        if ((m & MOD_CTRL) != 0) {
+            if (c >= 'a' && c <= 'z') { c = c - 96; }
+            else if (c >= 'A' && c <= 'Z') { c = c - 64; }
+            else if (c == ' ') { c = 0; }
+            else if (c == '\\') { c = 28; }
+            else if (c == ']') { c = 29; }
+            else if (c == '^') { c = 30; }
+            else if (c == '/' || c == '_') { c = 31; }
+            else { ok = false; }
+        }
+        if (!ok) {
+            out[0] = 27; out[1] = '[';
+            char t[24];
+            intToStr(key, &t[0]);
+            n = 2;
+            for (int i = 0; t[i] != 0; i++) { out[n] = t[i]; n++; }
+            out[n] = ';'; n++;
+            intToStr(mp, &t[0]);
+            for (int i = 0; t[i] != 0; i++) { out[n] = t[i]; n++; }
+            out[n] = 'u'; n++;
+            return n;
+        }
+        if ((m & MOD_ALT) != 0) { out[n] = 27; n++; }
+        if (c < 0x80) { out[n] = c; return n + 1; }
+        return n + putUtf8(&out[n], c);
+    }
+    if ((m & MOD_ALT) != 0 && (key == KEY_ENTER || key == KEY_TAB || key == KEY_BACKSPACE || key == KEY_ESC)) {
+        out[0] = 27;
+        n = 1;
+        m = m & ~MOD_ALT;
+        mp = m + 1;
+    }
+    if (key == KEY_ENTER) { out[n] = ((m & MOD_CTRL) != 0) ? 10 : 13; return n + 1; }
+    if (key == KEY_TAB) {
+        if (m == MOD_SHIFT) { out[n] = 27; out[n + 1] = '['; out[n + 2] = 'Z'; return n + 3; }
+        out[n] = 9;
+        return n + 1;
+    }
+    if (key == KEY_BACKSPACE) { out[n] = ((m & MOD_CTRL) != 0) ? 8 : 127; return n + 1; }
+    if (key == KEY_ESC) { out[n] = 27; return n + 1; }
+    int letter = 0;
+    int tilde = 0;
+    if (key == KEY_UP) { letter = 'A'; }
+    else if (key == KEY_DOWN) { letter = 'B'; }
+    else if (key == KEY_RIGHT) { letter = 'C'; }
+    else if (key == KEY_LEFT) { letter = 'D'; }
+    else if (key == KEY_HOME) { letter = 'H'; }
+    else if (key == KEY_END) { letter = 'F'; }
+    else if (key == KEY_BEGIN) { letter = 'E'; }
+    else if (key == KEY_INSERT) { tilde = 2; }
+    else if (key == KEY_DELETE) { tilde = 3; }
+    else if (key == KEY_PGUP) { tilde = 5; }
+    else if (key == KEY_PGDN) { tilde = 6; }
+    else if (key >= KEY_F1 && key <= KEY_F1 + 3) {
+        letter = 'P' + (key - KEY_F1);
+        if (m == 0) { out[0] = 27; out[1] = 'O'; out[2] = letter; return 3; }
+    }
+    else if (key >= KEY_F1 + 4 && key <= KEY_F1 + 19) {
+        int codes[20] = {11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34};
+        tilde = codes[key - KEY_F1];
+    }
+    else { return 0; }
+    out[n] = 27;
+    out[n + 1] = '[';
+    n = n + 2;
+    char t[24];
+    if (letter != 0) {
+        if (m != 0) {
+            out[n] = '1'; out[n + 1] = ';';
+            n = n + 2;
+            intToStr(mp, &t[0]);
+            for (int i = 0; t[i] != 0; i++) { out[n] = t[i]; n++; }
+        }
+        out[n] = letter;
+        return n + 1;
+    }
+    intToStr(tilde, &t[0]);
+    for (int i = 0; t[i] != 0; i++) { out[n] = t[i]; n++; }
+    if (m != 0) {
+        out[n] = ';';
+        n++;
+        intToStr(mp, &t[0]);
+        for (int i = 0; t[i] != 0; i++) { out[n] = t[i]; n++; }
+    }
+    out[n] = '~';
+    return n + 1;
+}
+
+// ---- capabilities --------------------------------------------------------------------------------------------------------------------------
+public const COLORS_NONE = 0;
+public const COLORS_8 = 8;
+public const COLORS_16 = 16;
+public const COLORS_256 = 256;
+public const COLORS_TRUE = 16777216;
+
+// What the terminal can do. capsFor / capsFromEnv fill it in; the fields may be changed by hand afterwards.
+public class Caps {
+    public int colors;               // COLORS_NONE .. COLORS_TRUE
+    public bool utf8;                // false: boxes and symbols are drawn with ASCII characters
+    public bool mouse;               // mouse reporting (1000 / 1002 / 1006)
+    public bool altScreen;           // alternate screen buffer (1049); without it the screen is cleared on leaving
+    public bool bracketedPaste;
+    public bool title;               // OSC 0 window title
+    public bool italic;
+    public bool cursorShape;         // DECSCUSR
+    public bool cursorAddr;          // false for a "dumb" terminal: full screen programs cannot work
+    public bool mouseMotion;         // ask for all motion (1003) instead of only drags (off by default)
+    public bool focusEvents;         // 1004 (off by default)
+    public bool syncOutput;          // 2026 synchronized updates (off by default, on for terminals known to support it)
+    public bool aos;                 // running on AOS: no SIGWINCH delivery while blocked, no job control: the size is polled
+    public char name[48];            // the TERM it was made from
+
+    public Caps() { capsFor(this, null, null, true, false); }
+}
+
+// fills caps from the values of TERM and COLORTERM (null when unset), whether the locale is UTF-8 and whether NO_COLOR is set
+public void capsFor(Caps* c, char* termName, char* colorTerm, bool utf8, bool noColor) {
+    c->colors = COLORS_16;
+    c->utf8 = utf8;
+    c->mouse = false;
+    c->altScreen = false;
+    c->bracketedPaste = false;
+    c->title = false;
+    c->italic = false;
+    c->cursorShape = false;
+    c->cursorAddr = true;
+    c->mouseMotion = false;
+    c->focusEvents = false;
+    c->syncOutput = false;
+    c->name[0] = 0;
+    if (termName != null) {
+        int i = 0;
+        while (termName[i] != 0 && i < 47) { c->name[i] = termName[i]; i++; }
+        c->name[i] = 0;
+    }
+    char* t = termName;
+    if (t == null || t[0] == 0) { t = "ansi"; }
+    bool modern = false;
+    if (same(t, "dumb") || same(t, "unknown")) {
+        c->colors = COLORS_NONE;
+        c->cursorAddr = false;
+    } else if (starts(t, "linux") || starts(t, "vt") || same(t, "ansi") || starts(t, "ansi.") || starts(t, "cons") || starts(t, "freebsd")) {
+        c->colors = COLORS_16;
+        if (starts(t, "vt")) { c->colors = COLORS_NONE; }
+        if (same(t, "ansi")) { c->colors = COLORS_8; }
+    } else {
+        // xterm family and friends
+        modern = true;
+        c->mouse = true;
+        c->altScreen = true;
+        c->bracketedPaste = true;
+        c->title = true;
+        c->cursorShape = true;
+        c->italic = true;
+        c->colors = COLORS_16;
+        if (starts(t, "xterm-color") && !has(t, "256")) { c->colors = COLORS_8; }
+        if (has(t, "256color") || starts(t, "st") || starts(t, "konsole") || starts(t, "gnome") || starts(t, "vte") || has(t, "putty") || starts(t, "cygwin")) {
+            c->colors = COLORS_256;
+        }
+        if (starts(t, "cygwin") || starts(t, "rxvt") || starts(t, "eterm") || starts(t, "screen") || starts(t, "linux")) { c->italic = false; }
+        if (has(t, "direct") || has(t, "truecolor") || has(t, "kitty") || starts(t, "alacritty") || starts(t, "foot") || has(t, "wezterm")
+            || has(t, "ghostty") || starts(t, "contour") || starts(t, "iterm")) {
+            c->colors = COLORS_TRUE;
+        }
+        if (has(t, "kitty") || starts(t, "alacritty") || starts(t, "foot") || has(t, "wezterm") || has(t, "ghostty") || starts(t, "contour")) { c->syncOutput = true; }
+        if (starts(t, "screen") || starts(t, "tmux")) { c->title = false; }
+    }
+    if (colorTerm != null && (same(colorTerm, "truecolor") || same(colorTerm, "24bit")) && modern) { c->colors = COLORS_TRUE; }
+    if (noColor) { c->colors = COLORS_NONE; }
+}
+
+// is a locale variable value a UTF-8 one? Unset or empty counts as yes, "C" and "POSIX" and other charsets as no
+private bool localeUtf8(char* v) {
+    if (v == null || v[0] == 0) { return true; }
+    if (has(v, "utf-8") || has(v, "utf8")) { return true; }
+    return false;
+}
+
+// ---- the environment -----------------------------------------------------------------------------------------------------------------------
+// the value of an environment variable as it is now (changes made with setenv of cstdlib are seen), null if unset
+public char* env(char* name) {
+    return getenv(name);
+}
+
+// the environment as a NULL terminated array of "NAME=value" strings (for starting programs; setenv changes are included)
+public char** environment() {
+    return environ();
+}
+
+// fills caps from TERM, COLORTERM, LC_ALL / LC_CTYPE / LANG and NO_COLOR, then applies TUI_COLORS, TUI_MOUSE, TUI_ASCII and TUI_SYNC
+public void capsFromEnv(Caps* c) {
+    char* loc = env("LC_ALL");
+    if (loc == null || loc[0] == 0) { loc = env("LC_CTYPE"); }
+    if (loc == null || loc[0] == 0) { loc = env("LANG"); }
+    char* nc = env("NO_COLOR");
+    capsFor(c, env("TERM"), env("COLORTERM"), localeUtf8(loc), nc != null && nc[0] != 0);
+    char* v = env("TUI_COLORS");
+    if (v != null && v[0] != 0) {
+        if (same(v, "0") || same(v, "none") || same(v, "mono")) { c->colors = COLORS_NONE; }
+        else if (same(v, "8")) { c->colors = COLORS_8; }
+        else if (same(v, "16")) { c->colors = COLORS_16; }
+        else if (same(v, "256")) { c->colors = COLORS_256; }
+        else if (same(v, "truecolor") || same(v, "24bit") || same(v, "true")) { c->colors = COLORS_TRUE; }
+    }
+    v = env("TUI_MOUSE");
+    if (v != null && v[0] != 0) { c->mouse = !same(v, "0"); }
+    v = env("TUI_ASCII");
+    if (v != null && v[0] != 0) { c->utf8 = same(v, "0"); }
+    v = env("TUI_SYNC");
+    if (v != null && v[0] != 0) { c->syncOutput = !same(v, "0"); }
+    v = env("TUI_MOTION");
+    if (v != null && v[0] != 0) { c->mouseMotion = !same(v, "0"); }
+}
+
+// ---- system calls ---------------------------------------------------------------------------------------------------------------------------
+// numbers: x86-64 first, the generic table (ARM64, RISC-V, LoongArch) second
+private int sysnr(int x, int g) { if (__ARCH == 0) { return x; } return g; }
+
+private int sysIoctl(int fd, int req, char* arg) {
+    return __syscall(sysnr(16, 29), fd, req, (int) arg, 0, 0, 0);
+}
+
+private int get32(char* b, int off) {
+    return (b[off] & 255) | ((b[off + 1] & 255) << 8) | ((b[off + 2] & 255) << 16) | ((b[off + 3] & 255) << 24);
+}
+
+private void put32(char* b, int off, int v) {
+    b[off] = v; b[off + 1] = v >> 8; b[off + 2] = v >> 16; b[off + 3] = v >> 24;
+}
+
+// polls the descriptors: fds is an array of struct pollfd (8 bytes each). ms < 0 waits for ever. Returns the number ready, or a negative errno
+private int sysPoll(char* fds, int n, int ms) {
+    int ts[2];
+    int* tp = null;
+    if (ms >= 0) {
+        ts[0] = ms / 1000;
+        ts[1] = (ms % 1000) * 1000000;
+        tp = &ts[0];
+    }
+    return __syscall(sysnr(271, 73), (int) fds, n, (int) tp, 0, 0, 0);
+}
+
+// ---- signals ---------------------------------------------------------------------------------------------------------------------------------
+char* sigPage;
+int winchFlag;
+int contFlag;
+bool suspended;                  // a child program runs in the foreground: Ctrl+C must not kill us
+
+private void put32le(char* p, int off, int v) {
+    p[off] = v; p[off + 1] = v >> 8; p[off + 2] = v >> 16; p[off + 3] = v >> 24;
+}
+
+// Makes the processor see the machine code that was just written to [start, start + n): the thunks of the signal handlers are made at run time.
+// ARM64 cleans the data cache and invalidates the instruction cache line by line (4 byte steps are fine: the operations act on the whole line),
+// RISC-V asks the kernel (riscv_flush_icache, all harts) and executes fence.i, LoongArch executes ibar; x86-64 needs nothing.
+private void syncCode(char* start, int n) {
+    if (__ARCH == 2) { __syscall(259, (int) start, (int) start + n, 0, 0, 0, 0); }
+    asm(start, n) {
+        x64: 0x90;
+        arm64: 0x8B010001, 0xAA0003E3, 0xD50B7B23, 0x91001063, 0xEB01007F, 0x54FFFFA3, 0xD5033B9F,
+               0xAA0003E3, 0xD50B7523, 0x91001063, 0xEB01007F, 0x54FFFFA3, 0xD5033B9F, 0xD5033FDF;
+        riscv64: 0x0000100F;
+        loongarch64: 0x38728000;
+    }
+}
+
+// An executable page with one small thunk per signal that calls the A function with the signal number on the stack (the kernel calls handlers
+// with the platform's C calling convention), and the x86-64 signal return code at offset 0. Null when the page cannot be mapped
+// (a system that forbids writable and executable memory): the handlers are not installed then (Terminal.hooksOk is false).
+private char* thunkFor(int sig, func handler) {
+    if (sigPage == null) {
+        int p = __syscall(sysnr(9, 222), 0, 4096, 7, 0x22, -1, 0);       // mmap(RWX, anonymous)
+        if (p < 0 && p > -4096) { return null; }
+        sigPage = (char*) p;
+        if (__ARCH == 0) {
+            char* r = sigPage;
+            r[0] = 0xB8; r[1] = 15; r[2] = 0; r[3] = 0; r[4] = 0; r[5] = 0x0F; r[6] = 0x05;       // mov eax, 15 ; syscall (rt_sigreturn)
+            syncCode(r, 16);
+        }
+    }
+    char* t = &sigPage[64 + 48 * sig];
+    int* lit = (int*) &t[32];
+    lit[0] = (int) handler;
+    if (__ARCH == 0) {
+        t[0] = 0x57;                                                                          // push rdi
+        t[1] = 0x48; t[2] = 0x8B; t[3] = 0x05; t[4] = 24; t[5] = 0; t[6] = 0; t[7] = 0;       // mov rax, [rip+24]
+        t[8] = 0xFF; t[9] = 0xD0;                                                             // call rax
+        t[10] = 0x48; t[11] = 0x83; t[12] = 0xC4; t[13] = 0x08;                               // add rsp, 8
+        t[14] = 0xC3;                                                                         // ret
+    } else if (__ARCH == 2) {
+        put32le(t, 0, 0x00008493); put32le(t, 4, 0xFF010113); put32le(t, 8, 0x00A13023); put32le(t, 12, 0x00000297);
+        put32le(t, 16, 0x0142B283); put32le(t, 20, 0x000280E7); put32le(t, 24, 0x01010113); put32le(t, 28, 0x00048067);
+    } else if (__ARCH == 3) {
+        put32le(t, 0, 0x00150037); put32le(t, 4, 0x02FFC063); put32le(t, 8, 0x29C00064); put32le(t, 12, 0x1C00000C);
+        put32le(t, 16, 0x28C0518C); put32le(t, 20, 0x4C000181); put32le(t, 24, 0x02C04063); put32le(t, 28, 0x4C0002E0);
+    } else {
+        put32le(t, 0, 0xA9BF7BFD); put32le(t, 4, 0xF81F0FE0); put32le(t, 8, 0x580000D0); put32le(t, 12, 0xD63F0200);
+        put32le(t, 16, 0x910043FF); put32le(t, 20, 0xA8C17BFD); put32le(t, 24, 0xD65F03C0);
+    }
+    syncCode(t, 48);
+    return t;
+}
+
+// installs handler for sig (handler == null: default action, 1: ignore). Returns true on success
+private bool setHandler(int sig, func handler, int flags) {
+    int h = (int) handler;
+    char* thunk = null;
+    if (h != 0 && h != 1) {
+        thunk = thunkFor(sig, handler);
+        if (thunk == null) { return false; }
+        h = (int) thunk;
+    }
+    int act[4];
+    int old[4];
+    act[0] = h;
+    act[1] = flags;
+    act[2] = 0;
+    act[3] = 0;
+    if (__ARCH == 0 && thunk != null) {
+        act[1] = act[1] | 0x04000000;                 // SA_RESTORER
+        act[2] = (int) sigPage;
+    }
+    return __syscall(sysnr(13, 134), sig, (int) &act[0], (int) &old[0], 8, 0, 0) == 0;
+}
+
+private int getPid() { return __syscall(sysnr(39, 172), 0, 0, 0, 0, 0, 0); }
+
+private void killSelf(int sig) {
+    __syscall(sysnr(62, 129), getPid(), sig, 0, 0, 0, 0);
+}
+
+class Terminal;
+Terminal* active;                // the terminal in raw mode (for the exit hook and the signal handlers)
+bool hookInstalled;
+
+void onWinch(int sig) { winchFlag = 1; }
+
+void onCont(int sig) { contFlag = 1; }
+
+// a signal that would end the program: put the terminal back first, then die the way the signal says
+void onFatal(int sig) {
+    if (suspended && (sig == 2 || sig == 3)) { return; }
+    Terminal* t = active;
+    if (t != null) { t->restore(); }
+    if (sig == 11 || sig == 7 || sig == 8 || sig == 4 || sig == 6) {
+        char nb[24];
+        intToStr(sig, &nb[0]);
+        eprint("\r\nfatal signal ");
+        eprint(&nb[0]);
+        eprint("\r\n");
+    }
+    setHandler(sig, null, 0);
+    killSelf(sig);
+}
+
+void atExitRestore() {
+    Terminal* t = active;
+    if (t != null) { t->restore(); }
+}
+
+private bool hooksResult;
+
+// installs the exit hook and the signal handlers; true when every handler that restores the terminal could be installed (only the first
+// call does the work, later calls return what it found)
+private bool installHooks() {
+    if (hookInstalled || __OS == 1) { return hooksResult; }
+    hookInstalled = true;
+    if (__atexit_n < 32) {
+        __atexit_fn[__atexit_n] = atExitRestore;
+        __atexit_n++;
+    }
+    bool ok = true;
+    if (!setHandler(2, onFatal, 0)) { ok = false; }                // SIGINT
+    if (!setHandler(1, onFatal, 0)) { ok = false; }                // SIGHUP
+    if (!setHandler(3, onFatal, 0)) { ok = false; }                // SIGQUIT
+    if (!setHandler(15, onFatal, 0)) { ok = false; }               // SIGTERM
+    if (!setHandler(11, onFatal, 0)) { ok = false; }               // SIGSEGV
+    if (!setHandler(7, onFatal, 0)) { ok = false; }                // SIGBUS
+    if (!setHandler(8, onFatal, 0)) { ok = false; }                // SIGFPE
+    if (!setHandler(4, onFatal, 0)) { ok = false; }                // SIGILL
+    if (!setHandler(6, onFatal, 0)) { ok = false; }                // SIGABRT
+    setHandler(28, onWinch, 0x10000000);        // SIGWINCH
+    setHandler(18, onCont, 0x10000000);         // SIGCONT
+    hooksResult = ok;
+    return ok;
+}
+
+// copies text for a window title: no control characters (C0, DEL, C1) and no invalid UTF-8; at most max bytes. Returns the length (no NUL written)
+public int cleanTitle(char* text, char* out, int max) {
+    int n = 0;
+    int i = 0;
+    while (text[i] != 0) {
+        int b = text[i] & 255;
+        int need = 0;
+        if (b < 0x20 || b == 0x7F) { i++; continue; }
+        if (b < 0x80) { need = 0; }
+        else if (b >= 0xC2 && b < 0xE0) { need = 1; }
+        else if (b >= 0xE0 && b < 0xF0) { need = 2; }
+        else if (b >= 0xF0 && b < 0xF5) { need = 3; }
+        else { i++; continue; }                                              // a stray continuation byte or an invalid lead byte
+        bool good = true;
+        for (int k = 1; k <= need; k++) {
+            int c = text[i + k] & 255;
+            if (text[i + k] == 0 || c < 0x80 || c > 0xBF) { good = false; break; }
+        }
+        if (good && b == 0xC2 && (text[i + 1] & 255) < 0xA0) { good = false; }        // U+0080..U+009F: C1 controls
+        if (!good) { i++; continue; }
+        if (n + need + 1 > max) { break; }
+        for (int k = 0; k <= need; k++) { out[n] = text[i + k]; n++; }
+        i = i + need + 1;
+    }
+    return n;
+}
+
+// ---- the terminal ----------------------------------------------------------------------------------------------------------------------------
+public class Terminal {
+    public int inFd;
+    public int outFd;
+    public bool isTty;
+    public bool raw;                 // in raw mode now
+    public int cols;
+    public int rows;
+    public bool eof;                 // the input is gone (hang up): the program should end
+    public bool pollSize;            // check the window size every 200 ms (no SIGWINCH there)
+    public bool useAlt;              // use the alternate screen when the terminal has one (default true)
+    public bool useMouse;            // enable mouse reporting when the terminal has it (default true)
+    public bool usePaste;            // enable bracketed paste when the terminal has it (default true)
+    public bool useDevTty;           // open() may use /dev/tty when standard input or output is redirected (default true; never on AOS)
+    public bool hooksOk;             // enter() installed the signal handlers that restore the terminal (false: only exit() and leave() restore it)
+    public Caps caps;
+    public Decoder dec;
+    private char saved[40];
+    private bool haveSaved;
+    private bool altOn;
+    private bool mouseOn;
+    private bool pasteOn;
+    private bool focusOn;
+    private bool titleSaved;
+    private int watchFd[16];
+    private int watchN;
+    private int lastInput;
+    private bool inPaste;               // the decoder is inside a bracketed paste ...
+    private int pasteWinStart;          // ... and the current 3 second window started then,
+    private int pasteWinBytes;          // with this many bytes arriving in it so far
+    private int lastSizeCheck;
+    private bool ownTtyFd;
+    private bool sizeKnown;
+    public bool sizeFromIoctl;       // the system knew the window size (else it came from LINES / COLUMNS, the terminal's answer to probeSize, or 80x24)
+
+    public Terminal() {
+        inFd = 0;
+        outFd = 1;
+        cols = 80;
+        rows = 24;
+        useAlt = true;
+        useMouse = true;
+        usePaste = true;
+        useDevTty = true;
+        dec = new Decoder();
+    }
+
+    // checks that there is a terminal (standard input and output, else /dev/tty), reads the capabilities and the window size.
+    // Returns false when there is no terminal. When standard input or output is redirected the program talks to the terminal through
+    // /dev/tty; on AOS /dev/tty is the serial console, not the terminal of the session, so there (and when useDevTty is false, or the
+    // environment variable TUI_DEVTTY is 0) it uses whichever of the descriptors 0, 1, 2 is a terminal instead.
+    public bool open() {
+        if (__OS == 1) { return false; }
+        char tmp[40];
+        bool onAos = runsOnAos();
+        bool devTty = useDevTty && !onAos;
+        char* dv = env("TUI_DEVTTY");                           // TUI_DEVTTY=0: never use /dev/tty, 1: use it (also on AOS)
+        if (dv != null && dv[0] != 0) { devTty = !same(dv, "0"); }
+        isTty = sysIoctl(0, 0x5401, &tmp[0]) == 0;
+        if (isTty) {
+            inFd = 0;
+            outFd = 1;
+            if (sysIoctl(1, 0x5401, &tmp[0]) != 0) {
+                if (devTty) {
+                    int fd = __open("/dev/tty", 2);
+                    if (fd >= 0) { outFd = fd; ownTtyFd = true; } else { return false; }
+                } else if (sysIoctl(2, 0x5401, &tmp[0]) == 0) {
+                    outFd = 2;
+                } else {
+                    outFd = 0;                          // stdin is a terminal, and terminals can be written to
+                }
+            }
+        } else if (devTty) {
+            int fd = __open("/dev/tty", 2);
+            if (fd < 0) { return false; }
+            if (sysIoctl(fd, 0x5401, &tmp[0]) != 0) { __close(fd); return false; }
+            inFd = fd;
+            outFd = fd;
+            ownTtyFd = true;
+            isTty = true;
+        } else {
+            int fd = 1;
+            if (sysIoctl(1, 0x5401, &tmp[0]) != 0) { fd = 2; }
+            if (sysIoctl(fd, 0x5401, &tmp[0]) != 0) { return false; }
+            inFd = fd;
+            outFd = fd;
+            isTty = true;
+        }
+        capsFromEnv(&caps);
+        caps.aos = onAos;
+        pollSize = caps.aos;
+        updateSize();
+        return true;
+    }
+
+    private bool runsOnAos() {
+        char u[390];
+        for (int i = 0; i < 390; i++) { u[i] = 0; }
+        if (__syscall(sysnr(63, 160), (int) &u[0], 0, 0, 0, 0, 0) != 0) { return false; }
+        return has(&u[130], "aos") || has(&u[195], "aos");
+    }
+
+    // ---- window size ---------------------------------------------------------------------------------------------------------------------
+    // reads the window size (ioctl, else LINES / COLUMNS, else 80x24); returns true when it changed (the EV_RESIZE event is not queued here)
+    public bool updateSize() {
+        char ws[8];
+        int r = sysIoctl(outFd, 0x5413, &ws[0]);
+        if (r != 0) { r = sysIoctl(inFd, 0x5413, &ws[0]); }
+        int nr = 0;
+        int nc = 0;
+        if (r == 0) {
+            nr = (ws[0] & 255) | ((ws[1] & 255) << 8);
+            nc = (ws[2] & 255) | ((ws[3] & 255) << 8);
+        }
+        sizeFromIoctl = nr > 0 && nc > 0;
+        if (nr <= 0 || nc <= 0) {
+            char* l = env("LINES");
+            char* c = env("COLUMNS");
+            if (l != null && c != null && atoi(l) > 0 && atoi(c) > 0) { nr = atoi(l); nc = atoi(c); }
+        }
+        if (nr <= 0 || nc <= 0) {
+            if (sizeKnown) { return false; }
+            nr = 24;
+            nc = 80;
+        }
+        if (nr > MAX_ROWS) { nr = MAX_ROWS; }
+        if (nc > MAX_COLS) { nc = MAX_COLS; }
+        sizeKnown = true;
+        if (nr == rows && nc == cols) { return false; }
+        rows = nr;
+        cols = nc;
+        return true;
+    }
+
+    // asks the terminal for its size (CSI 18 t, then the cursor position report as a fallback) and waits up to ms for the answer.
+    // Use it when the system does not know the size (a serial console). Needs raw mode. Returns true when the size was learned.
+    public bool probeSize(int ms) {
+        if (!raw) { return false; }
+        Event e;
+        dec.expectCpr = true;
+        writeStr("\e[18t");
+        int got = collectReply(&e, ms);
+        if (got == 0) {
+            writeStr("\e7\e[9999;9999H\e[6n\e8");
+            got = collectReply(&e, ms);
+        }
+        dec.expectCpr = false;
+        if (got == 0 || e.x <= 0 || e.y <= 0) { return false; }
+        rows = e.y > MAX_ROWS ? MAX_ROWS : e.y;
+        cols = e.x > MAX_COLS ? MAX_COLS : e.x;
+        sizeKnown = true;
+        return true;
+    }
+
+    private int collectReply(Event* e, int ms) {
+        int until = millis() + ms;
+        for (;;) {
+            if (dec.take(EV_REPLY, e)) { return 1; }
+            int left = until - millis();
+            if (left <= 0) { return 0; }
+            readInput(left);
+        }
+    }
+
+    // ---- output --------------------------------------------------------------------------------------------------------------------------
+    public void write(char* b, int n) {
+        int done = 0;
+        while (done < n) {
+            int k = __write(outFd, &b[done], n - done);
+            if (k == -4) { continue; }                          // EINTR
+            if (k == -11) {                                     // EAGAIN: somebody made the descriptor non-blocking
+                char pf[8];
+                put32(&pf[0], 0, outFd);
+                pf[4] = POLL_OUT; pf[5] = 0; pf[6] = 0; pf[7] = 0;
+                sysPoll(&pf[0], 1, 100);
+                continue;
+            }
+            if (k <= 0) { return; }
+            done = done + k;
+        }
+    }
+
+    public void writeStr(char* s) { write(s, strlen(s)); }
+
+    // ---- modes ---------------------------------------------------------------------------------------------------------------------------
+    // raw mode, alternate screen, hidden cursor, mouse and paste reporting (as far as the terminal can and the use... flags allow)
+    public bool enter() {
+        if (!isTty) { return false; }
+        if (raw) { return true; }
+        hooksOk = installHooks();
+        if (!haveSaved) {
+            if (sysIoctl(inFd, 0x5401, &saved[0]) != 0) { return false; }
+            haveSaved = true;
+        }
+        char t[40];
+        for (int i = 0; i < 40; i++) { t[i] = saved[i]; }
+        int iflag = get32(&t[0], 0);
+        int lflag = get32(&t[0], 12);
+        int cflag = get32(&t[0], 8);
+        iflag = iflag & ~(0x1 | 0x2 | 0x8 | 0x20 | 0x40 | 0x80 | 0x100 | 0x400 | 0x1000);      // IGNBRK BRKINT PARMRK ISTRIP INLCR IGNCR ICRNL IXON IXOFF
+        lflag = lflag & ~(0x8 | 0x40 | 0x2 | 0x1 | 0x8000);                                      // ECHO ECHONL ICANON ISIG IEXTEN
+        cflag = cflag | 0x30;                                                                    // CS8
+        put32(&t[0], 0, iflag);
+        put32(&t[0], 12, lflag);
+        put32(&t[0], 8, cflag);
+        t[17 + 6] = 1;                                                                           // VMIN
+        t[17 + 5] = 0;                                                                           // VTIME
+        if (sysIoctl(inFd, 0x5403, &t[0]) != 0) { return false; }                                // TCSETSW
+        raw = true;
+        active = this;
+        char seq[160];
+        int n = 0;
+        if (caps.title) { n = appendStr(&seq[0], n, 160, "\e[22;0t"); titleSaved = true; }       // push the window title: restored on leaving
+        n = appendStr(&seq[0], n, 160, "\e[?25l\e[?7l");
+        if (caps.altScreen && useAlt) { n = appendStr(&seq[0], n, 160, "\e[?1049h"); altOn = true; }
+        if (caps.mouse && useMouse) {
+            n = appendStr(&seq[0], n, 160, caps.mouseMotion ? "\e[?1003h" : "\e[?1002h");
+            n = appendStr(&seq[0], n, 160, "\e[?1000h\e[?1006h");
+            mouseOn = true;
+        }
+        if (caps.bracketedPaste && usePaste) { n = appendStr(&seq[0], n, 160, "\e[?2004h"); pasteOn = true; }
+        if (caps.focusEvents) { n = appendStr(&seq[0], n, 160, "\e[?1004h"); focusOn = true; }
+        n = appendStr(&seq[0], n, 160, "\e[0m\e[2J\e[H");
+        write(&seq[0], n);
+        return true;
+    }
+
+    // puts everything back: the terminal modes, the cursor, the colours and the screen. Safe to call twice, from signal handlers too.
+    public void restore() {
+        if (!raw) { return; }
+        raw = false;
+        char seq[160];
+        int n = 0;
+        n = appendStr(&seq[0], n, 160, "\e[0m\e[?25h\e[?7h\e[0 q");
+        if (focusOn) { n = appendStr(&seq[0], n, 160, "\e[?1004l"); }
+        if (pasteOn) { n = appendStr(&seq[0], n, 160, "\e[?2004l"); }
+        if (mouseOn) { n = appendStr(&seq[0], n, 160, "\e[?1006l\e[?1000l\e[?1002l\e[?1003l"); }
+        if (altOn) { n = appendStr(&seq[0], n, 160, "\e[?1049l"); }
+        else { n = appendStr(&seq[0], n, 160, "\e[2J\e[H"); }
+        if (titleSaved) { n = appendStr(&seq[0], n, 160, "\e[23;0t"); }
+        titleSaved = false;
+        focusOn = false;
+        pasteOn = false;
+        mouseOn = false;
+        altOn = false;
+        write(&seq[0], n);
+        if (haveSaved) { sysIoctl(inFd, 0x5403, &saved[0]); }
+        if (active == this) { active = null; }
+    }
+
+    public void leave() { restore(); }
+
+    // leaves raw mode for good and closes a /dev/tty descriptor that open() made
+    public void close() {
+        restore();
+        if (ownTtyFd) {
+            if (inFd > 2) { __close(inFd); }
+            if (outFd > 2 && outFd != inFd) { __close(outFd); }
+            ownTtyFd = false;
+        }
+    }
+
+    // sets the window title (OSC 0). The text is cleaned first: control characters (below 0x20, DEL, and the C1 range U+0080..U+009F) are dropped,
+    // so a title made from untrusted text (a file name) cannot end the sequence early and smuggle escape sequences to the terminal;
+    // invalid UTF-8 bytes are dropped too, and the title is cut at 400 bytes.
+    public void setTitle(char* title) {
+        if (!raw || !caps.title) { return; }
+        char clean[420];
+        int n = cleanTitle(title, &clean[0], 400);
+        clean[n] = 0;
+        writeStr("\e]0;");
+        writeStr(&clean[0]);
+        writeStr("\x07");
+    }
+
+    // ---- watching descriptors ------------------------------------------------------------------------------------------------------------
+    // wait() also reports when fd becomes readable (an EV_FD event with key = fd and x = the POLL_ bits). At most 16.
+    public bool watch(int fd) {
+        for (int i = 0; i < watchN; i++) { if (watchFd[i] == fd) { return true; } }
+        if (watchN >= 16) { return false; }
+        watchFd[watchN] = fd;
+        watchN++;
+        return true;
+    }
+
+    public void unwatch(int fd) {
+        for (int i = 0; i < watchN; i++) {
+            if (watchFd[i] == fd) {
+                watchFd[i] = watchFd[watchN - 1];
+                watchN--;
+                return;
+            }
+        }
+    }
+
+    // ---- waiting for input ---------------------------------------------------------------------------------------------------------------
+    // reads what is there (waiting at most ms for it) and feeds the decoder; events from watched descriptors are queued as EV_FD.
+    // Returns the number of bytes read from the terminal (0 on time out).
+    private int readInput(int ms) {
+        char pf[136];
+        put32(&pf[0], 0, inFd);
+        pf[4] = POLL_IN; pf[5] = 0; pf[6] = 0; pf[7] = 0;
+        for (int i = 0; i < watchN; i++) {
+            put32(&pf[0], 8 + i * 8, watchFd[i]);
+            pf[12 + i * 8] = POLL_IN; pf[13 + i * 8] = 0; pf[14 + i * 8] = 0; pf[15 + i * 8] = 0;
+        }
+        for (int i = 0; i < 1 + watchN; i++) { pf[6 + i * 8] = 0; pf[7 + i * 8] = 0; }
+        int r = sysPoll(&pf[0], 1 + watchN, ms);
+        if (r <= 0) { return 0; }
+        for (int i = 0; i < watchN; i++) {
+            int re = (pf[14 + i * 8] & 255) | ((pf[15 + i * 8] & 255) << 8);
+            if (re != 0) { dec.push(EV_FD, watchFd[i], re, 0); }
+        }
+        int re0 = (pf[6] & 255) | ((pf[7] & 255) << 8);
+        if (re0 == 0) { return 0; }
+        char buf[1024];
+        int n = __read(inFd, &buf[0], 1024);
+        if (n == -4 || n == -11) { return 0; }
+        if (n <= 0) {
+            eof = true;
+            dec.push(EV_HUP, 0, 0, 0);
+            return 0;
+        }
+        lastInput = millis();
+        dec.feedBytes(&buf[0], n);
+        dec.endRead();
+        if (dec.state == ST_PASTE) {
+            if (!inPaste) { inPaste = true; pasteWinStart = lastInput; pasteWinBytes = 0; }
+            pasteWinBytes = pasteWinBytes + n;
+        } else {
+            inPaste = false;
+        }
+        return n;
+    }
+
+    // Waits for something to happen, at most timeoutMs (-1 for ever, 0 only looks): a key or mouse event, a paste, a watched descriptor
+    // becoming readable, the window size changing. The events are queued: read them with next(). Returns the number of queued events.
+    public int wait(int timeoutMs) {
+        int start = millis();
+        for (;;) {
+            checkSignals();
+            if (dec.count() > 0) { return dec.count(); }
+            int left = -1;
+            if (timeoutMs >= 0) {
+                left = timeoutMs - (millis() - start);
+                if (left < 0) { left = 0; }
+            }
+            int fd = dec.flushDelay();
+            if (fd > 0) {
+                int idle = fd - (millis() - lastInput);
+                if (dec.state == ST_PASTE && inPaste) {
+                    // a paste that is not finished is given up after fd ms of silence, or when a whole fd ms window brought fewer than
+                    // PASTE_RATE bytes (somebody typing, not a paste: an unterminated paste must not swallow the keys for ever)
+                    int win = fd - (millis() - pasteWinStart);
+                    if (win <= 0) {
+                        if (pasteWinBytes >= PASTE_RATE) { pasteWinStart = millis(); pasteWinBytes = 0; win = fd; }
+                        else { idle = 0; }
+                    }
+                    if (win < idle) { idle = win; }
+                }
+                if (idle <= 0) { dec.flush(); inPaste = false; continue; }
+                if (left < 0 || idle < left) { left = idle; }
+            }
+            if (pollSize && raw && (left < 0 || left > 200)) { left = 200; }
+            readInput(left);
+            if (dec.count() > 0) { continue; }
+            if (pollSize && raw && millis() - lastSizeCheck >= 200) {
+                lastSizeCheck = millis();
+                if (updateSize()) { dec.push(EV_RESIZE, 0, cols, rows); }
+            }
+            if (timeoutMs >= 0 && millis() - start >= timeoutMs) {
+                if (dec.flushDelay() > 0 && millis() - lastInput >= dec.flushDelay()) { dec.flush(); inPaste = false; }
+                return dec.count();
+            }
+        }
+    }
+
+    // signals seen by the handlers become events here
+    private void checkSignals() {
+        if (winchFlag != 0) {
+            winchFlag = 0;
+            if (updateSize()) { dec.push(EV_RESIZE, 0, cols, rows); }
+        }
+        if (contFlag != 0) {
+            contFlag = 0;
+            if (raw) {
+                raw = false;
+                enter();
+                updateSize();
+                dec.push(EV_RESUME, 0, 0, 0);
+            }
+        }
+    }
+
+    public bool next(Event* e) { return dec.next(e); }
+
+    // makes the terminal send a window size report once (see probeSize); ms = how long to wait
+    public void sendBell() { writeStr("\x07"); }
+
+    // ---- running other programs ----------------------------------------------------------------------------------------------------------
+    // Leaves raw mode, runs the program (argv[0] is searched in PATH) with the terminal, waits for it, and comes back (raw mode again,
+    // the caller must redraw). Returns the exit status (128 + signal when it was killed, 127 when it could not be started).
+    public int runProgram(char** argv) {
+        bool wasRaw = raw;
+        if (wasRaw) { restore(); }
+        suspended = true;
+        int status = runWait(argv);
+        suspended = false;
+        if (wasRaw) {
+            enter();
+            updateSize();
+            dec.clearEvents();
+            dec.push(EV_RESUME, 0, 0, 0);
+        }
+        return status;
+    }
+
+    // runs a shell command line (/bin/sh -c command), or an interactive shell ($SHELL, else /bin/sh) when command is null
+    public int runShell(char* command) {
+        char* argv[5];
+        if (command == null) {
+            char* sh = env("SHELL");
+            if (sh == null || sh[0] == 0) { sh = "/bin/sh"; }
+            argv[0] = sh;
+            argv[1] = null;
+        } else {
+            argv[0] = "/bin/sh";
+            argv[1] = "-c";
+            argv[2] = command;
+            argv[3] = null;
+        }
+        return runProgram(&argv[0]);
+    }
+
+    // stops the program like Ctrl+Z in a shell (SIGSTOP to itself) and redraws when it is continued. Does nothing useful on AOS (no job control).
+    public void suspendSelf() {
+        if (!raw) { return; }
+        restore();
+        __syscall(sysnr(62, 129), getPid(), 19, 0, 0, 0, 0);       // SIGSTOP; returns after SIGCONT
+        enter();
+        contFlag = 0;                                               // the handler of SIGCONT has run, this was the reaction
+        updateSize();
+        dec.push(EV_RESUME, 0, 0, 0);
+    }
+}
+
+// ---- starting programs --------------------------------------------------------------------------------------------------------------------
+private int sysFork() {
+    if (__ARCH == 0) { return __syscall(57, 0, 0, 0, 0, 0, 0); }
+    return __syscall(220, 17, 0, 0, 0, 0, 0);                 // clone(SIGCHLD)
+}
+
+private int sysDup2(int a, int b) {
+    if (__ARCH == 0) { return __syscall(33, a, b, 0, 0, 0, 0); }
+    return __syscall(24, a, b, 0, 0, 0, 0);                  // dup3
+}
+
+private int sysExecve(char* path, char** argv, char** envp) {
+    return __syscall(sysnr(59, 221), (int) path, (int) argv, (int) envp, 0, 0, 0);
+}
+
+private int sysWait4(int pid, int* status, int options) {
+    return __syscall(sysnr(61, 260), pid, (int) status, options, 0, 0, 0);
+}
+
+private int sysPipe2(int* fds, int flags) {
+    return __syscall(sysnr(293, 59), (int) fds, flags, 0, 0, 0, 0);
+}
+
+// tries execve for the name as given or through PATH; returns only when it failed
+private void execSearch(char* name, char** argv) {
+    char** envp = environment();
+    if (indexOf(name, '/') >= 0) {
+        sysExecve(name, argv, envp);
+        return;
+    }
+    char* path = env("PATH");
+    if (path == null || path[0] == 0) { path = "/bin:/usr/bin"; }
+    char full[512];
+    int nl = strlen(name);
+    int i = 0;
+    while (true) {
+        int e = i;
+        while (path[e] != 0 && path[e] != ':') { e++; }
+        int dl = e - i;
+        if (dl + nl + 2 < 512) {
+            int n = 0;
+            for (int k = 0; k < dl; k++) { full[n] = path[i + k]; n++; }
+            if (dl > 0) { full[n] = '/'; n++; }
+            for (int k = 0; k < nl; k++) { full[n] = name[k]; n++; }
+            full[n] = 0;
+            sysExecve(&full[0], argv, envp);
+        }
+        if (path[e] == 0) { break; }
+        i = e + 1;
+    }
+}
+
+private int statusOf(int st) {
+    if ((st & 127) != 0) { return 128 + (st & 127); }
+    return (st >> 8) & 255;
+}
+
+// runs a program in the foreground and waits for it; 127 if it could not be started
+private int runWait(char** argv) {
+    if (__OS == 1) { return 127; }
+    int pid = sysFork();
+    if (pid < 0) { return 127; }
+    if (pid == 0) {
+        execSearch(argv[0], argv);
+        __exit(127);
+    }
+    int st = 0;
+    for (;;) {
+        int r = sysWait4(pid, &st, 0);
+        if (r == -4) { continue; }
+        if (r < 0) { return 127; }
+        break;
+    }
+    return statusOf(st);
+}
+
+// A child program with its output (standard output and error together) coming through a pipe. Watch fd with Terminal.watch to get
+// EV_FD events, then call read(). When read() returns 0 the child closed its output: call finish() for the exit status.
+public class Process {
+    public int pid;
+    public int fd;                   // the read end of the pipe (-1 when not started)
+    public bool running;
+    public int status;               // exit status after finish()
+
+    public Process() { fd = -1; }
+
+    // starts argv[0] (searched in PATH); standard input is /dev/null, the child gets its own process group. false when it cannot be started
+    public bool start(char** argv) {
+        if (__OS == 1) { return false; }
+        char pp[8];
+        if (sysPipe2((int*) &pp[0], 0x80000) != 0) { return false; }       // O_CLOEXEC
+        int rfd = get32(&pp[0], 0);
+        int wfd = get32(&pp[0], 4);
+        int p = sysFork();
+        if (p < 0) { __close(rfd); __close(wfd); return false; }
+        if (p == 0) {
+            __syscall(sysnr(109, 154), 0, 0, 0, 0, 0, 0);            // setpgid(0, 0)
+            int nul = __open("/dev/null", 0);
+            if (nul >= 0) { sysDup2(nul, 0); if (nul > 2) { __close(nul); } }
+            sysDup2(wfd, 1);
+            sysDup2(wfd, 2);
+            execSearch(argv[0], argv);
+            __exit(127);
+        }
+        __close(wfd);
+        pid = p;
+        fd = rfd;
+        running = true;
+        return true;
+    }
+
+    // runs a shell command line
+    public bool startShell(char* command) {
+        char* argv[4];
+        argv[0] = "/bin/sh";
+        argv[1] = "-c";
+        argv[2] = command;
+        argv[3] = null;
+        return start(&argv[0]);
+    }
+
+    // reads what the child has written (call when the descriptor is readable; it does not wait when ready() said so). 0 at the end
+    public int read(char* buf, int n) {
+        if (fd < 0) { return 0; }
+        for (;;) {
+            int k = __read(fd, buf, n);
+            if (k == -4) { continue; }
+            if (k < 0) { return 0; }
+            return k;
+        }
+    }
+
+    // is output waiting? (does not block)
+    public bool ready() {
+        if (fd < 0) { return false; }
+        char pf[8];
+        put32(&pf[0], 0, fd);
+        pf[4] = POLL_IN; pf[5] = 0; pf[6] = 0; pf[7] = 0;
+        return sysPoll(&pf[0], 1, 0) > 0;
+    }
+
+    // has the child ended? (does not wait)
+    public bool poll() {
+        if (!running) { return true; }
+        int st = 0;
+        int r = sysWait4(pid, &st, 1);          // WNOHANG
+        if (r == pid) { running = false; status = statusOf(st); return true; }
+        if (r < 0 && r != -4) { running = false; status = 127; return true; }
+        return false;
+    }
+
+    // waits for the child to end and closes the pipe; returns the exit status (128 + signal when it was killed)
+    public int finish() {
+        if (fd >= 0) { __close(fd); fd = -1; }
+        while (running) {
+            int st = 0;
+            int r = sysWait4(pid, &st, 0);
+            if (r == -4) { continue; }
+            running = false;
+            status = (r == pid) ? statusOf(st) : 127;
+        }
+        return status;
+    }
+
+    // sends a signal to the child's process group (2 = interrupt, 15 = terminate, 9 = kill)
+    public void kill(int sig) {
+        if (!running) { return; }
+        // the child makes itself the leader of a process group; if it has not done that yet the signal goes to the process alone
+        if (__syscall(sysnr(62, 129), -pid, sig, 0, 0, 0, 0) < 0) { __syscall(sysnr(62, 129), pid, sig, 0, 0, 0, 0); }
+    }
+}

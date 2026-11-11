@@ -1,0 +1,493 @@
+// files - a two panel file manager in the terminal.                       ac examples/tui/files.a -o files && ./files [left-dir [right-dir]]
+//
+//   Tab switch panel          Enter open a directory (a file: view it)     Backspace go up
+//   F3 view  F4 edit          F5 copy to the other panel   F6 move   F7 new directory   F8 delete   F9 menu
+//   Alt+. hidden files       Ctrl+O shell (comes back when it ends)       Ctrl+R reload   F10 / Ctrl+Q quit
+// The mouse works too: click to select, double click to open, click the buttons at the bottom, drag the scroll bars. $PAGER and $EDITOR are used.
+import tui;
+import tuix;
+import term;
+import tscreen;
+import os;
+
+class Panel {
+public:
+    tui.Frame* frame;
+    tuix.Table* table;
+    tuix.DirList dl;
+    tui.Text path;
+    bool hidden;
+    bool atTop;                     // the first row is the ".." entry
+}
+
+tui.App* app;
+tui.StatusBar* status;
+tui.MenuBar* menubar;
+Panel* left;
+Panel* right;
+Panel* active;
+
+// ---- panels -----------------------------------------------------------------------------------------------------------------------------------------
+Panel* other() { if (active == left) { return right; } return left; }
+
+char* sizeText(int n, char* buf) {
+    if (n < 0) { format(buf, 24, "", 0, 0, 0, 0); }
+    else if (n < 10000) { format(buf, 24, "%d", n, 0, 0, 0); }
+    else if (n < 10000000) { format(buf, 24, "%dK", n / 1024, 0, 0, 0); }
+    else { format(buf, 24, "%dM", n / 1048576, 0, 0, 0); }
+    return buf;
+}
+
+void load(Panel* p, char* dir) {
+    p->path.set(dir);
+    p->frame->setTitle(dir);
+    p->table->clear();
+    p->dl.load(dir, p->hidden, true);
+    p->dl.sort();
+    p->atTop = !streq(dir, "/");
+    if (p->atTop) { p->table->addRow("..", "<UP>"); }
+    for (int i = 0; i < p->dl.count; i++) {
+        char nm[300];
+        char sz[24];
+        if (p->dl.isDir(i)) {
+            format(&nm[0], 300, "/%s", p->dl.name(i), 0, 0, 0);
+            p->table->addRow(&nm[0], "<DIR>");
+        } else {
+            p->table->addRow(p->dl.name(i), sizeText(p->dl.sizeOf(i), &sz[0]));
+        }
+    }
+    p->table->selectRow(0);
+    if (!p->dl.ok) { app->toast("cannot read that directory", 2000, tui.theme->error); }
+}
+
+// the entry under the cursor: its name (no slash), or null for ".."
+char* selectedName(Panel* p) {
+    int row = p->table->selectedRow();
+    if (row < 0) { return null; }
+    if (p->atTop) {
+        if (row == 0) { return null; }
+        row--;
+    }
+    return p->dl.name(row);
+}
+
+bool selectedIsDir(Panel* p) {
+    int row = p->table->selectedRow();
+    if (row < 0) { return false; }
+    if (p->atTop) {
+        if (row == 0) { return true; }
+        row--;
+    }
+    return p->dl.isDir(row);
+}
+
+char* selectedPath(Panel* p) {
+    char* n = selectedName(p);
+    if (n == null) { return null; }
+    return tuix.joinPath(p->path.str(), n);
+}
+
+void reload(Panel* p) {
+    char* keep = selectedName(p);
+    char saved[300];
+    saved[0] = 0;
+    if (keep != null) { format(&saved[0], 300, "%s", keep, 0, 0, 0); }
+    load(p, p->path.str());
+    if (saved[0] != 0) {
+        for (int i = 0; i < p->dl.count; i++) {
+            if (streq(p->dl.name(i), &saved[0])) { p->table->selectRow(i + (p->atTop ? 1 : 0)); }
+        }
+    }
+    if (p == active) { showInfo(); }                  // the status line must not keep talking about what was just deleted
+}
+
+void showInfo() {
+    char buf[400];
+    char* n = selectedName(active);
+    if (n == null) { format(&buf[0], 400, "%s", active->path.str(), 0, 0, 0); }
+    else { format(&buf[0], 400, "%s  (%d entries)", n, active->dl.count, 0, 0); }
+    status->set(0, &buf[0]);
+}
+
+void enter(Panel* p) {
+    if (selectedIsDir(p)) {
+        int row = p->table->selectedRow();
+        if (p->atTop && row == 0) {
+            char* old = p->path.str();
+            char from[300];
+            format(&from[0], 300, "%s", old, 0, 0, 0);
+            load(p, tuix.parentPath(old));
+            // put the cursor on the directory we came from
+            int slash = strlen(&from[0]);
+            while (slash > 0 && from[slash - 1] != '/') { slash--; }
+            for (int i = 0; i < p->dl.count; i++) {
+                if (streq(p->dl.name(i), &from[slash])) { p->table->selectRow(i + (p->atTop ? 1 : 0)); }
+            }
+        } else {
+            load(p, tuix.cleanPath(p->path.str(), selectedName(p)));
+        }
+    }
+    showInfo();
+}
+
+// ---- file operations -----------------------------------------------------------------------------------------------------------------------------
+void say(char* title, char* text) { tuix.messageBox(app, title, text); }
+
+bool removeEmptyDir(char* path) {
+    if (__ARCH == 0) { return __syscall(84, (int) path, 0, 0, 0, 0, 0) == 0; }
+    return __syscall(35, -100, (int) path, 0x200, 0, 0, 0) == 0;
+}
+
+// Symbolic links are never followed by copy, move or delete: a link is copied as a link and deleted as a link (the target stays as it is).
+// Only ordinary files are read: a FIFO, a device or a socket is skipped (opening a FIFO would wait for ever).
+char* readLink(char* path) {
+    char buf[4100];
+    int r;
+    if (__ARCH == 0) { r = __syscall(89, (int) path, (int) &buf[0], 4096, 0, 0, 0); }
+    else { r = __syscall(78, -100, (int) path, (int) &buf[0], 4096, 0, 0); }
+    if (r <= 0 || r > 4096) { return null; }
+    char* t = alloc(r + 1);
+    memcpy(t, &buf[0], r);
+    t[r] = 0;
+    return t;
+}
+
+bool makeLink(char* target, char* path) {
+    if (__ARCH == 0) { return __syscall(88, (int) target, (int) path, 0, 0, 0, 0) == 0; }
+    return __syscall(36, (int) target, -100, (int) path, 0, 0, 0) == 0;
+}
+
+// does something exist at path? (a dangling link counts; nothing is opened)
+bool exists(char* path) { return tuix.fileMode(path, false) >= 0; }
+
+// is dir itself, or the path below it, the same place as `inner`: inner is dir or somewhere inside it? Compares by device and inode, so
+// different spellings and links to the directory are recognised
+bool isInside(char* inner, char* dir) {
+    char* p = inner;
+    for (int guard = 0; guard < 200; guard++) {
+        if (tuix.sameFile(p, dir)) { return true; }
+        char* up = tuix.parentPath(p);
+        if (streq(up, p)) { return false; }
+        p = up;
+    }
+    return false;
+}
+
+// the destination of the copy being made: a directory that is found again while copying is skipped (copying a directory into itself
+// through links or odd paths must not run for ever)
+char* copyRoot;
+
+// copies the file's bytes to a temporary name next to the target and renames it over the target, so the source is never truncated, even if
+// source and target are the same file under two names (hard links)
+bool copyFile(char* from, char* to) {
+    if (!tuix.isRegularFile(from)) { return false; }
+    if (tuix.sameFile(from, to)) { return false; }
+    char* tmp = alloc(strlen(to) + 16);
+    format(tmp, strlen(to) + 16, "%s.~copy~", to, 0, 0, 0);
+    int in = fileOpen(from, FILE_READ);
+    if (in < 0) { return false; }
+    int out = fileOpen(tmp, FILE_WRITE);
+    if (out < 0) { fileClose(in); return false; }
+    char* buf = alloc(65536);
+    bool ok = true;
+    for (;;) {
+        int n = fileRead(in, buf, 65536);
+        if (n < 0) { ok = false; break; }
+        if (n == 0) { break; }
+        if (fileWrite(out, buf, n) != n) { ok = false; break; }
+    }
+    fileClose(in);
+    fileClose(out);
+    if (ok && !os.rename(tmp, to)) { ok = false; }
+    if (!ok) { fileDelete(tmp); }
+    return ok;
+}
+
+bool copyLink(char* from, char* to) {
+    char* target = readLink(from);
+    if (target == null) { return false; }
+    if (exists(to)) {
+        if (tuix.isDirectory(to) && !tuix.isSymlink(to)) { return false; }
+        if (!fileDelete(to)) { return false; }
+    }
+    return makeLink(target, to);
+}
+
+bool copyTree(char* from, char* to) {
+    if (tuix.isSymlink(from)) { return copyLink(from, to); }
+    tuix.DirList d;
+    d.load(from, true, false);
+    if (!d.ok) { return copyFile(from, to); }
+    makeDir(to);
+    if (copyRoot == null) { copyRoot = to; }
+    bool ok = true;
+    for (int i = 0; i < d.count; i++) {
+        char* a = tuix.joinPath(from, d.name(i));
+        char* b = tuix.joinPath(to, d.name(i));
+        if (d.isLink(i)) { if (!copyLink(a, b)) { ok = false; } }
+        else if (d.isDir(i)) {
+            if (tuix.sameFile(a, copyRoot)) { continue; }                  // that is where we are copying to
+            if (!copyTree(a, b)) { ok = false; }
+        }
+        else if (!copyFile(a, b)) { ok = false; }
+    }
+    return ok;
+}
+
+bool deleteTree(char* path) {
+    if (tuix.isSymlink(path)) { return fileDelete(path); }              // the link, never what it points to
+    tuix.DirList d;
+    d.load(path, true, false);
+    if (!d.ok) { return fileDelete(path); }
+    bool ok = true;
+    for (int i = 0; i < d.count; i++) {
+        char* a = tuix.joinPath(path, d.name(i));
+        if (!d.isLink(i) && d.isDir(i)) { if (!deleteTree(a)) { ok = false; } }
+        else if (!fileDelete(a)) { ok = false; }
+    }
+    return removeEmptyDir(path) && ok;
+}
+
+// the checks that go before copying or moving src to dst; says why and returns false when it must not be done
+bool allowed(char* title, char* src, char* dst) {
+    if (streq(src, dst) || tuix.sameFile(src, dst)) {
+        say(title, "The source and the target are the same file.");
+        return false;
+    }
+    if (tuix.isDirectory(src) && !tuix.isSymlink(src) && isInside(dst, src)) {
+        say(title, "A directory cannot be put into itself.");
+        return false;
+    }
+    return true;
+}
+
+int doCopy(int x) {
+    char* src = selectedPath(active);
+    if (src == null) { return 0; }
+    char* dst = tuix.joinPath(other()->path.str(), selectedName(active));
+    if (!allowed("Copy", src, dst)) { return 0; }
+    if (exists(dst) && !tuix.askYesNo(app, "Copy", "The target exists already. Replace it?")) { return 0; }
+    copyRoot = null;
+    if (!copyTree(src, dst)) { say("Copy", "Copying failed, or some items (devices, FIFOs) could not be copied."); }
+    reload(other());
+    reload(active);
+    return 0;
+}
+
+int doMove(int x) {
+    char* src = selectedPath(active);
+    if (src == null) { return 0; }
+    char* dst = tuix.joinPath(other()->path.str(), selectedName(active));
+    if (!allowed("Move", src, dst)) { return 0; }
+    if (exists(dst) && !tuix.askYesNo(app, "Move", "The target exists already. Replace it?")) { return 0; }
+    if (!os.rename(src, dst)) {
+        // another file system: copy and delete (the source is only deleted when everything was copied)
+        copyRoot = null;
+        if (!copyTree(src, dst) || !deleteTree(src)) { say("Move", "Moving failed."); }
+    }
+    reload(other());
+    reload(active);
+    return 0;
+}
+
+int doMkdir(int x) {
+    char* name = tuix.prompt(app, "New directory", "Name of the new directory:", "");
+    if (name == null || name[0] == 0) { return 0; }
+    if (!makeDir(tuix.joinPath(active->path.str(), name))) { say("New directory", "The directory could not be created."); }
+    reload(active);
+    return 0;
+}
+
+int doDelete(int x) {
+    char* p = selectedPath(active);
+    if (p == null) { return 0; }
+    char msg[400];
+    if (tuix.isSymlink(p)) { format(&msg[0], 400, "Delete the link %s ?", selectedName(active), 0, 0, 0); }
+    else { format(&msg[0], 400, "Delete %s ?", selectedName(active), 0, 0, 0); }
+    if (!tuix.askYesNo(app, "Delete", &msg[0])) { return 0; }
+    if (!deleteTree(p)) { say("Delete", "Deleting failed."); }
+    reload(active);
+    reload(other());
+    return 0;
+}
+
+int runWith(char* envName, char* fallback) {
+    char* p = selectedPath(active);
+    if (p == null || selectedIsDir(active)) { return 0; }
+    char* prog = term.env(envName);
+    if (prog == null || prog[0] == 0) { prog = fallback; }
+    // $0 is the program, then the file as the first argument
+    char* argv2[6];
+    argv2[0] = "/bin/sh";
+    argv2[1] = "-c";
+    argv2[2] = "$0 \"$1\"";
+    argv2[3] = prog;
+    argv2[4] = p;
+    argv2[5] = null;
+    app->runProgram(&argv2[0]);
+    reload(active);
+    reload(other());
+    return 0;
+}
+
+int doView(int x) { return runWith("PAGER", "less"); }
+int doEdit(int x) { return runWith("EDITOR", "vi"); }
+int doShell(int x) { app->runShell(null); reload(left); reload(right); return 0; }
+int doMenu(int x) { menubar->openMenu(0); return 0; }
+int doReload(int x) { reload(left); reload(right); return 0; }
+int doQuit(int x) { app->quit(0); return 0; }
+
+int doHidden(int x) {
+    active->hidden = !active->hidden;
+    reload(active);
+    return 0;
+}
+
+int doSwitch(int x) {
+    active = other();
+    active->table->focusMe();
+    showInfo();
+    return 0;
+}
+
+int doHelp(int x) {
+    tuix.messageBox(app, "Help",
+        "Tab switches panels, Enter opens, Backspace goes up.\nF3 view, F4 edit, F5 copy, F6 move, F7 new directory, F8 delete.\nAlt+. shows hidden files, Ctrl+O runs a shell, F10 quits.\nLinks are copied and deleted as links.\nThe mouse works too.");
+    return 0;
+}
+
+// ---- events ----------------------------------------------------------------------------------------------------------------------------------------
+int tableActivate(int t) {
+    Panel* p = (Panel*) ((tui.Widget*) t)->userData;
+    active = p;
+    if (selectedIsDir(p)) { enter(p); }
+    else { doView(0); }
+    return 0;
+}
+
+int tableSelect(int t) {
+    Panel* p = (Panel*) ((tui.Widget*) t)->userData;
+    active = p;
+    showInfo();
+    return 0;
+}
+
+int tableFocus(int t) {
+    Panel* p = (Panel*) ((tui.Widget*) t)->userData;
+    if (((tui.Widget*) t)->hasFocus()) { active = p; showInfo(); }
+    return 0;
+}
+
+int keyHook(int widget, int event) {
+    term.Event* e = (term.Event*) event;
+    Panel* p = (Panel*) ((tui.Widget*) widget)->userData;
+    if (e->key == term.KEY_BACKSPACE && e->mods == 0) {
+        // go up like Enter on ".."
+        if (p->atTop) { p->table->selectRow(0); enter(p); }
+        return 1;
+    }
+    return 0;
+}
+
+Panel* makePanel(char* dir) {
+    Panel* p = new Panel();
+    p->table = new tuix.Table();
+    p->table->addColumn("Name", 0);
+    p->table->addColumn("Size", 9, 2);
+    p->table->sortable = false;
+    p->table->flex = 1;
+    p->table->userData = (int) p;
+    p->table->onActivate = tableActivate;
+    p->table->onSelect = tableSelect;
+    p->table->onFocusChange = tableFocus;
+    p->table->onKey = keyHook;
+    p->frame = new tui.Frame(dir);
+    p->frame->add(p->table);
+    p->frame->flex = 1;
+    load(p, dir);
+    return p;
+}
+
+tui.Button* fkey(tui.Box* row, char* label, func f) {
+    tui.Button* b = new tui.Button(label);
+    b->flat = true;
+    b->onClick = f;
+    b->flex = 1;
+    b->focusable = false;
+    row->add(b);
+    return b;
+}
+
+int main(int argc, char** argv) {
+    app = new tui.App();
+    if (!app->start()) {
+        println("files needs a terminal");
+        return 1;
+    }
+    app->setTitle("files");
+    char* cwd = tuix.currentDir();
+    char* ld = argc > 1 ? tuix.cleanPath(cwd, argv[1]) : cwd;
+    char* rd = argc > 2 ? tuix.cleanPath(cwd, argv[2]) : ld;
+    status = new tui.StatusBar();
+    left = makePanel(ld);
+    right = makePanel(rd);
+    active = left;
+
+    tui.MenuBar* mb = new tui.MenuBar();
+    menubar = mb;
+    tui.Menu* f = mb->addMenu("&File");
+    f->add("&View", doView, "F3");
+    f->add("&Edit", doEdit, "F4");
+    f->add("&Copy", doCopy, "F5");
+    f->add("&Move", doMove, "F6");
+    f->add("&New directory", doMkdir, "F7");
+    f->add("&Delete", doDelete, "F8");
+    f->addSeparator();
+    f->add("&Quit", doQuit, "F10");
+    tui.Menu* pm = mb->addMenu("&Panel");
+    pm->add("&Switch panel", doSwitch);
+    pm->add("&Hidden files", doHidden, "Alt+.");
+    pm->add("&Reload", doReload, "Ctrl+R");
+    pm->add("S&hell", doShell, "Ctrl+O");
+    tui.Menu* hm = mb->addMenu("&Help");
+    hm->add("&Keys", doHelp, "F1");
+
+    tui.Box* panels = tui.hbox(0, 0);
+    panels->flex = 1;
+    panels->add(left->frame);
+    panels->add(right->frame);
+    tui.Box* keys = tui.hbox(0, 0);
+    fkey(keys, "1Help", doHelp);
+    fkey(keys, "3View", doView);
+    fkey(keys, "4Edit", doEdit);
+    fkey(keys, "5Copy", doCopy);
+    fkey(keys, "6Move", doMove);
+    fkey(keys, "7Mkdir", doMkdir);
+    fkey(keys, "8Delete", doDelete);
+    fkey(keys, "10Quit", doQuit);
+
+    tui.Box* col = tui.vbox(0, 0);
+    col->add(mb);
+    col->add(panels);
+    col->add(keys);
+    col->add(status);
+    app->setMenuBar(mb);
+    app->setRoot(col);
+    app->addShortcut("F1", doHelp);
+    app->addShortcut("F3", doView);
+    app->addShortcut("F4", doEdit);
+    app->addShortcut("F5", doCopy);
+    app->addShortcut("F6", doMove);
+    app->addShortcut("F7", doMkdir);
+    app->addShortcut("F8", doDelete);
+    app->addShortcut("F10", doQuit);
+    app->addShortcut("Ctrl+Q", doQuit);
+    app->addShortcut("Alt+.", doHidden);
+    app->addShortcut("Ctrl+R", doReload);
+    app->addShortcut("Ctrl+O", doShell);
+    mb->noF10 = true;
+    app->addShortcut("F9", doMenu);
+    left->table->focusMe();
+    showInfo();
+    return app->run();
+}
