@@ -1,0 +1,2281 @@
+// =============================================================================
+//  asys - a small system layer for editors and tools                                         import asys;
+//
+//  What it is: memory that can be freed, whole-file reading, atomic file writing, directory listing, file
+//  information (kind, size, modification time, device + inode), time, random bytes and child processes with pipes.
+//  It uses only system calls that both Linux (x86-64, ARM64, RISC-V 64, LoongArch64) and AOS implement, so a program
+//  that uses it runs unchanged on both. On Windows everything except processes works (processes return -ENOSYS).
+//
+//  Conventions
+//    * Functions that can fail return a value >= 0 on success and -ERRNO on failure (-asys.ENOENT, ...); functions that
+//      return pointers return null and may store the error code through an optional  int* err  argument.
+//      asys.errText(code) turns a code into text.
+//    * Memory from asys.alloc / realloc is ZEROED, can be given back with asys.free (big blocks go back to the operating
+//      system with munmap) and is counted: asys.memInUse() / memBlocks() / memMapped() make leaks visible to tests.
+//      Strings returned by asys functions (and by acode, asyntax, aproject, ...) are asys memory: free them with asys.free.
+//    * Paths are NUL terminated UTF-8 / byte strings; '/' is the separator (Windows accepts it too).
+//
+//  Memory      alloc(n) realloc(p, n) free(p) blockSize(p) memInUse() memBlocks() memMapped() moveBytes(dst, src, n)
+//              fillBytes(p, byte, n) bytesEqual(a, b, n) strDup(s) strDupN(s, n) join(a, b) concat3(a, b, c)
+//  Files       fileOpen(path, flags, mode) fileRead fileWrite fileClose fileSeek fileSync fileTruncate
+//              readFile(path, &len, maxBytes, &err)    whole REGULAR file (a FIFO, device or directory is refused, it never blocks)
+//              writeFile(path, data, n)                plain overwrite
+//              writeFileAtomic(path, data, n, mode, flags)   temp file (O_EXCL, random name, final permissions from the first
+//                                                      byte) + fsync + rename; symlinks are not followed for the temp file
+//              stat(path, &st) lstat fstat   Stat has dev ino mode size mtime mtimeNs; st.isFile() isDir() isLink() isFifo()
+//              exists isFile isDir mkdir mkdirs rmdir unlink rename readlink setMtime chmod getcwd realpath
+//              listDir(path, DirList* out)    names + kinds, sorted on request; DirList.dispose() frees everything
+//              validName(name)                false for "", ".", "..", names with / \ or control characters or > 255 bytes
+//  Time        nowMs() (Unix epoch) monoMs() (monotonic) sleepMs(ms)
+//  Random      randomBytes(buf, n)  (getrandom, /dev/urandom, RtlGenRandom; a clock mix only as a last resort)
+//  Environment getenv(name) (a copy, free it) environment() (NAME=value strings, null terminated)
+//  Processes   class Process: start(argv, cwd, env, flags) read(which, buf, max) write(buf, n) closeIn() tryWait() wait(ms)
+//              signal(sig) signalGroup(sig) waitReadable(ms) dispose();  pollFds(...) for your own descriptors.
+//              All pipe ends are non-blocking, SIGPIPE is ignored for the parent (and restored in the child).
+//  Platform    platform() is OS_LINUX, OS_AOS or OS_WINDOWS (AOS is told from Linux with uname); canSpawn()
+//
+//  AOS notes (what the kernel does not have, and what asys does about it)
+//    * no fchmod / fsync / mremap / link / symlink / utimensat: asys skips them (fsync becomes sync(2) on AOS), never
+//      calls them on AOS, so the kernel log stays quiet. Permissions are given when the file is created.
+//    * file names are limited to 55 bytes and paths to 255 bytes by the AOS file system; validName() only enforces
+//      the Linux limit of 255, the file system reports longer ones as an error.
+//    * openat ignores the directory descriptor (AT_FDCWD behaviour), asys always passes AT_FDCWD.
+// =============================================================================
+module asys;
+
+// ---- constants ------------------------------------------------------------------------------------------------------
+public const OS_LINUX = 0;
+public const OS_AOS = 1;
+public const OS_WINDOWS = 2;
+
+public const EPERM = 1;
+public const ENOENT = 2;
+public const ESRCH = 3;
+public const EINTR = 4;
+public const EIO = 5;
+public const ENXIO = 6;
+public const E2BIG = 7;
+public const ENOEXEC = 8;
+public const EBADF = 9;
+public const ECHILD = 10;
+public const EAGAIN = 11;
+public const ENOMEM = 12;
+public const EACCES = 13;
+public const EFAULT = 14;
+public const EBUSY = 16;
+public const EEXIST = 17;
+public const EXDEV = 18;
+public const ENOTDIR = 20;
+public const EISDIR = 21;
+public const EINVAL = 22;
+public const EMFILE = 24;
+public const EFBIG = 27;
+public const ENOSPC = 28;
+public const EROFS = 30;
+public const EPIPE = 32;
+public const ENAMETOOLONG = 36;
+public const ENOSYS = 38;
+public const ENOTEMPTY = 39;
+public const ELOOP = 40;
+public const ENOTREG = 4001;           // not a regular file (FIFO, device, directory, socket)
+public const ETOOBIG = 4002;           // larger than the limit that was given
+public const EBADNAME = 4003;          // not a valid file name
+public const ETIMEOUT = 4004;
+
+// fileOpen flags (the same on every system; asys translates them)
+public const F_READ = 1;
+public const F_WRITE = 2;
+public const F_RDWR = 3;
+public const F_CREATE = 4;
+public const F_EXCL = 8;
+public const F_TRUNC = 16;
+public const F_APPEND = 32;
+public const F_NOFOLLOW = 64;
+public const F_NONBLOCK = 128;
+public const F_CLOEXEC = 256;
+public const F_DIRECTORY = 512;
+
+// writeFileAtomic flags
+public const W_BACKUP = 1;             // keep the old content as "path~" (a copy, made before the replace)
+public const W_NOSYNC = 2;             // do not fsync
+public const W_INPLACE_OK = 4;         // when no temp file can be created, overwrite the file in place
+
+// file kinds (Stat.mode & 0xF000)
+public const S_IFMT = 0xF000;
+public const S_IFREG = 0x8000;
+public const S_IFDIR = 0x4000;
+public const S_IFLNK = 0xA000;
+public const S_IFIFO = 0x1000;
+public const S_IFCHR = 0x2000;
+public const S_IFBLK = 0x6000;
+public const S_IFSOCK = 0xC000;
+
+// directory entry kinds
+public const K_UNKNOWN = 0;
+public const K_FILE = 1;
+public const K_DIR = 2;
+public const K_LINK = 3;
+public const K_OTHER = 4;
+
+// Process flags
+public const P_STDIN = 1;              // give the child a pipe as standard input (else /dev/null)
+public const P_STDOUT = 2;             // capture standard output (else inherited)
+public const P_STDERR = 4;             // capture standard error (else inherited)
+public const P_MERGE = 8;              // standard error goes into the standard output pipe
+public const P_GROUP = 16;             // the child becomes the leader of a new process group (signalGroup kills the tree)
+public const P_QUIET = 32;             // standard output and error go to /dev/null when they are not captured
+
+public const POLLIN = 1;
+public const POLLOUT = 4;
+public const POLLERR = 8;
+public const POLLHUP = 16;
+public const POLLNVAL = 32;
+
+public const SIGHUP = 1;
+public const SIGINT = 2;
+public const SIGKILL = 9;
+public const SIGPIPE = 13;
+public const SIGTERM = 15;
+
+// ---- raw system calls -----------------------------------------------------------------------------------------------
+// number for x86-64 (and AOS) first, then the generic number used by ARM64, RISC-V and LoongArch
+private int sys(int x86, int gen, int a1 = 0, int a2 = 0, int a3 = 0, int a4 = 0, int a5 = 0, int a6 = 0) {
+    int nr = x86;
+    if (__ARCH >= 1) {
+        nr = gen;
+    }
+    return __syscall(nr, a1, a2, a3, a4, a5, a6);
+}
+
+private bool isErr(int r) {
+    return r < 0 && r > -4096;
+}
+
+private int imin(int a, int b) {
+    if (a < b) { return a; }
+    return b;
+}
+
+private int imax(int a, int b) {
+    if (a > b) { return a; }
+    return b;
+}
+
+// ---- platform ---------------------------------------------------------------------------------------------------------
+private int plat = -1;
+
+public int platform() {
+    if (plat >= 0) {
+        return plat;
+    }
+    if (__OS == 1) {
+        plat = OS_WINDOWS;
+        return plat;
+    }
+    plat = OS_LINUX;
+    char u[400];
+    for (int i = 0; i < 400; i++) { u[i] = 0; }
+    int r = sys(63, 160, (int) &u[0]);                    // uname: sysname, nodename, release (130), version (195), machine
+    if (r == 0) {
+        u[129] = 0;
+        u[194] = 0;
+        u[259] = 0;
+        char* release = &u[130];
+        char* version = &u[195];
+        int rl = strlen(release);
+        if (rl >= 4 && streq(&release[rl - 4], "-aos")) {
+            plat = OS_AOS;
+        }
+        if (contains(version, " AOS")) {
+            plat = OS_AOS;
+        }
+    }
+    return plat;
+}
+
+public bool isAos() {
+    return platform() == OS_AOS;
+}
+
+public bool isWindows() {
+    return __OS == 1;
+}
+
+// true when Process.start can work (Linux and AOS)
+public bool canSpawn() {
+    return __OS != 1;
+}
+
+public char* errText(int code) {
+    if (code < 0) { code = -code; }
+    switch (code) {
+        case 0: return "no error";
+        case 1: return "operation not permitted";
+        case 2: return "no such file or directory";
+        case 3: return "no such process";
+        case 4: return "interrupted";
+        case 5: return "input/output error";
+        case 6: return "no such device or address";
+        case 7: return "argument list too long";
+        case 8: return "exec format error";
+        case 9: return "bad file descriptor";
+        case 10: return "no child process";
+        case 11: return "resource temporarily unavailable";
+        case 12: return "out of memory";
+        case 13: return "permission denied";
+        case 17: return "file exists";
+        case 18: return "cross-device link";
+        case 20: return "not a directory";
+        case 21: return "is a directory";
+        case 22: return "invalid argument";
+        case 24: return "too many open files";
+        case 27: return "file too large";
+        case 28: return "no space left on device";
+        case 30: return "read-only file system";
+        case 32: return "broken pipe";
+        case 36: return "file name too long";
+        case 38: return "not supported";
+        case 39: return "directory not empty";
+        case 40: return "too many levels of symbolic links";
+        case 4001: return "not a regular file";
+        case 4002: return "file too large for this operation";
+        case 4003: return "invalid file name";
+        case 4004: return "timed out";
+    }
+    return "unknown error";
+}
+
+// ---- memory -----------------------------------------------------------------------------------------------------------------
+// Blocks have a 16 byte header { capacity | magic << 56, requested size }. Small blocks (up to 128 KiB) come from 2 MiB
+// chunks and are kept in free lists per size class (four classes per doubling, so at most 25 % is wasted); big blocks are
+// mapped directly and returned with munmap (Windows has no unmap in the import table: there big blocks are kept in free lists
+// as well). All memory is zeroed when it is handed out.
+const MAGIC = 0xA5;
+const SMALL_MAX = 131072;
+const CHUNK = 2097152;
+const NCLASS = 160;
+
+private int* freeList[NCLASS];
+private char* chunkPtr;
+private int chunkLeft;
+private int statInUse;
+private int statBlocks;
+private int statMapped;
+private int statBad;
+
+private int classSize(int c) {
+    if (c < 8) {
+        return (c + 1) * 16;
+    }
+    int g = (c - 8) / 4;                        // doubling group, group 0 starts at 128
+    int k = (c - 8) % 4;
+    int base = 128 << g;
+    return base + (base / 4) * (k + 1);
+}
+
+// the class whose size is >= n (n >= 1)
+private int classOf(int n) {
+    if (n <= 128) {
+        return (n + 15) / 16 - 1;
+    }
+    int c = 8;
+    int base = 128;
+    while (base * 2 < n) {
+        base = base * 2;
+        c = c + 4;
+    }
+    // sizes in this group: base * 5/4, 6/4, 7/4, 8/4
+    int k = 0;
+    while (k < 3 && base + (base / 4) * (k + 1) < n) {
+        k++;
+    }
+    return c + k;
+}
+
+private char* mapPages(int len) {
+    if (__OS == 1) {
+        return ::alloc(len);
+    }
+    int p = sys(9, 222, 0, len, 3, 0x22, -1, 0);        // mmap(PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS)
+    if (isErr(p) || p == 0) {
+        return null;
+    }
+    return (char*) p;
+}
+
+private void unmapPages(char* p, int len) {
+    if (__OS == 1) {
+        return;
+    }
+    sys(11, 215, (int) p, len);                          // munmap
+}
+
+private int pageUp(int n) {
+    return (n + 4095) & ~4095;
+}
+
+private void zeroBytes(char* p, int n) {
+    if (n >= 64) {
+        memset(p, 0, n);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        p[i] = 0;
+    }
+}
+
+// Returns a zeroed block of at least n bytes (n may be 0), null when the system is out of memory.
+public char* alloc(int n) {
+    if (n < 0 || n > 0x3FFFFFFFFFF) {
+        return null;
+    }
+    if (n < 1) {
+        n = 1;
+    }
+    int cap;
+    char* raw;
+    if (n <= SMALL_MAX) {
+        int c = classOf(n);
+        cap = classSize(c);
+        int* head = freeList[c];
+        if (head != null) {
+            freeList[c] = (int*) head[0];
+            raw = (char*) head;
+            raw = &raw[-16];
+            zeroBytes(&raw[16], cap);
+        } else {
+            if (chunkLeft < cap + 16) {
+                char* nc = mapPages(CHUNK);
+                if (nc == null) {
+                    return null;
+                }
+                chunkPtr = nc;
+                chunkLeft = CHUNK;
+                statMapped = statMapped + CHUNK;
+            }
+            raw = chunkPtr;
+            chunkPtr = &chunkPtr[cap + 16];
+            chunkLeft = chunkLeft - cap - 16;
+        }
+    } else if (__OS == 1) {
+        int c = classOf(n);
+        cap = classSize(c);
+        int* head = freeList[c];
+        if (head != null) {
+            freeList[c] = (int*) head[0];
+            raw = (char*) head;
+            raw = &raw[-16];
+            zeroBytes(&raw[16], cap);
+        } else {
+            raw = mapPages(cap + 16);
+            if (raw == null) {
+                return null;
+            }
+            statMapped = statMapped + cap + 16;
+        }
+    } else {
+        int total = pageUp(n + 16);
+        raw = mapPages(total);
+        if (raw == null) {
+            return null;
+        }
+        cap = total - 16;
+        statMapped = statMapped + total;
+    }
+    int* h = (int*) raw;
+    h[0] = (MAGIC << 56) | cap;
+    h[1] = n;
+    statInUse = statInUse + cap;
+    statBlocks++;
+    return &raw[16];
+}
+
+private int capOf(char* p) {
+    int* h = (int*) &p[-16];
+    if (((h[0] >> 56) & 0xFF) != MAGIC) {
+        return -1;
+    }
+    return h[0] & 0xFFFFFFFFFFFFFF;
+}
+
+// the usable size of a block (the capacity, at least what was asked for); -1 if p is not an asys block
+public int blockSize(char* p) {
+    if (p == null) {
+        return -1;
+    }
+    return capOf(p);
+}
+
+// gives a block back; free(null) does nothing, a pointer that is not an asys block is ignored (and counted)
+public void free(char* p) {
+    if (p == null) {
+        return;
+    }
+    int cap = capOf(p);
+    if (cap < 0) {
+        statBad++;
+        return;
+    }
+    int* h = (int*) &p[-16];
+    h[0] = 0;                                            // a second free() is caught by the magic
+    statInUse = statInUse - cap;
+    statBlocks--;
+    if (cap <= SMALL_MAX || __OS == 1) {
+        int c = classOf(cap);
+        h[0] = (MAGIC << 56) | cap;                      // keep the header valid while the block sits in a list
+        h[1] = -1;
+        int* link = (int*) p;
+        link[0] = (int) freeList[c];
+        freeList[c] = link;
+        h[0] = (0x5A << 56) | cap;                       // marks it as free: a double free is ignored
+        return;
+    }
+    statMapped = statMapped - (cap + 16);
+    unmapPages(&p[-16], cap + 16);
+}
+
+// Changes the size of a block, keeping its content; new bytes are zero. realloc(null, n) is alloc(n),
+// realloc(p, 0) frees. Returns null (the old block stays valid) if memory is short. Big blocks shrink in place.
+public char* realloc(char* p, int n) {
+    if (p == null) {
+        return alloc(n);
+    }
+    if (n <= 0) {
+        free(p);
+        return null;
+    }
+    int cap = capOf(p);
+    if (cap < 0) {
+        return null;
+    }
+    int* h = (int*) &p[-16];
+    int old = h[1];
+    if (n <= cap) {
+        if (cap > SMALL_MAX && n * 4 <= cap) {
+            // a big block that became much smaller: move it to a fresh, smaller block so the pages go back
+            char* q = alloc(n);
+            if (q != null) {
+                memcpy(q, p, n);
+                free(p);
+                return q;
+            }
+        }
+        if (n < old) {
+            zeroBytes(&p[n], old - n);                   // keep "everything above the requested size is zero"
+        }
+        h[1] = n;
+        return p;
+    }
+    if (cap > SMALL_MAX && __OS != 1 && platform() == OS_LINUX) {
+        int total = cap + 16;
+        int want = pageUp(n + 16);
+        int r = sys(25, 216, (int) &p[-16], total, want, 1, 0, 0);       // mremap(MAYMOVE)
+        if (!isErr(r) && r != 0) {
+            char* nr = (char*) r;
+            int* nh = (int*) nr;
+            nh[0] = (MAGIC << 56) | (want - 16);
+            nh[1] = n;
+            statInUse = statInUse + (want - total);
+            statMapped = statMapped + (want - total);
+            return &nr[16];
+        }
+    }
+    char* q = alloc(n);
+    if (q == null) {
+        return null;
+    }
+    memcpy(q, p, imin(old, n));
+    free(p);
+    return q;
+}
+
+public int memInUse() {
+    return statInUse;
+}
+
+public int memBlocks() {
+    return statBlocks;
+}
+
+public int memMapped() {
+    return statMapped;
+}
+
+// how many free() calls were given something that was not a live asys block
+public int memBadFrees() {
+    return statBad;
+}
+
+// like memmove: the ranges may overlap
+public void moveBytes(char* dst, char* src, int n) {
+    if (n <= 0 || dst == src) {
+        return;
+    }
+    if (dst < src || dst >= &src[n]) {
+        memcpy(dst, src, n);
+        return;
+    }
+    // overlapping with dst above src: copy backwards
+    int i = n;
+    if ((((int) dst) & 7) == (((int) src) & 7)) {
+        while (i > 0 && ((((int) dst) + i) & 7) != 0) {
+            i--;
+            dst[i] = src[i];
+        }
+        while (i >= 8) {
+            i = i - 8;
+            int* d = (int*) &dst[i];
+            int* s = (int*) &src[i];
+            d[0] = s[0];
+        }
+    }
+    while (i > 0) {
+        i--;
+        dst[i] = src[i];
+    }
+}
+
+public void fillBytes(char* p, int value, int n) {
+    if (n > 0) {
+        memset(p, value, n);
+    }
+}
+
+public bool bytesEqual(char* a, char* b, int n) {
+    for (int i = 0; i < n; i++) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// a copy of a string in asys memory
+public char* strDup(char* s) {
+    int n = strlen(s);
+    char* r = alloc(n + 1);
+    if (r != null) {
+        memcpy(r, s, n);
+    }
+    return r;
+}
+
+// a copy of the first n bytes of s (NUL terminated)
+public char* strDupN(char* s, int n) {
+    char* r = alloc(n + 1);
+    if (r != null) {
+        memcpy(r, s, n);
+    }
+    return r;
+}
+
+// a/b with exactly one separator between them (a new string)
+public char* join(char* a, char* b) {
+    int la = strlen(a);
+    int lb = strlen(b);
+    if (la == 0) {
+        return strDup(b);
+    }
+    if (lb == 0) {
+        return strDup(a);
+    }
+    bool sep = a[la - 1] == '/';
+    while (lb > 0 && b[0] == '/') {
+        b = &b[1];
+        lb--;
+    }
+    char* r = alloc(la + lb + 2);
+    if (r == null) {
+        return null;
+    }
+    memcpy(r, a, la);
+    int o = la;
+    if (!sep) {
+        r[o] = '/';
+        o++;
+    }
+    memcpy(&r[o], b, lb);
+    return r;
+}
+
+public char* concat3(char* a, char* b, char* c) {
+    int la = strlen(a);
+    int lb = strlen(b);
+    int lc = strlen(c);
+    char* r = alloc(la + lb + lc + 1);
+    if (r == null) {
+        return null;
+    }
+    memcpy(r, a, la);
+    memcpy(&r[la], b, lb);
+    memcpy(&r[la + lb], c, lc);
+    return r;
+}
+
+// ---- time -------------------------------------------------------------------------------------------------------------------
+public int monoMs() {
+    return millis();
+}
+
+// milliseconds since 1970-01-01 UTC
+public int nowMs() {
+    if (__OS == 1) {
+        char ft[8];
+        __winapi(11, (int) &ft[0], 0, 0, 0);               // GetSystemTimeAsFileTime
+        int t = 0;
+        for (int i = 7; i >= 0; i--) {
+            t = (t << 8) | ft[i];
+        }
+        return t / 10000 - 11644473600000;
+    }
+    char ts[16];
+    for (int i = 0; i < 16; i++) { ts[i] = 0; }
+    sys(228, 113, 0, (int) &ts[0]);                     // clock_gettime(CLOCK_REALTIME)
+    int* w = (int*) &ts[0];
+    return w[0] * 1000 + w[1] / 1000000;
+}
+
+public void sleepMs(int ms) {
+    if (ms > 0) {
+        ::sleepMs(ms);
+    }
+}
+
+// ---- random -----------------------------------------------------------------------------------------------------------------
+private int mixCounter;
+
+// Fills buf with n random bytes. Uses the system generator; only if there is none, a mix of the clock and addresses.
+public void randomBytes(char* buf, int n) {
+    int done = 0;
+    if (__OS == 1) {
+        while (done < n) {
+            int chunk = imin(n - done, 65536);
+            if ((__winapi(70, (int) &buf[done], chunk, 0, 0) & 255) == 0) {
+                break;
+            }
+            done = done + chunk;
+        }
+    } else {
+        while (done < n) {
+            int got = sys(318, 278, (int) &buf[done], n - done, 0);       // getrandom
+            if (got == -EINTR) {
+                continue;
+            }
+            if (got <= 0) {
+                break;
+            }
+            done = done + got;
+        }
+        if (done < n) {
+            int fd = sys(257, 56, -100, (int) "/dev/urandom", 0x80000, 0);
+            if (fd >= 0) {
+                while (done < n) {
+                    int got = sys(0, 63, fd, (int) &buf[done], n - done);
+                    if (got <= 0) {
+                        break;
+                    }
+                    done = done + got;
+                }
+                sys(3, 57, fd);
+            }
+        }
+    }
+    if (done < n) {
+        // last resort: a xorshift stream seeded from the clock, a counter and an address (not secret, but not constant)
+        mixCounter++;
+        int x = monoMs() * 6364136223846793005 + mixCounter * 1442695040888963407 + (int) buf;
+        if (x == 0) { x = 88172645463325252; }
+        for (int i = done; i < n; i++) {
+            x = x ^ (x << 13);
+            x = x ^ ((x >> 7) & 0x01FFFFFFFFFFFFFF);
+            x = x ^ (x << 17);
+            buf[i] = x >> 24;
+        }
+    }
+}
+
+// ---- environment ------------------------------------------------------------------------------------------------------------
+private char* envBlob;
+private char** envList;
+private int envCount;
+
+private void envLoad() {
+    if (envList != null) {
+        return;
+    }
+    int cap = 8192;
+    int len = 0;
+    char* buf = alloc(cap);
+    if (__OS != 1) {
+        int fd = sys(257, 56, -100, (int) "/proc/self/environ", 0x80000, 0);
+        if (fd >= 0) {
+            for (;;) {
+                if (len + 4096 > cap) {
+                    char* nb = realloc(buf, cap * 2);
+                    if (nb == null) { break; }
+                    buf = nb;
+                    cap = cap * 2;
+                }
+                int got = sys(0, 63, fd, (int) &buf[len], cap - len - 1);
+                if (got == -EINTR) { continue; }
+                if (got <= 0) { break; }
+                len = len + got;
+            }
+            sys(3, 57, fd);
+        }
+    }
+    envBlob = buf;
+    int n = 0;
+    for (int i = 0; i < len; i++) {
+        if (buf[i] == 0) { n++; }
+    }
+    envList = (char**) alloc((n + 2) * 8);
+    int start = 0;
+    int idx = 0;
+    for (int i = 0; i < len; i++) {
+        if (buf[i] == 0) {
+            if (i > start) {
+                envList[idx] = &buf[start];
+                idx++;
+            }
+            start = i + 1;
+        }
+    }
+    envCount = idx;
+}
+
+// the value of an environment variable as a new string, null when it is not set
+public char* getenv(char* name) {
+    if (__OS == 1) {
+        char tmp[2048];
+        int n = __winapi(12, (int) name, (int) &tmp[0], 2048, 0);
+        n = (n << 32) >> 32;
+        if (n <= 0 || n >= 2048) {
+            return null;
+        }
+        return strDup(&tmp[0]);
+    }
+    envLoad();
+    int len = strlen(name);
+    for (int i = 0; i < envCount; i++) {
+        char* e = envList[i];
+        int k = 0;
+        while (k < len && e[k] == name[k]) {
+            k++;
+        }
+        if (k == len && e[len] == '=') {
+            return strDup(&e[len + 1]);
+        }
+    }
+    return null;
+}
+
+// The environment of this program as a null terminated array of "NAME=value" strings. The array is owned by asys.
+public char** environment() {
+    envLoad();
+    return envList;
+}
+
+// ---- file information ---------------------------------------------------------------------------------------------------------
+public struct Stat {
+    int dev;
+    int ino;
+    int mode;
+    int size;
+    int mtime;          // seconds since 1970
+    int mtimeNs;
+    int uid;
+    int nlink;
+
+    bool isFile() { return (mode & 0xF000) == 0x8000; }
+    bool isDir() { return (mode & 0xF000) == 0x4000; }
+    bool isLink() { return (mode & 0xF000) == 0xA000; }
+    bool isFifo() { return (mode & 0xF000) == 0x1000; }
+    int perm() { return mode & 0xFFF; }
+}
+
+private int rd32(char* p, int off) {
+    return p[off] | (p[off + 1] << 8) | (p[off + 2] << 16) | (p[off + 3] << 24);
+}
+
+private int rd64(char* p, int off) {
+    return rd32(p, off) | (rd32(p, off + 4) << 32);
+}
+
+private int rd16(char* p, int off) {
+    return p[off] | (p[off + 1] << 8);
+}
+
+// fills st from the kernel's struct stat (x86-64 layout, also what AOS fills) or the generic layout of ARM64 / RISC-V
+private void fillStat(char* raw, Stat* st) {
+    if (__ARCH == 0) {
+        st->dev = rd64(raw, 0);
+        st->ino = rd64(raw, 8);
+        st->nlink = rd64(raw, 16);
+        st->mode = rd32(raw, 24);
+        st->uid = rd32(raw, 28);
+        st->size = rd64(raw, 48);
+        st->mtime = rd64(raw, 88);
+        st->mtimeNs = rd64(raw, 96);
+    } else {
+        st->dev = rd64(raw, 0);
+        st->ino = rd64(raw, 8);
+        st->mode = rd32(raw, 16);
+        st->nlink = rd32(raw, 20);
+        st->uid = rd32(raw, 24);
+        st->size = rd64(raw, 48);
+        st->mtime = rd64(raw, 88);
+        st->mtimeNs = rd64(raw, 96);
+    }
+}
+
+// statx for LoongArch (it has no stat / fstat)
+private int statxCall(int dirfd, char* path, int flags, Stat* st) {
+    char sx[256];
+    for (int i = 0; i < 256; i++) { sx[i] = 0; }
+    int r = __syscall(291, dirfd, (int) path, flags, 0x7FF, (int) &sx[0], 0);
+    if (r < 0) {
+        return r;
+    }
+    st->dev = (rd32(&sx[0], 136) << 20) | rd32(&sx[0], 140);
+    st->ino = rd64(&sx[0], 32);
+    st->mode = rd16(&sx[0], 28);
+    st->nlink = rd32(&sx[0], 16);
+    st->uid = rd32(&sx[0], 20);
+    st->size = rd64(&sx[0], 40);
+    st->mtime = rd64(&sx[0], 112);
+    st->mtimeNs = rd32(&sx[0], 120);
+    return 0;
+}
+
+private int winStat(char* path, Stat* st) {
+    char d[40];
+    for (int i = 0; i < 40; i++) { d[i] = 0; }
+    int ok = __winapi(33, (int) path, 0, (int) &d[0], 0);                 // GetFileAttributesExA
+    if (((ok << 32) >> 32) == 0) {
+        return -ENOENT;
+    }
+    int attr = rd32(&d[0], 0);
+    st->dev = 1;
+    st->ino = 0;
+    if ((attr & 0x10) != 0) {
+        st->mode = 0x4000 | 493;
+    } else if ((attr & 0x400) != 0) {
+        st->mode = 0xA000 | 420;
+    } else if ((attr & 1) != 0) {
+        st->mode = 0x8000 | 292;
+    } else {
+        st->mode = 0x8000 | 420;
+    }
+    int ft = rd32(&d[0], 20) | (rd32(&d[0], 24) << 32);                   // last write time, 100 ns since 1601
+    st->mtime = ft / 10000000 - 11644473600;
+    st->mtimeNs = (ft % 10000000) * 100;
+    st->size = (rd32(&d[0], 28) << 32) | rd32(&d[0], 32);
+    st->nlink = 1;
+    return 0;
+}
+
+private int statCommon(char* path, Stat* st, bool follow) {
+    memset((char*) st, 0, sizeof(Stat));
+    if (__OS == 1) {
+        return winStat(path, st);
+    }
+    if (__ARCH == 3) {
+        int fl = 0;
+        if (!follow) { fl = 0x100; }
+        return statxCall(-100, path, fl, st);
+    }
+    char raw[160];
+    for (int i = 0; i < 160; i++) { raw[i] = 0; }
+    int r;
+    if (__ARCH >= 1) {
+        int fl = 0;
+        if (!follow) { fl = 0x100; }
+        r = __syscall(79, -100, (int) path, (int) &raw[0], fl, 0, 0);     // newfstatat
+    } else if (follow) {
+        r = __syscall(4, (int) path, (int) &raw[0], 0, 0, 0, 0);
+    } else {
+        r = __syscall(6, (int) path, (int) &raw[0], 0, 0, 0, 0);
+    }
+    if (r < 0) {
+        return r;
+    }
+    fillStat(&raw[0], st);
+    return 0;
+}
+
+// information about a path (symbolic links are followed): 0 or -errno
+public int stat(char* path, Stat* st) {
+    return statCommon(path, st, true);
+}
+
+// like stat but a symbolic link is described itself
+public int lstat(char* path, Stat* st) {
+    return statCommon(path, st, false);
+}
+
+public int fstat(int fd, Stat* st) {
+    memset((char*) st, 0, sizeof(Stat));
+    if (__OS == 1) {
+        int size = 0;
+        int ok = __winapi(29, fd, (int) &size, 0, 0);                    // GetFileSizeEx
+        if (((ok << 32) >> 32) == 0) {
+            return -EBADF;
+        }
+        st->size = size;
+        st->mode = 0x8000 | 420;
+        st->nlink = 1;
+        st->dev = 1;
+        return 0;
+    }
+    if (__ARCH == 3) {
+        return statxCall(fd, "", 0x1000, st);                              // AT_EMPTY_PATH
+    }
+    char raw[160];
+    for (int i = 0; i < 160; i++) { raw[i] = 0; }
+    int r = sys(5, 80, fd, (int) &raw[0]);
+    if (r < 0) {
+        return r;
+    }
+    fillStat(&raw[0], st);
+    return 0;
+}
+
+public bool exists(char* path) {
+    Stat st;
+    return lstat(path, &st) == 0;
+}
+
+public bool isFile(char* path) {
+    Stat st;
+    return stat(path, &st) == 0 && st.isFile();
+}
+
+public bool isDir(char* path) {
+    Stat st;
+    return stat(path, &st) == 0 && st.isDir();
+}
+
+// ---- files ------------------------------------------------------------------------------------------------------------------
+private int linuxFlags(int f) {
+    int o = 0;
+    int rw = f & 3;
+    if (rw == 2) { o = 1; }
+    else if (rw == 3) { o = 2; }
+    if ((f & F_CREATE) != 0) { o = o | 0x40; }
+    if ((f & F_EXCL) != 0) { o = o | 0x80; }
+    if ((f & F_TRUNC) != 0) { o = o | 0x200; }
+    if ((f & F_APPEND) != 0) { o = o | 0x400; }
+    if ((f & F_NONBLOCK) != 0) { o = o | 0x800; }
+    if ((f & F_CLOEXEC) != 0) { o = o | 0x80000; }
+    if ((f & F_DIRECTORY) != 0) {
+        if (__ARCH == 1) { o = o | 0x4000; } else { o = o | 0x10000; }
+    }
+    if ((f & F_NOFOLLOW) != 0) {
+        if (__ARCH == 1) { o = o | 0x8000; } else { o = o | 0x20000; }
+    }
+    return o;
+}
+
+// Opens a file. flags: F_READ, F_WRITE, F_RDWR, optionally with F_CREATE F_EXCL F_TRUNC F_APPEND F_NOFOLLOW F_NONBLOCK
+// F_CLOEXEC F_DIRECTORY. mode is the permission for a new file (0644). Returns a descriptor or -errno.
+public int fileOpen(char* path, int flags, int mode = 420) {
+    if (__OS == 1) {
+        int access = 0;
+        if ((flags & 1) != 0) { access = access | 0x80000000; }
+        if ((flags & 2) != 0) { access = access | 0x40000000; }
+        if ((flags & F_APPEND) != 0) { access = (access & ~0x40000000) | 4; }
+        int disp = 3;
+        if ((flags & F_CREATE) != 0) {
+            if ((flags & F_EXCL) != 0) { disp = 1; }
+            else if ((flags & F_TRUNC) != 0) { disp = 2; }
+            else { disp = 4; }
+        } else if ((flags & F_TRUNC) != 0) {
+            disp = 5;
+        }
+        int h = __winapix(4, (int) path, access, 7, 0, disp, 0x80, 0, 0, 0, 0);
+        if (h == -1 || h == 0) {
+            if ((flags & F_EXCL) != 0 && exists(path)) { return -EEXIST; }
+            if ((flags & F_CREATE) == 0) { return -ENOENT; }
+            return -EACCES;
+        }
+        return h;
+    }
+    int fd;
+    for (;;) {
+        fd = sys(257, 56, -100, (int) path, linuxFlags(flags) | 0x100, mode);      // openat(AT_FDCWD, ..., O_NOCTTY)
+        if (fd != -EINTR) {
+            break;
+        }
+    }
+    return fd;
+}
+
+// reads up to n bytes: the count, 0 at the end of the file, -errno (-EAGAIN on a non-blocking descriptor without data)
+public int fileRead(int fd, char* buf, int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    if (__OS == 1) {
+        int r = __read(fd, buf, n);
+        if (r < 0) { return 0; }
+        return r;
+    }
+    int r;
+    for (;;) {
+        r = sys(0, 63, fd, (int) buf, n);
+        if (r != -EINTR) {
+            break;
+        }
+    }
+    return r;
+}
+
+// writes everything (or stops at an error): n, or -errno. On a non-blocking descriptor it may return the bytes written so
+// far (less than n) when the pipe is full; if nothing could be written it returns -EAGAIN.
+public int fileWrite(int fd, char* buf, int n) {
+    int done = 0;
+    while (done < n) {
+        int r;
+        if (__OS == 1) {
+            r = __write(fd, &buf[done], n - done);
+            if (r <= 0) {
+                return (done > 0) ? done : -EIO;
+            }
+        } else {
+            r = sys(1, 64, fd, (int) &buf[done], imin(n - done, 1073741824));
+            if (r == -EINTR) {
+                continue;
+            }
+            if (r < 0) {
+                if (done > 0 && r == -EAGAIN) {
+                    return done;
+                }
+                return r;
+            }
+        }
+        done = done + r;
+    }
+    return done;
+}
+
+public int fileClose(int fd) {
+    if (__OS == 1) {
+        __close(fd);
+        return 0;
+    }
+    return sys(3, 57, fd);
+}
+
+// whence: 0 start, 1 current, 2 end. Returns the new position or -errno.
+public int fileSeek(int fd, int off, int whence) {
+    if (__OS == 1) {
+        int np = 0;
+        int ok = __winapix(21, fd, off, (int) &np, whence, 0, 0, 0, 0, 0, 0);          // SetFilePointerEx
+        if (((ok << 32) >> 32) == 0) {
+            return -EINVAL;
+        }
+        return np;
+    }
+    return sys(8, 62, fd, off, whence);
+}
+
+// flushes a file to the disk. AOS has no fsync: it uses sync(2) there.
+public int fileSync(int fd) {
+    if (__OS == 1) {
+        __winapi(28, fd, 0, 0, 0);                                       // FlushFileBuffers
+        return 0;
+    }
+    if (platform() == OS_AOS) {
+        return sys(162, 81);
+    }
+    return sys(74, 82, fd);
+}
+
+public int fileTruncate(int fd, int len) {
+    if (__OS == 1) {
+        if (fileSeek(fd, len, 0) < 0) { return -EINVAL; }
+        __winapi(27, fd, 0, 0, 0);                                       // SetEndOfFile
+        return 0;
+    }
+    if (platform() == OS_AOS) {
+        return -ENOSYS;
+    }
+    return sys(77, 46, fd, len);
+}
+
+public int chmod(char* path, int mode) {
+    if (__OS == 1 || platform() == OS_AOS) {
+        return -ENOSYS;
+    }
+    if (__ARCH >= 1) {
+        return __syscall(53, -100, (int) path, mode, 0, 0, 0);          // fchmodat
+    }
+    return __syscall(90, (int) path, mode, 0, 0, 0, 0);
+}
+
+private int fchmodFd(int fd, int mode) {
+    if (__OS == 1 || platform() == OS_AOS) {
+        return -ENOSYS;
+    }
+    return sys(91, 52, fd, mode);
+}
+
+// sets the modification time (seconds); not on AOS / Windows (-ENOSYS)
+public int setMtime(char* path, int seconds) {
+    if (__OS == 1 || platform() == OS_AOS) {
+        return -ENOSYS;
+    }
+    char ts[32];
+    int* w = (int*) &ts[0];
+    w[0] = seconds;
+    w[1] = 0;
+    w[2] = seconds;
+    w[3] = 0;
+    return sys(280, 88, -100, (int) path, (int) &ts[0], 0);           // utimensat
+}
+
+public int mkdir(char* path, int mode = 493) {
+    if (__OS == 1) {
+        int ok = __winapi(14, (int) path, 0, 0, 0);
+        if (((ok << 32) >> 32) == 0) {
+            return exists(path) ? -EEXIST : -ENOENT;
+        }
+        return 0;
+    }
+    if (__ARCH >= 1) {
+        return __syscall(34, -100, (int) path, mode, 0, 0, 0);          // mkdirat
+    }
+    return __syscall(83, (int) path, mode, 0, 0, 0, 0);
+}
+
+// creates a directory and its missing parents; an existing directory is fine. 0 or -errno
+public int mkdirs(char* path) {
+    int n = strlen(path);
+    if (n == 0) {
+        return -ENOENT;
+    }
+    char* tmp = strDup(path);
+    if (tmp == null) {
+        return -ENOMEM;
+    }
+    int result = 0;
+    for (int i = 1; i <= n; i++) {
+        if (tmp[i] == '/' || tmp[i] == 0) {
+            char save = tmp[i];
+            tmp[i] = 0;
+            if (i > 1 && !(i == 2 && tmp[1] == ':')) {
+                int r = mkdir(tmp, 493);
+                if (r < 0 && r != -EEXIST) {
+                    if (!isDir(tmp)) {
+                        result = r;
+                        tmp[i] = save;
+                        break;
+                    }
+                }
+            }
+            tmp[i] = save;
+        }
+    }
+    free(tmp);
+    if (result == 0 && !isDir(path)) {
+        return -ENOTDIR;
+    }
+    return result;
+}
+
+public int rmdir(char* path) {
+    if (__OS == 1) {
+        int ok = __winapi(23, (int) path, 0, 0, 0);
+        return (((ok << 32) >> 32) != 0) ? 0 : -ENOTEMPTY;
+    }
+    if (__ARCH >= 1) {
+        return __syscall(35, -100, (int) path, 0x200, 0, 0, 0);         // unlinkat(AT_REMOVEDIR)
+    }
+    return __syscall(84, (int) path, 0, 0, 0, 0, 0);
+}
+
+// removes a file (not a directory); a symbolic link itself is removed
+public int unlink(char* path) {
+    if (__OS == 1) {
+        int ok = __winapi(13, (int) path, 0, 0, 0);
+        return (((ok << 32) >> 32) != 0) ? 0 : -ENOENT;
+    }
+    if (__ARCH >= 1) {
+        return __syscall(35, -100, (int) path, 0, 0, 0, 0);
+    }
+    return __syscall(87, (int) path, 0, 0, 0, 0, 0);
+}
+
+// renames or moves; an existing target file is replaced (atomically on Linux and AOS)
+public int rename(char* from, char* to) {
+    if (__OS == 1) {
+        int ok = __winapi(26, (int) from, (int) to, 1, 0);               // MoveFileExA(MOVEFILE_REPLACE_EXISTING)
+        return (((ok << 32) >> 32) != 0) ? 0 : -EACCES;
+    }
+    int r;
+    for (;;) {
+        if (__ARCH == 0) {
+            r = __syscall(82, (int) from, (int) to, 0, 0, 0, 0);
+        } else if (__ARCH == 1) {
+            r = __syscall(38, -100, (int) from, -100, (int) to, 0, 0);
+        } else {
+            r = __syscall(276, -100, (int) from, -100, (int) to, 0, 0);
+        }
+        if (r != -EINTR) {
+            break;
+        }
+    }
+    return r;
+}
+
+// the target of a symbolic link as a new string (null if it is not a link); AOS has no links
+public char* readlink(char* path) {
+    if (__OS == 1 || platform() == OS_AOS) {
+        return null;
+    }
+    char buf[4097];
+    int r = sys(89, 78, (__ARCH == 0) ? (int) path : -100, (__ARCH == 0) ? (int) &buf[0] : (int) path, (__ARCH == 0) ? 4096 : (int) &buf[0], 4096);
+    if (r <= 0) {
+        return null;
+    }
+    buf[r] = 0;
+    return strDup(&buf[0]);
+}
+
+// the current directory as a new string, null on error
+public char* getcwd() {
+    char buf[4096];
+    if (__OS == 1) {
+        int n = __winapi(16, 4096, (int) &buf[0], 0, 0);
+        n = (n << 32) >> 32;
+        if (n <= 0) { return null; }
+        return strDup(&buf[0]);
+    }
+    int r = sys(79, 17, (int) &buf[0], 4096);
+    if (r <= 0) {
+        return null;
+    }
+    return strDup(&buf[0]);
+}
+
+// Reads a whole REGULAR file into a new block (NUL terminated after the data). maxBytes < 0 means no limit.
+// Returns null and stores -errno in *err (if given): ENOENT, EACCES, ENOTREG for a FIFO / device / directory (it never
+// blocks on them), ETOOBIG when the file is bigger than maxBytes.
+public char* readFile(char* path, int* lenOut, int maxBytes = -1, int* err = null) {
+    int e = 0;
+    int fd = fileOpen(path, F_READ | F_NONBLOCK | F_CLOEXEC, 0);
+    if (fd < 0) {
+        if (err != null) { *err = fd; }
+        return null;
+    }
+    Stat st;
+    if (fstat(fd, &st) < 0) {
+        fileClose(fd);
+        if (err != null) { *err = -EIO; }
+        return null;
+    }
+    if (!st.isFile()) {
+        fileClose(fd);
+        if (err != null) { *err = -ENOTREG; }
+        return null;
+    }
+    if (maxBytes >= 0 && st.size > maxBytes) {
+        fileClose(fd);
+        if (err != null) { *err = -ETOOBIG; }
+        return null;
+    }
+    int cap = st.size + 1;
+    if (cap < 4096) {
+        cap = 4096;
+    }
+    char* buf = alloc(cap);
+    if (buf == null) {
+        fileClose(fd);
+        if (err != null) { *err = -ENOMEM; }
+        return null;
+    }
+    int len = 0;
+    for (;;) {
+        if (len + 1 >= cap) {
+            char* nb = realloc(buf, cap * 2);
+            if (nb == null) {
+                e = -ENOMEM;
+                break;
+            }
+            buf = nb;
+            cap = cap * 2;
+        }
+        int got = fileRead(fd, &buf[len], cap - len - 1);
+        if (got == -EAGAIN) {
+            sleepMs(1);
+            continue;
+        }
+        if (got < 0) {
+            e = got;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        len = len + got;
+        if (maxBytes >= 0 && len > maxBytes) {
+            e = -ETOOBIG;
+            break;
+        }
+    }
+    fileClose(fd);
+    if (e != 0) {
+        free(buf);
+        if (err != null) { *err = e; }
+        return null;
+    }
+    buf[len] = 0;
+    if (lenOut != null) { *lenOut = len; }
+    return buf;
+}
+
+// overwrites (or creates) a file in place: n, or -errno. Not atomic; see writeFileAtomic.
+public int writeFile(char* path, char* data, int n) {
+    int fd = fileOpen(path, F_WRITE | F_CREATE | F_TRUNC | F_CLOEXEC, 420);
+    if (fd < 0) {
+        return fd;
+    }
+    int r = fileWrite(fd, data, n);
+    int c = fileClose(fd);
+    if (r >= 0 && c < 0) {
+        r = c;
+    }
+    return r;
+}
+
+private int lastSlash(char* p) {
+    int r = -1;
+    for (int i = 0; p[i] != 0; i++) {
+        if (p[i] == '/') { r = i; }
+    }
+    return r;
+}
+
+private char* hexName(int n) {
+    char* name = alloc(n * 2 + 1);
+    char* digits = "0123456789abcdef";
+    char rnd[32];
+    randomBytes(&rnd[0], n);
+    for (int i = 0; i < n; i++) {
+        name[i * 2] = digits[(rnd[i] >> 4) & 15];
+        name[i * 2 + 1] = digits[rnd[i] & 15];
+    }
+    return name;
+}
+
+// Follows symbolic links of the last component (at most 32 hops) and returns the path that really holds the data (a new
+// string). A dangling link resolves to its target path, so a save creates the target.
+public char* realpath(char* path) {
+    char* cur = strDup(path);
+    if (cur == null) {
+        return null;
+    }
+    for (int hop = 0; hop < 32; hop++) {
+        Stat st;
+        if (lstat(cur, &st) < 0 || !st.isLink()) {
+            return cur;
+        }
+        char* t = readlink(cur);
+        if (t == null) {
+            return cur;
+        }
+        char* nx;
+        if (t[0] == '/') {
+            nx = t;
+        } else {
+            int sl = lastSlash(cur);
+            if (sl < 0) {
+                nx = t;
+            } else {
+                char* dir = strDupN(cur, sl);
+                nx = join(dir, t);
+                free(dir);
+                free(t);
+            }
+        }
+        free(cur);
+        cur = nx;
+    }
+    return cur;                                                  // too many links: let the caller's open fail with ELOOP
+}
+
+// copies a regular file (for the backup); 0 or -errno
+private int copyFile(char* from, char* to, int mode) {
+    int len = 0;
+    int e = 0;
+    char* data = readFile(from, &len, -1, &e);
+    if (data == null) {
+        return e;
+    }
+    int r = writeFileAtomic(to, data, len, mode, W_NOSYNC);
+    free(data);
+    return (r < 0) ? r : 0;
+}
+
+// Writes a file so that readers see either the old or the new content, never a mix:
+//   1. a temp file next to the target is created with O_CREAT | O_EXCL | O_NOFOLLOW, a random name and the permissions of the
+//      existing file (or `mode` for a new file) from the very first byte,
+//   2. the data is written and (unless W_NOSYNC) flushed to the disk,
+//   3. with W_BACKUP the old file is copied to "path~" first,
+//   4. the temp file is renamed over the target.
+// A symbolic link as target is followed (the data is written where the link points). If no temp file can be created and
+// W_INPLACE_OK is set, the file is overwritten in place instead. Returns n or -errno; the temp file is removed on failure.
+public int writeFileAtomic(char* path, char* data, int n, int mode = 420, int flags = 0) {
+    if (path[0] == 0) {
+        return -ENOENT;
+    }
+    char* target = realpath(path);
+    if (target == null) {
+        return -ENOMEM;
+    }
+    Stat st;
+    int perm = mode & 0xFFF;
+    bool existed = false;
+    if (stat(target, &st) == 0) {
+        if (!st.isFile()) {
+            free(target);
+            return -ENOTREG;
+        }
+        perm = st.mode & 0xFFF;
+        existed = true;
+    }
+    if (existed && (flags & W_BACKUP) != 0) {
+        char* bak = concat3(target, "~", "");
+        int br = copyFile(target, bak, perm);
+        free(bak);
+        if (br < 0) {
+            free(target);
+            return br;
+        }
+    }
+    int sl = lastSlash(target);
+    char* dir = (sl < 0) ? strDup(".") : (sl == 0 ? strDup("/") : strDupN(target, sl));
+    char* base = &target[sl + 1];
+    int fd = -1;
+    char* tmp = null;
+    for (int attempt = 0; attempt < 16; attempt++) {
+        char* rnd = hexName(6);
+        char* pre = concat3(".", base, ".tmp-");
+        char* leaf = concat3(pre, rnd, "");
+        free(pre);
+        free(rnd);
+        if (strlen(leaf) > 250) {
+            leaf[250] = 0;
+        }
+        tmp = join(dir, leaf);
+        free(leaf);
+        fd = fileOpen(tmp, F_WRITE | F_CREATE | F_EXCL | F_NOFOLLOW | F_CLOEXEC, perm);
+        if (fd >= 0 || fd != -EEXIST) {
+            break;
+        }
+        free(tmp);
+        tmp = null;
+    }
+    free(dir);
+    if (fd < 0) {
+        int e = fd;
+        if (tmp != null) { free(tmp); }
+        if ((flags & W_INPLACE_OK) != 0 && existed && (e == -EACCES || e == -EROFS || e == -EPERM)) {
+            int r = writeFile(target, data, n);
+            free(target);
+            return r;
+        }
+        free(target);
+        return e;
+    }
+    // the umask may have removed permission bits: put them back (on a descriptor we own, nothing else can see it yet)
+    Stat fs;
+    if (fstat(fd, &fs) == 0 && (fs.mode & 0xFFF) != perm && fileHasMode(fd)) {
+        fchmodFd(fd, perm);
+    }
+    int w = fileWrite(fd, data, n);
+    if (w >= 0 && w < n) {
+        w = -EIO;
+    }
+    if (w >= 0 && (flags & W_NOSYNC) == 0) {
+        fileSync(fd);
+    }
+    int c = fileClose(fd);
+    if (w >= 0 && c < 0) {
+        w = c;
+    }
+    if (w < 0) {
+        unlink(tmp);
+        free(tmp);
+        free(target);
+        return w;
+    }
+    int rr = rename(tmp, target);
+    if (rr < 0) {
+        unlink(tmp);
+        free(tmp);
+        free(target);
+        return rr;
+    }
+    free(tmp);
+    free(target);
+    return n;
+}
+
+private bool fileHasMode(int fd) {
+    return __OS != 1 && platform() != OS_AOS;
+}
+
+// ---- names and directories --------------------------------------------------------------------------------------------------------
+// A name for create / rename: not empty, not "." or "..", no '/' or '\', no control characters, at most 255 bytes.
+public bool validName(char* name) {
+    if (name == null) {
+        return false;
+    }
+    int n = strlen(name);
+    if (n == 0 || n > 255) {
+        return false;
+    }
+    if (n == 1 && name[0] == '.') {
+        return false;
+    }
+    if (n == 2 && name[0] == '.' && name[1] == '.') {
+        return false;
+    }
+    for (int i = 0; i < n; i++) {
+        int c = name[i];
+        if (c == '/' || c == 92 || c < 32 || c == 127) {
+            return false;
+        }
+    }
+    return true;
+}
+
+public struct DirEntry {
+    int nameOff;        // offset of the name in DirList.names
+    int kind;           // K_FILE, K_DIR, K_LINK, K_OTHER
+}
+
+// The content of one directory. Names are stored together in one block (no allocation per name).
+public class DirList {
+    public DirEntry* ents;
+    public int count;
+    public char* names;
+    private int namesLen;
+    private int namesCap;
+    private int entCap;
+
+    public DirList() {
+    }
+
+    // frees the lists; the object can be used again
+    public void dispose() {
+        free((char*) ents);
+        free(names);
+        ents = null;
+        names = null;
+        count = 0;
+        namesLen = 0;
+        namesCap = 0;
+        entCap = 0;
+    }
+
+    public char* name(int i) {
+        return &names[ents[i].nameOff];
+    }
+
+    public int kind(int i) {
+        return ents[i].kind;
+    }
+
+    public int add(char* nm, int len, int kind) {
+        if (count == entCap) {
+            int nc = (entCap == 0) ? 32 : entCap * 2;
+            char* ne = realloc((char*) ents, nc * sizeof(DirEntry));
+            if (ne == null) { return -ENOMEM; }
+            ents = (DirEntry*) ne;
+            entCap = nc;
+        }
+        if (namesLen + len + 1 > namesCap) {
+            int nc = (namesCap == 0) ? 1024 : namesCap * 2;
+            while (nc < namesLen + len + 1) { nc = nc * 2; }
+            char* nn = realloc(names, nc);
+            if (nn == null) { return -ENOMEM; }
+            names = nn;
+            namesCap = nc;
+        }
+        memcpy(&names[namesLen], nm, len);
+        names[namesLen + len] = 0;
+        ents[count].nameOff = namesLen;
+        ents[count].kind = kind;
+        namesLen = namesLen + len + 1;
+        count++;
+        return 0;
+    }
+
+    // sorts by name (bytewise, or ignoring ASCII case); with dirsFirst directories come first. Stable.
+    public void sort(bool dirsFirst, bool fold) {
+        if (count < 2) { return; }
+        DirEntry* tmp = (DirEntry*) alloc(count * sizeof(DirEntry));
+        if (tmp == null) { return; }
+        int width = 1;
+        DirEntry* src = ents;
+        DirEntry* dst = tmp;
+        while (width < count) {
+            int i = 0;
+            while (i < count) {
+                int mid = imin(i + width, count);
+                int hi = imin(i + 2 * width, count);
+                int l = i;
+                int r = mid;
+                int o = i;
+                while (l < mid && r < hi) {
+                    if (cmpEnt(names, &src[l], &src[r], dirsFirst, fold) <= 0) {
+                        dst[o] = src[l];
+                        l++;
+                    } else {
+                        dst[o] = src[r];
+                        r++;
+                    }
+                    o++;
+                }
+                while (l < mid) { dst[o] = src[l]; l++; o++; }
+                while (r < hi) { dst[o] = src[r]; r++; o++; }
+                i = i + 2 * width;
+            }
+            DirEntry* t = src;
+            src = dst;
+            dst = t;
+            width = width * 2;
+        }
+        if (src != ents) {
+            memcpy((char*) ents, (char*) src, count * sizeof(DirEntry));
+        }
+        free((char*) tmp);
+    }
+}
+
+private int cmpEnt(char* names, DirEntry* a, DirEntry* b, bool dirsFirst, bool fold) {
+    if (dirsFirst) {
+        int da = (a->kind == K_DIR) ? 0 : 1;
+        int db = (b->kind == K_DIR) ? 0 : 1;
+        if (da != db) { return da - db; }
+    }
+    char* x = &names[a->nameOff];
+    char* y = &names[b->nameOff];
+    int i = 0;
+    for (;;) {
+        int cx = x[i];
+        int cy = y[i];
+        if (fold) {
+            if (cx >= 'A' && cx <= 'Z') { cx = cx + 32; }
+            if (cy >= 'A' && cy <= 'Z') { cy = cy + 32; }
+        }
+        if (cx != cy) { return cx - cy; }
+        if (cx == 0) { break; }
+        i++;
+    }
+    return 0;
+}
+
+// Lists a directory (without "." and "..") into out (which is cleared first). Kinds come from the directory itself;
+// when the file system does not say, lstat decides. A symbolic link has kind K_LINK (it is never followed).
+// Returns the number of entries or -errno.
+public int listDir(char* path, DirList* out) {
+    out->dispose();
+    if (__OS == 1) {
+        char pattern[1100];
+        int n = strlen(path);
+        if (n > 1000) {
+            return -ENAMETOOLONG;
+        }
+        strcpy(&pattern[0], path);
+        if (n > 0 && path[n - 1] != '/' && path[n - 1] != 92) {
+            pattern[n] = '/';
+            n++;
+        }
+        pattern[n] = '*';
+        pattern[n + 1] = 0;
+        char data[400];
+        int h = __winapi(18, (int) &pattern[0], (int) &data[0], 0, 0);        // FindFirstFileA
+        if (h == -1) {
+            return -ENOENT;
+        }
+        for (;;) {
+            char* nm = &data[44];
+            if (!streq(nm, ".") && !streq(nm, "..")) {
+                int attr = rd32(&data[0], 0);
+                int k = K_FILE;
+                if ((attr & 0x400) != 0) { k = K_LINK; }
+                else if ((attr & 0x10) != 0) { k = K_DIR; }
+                out->add(nm, strlen(nm), k);
+            }
+            if (((__winapi(19, h, (int) &data[0], 0, 0) << 32) >> 32) == 0) {
+                break;
+            }
+        }
+        __winapi(20, h, 0, 0, 0);
+        return out->count;
+    }
+    int fd = fileOpen(path, F_READ | F_DIRECTORY | F_CLOEXEC, 0);
+    if (fd < 0) {
+        return fd;
+    }
+    char* buf = alloc(32768);
+    if (buf == null) {
+        fileClose(fd);
+        return -ENOMEM;
+    }
+    int result = 0;
+    for (;;) {
+        int got = sys(217, 61, fd, (int) buf, 32768);                           // getdents64
+        if (got == -EINTR) {
+            continue;
+        }
+        if (got < 0) {
+            result = got;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        int pos = 0;
+        while (pos < got) {
+            int reclen = rd16(buf, pos + 16);
+            if (reclen < 20) {
+                break;
+            }
+            int dtype = buf[pos + 18];
+            char* nm = &buf[pos + 19];
+            if (!(nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0)))) {
+                int k = K_UNKNOWN;
+                if (dtype == 8) { k = K_FILE; }
+                else if (dtype == 4) { k = K_DIR; }
+                else if (dtype == 10) { k = K_LINK; }
+                else if (dtype != 0) { k = K_OTHER; }
+                if (k == K_UNKNOWN) {
+                    char* full = join(path, nm);
+                    Stat st;
+                    if (full != null && lstat(full, &st) == 0) {
+                        if (st.isFile()) { k = K_FILE; }
+                        else if (st.isDir()) { k = K_DIR; }
+                        else if (st.isLink()) { k = K_LINK; }
+                        else { k = K_OTHER; }
+                    } else {
+                        k = K_OTHER;
+                    }
+                    free(full);
+                }
+                int ar = out->add(nm, strlen(nm), k);
+                if (ar < 0) {
+                    result = ar;
+                    break;
+                }
+            }
+            pos = pos + reclen;
+        }
+        if (result < 0) {
+            break;
+        }
+    }
+    free(buf);
+    fileClose(fd);
+    if (result < 0) {
+        out->dispose();
+        return result;
+    }
+    return out->count;
+}
+
+// ---- polling -----------------------------------------------------------------------------------------------------------------------
+// Waits until one of n descriptors (n <= 16) has an event or timeoutMs passes (-1 = forever). events / revents use POLLIN
+// POLLOUT POLLERR POLLHUP. Returns how many are ready, 0 on time out, -errno. A descriptor < 0 is ignored.
+public int pollFds(int* fds, int* events, int* revents, int n, int timeoutMs) {
+    if (__OS == 1) {
+        return -ENOSYS;
+    }
+    if (n > 16) {
+        return -EINVAL;
+    }
+    char pf[128];
+    for (int i = 0; i < 128; i++) { pf[i] = 0; }
+    for (int i = 0; i < n; i++) {
+        int fd = fds[i];
+        pf[i * 8] = fd & 255;
+        pf[i * 8 + 1] = (fd >> 8) & 255;
+        pf[i * 8 + 2] = (fd >> 16) & 255;
+        pf[i * 8 + 3] = (fd >> 24) & 255;
+        pf[i * 8 + 4] = events[i] & 255;
+        pf[i * 8 + 5] = (events[i] >> 8) & 255;
+    }
+    int r;
+    for (;;) {
+        if (__ARCH == 0) {
+            r = __syscall(7, (int) &pf[0], n, timeoutMs, 0, 0, 0);
+        } else {
+            char ts[16];
+            int* tw = (int*) &ts[0];
+            tw[0] = timeoutMs / 1000;
+            tw[1] = (timeoutMs % 1000) * 1000000;
+            r = __syscall(73, (int) &pf[0], n, (timeoutMs < 0) ? 0 : (int) &ts[0], 0, 0, 0);
+        }
+        if (r != -EINTR) {
+            break;
+        }
+    }
+    if (r < 0) {
+        return r;
+    }
+    for (int i = 0; i < n; i++) {
+        revents[i] = pf[i * 8 + 6] | (pf[i * 8 + 7] << 8);
+    }
+    return r;
+}
+
+// ---- child processes -----------------------------------------------------------------------------------------------------------------
+private bool sigpipeIgnored;
+
+// SIGPIPE would kill the program when a child closes its input; ignore it (and let write return -EPIPE)
+private void ignoreSigpipe() {
+    if (sigpipeIgnored || __OS == 1) {
+        return;
+    }
+    sigpipeIgnored = true;
+    char act[32];
+    for (int i = 0; i < 32; i++) { act[i] = 0; }
+    int* w = (int*) &act[0];
+    w[0] = 1;                                                     // SIG_IGN (the other words stay 0)
+    sys(13, 134, SIGPIPE, (int) &act[0], 0, 8);
+}
+
+private void defaultSigpipe() {
+    char act[32];
+    for (int i = 0; i < 32; i++) { act[i] = 0; }
+    sys(13, 134, SIGPIPE, (int) &act[0], 0, 8);                   // SIG_DFL
+}
+
+private int makePipe(int* fds) {
+    char p[8];
+    int r = sys(293, 59, (int) &p[0], 0x80000);                   // pipe2(O_CLOEXEC)
+    if (r < 0) {
+        return r;
+    }
+    fds[0] = rd32(&p[0], 0);
+    fds[1] = rd32(&p[0], 4);
+    return 0;
+}
+
+private int setNonBlock(int fd) {
+    return sys(72, 25, fd, 4, 0x800);                             // fcntl(F_SETFL, O_NONBLOCK)
+}
+
+// a child process with pipes to its standard streams
+public class Process {
+    public int pid;               // 0 until started
+    public int inFd;              // our end of the child's standard input (-1: none / closed)
+    public int outFd;             // our end of its standard output
+    public int errFd;             // our end of its standard error (-1 with P_MERGE)
+    public bool running;          // started and not yet reaped
+    public bool exited;           // ended by exit(): exitCode is valid
+    public int exitCode;
+    public int termSignal;        // ended by this signal (0: none)
+    public int rawStatus;
+    public bool ownGroup;
+
+    public Process() {
+        inFd = -1;
+        outFd = -1;
+        errFd = -1;
+    }
+
+    // Starts argv[0] with the arguments argv (null terminated array). A name without '/' is searched in PATH.
+    // cwd: directory to run in (null: ours). env: extra "NAME=value" strings (null terminated array or null) that
+    // replace / add to our environment. flags: P_STDIN P_STDOUT P_STDERR P_MERGE P_GROUP P_QUIET.
+    // Returns 0, or -errno (also when the program cannot be started: the failure of exec is reported here).
+    public int start(char** argv, char* cwd, char** env, int flags) {
+        if (__OS == 1) {
+            return -ENOSYS;
+        }
+        if (pid != 0 || argv == null || argv[0] == null) {
+            return -EINVAL;
+        }
+        ignoreSigpipe();
+        envLoad();
+        // candidate programs, built before fork so that the child only makes system calls
+        char** cands = null;
+        int ncand = 0;
+        bool ownCands = false;
+        char* prog = argv[0];
+        if (indexOf(prog, '/') >= 0) {
+            cands = (char**) alloc(16);
+            cands[0] = prog;
+            ncand = 1;
+        } else {
+            ownCands = true;
+            char* path = getenv("PATH");
+            if (path == null) {
+                path = strDup("/usr/local/bin:/usr/bin:/bin");
+            }
+            int pl = strlen(path);
+            cands = (char**) alloc((pl / 2 + 3) * 8);
+            int s = 0;
+            for (int i = 0; i <= pl; i++) {
+                if (i == pl || path[i] == ':') {
+                    char* d = (i > s) ? strDupN(&path[s], i - s) : strDup(".");
+                    cands[ncand] = join(d, prog);
+                    free(d);
+                    ncand++;
+                    s = i + 1;
+                }
+            }
+            free(path);
+        }
+        // the environment of the child: ours, with the extra strings replacing same-named entries
+        int nenv = 0;
+        if (env != null) {
+            while (env[nenv] != null) { nenv++; }
+        }
+        char** envp = (char**) alloc((envCount + nenv + 2) * 8);
+        int no = 0;
+        for (int i = 0; i < envCount; i++) {
+            char* e = envList[i];
+            bool replaced = false;
+            for (int k = 0; k < nenv; k++) {
+                int nl = indexOf(env[k], '=');
+                if (nl > 0 && strncmpEq(e, env[k], nl + 1)) {
+                    replaced = true;
+                }
+            }
+            if (!replaced) {
+                envp[no] = e;
+                no++;
+            }
+        }
+        for (int k = 0; k < nenv; k++) {
+            envp[no] = env[k];
+            no++;
+        }
+        int inP[2];
+        int outP[2];
+        int errP[2];
+        int ep[2];
+        inP[0] = -1; inP[1] = -1; outP[0] = -1; outP[1] = -1; errP[0] = -1; errP[1] = -1;
+        int r = makePipe(&ep[0]);
+        if (r < 0) {
+            cleanupStart(cands, ncand, ownCands, envp);
+            return r;
+        }
+        if ((flags & P_STDIN) != 0) { r = makePipe(&inP[0]); }
+        if (r >= 0 && (flags & (P_STDOUT | P_MERGE)) != 0) { r = makePipe(&outP[0]); }
+        if (r >= 0 && (flags & P_STDERR) != 0 && (flags & P_MERGE) == 0) { r = makePipe(&errP[0]); }
+        if (r < 0) {
+            closeAll(&ep[0], &inP[0], &outP[0], &errP[0]);
+            cleanupStart(cands, ncand, ownCands, envp);
+            return r;
+        }
+        // keep our pipe fds out of 0..2 so that the child's dup2 calls cannot trample them
+        inP[0] = lift(inP[0]); inP[1] = lift(inP[1]);
+        outP[0] = lift(outP[0]); outP[1] = lift(outP[1]);
+        errP[0] = lift(errP[0]); errP[1] = lift(errP[1]);
+        ep[0] = lift(ep[0]); ep[1] = lift(ep[1]);
+        bool outCap = (flags & (P_STDOUT | P_MERGE)) != 0;
+        bool errCap = (flags & P_STDERR) != 0 && (flags & P_MERGE) == 0;
+        int child;
+        if (__ARCH == 0) {
+            child = __syscall(57, 0, 0, 0, 0, 0, 0);                 // fork
+        } else {
+            child = __syscall(220, 17, 0, 0, 0, 0, 0);               // clone(SIGCHLD)
+        }
+        if (child < 0) {
+            closeAll(&ep[0], &inP[0], &outP[0], &errP[0]);
+            cleanupStart(cands, ncand, ownCands, envp);
+            return child;
+        }
+        if (child == 0) {
+            // ---- the child: only system calls from here on
+            if ((flags & P_GROUP) != 0) {
+                sys(109, 154, 0, 0);                                 // setpgid(0, 0)
+            }
+            defaultSigpipe();
+            if ((flags & P_STDIN) != 0) {
+                sys(33, 24, inP[0], 0, 0);
+            } else {
+                int nul = sys(257, 56, -100, (int) "/dev/null", 0, 0);
+                if (nul >= 0 && nul != 0) {
+                    sys(33, 24, nul, 0, 0);
+                    sys(3, 57, nul);
+                }
+            }
+            if (outCap) {
+                sys(33, 24, outP[1], 1, 0);
+            } else if ((flags & P_QUIET) != 0) {
+                int nul = sys(257, 56, -100, (int) "/dev/null", 1, 0);
+                if (nul >= 0 && nul != 1) {
+                    sys(33, 24, nul, 1, 0);
+                    sys(3, 57, nul);
+                }
+            }
+            if ((flags & P_MERGE) != 0) {
+                sys(33, 24, outP[1], 2, 0);
+            } else if (errCap) {
+                sys(33, 24, errP[1], 2, 0);
+            } else if ((flags & P_QUIET) != 0) {
+                int nul = sys(257, 56, -100, (int) "/dev/null", 1, 0);
+                if (nul >= 0 && nul != 2) {
+                    sys(33, 24, nul, 2, 0);
+                    sys(3, 57, nul);
+                }
+            }
+            int fail = 0;
+            if (cwd != null && cwd[0] != 0) {
+                fail = sys(80, 49, (int) cwd);                       // chdir
+            }
+            if (fail == 0) {
+                fail = -ENOENT;
+                for (int i = 0; i < ncand; i++) {
+                    int xr = sys(59, 221, (int) cands[i], (int) argv, (int) envp);     // only returns on failure
+                    if (xr == -ENOENT || xr == -ENOTDIR) {
+                        continue;
+                    }
+                    fail = xr;
+                    if (xr != -EACCES) {
+                        break;
+                    }
+                }
+            }
+            char eb[8];
+            int code = -fail;
+            eb[0] = code & 255; eb[1] = (code >> 8) & 255; eb[2] = (code >> 16) & 255; eb[3] = (code >> 24) & 255;
+            sys(1, 64, ep[1], (int) &eb[0], 4);
+            __syscall(__ARCH == 0 ? 231 : 94, 127, 0, 0, 0, 0, 0);   // exit_group(127)
+            for (;;) { }
+        }
+        // ---- the parent
+        sys(3, 57, ep[1]);
+        if (inP[0] >= 0) { sys(3, 57, inP[0]); }
+        if (outP[1] >= 0) { sys(3, 57, outP[1]); }
+        if (errP[1] >= 0) { sys(3, 57, errP[1]); }
+        // did exec work? the read returns 0 bytes when the close-on-exec descriptor vanished
+        char eb[8];
+        int got;
+        for (;;) {
+            got = sys(0, 63, ep[0], (int) &eb[0], 4);
+            if (got != -EINTR) {
+                break;
+            }
+        }
+        sys(3, 57, ep[0]);
+        cleanupStart(cands, ncand, ownCands, envp);
+        if (got >= 4) {
+            int code = rd32(&eb[0], 0);
+            if (inP[1] >= 0) { sys(3, 57, inP[1]); }
+            if (outP[0] >= 0) { sys(3, 57, outP[0]); }
+            if (errP[0] >= 0) { sys(3, 57, errP[0]); }
+            int st;
+            reapBlocking(child, &st);
+            return -code;
+        }
+        pid = child;
+        running = true;
+        exited = false;
+        termSignal = 0;
+        exitCode = -1;
+        ownGroup = (flags & P_GROUP) != 0;
+        inFd = inP[1];
+        outFd = outP[0];
+        errFd = errP[0];
+        if (inFd >= 0) { setNonBlock(inFd); }
+        if (outFd >= 0) { setNonBlock(outFd); }
+        if (errFd >= 0) { setNonBlock(errFd); }
+        return 0;
+    }
+
+    private bool strncmpEq(char* a, char* b, int n) {
+        for (int i = 0; i < n; i++) {
+            if (a[i] != b[i]) { return false; }
+        }
+        return true;
+    }
+
+    private int lift(int fd) {
+        if (fd < 0 || fd > 2) {
+            return fd;
+        }
+        int nf = sys(72, 25, fd, 1030, 3);                          // F_DUPFD_CLOEXEC, at least 3
+        if (nf >= 0) {
+            sys(3, 57, fd);
+            return nf;
+        }
+        return fd;
+    }
+
+    private void closeAll(int* a, int* b, int* c, int* d) {
+        for (int i = 0; i < 2; i++) {
+            if (a[i] >= 0) { sys(3, 57, a[i]); }
+            if (b[i] >= 0) { sys(3, 57, b[i]); }
+            if (c[i] >= 0) { sys(3, 57, c[i]); }
+            if (d[i] >= 0) { sys(3, 57, d[i]); }
+        }
+    }
+
+    private void cleanupStart(char** cands, int ncand, bool own, char** envp) {
+        if (own) {
+            for (int i = 0; i < ncand; i++) {
+                free(cands[i]);
+            }
+        }
+        free((char*) cands);
+        free((char*) envp);
+    }
+
+    private int reapBlocking(int p, int* status) {
+        char st[8];
+        for (;;) {
+            int r = sys(61, 260, p, (int) &st[0], 0, 0);
+            if (r == -EINTR) { continue; }
+            *status = rd32(&st[0], 0);
+            return r;
+        }
+        return -1;
+    }
+
+    // Reads what the child has written without blocking. which: 1 standard output, 2 standard error.
+    // Returns the bytes read, 0 at the end of the stream (the child closed it), -EAGAIN when nothing is there now.
+    public int read(int which, char* buf, int max) {
+        int fd = (which == 2) ? errFd : outFd;
+        if (fd < 0) {
+            return 0;
+        }
+        int r = sys(0, 63, fd, (int) buf, max);
+        if (r == -EINTR) {
+            return -EAGAIN;
+        }
+        return r;
+    }
+
+    public void closeOut() {
+        if (outFd >= 0) { sys(3, 57, outFd); outFd = -1; }
+    }
+
+    public void closeErr() {
+        if (errFd >= 0) { sys(3, 57, errFd); errFd = -1; }
+    }
+
+    // Writes to the child's standard input without blocking: the bytes written (may be less than n, or 0 -> -EAGAIN when the pipe
+    // is full), -EPIPE when the child closed its input. Never raises SIGPIPE.
+    public int write(char* buf, int n) {
+        if (inFd < 0) {
+            return -EPIPE;
+        }
+        if (n <= 0) {
+            return 0;
+        }
+        int r = sys(1, 64, inFd, (int) buf, n);
+        if (r == -EINTR) {
+            return -EAGAIN;
+        }
+        return r;
+    }
+
+    public void closeIn() {
+        if (inFd >= 0) { sys(3, 57, inFd); inFd = -1; }
+    }
+
+    // Looks whether the child has ended (never blocks): 1 it ended just now (the status is recorded), 0 still running,
+    // 2 it was already reaped, -errno on error.
+    public int tryWait() {
+        if (!running) {
+            return pid == 0 ? -ECHILD : 2;
+        }
+        char st[8];
+        int r;
+        for (;;) {
+            r = sys(61, 260, pid, (int) &st[0], 1, 0);              // wait4(WNOHANG)
+            if (r != -EINTR) { break; }
+        }
+        if (r == 0) {
+            return 0;
+        }
+        if (r < 0) {
+            if (r == -ECHILD) {
+                running = false;
+                exited = false;
+                exitCode = -1;
+                return 1;
+            }
+            return r;
+        }
+        rawStatus = rd32(&st[0], 0);
+        running = false;
+        if ((rawStatus & 0x7F) == 0) {
+            exited = true;
+            exitCode = (rawStatus >> 8) & 255;
+        } else {
+            exited = false;
+            termSignal = rawStatus & 0x7F;
+            exitCode = -1;
+        }
+        return 1;
+    }
+
+    // waits until the child ends or timeoutMs passes (-1: no limit): true if it has ended
+    public bool wait(int timeoutMs) {
+        int start = monoMs();
+        for (;;) {
+            int r = tryWait();
+            if (r != 0) {
+                return true;
+            }
+            if (timeoutMs >= 0 && monoMs() - start >= timeoutMs) {
+                return false;
+            }
+            sleepMs(1);
+        }
+        return false;
+    }
+
+    // sends a signal to the child (0 or -errno). The status of an already reaped child is not touched.
+    public int signal(int sig) {
+        if (!running) {
+            return -ESRCH;
+        }
+        return sys(62, 129, pid, sig);
+    }
+
+    // sends a signal to the child's whole process group (P_GROUP) or, without it, to the child alone
+    public int signalGroup(int sig) {
+        if (!running) {
+            return -ESRCH;
+        }
+        if (ownGroup) {
+            return sys(62, 129, -pid, sig);
+        }
+        return sys(62, 129, pid, sig);
+    }
+
+    // waits until the output or error stream has data (or ended), or timeoutMs passes. True when something is ready.
+    public bool waitReadable(int timeoutMs) {
+        int fds[2];
+        int ev[2];
+        int rev[2];
+        int n = 0;
+        if (outFd >= 0) { fds[n] = outFd; ev[n] = POLLIN; n++; }
+        if (errFd >= 0) { fds[n] = errFd; ev[n] = POLLIN; n++; }
+        if (n == 0) {
+            return false;
+        }
+        return pollFds(&fds[0], &ev[0], &rev[0], n, timeoutMs) > 0;
+    }
+
+    // closes our pipe ends and, if the child still runs, kills it (the group too) and reaps it
+    public void dispose() {
+        closeIn();
+        closeOut();
+        closeErr();
+        if (running) {
+            signalGroup(SIGKILL);
+            wait(2000);
+        }
+    }
+}
