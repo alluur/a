@@ -346,6 +346,7 @@ A `gchart.Gauge(min, max)` is a dial with coloured zones: green, then amber from
 A `gchart.Switch(initial)` is an on/off toggle (`on`, `set(b)`, `onChange`; click it, or press Space while it has the focus). A `gchart.Rating(stars, initial)` is a row of stars to click (`value`, `max`, `set(n)`, `onChange`);
 `set` cuts the number to 0 .. `max`, and a click on the star that is already the value sets it back to 0. `onChange` of both runs only when the value really changes, and is a function `int f(int widget)`.
 In the first picture the CPU gauge (35) is all green, the memory gauge (72) has passed the amber mark at 60, and the disk gauge (94) reaches into the red zone that starts at 85. In the second, the first switch is off, the second is on, and the ratings show 3 of 5 stars and 5 of 5.
+The output lines show the clamping: `setValue(250)` on a gauge of 0 to 100 leaves 100, and `set(9)` on a rating of five stars gives 5.
 
 {{sample gfx/gauges}}
 
@@ -357,7 +358,7 @@ In the first picture the CPU gauge (35) is all green, the memory gauge (72) has 
 
 ::: note
 
-A gauge draws its caption **below** its preferred height, so a gauge that gets exactly `prefH()` (100 pixels) in a window shows the number but not the caption. Give it more room (a taller box), or leave the caption out.
+A gauge draws its caption **below** the point that its preferred height (100 pixels) reaches, so a gauge that gets exactly that height in a window shows the number but cuts off the caption. Give it more room (a taller box; the samples above use 125 pixels), or leave the caption out.
 
 :::
 
@@ -371,14 +372,15 @@ A gauge draws its caption **below** its preferred height, so a gauge that gets e
 
 * The chart has `flex = 1` and fills the window; the gauge and the stars keep their preferred sizes. `push` calls `invalidate()` by itself, so the chart redraws.
 * The picture shows the 12 starting values and five clicks on **Add sample**, which pushed 35, 52, 61, 48 and 73 from the table in the program. The gauge shows the last of them, 73.
+* The switch labelled "Auto" is only there to be looked at: the sample does not connect it to anything. A real program would set its `onChange`, and `d->after` would call `push` while the switch is on.
 * Real programs would call `push` from a timer (`d->after`): [the previous chapter](#chap-gui-basics) shows how timers work.
 
 ## Summary
 
 * `guix.MenuBar`, `Menu`, `MenuItem`: titles with `&`, items with callbacks `int f(int item)`, `->accel("Ctrl+S")`, `addCheck`, `addSub`, `addSeparator`, `disable`; context menus with `onContext` and `popup`.
-* `ComboBox`, `RadioGroup` + `RadioButton`, `TabView`, `ScrollView`, `SpinBox` and `Splitter` cover choices and structure. Callbacks fire as soon as `onChange` is set and the value changes: create what they use first.
-* `TableView` (columns, rows, sorting), `TreeView`, `Toolbar` with `IconButton`, `StatusBar`, `TextBlock`, `Calendar` and `tooltip` finish the set; `drawIcon` draws any of the 31 icons anywhere.
-* Dialogs (`confirm`, `prompt`, `openFile`, `saveFile`, `chooseColor`, `chooseDate`) call your function with the answer; `notify` shows a card.
+* `ComboBox`, `RadioGroup` + `RadioButton`, `TabView` (also with closable tabs), `ScrollView` (and its `ScrollBar`), `SpinBox` and `Splitter` (side by side or stacked) cover choices and structure. Callbacks fire as soon as `onChange` is set and the value changes: create what they use first.
+* `TableView` (columns, rows, sorting), `TreeView` (with children loaded on demand), `Toolbar` with `IconButton`, `StatusBar`, `TextBlock` and `Calendar` finish the set of `guix`; every widget has a `tooltip`, and `drawIcon` draws any of the 31 icons anywhere.
+* Dialogs (`confirm`, `prompt`, `openFile`, `saveFile`, `chooseColor`, `chooseDate`) call your function with the answer; four of them have an `...Arg` version that passes an extra number in `guix.dialogArg`. `notify` shows a card (at most six at a time).
 * A colour scheme is a set of global variables (`gui.cBack` and friends) set before the windows are built.
 * `gchart`: `Chart` (bar, line, area, pie), `Gauge`, `Switch`, `Rating`: ordinary widgets that can also paint into any surface.
 

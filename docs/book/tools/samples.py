@@ -20,6 +20,7 @@ Next to the program:  NAME.in is read as standard input, NAME.out is the expecte
 The program runs in a scratch copy of its directory, so it may create files.
 
 --update writes the .out of samples that have none (and rewrites the ones that differ: check the diff before you commit!).
+--run-target T builds for T (linux-arm64, linux-riscv64 or linux-loongarch64) and runs the sample under qemu-user: the output must equal the recorded one.
 --targets compiles every sample for every target of the compiler as well (a build check, nothing is run).
 Exit status 0 only when every selected sample passes.
 """
@@ -28,6 +29,7 @@ import argparse, concurrent.futures, difflib, os, re, shlex, shutil, subprocess,
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOOK = os.path.dirname(HERE)
 SAMPLES = os.path.join(BOOK, "samples")
+QEMU = {"linux-arm64": "qemu-aarch64", "linux-riscv64": "qemu-riscv64", "linux-loongarch64": "qemu-loongarch64"}
 TARGETS = ["linux", "linux-arm64", "linux-riscv64", "linux-loongarch64", "windows", "android", "android-x64", "android-riscv64", "android-loongarch64"]
 
 
@@ -86,7 +88,7 @@ def out_path(path):
     return path[:-2] + ".out"
 
 
-def run_one(path, ac, update, targets, verbose):
+def run_one(path, ac, update, targets, verbose, run_target=None):
     name = sample_name(path)
     d = directives(path)
     srcdir = os.path.dirname(path)
@@ -119,7 +121,7 @@ def run_one(path, ac, update, targets, verbose):
                 return subprocess.run([ac] + targ + objs + ["-o", out], cwd=work, capture_output=True, text=True, timeout=120)
             return subprocess.run([ac] + targ + [prog, "-o", out], cwd=work, capture_output=True, text=True, timeout=120)
 
-        r = build(None, exe)
+        r = build(run_target, exe)
         if r.returncode != 0:
             return name, False, "compile error:\n" + (r.stderr or r.stdout)[:1500]
         if targets:
@@ -135,7 +137,7 @@ def run_one(path, ac, update, targets, verbose):
         stdin = open(stdin_path, "rb") if os.path.exists(stdin_path) else subprocess.DEVNULL
         timeout = int(d.get("timeout", 20) if d.get("timeout") is not True else 20)
         want_exit = int(d.get("exit", 0) if d.get("exit") is not True else 0)
-        argv = [exe] + shlex.split(d.get("args", ""))
+        argv = ([QEMU[run_target]] if run_target else []) + [exe] + shlex.split(d.get("args", ""))
         env = {"PATH": "/usr/bin:/bin", "HOME": work, "LANG": "C", "TERM": "dumb"}
         try:
             r = subprocess.run(argv, cwd=work, stdin=stdin, capture_output=True, timeout=timeout, env=env)
@@ -170,6 +172,7 @@ def main():
     ap.add_argument("--ac", default=os.environ.get("AC") or os.path.join(BOOK, "..", "..", "build", "ac"))
     ap.add_argument("--update", action="store_true")
     ap.add_argument("--targets", action="store_true")
+    ap.add_argument("--run-target", choices=sorted(QEMU), help="build for this target and RUN the sample under qemu-user (needs qemu-aarch64 / qemu-riscv64 / qemu-loongarch64); the output must equal the recorded one")
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("selectors", nargs="*")
@@ -182,7 +185,7 @@ def main():
         sys.exit("no samples selected")
     bad = 0
     with concurrent.futures.ThreadPoolExecutor(a.jobs) as ex:
-        futs = [ex.submit(run_one, p, ac, a.update, a.targets, a.verbose) for p in files]
+        futs = [ex.submit(run_one, p, ac, a.update and not a.run_target, a.targets, a.verbose, a.run_target) for p in files]
         for f in futs:
             name, ok, msg = f.result()
             if not ok:
