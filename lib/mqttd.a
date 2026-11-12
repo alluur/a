@@ -75,6 +75,12 @@ class Session {
     public int tmpQos;
     public int disconnectedAt;
     public char* username;
+    public char** rTopics;              // retained messages that SUBSCRIBE found and that are still to be sent (the topics: the message is looked up when it is sent)
+    public int* rQos;                   // the granted QoS of the subscription each came from
+    public int rPos;
+    public int rCount;
+    public int rCap;
+    public int rBytes;                  // what the backlog costs (counted in the broker's queued bytes)
 }
 
 class Node {
@@ -119,6 +125,7 @@ public class Stats {
     public int malformed;               // connections closed for a malformed packet or a protocol violation
     public int timeouts;                // keep-alive and CONNECT time outs
     public int evicted;                 // clients cut off because their output queue overflowed
+    public int retainedRefused;         // retained messages that were not stored because maxRetained or maxRetainedBytes was reached (they are still delivered)
     public int liveMsgs;                // messages in memory (for leak checks)
     public int liveItems;
 }
@@ -140,7 +147,9 @@ public class Broker {
     public int maxOut;                  // bytes waiting for one client's socket, default 4 MiB
     public int maxSubsPerClient;        // default 200
     public int maxSubscriptions;        // all clients, default 20000
-    public int maxRetained;             // default 10000
+    public int maxRetained;             // retained messages, default 10000 ($ topics of the broker do not count)
+    public int maxRetainedBytes;        // what they cost together (payload, topic, tree nodes), default 16 MiB
+    public bool bindSessions;           // default true: a stored session can only be resumed or taken over by a connection with the same user name (else CONNACK 5)
     public int maxSessions;             // persistent sessions of offline clients, default 1000
     public int maxLevels;               // topic levels, default 64
     public int maxTopicLength;          // default 1024
@@ -169,6 +178,7 @@ public class Broker {
     private int nusers;
     private int totalSubs;
     private int nRetained;
+    private int retBytes;
     private int queuedTotal;
     private int autoId;
     private int startedAt;
@@ -190,6 +200,8 @@ public class Broker {
         maxSubsPerClient = 200;
         maxSubscriptions = 20000;
         maxRetained = 10000;
+        maxRetainedBytes = 16777216;
+        bindSessions = true;
         maxSessions = 1000;
         maxLevels = 64;
         maxTopicLength = 1024;
@@ -449,6 +461,7 @@ public class Broker {
             it = nx;
         }
         unref(s->will);
+        freeBacklog(s);
         if (s->in2 != null) free(s->in2);
         int at = findSess(s->id);
         if (at >= 0) {
@@ -471,13 +484,23 @@ public class Broker {
         }
     }
 
-    // makes room offline persistent sessions: the one that has been gone longest is dropped
-    private void evictOldestOffline() {
+    private bool sameUser(char* a, char* b) {
+        if (a == null || b == null) return a == b;
+        return streq(a, b);
+    }
+
+    // makes room for an offline persistent session: the one that the same user (user name) has left for longest is dropped, and only if that user has none
+    // the one that has been gone longest of all (so that one user's sessions do not push out the sessions of the others as long as it has some of its own)
+    private void evictOldestOffline(char* username) {
         Session* oldest = null;
+        Session* oldestOwn = null;
         for (int i = 0; i < nsess; i++) {
             Session* s = sess[i];
-            if (s->peer == null && (oldest == null || s->disconnectedAt < oldest->disconnectedAt)) oldest = s;
+            if (s->peer != null) continue;
+            if (oldest == null || s->disconnectedAt < oldest->disconnectedAt) oldest = s;
+            if (sameUser(s->username, username) && (oldestOwn == null || s->disconnectedAt < oldestOwn->disconnectedAt)) oldestOwn = s;
         }
+        if (oldestOwn != null) oldest = oldestOwn;
         if (oldest != null) destroySession(oldest);
     }
 
@@ -545,6 +568,7 @@ public class Broker {
         }
         s->peer = null;
         s->disconnectedAt = now;
+        freeBacklog(s);                     // retained messages that were not sent yet are not sent after a reconnect (subscribe again)
         if (graceful || p->sawDisconnect) {
             unref(s->will);
             s->will = null;
@@ -680,8 +704,17 @@ public class Broker {
             }
         }
         if (code != 0) return refuse(p, code);
+        // A will is a PUBLISH that the broker makes later: it is held to the same rules as a PUBLISH now (otherwise a will would be a way round the ACL, round
+        // the ban on $ topics and round the topic limits)
+        if (k->hasWill) {
+            bool wok = strlen(k->willTopic) <= maxTopicLength && levels(k->willTopic) <= maxLevels && k->willTopic[0] != '$';
+            if (wok && aclHook != null) wok = aclHook(this, id, 1, k->willTopic) != 0;
+            if (!wok) return refuse(p, mqtt.CONNACK_NOT_AUTHORIZED);
+        }
         int at = findSess(id);
         Session* s = at >= 0 ? sess[at] : null;
+        // a stored session belongs to the user that made it: another user does not get its subscriptions and queued messages (and does not throw it out)
+        if (s != null && bindSessions && !sameUser(s->username, k->hasUser ? k->username : null)) return refuse(p, mqtt.CONNACK_NOT_AUTHORIZED);
         if (s != null && s->peer != null) {
             // the same client id connects again: the old connection is dropped (its will is sent)
             Peer* old = (Peer*) s->peer;
@@ -701,7 +734,7 @@ public class Broker {
         if (s != null) {
             present = true;
         } else {
-            if (!k->clean && offlineCount() >= maxSessions) evictOldestOffline();
+            if (!k->clean && offlineCount() >= maxSessions) evictOldestOffline(k->hasUser ? k->username : null);
             at = findSess(id);
             s = addSess(id, -at - 1);
         }
@@ -795,29 +828,48 @@ public class Broker {
         }
     }
 
+    // what a retained message costs: payload, topic, and the tree nodes of its topic (counted as if no node were shared: pessimistic)
+    private int retCost(Msg* m) {
+        return m->len + strlen(m->topic) + 96 + 160 * levels(m->topic);
+    }
+
+    private void removeRetained(Node* n) {
+        retBytes = retBytes - retCost(n->retained);
+        unref(n->retained);
+        n->retained = null;
+        nRetained--;
+        prune(n);
+    }
+
     private void setRetained(Msg* m, int qos) {
+        Node* n = nodeFor(m->topic, false);
+        bool own = m->topic[0] == '$';          // the broker's own topics (statistics): a few fixed messages, not limited
         if (m->len == 0) {
-            Node* n = nodeFor(m->topic, false);
-            if (n != null && n->retained != null) {
-                unref(n->retained);
-                n->retained = null;
-                nRetained--;
-                prune(n);
-            }
+            if (n != null && n->retained != null) removeRetained(n);
             return;
         }
-        Node* n = nodeFor(m->topic, false);
-        if (n == null || n->retained == null) {
-            if (nRetained >= maxRetained) { stats->dropped++; return; }
-            if (levels(m->topic) > maxLevels) return;
+        if (levels(m->topic) > maxLevels) return;
+        int cost = retCost(m);
+        int oldCost = (n != null && n->retained != null) ? retCost(n->retained) : 0;
+        bool isNew = n == null || n->retained == null;
+        if (!own && ((isNew && nRetained >= maxRetained) || retBytes - oldCost + cost > maxRetainedBytes)) {
+            // not stored. A value that is already there would be out of date now: it goes (no retained message is better than a wrong one)
+            stats->retainedRefused++;
+            stats->dropped++;
+            if (!isNew) removeRetained(n);
+            return;
+        }
+        if (isNew) {
             n = nodeFor(m->topic, true);
             nRetained++;
         } else {
             unref(n->retained);
+            retBytes = retBytes - oldCost;
         }
         m->refs++;
         n->retained = m;
         n->retQos = qos;
+        retBytes = retBytes + cost;
     }
 
     private void addFan(Session* s, int qos) {
@@ -924,41 +976,150 @@ public class Broker {
         return 0;
     }
 
-    // sends queued QoS 1 / 2 messages while the window and the client's output queue have room
+    // Starts the delivery of a QoS 1 / 2 item: a packet identifier, the PUBLISH, the item goes to the in-flight list. false: nothing was started
+    // (no free identifier, or the client could not take the packet and was cut off)
+    private bool launch(Session* s, Peer* p, QItem* it) {
+        int pid = allocPid(s);
+        if (pid == 0) return false;
+        if (!mqtt.putPublish(p->out, it->m->topic, it->m->payload, it->m->len, it->qos, it->retain, false, pid)) {
+            stats->evicted++;
+            kick(p, true);
+            return false;
+        }
+        it->pid = pid;
+        it->state = it->qos == 1 ? W_ACK : W_REC;
+        if (s->ninfl >= s->inflCap) {
+            int nc = s->inflCap == 0 ? 8 : s->inflCap * 2;
+            QItem** ni = (QItem**) malloc(nc * 8);
+            for (int i = 0; i < s->ninfl; i++) ni[i] = s->infl[i];
+            if (s->infl != null) free((char*) s->infl);
+            s->infl = ni;
+            s->inflCap = nc;
+        }
+        s->infl[s->ninfl] = it;
+        s->ninfl++;
+        stats->messagesOut++;
+        return true;
+    }
+
+    // sends the retained messages that wait for the client, then the queued QoS 1 / 2 messages, while the window and the client's output queue have room
     private void pumpSession(Session* s) {
         Peer* p = (Peer*) s->peer;
         if (p == null) return;
         int win = maxInflight;
         if (win > 256) win = 256;
         if (win < 1) win = 1;
+        pumpRetained(s, p, win);
         while (s->qHead != null && s->ninfl < win && p->out->pending() < maxOut / 2) {
             QItem* it = s->qHead;
-            int pid = allocPid(s);
-            if (pid == 0) return;
-            if (!mqtt.putPublish(p->out, it->m->topic, it->m->payload, it->m->len, it->qos, it->retain, false, pid)) {
-                stats->evicted++;
-                kick(p, true);
-                return;
-            }
+            if (!launch(s, p, it)) return;
             s->qHead = it->next;
             if (s->qHead == null) s->qTail = null;
             it->next = null;
             s->qCount--;
             s->qBytes = s->qBytes - it->m->len;
             queuedTotal = queuedTotal - it->m->len;
-            it->pid = pid;
-            it->state = it->qos == 1 ? W_ACK : W_REC;
-            if (s->ninfl >= s->inflCap) {
-                int nc = s->inflCap == 0 ? 8 : s->inflCap * 2;
-                QItem** ni = (QItem**) malloc(nc * 8);
-                for (int i = 0; i < s->ninfl; i++) ni[i] = s->infl[i];
-                if (s->infl != null) free((char*) s->infl);
-                s->infl = ni;
-                s->inflCap = nc;
+        }
+    }
+
+    // ---- retained messages that wait for a client -----------------------------------------------------------------------------------------------------------
+    // SUBSCRIBE finds the retained messages of the new filters and puts their topics on a list; they are sent as the client's window and output queue have room
+    // (not through the client's queue limits: the spec wants every matching retained message, however many there are). The message itself is looked up when it
+    // is sent: a retained message that was removed or replaced in the meantime is not sent / is sent in its new form.
+    private int backlogCost(char* topic) { return strlen(topic) + 1 + 16; }
+
+    private void queueRetained(Session* s, Node* n, int subQos) {
+        if (n->retained == null) return;
+        char* topic = n->retained->topic;
+        int cost = backlogCost(topic);
+        if (s->rCount - s->rPos >= maxRetained || queuedTotal + cost > maxQueuedTotal) {
+            stats->dropped++;
+            return;
+        }
+        if (s->rCount >= s->rCap) {
+            int live = s->rCount - s->rPos;
+            if (s->rPos > 0 && live < s->rCap) {
+                for (int i = 0; i < live; i++) { s->rTopics[i] = s->rTopics[s->rPos + i]; s->rQos[i] = s->rQos[s->rPos + i]; }
+                s->rPos = 0;
+                s->rCount = live;
+            } else {
+                int nc = s->rCap == 0 ? 16 : s->rCap * 2;
+                char** nt = (char**) malloc(nc * 8);
+                int* nq = (int*) malloc(nc * 8);
+                if (nt == null || nq == null) {
+                    if (nt != null) free((char*) nt);
+                    if (nq != null) free((char*) nq);
+                    stats->dropped++;
+                    return;
+                }
+                for (int i = 0; i < live; i++) { nt[i] = s->rTopics[s->rPos + i]; nq[i] = s->rQos[s->rPos + i]; }
+                if (s->rTopics != null) { free((char*) s->rTopics); free((char*) s->rQos); }
+                s->rTopics = nt;
+                s->rQos = nq;
+                s->rCap = nc;
+                s->rPos = 0;
+                s->rCount = live;
             }
-            s->infl[s->ninfl] = it;
-            s->ninfl++;
-            stats->messagesOut++;
+        }
+        char* t = copy(topic);
+        if (t == null) { stats->dropped++; return; }
+        s->rTopics[s->rCount] = t;
+        s->rQos[s->rCount] = subQos;
+        s->rCount++;
+        s->rBytes = s->rBytes + cost;
+        queuedTotal = queuedTotal + cost;
+    }
+
+    private void popRetained(Session* s) {
+        int cost = backlogCost(s->rTopics[s->rPos]);
+        free(s->rTopics[s->rPos]);
+        s->rTopics[s->rPos] = null;
+        s->rBytes = s->rBytes - cost;
+        queuedTotal = queuedTotal - cost;
+        s->rPos++;
+        if (s->rPos >= s->rCount) freeBacklog(s);
+    }
+
+    private void freeBacklog(Session* s) {
+        if (s->rTopics == null) return;
+        for (int i = s->rPos; i < s->rCount; i++) free(s->rTopics[i]);
+        queuedTotal = queuedTotal - s->rBytes;
+        free((char*) s->rTopics);
+        free((char*) s->rQos);
+        s->rTopics = null;
+        s->rQos = null;
+        s->rBytes = 0;
+        s->rPos = 0;
+        s->rCount = 0;
+        s->rCap = 0;
+    }
+
+    private void pumpRetained(Session* s, Peer* p, int win) {
+        while (s->rPos < s->rCount && !p->doomed) {
+            if (p->out->pending() >= maxOut / 2) return;
+            Node* n = nodeFor(s->rTopics[s->rPos], false);
+            Msg* m = n == null ? null : n->retained;
+            if (m == null) { popRetained(s); continue; }                   // removed meanwhile
+            int q = n->retQos < s->rQos[s->rPos] ? n->retQos : s->rQos[s->rPos];
+            if (q == 0) {
+                if (!mqtt.putPublish(p->out, m->topic, m->payload, m->len, 0, true, false, 0)) {
+                    stats->evicted++;
+                    kick(p, true);
+                    return;
+                }
+                stats->messagesOut++;
+                popRetained(s);
+                continue;
+            }
+            if (s->ninfl >= win) return;
+            QItem* it = newItem(m, q, true);
+            if (it == null) { stats->dropped++; popRetained(s); continue; }
+            if (!launch(s, p, it)) {
+                it->state = W_ACK;                                          // never queued: freeItem must not take it off the queue's byte count
+                freeItem(it);
+                return;
+            }
+            popRetained(s);
         }
     }
 
@@ -1051,18 +1212,17 @@ public class Broker {
         for (int i = 0; i < k->nfilters; i++) {
             if (codes[i] != mqtt.SUBACK_FAILURE) sendRetained(s, k->filters[i], codes[i]);
         }
+        pumpSession(s);
         return p->wantClose ? false : true;
     }
 
-    // delivers the retained messages that match a filter (retain flag set), with the subscription's QoS as the limit
+    // lists the retained messages that match a filter for delivery (retain flag set), with the subscription's QoS as the limit
     private void sendRetained(Session* s, char* filter, int subQos) {
         retMatch(s, root, filter, 0, true, subQos);
     }
 
     private void retEmit(Session* s, Node* n, int subQos) {
-        if (n->retained == null) return;
-        int q = n->retQos < subQos ? n->retQos : subQos;
-        deliver(s, n->retained, q, true);
+        queueRetained(s, n, subQos);
     }
 
     private void retAll(Session* s, Node* n, int subQos, bool skipDollar) {
@@ -1132,7 +1292,7 @@ public class Broker {
                 }
             }
             for (int i = 0; i < nsess; i++) {
-                if (sess[i]->qHead != null && sess[i]->peer != null) pumpSession(sess[i]);
+                if ((sess[i]->qHead != null || sess[i]->rPos < sess[i]->rCount) && sess[i]->peer != null) pumpSession(sess[i]);
             }
             sweep();
             if (sessionExpirySec > 0) {
@@ -1205,6 +1365,7 @@ public class Broker {
 
     public int subscriptionCount() { return totalSubs; }
     public int retainedCount() { return nRetained; }
+    public int retainedBytes() { return retBytes; }
     public int queuedBytes() { return queuedTotal; }
 
     // does a session with this id exist (connected or offline)? Its queued / in-flight counts are for tests and monitoring
@@ -1225,7 +1386,7 @@ public class Broker {
         for (int i = 0; i < nusers; i++) { free(userNames[i]); free(userPass[i]); }
         if (userNames != null) { free((char*) userNames); free((char*) userPass); }
         sess = null; peers = null; fan = null; pk = null; userNames = null; userPass = null; nusers = 0;
-        nsess = 0; npeers = 0; nRetained = 0;
+        nsess = 0; npeers = 0; nRetained = 0; retBytes = 0;
     }
 
     private void freeTree(Node* n) {

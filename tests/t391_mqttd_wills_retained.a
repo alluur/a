@@ -1,0 +1,512 @@
+// The broker core against the things a hostile or careless client can do with wills, retained messages, subscriptions and client ids (review findings
+// of stage net2): a will is held to the ACL, to the ban on $ topics and to the topic limits (CONNACK 5 otherwise), the retained store has a byte limit
+// (a message that does not fit is delivered but not kept, a value that is replaced by one that does not fit is removed), the retained messages of a
+// SUBSCRIBE are all delivered however many there are (as window and output queue allow), a stored session belongs to its user, and a user that
+// reaches maxSessions pushes out its own oldest session first.
+import mqtt;
+import mqttd;
+import netio;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqttd.Broker* b;
+int now = 100000;
+
+// a client as the broker sees it: a peer, what we send (q) and a parser for what the broker answers
+class Cli {
+    public mqttd.Peer* p;
+    public mqtt.Parser* rp;
+    public netio.Queue q;
+    public mqtt.Packet r;
+    public bool sp;                 // session present in the last CONNACK
+    public int code;                // the last CONNACK code
+    public int pid;
+}
+
+void advance(int ms) {
+    now = now + ms;
+    b->tick(now);
+}
+
+void freshBroker() {
+    b = new mqttd.Broker();
+    b->sysIntervalMs = 0;
+    b->setClock(now);
+}
+
+Cli* newCli() {
+    Cli* c = (Cli*) malloc(sizeof(Cli));
+    c->p = b->open(now);
+    c->rp = mqtt.newParser(mqtt.MODE_CLIENT, 1048576);
+    c->pid = 1;
+    return c;
+}
+
+// sends what is in c->q, returns the broker's verdict (< 0: the connection is to be closed)
+int flush(Cli* c) {
+    int rc = b->feed(c->p, c->q.data(), c->q.pending());
+    c->q.clear();
+    return rc;
+}
+
+int sendHex(Cli* c, char* hex) {
+    int n = 0;
+    char* raw = bytebuf.fromHex(hex, &n);
+    int rc = b->feed(c->p, raw, n);
+    free(raw);
+    return rc;
+}
+
+// the next packet the broker sent: its type, 0 if there is none; the packet is in c->r
+int next(Cli* c) {
+    for (;;) {
+        int r = c->rp->next(&c->r);
+        if (r == 1) return c->r.type;
+        if (r < 0) return -1;
+        int n = c->p->out->pending();
+        if (n <= 0) return 0;
+        if (n > 32768) n = 32768;                       // a socket delivers in pieces
+        c->rp->feed(c->p->out->data(), n);
+        c->p->out->consume(n);
+    }
+}
+
+// CONNECT and the CONNACK code (-1: no CONNACK came)
+int connectWith(Cli* c, char* id, bool clean, int ka, char* user, char* pass, char* willTopic, char* willPayload, int willQos, bool willRetain) {
+    mqtt.Packet k;
+    k.reset();
+    k.clientId = id;
+    k.clean = clean;
+    k.keepAlive = ka;
+    if (user != null) { k.hasUser = true; k.username = user; }
+    if (pass != null) { k.hasPass = true; k.password = pass; k.passwordLen = strlen(pass); }
+    if (willTopic != null) { k.hasWill = true; k.willTopic = willTopic; k.willPayload = willPayload; k.willLen = strlen(willPayload); k.willQos = willQos; k.willRetain = willRetain; }
+    mqtt.putConnect(&c->q, &k);
+    flush(c);
+    if (next(c) != mqtt.CONNACK) { c->code = -1; return -1; }
+    c->sp = c->r.sessionPresent;
+    c->code = c->r.returnCode;
+    return c->code;
+}
+
+int connect(Cli* c, char* id, bool clean = true, int ka = 0) {
+    return connectWith(c, id, clean, ka, null, null, null, null, 0, false);
+}
+
+// SUBSCRIBE: the granted QoS or 128, -1 without a SUBACK
+int sub(Cli* c, char* filter, int qos) {
+    char* f[1];
+    int q[1];
+    f[0] = filter;
+    q[0] = qos;
+    mqtt.putSubscribe(&c->q, c->pid, &f[0], &q[0], 1);
+    c->pid++;
+    flush(c);
+    if (next(c) != mqtt.SUBACK) return -1;
+    return c->r.fqos[0];
+}
+
+void pub(Cli* c, char* topic, char* payload, int qos, bool retain = false) {
+    mqtt.putPublish(&c->q, topic, payload, strlen(payload), qos, retain, false, qos > 0 ? c->pid : 0);
+    if (qos > 0) c->pid++;
+    flush(c);
+    if (qos > 0 && c->p != null) next(c);                   // the PUBACK or PUBREC: the publishers of this test do not subscribe
+}
+
+void disconnect(Cli* c) {
+    mqtt.putEmpty(&c->q, mqtt.DISCONNECT);
+    flush(c);
+}
+
+// the connection breaks without DISCONNECT
+void drop(Cli* c) {
+    b->closed(c->p);
+    c->p = null;
+}
+
+void ack(Cli* c, int type, int pid) {
+    mqtt.putAck(&c->q, type, pid);
+    flush(c);
+}
+
+// the next packet is a PUBLISH with these properties (it stays in c->r)
+bool isPub(Cli* c, char* topic, char* payload, int qos, bool retain) {
+    if (next(c) != mqtt.PUBLISH) return false;
+    mqtt.Packet* r = &c->r;
+    return streq(r->topic, topic) && r->payloadLen == strlen(payload) && memcmp(r->payload, payload, r->payloadLen) == 0 && r->qos == qos && r->retain == retain;
+}
+
+bool quiet(Cli* c) { return next(c) == 0; }
+
+
+int aclCalls = 0;
+int aclLastOp = 0;
+char aclLastTopic[64];
+
+// an ACL: nothing may be published to secret/..., everything else is allowed
+int acl(mqttd.Broker* br, char* clientId, int op, char* topic) {
+    aclCalls++;
+    aclLastOp = op;
+    format(&aclLastTopic[0], 64, "%s", topic, 0, 0, 0);
+    if (op == 1 && startsWith(topic, "secret/")) return 0;
+    return 1;
+}
+
+
+// reads every PUBLISH the client has been sent, acknowledging QoS 1 and 2 as it goes and serving the broker's timers when nothing comes; returns how many
+int drainAll(Cli* c, int maxRounds) {
+    int got = 0;
+    int idle = 0;
+    for (int round = 0; round < maxRounds && idle < 3; round++) {
+        int t = next(c);
+        if (t == 0) { advance(25); idle++; continue; }
+        idle = 0;
+        if (t == mqtt.PUBLISH) {
+            got++;
+            if (c->r.qos == 1) ack(c, mqtt.PUBACK, c->r.pid);
+            else if (c->r.qos == 2) ack(c, mqtt.PUBREC, c->r.pid);
+        } else if (t == mqtt.PUBREL) {
+            ack(c, mqtt.PUBCOMP, c->r.pid);
+        }
+    }
+    return got;
+}
+
+int main() {
+    freshBroker();
+    b->aclHook = acl;
+
+    // ---- wills are held to the rules of a PUBLISH ---------------------------------------------------------------------------------------------------------------------------
+    Cli* mon = newCli();
+    connect(mon, "mon");
+    check("the monitor subscribes to #", sub(mon, "#", 0) == 0);
+    Cli* w = newCli();
+    check("a will on a topic that the ACL refuses: CONNACK 5", connectWith(w, "w1", true, 60, null, null, "secret/will", "pwned", 0, false) == mqtt.CONNACK_NOT_AUTHORIZED && w->p->wantClose);
+    check("... the ACL was asked with the will topic and operation publish", aclLastOp == 1 && streq(&aclLastTopic[0], "secret/will"));
+    b->closed(w->p);
+    check("... no session was made, nothing was sent, nothing retained", !b->hasSession("w1") && quiet(mon) && b->retainedCount() == 0);
+    w = newCli();
+    check("a will on a $ topic: CONNACK 5", connectWith(w, "w2", true, 60, null, null, "$SYS/broker/version", "pwned", 0, true) == mqtt.CONNACK_NOT_AUTHORIZED);
+    b->closed(w->p);
+    char* longTopic = alloc(2100);
+    memset(longTopic, 'W', 2050);
+    longTopic[2050] = 0;
+    w = newCli();
+    check("a will topic longer than maxTopicLength (1024): CONNACK 5", connectWith(w, "w3", true, 60, null, null, longTopic, "x", 0, true) == mqtt.CONNACK_NOT_AUTHORIZED);
+    b->closed(w->p);
+    b->maxLevels = 4;
+    w = newCli();
+    check("a will topic with more levels than maxLevels: CONNACK 5", connectWith(w, "w4", true, 60, null, null, "a/b/c/d/e", "x", 0, true) == mqtt.CONNACK_NOT_AUTHORIZED);
+    b->closed(w->p);
+    b->maxLevels = 64;
+    check("none of these changed the broker: no retained message, no session", b->retainedCount() == 0 && b->sessionCount() == 1 && b->connected == 1 && b->retainedBytes() == 0);
+    int refused = b->stats->rejected;
+    w = newCli();
+    check("a will that is allowed is accepted", connectWith(w, "w5", true, 60, null, null, "ok/will", "bye", 1, true) == 0);
+    check("... the ACL was asked about it", aclLastOp == 1 && streq(&aclLastTopic[0], "ok/will"));
+    drop(w);
+    check("... and it is sent when the connection vanishes (and retained)", isPub(mon, "ok/will", "bye", 0, false) && b->retainedCount() == 1);
+    // the refused CONNECT must not throw out a session that exists: the will check comes before the takeover
+    Cli* v = newCli();
+    connectWith(v, "keep", true, 60, null, null, "ok/keep", "x", 0, false);
+    Cli* v2 = newCli();
+    check("a CONNECT with a forbidden will for an id that is connected: refused", connectWith(v2, "keep", true, 60, null, null, "secret/x", "x", 0, false) == mqtt.CONNACK_NOT_AUTHORIZED);
+    b->closed(v2->p);
+    check("... and the connection that has the id is left alone", b->hasSession("keep") && !v->p->wantClose && b->connected == 2);
+    check("the refusals were counted", b->stats->rejected >= refused + 1);
+    disconnect(v);
+    b->closed(v->p);
+    // the broker's own retained statistics cannot be overwritten (the only way a client could have reached them)
+    b->sysIntervalMs = 1000;
+    b->publishSys();
+    Cli* probe = newCli();
+    connect(probe, "probe");
+    sub(probe, "$SYS/broker/version", 0);
+    check("$SYS/broker/version is retained", isPub(probe, "$SYS/broker/version", "mqttd 1", 0, true));
+    w = newCli();
+    connectWith(w, "w6", true, 60, null, null, "$SYS/broker/version", "mqttd pwned", 0, true);
+    b->closed(w->p);
+    Cli* probe2 = newCli();
+    connect(probe2, "probe2");
+    sub(probe2, "$SYS/broker/version", 0);
+    check("... a will cannot change it", isPub(probe2, "$SYS/broker/version", "mqttd 1", 0, true));
+    disconnect(probe);
+    b->closed(probe->p);
+    disconnect(probe2);
+    b->closed(probe2->p);
+    b->sysIntervalMs = 0;
+
+    // ---- the retained store has a byte limit ----------------------------------------------------------------------------------------------------------------------------------
+    freshBroker();
+    b->maxRetainedBytes = 100000;
+    Cli* pub1 = newCli();
+    connect(pub1, "pub1");
+    Cli* live = newCli();
+    connect(live, "live");
+    sub(live, "r/#", 1);
+    char* big = alloc(40000);
+    memset(big, 'b', 39999);
+    big[39999] = 0;
+    pub(pub1, "r/1", big, 1, true);
+    pub(pub1, "r/2", big, 1, true);
+    check("two retained messages of 40000 bytes fit into maxRetainedBytes (100000)", b->retainedCount() == 2 && b->retainedBytes() > 79998 && b->retainedBytes() <= 100000);
+    pub(pub1, "r/3", big, 1, true);
+    check("the third does not: it is not stored", b->retainedCount() == 2 && b->retainedBytes() <= 100000 && b->stats->retainedRefused == 1);
+    check("... but it is delivered to the live subscriber (three messages)", drainAll(live, 100) == 3);
+    Cli* late = newCli();
+    connect(late, "late");
+    sub(late, "r/#", 1);
+    check("a late subscriber gets the two that are retained", drainAll(late, 100) == 2);
+    int before = b->retainedBytes();
+    pub(pub1, "r/1", "small", 1, true);
+    check("a retained message is replaced by a smaller one: the bytes go down", b->retainedCount() == 2 && b->retainedBytes() < before - 39000);
+    pub(pub1, "r/1", big, 1, true);
+    check("... and by a big one again (it fits: the old one is not counted twice)", b->retainedCount() == 2 && b->retainedBytes() == before && b->stats->retainedRefused == 1);
+    char* huge = alloc(70000);
+    memset(huge, 'h', 69999);
+    huge[69999] = 0;
+    pub(pub1, "r/1", huge, 1, true);
+    check("replaced by one that does not fit: the old value is removed (no wrong value stays), the new one is not stored", b->retainedCount() == 1 && b->stats->retainedRefused == 2 && b->retainedBytes() < 50000);
+    pub(pub1, "r/2", "", 1, true);
+    check("an empty retained message removes the last one: no bytes left", b->retainedCount() == 0 && b->retainedBytes() == 0);
+    pub(pub1, "r/a/b/c/d/e/f/g/h", "x", 0, true);
+    check("a deep topic costs more than its payload (the tree nodes are counted)", b->retainedBytes() > 1000);
+    pub(pub1, "r/a/b/c/d/e/f/g/h", "", 0, true);
+    check("... and gives it all back", b->retainedBytes() == 0 && b->retainedCount() == 0);
+    // maxRetained counts too; the broker's own $ topics are exempt from both limits
+    b->maxRetained = 3;
+    for (int i = 0; i < 6; i++) {
+        char t[16];
+        format(&t[0], 16, "c/%d", i, 0, 0, 0);
+        pub(pub1, &t[0], "x", 0, true);
+    }
+    check("maxRetained: only 3 are stored", b->retainedCount() == 3 && b->stats->retainedRefused == 5);
+    b->maxRetainedBytes = 10;
+    b->sysIntervalMs = 1000;
+    b->publishSys();
+    Cli* sysSub = newCli();
+    connect(sysSub, "sys");
+    sub(sysSub, "$SYS/broker/version", 0);
+    check("the $SYS statistics are stored although both limits are used up", isPub(sysSub, "$SYS/broker/version", "mqttd 1", 0, true));
+    b->sysIntervalMs = 0;
+    // a retained will does not get round the limit
+    b->maxRetainedBytes = 100000;
+    b->maxRetained = 100;
+    check("(the store is cleaned for the next test)", b->retainedBytes() > 0);
+    b->dispose();
+
+    freshBroker();
+    b->maxRetainedBytes = 2000;
+    Cli* wl = newCli();
+    char* wbig = alloc(5000);
+    memset(wbig, 'w', 4999);
+    wbig[4999] = 0;
+    // the will payload of a CONNECT is limited to 65535 bytes
+    check("a client with a retained will of 4999 bytes", connectWith(wl, "wl", true, 60, null, null, "will/big", wbig, 0, true) == 0);
+    drop(wl);
+    check("the will over maxRetainedBytes is not retained (counted)", b->retainedCount() == 0 && b->stats->retainedRefused == 1 && b->retainedBytes() == 0);
+    b->dispose();
+
+    // ---- all retained messages of a SUBSCRIBE are delivered ------------------------------------------------------------------------------------------------------------------
+    freshBroker();
+    Cli* src = newCli();
+    connect(src, "src");
+    for (int i = 0; i < 3000; i++) {
+        char t[24];
+        format(&t[0], 24, "ret/%d", i, 0, 0, 0);
+        mqtt.putPublish(&src->q, &t[0], "v", 1, 1, true, false, i + 1);          // QoS 1: the subscribers get QoS 1 (a retained message keeps its QoS)
+        if (i % 100 == 99) { flush(src); src->p->out->clear(); }
+    }
+    flush(src);
+    check("3000 retained messages are stored", b->retainedCount() == 3000);
+    Cli* q1 = newCli();
+    connect(q1, "q1");
+    check("a QoS 1 subscriber (window 20) subscribes to ret/#", sub(q1, "ret/#", 1) == 1);
+    int got = drainAll(q1, 20000);
+    check("it gets all 3000 (the limit of its queue, 1000 messages, does not apply to them)", got == 3000);
+    check("... nothing is left in the broker's queues: no bytes, no backlog", b->queuedBytes() == 0 && b->sessionQueued("q1") == 0 && b->sessionInflight("q1") == 0);
+    check("... nothing was dropped", b->stats->dropped == 0);
+    Cli* q2 = newCli();
+    connect(q2, "q2");
+    check("a QoS 2 subscriber", sub(q2, "ret/#", 2) == 2);
+    check("... gets all 3000 as QoS 2 flows", drainAll(q2, 40000) == 3000 && b->sessionInflight("q2") == 0);
+    Cli* q0 = newCli();
+    connect(q0, "q0");
+    check("a QoS 0 subscriber", sub(q0, "ret/#", 0) == 0);
+    check("... gets all 3000", drainAll(q0, 20000) == 3000);
+    disconnect(q0);
+    b->closed(q0->p);
+    // big retained messages and a QoS 0 subscriber: the output queue limit stops the delivery for a while, it goes on when the socket has drained
+    for (int i = 0; i < 3000; i++) {
+        char t[24];
+        format(&t[0], 24, "ret/%d", i, 0, 0, 0);
+        mqtt.putPublish(&src->q, &t[0], "", 0, 0, true, false, 0);
+        if (i % 100 == 99) flush(src);
+    }
+    flush(src);
+    check("(cleared)", b->retainedCount() == 0 && b->retainedBytes() == 0);
+    char* kb60 = alloc(60000);
+    memset(kb60, 'k', 59999);
+    kb60[59999] = 0;
+    for (int i = 0; i < 50; i++) {
+        char t[24];
+        format(&t[0], 24, "big/%d", i, 0, 0, 0);
+        pub(src, &t[0], kb60, 0, true);
+    }
+    check("50 retained messages of 60000 bytes (3 MB)", b->retainedCount() == 50);
+    Cli* q3 = newCli();
+    connect(q3, "q3");
+    sub(q3, "big/#", 0);
+    check("a QoS 0 subscriber gets all 50 (the output limit holds the rest back until the socket has drained)", drainAll(q3, 2000) == 50);
+    check("... nothing was dropped, nothing is left", b->stats->dropped == 0 && b->queuedBytes() == 0);
+
+    // a retained message that was removed or replaced before it was sent
+    freshBroker();
+    b->maxInflight = 1;
+    src = newCli();
+    connect(src, "src");
+    for (int i = 1; i <= 5; i++) {
+        char t[16];
+        format(&t[0], 16, "ret/%d", i, 0, 0, 0);
+        pub(src, &t[0], "old", 1, true);
+    }
+    Cli* slow = newCli();
+    connect(slow, "slow");
+    sub(slow, "ret/#", 1);
+    check("window 1: the first retained message comes", isPub(slow, "ret/1", "old", 1, true));
+    int firstPid = slow->r.pid;
+    pub(src, "ret/3", "", 1, true);
+    pub(src, "ret/4", "new", 1, true);
+    ack(slow, mqtt.PUBACK, firstPid);
+    check("ret/2 as it was", isPub(slow, "ret/2", "old", 1, true));
+    ack(slow, mqtt.PUBACK, slow->r.pid);
+    check("ret/3 was removed meanwhile: it is not sent; ret/4 is sent as it is now", isPub(slow, "ret/4", "new", 1, true));
+    ack(slow, mqtt.PUBACK, slow->r.pid);
+    check("ret/5", isPub(slow, "ret/5", "old", 1, true));
+    ack(slow, mqtt.PUBACK, slow->r.pid);
+    check("then the two live messages that made the changes (they match the subscription too): the removal of ret/3 ...", isPub(slow, "ret/3", "", 1, false));
+    ack(slow, mqtt.PUBACK, slow->r.pid);
+    check("... and the new ret/4", isPub(slow, "ret/4", "new", 1, false));
+    ack(slow, mqtt.PUBACK, slow->r.pid);
+    check("... and that was all", quiet(slow) && b->queuedBytes() == 0 && b->sessionInflight("slow") == 0);
+
+    // the backlog of one client is bounded, and goes when the client does
+    freshBroker();
+    b->maxInflight = 1;
+    b->maxRetained = 10;
+    src = newCli();
+    connect(src, "src");
+    for (int i = 0; i < 10; i++) {
+        char t[16];
+        format(&t[0], 16, "ret/%d", i, 0, 0, 0);
+        pub(src, &t[0], "x", 1, true);
+    }
+    Cli* idle = newCli();
+    connect(idle, "idle");
+    sub(idle, "ret/#", 1);
+    int dropped0 = b->stats->dropped;
+    sub(idle, "ret/+", 1);
+    sub(idle, "ret/#", 1);
+    check("a client that never acknowledges cannot make the backlog grow by subscribing again and again (at most maxRetained wait)", b->stats->dropped > dropped0 && b->queuedBytes() > 0 && b->queuedBytes() <= 10 * 40);
+    drop(idle);
+    check("when the connection ends the backlog is freed", b->queuedBytes() == 0);
+    b->maxQueuedTotal = 40;
+    Cli* tiny = newCli();
+    connect(tiny, "tiny");
+    dropped0 = b->stats->dropped;
+    sub(tiny, "ret/#", 1);
+    check("the global budget (maxQueuedTotal) bounds the backlogs of all clients: the rest is dropped and counted", b->stats->dropped > dropped0 && b->queuedBytes() <= 40);
+    drop(tiny);
+    check("... freed again", b->queuedBytes() == 0);
+
+    // ---- a stored session belongs to its user ------------------------------------------------------------------------------------------------------------------------------
+    freshBroker();
+    b->addUser("alice", "a");
+    b->addUser("bob", "b");
+    Cli* al = newCli();
+    check("alice connects with a persistent session", connectWith(al, "dev1", false, 60, "alice", "a", null, null, 0, false) == 0 && !al->sp);
+    sub(al, "alice/private/#", 1);
+    disconnect(al);
+    b->closed(al->p);
+    Cli* pb = newCli();
+    connect(pb, "pubber");
+    pub(pb, "alice/private/secret", "alice-only-data", 1);
+    check("a QoS 1 message is queued for her offline session", b->sessionQueued("dev1") == 1);
+    Cli* bo = newCli();
+    check("bob (valid credentials) uses her client id: CONNACK 5", connectWith(bo, "dev1", false, 60, "bob", "b", null, null, 0, false) == mqtt.CONNACK_NOT_AUTHORIZED);
+    b->closed(bo->p);
+    check("... her session and its queue are untouched", b->hasSession("dev1") && b->sessionQueued("dev1") == 1);
+    bo = newCli();
+    check("bob with a clean session does not wipe it either", connectWith(bo, "dev1", true, 60, "bob", "b", null, null, 0, false) == mqtt.CONNACK_NOT_AUTHORIZED && b->hasSession("dev1"));
+    b->closed(bo->p);
+    bo = newCli();
+    check("an anonymous client does not get it", connect(bo, "dev1", false) == mqtt.CONNACK_NOT_AUTHORIZED);
+    b->closed(bo->p);
+    al = newCli();
+    check("alice comes back: session present, her message is there", connectWith(al, "dev1", false, 60, "alice", "a", null, null, 0, false) == 0 && al->sp && isPub(al, "alice/private/secret", "alice-only-data", 1, false));
+    bo = newCli();
+    check("a user cannot take over a connected session either (CONNACK 5, alice stays connected)", connectWith(bo, "dev1", true, 60, "bob", "b", null, null, 0, false) == mqtt.CONNACK_NOT_AUTHORIZED && !al->p->wantClose);
+    b->closed(bo->p);
+    Cli* al2 = newCli();
+    check("alice herself can take over from another connection", connectWith(al2, "dev1", false, 60, "alice", "a", null, null, 0, false) == 0 && al->p->wantClose);
+    b->closed(al->p);
+    disconnect(al2);
+    b->closed(al2->p);
+    b->bindSessions = false;
+    bo = newCli();
+    check("with bindSessions off bob takes it over (the old behaviour of MQTT brokers)", connectWith(bo, "dev1", false, 60, "bob", "b", null, null, 0, false) == 0 && bo->sp);
+    disconnect(bo);
+    b->closed(bo->p);
+    b->bindSessions = true;
+
+    // ---- maxSessions: a user pushes out its own sessions first ---------------------------------------------------------------------------------------------------------------
+    freshBroker();
+    b->addUser("alice", "a");
+    b->addUser("bob", "b");
+    b->maxSessions = 3;
+    Cli* s1 = newCli();
+    connectWith(s1, "bob-1", false, 60, "bob", "b", null, null, 0, false);
+    disconnect(s1);
+    b->closed(s1->p);
+    advance(10);
+    for (int i = 0; i < 2; i++) {
+        char id[16];
+        format(&id[0], 16, "alice-%d", i, 0, 0, 0);
+        Cli* c = newCli();
+        connectWith(c, &id[0], false, 60, "alice", "a", null, null, 0, false);
+        disconnect(c);
+        b->closed(c->p);
+        advance(10);
+    }
+    check("three offline sessions (maxSessions 3): bob's is the oldest", b->sessionCount() == 3 && b->hasSession("bob-1"));
+    for (int i = 2; i < 6; i++) {
+        char id[16];
+        format(&id[0], 16, "alice-%d", i, 0, 0, 0);
+        Cli* c = newCli();
+        check("alice makes another session", connectWith(c, &id[0], false, 60, "alice", "a", null, null, 0, false) == 0);
+        disconnect(c);
+        b->closed(c->p);
+        advance(10);
+    }
+    check("alice pushed out only her own sessions: bob's is still there", b->hasSession("bob-1") && b->sessionCount() == 3 && !b->hasSession("alice-0") && !b->hasSession("alice-1") && b->hasSession("alice-5"));
+    Cli* c3 = newCli();
+    connectWith(c3, "carol", false, 60, null, null, null, null, 0, false);
+    disconnect(c3);
+    b->closed(c3->p);
+    check("a user that has no session of its own pushes out the oldest of all", b->sessionCount() == 3 && b->hasSession("carol"));
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
