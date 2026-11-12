@@ -143,7 +143,7 @@ print(patch);  strx.freeText(patch);  d.dispose();
 ```
 
 `d.distance()` is the number of deleted plus inserted lines; `opCount() opKind(i) opA(i) opB(i) opLen(i)` give the script as runs (equal / delete / insert).
-The unified text is what `diff -u` prints (no timestamps), including `\ No newline at end of file`; it was checked against GNU `diff` and `patch` (see [tests](#tests)).
+The unified text is what `diff -u` prints (no timestamps; line breaks in the names are written as spaces, so a name cannot forge lines), including `\ No newline at end of file`; it was checked against GNU `diff` and `patch` (see [tests](#tests)).
 
 ### Suffix array and palindromes
 
