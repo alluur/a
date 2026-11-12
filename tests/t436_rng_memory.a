@@ -1,0 +1,93 @@
+// rng: dispose() frees everything (asys.memInUse before and after), sample / alias / reservoir / generators do not leak, edge cases of the classes
+import cstdio;
+import cstring;
+import asys;
+import rng;
+
+int fails = 0;
+int checks = 0;
+void check(bool cond, char* what) {
+    checks++;
+    if (!cond) { printf("FAIL: %s\n", what); fails++; }
+}
+
+int main() {
+    rng.Xoshiro256 g(77);
+    rng.system()->nextU64();                       // creates the shared generator: counted in the baseline
+    int base = asys.memInUse();
+
+    // generators with memory: Mt19937 and ChaCha20Rng
+    for (int round = 0; round < 20; round++) {
+        rng.Mt19937 m(round);
+        m.nextU32();
+        m.seedPython(round * 1000);
+        m.nextDouble();
+        m.dispose();
+        rng.ChaCha20Rng c;
+        c.nextU64();
+        char key[32];
+        memset(&key[0], round, 32);
+        c.seedBytes(&key[0]);
+        for (int i = 0; i < 300; i++) { c.nextU64(); }
+        c.dispose();
+    }
+    check(asys.memInUse() == base, "Mt19937 and ChaCha20Rng: nothing left after dispose");
+    rng.Mt19937 again(5);
+    uint64 a1 = again.nextU32();
+    again.dispose();
+    uint64 a2 = again.nextU32();                    // after dispose it reseeds with 5489
+    again.dispose();
+    check(a1 != a2 && a2 == 3499211612, "Mt19937 reseeds with 5489 after dispose");
+
+    // sampling and shuffling allocate temporarily
+    int out[600];
+    for (int round = 0; round < 100; round++) {
+        g.sample(1000000, 500, &out[0]);
+        g.sample(50, 40, &out[0]);
+        g.sampleSorted(100000, 100, &out[0]);
+    }
+    check(asys.memInUse() == base, "sample and sampleSorted free their tables");
+    int w[4] = { 1, 2, 3, 4 };
+    for (int i = 0; i < 1000; i++) { g.weighted(&w[0], 4); }
+    char id[40];
+    for (int i = 0; i < 100; i++) { g.uuid4(&id[0]); }
+    check(asys.memInUse() == base, "weighted and uuid4 use no heap memory");
+
+    // alias tables and reservoirs: built and thrown away many times
+    double dw[40];
+    for (int i = 0; i < 40; i++) { dw[i] = (double) (i + 1); }
+    for (int round = 0; round < 50; round++) {
+        rng.AliasTable t(&dw[0], 40);
+        t.sample(&g);
+        t.buildInts(&w[0], 4);
+        t.build(&dw[0], 20);
+        t.dispose();
+        rng.ReservoirSampler r(100);
+        for (int i = 0; i < 300; i++) { r.offer(&g, i); }
+        r.dispose();
+    }
+    check(asys.memInUse() == base, "AliasTable and ReservoirSampler: nothing left after dispose");
+    // a table that was refused leaves nothing either
+    double bad[3] = { 1.0, -2.0, 3.0 };
+    for (int i = 0; i < 20; i++) { rng.AliasTable t(&bad[0], 3); t.dispose(); }
+    double zero[3] = { 0.0, 0.0, 0.0 };
+    for (int i = 0; i < 20; i++) { rng.AliasTable t(&zero[0], 3); t.dispose(); }
+    check(asys.memInUse() == base, "refused alias tables leave nothing");
+    // rebuilding replaces the old table without a leak
+    rng.AliasTable t(&dw[0], 40);
+    int mid = asys.memInUse();
+    for (int i = 0; i < 100; i++) { t.build(&dw[0], 40); }
+    check(asys.memInUse() == mid, "build() on a used table frees the old one");
+    t.dispose();
+    check(asys.memInUse() == base, "back to the baseline");
+
+    // the same stack object used again after dispose
+    rng.ReservoirSampler r(3);
+    r.offer(&g, 1);
+    r.dispose();
+    r.offer(&g, 2);
+    check(r.size() == 0 && !r.ok(), "a disposed reservoir ignores offers");
+    check(asys.memBadFrees() == 0, "no bad free");
+    printf("memory: %d checks, %d failures\n", checks, fails);
+    return fails;
+}
