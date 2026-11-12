@@ -1,0 +1,175 @@
+// wshub: rooms (join, leave, publish, except the sender), limits of rooms, rooms disappear with their last member, clients leave their rooms when they close
+import wshub;
+import websocket;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+wshub.Hub* hub;
+
+// commands: "join NAME", "leave NAME", "pub NAME text", "size NAME", "bin NAME" (publishes 3 binary bytes)
+int onMessage(wshub.Hub* h, wshub.Client* c, char* data, int n, int isText) {
+    char* t = alloc(n + 1);
+    memcpy(t, data, n);
+    char reply[100];
+    reply[0] = 0;
+    if (startsWith(t, "join ")) {
+        format(&reply[0], 100, "join %s", h->join(c, &t[5]) ? "ok" : "refused");
+    } else if (startsWith(t, "leave ")) {
+        format(&reply[0], 100, "leave %s", h->leave(c, &t[6]) ? "ok" : "not a member");
+    } else if (startsWith(t, "pub ")) {
+        int sp = indexOf(&t[4], ' ');
+        t[4 + sp] = 0;
+        format(&reply[0], 100, "sent to %d", h->publish(&t[4], &t[5 + sp], strlen(&t[5 + sp]), true, c->id));
+    } else if (startsWith(t, "size ")) {
+        format(&reply[0], 100, "size %d", h->roomSize(&t[5]));
+    } else if (startsWith(t, "bin ")) {
+        format(&reply[0], 100, "sent to %d", h->publish(&t[4], "\x01\x00\x02", 3, false, 0));
+    }
+    if (reply[0] != 0) h->sendText(c, &reply[0]);
+    return 0;
+}
+
+int hook() {
+    hub->poll(0);
+    return 0;
+}
+
+// sends a command and returns the reply
+char* ask(websocket.WebSocket* w, char* cmd) {
+    w->sendText(cmd);
+    websocket.Message* m = w->receiveMessage();
+    if (m == null) return "(closed)";
+    char* r = strdup(m->data);
+    m->dispose();
+    return r;
+}
+
+// the next text message or "(none)"
+char* next(websocket.WebSocket* w) {
+    websocket.Message* m = w->waitMessage(40);
+    if (m == null) return "(none)";
+    char* r = strdup(m->data);
+    m->dispose();
+    return r;
+}
+
+int main() {
+    hub = new wshub.Hub();
+    hub->onMessage = onMessage;
+    hub->listen(0);
+    net.setIdleHook(hook);
+    char* u = alloc(100);
+    format(u, 100, "ws://127.0.0.1:%d/", hub->port);
+    websocket.WebSocket* a = websocket.connect(u);
+    websocket.WebSocket* b = websocket.connect(u);
+    websocket.WebSocket* c = websocket.connect(u);
+
+    check("a joins", streq(ask(a, "join red"), "join ok"));
+    check("b joins", streq(ask(b, "join red"), "join ok"));
+    check("c joins another room", streq(ask(c, "join blue"), "join ok"));
+    check("joining twice is fine", streq(ask(a, "join red"), "join ok") && hub->roomSize("red") == 2);
+    check("size", streq(ask(c, "size red"), "size 2") && streq(ask(c, "size blue"), "size 1") && streq(ask(c, "size green"), "size 0"));
+    check("two rooms exist", hub->roomCount() == 2);
+
+    // publish: everybody in the room except the sender
+    check("a publishes to red: one receiver (b)", streq(ask(a, "pub red hello red"), "sent to 1"));
+    check("b got it", streq(next(b), "hello red"));
+    check("a did not get its own message, c is in another room", streq(next(a), "(none)") && streq(next(c), "(none)"));
+    check("a client that is not a member may publish too", streq(ask(c, "pub red from outside"), "sent to 2"));
+    check("both members got it", streq(next(a), "from outside") && streq(next(b), "from outside"));
+    check("publish to a room that does not exist", streq(ask(a, "pub nowhere x"), "sent to 0"));
+
+    // binary
+    websocket.Message* m;
+    a->sendText("bin red");
+    m = a->receiveMessage();
+    check("a received the binary message (it is queued before the reply)", m != null && m->opcode == 2 && m->length == 3 && m->data[1] == 0 && m->data[2] == 2);
+    m->dispose();
+    m = a->receiveMessage();
+    check("binary publish goes to all members, the sender too: 2", m != null && streq(m->data, "sent to 2"));
+    m->dispose();
+    m = b->waitMessage(40);
+    check("b too", m != null && m->opcode == 2 && m->length == 3);
+    m->dispose();
+
+    // leave
+    check("a leaves red", streq(ask(a, "leave red"), "leave ok") && hub->roomSize("red") == 1);
+    check("leaving a room again", streq(ask(a, "leave red"), "leave not a member"));
+    check("a no longer gets red", streq(ask(b, "pub red only me"), "sent to 0"));
+    check("the last member leaves: the room is gone", streq(ask(b, "leave red"), "leave ok") && hub->roomCount() == 1 && hub->roomSize("red") == 0);
+
+    // limits
+    check("a room name of 64 bytes is refused", !hub->join(hub->find(1), "0123456789012345678901234567890123456789012345678901234567890123"));
+    check("a room name of 63 bytes is fine", hub->join(hub->find(1), "012345678901234567890123456789012345678901234567890123456789012"));
+    check("the empty name is refused", !hub->join(hub->find(1), ""));
+    hub->leave(hub->find(1), "012345678901234567890123456789012345678901234567890123456789012");
+    bool all = true;
+    for (int i = 0; i < 8; i++) {
+        char name[20];
+        format(&name[0], 20, "room%d", i);
+        if (!hub->join(hub->find(1), &name[0])) all = false;
+    }
+    check("a client may be in 8 rooms", all);
+    check("... not in a ninth", !hub->join(hub->find(1), "room8") && hub->roomSize("room8") == 0);
+    check("an unknown client cannot join", !hub->join(null, "x") && !hub->joinId(999, "x"));
+    check("joinId and leaveId", hub->leaveId(1, "room0") && hub->joinId(1, "room0"));
+
+    // a client that closes leaves all its rooms
+    int before = hub->roomCount();
+    a->closeWith(1000, null);
+    for (int i = 0; i < 10; i++) hub->poll(0);
+    check("a closed: its rooms are gone", hub->roomCount() == before - 8 && hub->roomSize("room3") == 0);
+    a->dispose();
+
+    // the room limit
+    hub->maxRooms = 3;
+    bool refused = false;
+    int made = 0;
+    for (int i = 0; i < 6; i++) {
+        char name[20];
+        format(&name[0], 20, "limit%d", i);
+        if (hub->join(hub->find(2), &name[0])) made++; else refused = true;
+    }
+    check("maxRooms limits the number of rooms", refused && hub->roomCount() <= 3);
+
+    // many clients in one room
+    hub->maxRooms = 1000;
+    b->closeWith(1000, null);
+    c->closeWith(1000, null);
+    for (int i = 0; i < 10; i++) hub->poll(0);
+    b->dispose();
+    c->dispose();
+    websocket.WebSocket* many[30];
+    for (int i = 0; i < 30; i++) {
+        many[i] = websocket.connect(u);
+        hub->joinId(0, "x");
+    }
+    int ids[40];
+    int n = hub->clientIds(&ids[0], 40);
+    for (int i = 0; i < n; i++) hub->joinId(ids[i], "everyone");
+    check("30 clients are in the room", n == 30 && hub->roomSize("everyone") == 30);
+    check("publish reaches all 30", hub->publishText("everyone", "news", 0) == 30);
+    int got = 0;
+    for (int i = 0; i < 30; i++) if (streq(next(many[i]), "news")) got++;
+    check("all 30 received it", got == 30);
+    check("except one client", hub->publishText("everyone", "again", ids[7]) == 29);
+    for (int i = 0; i < 30; i++) next(many[i]);
+    for (int i = 0; i < 30; i++) { many[i]->closeWith(1000, null); }
+    for (int i = 0; i < 20; i++) hub->poll(0);
+    check("all gone, no rooms left", hub->count() == 0 && hub->roomCount() == 0);
+    for (int i = 0; i < 30; i++) many[i]->dispose();
+    net.setIdleHook(null);
+    hub->shutdown(100);
+    printf("failures: %d\n", fails);
+    return fails;
+}
