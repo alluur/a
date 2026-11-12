@@ -81,6 +81,8 @@ Everything a client can say about itself goes into `websocket.Options` for `webs
 | `maxMessage`, `maxFrame` | largest message and frame you accept, default 16 MiB each |
 | `connectTimeoutMs`, `handshakeTimeoutMs` | 5000 and 10000 ms |
 
+Make the object with `new websocket.Options()` or `websocket.Options o();`: the constructor sets these defaults. A zeroed `websocket.Options o;` (no parentheses) has `verify` false, so a `wss://` connection would not check the certificate, and every limit and time out is 0: the connect then fails with `the handshake took too long`. `ServerOptions` and `wshub.Hub` work the same way.
+
 ### Text and binary messages
 
 A message is **text** (it must be UTF-8) or **binary** (anything). The module checks text on the way in and on the way out. A
@@ -121,13 +123,13 @@ side answers with its own close frame, and then the TCP connection is closed. Co
 | 3000 to 3999 | | for libraries and frameworks |
 | 4000 to 4999 | | **yours**: use them for application meanings such as "kicked" |
 
-`closeWith(code, reason)` accepts 1000 to 1003, 1007 to 1014 and 3000 to 4999 and returns `false` for anything else.
+`closeWith(code, reason)` accepts 1000 to 1003, 1007 to 1014 and 3000 to 4999 and returns `false` for anything else, except that the code 0 or 1005 sends a close frame without a code.
 
 {{sample web/ws_close}}
 
 **What to notice.**
 
-* The side that starts the close sees the **answer**: the client's `closeReason` is empty because an answer carries only the code. The
+* The side that starts the close sees the **answer**: the client's `closeReason` is empty because the library answers a close frame with the same code and no reason. The
   server, which received the first frame, has both the code and the reason (`"all done"`).
 * When the server closes, the client's `receiveMessage` returns `null`; `closeCode` and `closeReason` say why. A program that reads
   until `null` needs nothing else.
@@ -174,7 +176,9 @@ frame with FIN clear says "more follows"; control frames such as pings may be se
 * `setFragmentSize(4)` cuts every message into frames of at most 4 bytes (the sample uses 4 to keep the output short).
 * The receiver of a fragmented message gets **one** message with `takeMessage` (the pieces are joined).
 * `setStreamHandler(f)` hands you each piece (`flags`: 1 first, 2 last, 0 in between) and collects nothing: `takeMessage` returns
-  `null`. The last piece may be empty, as here. Use it for messages that are bigger than you want to hold.
+  `null`. The end of a message is always announced by an **empty** last piece with the flag 2, as here, so a piece that is flagged "last" never
+  carries data. A message that is empty, or was compressed (it is inflated in memory first), arrives as one piece with the flags 3 (first and last). Use the
+  handler for messages that are bigger than you want to hold.
 * With compression switched on (next section) the pieces are collected and sent compressed by `endMessage`.
 * Limits: `maxMessage` and `maxFrame` are 16 MiB by default; a message is built in a buffer that grows with the data. `maxOutBuffer` limits
   the bytes queued for sending; a send that would pass it returns `false` and sets `overflowed`.
@@ -248,11 +252,13 @@ if you give its id. `broadcast` goes to everybody.
 
 **What to notice.**
 
-* `onMessage` copies `data` with `strdup`, because the pointer is only valid during the call.
+* `onMessage` copies `data` into a buffer of its own (a bounded copy: the sender is a stranger), because the pointer is only valid during the call. Do not
+  copy with `strdup` or `alloc` on every message in a server that runs for days: they never give memory back. `c->user` here points into the client
+  (`&c->path[1]`), which is why nothing has to be allocated or freed per client.
 * `join` creates a room when its first member arrives; a room disappears with its last member; a client leaves its rooms when it closes
   (the last line: bob left, so red and blue each have one member). A client may be in 8 rooms, a name has at most 63 bytes, a hub has
-  at most 1000 rooms by default.
-* `publish` skipped the sender (`c->id`). `broadcastText` reached every client in every room.
+  at most 1000 rooms (`maxRooms` can only lower that).
+* `publish` skipped the sender (`c->id`). `broadcastText` reached every WebSocket and event stream client, in a room or not.
 * `hub->listen(port)` listens on **every** network interface; `hub->listenOn("127.0.0.1", port, null)` only on this machine. The samples
   use the second form.
 * The clients wait with `receiveMessage()` for messages that must come. A message that must **not** come can only be checked by waiting
@@ -303,7 +309,7 @@ The defaults of a hub are made for a trusted network. Change them for anything t
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `maxClients` | 1000 (also the highest value) | all connections; more get `503 Service Unavailable` |
+| `maxClients` | 1000 (also the highest value) | all connections; more get `503 Service Unavailable`. Set it **before** `listen`: the hub sizes its tables then, so a larger value set later is ignored (a smaller one works) |
 | `maxMessage` | 1 MiB | largest WebSocket message, else close code 1009 |
 | `maxQueued` | 1 MiB | bytes waiting for **one** client that reads slowly; over it the client is cut off (1008, `stats->evicted`) |
 | `maxBody`, `maxHead` | 1 MiB, 16 KiB | HTTP request limits (413, 431) |
@@ -342,7 +348,8 @@ with a colon is a comment that keeps the connection alive.
 **What to notice.**
 
 * `sse.eventText(event, data, id, retryMs)` builds the text of one event. It returns `null` if the event name or the id contains a line
-  break: otherwise a client's text could add fields (stream injection).
+  break: otherwise a client's text could add fields (stream injection). The text is a heap string (`commentText` too): free it with `free` when you
+  are done, unless the program is short.
 * The parser takes bytes in **any** pieces (here 5 at a time) and understands LF, CR and CRLF as line ends. A comment gives nothing;
   `event: nodata` followed by an empty line gives nothing either, because an event is only dispatched when it has data.
 * An event without a name has the type `message`. The `id` **persists**: the second event has no `id:` line and still reports `1`.
@@ -412,7 +419,7 @@ that have a history, and `httpx` follows them.
 
 **What to notice.**
 
-* **301 and 302** turn a `POST` into a `GET` without a body, **303** always does, **307 and 308** keep the method and the body (the 7 bytes
+* **301 and 302** turn a `POST` into a `GET` without a body, **303** always does (only a `HEAD` stays a `HEAD`), **307 and 308** keep the method and the body (the 7 bytes
   of JSON arrived again). Relative, absolute and `//host` locations, and dot segments, are resolved.
 * `maxRedirects` is 10 by default. `0` switches following off: you get the 302 itself with its `Location`. A loop ends with the
   error `too many redirects`.
@@ -448,8 +455,8 @@ Networks fail, and some failures are worth another try. With `retries` set, the 
 
 **What to notice.**
 
-* Without retries the first answer is the answer: the `503` came back. With three retries the client tried three times and got the 200.
-  The `Retry-After: 0` of the server made the pauses zero.
+* Without retries the first answer is the answer: the `503` came back. With `retries = 3` the client may try three more times; it needed two
+  (three attempts in all, the counter says 3) and got the 200. The `Retry-After: 0` of the server made the pauses zero. `retryBackoffMs` is 200 by default.
 * Time limits are separate, all in milliseconds: `connectTimeoutMs` (5000), `sendTimeoutMs` (15000), `headerTimeoutMs` (15000),
   `bodyTimeoutMs` (15000, for each piece of the body) and `totalTimeoutMs` (0 = none, the whole request with its redirects).
   A server that says nothing ends with `timed out waiting for the answer`.
@@ -516,7 +523,8 @@ side is `getRange`, conditional headers, `downloadTo` and `decompress`.
   `-1` on failure.
 * `c->decompress = true` asks for gzip and unpacks the answer; the reply says 59 bytes where 35 travelled. A body that does not unpack is
   an **error**, not the raw bytes, and `maxBody` (64 MiB) holds for the unpacked size too, so that a compressed bomb is refused
-  (`docs/NET.md`; this part was not run for the chapter). `stream(url, callback, user)` hands a body to a function in pieces; it is not in a sample.
+  (`docs/NET.md`; not in a sample, but a throw-away program checked it: 3 MB of `a` in a gzip body with `maxBody = 100000` gave no reply and the
+  error `the answer body is too big`, and a body that said `gzip` but was not gave `the answer body is damaged (it does not unpack)`). `stream(url, callback, user)` hands a body to a function in pieces; it is not in a sample.
 
 ## JSON-RPC 2.0
 
@@ -541,7 +549,8 @@ the answer as text (or `null` when no answer is due). It has no transport, so it
 * A notification (no `id`) ran the handler (`logged` is 1) and produced no answer. A batch gives an array of answers; the notification
   in it has none, the invalid entry (`42`) has an Invalid Request with `id` `null`, and a batch of notifications alone has no answer at all.
 * The checks of the specification are there: an empty batch, an `id` that is an object, text that is not JSON (-32700). `id`s may be
-  strings, numbers or `null`. Limits: 100 requests per batch, 1 MiB per message, 200 levels of nesting. A text that is not UTF-8, or has a
+  strings, numbers or `null`. Limits: 100 requests per batch (a bigger one gets one Invalid Request), 1 MiB per message, 200 levels of nesting, and 64 methods in
+  one dispatcher (`add` returns `false` for the 65th, for a name that starts with `rpc.`, and for a name that is already there). A text that is not UTF-8, or has a
   NUL byte or a `\u0000`, is a parse error.
 
 ### Three transports
@@ -558,6 +567,9 @@ The same dispatcher serves three transports:
 
 **What to notice.**
 
+* `serveStream(d, connection, framing, limit)` reads and answers messages until the connection ends, or until `limit` messages were answered (0: no limit). The sample
+  passes 1 and calls it whenever the socket is readable, so that the one thread can serve other things in between; the call waits for the rest of a message that has begun
+  to arrive, so a hook should only call it when whole messages come.
 * The function `exercise` is the same for all three, and so is its output. A client has `call(method, params)`, `notify(method, params)`
   and `batch()`; the calls look alike whatever carries them.
 * `call` returns the result (free it with `dispose()`), or `null`. Then either `c->errCode`, `c->errMessage` and `c->errData` describe an

@@ -43,7 +43,7 @@ All containers hold ints. Texts and pointers fit in an int, and the maps, sets a
 
 ### Sequences: `Deque`
 
-A **deque** (say "deck") is a queue that you can fill and empty at both ends. `ds.Deque` keeps its elements in a ring that grows when it is full, so `pushBack`, `pushFront`, `popBack` and `popFront` take constant time.
+A **deque** (say "deck") is a queue that you can fill and empty at both ends. `ds.Deque` keeps its elements in a ring that grows when it is full, so `pushBack`, `pushFront`, `popBack` and `popFront` take constant time (amortized: a full ring doubles its storage, which costs one copy now and then).
 
 {{sample algo/deque_basics}}
 
@@ -103,7 +103,7 @@ What to notice:
 
 * `floorKey(x)` is the largest key `<= x`, `lowerKey(x)` the largest `< x`, `ceilKey(x)` the smallest `>= x`, `higherKey(x)` the smallest `> x`. Each takes a fallback for "none" (`higherKey(500, -1)`). The `...Node` versions return a node number, -1 for none.
 * `rank(key)` is how many keys are smaller (the key need not be there), `select(i)` the node of the i-th smallest, `countRange(lo, hi)` how many keys lie in `lo .. hi`, **both ends included**.
-* A **node number** stays valid until that key is removed, whatever else is inserted or removed. `keyAt`, `valueAt` and `setValueAt` use it, and `firstNode()` with `nextNode(t)` walk the map in order.
+* A **node number** stays valid until that key is removed, whatever else is inserted or removed. `keyAt`, `valueAt` and `setValueAt` use it, and `firstNode()` with `nextNode(t)` walk the map in order. Each `nextNode` is a search of O(log n), so a walk over the whole map costs O(n log n); to visit many entries use `forEachRange`, `range` or `toArrays`.
 * `forEachRange(lo, hi, callback, ctx)` calls `int callback(int key, int value, int ctx)` for every entry in the range, in order; a non-zero result stops the walk and is returned. The callback must not insert or remove entries. `range(lo, hi, keys, values, max)` and `toArrays` copy into arrays instead.
 * `put` returns 1 for a new key and 0 when it replaced a value. `ds.OrderedMap reverse(ds.cmpDesc);` orders the keys with a comparator. `OrderedSet` is the same with keys only, and `foreach` works on it.
 
@@ -143,10 +143,10 @@ A **trie** is a tree with one edge per byte of the key. Searching for a prefix c
 
 What to notice:
 
-* `countPrefix("car")` counts the keys that begin with `car` (the key `car` itself included). `walkPrefix(prefix, callback, ctx)` calls `int callback(char* key, int value, int ctx)` in byte order; the key text is only valid during the call.
+* `countPrefix("car")` counts the keys that begin with `car` (the key `car` itself included). `walkPrefix(prefix, callback, ctx)` calls `int callback(char* key, int value, int ctx)` in byte order; the key text is only valid during the call, and the callback must not change the trie.
 * `collect(prefix, out, max)` **copies** the keys: free them with `ds.freeTexts(out, n)`.
 * In a wildcard pattern `?` is exactly one byte and `*` is any run of bytes, also none; `\` takes the next byte literally. A pattern may have at most 62 items besides stars: `countWildcard` returns -1 for a longer one.
-* `longestPrefixOf(text, &value)` returns the length of the longest stored key that begins `text`, or -1; that is how a router picks `/api/users` over `/api`.
+* `longestPrefixOf(text, &value)` is the other way round: it returns the length of the longest stored key that is a beginning of `text` (or -1 when there is none) and puts that key's value into `value`. In the sample `/api/users/42` gives the key `/api/users` (length 10), not `/api`: that is how a router picks the most specific route. `countPrefix` and `walkPrefix` look for the keys that begin with the prefix; `longestPrefixOf` looks for the keys that the text begins with.
 
 ### Union-find: `DisjointSet`
 
@@ -249,7 +249,7 @@ What to notice:
 | `BinaryHeap` | `push`, `pop`, `update`, `remove` | O(log n) | `peek`: O(1); equal keys in no order |
 | `OrderedMap`, `OrderedSet` | everything | O(log n) | `range`: O(log n + count); no allocation per node |
 | `HashMap`, `TextHashMap` | `put`, `get`, `remove` | O(1) on average | iteration in insertion order; the table is never more than half full |
-| `Trie` | `put`, `get`, `countPrefix` | O(key length) | wildcard search: one step per trie node that can still match |
+| `Trie` | `put`, `get`, `countPrefix` | O(key length) steps | the children of a node are a sorted list, so a step may scan up to 255 siblings; wildcard search: one step per trie node that can still match |
 | `DisjointSet` | `find`, `unite` | nearly O(1) | |
 | `BitSet` | `set`, `get` | O(1) | `count` and set operations: O(size / 64) |
 | `Fenwick` | `add`, `prefix`, `sum`, `lowerBound` | O(log n) | `build`: O(n) |
@@ -274,7 +274,7 @@ What to notice:
 
 * `find(text, n, from)` gives the index of the first match at or after `from`, or -1. `findAll(text, n, out, max, overlap)` stores up to `max` positions and returns the **total** number of matches. `count(text, n, overlap)` only counts. Overlapping matches are counted unless you pass `overlap = false` (`"aa"` in `"aaaaa"`: 4, or 2).
 * An **empty pattern** matches at every position `0 .. n`.
-* `strx.indexOf`, `countOf` and `findAll` need no setup. They use Horspool with a table on the stack and switch to KMP when the text turns out to be nasty, so they stay linear.
+* `strx.indexOf`, `countOf` and `findAll` need no setup, and all three stay linear. `indexOf` uses Horspool with a table on the stack and switches to KMP when the text turns out to be nasty; `countOf` and `findAll` use KMP from the start.
 * `prefixFunction` (the KMP failure table), `zFunction` (the Z array; `z[0]` is the length) and `period` (the smallest period of a text) are the tools the searches are built from.
 * `Kmp` is always linear. `Horspool` is usually faster than that but takes O(n * m) when almost every window matches, and `RabinKarp` has to verify every hit, so it does too: see [Limits and traps](#limits-and-traps).
 
@@ -301,10 +301,10 @@ The **edit distance** between two texts is the smallest number of changes that t
 What to notice:
 
 * `levenshtein` counts insertions, deletions and replacements of one letter. `osa` and `damerau` also count swapping two neighbours as one change. `ca` to `abc` shows the difference: the optimal string alignment (`osa`) allows no edit inside a swapped pair (3), the true Damerau-Levenshtein distance finds 2.
-* `levenshteinMax(a, na, b, nb, k)` stops early and returns `k + 1` when the distance is larger than `k`. It needs O(k * n) time, so comparing two megabyte texts with a few differences is instant.
+* `levenshteinMax(a, na, b, nb, k)` stops early and returns `k + 1` when the distance is larger than `k`. It needs O(k * n) time: two texts of one megabyte with three differences and `k = 5` took about 0.14 seconds (measured natively on x86-64, one run).
 * `hamming` counts the positions that differ and returns -1 for texts of different lengths; `hammingBits` counts differing bits. `levenshteinSimilarity` is a number from 0.0 to 1.0.
 * The last argument `utf8 = true` compares whole characters: `café` is 5 bytes and 4 characters, so the distance to `cafe` is 2 by bytes and 1 by characters.
-* Memory: `levenshtein` needs only O(min(na, nb)) memory and `osa` linear memory; `damerau` needs the whole table and returns -1 above 2^23 cells.
+* Memory: `levenshtein`, `levenshteinMax` and `osa` never build the whole table (they keep two or three rows of the shorter text), but every text is first turned into an array of ints, so they need about 8 bytes per input byte (two texts of one megabyte: about 16 MB). `damerau` needs the whole table of (na + 2) * (nb + 2) cells and returns -1 above 2^23 cells (about 2900 by 2900 letters).
 
 ### Similarity and fuzzy suggestions
 
@@ -397,7 +397,7 @@ What to notice:
 | the same, usually faster | `strx.Horspool` | usually sub-linear, O(n * m) at worst |
 | many patterns at once | `strx.AhoCorasick` | linear in the text plus the matches; about 48 bytes per trie node |
 | many questions about one text | `strx.SuffixArray` | build O(n), about 24 bytes per byte; `count` and `find` O(m log n) |
-| typo tolerance | `levenshtein`, `levenshteinMax`, `jaroWinkler` | O(na * nb) time and O(min) memory; with a limit `k`: O(k * n) |
+| typo tolerance | `levenshtein`, `levenshteinMax`, `jaroWinkler` | O(na * nb) time, memory linear in na + nb (no table); with a limit `k`: O(k * n) time |
 | what two texts share | `lcs`, `longestCommonSubstring` | O(na * nb) with linear memory; O(na + nb) for the substring |
 | what changed between two files | `strx.LineDiff` | O((N + M) D) time, linear memory (D = changed lines) |
 | palindromes | `longestPalindrome`, `manacher` | O(n) |
@@ -417,10 +417,10 @@ A **pseudo random generator** is a formula that turns a number (the **seed**) in
 | `Xoshiro256(seed)` | xoshiro256\*\*, period 2^256 - 1 | four outputs of `SplitMix64(seed)`, or `setState(a, b, c, d)` | the default choice: fast and good; `jump()` skips 2^128 numbers, `longJump()` 2^192 |
 | `Pcg32(seed, stream)` | PCG XSH RR 64/32 | `Pcg32(42, 54)` is the default | native 32 bit output with `nextU32()`; the stream makes independent sequences |
 | `Pcg64(seed, stream)` | PCG XSL RR 128/64 | `seed128(...)`, or `setState(...)` like NumPy's state | the same numbers as NumPy's `PCG64` in the same state |
-| `Mt19937(seed)` | Mersenne Twister | `init_genrand`, `seedArray`, or `seedPython(seed)` | `Mt19937` with `seedPython` gives **Python's `random.random()`** |
-| `ChaCha20Rng(key32)` | ChaCha20 with key erasure | a 32 byte key, `seedUint64`, or the system | **the only one for secrets** (2.6 M numbers per second) |
+| `Mt19937(seed)` | Mersenne Twister | `Mt19937(seed)` is `init_genrand`; `seedArray(key, n)` is `init_by_array`; `seedPython(seed)` | `Mt19937` with `seedPython` gives **Python's `random.random()`** |
+| `ChaCha20Rng(key32)` | ChaCha20 with key erasure | a 32 byte key, `seedUint64` (only 64 bits of entropy: for tests), or the system | **the only one for secrets** (2.6 M numbers per second) |
 
-The speeds are from the module documentation (native x86-64, not measured again). Every sequence is exact: the tests of the module compare them with independent implementations, and the next sample shows the documented first values.
+The speeds are from the module documentation (native x86-64, not measured again). Every sequence is exact: the tests of the module compare them with independent implementations, and the next sample shows the documented first values. `Mt19937` (a state of 624 words) and `ChaCha20Rng` (a key and a 1 KB buffer) allocate memory and have a `dispose()`; the other four generators are plain values with nothing to free.
 
 {{sample algo/rng_generators}}
 
@@ -463,7 +463,7 @@ Real data is rarely uniform. `rng` has the usual ones, with the algorithms of **
 
 What to notice:
 
-* Each row draws 2000 numbers from one `Pcg64`. The first three draws, the mean of all 2000 and the true mean are printed: the sample means are within a few percent of the true means, which is what a sample of this size gives. The numbers are the numbers that NumPy gives for the same state.
+* Each row draws 2000 numbers from one `Pcg64`. The first three draws, the mean of all 2000 and the true mean are printed: the sample means are within a few percent of the true means, which is what a sample of this size gives. The numbers are the numbers that NumPy gives for the same state (checked against NumPy 2.5.3 for this chapter). "The same state" matters: NumPy seeds `PCG64` through a `SeedSequence`, so `np.random.default_rng(42)` and `rng.Pcg64(42)` start at different places. To compare, copy the state that `getState(0)` to `getState(3)` returns (state high and low half, increment high and low half) into NumPy's `PCG64().state`.
 * The `...At` and `...Rate` forms are the plain ones shifted and scaled. `poisson`, `binomial` and `geometric` return whole numbers, which the sample converts to `double` to share one loop.
 * The bins show the bell curve. The three middle bins cover -1.5 to 1.5, which holds 86.6 percent of a normal distribution; the sample has 17,414 of 20,000 draws there, 87 percent.
 * **Speed**: integer generators run at tens of millions of numbers per second, but the distributions use soft float: `normal` and `exponential` about a million per second, `gamma` and `binomial(100, 0.1)` about a hundred thousand, `poisson(100)` twenty thousand (figures from the module documentation).
@@ -525,7 +525,8 @@ A checklist of what the three modules do **not** do, or do differently from what
 
 **Declaring and freeing**
 
-* `Class c;` without parentheses does not run the constructor. The classes made with a size or capacity (`RingBuffer`, `ByteRing`, `Fenwick`, `RangeFenwick`, `SegTree`, `LruCache`, `TextLruCache`, `BloomFilter`, `CountMinSketch`, and in `strx` `Kmp`, `Horspool`, `RabinKarp`, `SuffixArray`, `FuzzyMatcher`) must be declared with their arguments. A zeroed one has size 0: `push`, `put` and `add` return `false` and queries find nothing, but nothing crashes. **A default argument is not applied to a zeroed object**: a zeroed `LruCache` has capacity 0, not 16.
+* `Class c;` without parentheses does not run the constructor. The `ds` classes made with a size or capacity (`RingBuffer`, `ByteRing`, `Fenwick`, `RangeFenwick`, `SegTree`, `LruCache`, `TextLruCache`, `BloomFilter`, `CountMinSketch`) must be declared with their arguments. A zeroed one has size 0: `push`, `put` and `add` return `false` and queries find nothing, but nothing crashes. **A default argument is not applied to a zeroed object**: a zeroed `LruCache` has capacity 0, not 16.
+* The `strx` classes that are made from a pattern or a text (`Kmp`, `Horspool`, `RabinKarp`, `SuffixArray`, `FuzzyMatcher`) must be declared with their arguments as well, but a zeroed one is **not** "finds nothing": a zeroed `Kmp`, `Horspool` or `RabinKarp` is an empty pattern, which matches everywhere (`find` returns 0, `count("abc")` returns 4), and a zeroed `FuzzyMatcher` matches every text with score 0. A zeroed `SuffixArray` is an empty text. Nothing crashes, but the answers are not the ones you meant.
 * The module documentation lists `BitSet` among the zeroed classes that "grow on first use", but a zeroed `BitSet` has size 0 and **ignores `set(5)`**. Call `resize(n)` first, or declare `BitSet(n)`. (A zeroed `DisjointSet` does grow: `add()` creates elements.)
 * `strx.LineDiff d();` is a compile error because the class has no constructor. Declare it as `strx.LineDiff d;`.
 * `dispose()` is the only way to free. `new` objects are never freed.
