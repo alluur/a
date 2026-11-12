@@ -1,0 +1,244 @@
+// Memory of the MQTT modules: whatever a client or a broker does again and again over months must not use up memory. The heap position (what `new`,
+// alloc and strdup consume, which is never given back) must stay exactly where it is after a warm-up while clients connect, subscribe, publish with every
+// QoS, receive, disconnect and vanish; while persistent sessions are made, taken over and wiped; while retained messages, wills and subscriptions with
+// wildcards come and go in the topic tree; while a client reconnects after drops; while the parser reads garbage and while hostile connections
+// come and go. (TLS handshakes are not part of this: their big number arithmetic keeps about 20 KB each, see docs/NET.md.)
+import mqtt;
+import mqttd;
+import netio;
+import net;
+import bytebuf;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqttd.Server* srv;
+int PORT;
+char url[100];
+mqtt.Client* watcher;
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+void settle() {
+    for (int i = 0; i < 25; i++) {
+        srv->poll(0);
+        if (watcher != null) watcher->poll(0);
+    }
+}
+
+void drain(mqtt.Client* c) {
+    mqtt.Message* m = c->next();
+    while (m != null) { m->dispose(); m = c->next(); }
+}
+
+// ---- operations ------------------------------------------------------------------------------------------------------------------------------------
+void opConnectCycle() {
+    mqtt.Client* c = mqtt.connect(&url[0]);
+    c->subscribeWait("mem/a/#", 1, 2000);
+    c->publishWait("mem/a/x", "hello", 5, 0, false, 2000);
+    c->publishWait("mem/a/y", "hello", 5, 1, false, 2000);
+    c->publishWait("mem/a/z", "hello", 5, 2, false, 2000);
+    mqtt.Message* m = c->waitMessage(1000);
+    if (m != null) m->dispose();
+    drain(c);
+    c->unsubscribeWait("mem/a/#", 2000);
+    c->disconnect();
+    c->dispose();
+    settle();
+}
+
+void opManyMessages() {
+    mqtt.Client* c = mqtt.connect(&url[0]);
+    c->subscribeWait("mem/b/+", 2, 2000);
+    char big[3000];
+    memset(&big[0], 'q', 3000);
+    for (int i = 0; i < 30; i++) c->publish("mem/b/n", &big[0], 3000, i % 3, false);
+    c->flushAll(3000);
+    for (int i = 0; i < 20; i++) { c->poll(0); srv->poll(0); }
+    drain(c);
+    c->disconnect();
+    c->dispose();
+    settle();
+}
+
+void opPersistent() {
+    mqtt.Options o();
+    o.clientId = "mem-persist";
+    o.cleanSession = false;
+    mqtt.Client* c = mqtt.connectWith(&url[0], &o);
+    c->subscribeWait("mem/p/#", 1, 2000);
+    c->disconnect();
+    c->dispose();
+    mqtt.Client* x = mqtt.connect(&url[0]);
+    x->publishWait("mem/p/1", "queued", 6, 1, false, 2000);
+    x->publishWait("mem/p/2", "queued", 6, 2, false, 2000);
+    x->disconnect();
+    x->dispose();
+    mqtt.Client* c2 = mqtt.connectWith(&url[0], &o);
+    mqtt.Message* m = c2->waitMessage(1000);
+    if (m != null) m->dispose();
+    m = c2->waitMessage(1000);
+    if (m != null) m->dispose();
+    c2->disconnect();
+    c2->dispose();
+    // wipe it
+    mqtt.Options w();
+    w.clientId = "mem-persist";
+    mqtt.Client* c3 = mqtt.connectWith(&url[0], &w);
+    c3->disconnect();
+    c3->dispose();
+    settle();
+}
+
+void opTakeoverAndWill() {
+    mqtt.Options o();
+    o.clientId = "mem-will";
+    o.willTopic = "mem/will";
+    o.willPayload = "gone";
+    o.willQos = 1;
+    mqtt.Client* a = mqtt.connectWith(&url[0], &o);
+    mqtt.Client* b = mqtt.connectWith(&url[0], &o);                 // takes over: the will of a is sent
+    settle();
+    a->dispose();
+    b->disconnect();
+    b->dispose();
+    settle();
+}
+
+void opRetained() {
+    mqtt.Client* c = mqtt.connect(&url[0]);
+    for (int i = 0; i < 4; i++) {
+        char t[40];
+        format(&t[0], 40, "mem/r/%d/leaf", i, 0, 0, 0);
+        c->publishWait(&t[0], "kept", 4, 1, true, 2000);
+    }
+    c->subscribeWait("mem/r/#", 1, 2000);
+    drain(c);
+    for (int i = 0; i < 4; i++) {
+        char t[40];
+        format(&t[0], 40, "mem/r/%d/leaf", i, 0, 0, 0);
+        c->publishWait(&t[0], "", 0, 1, true, 2000);
+    }
+    c->disconnect();
+    c->dispose();
+    settle();
+}
+
+void opTree() {
+    mqtt.Client* c = mqtt.connect(&url[0]);
+    c->subscribeWait("t/+/b/#", 0, 2000);
+    c->subscribeWait("t/x/+", 1, 2000);
+    c->subscribeWait("+/+/+/+/deep", 0, 2000);
+    c->subscribeWait("$SYS/#", 0, 2000);
+    c->unsubscribeWait("t/x/+", 2000);
+    c->disconnect();                                  // the others go with the clean session
+    c->dispose();
+    settle();
+}
+
+void opReconnect() {
+    mqtt.Options o();
+    o.autoReconnect = true;
+    o.reconnectMinMs = 5;
+    o.reconnectMaxMs = 20;
+    mqtt.Client* c = mqtt.connectWith(&url[0], &o);
+    c->subscribeWait("mem/rc", 0, 2000);
+    c->publishText("mem/rc", "queued", 1, false);
+    srv->dropClients();
+    settle();
+    for (int i = 0; i < 100 && c->state != mqtt.ST_ONLINE; i++) { c->poll(5); srv->poll(0); }
+    c->flushAll(2000);
+    drain(c);
+    c->disconnect();
+    c->dispose();
+    settle();
+}
+
+void opParser() {
+    mqtt.Parser* p = mqtt.newParser(mqtt.MODE_SERVER, 5000);
+    mqtt.Packet k;
+    int n = 0;
+    char* a = bytebuf.fromHex("320c0003612f62000a68656c6c6f820e00010003612f62000003632f2302", &n);
+    for (int i = 0; i < n; i++) p->feed(&a[i], 1);
+    while (p->next(&k) == 1) { }
+    free(a);
+    char* g = bytebuf.fromHex("00ff", &n);
+    p->feed(g, n);
+    p->next(&k);
+    free(g);
+    p->dispose();
+    mqtt.Packet pk;
+    pk.reset();
+    pk.clientId = "m";
+    netio.Queue q;
+    mqtt.putConnect(&q, &pk);
+    mqtt.putPublish(&q, "a/b", "payload", 7, 2, true, false, 5);
+    q.release();
+}
+
+void opHostile() {
+    int h = net.connect("127.0.0.1", PORT);
+    char junk[200];
+    for (int i = 0; i < 200; i++) junk[i] = i * 37;
+    net.send(h, &junk[0], 200);
+    for (int i = 0; i < 10; i++) srv->poll(0);
+    net.close(h);
+    h = net.connect("127.0.0.1", PORT);
+    int n = 0;
+    char* c = bytebuf.fromHex("101000044d5154540402003c00046d6f7371", &n);
+    net.send(h, c, n);
+    free(c);
+    for (int i = 0; i < 10; i++) srv->poll(0);
+    net.close(h);                                      // vanishes without DISCONNECT
+    settle();
+}
+
+void run(char* name, func f) {
+    for (int i = 0; i < 4; i++) f();
+    settle();
+    int h0 = __heap_pos;
+    for (int i = 0; i < 10; i++) f();
+    settle();
+    char t[160];
+    format(&t[0], 160, "%s: 10 operations leave the heap where it was", name, 0, 0, 0);
+    bool ok = __heap_pos == h0;
+    check(&t[0], ok);
+    if (!ok) printf("     the heap grew by %d bytes\n", __heap_pos - h0);
+}
+
+int main() {
+    srv = mqttd.newServer();
+    srv->listenOn("127.0.0.1", 0, null);
+    srv->broker->sysIntervalMs = 0;
+    PORT = srv->port;
+    format(&url[0], 100, "mqtt://127.0.0.1:%d", PORT, 0, 0, 0);
+    net.setIdleHook(hook);
+    watcher = null;
+    run("connect, subscribe, publish (QoS 0, 1, 2), receive, unsubscribe", opConnectCycle);
+    run("30 messages of 3000 bytes with every QoS", opManyMessages);
+    run("persistent session: queue, resume, wipe", opPersistent);
+    run("takeover with a will", opTakeoverAndWill);
+    run("retained messages set and cleared", opRetained);
+    run("wildcard subscriptions in the topic tree", opTree);
+    run("reconnect after the broker dropped the client", opReconnect);
+    run("parser and packet writers", opParser);
+    run("garbage and abrupt connections", opHostile);
+    mqttd.Broker* b = srv->broker;
+    settle();
+    check("the broker is empty at the end", b->connected == 0 && b->sessionCount() == 0 && b->peerCount() == 0 && b->stats->liveMsgs == 0 && b->stats->liveItems == 0 && b->retainedCount() == 0 && b->subscriptionCount() == 0);
+    net.setIdleHook(null);
+    printf("failures: %d\n", fails);
+    srv->shutdown();
+    return fails;
+}
