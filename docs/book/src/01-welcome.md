@@ -90,9 +90,16 @@ Programs that need a window, a terminal or a network are shown with a screenshot
 
 ## What was tested
 
-* Every sample in this book was compiled with `ac` and its output was checked against the recorded output; every sample was also compiled for all eight targets.
-* The samples were run on Linux x86-64. The compiler's own regression suite (several hundred programs) runs on Linux x86-64, ARM64, RISC-V 64 and LoongArch64 under QEMU, and on Windows under Wine.
-* The compiler has **not** been tested on real Windows, Android, RISC-V or LoongArch hardware in the course of writing this book. Reports from real devices are welcome.
+This book has **551 code samples**. They are the reason you can trust the listings, so here is exactly what was done with them (the list of all samples is in [the code sample index](#chap-samples)):
+
+* **Every sample was compiled and run** on Linux x86-64, and its output was compared with the output recorded in the book.
+* **Every sample was compiled for all nine targets** of the compiler, Windows and Android included.
+* **The whole set was run again on three other processors**, under QEMU user-mode emulation: ARM64, RISC-V 64 and LoongArch64. Every program printed the same output as on x86-64. Five samples are left out of this comparison on purpose, because their job is to print the name of the processor they run on, so about 546 programs were compared on each processor. As a second check, 13 drawing samples were run on x86-64, ARM64 and RISC-V and produced **byte-identical PNG pictures**.
+* **Graphical samples** ran against the headless display server and were photographed there; **terminal samples** ran in a pseudo terminal and their screens were recorded. Samples that use the network talk to themselves over the loopback interface.
+* **The compiler itself** has a regression suite of several hundred programs that runs on Linux x86-64, ARM64, RISC-V 64 and LoongArch64 under QEMU, and on Windows under Wine. For this book a Windows program was started under Wine to show the output in [the compiler chapter](#chap-compiler); the samples were not run on Windows.
+* Every chapter was checked a second time by independent reviewers, who tested the claims in the text against the compiler and the library sources. Where a claim could not be tested, the chapter says so.
+
+What was **not** tested: real hardware of any kind (phones, RISC-V and LoongArch boards, Windows and Android devices), real terminals (xterm, the Linux console, tmux), a real framebuffer or VNC viewer, and servers on the real Internet. Programs that need those are shown as *compiled* only, and the text says so. Reports from real devices are welcome.
 
 ## About Aytict
 
