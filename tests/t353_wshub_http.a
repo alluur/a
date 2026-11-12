@@ -1,0 +1,331 @@
+// wshub HTTP side: /healthz, static files (types, HEAD, ranges, ETag, If-Modified-Since, traversal), a router with parameters and middleware,
+// the onHttp callback, keep-alive, pipelining, body limits, chunked and Expect: 100-continue request bodies
+import wshub;
+import httpx;
+import conn;
+import net;
+import asys;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+wshub.Hub* hub;
+
+int hook() {
+    hub->poll(0);
+    return 0;
+}
+
+// ---- a small HTTP client on a raw connection
+class Reply {
+    public int status;
+    public char head[2000];
+    public char* body;
+    public int bodyLen;
+    public bool closed;
+}
+
+// the value of a header of the reply (a heap string) or null
+char* hdr(Reply* r, char* name) {
+    char key[60];
+    format(&key[0], 60, "\r\n%s: ", name);
+    int at = find(&r->head[0], &key[0]);
+    if (at < 0) {
+        // the first header follows the status line directly
+        return null;
+    }
+    int s = at + strlen(&key[0]);
+    int e = s;
+    while (r->head[e] != 0 && r->head[e] != 13) e++;
+    return substr(&r->head[0], s, e - s);
+}
+
+// reads one answer; head requests have no body
+Reply* readReply(conn.Connection* c, bool headOnly) {
+    Reply* r = new Reply();
+    char line[300];
+    if (c->readLine(&line[0], 300) < 0) { r->closed = true; return r; }
+    r->status = atoi(&line[9]);
+    int hl = 0;
+    strcpy(&r->head[0], &line[0]);
+    hl = strlen(&line[0]);
+    int cl = -1;
+    for (;;) {
+        int n = c->readLine(&line[0], 300);
+        if (n < 0) { r->closed = true; return r; }
+        if (n == 0) break;
+        if (hl + n + 3 < 2000) {
+            r->head[hl] = 13; r->head[hl + 1] = 10;
+            memcpy(&r->head[hl + 2], &line[0], n);
+            hl = hl + n + 2;
+            r->head[hl] = 0;
+        }
+        if (startsWith(&line[0], "Content-Length: ")) cl = atoi(&line[16]);
+    }
+    if (r->status == 100) return r;
+    if (!headOnly && cl > 0) {
+        r->body = alloc(cl + 1);
+        r->bodyLen = c->readExact(r->body, cl);
+    }
+    return r;
+}
+
+Reply* request(int port, char* text, bool headOnly) {
+    conn.Connection* c = conn.open("127.0.0.1", port, 1000);
+    c->writeText(text);
+    c->flush();
+    Reply* r = readReply(c, headOnly);
+    c->close();
+    return r;
+}
+
+Reply* get(int port, char* path) {
+    char req[400];
+    format(&req[0], 400, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", path);
+    return request(port, &req[0], false);
+}
+
+// ---- the application
+int showUser(httpx.Context* x) {
+    char* id = x->req->param("id");
+    char t[100];
+    char q[40];
+    q[0] = 0;
+    x->req->queryValue("fmt", &q[0], 40);
+    format(&t[0], 100, "user %s%s%s", id, q[0] != 0 ? " fmt=" : "", &q[0]);
+    x->res->text(200, &t[0]);
+    return 0;
+}
+
+int echoBody(httpx.Context* x) {
+    x->res->bytes(201, "application/octet-stream", x->req->body, x->req->bodyLen);
+    return 0;
+}
+
+int fileOfRoute(httpx.Context* x) {
+    char t[200];
+    format(&t[0], 200, "file %s", x->req->param("*"));
+    x->res->text(200, &t[0]);
+    return 0;
+}
+
+int stamp(httpx.Context* x) {
+    x->next();
+    x->res->setHeader("X-Stamp", "mw1");
+    return 0;
+}
+
+int block(httpx.Context* x) {
+    if (x->req->header("X-Block") != null) {
+        x->res->text(403, "blocked");
+        return 0;
+    }
+    x->next();
+    return 0;
+}
+
+int onHttp(wshub.Hub* h, wshub.Client* c, httpx.Request* req, httpx.Response* res) {
+    if (streq(&req->path[0], "/custom")) {
+        res->text(200, "from the callback");
+        return 1;
+    }
+    return 0;
+}
+
+int main() {
+    // the files
+    makeDir("build/tests/www353");
+    makeDir("build/tests/www353/sub");
+    writeFile("build/tests/www353/index.html", "<h1>hello</h1>");
+    writeFile("build/tests/www353/sub/a.txt", "0123456789abcdefghij");
+    writeFile("build/tests/www353/a b.txt", "with a space");
+    writeFile("build/tests/www353/.hidden", "secret");
+    char* big = alloc(100001);
+    for (int i = 0; i < 100000; i++) big[i] = 'A' + (i % 26);
+    writeFile("build/tests/www353/big.txt", big);
+
+    hub = new wshub.Hub();
+    hub->onHttp = onHttp;
+    hub->staticDir = "build/tests/www353";
+    httpx.Router* router = new httpx.Router();
+    router->get("/users/:id", showUser);
+    router->post("/echo", echoBody);
+    router->get("/files/*", fileOfRoute);
+    router->use(stamp, null);
+    router->use(block, null);
+    hub->router = router;
+    hub->maxBody = 5000;
+    hub->listen(0);
+    net.setIdleHook(hook);
+    int port = hub->port;
+
+    // --- healthz
+    Reply* r = get(port, "/healthz");
+    check("/healthz: 200 JSON", r->status == 200 && contains(hdr(r, "Content-Type"), "application/json") && contains(r->body, "\"status\":\"ok\"") && contains(r->body, "\"clients\":1"));
+    check("... counted as a request", hub->stats->httpRequests == 1);
+
+    // --- the callback
+    r = get(port, "/custom");
+    check("the onHttp callback answers", r->status == 200 && streq(r->body, "from the callback"));
+
+    // --- the router
+    r = get(port, "/users/42");
+    check("route with a parameter", r->status == 200 && streq(r->body, "user 42"));
+    check("middleware runs after the chain", streq(hdr(r, "X-Stamp"), "mw1"));
+    r = get(port, "/users/a%20b?fmt=json%21");
+    check("percent decoded parameter and query value", streq(r->body, "user a b fmt=json!"));
+    r = get(port, "/files/docs/readme.txt");
+    check("a wildcard route", streq(r->body, "file docs/readme.txt"));
+    r = request(port, "GET /users/7 HTTP/1.1\r\nHost: x\r\nX-Block: 1\r\nConnection: close\r\n\r\n", false);
+    check("a middleware can stop the chain (the outer one still runs its second half)", r->status == 403 && streq(r->body, "blocked") && streq(hdr(r, "X-Stamp"), "mw1"));
+    r = request(port, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello", false);
+    check("a POST body reaches the handler", r->status == 201 && r->bodyLen == 5 && memcmp(r->body, "hello", 5) == 0);
+    r = request(port, "GET /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", false);
+    check("a wrong method on a route is 405 with Allow", r->status == 405 && streq(hdr(r, "Allow"), "POST"));
+    r = request(port, "OPTIONS /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", false);
+    check("OPTIONS lists the methods", r->status == 204 && streq(hdr(r, "Allow"), "POST"));
+
+    // --- static files
+    r = get(port, "/");
+    check("the index of a directory", r->status == 200 && streq(r->body, "<h1>hello</h1>") && contains(hdr(r, "Content-Type"), "text/html"));
+    r = get(port, "/sub/a.txt");
+    check("a file in a subdirectory", r->status == 200 && streq(r->body, "0123456789abcdefghij") && contains(hdr(r, "Content-Type"), "text/plain"));
+    r = get(port, "/a%20b.txt");
+    check("a name with a space", r->status == 200 && streq(r->body, "with a space"));
+    r = get(port, "/nothing.txt");
+    check("a missing file is 404", r->status == 404);
+    r = get(port, "/.hidden");
+    check("a dot file is 404", r->status == 404);
+    r = get(port, "/%2e%2e/%2e%2e/etc/passwd");
+    check("a path that leaves the directory is 403", r->status == 403);
+    r = get(port, "/sub/../../x");
+    check("dot segments are 403", r->status == 403);
+    r = get(port, "/sub%5c..%5ca.txt");
+    check("a backslash is 403", r->status == 403);
+    r = get(port, "/sub");
+    check("a directory without an index is 404", r->status == 404);
+    r = request(port, "HEAD /sub/a.txt HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", true);
+    check("HEAD: the length but no body", r->status == 200 && streq(hdr(r, "Content-Length"), "20") && r->bodyLen == 0);
+    r = get(port, "/big.txt");
+    bool same = r->status == 200 && r->bodyLen == 100000;
+    for (int i = 0; i < 100000 && same; i++) if (r->body[i] != 'A' + (i % 26)) same = false;
+    check("a 100000 byte file arrives complete (streamed in pieces)", same);
+    // validators
+    char* etag = hdr(r, "ETag");
+    char* modified = hdr(r, "Last-Modified");
+    check("ETag and Last-Modified are sent", etag != null && startsWith(etag, "W/\"") && modified != null && endsWith(modified, " GMT") && streq(hdr(r, "Accept-Ranges"), "bytes"));
+    char req[400];
+    format(&req[0], 400, "GET /big.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match: %s\r\nConnection: close\r\n\r\n", etag);
+    r = request(port, &req[0], false);
+    check("If-None-Match with the ETag: 304, no body", r->status == 304 && r->bodyLen == 0);
+    format(&req[0], 400, "GET /big.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match: \"other\", %s\r\nConnection: close\r\n\r\n", etag);
+    check("... in a list too", request(port, &req[0], false)->status == 304);
+    format(&req[0], 400, "GET /big.txt HTTP/1.1\r\nHost: x\r\nIf-None-Match: \"other\"\r\nConnection: close\r\n\r\n");
+    check("a different ETag gets the file", request(port, &req[0], false)->status == 200);
+    format(&req[0], 400, "GET /big.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: %s\r\nConnection: close\r\n\r\n", modified);
+    check("If-Modified-Since with its date: 304", request(port, &req[0], false)->status == 304);
+    format(&req[0], 400, "GET /big.txt HTTP/1.1\r\nHost: x\r\nIf-Modified-Since: Mon, 01 Jan 2001 00:00:00 GMT\r\nConnection: close\r\n\r\n");
+    check("an old date gets the file", request(port, &req[0], false)->status == 200);
+    // ranges
+    r = request(port, "GET /sub/a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=2-5\r\nConnection: close\r\n\r\n", false);
+    check("a range: 206 with Content-Range", r->status == 206 && streq(r->body, "2345") && streq(hdr(r, "Content-Range"), "bytes 2-5/20") && streq(hdr(r, "Content-Length"), "4"));
+    r = request(port, "GET /sub/a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=15-\r\nConnection: close\r\n\r\n", false);
+    check("an open ended range", r->status == 206 && streq(r->body, "fghij") && streq(hdr(r, "Content-Range"), "bytes 15-19/20"));
+    r = request(port, "GET /sub/a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=-4\r\nConnection: close\r\n\r\n", false);
+    check("the last 4 bytes", r->status == 206 && streq(r->body, "ghij"));
+    r = request(port, "GET /sub/a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=0-999\r\nConnection: close\r\n\r\n", false);
+    check("a range that ends after the file is cut", r->status == 206 && r->bodyLen == 20 && streq(hdr(r, "Content-Range"), "bytes 0-19/20"));
+    r = request(port, "GET /sub/a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=50-60\r\nConnection: close\r\n\r\n", false);
+    check("a range outside the file: 416 with the size", r->status == 416 && streq(hdr(r, "Content-Range"), "bytes */20"));
+    r = request(port, "GET /sub/a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=1-2,5-6\r\nConnection: close\r\n\r\n", false);
+    check("several ranges are ignored: the whole file", r->status == 200 && r->bodyLen == 20);
+    r = request(port, "GET /sub/a.txt HTTP/1.1\r\nHost: x\r\nRange: pages=1-2\r\nConnection: close\r\n\r\n", false);
+    check("an unknown unit is ignored", r->status == 200);
+    r = request(port, "GET /sub/a.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=abc\r\nConnection: close\r\n\r\n", false);
+    check("a malformed range is ignored", r->status == 200);
+    r = request(port, "GET /big.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=99990-\r\nConnection: close\r\n\r\n", false);
+    check("a range of a streamed file", r->status == 206 && r->bodyLen == 10);
+    r = request(port, "POST /sub/a.txt HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", false);
+    check("POST to a static file: no route and no static handling: 404", r->status == 404);
+
+    // --- connections: keep-alive, pipelining, HTTP/1.0
+    conn.Connection* c = conn.open("127.0.0.1", port, 1000);
+    c->writeText("GET /users/1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    c->flush();
+    r = readReply(c, false);
+    check("keep-alive: first answer", r->status == 200 && streq(r->body, "user 1") && streq(hdr(r, "Connection"), "keep-alive"));
+    c->writeText("GET /users/2 HTTP/1.1\r\nHost: x\r\n\r\n");
+    c->flush();
+    r = readReply(c, false);
+    check("... second answer on the same connection", r->status == 200 && streq(r->body, "user 2"));
+    c->writeText("GET /users/3 HTTP/1.1\r\nHost: x\r\n\r\nGET /users/4 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+    c->flush();
+    r = readReply(c, false);
+    check("pipelined requests: first", streq(r->body, "user 3"));
+    r = readReply(c, false);
+    check("... second, then the connection closes", streq(r->body, "user 4") && streq(hdr(r, "Connection"), "close"));
+    r = readReply(c, false);
+    check("nothing more", r->closed);
+    c->close();
+    r = request(port, "GET /users/5 HTTP/1.0\r\n\r\n", false);
+    check("HTTP/1.0 gets Connection: close and needs no Host", r->status == 200 && streq(hdr(r, "Connection"), "close"));
+    r = request(port, "GET /users/5 HTTP/1.1\r\n\r\n", false);
+    check("HTTP/1.1 without Host: 400", r->status == 400);
+
+    // --- request bodies
+    r = request(port, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 6000\r\nConnection: close\r\n\r\n", false);
+    check("a body over maxBody: 413 before it is read", r->status == 413);
+    r = request(port, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\nTrailer: x\r\n\r\n", false);
+    check("a chunked body is assembled", r->status == 201 && r->bodyLen == 12 && memcmp(r->body, "hello, world", 12) == 0);
+    char* bigChunks = alloc(20000);
+    strcpy(bigChunks, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+    for (int i = 0; i < 5; i++) {
+        strcat(bigChunks, "400\r\n");
+        int at = strlen(bigChunks);
+        for (int k = 0; k < 1024; k++) bigChunks[at + k] = 'x';
+        bigChunks[at + 1024] = 0;
+        strcat(bigChunks, "\r\n");
+    }
+    strcat(bigChunks, "0\r\n\r\n");
+    r = request(port, bigChunks, false);
+    check("a chunked body over maxBody: 413", r->status == 413);
+    r = request(port, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\nConnection: close\r\n\r\n", false);
+    check("an unsupported transfer coding: 501", r->status == 501);
+    r = request(port, "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\nConnection: close\r\n\r\n", false);
+    check("Content-Length together with chunked is refused (request smuggling): 400", r->status == 400);
+    r = request(port, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\nConnection: close\r\n\r\n", false);
+    check("two different Content-Length headers: 400", r->status == 400);
+    r = request(port, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\nConnection: close\r\n\r\n", false);
+    check("a Content-Length that is not a number: 400", r->status == 400);
+    // Expect: 100-continue
+    conn.Connection* ec = conn.open("127.0.0.1", port, 1000);
+    ec->writeText("POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n");
+    ec->flush();
+    r = readReply(ec, false);
+    check("Expect: 100-continue gets an interim answer", r->status == 100);
+    ec->writeText("abc");
+    ec->flush();
+    r = readReply(ec, false);
+    check("... then the real one", r->status == 201 && r->bodyLen == 3);
+    ec->close();
+
+    // --- header injection through a route value
+    r = get(port, "/users/x%0d%0aSet-Cookie:%20evil=1");
+    check("CR LF in a path parameter stays in the body, not in the headers", r->status == 200 && hdr(r, "Set-Cookie") == null);
+
+    // --- the hub is still healthy
+    check("no connection is left over", hub->count() == 1 || hub->count() == 0);
+    check("errors were counted", hub->stats->httpErrors >= 8);
+    net.setIdleHook(null);
+    hub->shutdown(100);
+    printf("failures: %d\n", fails);
+    return fails;
+}
