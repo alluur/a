@@ -447,9 +447,28 @@ type_size:
     mov eax, [struct_tab+rax+ST_SIZE]
     ret
 
+; type_with_len: rdi = array type (the array flag is set), rsi = number of elements -> rax = the type with the length in bits
+; 40..63 (left out when it does not fit: the length is then unknown to foreach)
+type_with_len:
+    mov rax, rdi
+    cmp rsi, TF_LEN_MAX
+    ja .r
+    shl rsi, TF_LEN_SHIFT
+    or rax, rsi
+.r: ret
+
+; type_array_len: rdi = type -> rax = element count if it is an array of known length, else 0
+type_array_len:
+    xor eax, eax
+    bt rdi, TF_ARRAY_BIT
+    jnc .r
+    mov rax, rdi
+    shr rax, TF_LEN_SHIFT
+.r: ret
+
 ; type_pointee_size: rdi = pointer type -> rax = size of what it points to
 type_pointee_size:
-    btr rdi, TF_ARRAY_BIT
+    TY_DECAY rdi
     sub rdi, TY_PTR1
     jmp type_size
 

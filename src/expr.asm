@@ -324,7 +324,7 @@ to_rvalue:
     mov [ld_end], rax
     ret
 .arr:
-    btr rdi, TF_ARRAY_BIT
+    TY_DECAY rdi
     mov [e_type], rdi
 .ret:
     ret
@@ -1676,7 +1676,7 @@ parse_primary:
     call expect
 .sz_arr:
     mov rdi, [r12+SYM_TYPE]
-    btr rdi, TF_ARRAY_BIT
+    TY_DECAY rdi
     sub rdi, TY_PTR1
     call type_size
     imul rax, [r12+SYM_EXTRA]
@@ -1811,13 +1811,18 @@ parse_primary:
     ERR "a compound literal needs a struct or array type"
 .cl_arr:
     test r13, r13
-    jg .cl_size
+    jg .cl_len
     ERR "array size must be positive"
+.cl_len:
+    mov rdi, rbx
+    mov rsi, r13
+    call type_with_len
+    mov rbx, rax
 .cl_size:
     mov rdi, rbx
     bt rbx, TF_ARRAY_BIT
     jnc .cl3
-    btr rdi, TF_ARRAY_BIT
+    TY_DECAY rdi
     sub rdi, TY_PTR1
     call type_size
     imul rax, r13
@@ -2809,7 +2814,7 @@ parse_unary:
     mov rax, [e_type]
     bt rax, TF_ARRAY_BIT
     jnc .a2
-    btr rax, TF_ARRAY_BIT
+    TY_DECAY rax
     jmp .a3
 .a2:
     add rax, TY_PTR1

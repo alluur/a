@@ -57,12 +57,17 @@ kw_table:
     KW "or",       T_OROR
     KW "not",      '!'
     KW "xor",      T_XORXOR
+    KW "foreach",  K_FOREACH
     db 0
 
 ops3:
     db "<=>", T_CMP3
     db "<<=", T_SHLEQ
     db ">>=", T_SHREQ
+    db "...", T_ELLIPSIS
+    db "||=", T_OROREQ
+    db "&&=", T_ANDANDEQ
+    db "??=", T_QQEQ
     db 0
 ops2:
     db "==", T_EQ
@@ -87,6 +92,7 @@ ops2:
     db "::", T_SCOPE
     db "^^", T_XORXOR
     db "??", T_QQ
+    db "..", T_DOTDOT
     db 0
 singles:
     db "(){}[];,.:?~=!<>&|^+-*/%", 0

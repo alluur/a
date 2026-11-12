@@ -84,14 +84,10 @@ parse_params:
     cmp qword [tk], ')'
     je .end
 .p:
-    cmp qword [tk], '.'
+    cmp qword [tk], T_ELLIPSIS
     jne .ptype
     ; "..." : any number of further arguments (they are read with va_arg(i), counted by va_count())
     call next_token
-    mov edi, '.'
-    call expect
-    mov edi, '.'
-    call expect
     mov dword [ptmp_variadic], 1
     cmp dword [ptmp_nreq], 0x7FFFFFFF
     je .end
@@ -792,6 +788,12 @@ parse_aggregate:
     imul rax, r12
     add r13, TY_PTR1
     bts r13, TF_ARRAY_BIT
+    push rax
+    mov rdi, r13
+    mov rsi, r12
+    call type_with_len                  ; the element count travels with the type (foreach, sizeof)
+    mov r13, rax
+    pop rax
     jmp .fsize
 .fscalar:
     mov rdi, r13
@@ -1467,6 +1469,13 @@ parse_global_vars:
     call expect
     add rbx, TY_PTR1
     bts rbx, TF_ARRAY_BIT
+    cmp dword [extern_decl], 0
+    jne .nolen                          ; extern int t[];  the length is not known here
+    mov rdi, rbx
+    mov rsi, r14
+    call type_with_len
+    mov rbx, rax
+.nolen:
     mov rdi, r12
     call type_size
     imul rax, r14

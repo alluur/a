@@ -116,6 +116,8 @@ parse_stmt:
     je parse_do
     cmp eax, K_FOR
     je parse_for
+    cmp eax, K_FOREACH
+    je parse_foreach
     cmp eax, K_RETURN
     je parse_return
     cmp eax, K_EXTERN
@@ -594,6 +596,12 @@ parse_local_decl:
     imul rax, r15
     add rbx, TY_PTR1
     bts rbx, TF_ARRAY_BIT
+    push rax
+    mov rdi, rbx
+    mov rsi, r15
+    call type_with_len
+    mov rbx, rax
+    pop rax
     jmp .size
 .scalar:
     mov qword [init_count], 0
@@ -852,6 +860,10 @@ parse_static_local:
     call expect
     add rbx, TY_PTR1
     bts rbx, TF_ARRAY_BIT
+    mov rdi, rbx
+    mov rsi, r14
+    call type_with_len
+    mov rbx, rax
     mov rdi, r12
     call type_size
     imul rax, r14
@@ -1030,7 +1042,7 @@ init_elem:
     ERR "an array is initialized with a {...} list (or a string for a char array)"
 .str:
     mov rax, rbx
-    btr rax, TF_ARRAY_BIT
+    TY_DECAY rax
     sub rax, TY_PTR1
     cmp rax, TY_CHAR
     je .s1
@@ -1210,7 +1222,7 @@ init_local_list:
     push rcx
     push rdi
     push rsi
-    btr rdi, TF_ARRAY_BIT
+    TY_DECAY rdi
     sub rdi, TY_PTR1
     call type_size
     mov r8, rax
@@ -1230,7 +1242,7 @@ init_local_list:
     jmp .sloop
 .array:
     mov r15, rbx
-    btr r15, TF_ARRAY_BIT
+    TY_DECAY r15
     sub r15, TY_PTR1
     mov rdi, r15
     call type_size
