@@ -1,0 +1,1222 @@
+// =============================================================================
+//  wshub - a poll based WebSocket server for many clients in one thread (plus an HTTP side and Server-Sent Events)       import wshub;
+//
+//    int onOpen(wshub.Hub* hub, wshub.Client* c)                      { hub->join(c, "lobby");  return 0; }
+//    int onMessage(wshub.Hub* hub, wshub.Client* c, char* data, int n, int isText)
+//                                                                      { hub->publish("lobby", data, n, isText, c->id);  return 0; }
+//    int onClose(wshub.Hub* hub, wshub.Client* c, int code)           { return 0; }
+//
+//    wshub.Hub* hub = new wshub.Hub();
+//    hub->onOpen = onOpen;  hub->onMessage = onMessage;  hub->onClose = onClose;
+//    hub->maxClients = 500;  hub->idleTimeoutMs = 120000;  hub->pingIntervalMs = 30000;
+//    hub->staticDir = "www";                                            // GET / serves www/index.html; /healthz answers by itself
+//    if (!hub->listen(8080)) { ...; }                                   // hub->listenTls(8443, tls.loadConfig(certPem, keyPem)) for wss / https
+//    hub->run();                                                        // or call hub->poll(ms) from your own loop
+//
+//  One thread serves every socket (net.poll): no thread per client, no blocking call anywhere in the loop, TLS handshakes included. Each client
+//  has a send queue with a byte limit (maxQueued): a client that does not read is cut off (stats.evicted) instead of blocking the others or
+//  using up memory. Callbacks are plain function pointers; the `user` field of a client is yours. The Client pointer is valid until
+//  onClose returns; keep the id (`c->id`) if you need to find a client later (hub->find(id), hub->sendTextTo(id, ...)).
+//
+//  Rooms: hub->join(c, "name"), hub->leave(c, "name"), hub->publish("name", data, n, isText, exceptId). Every client is in its rooms until it
+//  closes. Event streams (Server-Sent Events) are clients too: an HTTP handler calls sse.startResponse(res) and the connection becomes a client of
+//  kind KIND_SSE that receives the text of send / broadcast / publish as events.
+//
+//  HTTP side: requests that are no WebSocket upgrades go to (in this order) GET /healthz (JSON with the statistics), hub->onHttp (return 1 when you
+//  answered), hub->router (an httpx.Router; 404 from it falls through to the static files), hub->staticDir (GET and HEAD, ETag, Range) and 404.
+//  Requests are parsed by httpx.RequestParser with limits (maxHead, maxBody), keep-alive works, pipelined requests wait for the answer.
+//  wsOptions (an websocket.ServerOptions) sets subprotocols, Origin checks and permessage-deflate; hub->onUpgrade(hub, client, info) may refuse an
+//  upgrade (return an HTTP status: 401, 403 ...) after looking at info->path, info->header("Cookie") ...
+//
+//  Limits and timeouts (all settable): maxClients, maxMessage, maxQueued, handshakeTimeoutMs, idleTimeoutMs, keepAliveMs, pingIntervalMs and
+//  pongTimeoutMs. shutdown(graceMs) closes every WebSocket with 1001 and waits for the answers.
+// =============================================================================
+import net;
+import websocket;
+import httpx;
+import sse;
+import tls;
+import asys;
+import cstdlib;
+module wshub;
+
+public const KIND_FREE = 0;
+public const KIND_TLS = 1;          // the TLS handshake is running
+public const KIND_NEW = 2;          // an HTTP request is being read
+public const KIND_WS = 3;           // a WebSocket
+public const KIND_BUSY = 4;         // an HTTP answer is being sent
+public const KIND_SSE = 5;          // an event stream
+
+// ---- statistics ------------------------------------------------------------------------------------------------------------------------------------
+public class Stats {
+    public int accepted;            // connections accepted
+    public int rejected;            // connections refused (maxClients) and upgrades refused
+    public int current;             // connections now
+    public int opened;              // WebSocket clients that completed the handshake
+    public int closed;              // WebSocket and event stream clients that ended
+    public int messagesIn;
+    public int messagesOut;
+    public int bytesIn;
+    public int bytesOut;
+    public int evicted;             // clients cut off because their send queue was full
+    public int idleClosed;          // clients closed by the idle timeout or the ping timeout
+    public int httpRequests;
+    public int httpErrors;          // requests answered with a 4xx or 5xx status
+    public int tlsFailures;         // TLS handshakes that failed
+    public int timeouts;            // connections dropped because a request or handshake took too long
+}
+
+// ---- a client --------------------------------------------------------------------------------------------------------------------------------------
+public class Client {
+    public int id;                  // never reused while the hub runs
+    public int kind;                // KIND_*
+    public char* user;              // for your use
+    public int fd;
+    public int ip;                  // the peer address (host order) and port
+    public int port;
+    public websocket.WebSocket* ws;
+    public char path[256];          // the request target of the upgrade ("/chat?room=1")
+    public char origin[128];
+    public char protocol[64];
+    public int connectedAt;         // millis() when it was accepted
+    public int lastRx;              // millis() of the last bytes from the client
+    public int messagesIn;
+    public int messagesOut;
+    public int closeCode;           // why it ended (set before onClose)
+    public char* closeReason;       // a text for the close code ("" if none); valid during onClose
+
+    // ---- internals (do not touch)
+    public bool opened;
+    public bool dead;               // finish at the end of the loop turn
+    public int deadCode;
+    public char deadReason[80];
+    public bool closeAfter;         // close when the output is sent
+    public bool sent100;
+    public int closeStarted;
+    public int lastSse;
+    public char* hubRef;            // the Hub that owns the client
+    public int reqStart;            // millis() when the first byte of the current request arrived
+    public int requests;            // requests answered on this connection
+    public tls.Tls* tlsSession;
+    public httpx.RequestParser* parser;
+    public httpx.Request* req;
+    public char* ob;                // bytes to send first (handshake answer, HTTP answers, events), plain text even for TLS clients
+    public int obLen;
+    public int obPos;
+    public int obCap;
+    public char* pend;              // bytes read while an answer was being sent (pipelining)
+    public int pendLen;
+    public int pendCap;
+    public int fileFd;
+    public int fileLeft;
+    public int nrooms;
+    public char* rooms[8];
+    public Client* hashNext;
+    public int slot;                // position in the hub's client list
+    public bool isHead;
+
+    public bool isWebSocket() { return kind == KIND_WS; }
+    public bool isEventStream() { return kind == KIND_SSE; }
+}
+
+class Room {
+    public char name[64];
+    public Client** members;
+    public int n;
+    public int cap;
+}
+
+// ---- the hub ---------------------------------------------------------------------------------------------------------------------------------------
+public class Hub {
+    // callbacks (function pointers; every argument is passed as an int)
+    public func onOpen;             // onOpen(hub, client): a WebSocket or event stream client is ready
+    public func onMessage;          // onMessage(hub, client, data, length, isText): data is valid only during the call
+    public func onClose;            // onClose(hub, client, code): the client is gone (code: its close code, 1006 for a dropped connection, 1008 for an evicted one)
+    public func onHttp;             // onHttp(hub, client, request, response): return 1 when you answered
+    public func onUpgrade;          // onUpgrade(hub, client, info): return 0 to accept the upgrade, an HTTP status to refuse it
+
+    // settings
+    public int maxClients;          // connections of every kind (default 1000, at most 1000)
+    public int maxMessage;          // largest WebSocket message (default 1 MiB)
+    public int maxQueued;           // bytes that may wait for a client that reads slowly (default 1 MiB), then it is cut off
+    public int maxBody;             // largest HTTP request body (default 1 MiB)
+    public int maxHead;             // largest request head (default 16 KiB)
+    public int maxRooms;            // default 1000
+    public int handshakeTimeoutMs;  // from accept to a complete request (TLS handshake included), default 5000
+    public int idleTimeoutMs;       // a WebSocket that sends nothing for this long is closed with 1001 (0: never, default)
+    public int keepAliveMs;         // an idle HTTP connection is closed after this long (default 10000)
+    public int pingIntervalMs;      // ping silent WebSocket clients every this many ms (0: off, default)
+    public int pongTimeoutMs;       // close a client whose ping stays unanswered this long (default 10000)
+    public int sseKeepAliveMs;      // a comment line to every event stream client every this many ms (default 15000, 0: off)
+    public int closeTimeoutMs;      // time for a closing handshake (default 3000)
+    public bool healthz;            // answer GET /healthz (default true)
+    public websocket.ServerOptions* wsOptions;
+    public httpx.Router* router;
+    public char* staticDir;
+    public httpx.StaticOptions* staticOptions;
+    public char* user;
+    public Stats* stats;
+    public int port;                // the port the hub listens on (after listen)
+    public bool running;
+
+    // internals
+    public int listenFd;
+    public tls.Config* tlsConfig;
+    public Client* clients[1000];
+    public int nclients;
+    public Client* buckets[2048];
+    public Client* freeList;
+    public int nextId;
+    public Room* rooms[1000];
+    public int nrooms;
+    public int* ph;
+    public int* pe;
+    public int* pr;
+    public Client** pc;
+    public int now;
+    public bool stopping;
+    public websocket.HandshakeInfo* info;
+    public httpx.Response* res;
+    public char* rbuf;
+    public char* fbuf;
+
+    public Hub() {
+        maxClients = 1000;
+        maxMessage = 1048576;
+        maxQueued = 1048576;
+        maxBody = 1048576;
+        maxHead = 16384;
+        maxRooms = 1000;
+        handshakeTimeoutMs = 5000;
+        keepAliveMs = 10000;
+        pongTimeoutMs = 10000;
+        sseKeepAliveMs = 15000;
+        closeTimeoutMs = 3000;
+        healthz = true;
+        stats = new Stats();
+        wsOptions = new websocket.ServerOptions();
+        listenFd = -1;
+        nextId = 1;
+        now = millis();
+    }
+
+    // ---- starting ------------------------------------------------------------------------------------------------------------------------------
+    // listens on all interfaces; port 0 picks a free one (see hub->port). false if the port cannot be used
+    public bool listen(int p) {
+        return listenOn("0.0.0.0", p, null);
+    }
+
+    // the same with TLS (wss:// and https://): cfg = tls.loadConfig(certChainPem, keyPem)
+    public bool listenTls(int p, tls.Config* cfg) {
+        return listenOn("0.0.0.0", p, cfg);
+    }
+
+    // listen on one address, e.g. "127.0.0.1" (a hub for the local machine only)
+    public bool listenOn(char* host, int p, tls.Config* cfg) {
+        if (maxClients > 1000) maxClients = 1000;
+        if (maxClients < 1) maxClients = 1;
+        listenFd = net.listenOn(host, p, 128);
+        if (listenFd < 0) return false;
+        net.setNonBlocking(listenFd, true);
+        port = net.localPort(listenFd);
+        tlsConfig = cfg;
+        ph = (int*) malloc((maxClients + 2) * 8);
+        pe = (int*) malloc((maxClients + 2) * 8);
+        pr = (int*) malloc((maxClients + 2) * 8);
+        pc = (Client**) malloc((maxClients + 2) * 8);
+        rbuf = malloc(16384);
+        fbuf = malloc(16384);
+        info = websocket.newHandshakeInfo();
+        res = httpx.newResponse();
+        running = true;
+        return true;
+    }
+
+    // ---- clients ---------------------------------------------------------------------------------------------------------------------------------
+    public int count() { return nclients; }
+
+    // the client with that id, or null (ids are never reused, so a stale id finds nothing)
+    public Client* find(int id) {
+        Client* c = buckets[id & 2047];
+        while (c != null) {
+            if (c->id == id) return c;
+            c = c->hashNext;
+        }
+        return null;
+    }
+
+    // the ids of up to max clients that are WebSockets or event streams; returns how many
+    public int clientIds(int* out, int max) {
+        int k = 0;
+        for (int i = 0; i < nclients && k < max; i++) {
+            if (clients[i]->kind == KIND_WS || clients[i]->kind == KIND_SSE) { out[k] = clients[i]->id; k++; }
+        }
+        return k;
+    }
+
+    private Client* newClient() {
+        Client* c = freeList;
+        if (c != null) {
+            freeList = c->hashNext;
+            c->hashNext = null;
+        } else {
+            c = (Client*) malloc(sizeof(Client));
+            if (c == null) return null;
+        }
+        return c;
+    }
+
+    private void addClient(Client* c, int fd) {
+        c->id = nextId;
+        nextId++;
+        c->hubRef = (char*) this;
+        c->requests = 0;
+        c->reqStart = 0;
+        c->fd = fd;
+        c->kind = KIND_NEW;
+        c->connectedAt = now;
+        c->lastRx = now;
+        c->slot = nclients;
+        clients[nclients] = c;
+        nclients++;
+        c->hashNext = buckets[c->id & 2047];
+        buckets[c->id & 2047] = c;
+        stats->current = nclients;
+    }
+
+    // ---- sending ---------------------------------------------------------------------------------------------------------------------------------
+    private void evict(Client* c, char* why) {
+        if (c->dead) return;
+        c->dead = true;
+        c->deadCode = 1008;
+        strcpy(&c->deadReason[0], why);
+        stats->evicted++;
+    }
+
+    // a text or binary message to one client (an event stream client gets the text as an event). false if it cannot be queued; a client whose
+    // send queue is full is cut off
+    public bool sendText(Client* c, char* text) { return sendData(c, text, strlen(text), true); }
+    public bool sendBinary(Client* c, char* data, int n) { return sendData(c, data, n, false); }
+
+    public bool sendData(Client* c, char* data, int n, bool isText) {
+        if (c == null || c->dead) return false;
+        if (c->kind == KIND_WS) {
+            bool ok = isText ? c->ws->sendTextN(data, n) : c->ws->sendBinary(data, n);
+            if (!ok) {
+                if (c->ws->overflowed) evict(c, "send queue overflow");
+                return false;
+            }
+            c->messagesOut++;
+            stats->messagesOut++;
+            if (c->ws->outPending() > 65536) pumpOut(c);
+            return true;
+        }
+        if (c->kind == KIND_SSE) {
+            if (!isText) return false;
+            char* tmp = malloc(n + 1);
+            if (tmp == null) return false;
+            memcpy(tmp, data, n);
+            tmp[n] = 0;
+            char* ev = sse.eventText(null, tmp, null, 0);
+            free(tmp);
+            if (ev == null) return false;
+            bool ok = queueRaw(c, ev, strlen(ev));
+            free(ev);
+            if (ok) { c->messagesOut++; stats->messagesOut++; }
+            return ok;
+        }
+        return false;
+    }
+
+    // an event to an event stream client: event name (may be null), data, id (may be null)
+    public bool sendEvent(Client* c, char* event, char* data, char* id) {
+        if (c == null || c->dead || c->kind != KIND_SSE) return false;
+        char* ev = sse.eventText(event, data, id, 0);
+        if (ev == null) return false;
+        bool ok = queueRaw(c, ev, strlen(ev));
+        free(ev);
+        if (ok) { c->messagesOut++; stats->messagesOut++; }
+        return ok;
+    }
+
+    public bool sendTextTo(int id, char* text) { return sendText(find(id), text); }
+    public bool sendBinaryTo(int id, char* data, int n) { return sendBinary(find(id), data, n); }
+
+    // to every WebSocket and event stream client; returns how many it was queued for
+    public int broadcast(char* data, int n, bool isText) {
+        int sent = 0;
+        for (int i = 0; i < nclients; i++) {
+            Client* c = clients[i];
+            if ((c->kind == KIND_WS || c->kind == KIND_SSE) && sendData(c, data, n, isText)) sent++;
+        }
+        return sent;
+    }
+
+    public int broadcastText(char* text) { return broadcast(text, strlen(text), true); }
+
+    // starts the closing handshake of a client (code 1000 .. 4999 as websocket.closeWith accepts, reason may be null); an event stream is simply ended
+    public bool close(Client* c, int code, char* reason) {
+        if (c == null || c->dead) return false;
+        if (c->kind == KIND_WS) {
+            if (!c->ws->closeWith(code, reason)) return false;
+            if (c->closeStarted == 0) c->closeStarted = now;
+            pumpOut(c);
+            return true;
+        }
+        c->dead = true;
+        c->deadCode = code;
+        c->deadReason[0] = 0;
+        return true;
+    }
+
+    public bool closeId(int id, int code, char* reason) { return close(find(id), code, reason); }
+
+    // ---- rooms ------------------------------------------------------------------------------------------------------------------------------------
+    private Room* findRoom(char* name) {
+        for (int i = 0; i < nrooms; i++) {
+            if (streq(&rooms[i]->name[0], name)) return rooms[i];
+        }
+        return null;
+    }
+
+    // puts a client in a room (created when the first client joins; a name has at most 63 bytes, a client may be in 8 rooms, a hub has maxRooms)
+    public bool join(Client* c, char* room) {
+        if (c == null || c->dead || strlen(room) > 63 || room[0] == 0) return false;
+        if (c->kind != KIND_WS && c->kind != KIND_SSE) return false;
+        Room* r = findRoom(room);
+        if (r != null) {
+            for (int i = 0; i < r->n; i++) if (r->members[i] == c) return true;
+        }
+        if (c->nrooms >= 8) return false;
+        if (r == null) {
+            if (nrooms >= maxRooms || nrooms >= 1000) return false;
+            r = (Room*) malloc(sizeof(Room));
+            if (r == null) return false;
+            strcpy(&r->name[0], room);
+            rooms[nrooms] = r;
+            nrooms++;
+        }
+        if (r->n >= r->cap) {
+            int nc = r->cap * 2;
+            if (nc < 8) nc = 8;
+            Client** nm = (Client**) malloc(nc * 8);
+            if (nm == null) return false;
+            for (int i = 0; i < r->n; i++) nm[i] = r->members[i];
+            if (r->members != null) free(r->members);
+            r->members = nm;
+            r->cap = nc;
+        }
+        r->members[r->n] = c;
+        r->n++;
+        c->rooms[c->nrooms] = &r->name[0];
+        c->nrooms++;
+        return true;
+    }
+
+    public bool joinId(int id, char* room) { return join(find(id), room); }
+
+    // takes a client out of a room (the room disappears with its last member)
+    public bool leave(Client* c, char* room) {
+        if (c == null) return false;
+        Room* r = findRoom(room);
+        if (r == null) return false;
+        bool found = false;
+        for (int i = 0; i < r->n; i++) {
+            if (r->members[i] == c) {
+                r->members[i] = r->members[r->n - 1];
+                r->n--;
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+        for (int i = 0; i < c->nrooms; i++) {
+            if (c->rooms[i] == &r->name[0]) {
+                c->rooms[i] = c->rooms[c->nrooms - 1];
+                c->nrooms--;
+                break;
+            }
+        }
+        if (r->n == 0) dropRoom(r);
+        return true;
+    }
+
+    public bool leaveId(int id, char* room) { return leave(find(id), room); }
+
+    private void dropRoom(Room* r) {
+        for (int i = 0; i < nrooms; i++) {
+            if (rooms[i] == r) {
+                rooms[i] = rooms[nrooms - 1];
+                nrooms--;
+                break;
+            }
+        }
+        if (r->members != null) free(r->members);
+        free(r);
+    }
+
+    public int roomCount() { return nrooms; }
+
+    // how many clients are in the room (0 if there is no such room)
+    public int roomSize(char* room) {
+        Room* r = findRoom(room);
+        if (r == null) return 0;
+        return r->n;
+    }
+
+    // the message goes to every member of the room except the client with id exceptId (0: nobody is left out). Returns how many got it
+    public int publish(char* room, char* data, int n, bool isText, int exceptId) {
+        Room* r = findRoom(room);
+        if (r == null) return 0;
+        int sent = 0;
+        int count = r->n;
+        // eviction only marks clients, so the member list does not change while it is walked
+        for (int i = 0; i < count; i++) {
+            Client* c = r->members[i];
+            if (c->id == exceptId) continue;
+            if (sendData(c, data, n, isText)) sent++;
+        }
+        return sent;
+    }
+
+    public int publishText(char* room, char* text, int exceptId) { return publish(room, text, strlen(text), true, exceptId); }
+
+    // ---- output ------------------------------------------------------------------------------------------------------------------------------------
+    // appends bytes to the client's own output buffer (the HTTP answer, events)
+    private bool queueRaw(Client* c, char* data, int n) {
+        int pend = c->obLen - c->obPos;
+        if (c->kind == KIND_SSE && pend + n > maxQueued) {
+            evict(c, "send queue overflow");
+            return false;
+        }
+        if (c->obPos == c->obLen) {
+            c->obPos = 0;
+            c->obLen = 0;
+        }
+        if (c->obLen + n > c->obCap) {
+            if (c->obPos > 0) {
+                for (int i = 0; i < pend; i++) c->ob[i] = c->ob[c->obPos + i];
+                c->obLen = pend;
+                c->obPos = 0;
+            }
+            if (c->obLen + n > c->obCap) {
+                int nc = c->obCap * 2;
+                if (nc < 1024) nc = 1024;
+                while (nc < c->obLen + n) nc = nc * 2;
+                char* nb = realloc(c->ob, nc);
+                if (nb == null) return false;
+                c->ob = nb;
+                c->obCap = nc;
+            }
+        }
+        memcpy(&c->ob[c->obLen], data, n);
+        c->obLen = c->obLen + n;
+        return true;
+    }
+
+    private int obPending(Client* c) { return c->obLen - c->obPos; }
+
+    private bool hasOutput(Client* c) {
+        if (c->obLen > c->obPos) return true;
+        if (c->fileFd >= 0 && c->fileLeft > 0) return true;
+        if (c->ws != null && c->kind == KIND_WS && c->ws->outPending() > 0) return true;
+        if (c->tlsSession != null && tls.outLength(c->tlsSession) > 0) return true;
+        return false;
+    }
+
+    // sends what the socket takes (never blocks). false if the connection failed
+    private bool pumpOut(Client* c) {
+        for (int guard = 0; guard < 64; guard++) {
+            // more of the file
+            if (c->fileFd >= 0 && obPending(c) < 32768) {
+                int want = c->fileLeft;
+                if (want > 16384) want = 16384;
+                int got = want > 0 ? asys.fileRead(c->fileFd, fbuf, want) : 0;
+                if (got <= 0) {
+                    asys.fileClose(c->fileFd);
+                    c->fileFd = -1;
+                    c->fileLeft = 0;
+                    if (want > 0) { c->closeAfter = true; }           // the file got shorter than promised: the connection cannot go on
+                } else {
+                    queueRaw(c, fbuf, got);
+                    c->fileLeft = c->fileLeft - got;
+                    if (c->fileLeft <= 0) {
+                        asys.fileClose(c->fileFd);
+                        c->fileFd = -1;
+                    }
+                }
+            }
+            // the next plain bytes
+            char* p = "";
+            int pn = 0;
+            bool fromOb = false;
+            if (obPending(c) > 0) {
+                p = &c->ob[c->obPos];
+                pn = obPending(c);
+                fromOb = true;
+            } else if (c->ws != null && c->kind == KIND_WS) {
+                p = c->ws->outData();
+                pn = c->ws->outPending();
+            }
+            if (c->tlsSession != null) {
+                tls.Tls* t = c->tlsSession;
+                int tn = tls.outLength(t);
+                if (tn > 0) {
+                    int r = net.sendSome(c->fd, tls.outData(t), tn);
+                    if (r < 0) return false;
+                    if (r == 0) return true;
+                    tls.outConsumed(t, r);
+                    stats->bytesOut = stats->bytesOut + r;
+                    continue;
+                }
+                if (pn > 0 && tls.ready(t)) {
+                    int take = pn > 16384 ? 16384 : pn;
+                    tls.write(t, p, take);
+                    if (fromOb) c->obPos = c->obPos + take; else c->ws->outConsumed(take);
+                    continue;
+                }
+                return true;
+            }
+            if (pn == 0) {
+                if (c->fileFd >= 0) continue;
+                return true;
+            }
+            int r = net.sendSome(c->fd, p, pn);
+            if (r < 0) return false;
+            if (r == 0) return true;
+            stats->bytesOut = stats->bytesOut + r;
+            if (fromOb) c->obPos = c->obPos + r; else c->ws->outConsumed(r);
+        }
+        return true;
+    }
+
+    // ---- the event loop -------------------------------------------------------------------------------------------------------------------------------
+    // Runs until stop() is called (from a callback or another place of your loop)
+    public void run() {
+        while (running) {
+            poll(50);
+        }
+    }
+
+    public void stop() { running = false; }
+
+    // One turn of the loop: waits at most ms milliseconds for something to do, serves what is ready, runs the timers. Returns the number of
+    // sockets that were ready. Never blocks beyond ms.
+    public int poll(int ms) {
+        if (listenFd < 0 && nclients == 0) {
+            if (ms > 0) sleepMs(ms > 20 ? 20 : ms);
+            return 0;
+        }
+        now = millis();
+        int n = 0;
+        if (listenFd >= 0) {
+            ph[n] = listenFd;
+            pe[n] = net.READABLE;
+            pc[n] = null;
+            n++;
+        }
+        for (int i = 0; i < nclients; i++) {
+            Client* c = clients[i];
+            if (c->dead) continue;
+            // output first: what is queued is sent now, the socket is polled for writing only when it did not take everything
+            if (hasOutput(c) && !pumpOut(c)) {
+                c->dead = true;
+                c->deadCode = 1006;
+                c->deadReason[0] = 0;
+                continue;
+            }
+            ph[n] = c->fd;
+            pe[n] = net.READABLE;
+            if (hasOutput(c)) pe[n] = pe[n] | net.WRITABLE;
+            if (c->kind == KIND_BUSY || c->pendLen > 0) pe[n] = pe[n] & ~net.READABLE;
+            if (pe[n] == 0) pe[n] = net.READABLE;
+            pc[n] = c;
+            n++;
+        }
+        int timeout = ms;
+        if (timeout < 0 || timeout > 100) timeout = 100;                    // the timers need a look every so often
+        bool anyDead = false;
+        for (int i = 0; i < nclients; i++) if (clients[i]->dead) anyDead = true;
+        if (anyDead) timeout = 0;
+        int ready = 0;
+        if (n > 0) {
+            ready = net.poll(ph, pe, pr, n, timeout);
+        } else if (timeout > 0) {
+            sleepMs(timeout > 20 ? 20 : timeout);
+        }
+        now = millis();
+        if (ready > 0) {
+            for (int k = 0; k < n; k++) {
+                if (pr[k] == 0) continue;
+                Client* c = pc[k];
+                if (c == null) {
+                    acceptNew();
+                    continue;
+                }
+                if (c->dead || c->fd < 0 || c->id == 0) continue;
+                if ((pr[k] & net.READABLE) != 0 || (pr[k] & (net.HUNGUP | net.FAILED)) != 0) {
+                    readClient(c);
+                }
+                if (!c->dead && (pr[k] & net.WRITABLE) != 0 && hasOutput(c)) {
+                    if (!pumpOut(c)) { c->dead = true; c->deadCode = 1006; c->deadReason[0] = 0; }
+                }
+            }
+        }
+        timers();
+        reap();
+        return ready > 0 ? ready : 0;
+    }
+
+    // ---- accepting -----------------------------------------------------------------------------------------------------------------------------
+    private void acceptNew() {
+        for (int k = 0; k < 32; k++) {
+            int fd = net.acceptSome(listenFd);
+            if (fd < 0) return;
+            if (stopping) { net.rawClose(fd); continue; }
+            net.setNonBlocking(fd, true);
+            net.setNoDelay(fd, true);
+            stats->accepted++;
+            if (nclients >= maxClients) {
+                // full: a short answer, then goodbye (the socket is non-blocking: best effort)
+                char* msg = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+                if (tlsConfig == null) net.sendSome(fd, msg, strlen(msg));
+                net.rawClose(fd);
+                stats->rejected++;
+                continue;
+            }
+            Client* c = newClient();
+            if (c == null) { net.rawClose(fd); continue; }
+            addClient(c, fd);
+            net.peer(fd, &c->ip, &c->port);
+            if (tlsConfig != null) {
+                c->kind = KIND_TLS;
+                c->tlsSession = tls.accept(tlsConfig);
+            }
+            if (c->parser == null) {
+                c->parser = httpx.newParser();
+                c->req = httpx.newRequest();
+            }
+            c->parser->maxBody = maxBody;
+            c->parser->maxHead = maxHead;
+            c->parser->reset(c->req);
+            c->req->remoteIp = c->ip;
+            c->req->remotePort = c->port;
+            c->req->secure = tlsConfig != null;
+            c->fileFd = -1;
+        }
+    }
+
+    // ---- reading -----------------------------------------------------------------------------------------------------------------------------------
+    private void readClient(Client* c) {
+        for (int round = 0; round < 4 && !c->dead; round++) {
+            int n = net.recvSome(c->fd, rbuf, 16384);
+            if (n == -2) return;
+            if (n <= 0) {
+                // the peer closed or the connection failed
+                if (!c->dead) {
+                    c->dead = true;
+                    c->deadCode = 1006;
+                    c->deadReason[0] = 0;
+                    if (c->kind == KIND_WS && c->ws->closeRecvd) c->deadCode = c->ws->closeCode;
+                }
+                return;
+            }
+            c->lastRx = now;
+            stats->bytesIn = stats->bytesIn + n;
+            if (c->tlsSession != null) {
+                tls.Tls* t = c->tlsSession;
+                tls.feed(t, rbuf, n);
+                if (tls.failed(t)) {
+                    stats->tlsFailures++;
+                    c->dead = true;
+                    c->deadCode = 1006;
+                    c->deadReason[0] = 0;
+                    // an alert may be queued; try to send it
+                    int tn = tls.outLength(t);
+                    if (tn > 0) net.sendSome(c->fd, tls.outData(t), tn);
+                    return;
+                }
+                if (tls.closed(t)) {
+                    c->dead = true;
+                    c->deadCode = 1006;
+                    c->deadReason[0] = 0;
+                    return;
+                }
+                if (c->kind == KIND_TLS && tls.ready(t)) c->kind = KIND_NEW;
+                // the handshake answers and the decrypted data
+                if (!pumpOut(c)) { c->dead = true; c->deadCode = 1006; return; }
+                while (!c->dead && tls.available(t) > 0) {
+                    int pn = tls.readApp(t, rbuf, 16384);
+                    if (pn <= 0) break;
+                    process(c, rbuf, pn);
+                }
+            } else {
+                process(c, rbuf, n);
+            }
+            if (n < 16384) return;
+        }
+    }
+
+    // plain bytes from the client
+    private void process(Client* c, char* d, int n) {
+        if (c->kind == KIND_WS) {
+            int r = c->ws->feed(d, n);
+            if (r < 0 || c->ws->closed) {
+                // the connection is over: the close frame (if any) is sent, then the client goes
+                if (c->closeStarted == 0) c->closeStarted = now;
+            }
+            return;
+        }
+        if (c->kind == KIND_SSE) return;                          // event stream clients have nothing to say
+        if (c->kind == KIND_BUSY) {
+            // pipelined bytes wait for the answer that is being sent
+            if (c->pendLen + n > 65536) { c->dead = true; c->deadCode = 1006; return; }
+            if (c->pendLen + n > c->pendCap) {
+                int nc = c->pendCap * 2;
+                if (nc < 1024) nc = 1024;
+                while (nc < c->pendLen + n) nc = nc * 2;
+                char* nb = realloc(c->pend, nc);
+                if (nb == null) { c->dead = true; return; }
+                c->pend = nb;
+                c->pendCap = nc;
+            }
+            memcpy(&c->pend[c->pendLen], d, n);
+            c->pendLen = c->pendLen + n;
+            return;
+        }
+        // KIND_NEW: a request is being read
+        if (c->parser->hlen == 0 && c->parser->state == httpx.PS_HEAD) c->reqStart = now;
+        int off = 0;
+        while (off < n && c->kind == KIND_NEW && !c->dead) {
+            int r = c->parser->feed(&d[off], n - off);
+            off = off + r;
+            httpx.RequestParser* ps = c->parser;
+            if (ps->failed()) {
+                stats->httpErrors++;
+                sendError(c, ps->errorStatus);
+                return;
+            }
+            if (!ps->done()) {
+                if (c->req->expectContinue && !c->sent100 && (ps->state == httpx.PS_BODY || ps->state == httpx.PS_CHUNK_SIZE)) {
+                    char* cont = "HTTP/1.1 100 Continue\r\n\r\n";
+                    queueRaw(c, cont, strlen(cont));
+                    c->sent100 = true;
+                }
+                continue;
+            }
+            dispatch(c);
+            if (c->kind == KIND_WS && off < n) {
+                // frames that came right behind the handshake
+                process(c, &d[off], n - off);
+                return;
+            }
+            if (c->kind == KIND_BUSY && off < n) {
+                process(c, &d[off], n - off);
+                return;
+            }
+        }
+    }
+
+    private void sendError(Client* c, int status) {
+        char* h = malloc(200);
+        format(h, 200, "HTTP/1.1 %d %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", status, httpx.statusText(status));
+        queueRaw(c, h, strlen(h));
+        free(h);
+        c->kind = KIND_BUSY;
+        c->closeAfter = true;
+    }
+
+    // ---- requests ----------------------------------------------------------------------------------------------------------------------------------
+    private void dispatch(Client* c) {
+        httpx.Request* req = c->req;
+        char* up = req->header("Upgrade");
+        if (up != null && streqi(up, "websocket") && req->isMethod("GET") && !stopping) {
+            upgrade(c);
+        } else {
+            http(c);
+        }
+    }
+
+    private void upgrade(Client* c) {
+        httpx.RequestParser* ps = c->parser;
+        // the head text without the empty line at its end
+        char* hb = ps->hb;
+        int hl = ps->hlen;
+        if (hl >= 4 && hb[hl - 1] == 10 && hb[hl - 2] == 13) hb[hl - 2] = 0;
+        else if (hl >= 2 && hb[hl - 1] == 10) hb[hl - 1] = 0;
+        int st = websocket.serverHandshake(hb, wsOptions, info);
+        if (st == 101 && onUpgrade != null) {
+            // the callback sees the request target and the headers
+            int code = onUpgrade(this, c, info);
+            if (code != 0) {
+                websocket.setRejection(info, code);
+                st = code;
+            }
+        }
+        if (st != 101) {
+            stats->rejected++;
+            queueRaw(c, info->response, info->responseLen);
+            c->kind = KIND_BUSY;
+            c->closeAfter = true;
+            return;
+        }
+        if (c->ws == null) c->ws = websocket.create(null, false);
+        websocket.WebSocket* w = c->ws;
+        w->init(null, false);
+        websocket.configure(w, wsOptions, info);
+        w->maxMessage = maxMessage;
+        w->maxFrame = maxMessage;
+        w->maxOutBuffer = maxQueued;
+        w->maxQueue = 0;
+        w->user = (char*) c;
+        w->setHandler(wsEvent);
+        if (pingIntervalMs > 0) {
+            w->setKeepalive(pingIntervalMs, pongTimeoutMs);
+            w->clockNow = now;
+            w->lastRx = now;
+        }
+        int pl = strlen(&info->path[0]);
+        if (pl > 255) pl = 255;
+        memcpy(&c->path[0], &info->path[0], pl);
+        c->path[pl] = 0;
+        strcpy(&c->origin[0], &info->origin[0]);
+        strcpy(&c->protocol[0], &info->protocol[0]);
+        queueRaw(c, info->response, info->responseLen);
+        c->kind = KIND_WS;
+        c->opened = true;
+        stats->opened++;
+        // the request is done: its memory is only needed again for the next connection
+        c->req->reset();
+        if (onOpen != null) onOpen(this, c);
+    }
+
+    private void http(Client* c) {
+        httpx.Request* req = c->req;
+        httpx.Response* r = res;
+        stats->httpRequests++;
+        r->reset();
+        bool isHead = req->isMethod("HEAD");
+        if (isHead) r->head = true;
+        bool handled = false;
+        if (healthz && (req->isMethod("GET") || isHead) && streq(&req->path[0], "/healthz")) {
+            char* j = statsText();
+            r->json(200, j);
+            free(j);
+            handled = true;
+        }
+        if (!handled && onHttp != null) {
+            if (onHttp(this, c, req, r) != 0) handled = true;
+        }
+        if (!handled && router != null) {
+            router->handle(req, r);
+            handled = true;
+            if (r->status == 404 && staticDir != null && (req->isMethod("GET") || isHead)) handled = false;
+        }
+        if (!handled && staticDir != null) {
+            r->reset();
+            if (isHead) r->head = true;
+            httpx.serveFile(req, r, staticDir, staticOptions);
+            handled = true;
+        }
+        if (!handled) {
+            r->reset();
+            if (isHead) r->head = true;
+            r->error(404);
+        }
+        if (r->status >= 400) stats->httpErrors++;
+        // an event stream: keep the connection
+        if (r->eventStream && r->status == 200) {
+            int hn;
+            char* h = r->buildHead(false, &hn);
+            queueRaw(c, h, hn);
+            free(h);
+            c->kind = KIND_SSE;
+            c->opened = true;
+            c->lastSse = now;
+            c->closeAfter = false;
+            strcpy(&c->path[0], "");
+            int pl = strlen(&req->rawPath[0]);
+            if (pl > 255) pl = 255;
+            memcpy(&c->path[0], &req->rawPath[0], pl);
+            c->path[pl] = 0;
+            stats->opened++;
+            if (onOpen != null) onOpen(this, c);
+            c->req->reset();
+            return;
+        }
+        bool keep = req->keepAlive && !stopping && !r->closeAfter && r->status != 400 && r->status != 413;
+        int hn;
+        char* h = r->buildHead(keep, &hn);
+        if (h != null) {
+            queueRaw(c, h, hn);
+            free(h);
+        }
+        if (!isHead && r->status != 204 && r->status != 304) {
+            if (r->bodyLen > 0) queueRaw(c, r->body, r->bodyLen);
+            if (r->filePath != null && r->fileLen > 0) {
+                int fd = asys.fileOpen(r->filePath, asys.F_READ);
+                if (fd >= 0) {
+                    if (r->fileOffset > 0) asys.fileSeek(fd, r->fileOffset, 0);
+                    c->fileFd = fd;
+                    c->fileLeft = r->fileLen;
+                } else {
+                    c->closeAfter = true;
+                }
+            }
+        }
+        c->closeAfter = c->closeAfter || !keep;
+        c->kind = KIND_BUSY;
+        c->sent100 = false;
+    }
+
+    // a WebSocket event (the handler of the websocket module)
+    public void wsEventInternal(websocket.WebSocket* w, int event, int op, char* data, int n) {
+        Client* c = (Client*) w->user;
+        if (event == websocket.EV_MESSAGE) {
+            c->messagesIn++;
+            stats->messagesIn++;
+            if (onMessage != null) onMessage(this, c, data, n, op == websocket.OP_TEXT ? 1 : 0);
+        }
+    }
+
+    // ---- statistics text --------------------------------------------------------------------------------------------------------------------------------
+    // the statistics as JSON (a heap string)
+    public char* statsText() {
+        char* j = malloc(600);
+        int ws = 0;
+        int sseN = 0;
+        for (int i = 0; i < nclients; i++) {
+            if (clients[i]->kind == KIND_WS) ws++;
+            if (clients[i]->kind == KIND_SSE) sseN++;
+        }
+        format(j, 600, "{\"status\":\"ok\",\"clients\":%d,\"websockets\":%d,\"eventStreams\":%d,\"rooms\":%d,", nclients, ws, sseN, nrooms);
+        int o = strlen(j);
+        format(&j[o], 600 - o, "\"accepted\":%d,\"messagesIn\":%d,\"messagesOut\":%d,\"evicted\":%d,\"httpRequests\":%d}",
+               stats->accepted, stats->messagesIn, stats->messagesOut, stats->evicted, stats->httpRequests);
+        return j;
+    }
+
+    // ---- timers -----------------------------------------------------------------------------------------------------------------------------------
+    private void timers() {
+        for (int i = 0; i < nclients; i++) {
+            Client* c = clients[i];
+            if (c->dead) continue;
+            int age = now - c->connectedAt;
+            int quiet = now - c->lastRx;
+            if (c->kind == KIND_TLS) {
+                if (age > handshakeTimeoutMs) {
+                    stats->timeouts++;
+                    c->dead = true; c->deadCode = 1006; c->deadReason[0] = 0;
+                }
+            } else if (c->kind == KIND_NEW) {
+                bool inProgress = c->parser->hlen > 0 || c->parser->state != httpx.PS_HEAD;
+                bool late = false;
+                if (inProgress) late = now - c->reqStart > handshakeTimeoutMs;
+                else if (c->requests == 0) late = age > handshakeTimeoutMs;
+                else late = quiet > keepAliveMs;
+                if (late) {
+                    stats->timeouts++;
+                    c->dead = true; c->deadCode = 1006; c->deadReason[0] = 0;
+                }
+            } else if (c->kind == KIND_BUSY) {
+                if (quiet > 30000 && hasOutput(c)) {
+                    stats->timeouts++;
+                    c->dead = true; c->deadCode = 1006; c->deadReason[0] = 0;
+                }
+            } else if (c->kind == KIND_WS) {
+                websocket.WebSocket* w = c->ws;
+                if (pingIntervalMs > 0 && !w->closeSent) {
+                    w->tick(now);
+                    if (w->failed && w->localCloseCode == 1011) {
+                        stats->idleClosed++;
+                        pumpOut(c);
+                        if (c->closeStarted == 0) c->closeStarted = now;
+                    }
+                }
+                if (idleTimeoutMs > 0 && !w->closeSent && quiet > idleTimeoutMs) {
+                    stats->idleClosed++;
+                    w->closeWith(1001, "idle timeout");
+                    c->closeStarted = now;
+                    pumpOut(c);
+                }
+                if (w->closeSent && c->closeStarted == 0) c->closeStarted = now;
+                if (c->closeStarted != 0 && now - c->closeStarted > closeTimeoutMs) {
+                    c->dead = true;
+                    c->deadCode = w->closeCode != 0 ? w->closeCode : 1006;
+                    c->deadReason[0] = 0;
+                }
+            } else if (c->kind == KIND_SSE) {
+                if (sseKeepAliveMs > 0 && now - c->lastSse >= sseKeepAliveMs) {
+                    char* ka = ": keepalive\n\n";
+                    queueRaw(c, ka, strlen(ka));
+                    c->lastSse = now;
+                }
+            }
+        }
+    }
+
+    // ---- finishing clients ---------------------------------------------------------------------------------------------------------------------
+    private void reap() {
+        int i = 0;
+        while (i < nclients) {
+            Client* c = clients[i];
+            bool done = c->dead;
+            if (!done && c->kind == KIND_WS && c->ws->closed) {
+                // the closing handshake is over (or the connection failed): when the last bytes are out the client goes
+                if (!hasOutput(c)) {
+                    done = true;
+                    c->deadCode = c->ws->closeCode != 0 ? c->ws->closeCode : 1006;
+                    if (c->ws->failed && c->ws->localCloseCode != 0 && c->ws->closeCode == 1006) c->deadCode = c->ws->localCloseCode;
+                } else {
+                    pumpOut(c);
+                    if (!hasOutput(c)) done = true;
+                    if (done) c->deadCode = c->ws->closeCode != 0 ? c->ws->closeCode : 1006;
+                }
+            } else if (!done && c->kind == KIND_BUSY && !hasOutput(c)) {
+                if (c->closeAfter || stopping) {
+                    done = true;
+                } else {
+                    // the next request on the same connection
+                    c->kind = KIND_NEW;
+                    c->parser->reset(c->req);
+                    c->req->remoteIp = c->ip;
+                    c->req->remotePort = c->port;
+                    c->req->secure = tlsConfig != null;
+                    c->requests++;
+                    c->lastRx = now;
+                    if (c->pendLen > 0) {
+                        char* tmp = malloc(c->pendLen);
+                        int tn = c->pendLen;
+                        memcpy(tmp, c->pend, tn);
+                        c->pendLen = 0;
+                        process(c, tmp, tn);
+                        free(tmp);
+                    }
+                }
+            }
+            if (done) {
+                finish(c);
+            } else {
+                i++;
+            }
+        }
+    }
+
+    private void finish(Client* c) {
+        c->closeCode = c->deadCode != 0 ? c->deadCode : 1006;
+        if (c->kind == KIND_WS && c->ws != null && c->ws->closeCode != 0 && !c->dead) c->closeCode = c->ws->closeCode;
+        c->closeReason = &c->deadReason[0];
+        if (c->kind == KIND_WS && c->ws != null && c->ws->closeReason != null && c->deadReason[0] == 0) c->closeReason = c->ws->closeReason;
+        if (c->opened) {
+            stats->closed++;
+            if (onClose != null) onClose(this, c, c->closeCode);
+        }
+        // out of the rooms
+        while (c->nrooms > 0) {
+            leave(c, c->rooms[0]);
+        }
+        // out of the lists
+        Client* p = buckets[c->id & 2047];
+        Client* prev = null;
+        while (p != null) {
+            if (p == c) {
+                if (prev == null) buckets[c->id & 2047] = p->hashNext; else prev->hashNext = p->hashNext;
+                break;
+            }
+            prev = p;
+            p = p->hashNext;
+        }
+        int slot = c->slot;
+        Client* last = clients[nclients - 1];
+        clients[slot] = last;
+        last->slot = slot;
+        nclients--;
+        stats->current = nclients;
+        if (c->fileFd >= 0) { asys.fileClose(c->fileFd); c->fileFd = -1; }
+        if (c->tlsSession != null && tls.ready(c->tlsSession)) {
+            // a goodbye (close_notify), best effort
+            tls.shutdown(c->tlsSession);
+            int tn = tls.outLength(c->tlsSession);
+            if (tn > 0) net.sendSome(c->fd, tls.outData(c->tlsSession), tn);
+        }
+        net.rawClose(c->fd);
+        c->fd = -1;
+        recycle(c);
+    }
+
+    // clears a finished client for reuse (the objects and buffers it owns are kept)
+    private void recycle(Client* c) {
+        c->id = 0;
+        c->kind = KIND_FREE;
+        c->user = null;
+        c->opened = false;
+        c->dead = false;
+        c->deadCode = 0;
+        c->deadReason[0] = 0;
+        c->closeAfter = false;
+        c->sent100 = false;
+        c->closeStarted = 0;
+        c->path[0] = 0;
+        c->origin[0] = 0;
+        c->protocol[0] = 0;
+        c->messagesIn = 0;
+        c->messagesOut = 0;
+        c->closeCode = 0;
+        c->closeReason = null;
+        c->tlsSession = null;
+        c->obLen = 0;
+        c->obPos = 0;
+        if (c->obCap > 262144) { free(c->ob); c->ob = null; c->obCap = 0; }
+        c->pendLen = 0;
+        if (c->pendCap > 65536) { free(c->pend); c->pend = null; c->pendCap = 0; }
+        c->nrooms = 0;
+        c->ip = 0;
+        c->port = 0;
+        c->lastSse = 0;
+        c->hashNext = freeList;
+        freeList = c;
+    }
+
+    // ---- stopping ---------------------------------------------------------------------------------------------------------------------------------
+    // Graceful shutdown: no new connections, every WebSocket gets a close frame with 1001, answers in progress finish, event streams end.
+    // Waits at most graceMs for the clients to say goodbye, then drops the rest. The hub can be used again after listen().
+    public void shutdown(int graceMs) {
+        stopping = true;
+        running = false;
+        if (listenFd >= 0) {
+            net.rawClose(listenFd);
+            listenFd = -1;
+        }
+        now = millis();
+        for (int i = 0; i < nclients; i++) {
+            Client* c = clients[i];
+            if (c->kind == KIND_WS) {
+                c->ws->closeWith(1001, "server is shutting down");
+                c->closeStarted = now;
+                pumpOut(c);
+            } else if (c->kind == KIND_SSE || c->kind == KIND_TLS || c->kind == KIND_NEW) {
+                c->dead = true;
+                c->deadCode = 1001;
+            }
+        }
+        int deadline = now + graceMs;
+        while (nclients > 0 && millis() < deadline) {
+            poll(20);
+        }
+        // whoever is left is dropped
+        for (int i = 0; i < nclients; i++) {
+            clients[i]->dead = true;
+            if (clients[i]->deadCode == 0) clients[i]->deadCode = 1001;
+        }
+        reap();
+        stopping = false;
+    }
+}
+
+// the function the websocket module calls for every event of a hub client
+private int wsEvent(websocket.WebSocket* w, int event, int op, char* data, int n) {
+    Client* c = (Client*) w->user;
+    Hub* h = (Hub*) c->hubRef;
+    h->wsEventInternal(w, event, op, data, n);
+    return 0;
+}
