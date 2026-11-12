@@ -115,7 +115,7 @@ bar drags the window, a double click (two presses within 0.4 s) maximizes it, a 
 **What to notice**
 
 * The title bar is 26 pixels high and sits *above* the client area (`win->y - 13` is the middle of it), the border is 2 pixels. `srv->windowAt(i)` is ordered from the back to the front.
-* A click on A brought it to the front (`stacking order: B A`) and gave it the focus: the focused window has the blue title bar, the other one is gray.
+* The press on A's title bar (the start of the drag) brought it to the front (`stacking order: B A`) and gave it the focus: the focused window has the blue title bar, the other one is gray.
 * **The window decides.** The close button only sends `E_CLOSE`; the client's `onClose` returned 1, so the window stayed. The server never kills a program.
 * `toggleMaximize` changed the server's window and told the client its new size (`E_RESIZE`): `b->w` and `wb->w` agree, and the window came back to 150 x 70.
 
@@ -140,9 +140,9 @@ they are ready (`service`). You add further ones with `srv->addBackend` (at most
 
 ### VNC
 
-`wvnc.Vnc` serves the screen as an RFB server (RFB is the protocol VNC viewers speak). The sample below is a tiny viewer written by hand, to show the protocol. It speaks version 3.8 with the security type "None", asks for the Raw encoding (plain pixels) and reads 32 bit pixels. That is all the book ran, and no real VNC viewer was tried.
+`wvnc.Vnc` serves the screen as an RFB server (RFB is the protocol VNC viewers speak). The sample below is a tiny viewer written by hand, to show the protocol. It speaks version 3.8 with the security type "None", sends no list of encodings, and reads the 32 bit Raw pixels (plain pixels) that the server sends. That is all the book ran, and no real VNC viewer was tried.
 
-The source of `lib/wvnc.a` says more: the server also accepts versions 3.3 and 3.7, 8, 16 and 32 bit true colour pixel formats, and the VNC password (see below). It always sends the Raw encoding, whatever encodings the viewer lists. Up to 15 viewers can be connected at once, together with the other backends. The mouse (three buttons and the wheel) and the keyboard come back as input; the clipboard of the viewer is ignored.
+The source of `lib/wvnc.a` says more: the server also accepts versions 3.3 and 3.7, 8, 16 and 32 bit true colour pixel formats, and the VNC password (see below). It always sends the Raw encoding, whatever encodings the viewer lists. Up to 15 viewers can be connected to one VNC backend at once. The mouse (three buttons and the wheel) and the keyboard come back as input; the clipboard of the viewer is ignored.
 
 {{sample guisrv/vnc}}
 
@@ -279,9 +279,9 @@ The login window is a `gui` client like any other, here shown on the headless ba
 
 * No hardware acceleration; the built-in fonts are DejaVu Sans, Sans Bold and Sans Mono at 13 pixels, Latin-1 characters only; no input methods; the clipboard is plain text.
 * The server and the clients are single threaded and talk TCP (over loopback unless you give the server a cookie and another address).
-* A server takes at most 60 clients, 254 windows and 4 backends; a VNC or web backend takes at most 15 viewers.
+* A server takes at most 60 clients, 255 windows and 4 backends; a VNC or web backend takes at most 15 viewers.
 * The GUI reference says that on Windows the server (with VNC), the toolkit and the programs work, that the framebuffer backend does not exist there and that the display manager cannot start sessions (no `fork`). This was not tried for this chapter.
-* Not run for this book: a real framebuffer, a real VNC viewer, a real web browser (and so the WebSocket), the VNC password, the RFB versions 3.3 and 3.7 and the 8 and 16 bit pixel formats of `wvnc`, and starting a session in `dm`. The VNC sample is a client written in A that uses RFB 3.8, security "None", Raw and 32 bit pixels; the web sample uses plain HTTP only.
+* Not run for this book: a real framebuffer, a real VNC viewer, a real web browser (and so the WebSocket), the VNC password, the RFB versions 3.3 and 3.7 and the 8 and 16 bit pixel formats of `wvnc`, and starting a session in `dm`. The VNC sample is a client written in A that uses RFB 3.8, security "None" and the 32 bit pixel format the server announces (the server sends Raw); the web sample uses plain HTTP only.
 
 ## Summary
 

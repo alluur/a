@@ -4,7 +4,7 @@ Some programs belong in a terminal: an editor you use over SSH, a file manager, 
 **full screen terminal programs** in A: it reads keys and the mouse, adapts to the colours the terminal has, writes only what changed on the
 screen, and brings menus, dialogs, lists, trees, tables, tabs and a command palette. It is written for Linux terminals; the source also has code for AOS.
 
-Every program in this chapter was run in a **pseudo terminal**: a software terminal that a test program can type into and read the screen of. It behaves like an `xterm-256color` terminal. The book did not try the programs in real terminal programs of other kinds, so where the text says what a terminal "can do", it means what the toolkit assumes from its tables.
+The programs in this chapter that need a terminal were run in a **pseudo terminal**: a software terminal that a test program can type into and read the screen of. It behaves like an `xterm-256color` terminal. The other programs run without any terminal (see [Trying programs without a terminal](#trying-programs-without-a-terminal)). The book did not try the programs in real terminal programs of other kinds, so where the text says what a terminal "can do", it means what the toolkit assumes from its tables.
 
 In this chapter:
 
@@ -36,7 +36,7 @@ which is how many examples in this chapter can print the screen of a "terminal p
 
 A class that has a constructor must be made with parentheses or with `new`: `term.Terminal t();`, `tui.Label l("x");` or `new tui.Label("x")`. A declaration without parentheses (`term.Terminal t;`, `tui.Label l;`) only fills the object with zeroes and does **not** run the constructor; [chapter 15](#chap-structs-and-classes) has the rules. For this toolkit that is a trap, not just untidiness:
 
-* `term.Decoder d;` and `term.Terminal t;` crash with `SIGFPE` (a division by zero). This is the form shown in the header comment of `lib/term.a` and in `docs/TUI.md`. The decoder keeps its events in a queue whose size the constructor sets, so in a zeroed decoder the size is 0: the first call that decodes bytes (`d.feedText(...)`), or the first key that reaches a `Terminal`, divides by zero. The program is killed by signal 8 (a program that is in raw mode prints "fatal signal 8" first, and the terminal is put back). Write `term.Decoder d();` and `term.Terminal t();`, or use `new`.
+* `term.Decoder d;` and `term.Terminal t;` crash with `SIGFPE` (a division by zero). This is the form shown in the header comment of `lib/term.a` and in [the tui reference](#chap-tui-reference). The decoder keeps its events in a queue whose size the constructor sets, so in a zeroed decoder the size is 0: the first call that decodes bytes (`d.feedText(...)`), or the first key that reaches a `Terminal`, divides by zero. The program is killed by signal 8 (a program that is in raw mode prints "fatal signal 8" first, and the terminal is put back). Write `term.Decoder d();` and `term.Terminal t();`, or use `new`.
 * A zeroed `term.Terminal` also has `useAlt`, `useMouse` and `usePaste` off, because the constructor is what turns them on.
 * A zeroed widget (`tui.Label l;`) has `visible`, `enabled`, `w` and `h` all zero or false, so nothing is drawn.
 * The constructor of your own widget class must start with `super();`. Without it the base class constructor does not run, with the same result as above.
@@ -53,7 +53,8 @@ A terminal program makes an `App`, calls `start()`, builds a tree of widgets, ha
 
 **What to notice**
 
-* `start()` switches the terminal to **raw mode** (every key arrives at once and is not echoed, and there are no line editing keys), to the **alternate screen** (a second screen, so that the text of your shell is back when the program ends) and to mouse reporting, as far as the terminal has them (see [what the terminal can do](#what-the-terminal-can-do)). It returns `false` when it has no terminal to use: the program has no controlling terminal at all (started by `cron`, for example), or `TERM` is `dumb`. Redirecting input or output is not a reason: with `./prog > file` the toolkit opens `/dev/tty` and the program still works. Nothing has been changed when `start()` returns `false`, so you can print a message and exit. `run()` returns when
+* `start()` switches the terminal to **raw mode** (every key arrives at once and is not echoed, and there are no line editing keys), to the **alternate screen** (a second screen, so that the text of your shell is back when the program ends) and to mouse reporting, as far as the terminal has them (see [what the terminal can do](#what-the-terminal-can-do)).
+* `start()` returns `false` when it has no terminal to use: the program has no controlling terminal at all (started by `cron`, for example), or `TERM` is `dumb`. Redirecting input or output is not a reason: with `./prog > file` the toolkit opens `/dev/tty` and the program still works (`TUI_DEVTTY=0` turns that off). Nothing has been changed when it returns `false`, so you can print a message and exit. `run()` returns when
   something calls `quit()`; the terminal is put back, also when the program ends through `exit()` or a fatal signal.
 * The `&` in `"&Greet"` marks the mnemonic: Alt+G presses the button. Tab moves the focus, Enter or Space presses the focused button.
 * `isDefault` on a button means "Enter in a **dialog** presses it". On a plain screen Enter goes to the focused widget, so the text field
@@ -116,8 +117,8 @@ The sample below only runs names through that function; it does not talk to term
 
 **What to notice**
 
-* `dumb` (and `unknown`) have no cursor addressing, so `App.start()` returns `false`. Any name that starts with `vt` (`vt100`) gets no colours and no mouse, `ansi` gets 8 colours, and `linux` gets 16 colours but no mouse and no alternate screen. A `TERM` that is not set is treated as `ansi`.
-* Every other name is treated like an xterm: mouse, alternate screen, bracketed paste and a window title, with 16 colours (`xterm-color` gets 8). A name with `256color` in it, or one starting with `st`, `konsole` or `gnome`, gets 256 colours; `xterm-direct`, `kitty`, `alacritty` and a few more get 24 bit. A name the table does not know (`foobar`) gets the xterm defaults.
+* `dumb` (and `unknown`) have no cursor addressing, so `App.start()` returns `false`. Any name that starts with `vt` (`vt100`) gets no colours and no mouse, `ansi` gets 8 colours, and `linux` (like `cons...`, `freebsd...` and `ansi.` names) gets 16 colours but no mouse and no alternate screen. A `TERM` that is not set is treated as `ansi`. Careful: `vte` and `vte-256color` also start with `vt`, so the toolkit takes them for a VT100 with no colours and no mouse (the table has a rule that would give them 256 colours, but it is never reached); set `TUI_COLORS=256` and `TUI_MOUSE=1` for such a terminal.
+* Every other name is treated like an xterm: mouse, alternate screen, bracketed paste and a window title (not for `screen` and `tmux` names), with 16 colours (`xterm-color` gets 8). A name with `256color` in it, or one starting with `st`, `konsole` or `gnome`, gets 256 colours; `xterm-direct`, `kitty`, `alacritty` and a few more get 24 bit. A name the table does not know (`foobar`) gets the xterm defaults.
 * `COLORTERM=truecolor` (or `24bit`) lifts such a terminal to 24 bit colours, `NO_COLOR` removes all colours (bold and underline stay), and a locale that is not UTF-8 (`C`, `POSIX`) turns box drawing characters into ASCII. An unset or empty locale counts as UTF-8.
 * Programs never test for these themselves: colours are downgraded to the nearest colour the terminal has, symbols fall back to ASCII, and `App.start()` picks a theme
   (dark for 256 and more colours, classic blue and cyan for 8 and 16, a monochrome one without colours).
@@ -274,7 +275,7 @@ A `MenuBar` holds `Menu` objects, each with items. An item text with `&` has a m
 * The action receives the item: `int f(int item)`; its `text` still contains the `&`, which the sample removes for printing.
 * In an open menu: Up and Down skip separators, Right opens a submenu (or the next menu), Left goes back, Esc closes, a letter chooses the item with that mnemonic.
 
-The same in a real terminal, with a menu that is open:
+The same as a full screen program (run in a pseudo terminal), with a menu that is open:
 
 {{sample tui/menuapp}}
 
@@ -340,7 +341,7 @@ There is also a colour dialog, `colorDialog(app, initial)`, with the 256 colour 
 ## Timers and the application loop
 
 `App.run()` calls `pump(maxWaitMs)` for ever. Each turn it paints if something changed and writes the difference, waits for input (but not longer than the next timer), dispatches the events, runs due timers and calls
-`onIdle`. Events go to the widget under the pointer (mouse) or the focused widget (keys), then to its parents; shortcuts and menus see keys first.
+`onIdle`. Events go to the widget under the pointer (mouse) or the focused widget (keys), then to its parents. The menu bar and the shortcuts with Ctrl, Alt or a function key see a key before the widgets do (but not while a dialog or a menu is open); a shortcut without a modifier only gets keys that no widget wanted.
 
 {{sample tui/timers}}
 
@@ -371,7 +372,7 @@ There is also a colour dialog, `colorDialog(app, initial)`, with the 256 colour 
 **What to notice**
 
 * The key file pressed on the divider (column 39), dragged to column 30 and 20 and released: the divider is now at column 20. Only drags (moving with a button held) are reported by default; `TUI_MOTION=1` asks the terminal for all mouse motion.
-* `app->clicks` is 1, 2 or 3 for double and triple clicks. A widget that sets `app->capture = this` on a press gets all mouse events until the release (that is how drags work).
+* `app->clicks` counts the presses of the same button on the same cell that follow each other within 450 ms: 1 for a single click, 2 for a double click, 3 for a triple click, and it keeps counting. A widget that sets `app->capture = this` on a press gets all mouse events until the release (that is how drags work).
 
 ### Child programs and descriptors
 
@@ -417,26 +418,28 @@ Derive from `tui.Widget`, start the constructor with `super();` (see the warning
 
 The programs of this chapter that start with `App.start()` need a real terminal, so the book's checker only compiles them. Their screens come from `tools/tuishot.py`: it compiles the program,
 starts it in a pseudo terminal of 80 x 24, sends the keys of the `.keys` file next to it (typed text, named keys, mouse clicks, drags, pastes, resizes, environment variables), waits until the program is quiet and
-records the final screen as plain text. The vocabulary is in the writing guide of the book. You can use the same approach for your own programs: the screen emulator it uses is `tests/tui/ptyterm.py`,
+records the final screen as plain text. The vocabulary of the key files is in the writing guide of the book (`docs/book/WRITING.md`, section 7). You can use the same approach for your own programs: the screen emulator it uses is `tests/tui/ptyterm.py`,
 and the toolkit's own `tests/tui.sh` drives the widget gallery and the file manager with it.
+
+This is also the limit of what the book has checked: the emulator understands the sequences the toolkit writes, and it was run with `TERM=xterm-256color` (and the `TERM=linux` of the fallback sample). Real terminal programs, the Linux console, `tmux`, serial lines and AOS were not tried for this chapter.
 
 For tests that run everywhere without a pseudo terminal, use `initHeadless` as in this chapter. Two things it cannot test are the raw mode and signals; the toolkit's test
 `t237` runs the real terminal layer in a pseudo terminal it creates itself.
 
 ## Limits
 
-* There is no multi line editor widget (the AIDE terminal editor brings its own); `TextPane` is read only.
-* Wide characters work as described above, but emoji sequences and right-to-left text do not. The GUI terminal `gterm` draws a wide character in one cell (see [the GUI terminal](#chap-gui-net-and-web)): use `TUI_ASCII=1` there.
-* Windows consoles are not supported (`Terminal.open()` is false); the decoder, the screen, the widgets and the headless `App` do compile and run there.
-* The Linux console has no mouse. Scrolling is done by redrawing the changed rows (no scroll regions), which is fine except on very slow links.
+* There is no multi line editor widget in `tui` and `tuix` (a text field has one line); `TextPane` is read only.
+* Wide characters work as described above, but emoji sequences (flags, skin tones) are drawn as separate characters, and right-to-left text and shaping are not handled. A terminal that draws wide characters in one cell would show a layout that is off by one cell for each of them; [the tui reference](#chap-tui-reference) says this about the GUI terminal `gterm` (see [the GUI terminal](#chap-gui-net-and-web); not tried for this chapter).
+* The toolkit is written for Linux terminals (the source also has code for Android and AOS). `Terminal.open()` returns `false` when the program is built for Windows, so no Windows console is supported. The decoder, the screen, the widgets and the headless `App` do not need a terminal, and every sample of this chapter compiles for every target of the compiler (checked with `samples.py --targets`), but the book ran them on Linux only.
+* With `TERM=linux` the toolkit assumes no mouse. It never uses scroll regions: when text scrolls, the rows that changed are redrawn.
 * Memory is not freed: `new` widgets and dialogs live until the program ends. Create them once.
 
 ## Summary
 
 * `term` decodes keys, mouse and paste into events, knows the capabilities of the terminal and owns raw mode; `tscreen` draws into a buffer and writes only the difference; `tui` and `tuix` are the widgets and the `App` loop.
-* `App.start()` takes over the terminal and returns `false` when there is none; `initHeadless` runs the same widgets without one, with a fake clock and a screen you can read as text.
+* `App.start()` takes over the terminal and returns `false` when there is no usable one; `initHeadless` runs the same widgets without one, with a fake clock and a screen you can read as text.
 * A style is one `int`; colours are downgraded to the nearest colour the terminal has, and symbols fall back to ASCII.
-* Callbacks are functions `int f(int widget)`; objects with a constructor need parentheses or `new`, and your own widgets start with `super();`.
+* Callbacks are functions that take `int` arguments (usually `int f(int widget)`); objects with a constructor need parentheses or `new` (`term.Terminal t;` and `term.Decoder d;` crash with `SIGFPE`), and your own widgets start with `super();`.
 * Menus, dialogs, lists, trees, tables, text panes, the file picker and the command palette are ready made; `Dialog` can run nested (`runDialog`) or event driven (`showDialog`).
 * Children and descriptors are watched by the loop (`watchFd`), so a build never freezes the screen.
 * In raw mode Ctrl+C is an ordinary key; say what it does with `addShortcut`.

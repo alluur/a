@@ -2,7 +2,7 @@
 
 AIDE, the integrated development environment of A, is built from libraries that you can use too. Underneath is an **engine** with no user interface: a system layer, a text buffer with undo, a syntax
 highlighter, themes, project files, searching and build jobs. On top of it sit the **widgets** of `gcode`: a code editor, tabs, a file explorer, find bars, an output panel, a terminal panel, a command
-palette and dialogs. The last section of this chapter assembles them into a small IDE and shows how the real `aide` and `aide-gui` are put together.
+palette and dialogs. The section "Building your own IDE" assembles them into a small IDE and shows how the real `aide` and `aide-gui` are put together.
 
 In this chapter:
 
@@ -11,8 +11,8 @@ In this chapter:
 * the widgets of `gcode` and its eight parts, most of them shown in a picture;
 * **building your own IDE** from these parts.
 
-The widgets use windows, boxes and menus from [GUI basics](#chap-gui-basics) and [more widgets](#chap-gui-more-widgets). Pictures here are taken the way [the display server chapter](#chap-display-server)
-describes: a server and a client in one program. The documents behind this chapter are [the GUI reference](#chap-gui-reference) (the code editor widgets) and [the AIDE notes](#chap-aide) (the engine).
+The widgets use windows, boxes and menus from [GUI basics](#chap-gui-basics) and [more widgets](#chap-gui-more-widgets). Most pictures here are taken the way [the display server chapter](#chap-display-server)
+describes: a server and a client in one program (the picture of the little IDE is taken by the screenshot tool, with a headless display server and the program as a client). The documents behind this chapter are [the GUI reference](#chap-gui-reference) (the code editor widgets) and [the AIDE notes](#chap-aide) (the engine).
 
 ## The layers
 
@@ -59,7 +59,7 @@ free them with `asys.free`. Errors are `-errno` numbers (`-asys.ENOENT`); `asys.
 **What to notice**
 
 * `writeFileAtomic` writes a temporary file next to the target, flushes it and renames it over the target, so a crash never leaves a half written file. The permissions of an existing file are kept, a symbolic link is
-  resolved, and `W_BACKUP` keeps the old content as `NAME~`. `writeFile` is the plain overwrite.
+  resolved (a file with several hard links is overwritten in place instead, so that all its names keep working), and `W_BACKUP` keeps the old content as `NAME~`. `writeFile` is the plain overwrite.
 * `readFile(path, &length, limit, &error)` reads **regular files only**: a directory or a FIFO is refused at once with "not a regular file" and never blocks. A size limit gives "file too large".
 * `listDir` reads names and kinds with `getdents64`, without a `stat` per entry; `sort(dirsFirst, ignoreCase)` orders them. `mkdirs` is `mkdir -p`; `validName` refuses `""`, `.`, `..`, names with `/`, `\` or control characters, and names
   longer than `nameMax()` (255 bytes; 55 on AOS).
@@ -79,7 +79,7 @@ Processes use the same conventions:
 
 ## acode: buffer and editor
 
-The text of a document is a **gap buffer** (UTF-8 bytes, `\n` between lines) with a line index that is a second gap array. Edits near the previous edit cost almost nothing: 100,000 lines appended one at a time took 33 ms when measured for this book (the AIDE notes say about 50 ms),
+The text of a document is a **gap buffer** (UTF-8 bytes, `\n` between lines) with a line index that is a second gap array. Edits near the previous edit cost almost nothing: 100,000 lines appended one at a time took between 33 and 65 ms in repeated runs for this book (the AIDE notes say about 50 ms),
 and a file of 124 MB with 2 million lines loaded in 0.9 s. An edit far from the last one costs the move of the gaps (5.6 ms on average over 1,000 random edits in that file; the AIDE notes say about 6 ms).
 The times are from one shared computer and will differ on yours.
 
@@ -142,7 +142,7 @@ Nine are built in: `dark light solarized-dark solarized-light monokai high-contr
 **What to notice**
 
 * A theme file is INI with `[theme]`, `[colors]` and `[tokens]`. It only names what it changes; the rest comes from `base`. Unknown keys and bad colours give warnings and leave the base value; random bytes or a file over 1 MB give the base theme and warnings, never a crash.
-* `validate` warns about unreadable contrast: text against its background (and the text of the bars and menus against theirs) must reach 4.5:1 (WCAG AA); line numbers, the cursor, the selection, errors and warnings and the syntax colours 3:1. `contrast(a, b)` is the ratio times 100 (13.17:1 is 1317), computed from a linearisation table.
+* `validate` warns about unreadable contrast: text against its background (and the text of the bars and menus against theirs) must reach 4.5:1 (WCAG AA); line numbers, the cursor, the text on the selection, errors and warnings and the syntax colours 3:1. `contrast(a, b)` is the ratio times 100 (13.17:1 is 1317), computed from a linearisation table.
 * The colour helpers: `rgb`, `parseColor` (`#fa0`, `#ffaa00`, `ffaa00`, `0xffaa00` or a name), `formatColor`, `mix`, `lighten`, `darken`, `to256` / `from256`, `to16` / `from16`, `luminance`, `readable`.
 
 The user's settings are a small INI file:
@@ -225,7 +225,7 @@ Snippets expand to code that fits the line:
 **What to notice**
 
 * The built-in snippets (`main`, `for`, `class`, `println`, `guimain` ...) plus the user's `snippets.ini`. `expandWord` replaces the word before the caret (Tab does this in an editor); the caret goes where `$0` was.
-* The expansion keeps the indentation of the line and uses the document's indent unit; the output is sized exactly, so any depth works, and a snippet that would grow beyond 8 MB is refused.
+* The expansion keeps the indentation of the line and uses the document's indent unit; the output is sized exactly, so deep indentation works, and a snippet that would grow beyond 8 MB, or be inserted at an indentation of more than 65,536 bytes, is refused.
 * `Recovery` (copies of unsaved documents in `CONFIG/recovery`, found again after a crash) and `Session` (the open files and carets of a project) are in this module too; they were not run for this chapter.
 
 ## The widgets of gcode
@@ -236,7 +236,7 @@ so `gcode.theLook()->setThemeName("monokai")` repaints all of them at once.
 | Part | What is in it |
 |---|---|
 | `gcode_core` | `Look`, `theLook()` / `setLook()`, `LineEdit` (a text box in the theme's colours), the key name helpers (`keyFromName`, `parseKeys`, `keyName`, `formatKeys`), `findTheme` / `themeDirectory`, small drawing helpers (`drawArrow`, `drawClipped`) |
-| `gcode_doc` | `Doc`: a buffer, its editor, highlighter, language, markers (`Mark`) and bookmarks (one per tab); `docCount()` / `docAt()` for all documents, the shared `completer()` |
+| `gcode_doc` | `Doc`: a buffer, its editor, highlighter, language, markers (`Mark`) and bookmarks (a tab holds one `Doc`); `docCount()` / `docAt()` for all documents, the shared `completer()` |
 | `gcode_editor` | `CodeEditor` |
 | `gcode_bars` | `TabBar`, `FindBar`, `GotoBar` (and `parseGoto`), `StatusBar`, `EditorStatus`, `Outline`, and the themed building blocks `FlatButton`, `BarBox`, `BarLabel`, `RowList` |
 | `gcode_panes` | `FileTree`, `OutputPane` (with its parts `OutputView` and `ProblemsView`), `TerminalPane`, the file icon helpers `iconKindOf` / `drawFileIcon` |
@@ -249,7 +249,7 @@ You import `gcode`, never one of the parts alone: they are files of the one modu
 ### The editor
 
 A `CodeEditor` is a `gui.Widget` that draws a gutter with line numbers, bookmark and error markers, syntax colours from the theme, a caret, selections, the current line, other uses of the word at the caret, the matching bracket, find matches, squiggles under
-markers, indentation guides and white space marks. **Only the visible lines are drawn and lexed**, and an edit repaints only the rows that changed, so a file of 100,000 lines scrolls and takes input like a small one.
+markers, indentation guides and white space marks. **Only the visible lines are drawn and lexed**, and an edit inside one line repaints only the rows that changed, so a file of 100,000 lines scrolls and takes input like a small one.
 
 {{sample gcode/editor_view}}
 
@@ -286,8 +286,8 @@ Themes change the look of every widget that uses the same `Look`, or of one edit
 **What to notice**
 
 * `TabBar.addTab(title, userData)`: the user data is the `Doc`. Tabs have a modified dot (`setModified`), close buttons (`onClose` can veto), middle click closes, tabs can be dragged to reorder, and an overflow gets arrows and a list.
-* `FindBar` is built on `afind`: incremental, Enter and Shift+Enter, "3 of 12", toggles for case, whole word and regular expression, Replace and Replace All (one undo step). It **follows the document the editor shows**: after a tab switch the count and Replace work on the new
-  text at once. The matches are highlighted in the editor; `GotoBar` understands `12`, `12:5`, `+10` and `-3`.
+* `FindBar` is built on `afind`: incremental, Enter and Shift+Enter, a count ("3 of 12", "5 found" when no match is selected, "No results"), toggles for case, whole word, regular expression and "only in the selection", Replace and Replace All (one undo step). It **follows the document the editor shows**: after a tab switch the count and Replace work on the new
+  text at once. The matches are highlighted in the editor; `GotoBar` understands `12`, `12:5`, `+10` and `-3`. In a narrow window the find bar drops parts to keep room for the text field: first the count, then the toggles, then the previous / next buttons (Enter and Shift+Enter still work). That is why the picture, where the outline takes 170 of the 700 pixels, shows no "5 found" (the program prints `matchCount`), and why the language section of the status bar is cut off at its right end.
 * `Outline` lists the symbols of the document (`asyntax.symbols`) with kind badges and a filter, follows the caret and refreshes after edits (up to 2 s later for documents over 500 KB). The sample shows two symbols: the two functions.
 * `EditorStatus` is a `StatusBar` that knows the editor: position (`Ln 1, Col 10`), the number of selected characters or of cursors, tabs or spaces (a click toggles), encoding, line ends (a click cycles) and language. The editor tells the others through `editor->observe(f, user)` with the events
   `EV_CHANGE`, `EV_CURSOR`, `EV_SCROLL` and `EV_DOC`; that is how these widgets follow it without the editor knowing them.
@@ -367,7 +367,7 @@ The theme editor edits a whole theme while you watch:
 * `SearchPane` is find in files on `aproject.FindJob`: a query field, toggles, a file name pattern, Search and Stop. The results are lines `path:line:col: text` and one click calls `onJump(pane)`. The search runs in steps from a timer; `step()` does it by hand, as the sample does.
 * `RunPane.start(job, name)` follows a started `aproject.Job` and has an input line: Enter sends a line to the program's standard input and shows it, Ctrl+D ends the input, Ctrl+C in the empty line stops the program. The picture was taken while the program waits for its name; when it
   ends, the pane shows the exit code and the run time (which is why the sample takes the picture before that: the time would change the picture).
-* `DocView` is a list of pages and a `ghtml.HtmlView`: `openDocs()` lists the Markdown files of the documentation folder (`$AIDE_DOCS`, `/usr/share/a/docs`, `/usr/local/share/a/docs`, `./docs`), (and the AIDE user guide, `/usr/share/aide/aide.md`, when it is installed), with links between pages, anchors and `back()`.
+* `DocView` is a list of pages and a `ghtml.HtmlView`: `openDocs()` lists the Markdown files of the documentation folder (`$AIDE_DOCS`, `/usr/share/a/docs`, `/usr/local/share/a/docs`, `./docs` when it contains `LANGUAGE.md`), (and the AIDE user guide, `/usr/share/aide/aide.md`, when it is installed), with links between pages, anchors and `back()`.
   `onOpenFile` is called for a link to a source file.
 
 ## Building your own IDE
@@ -384,7 +384,7 @@ the screenshot tool against a headless display server, after pressing Ctrl+F and
 * **One `Doc` per open file.** The tab bar holds the `Doc*` as the user data of each tab, and the editor shows the selected one with `setDoc`. `openFile` first looks for an existing tab with that path, so opening a file twice shows the same tab.
 * **The editor tells the others.** `EditorStatus`, `Outline` and `FindBar` are given the editor when they are made and follow it through `observe`; the program never copies state between them. The modified dot of the tab is updated from `editor->onChange`.
 * **Files open from the explorer.** `FileTree.onOpen` has `openedPath`. A click on a problem does the reverse: `OutputPane.onJump` opens `jumpPath` and calls `gotoLine`.
-* **A build is a `BuildJob` that the `OutputPane` follows.** `startCompiler` returns `-ENOENT` when `ac` is not found; the sample prints that instead of crashing. The picture does not show this part: it only presses Ctrl+F and types `total`.
+* **A build is a `BuildJob` that the `OutputPane` follows.** `startCompiler` returns `-ENOENT` when `ac` is not found; the sample then writes a line into the output panel instead of crashing. The picture does not show this part: it only presses Ctrl+F and types `total`.
 * **Layout is a `Dock`** with a sidebar of two pages (`PanelTabs`), the centre (tabs, editor, find bar) and the bottom panel. The menu bar and the status bar are above and below it.
 * A global variable named `find` would clash with a function of the standard library (`std` has a `find(char*, char*)`), which is why the find bar is called `findBar`.
 
