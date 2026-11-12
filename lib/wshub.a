@@ -46,6 +46,7 @@ public const KIND_NEW = 2;          // an HTTP request is being read
 public const KIND_WS = 3;           // a WebSocket
 public const KIND_BUSY = 4;         // an HTTP answer is being sent
 public const KIND_SSE = 5;          // an event stream
+public const KIND_LINGER = 6;       // a closed WebSocket whose socket is kept for a moment so that the peer reads the close frame (no RST)
 
 // ---- statistics ------------------------------------------------------------------------------------------------------------------------------------
 public class Stats {
@@ -93,6 +94,7 @@ public class Client {
     public bool closeAfter;         // close when the output is sent
     public bool sent100;
     public int closeStarted;
+    public int lingerStart;
     public int lastSse;
     public char* hubRef;            // the Hub that owns the client
     public int reqStart;            // millis() when the first byte of the current request arrived
@@ -164,6 +166,7 @@ public class Hub {
     public tls.Config* tlsConfig;
     public Client* clients[1000];
     public int nclients;
+    public int nlinger;
     public Client* buckets[2048];
     public Client* freeList;
     public int nextId;
@@ -233,7 +236,8 @@ public class Hub {
     }
 
     // ---- clients ---------------------------------------------------------------------------------------------------------------------------------
-    public int count() { return nclients; }
+    // connections that are not closed (a closed WebSocket that is only waiting for its peer to hang up is not counted)
+    public int count() { return nclients - nlinger; }
 
     // the client with that id, or null (ids are never reused, so a stale id finds nothing)
     public Client* find(int id) {
@@ -281,7 +285,7 @@ public class Hub {
         nclients++;
         c->hashNext = buckets[c->id & 2047];
         buckets[c->id & 2047] = c;
-        stats->current = nclients;
+        stats->current = nclients - nlinger;
     }
 
     // ---- sending ---------------------------------------------------------------------------------------------------------------------------------
@@ -629,6 +633,7 @@ public class Hub {
             pe[n] = net.READABLE;
             if (hasOutput(c)) pe[n] = pe[n] | net.WRITABLE;
             if (c->kind == KIND_BUSY || c->pendLen > 0) pe[n] = pe[n] & ~net.READABLE;
+            if (c->kind == KIND_LINGER) pe[n] = net.READABLE;
             if (pe[n] == 0) pe[n] = net.READABLE;
             pc[n] = c;
             n++;
@@ -708,6 +713,14 @@ public class Hub {
 
     // ---- reading -----------------------------------------------------------------------------------------------------------------------------------
     private void readClient(Client* c) {
+        if (c->kind == KIND_LINGER) {
+            for (int round = 0; round < 8; round++) {
+                int n = net.recvSome(c->fd, rbuf, 16384);
+                if (n == -2) return;
+                if (n <= 0) { c->dead = true; return; }            // the peer hung up: done
+            }
+            return;
+        }
         for (int round = 0; round < 4 && !c->dead; round++) {
             int n = net.recvSome(c->fd, rbuf, 16384);
             if (n == -2) return;
@@ -1045,6 +1058,8 @@ public class Hub {
                     c->deadCode = wsCloseCode(c);
                     c->deadReason[0] = 0;
                 }
+            } else if (c->kind == KIND_LINGER) {
+                if (now - c->lingerStart > 1000) c->dead = true;
             } else if (c->kind == KIND_SSE) {
                 if (sseKeepAliveMs > 0 && now - c->lastSse >= sseKeepAliveMs) {
                     char* ka = ": keepalive\n\n";
@@ -1062,11 +1077,21 @@ public class Hub {
             Client* c = clients[i];
             bool done = c->dead;
             if (!done && c->kind == KIND_WS && c->ws->closed) {
-                // the closing handshake is over (or the connection failed): when the last bytes are out the client goes
+                // the closing handshake is over (or the connection failed): when the last bytes are out the client is finished; the socket stays
+                // for a moment (the peer reads the close frame and hangs up) so that unread data does not turn the close into a reset
                 if (hasOutput(c)) pumpOut(c);
                 if (!hasOutput(c)) {
-                    done = true;
                     c->deadCode = wsCloseCode(c);
+                    closeOut(c);
+                    if (c->ws->closeSent) {
+                        net.shutdown(c->fd, 1);
+                        c->kind = KIND_LINGER;
+                        c->lingerStart = now;
+                        nlinger++;
+                        stats->current = nclients - nlinger;
+                    } else {
+                        done = true;
+                    }
                 }
             } else if (!done && c->kind == KIND_BUSY && !hasOutput(c)) {
                 if (c->closeAfter || stopping) {
@@ -1106,18 +1131,24 @@ public class Hub {
         return 1006;
     }
 
-    private void finish(Client* c) {
+    // the client is over for the application: onClose runs once, the rooms forget it
+    private void closeOut(Client* c) {
         c->closeCode = c->deadCode != 0 ? c->deadCode : 1006;
         c->closeReason = &c->deadReason[0];
         if (c->kind == KIND_WS && c->ws != null && c->ws->closeReason != null && c->deadReason[0] == 0) c->closeReason = c->ws->closeReason;
         if (c->opened) {
+            c->opened = false;
             stats->closed++;
             if (onClose != null) onClose(this, c, c->closeCode);
         }
-        // out of the rooms
         while (c->nrooms > 0) {
             leave(c, c->rooms[0]);
         }
+    }
+
+    private void finish(Client* c) {
+        if (c->kind == KIND_LINGER) nlinger--;
+        closeOut(c);
         // out of the lists
         Client* p = buckets[c->id & 2047];
         Client* prev = null;
@@ -1134,7 +1165,7 @@ public class Hub {
         clients[slot] = last;
         last->slot = slot;
         nclients--;
-        stats->current = nclients;
+        stats->current = nclients - nlinger;
         if (c->fileFd >= 0) { asys.fileClose(c->fileFd); c->fileFd = -1; }
         if (c->tlsSession != null && tls.ready(c->tlsSession)) {
             // a goodbye (close_notify), best effort
@@ -1144,6 +1175,10 @@ public class Hub {
         }
         net.rawClose(c->fd);
         c->fd = -1;
+        if (c->tlsSession != null) {
+            tls.release(c->tlsSession);                          // its buffers serve the next TLS client
+            c->tlsSession = null;
+        }
         recycle(c);
     }
 
@@ -1159,6 +1194,7 @@ public class Hub {
         c->closeAfter = false;
         c->sent100 = false;
         c->closeStarted = 0;
+        c->lingerStart = 0;
         c->path[0] = 0;
         c->origin[0] = 0;
         c->protocol[0] = 0;
