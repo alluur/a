@@ -245,7 +245,80 @@ char id[40];  rng.uuid4(id);                          // from the system generat
 
 Measured by `examples/algo_bench.a` (native x86-64, one run on a shared 4 CPU machine: expect plus or minus 20 percent; everything is compiled by `ac`, doubles are soft float).
 
-SPEEDTABLE
+**ds**
+
+| operation | per second |
+|---|---:|
+| Deque pushBack + popFront | 87 M |
+| RingBuffer push (overwriting) | 172 M |
+| BinaryHeap push + pop (200000 each) | 3.4 M |
+| OrderedMap put (random keys) | 957 K |
+| OrderedMap get | 2.2 M |
+| OrderedMap floorNode | 2.0 M |
+| OrderedMap rank | 2.2 M |
+| OrderedMap remove (mostly absent keys) | 1.6 M |
+| HashMap put (int keys, 500000 keys) | 8.8 M |
+| HashMap get | 16 M |
+| TextHashMap add (text keys) | 4.5 M |
+| TextHashMap get | 10 M |
+| Trie put (text keys) | 2.8 M |
+| Trie countPrefix | 31 M |
+| Trie countWildcard (100000 keys) | 29 K |
+| DisjointSet unite (random pairs) | 7.4 M |
+| DisjointSet find | 60 M |
+| BitSet set (random bit) | 97 M |
+| BitSet count (1000000 bits) | 13 K |
+| Fenwick add / prefix (500000 each) | 14 M |
+| SegTree range add / range sum (lazy) | 678 K |
+| LruCache get / put (capacity 10000, 20000 keys) | 5.3 M |
+| BloomFilter add + mightContain | 16 M |
+| CountMinSketch add + estimate | 61 M |
+
+**strx**
+
+| operation | per second |
+|---|---:|
+| Kmp.count: bytes per second (4 MB, 12 letter pattern) | 108 M |
+| Horspool.count: bytes per second | 133 M |
+| RabinKarp.count: bytes per second | 65 M |
+| AhoCorasick (500 patterns): bytes per second | 15 M |
+| levenshtein of two 40 letter texts | 84 K |
+| levenshteinMax(k = 3) of two 40 letter texts | 1.4 M |
+| osa of two 40 letter texts | 74 K |
+| jaroWinkler of two 40 letter texts | 185 K |
+| lcsLength of two 40 letter texts | 130 K |
+| SuffixArray build: letters per second (2 MB, 4 letters) | 2.5 M |
+| SuffixArray.count of a 5 letter pattern | 1.2 M |
+| longestPalindrome (Manacher): letters per second | 22 M |
+| LineDiff.run: lines per second (100000 lines, 400 edits) | 6.7 M |
+| FuzzyMatcher.rank: candidates per second | 3.6 M |
+| globMatch src/**/*.a | 3.8 M |
+| SplitMix64.nextU64 | 204 M |
+
+**rng**
+
+| operation | per second |
+|---|---:|
+| Xoshiro256.nextU64 | 71 M |
+| Pcg32.nextU64 (two 32 bit outputs) | 67 M |
+| Pcg64.nextU64 | 48 M |
+| Mt19937.nextU64 (two 32 bit outputs) | 18 M |
+| ChaCha20Rng.nextU64 (CSPRNG) | 2.6 M |
+| below(1000) (Lemire, no bias) | 38 M |
+| nextDouble (soft float) | 2.8 M |
+| normal (ziggurat) | 1.0 M |
+| exponential (ziggurat) | 965 K |
+| gamma(2.5) | 99 K |
+| poisson(4) | 735 K |
+| poisson(100) (PTRS) | 20 K |
+| binomial(100, 0.1) | 104 K |
+| shuffle: elements per second | 14 M |
+| sample(1000000, 1000): samples per second x 1000 | 8.3 M |
+| AliasTable.sample (1000 categories) | 3.3 M |
+| uuid4 | 685 K |
+
+How to read it: the byte and letter rates are for the whole run of one search or build; the others are single operations. `Kmp`, `Horspool`, `RabinKarp` and `AhoCorasick` scan 4 MB of random text over four letters. Soft float makes the `double` based
+functions much slower than the integer ones (`normal` needs about 1 microsecond, `gamma` 10, `poisson(100)` 50, because their rare branches call the 45 microsecond `log` and `exp`); the integer generators run at 15 to 200 million numbers per second.
 
 ---
 
