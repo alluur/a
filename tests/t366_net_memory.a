@@ -1,0 +1,190 @@
+// Memory of the client side and of the toolkits: whatever a program does again and again, over months, must not grow: HTTP requests (keep-alive,
+// redirects, cookies, streaming, ranges, JSON and multipart posts), event stream clients, JSON-RPC clients (HTTP and WebSocket) and servers,
+// WebSocket clients that connect and disconnect. A hub in the same process serves them; the heap position (what `new`, alloc and strdup use up,
+// which is never given back) must stay exactly where it is after a warm-up. Objects made by the factory functions (httpx.newClient,
+// httpx.newMultipart, httpx.newCookieJar, sse.connect, jsonrpc.connect*, websocket.connect, conn.create) are freed by dispose() completely.
+import wshub;
+import websocket;
+import httpx;
+import jsonrpc;
+import json;
+import sse;
+import net;
+import asys;
+
+wshub.Hub* hub;
+int PORT;
+
+int hook() { hub->poll(0); return 0; }
+void settle() { for (int i = 0; i < 30; i++) hub->poll(0); }
+
+int hello(httpx.Context* x) { x->res->text(200, "hello"); return 0; }
+int redir(httpx.Context* x) { x->res->redirect(302, "/hello"); return 0; }
+int cookie(httpx.Context* x) { x->res->setHeader("Set-Cookie", "sid=abc; Path=/; Max-Age=3600"); x->res->text(200, "ok"); return 0; }
+int upload(httpx.Context* x) {
+    httpx.Part* parts[20];
+    char* ct = x->req->header("Content-Type");
+    int n = ct == null ? -1 : httpx.parseMultipart(ct, x->req->body, x->req->bodyLen, &parts[0], 20);
+    if (n < 0) { x->res->text(400, "bad"); return 0; }
+    httpx.freeParts(&parts[0], n);
+    x->res->text(200, "uploaded");
+    return 0;
+}
+json.Json* rpcAdd(jsonrpc.Call* c) {
+    json.Json* a = c->param(0, "a"); json.Json* b = c->param(1, "b");
+    if (a == null || b == null) { c->fail(jsonrpc.INVALID_PARAMS, "need a and b", null); return null; }
+    return json.newInt(a->asInt() + b->asInt());
+}
+int onHttp(wshub.Hub* h, wshub.Client* c, httpx.Request* req, httpx.Response* res) {
+    if (streq(&req->path[0], "/events")) { sse.startResponse(res); return 1; }
+    return 0;
+}
+int onOpen(wshub.Hub* h, wshub.Client* c) {
+    if (c->isEventStream()) h->sendEvent(c, "hello", "welcome", "0");
+    return 0;
+}
+int sinkCb(char* user, char* data, int n) { return 0; }
+
+char url[100];
+void u(char* path) { format(&url[0], 100, "http://127.0.0.1:%d%s", PORT, path); }
+
+httpx.Client* hc;
+httpx.Client* hk;
+httpx.Client* hcookie;
+
+void opGet() { u("/hello"); httpx.Reply* r = hc->get(&url[0]); if (r != null) r->dispose(); }
+void opKeep() { u("/hello"); httpx.Reply* r = hk->get(&url[0]); if (r != null) r->dispose(); }
+void opRedir() { u("/redir"); httpx.Reply* r = hc->get(&url[0]); if (r != null) r->dispose(); }
+void opCookie() { u("/cookie"); httpx.Reply* r = hcookie->get(&url[0]); if (r != null) r->dispose(); u("/hello"); r = hcookie->get(&url[0]); if (r != null) r->dispose(); }
+void opStream() { u("/hello"); httpx.Reply* r = hc->stream(&url[0], sinkCb, null); if (r != null) r->dispose(); }
+void opRange() { u("/index.html"); httpx.Reply* r = hc->getRange(&url[0], 2, 5); if (r != null) r->dispose(); }
+void opPostJson() { u("/rpc"); httpx.Reply* r = hc->postJson(&url[0], "{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":1}"); if (r != null) r->dispose(); }
+void opMulti() {
+    httpx.Multipart* m = httpx.newMultipart();
+    m->addField("a", "b"); m->addFile("f", "x.txt", "text/plain", "hello", 5);
+    u("/upload"); httpx.Reply* r = hc->postMultipart(&url[0], m); if (r != null) r->dispose();
+    m->dispose();
+}
+void opClientLife() {
+    httpx.Client* c = httpx.newClient();
+    c->keepAlive = true;
+    c->cookies = httpx.newCookieJar();
+    u("/cookie");
+    httpx.Reply* r = c->get(&url[0]); if (r != null) r->dispose();
+    u("/hello");
+    r = c->get(&url[0]); if (r != null) r->dispose();
+    c->cookies->dispose();
+    c->dispose();
+}
+void opRpcBad() {                       // a parse error, a batch, an unknown method, a notification: every answer path of the dispatcher
+    u("/rpc");
+    httpx.Reply* r = hc->postJson(&url[0], "{not json"); if (r != null) r->dispose();
+    r = hc->postJson(&url[0], "[{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":1},{\"jsonrpc\":\"2.0\",\"method\":\"nope\",\"id\":2},{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1]}]");
+    if (r != null) r->dispose();
+    r = hc->postJson(&url[0], "{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":{\"a\":5,\"b\":6},\"id\":\"x\"}"); if (r != null) r->dispose();
+    r = hc->postJson(&url[0], "[]"); if (r != null) r->dispose();
+}
+void opRpcBatch() {
+    u("/rpc");
+    jsonrpc.Client* c = jsonrpc.connectHttp(&url[0]);
+    json.Json* p = json.parse("[1,2]");
+    jsonrpc.Batch* b = c->batch();
+    int i = b->add("add", p);
+    b->notify("add", p);
+    int j = b->add("add", p);
+    if (b->send() && b->result(i) == null) printf("no result\n");
+    if (b->result(j) == null) printf("no result\n");
+    b->dispose();
+    p->dispose();
+    c->dispose();
+}
+void opSse() {
+    u("/events");
+    sse.Client* c = sse.connect(&url[0]);
+    sse.Event* e = c->next(2000);
+    if (e != null) e->dispose();
+    c->close();
+    c->dispose();
+}
+void opRpcHttp() {
+    u("/rpc");
+    jsonrpc.Client* c = jsonrpc.connectHttp(&url[0]);
+    json.Json* p = json.parse("[1,2]");
+    json.Json* r = c->call("add", p);
+    if (r != null) r->dispose();
+    p->dispose();
+    c->dispose();
+}
+void opRpcWs() {
+    char w[100]; format(&w[0], 100, "ws://127.0.0.1:%d/", PORT);
+    jsonrpc.Client* c = jsonrpc.connectWebSocket(&w[0]);
+    json.Json* p = json.parse("[1,2]");
+    json.Json* r = c->call("add", p);
+    if (r != null) r->dispose();
+    p->dispose();
+    c->dispose();
+}
+void opWs() {
+    char w[100]; format(&w[0], 100, "ws://127.0.0.1:%d/", PORT);
+    websocket.WebSocket* ws = websocket.connect(&w[0]);
+    ws->sendText("{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":1}");
+    websocket.Message* m = ws->receiveMessage();
+    if (m != null) m->dispose();
+    ws->closeWith(1000, null);
+    settle();
+    ws->dispose();
+}
+
+void run(char* name, func f) {
+    for (int i = 0; i < 4; i++) f();
+    settle();
+    int h0 = __heap_pos;
+    for (int i = 0; i < 10; i++) f();
+    settle();
+    char t[120];
+    format(&t[0], 120, "%s: 10 operations leave the heap where it was", name);
+    check(&t[0], __heap_pos == h0);
+}
+
+int fails = 0;
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int main() {
+    makeDir("build/tests/www366t");
+    writeFile("build/tests/www366t/index.html", "0123456789 a small file");
+    hub = new wshub.Hub();
+    hub->onHttp = onHttp;
+    hub->onOpen = onOpen;
+    jsonrpc.Dispatcher* d = new jsonrpc.Dispatcher();
+    d->add("add", rpcAdd);
+    hub->user = (char*) d;
+    hub->onMessage = jsonrpc.hubMessage;
+    httpx.Router* router = new httpx.Router();
+    router->get("/hello", hello);
+    router->get("/redir", redir);
+    router->get("/cookie", cookie);
+    router->post("/upload", upload);
+    router->add("POST", "/rpc", jsonrpc.httpHandler, (char*) d);
+    hub->router = router;
+    hub->staticDir = "build/tests/www366t";
+    hub->listen(0);
+    PORT = hub->port;
+    net.setIdleHook(hook);
+    hc = httpx.newClient();
+    hk = httpx.newClient(); hk->keepAlive = true;
+    hcookie = httpx.newClient(); hcookie->cookies = httpx.newCookieJar();
+    run("get", opGet); run("keepalive", opKeep); run("redirect", opRedir); run("cookies", opCookie); run("stream", opStream);
+    run("range", opRange); run("postJson", opPostJson); run("multipart", opMulti); run("sse client", opSse); run("rpc errors", opRpcBad); run("rpc batch", opRpcBatch); run("client life", opClientLife);
+    run("rpc http", opRpcHttp); run("rpc ws", opRpcWs); run("ws client", opWs);
+    net.setIdleHook(null);
+    hub->shutdown(200);
+    printf("failures: %d\n", fails);
+    return fails;
+}

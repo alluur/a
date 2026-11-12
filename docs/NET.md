@@ -153,7 +153,7 @@ import sse;
 char* wire = sse.eventText("update", "line 1\nline 2", "7", 0);      // event: update / id: 7 / data: line 1 / data: line 2 / blank line (a heap string)
 sse.begin(fd);  sse.send(fd, "tick", "now", "1");  sse.comment(fd, "keep-alive");     // on a plain socket (http.serve handlers)
 
-sse.Client* c = new sse.Client("http://localhost:8080/events");     // https works too
+sse.Client* c = sse.connect("http://localhost:8080/events");          // https works too; c->dispose() frees it
 sse.Event* e = c->next(5000);                                        // waits at most 5 s; null: nothing yet (c->closed: given up)
 println(e->event); println(e->data); println(e->id);  e->dispose();
 ```
@@ -170,7 +170,7 @@ events waiting. The client sends `Last-Event-ID`, follows up to 3 redirects, und
 | Feature | How |
 |---|---|
 | redirects 301 302 303 307 308 | `maxRedirects` (default 10). 303 becomes GET (HEAD stays); 301 and 302 turn POST into GET; 307, 308 and 301/302 of other methods keep method and body; `Authorization` and `Cookie` are dropped on a redirect to another host; relative, absolute and `//host` locations, dot segments |
-| cookies | `client->cookies = new httpx.CookieJar()`: Set-Cookie after RFC 6265 (Domain, Path, Expires, Max-Age, Secure, HttpOnly, SameSite, `__Secure-` and `__Host-`), 50 per host and 256 in all |
+| cookies | `client->cookies = httpx.newCookieJar()`: Set-Cookie after RFC 6265 (Domain, Path, Expires, Max-Age, Secure, HttpOnly, SameSite, `__Secure-` and `__Host-`), 50 per host and 256 in all |
 | keep-alive | `keepAlive = true` reuses the connection; a kept connection that went stale is replaced without the caller noticing |
 | retries | `retries`, `retryBackoffMs` (doubling, at most 5 s): connection errors and 502, 503, 504, 429 (`Retry-After` up to 5 s); only idempotent methods unless `retryAll` |
 | timeouts | `connectTimeoutMs`, `sendTimeoutMs`, `headerTimeoutMs`, `bodyTimeoutMs`, `totalTimeoutMs` (https: the TLS layer reads with its own 10 s limit) |
@@ -222,14 +222,28 @@ and a server in one thread, which works the same on every target including Windo
 
 ## Memory
 
-Everything that lives long is freed: `WebSocket`, `Message`, `Headers`, `Request`, `Response`, `Reply`, cookies, multipart parts, JSON values and the texts that `stringify` makes use the malloc heap and have
-`dispose()` (or are freed with `free`). A `wshub` reuses its client objects, buffers and TLS sessions (`tls.release`), so it runs in constant memory; the tests check this with the heap position. What is **not**
-freed, because the runtime's `new` / `alloc` never frees: the `conn.Connection` object itself and the strings that `strdup` makes (a few hundred bytes per connection or request), and the
-cryptography inside a TLS handshake (big numbers; about 50 KB per handshake with both ends in one process). A TLS server that handles millions of connections should be restarted now and then or sit
+A long running program must not grow. Everything that lives long is freed: `WebSocket`, `Message`, `Headers`, `Request`, `Response`, `Reply`, cookies, multipart
+parts, JSON values and the texts that `stringify` makes use the malloc heap and have `dispose()` (or are freed with `free`). The runtime's `new` and `alloc` never give memory back, so
+the objects that a program creates again and again have **factory functions** whose `dispose()` frees the object completely:
+
+| Make it with | Free it with |
+|---|---|
+| `websocket.connect(url)`, `websocket.accept(...)` | `ws->dispose()` (also the connection that `connect` made) |
+| `httpx.newClient()`, `httpx.newCookieJar()`, `httpx.newMultipart()` | `client->dispose()`, `jar->dispose()`, `form->dispose()` |
+| `sse.connect(url)` | `client->dispose()` |
+| `jsonrpc.connectHttp(url)`, `connectWebSocket(url)`, `connectStream(c, framing)` | `client->dispose()` (a connection that you gave to `connectStream` stays yours) |
+| `conn.create(handle)`, `listener->accept(ms)` | `connection->dispose()` |
+
+`new httpx.Client()` and the other constructors still work, but their object stays in memory after `dispose()` (the contents are freed); use them for objects that live as long as the program.
+A `wshub` reuses its client objects, buffers and TLS sessions (`tls.release`) and the HTTP side allocates nothing per request, so it runs in constant memory.
+Two tests check this the strict way: `t365` (a hub, served from raw sockets, for every kind of connection) and `t366` (the client side and the toolkits) compare the heap position
+before and after many operations and demand that it did not move at all. (An early version leaked 10 KB in every permessage-deflate message and 176 bytes in every WebSocket handshake;
+a test with a loose limit had let that through.) What is **not** freed: the strings that `strdup` makes (a few bytes per request in some paths of the old `http` module) and the
+cryptography inside a TLS handshake (big numbers in the `bn` module; measured about 20 KB per handshake on a server). A TLS server that handles millions of connections should be restarted now and then or sit
 behind a TLS terminating proxy. On AOS blocks over 128 KiB are never reused address space: message and file buffers here are small (16 KB pieces) except when you send huge messages.
 
 ## Tests
 
-`tests/t340` to `t363` run in the normal suite on every target (client and server in one thread, ephemeral ports): frames and strictness (`t340`-`t344`), permessage-deflate (`t345`), sockets, options, non-blocking and keepalive (`t346`-`t349`), the hub (`t350`-`t354`), SSE (`t355`), httpx (`t356`, `t357`), JSON-RPC (`t358`, `t359`), and the layers underneath: conn and net (`t360`), zlib (`t361`), json (`t362`), TLS session reuse (`t363`). `tests/net.sh` (Linux x86-64; needs python3, curl, openssl; uses the python packages
+`tests/t340` to `t366` run in the normal suite on every target (client and server in one thread, ephemeral ports): frames and strictness (`t340`-`t344`), permessage-deflate (`t345`), sockets, options, non-blocking and keepalive (`t346`-`t349`), the hub (`t350`-`t354`), SSE (`t355`), httpx (`t356`, `t357`), JSON-RPC (`t358`, `t359`), and the layers underneath: conn and net (`t360`), zlib (`t361`), json (`t362`), TLS session reuse (`t363`), memory (`t364` zlib and permessage-deflate, `t365` the hub, `t366` clients and toolkits). `tests/net.sh` (Linux x86-64; needs python3, curl, openssl; uses the python packages
 `websockets` and `requests` when they are installed) checks the modules against independent implementations: python websockets as client and server (permessage-deflate, subprotocols, Origin, wss with a
 verified certificate, 160 KB and 300 KB messages), raw frames with every RFC 6455 violation, curl (Range, ETag, chunked uploads, `Expect: 100-continue`, multipart, JSON-RPC, https) and a python SSE client.
