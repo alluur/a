@@ -42,25 +42,25 @@ What to notice:
 | `concat(a, b)` | `a` followed by `b` |
 | `repeat(s, n)` | `s` written `n` times |
 | `reverse(s)` | the bytes in the opposite order (use `utf8.reverse` for text with accents) |
-| `count(s, sub)` | how many times `sub` occurs, without overlaps |
+| `count(s, sub)` | how many times `sub` occurs, without overlaps (0 when `sub` is empty) |
 | `lastIndexOf(s, c)` | the index of the last character `c`, or -1 |
-| `replace(s, from, to)` | every occurrence of `from` replaced by `to` |
-| `padLeft(s, width, fill)`, `padRight(...)` | fill up to `width` characters with the character `fill` |
+| `replace(s, from, to)` | every occurrence of `from` replaced by `to` (an empty `from` changes nothing) |
+| `padLeft(s, width, fill)`, `padRight(...)` | fill up to `width` bytes with the character `fill` (on the left or on the right) |
 | `capitalize(s)`, `upper(s)`, `lower(s)` | letter case (ASCII letters only) |
-| `isBlank(s)` | true when the text is empty or only white space |
+| `isBlank(s)` | true when the text is empty or has only spaces, tabs and line breaks |
 
 {{sample text/strings_functions}}
 
 What to notice:
 
 * `count("aaaa", "aa")` is 2: matches never overlap, and `replace` works the same way.
-* `padLeft` and `padRight` never cut: a text that is already too long comes back as it is.
+* `padLeft` and `padRight` never cut: a text that is already too long comes back as it is. They count bytes, so a text with accents gets less padding than it looks like it needs.
 * Replacing with an empty text deletes the matches.
 * The case functions know only the letters A to Z. For accented letters you need your own code with `utf8`.
 
 ### Splitting and joining
 
-`split` cuts a text at every occurrence of one separator character and stores the pieces in an array you provide. `join` is the opposite.
+`split(text, sep, out, max)` cuts a text at every occurrence of one separator character and stores the pieces (new strings) in the array `out`, which you provide. `join(parts, n, sep)` is the opposite.
 
 {{sample text/strings_split_join}}
 
@@ -96,8 +96,8 @@ What to notice:
 * `strlen` says 29 and `utf8.length` says 18 for the same text.
 * `utf8.decode(s, pos, &cp)` reads one code point at byte offset `pos` and returns how many bytes it used. That is the loop you write to walk through a text.
 * `utf8.byteOffset(s, index)` converts a character index into a byte offset.
-* `utf8.reverse` keeps multi-byte characters intact. It handles at most 1024 code points; a longer text is cut off.
-* A code point is not always what a reader sees as one character: an accent can be a separate code point, and `utf8.length` counts it as one.
+* `utf8.reverse` keeps multi-byte characters intact. It handles at most 1024 code points: of a longer text only the first 1024 are reversed and the rest is dropped.
+* A code point is not always what a reader sees as one character: an accent can be a separate code point, and `utf8.length` counts it as one more.
 
 Converting between text and arrays of code points:
 
@@ -125,7 +125,7 @@ See the [API reference of `utf8`](#api-utf8).
 
 ## Base64, hexadecimal and URLs: `encoding`
 
-Binary data cannot go into a JSON string, a URL or an e-mail as it is. The `encoding` module turns bytes into safe text and back. Functions that produce text return new strings; the decoding functions write into a buffer you provide and return the number of bytes, or -1 when the input is not valid.
+Binary data cannot go into a JSON string, a URL or an e-mail as it is. The `encoding` module turns bytes into safe text and back. Functions that produce text return new strings. The binary decoders (`base64Decode`, `hexDecode`) write into a buffer you provide and return the number of bytes, or -1 when the input is not valid. `urlDecode` returns a new string.
 
 {{sample text/encoding_base64}}
 
@@ -133,15 +133,15 @@ What to notice:
 
 * The inputs are the Base64 test vectors of RFC 4648. The `=` padding grows as the input shortens.
 * You pass the **length** of binary data: `base64Encode(data, n)`. That is why bytes that are 0 or 255 work.
-* The output buffer of `base64Decode` needs about `strlen(text) * 3 / 4` bytes. The decoder skips white space and accepts text with or without the `=` padding.
-* The decoder returns -1 for characters that are not part of the alphabet.
+* The output buffer of `base64Decode` needs about `strlen(text) * 3 / 4` bytes. The decoder skips white space, accepts text with or without the `=` padding and stops at the first `=`.
+* The decoder returns -1 for characters that are not part of the alphabet (the URL-safe `-` and `_` are not accepted).
 
 {{sample text/encoding_hex_url}}
 
 What to notice:
 
 * `hexEncode` writes lowercase digits; `hexDecode` accepts both cases and returns -1 for an odd number of digits or a non-hex character.
-* `urlEncode` leaves letters, digits and `- _ . ~` alone and writes every other **byte** as `%XX`. A UTF-8 character therefore becomes several escapes.
+* `urlEncode` leaves letters, digits and `- _ . ~` alone and writes every other **byte** as `%XX` with capital hex digits. A UTF-8 character therefore becomes several escapes.
 * `urlDecode` turns `+` into a space and keeps a broken escape such as `%zz` as text.
 
 See the [API reference of `encoding`](#api-encoding).
@@ -174,7 +174,7 @@ What to notice:
 
 ### Text as a picture and back
 
-`textToImage` draws text with a built-in 5 by 7 pixel font. `imageToText` reads such a picture back, even when a few pixels are wrong.
+`textToImage` draws text with a built-in 5 by 8 pixel font (capital letters use 7 rows, letters such as `g` and `y` use the eighth row). `imageToText` reads such a picture back, even when a few pixels are wrong.
 
 {{sample text/codec_text_image}}
 
@@ -183,7 +183,7 @@ What to notice:
 * Every character takes 6 columns (5 plus one blank) and every line 9 rows, and the picture has a margin of one pixel, all multiplied by the scale: `n` characters on one line give a picture `(6n + 1) * scale` wide and `10 * scale` high.
 * `imageToText(img, 0)` detects the scale; pass the scale when you know it.
 * After flipping six pixels the reader still finds the right text, because it picks the closest glyph. `imageToTextWith(img, scale, recogniser)` lets your own neural network do that choice.
-* The font has the characters 32 to 126 (ASCII). Other characters come out as `?`.
+* The font has the characters 32 to 126 (ASCII). Other characters come out as `?` (a UTF-8 character gives one `?` per byte), and `\n` starts a new line.
 
 ### Image files
 
@@ -191,7 +191,8 @@ What to notice:
 
 What to notice:
 
-* `writePgm` / `readPgm` (8 bit grey), `writePbm` / `readPbm` (1 bit, binary or plain text form) and `writeBmp` / `readBmp` (reads 1, 8, 24 and 32 bit) cover the formats that any image viewer opens.
+* `writePgm` / `readPgm` (8 bit grey), `writePbm` / `readPbm` (1 bit, binary or plain text form) and `writeBmp` / `readBmp` (writes 8 bit grey, reads uncompressed 1, 8, 24 and 32 bit) cover the formats that any image viewer opens. `readPgm` also accepts the plain text form of PGM.
+* The write functions return true on success. `writePbm(img, path, threshold, binary)` makes pixels darker than `threshold` black; `binary` chooses the packed form.
 * The binary PBM is the smallest file (229 bytes: one bit per pixel); PGM stores a byte per pixel, the plain text PBM a character per pixel, and the BMP is the largest.
 * A reader returns `null` for a file that is missing or is not in that format.
 
@@ -205,8 +206,8 @@ A regular expression is a short pattern that describes a set of texts: `\d+` mea
 
 | Pattern | Meaning |
 |---|---|
-| `abc`, `\.`, `\n`, `\t`, `\xHH` | literal characters; a backslash makes a special character literal |
-| `.` | any character except a line break (a whole UTF-8 character, not one byte) |
+| `abc`, `\.`, `\n`, `\t`, `\xHH` | literal characters; a backslash makes a special character literal; `\xHH` is one byte given in hexadecimal |
+| `.` | any character except `\n` (a whole UTF-8 character, not one byte) |
 | `[abc]` `[a-z]` `[^0-9]` `[[:alpha:]]` | character classes, ranges, negation, POSIX names |
 | `\d` `\w` `\s` and `\D` `\W` `\S` | digits, "word" characters and white space (`\d` and `\s` are ASCII only; `\w` also matches every non-ASCII character) |
 | `^` `$` `\A` `\Z` `\b` `\B` | start and end of the text (of each line with `(?m)`), start and end always, word boundary and its opposite |
@@ -214,7 +215,7 @@ A regular expression is a short pattern that describes a set of texts: `\d+` mea
 | `*?` `+?` `??` `{n,m}?` | the lazy versions: as few as possible |
 | `a\|b` | alternatives |
 | `(...)` `(?:...)` `(?P<name>...)` `(?<name>...)` | a numbered group, a group that does not capture, a named group |
-| `\1` ... `\9`, `(?P=name)` | back references to what a group matched |
+| `\1` ... `\9` (up to `\32`), `(?P=name)` | back references to what a group matched |
 | `(?=...)` `(?!...)` | look-ahead, positive and negative |
 | `(?i)` `(?s)` `(?m)` `(?i:...)` | flags: ignore case, `.` matches a line break, `^` and `$` per line; the flags can also be given as the second argument of `compile` |
 
@@ -250,7 +251,7 @@ There is no "find all" call. You write a loop with `search` and move `from` to t
 
 What to notice:
 
-* `pos = caps[1] > at ? caps[1] : at + 1;` continues after the match and steps one byte forward after an empty match. Without this a pattern such as `x*` would loop for ever.
+* `pos = caps[1] > at ? caps[1] : at + 1;` continues after the match and steps one byte forward after an empty match. Without this a pattern such as `x*` would loop forever.
 * Groups give you the parts: the sample turns groups 1 and 2 into numbers with `atoi`.
 
 ### Replacing
@@ -265,6 +266,7 @@ What to notice:
 * An empty match is replaced as well: `x*` on `abc` puts a dash before and after every letter, like Python 3.7 and newer.
 * A group that did not take part in the match contributes nothing.
 * `replaceAll` uses the replacement literally and the *simple dialect* described at the end of this section.
+* The result of `replaceGroups` and `replaceAll` (and of `quote`, below) is memory from the `asys` allocator, so you can give it back with `asys.free` if you need to.
 
 ### Anchors and boundaries
 
@@ -324,7 +326,7 @@ What to notice:
 
 What to notice:
 
-* A pattern that does not compile sets `ok` to false. Using such a `Regex` is safe: searches simply find nothing.
+* A pattern that does not compile sets `ok` to false, `error` says why and `errorPos` where in the pattern. Using such a `Regex` is safe: searches simply find nothing.
 * A pattern can have at most 32 capturing groups (`regex.MAXGROUPS`).
 * The engine stops after **5 million steps**: `search` returns -1 and `exceeded` is true. You can change the limit per pattern with `stepLimit`.
 
@@ -334,13 +336,13 @@ Nested quantifiers such as `(a+)+b` can take exponential time on text that does 
 
 ### The simple functions
 
-For a quick test in a tool, four functions compile and cache the pattern for you: `matches` (the whole text), `test` (anywhere), `search` (the position and length) and `quote` (escape a text so that it matches itself). The last eight patterns are cached.
+For a quick test in a tool, four functions compile the pattern for you: `matches` (the whole text), `test` (anywhere), `search` (the position, and the length through a pointer) and `replaceAll` (replace every match, see above). A fifth helper, `quote`, escapes a text so that it matches itself. The compiled patterns of the last eight different patterns are kept, so calling these functions in a loop does not compile each time.
 
 {{sample text/regex_simple}}
 
 What to notice:
 
-* `matches`, `test`, `search` and `replaceAll` use the **simple dialect**: `( ) | { }` are ordinary characters, a `^` that is not first and a `$` that is not last are ordinary characters, `.` also matches a line break. That is why `regex.test("main()", line)` finds a function call and behaves like `grep`.
+* `matches`, `test`, `search` and `replaceAll` use the **simple dialect**: `( ) | { }` are ordinary characters, a `^` that is not first and a `$` that is not last are ordinary characters, `.` also matches a line break and `$` matches only at the very end of the text. That is why `regex.test("main()", line)` finds a function call and behaves like `grep`.
 * `compile(pattern, 0)` and `replaceGroups` use the full syntax. `compile(pattern, regex.F_SIMPLE)` gives the simple dialect as an object.
 * `quote` is for user input: build a pattern from `quote(userText)` and it matches exactly that text.
 
