@@ -242,6 +242,20 @@ a test with a loose limit had let that through.) What is **not** freed: the stri
 cryptography inside a TLS handshake (big numbers in the `bn` module; measured about 20 KB per handshake on a server). A TLS server that handles millions of connections should be restarted now and then or sit
 behind a TLS terminating proxy. On AOS blocks over 128 KiB are never reused address space: message and file buffers here are small (16 KB pieces) except when you send huge messages.
 
+## Limits: what these modules do not do
+
+* **TLS speed.** Public key arithmetic is done in A (no assembly, no hardware help). A TLS 1.3 handshake costs a server about 150 ms of processor time on x86-64 (measured with
+  `tests/net.sh`-style clients against `hub_demo`), and a `wshub` is one thread: while it computes a handshake it serves nobody else. Plain `ws://` and `http://` ports are not affected;
+  for many new `wss://` connections per second put a TLS terminating proxy in front.
+* **permessage-deflate.** Receiving is complete (every parameter, context takeover, dynamic and fixed blocks). Our compressor writes fixed Huffman blocks with a hash chain match finder and never
+  keeps its window between messages, so it compresses less than zlib (text usually to 30 to 50 percent) but every peer accepts it.
+* **HTTP.** HTTP/1.0 and 1.1 only (no HTTP/2, no h2c upgrade, no proxies, no `CONNECT`, no trailers in answers). The client does not keep a cache. `Expect` values other than `100-continue` are ignored.
+  Method names are compared as they come (`get` is not `GET`).
+* **JSON-RPC.** The server cannot call the client over the connection it came in on; messages that the server sends on its own arrive in `onNotification` of the client.
+* **One thread.** All blocking calls of the client side block; the way to wait for several things is `conn.Poller`, `ws->setNonBlocking`, or a `wshub`. `net.setIdleHook` is for tests and GUI programs.
+* **IPv4 only**, like the rest of `net`.
+* **Memory.** Objects made with `new` (instead of the factory functions) keep their own few bytes after `dispose()`; TLS handshakes keep about 20 KB each (see Memory).
+
 ## Tests
 
 `tests/t340` to `t367` run in the normal suite on every target (client and server in one thread, ephemeral ports): frames and strictness (`t340`-`t344`), permessage-deflate (`t345`), sockets, options, non-blocking and keepalive (`t346`-`t349`), the hub (`t350`-`t354`), SSE (`t355`, and from the plain `http` server `t367`), httpx (`t356`, `t357`), JSON-RPC (`t358`, `t359`), and the layers underneath: conn and net (`t360`), zlib (`t361`), json (`t362`), TLS session reuse (`t363`), memory (`t364` zlib and permessage-deflate, `t365` the hub, `t366` clients and toolkits). `tests/net.sh` (Linux x86-64; needs python3, curl, openssl; uses the python packages
