@@ -40,7 +40,7 @@ outside the compiler is needed: no X11, no Wayland, no libc.
 | `dm` | the display manager: users, passwords, login screen, sessions |
 | `syscrypt` | `$6$` SHA-512 password hashes (as in `/etc/shadow`) |
 
-The programs are in `examples/gui/`; tests in `tests/t110`-`t129`, `t240`-`t267` and `t281`-`t282` (gcode, fonts, panels), `tests/gui.sh`, `tests/https.sh`.
+The programs are in `examples/gui/`; tests in `tests/t110`-`t129`, `t240`-`t267` and `t281`-`t283` (gcode, fonts, panels, aidecore), `tests/gui.sh`, `tests/https.sh`.
 
 ## Quick start
 
@@ -89,6 +89,9 @@ s->savePPM("out.ppm");                                       // or saveBMP
   target). `gfx.setFontScales(uiPercent, monoPercent)` scales the shared fonts **in place** (`sans()` and `sansBold()` by the first number, `mono()` by the second; `Font.assign` swaps the glyph data of the
   object, so every widget that holds a pointer to `gfx.sans()` has the new size after its next layout; the terminal calls `remeasure()`), `gfx.setUiFont("mono" | "sans" | "/path/font.afont")` chooses
   the font of sans and sansbold (false for a file that cannot be used), `uiFontScale()` / `monoFontScale()` read the sizes. 100 gives back the exact original fonts.
+  The glyph sets that `setFontScales` makes are **cached** (48 sets, the one used least recently is freed first; `gfx.fontScaleBuilds()` counts the sets that had to be computed): zooming back and forth costs
+  no memory after the first visit of a size (every call used to compute and keep three new sets, about 64 KB, for good). A font that took over `sans()` with `assign` while a scale was set must not be
+  kept across a later `setFontScales`: make a copy with `scaleFont(f, 100)`.
 * `checksum()` gives one number for the whole picture: the same program draws the same pixels on every target, which is how
   the tests compare Linux x64, ARM64, RISC-V, LoongArch and Windows.
 

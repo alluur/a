@@ -141,19 +141,24 @@ public char* commandLineText(char** words, int n) {
 }
 
 // ---- Words: a command line split into words ---------------------------------------------------------------------------------------------
-// Spaces and tabs separate the words; single or double quotes group (there are no escapes). At most 255 words.
+// Spaces and tabs separate the words; single or double quotes group (there are no escapes). Any number of words.
 public class Words {
     public char** argv;                     // null terminated
     public int count;
     private char* text;
 
     public Words(char* line) {
-        argv = (char**) asys.alloc(256 * 8);
+        int cap = 32;
+        argv = (char**) asys.alloc(cap * 8);
         count = 0;
         text = asys.strDup(line == null ? "" : line);
         int len = strlen(text);
         int i = 0;
-        while (i < len && count < 255) {
+        while (i < len) {
+            if (count + 2 > cap) {
+                cap = cap * 2;
+                argv = (char**) asys.realloc((char*) argv, cap * 8);
+            }
             while (i < len && (text[i] == ' ' || text[i] == 9)) { i++; }
             if (i >= len) { break; }
             char* w = &text[i];
@@ -187,6 +192,8 @@ public class Words {
 // ---- run configurations --------------------------------------------------------------------------------------------------------------------
 // What Run starts: the program that the build made (program empty) or another program, with arguments, a working directory (empty:
 // the project folder) and extra environment variables ("NAME=value NAME2='a b'", split like a command line).
+public const RUN_NAME_MAX = 60;
+
 public class RunConfig {
     public char* name;
     public char* program;
@@ -210,6 +217,38 @@ public class RunConfig {
         asys.free(env);
         name = null;
     }
+}
+
+// appends a text to buf at n (cap is the size of buf): a line break becomes a blank (in the project file it would end the line and what
+// follows would be read as a new entry or a new section); returns the new length
+private int putText(char* buf, int n, int cap, char* v) {
+    for (int i = 0; v[i] != 0 && n < cap - 1; i++) {
+        buf[n] = (v[i] == 10 || v[i] == 13) ? ' ' : v[i];
+        n++;
+    }
+    buf[n] = 0;
+    return n;
+}
+
+// appends the line  KEY = VALUE
+private int putKey(char* buf, int n, int cap, char* key, char* value) {
+    n = n + format(&buf[n], cap - n, "%s = ", key);
+    n = putText(buf, n, cap, value);
+    if (n < cap - 1) { buf[n] = 10; n++; buf[n] = 0; }
+    return n;
+}
+
+// Why a name cannot be the name of a run configuration, or null when it can: the name is the text of the section header [run NAME] of the project
+// file, which is only read back when the name is not empty, at most 60 characters long and holds no line break or brackets.
+public char* runNameProblem(char* name) {
+    int n = strlen(name);
+    if (n == 0) { return "The name is empty"; }
+    if (n > RUN_NAME_MAX) { return "The name is longer than 60 characters"; }
+    for (int i = 0; i < n; i++) {
+        if (name[i] < 32 || name[i] == '[' || name[i] == ']') { return "The name must not contain brackets or control characters"; }
+    }
+    if (name[0] == ' ' || name[n - 1] == ' ') { return "The name must not start or end with a space"; }
+    return null;
 }
 
 // ---- the project file ---------------------------------------------------------------------------------------------------------------------------
@@ -356,11 +395,25 @@ public class Project {
         char* foreign = (oldText != null) ? foreignSections(oldText) : null;
         if (foreign != null) { cap = cap + strlen(foreign); }
         char* buf = asys.alloc(cap);
-        int n = format(buf, cap, "[project]\nname = %s\nmain = %s\nbuild = %s\nrun = %s\nignore = %s\n", name, mainFile, buildCmd, runArgs, ignore);
-        n = n + format(&buf[n], cap - n, "flags = %s\noutput = %s\ntarget = %s\nversion = %d\nconfig = %s\n", flags, output, target, version, release ? "release" : "debug");
+        int n = format(buf, cap, "[project]\n");
+        n = putKey(buf, n, cap, "name", name);
+        n = putKey(buf, n, cap, "main", mainFile);
+        n = putKey(buf, n, cap, "build", buildCmd);
+        n = putKey(buf, n, cap, "run", runArgs);
+        n = putKey(buf, n, cap, "ignore", ignore);
+        n = putKey(buf, n, cap, "flags", flags);
+        n = putKey(buf, n, cap, "output", output);
+        n = putKey(buf, n, cap, "target", target);
+        n = n + format(&buf[n], cap - n, "version = %d\nconfig = %s\n", version, release ? "release" : "debug");
         for (int i = 0; i < nruns; i++) {
             RunConfig* r = runs[i];
-            n = n + format(&buf[n], cap - n, "\n[run %s]\nprogram = %s\nargs = %s\ncwd = %s\nenv = %s\n", r->name, r->program, r->args, r->cwd, r->env);
+            n = n + format(&buf[n], cap - n, "\n[run ");
+            n = putText(buf, n, cap, r->name);
+            n = n + format(&buf[n], cap - n, "]\n");
+            n = putKey(buf, n, cap, "program", r->program);
+            n = putKey(buf, n, cap, "args", r->args);
+            n = putKey(buf, n, cap, "cwd", r->cwd);
+            n = putKey(buf, n, cap, "env", r->env);
         }
         if (foreign != null) {
             n = n + format(&buf[n], cap - n, "%s", foreign);
@@ -415,6 +468,7 @@ public class Project {
         ig->loadFile(g, "");
         asys.free(g);
         ig->addPattern(".aide/", "");                    // a configuration directory is never project content
+        ig->addPattern("aide-lock-*", "");               // the mark of a running AIDE (in /tmp on AOS: a project that is /tmp must not list them)
         if (streq(root, "/")) {
             ig->addPattern("/proc/", "");
             ig->addPattern("/dev/", "");
@@ -459,7 +513,7 @@ public class Project {
         if (startsWith(section, "run ") || startsWith(section, "run\t")) {
             char* rn = &section[4];
             while (rn[0] == ' ') { rn = &rn[1]; }
-            if (rn[0] == 0 || strlen(rn) > 60) { return; }
+            if (rn[0] == 0 || strlen(rn) > RUN_NAME_MAX) { return; }
             if (curRun == null || !streq(curRun->name, rn)) { curRun = addRun(rn); }
             if (streqi(key, "program")) { setStr(&curRun->program, value); }
             else if (streqi(key, "args")) { setStr(&curRun->args, value); }
@@ -541,14 +595,12 @@ public class BuildPlan {
     public bool check;
     private char** owned;
     private int nowned;
+    private int cap;
 
     public BuildPlan() {
-        argv = (char**) asys.alloc(80 * 8);
-        owned = (char**) asys.alloc(80 * 8);
-    }
-
-    private void own(char* s) {
-        if (nowned < 80) { owned[nowned] = s; nowned++; }
+        cap = 80;
+        argv = (char**) asys.alloc(cap * 8);
+        owned = (char**) asys.alloc(cap * 8);
     }
 
     public void dispose() {
@@ -564,14 +616,19 @@ public class BuildPlan {
         nowned = 0;
     }
 
+    // appends a word (a copy); the lists grow as needed, so no flag of the project is ever dropped. The argv pointer can change: read it after the plan is complete.
     public void add(char* word) {
-        if (argc < 78) {
-            char* c = asys.strDup(word);
-            own(c);
-            argv[argc] = c;
-            argc++;
-            argv[argc] = null;
+        if (argc + 2 > cap) {
+            cap = cap * 2;
+            argv = (char**) asys.realloc((char*) argv, cap * 8);
+            owned = (char**) asys.realloc((char*) owned, cap * 8);
         }
+        char* c = asys.strDup(word);
+        owned[nowned] = c;
+        nowned++;
+        argv[argc] = c;
+        argc++;
+        argv[argc] = null;
     }
 }
 
@@ -676,8 +733,10 @@ public char* runShellLine(char* cwd, char* env, char* program, char* args) {
     char* q1 = shellQuote(cwd);
     char* q2 = shellQuote(program);
     Words ew(env);
-    int cap = strlen(q1) + strlen(q2) + strlen(args) + strlen(env) * 2 + 80;
-    char* out = asys.alloc(cap + ew.count * 4);
+    // the room for everything: a quoted value can be four times as long as the word (every ' becomes '\'')
+    int cap = strlen(q1) + strlen(q2) + strlen(args) + 80;
+    for (int i = 0; i < ew.count; i++) { cap = cap + strlen(ew.argv[i]) * 4 + 8; }
+    char* out = asys.alloc(cap);
     int o = format(out, cap, "cd %s && ", q1);
     for (int i = 0; i < ew.count; i++) {
         char* eq = ew.argv[i];
@@ -685,14 +744,50 @@ public char* runShellLine(char* cwd, char* env, char* program, char* args) {
         if (k <= 0) { continue; }
         char* val = shellQuote(&eq[k + 1]);
         eq[k] = 0;
-        o = o + format(&out[o], cap + ew.count * 4 - o, "%s=%s ", eq, val);
+        o = o + format(&out[o], cap - o, "%s=%s ", eq, val);
         asys.free(val);
     }
-    o = o + format(&out[o], cap + ew.count * 4 - o, "%s %s", q2, args);
+    o = o + format(&out[o], cap - o, "%s %s", q2, args);
     ew.dispose();
     asys.free(q1);
     asys.free(q2);
     return out;
+}
+
+// the largest text that a snippet may expand to (a snippet of many lines at a very deep indentation is refused, not cut), and the
+// deepest indentation that a snippet is inserted at
+const SNIPPET_MAX_TEXT = 8388608;
+const SNIPPET_MAX_INDENT = 65536;
+
+// The expanded text of a snippet: $0 is dropped (its place goes to *marker, -1 when there is none), every line break gets the indentation
+// of the line that the snippet is inserted in, and every group of four spaces at the start of a line becomes the indent unit. With out ==
+// null nothing is written (the result is the length that the text will have), so the buffer can be sized exactly.
+private int expandInto(char* out, char* src, int sl, char* indent, int il, char* unit, int ul, int* marker) {
+    int o = 0;
+    *marker = -1;
+    for (int i = 0; i < sl; i++) {
+        if (src[i] == '$' && src[i + 1] == '0') {
+            if (*marker < 0) { *marker = o; }
+            // a second $0 repeats the text that was typed at the first one: there is none, so it is left out
+            i++;
+            continue;
+        }
+        if (src[i] == 10) {
+            if (out != null) { out[o] = 10; memcpy(&out[o + 1], indent, il); }
+            o = o + 1 + il;
+            int k = i + 1;
+            while (src[k] == ' ' && src[k + 1] == ' ' && src[k + 2] == ' ' && src[k + 3] == ' ') {
+                if (out != null) { memcpy(&out[o], unit, ul); }
+                o = o + ul;
+                k = k + 4;
+            }
+            i = k - 1;
+            continue;
+        }
+        if (out != null) { out[o] = src[i]; }
+        o++;
+    }
+    return o;
 }
 
 // ---- snippets --------------------------------------------------------------------------------------------------------------------------------
@@ -804,10 +899,11 @@ public class SnippetSet {
         int start = (from >= 0) ? from : caret;
         int ln = b->lineAt(start);
         int ls = b->lineStart(ln);
-        char indent[200];
         int il = 0;
-        int p = ls;
-        while (p < start && il < 190 && (b->byteAt(p) == ' ' || b->byteAt(p) == 9)) { indent[il] = b->byteAt(p); il++; p++; }
+        while (ls + il < start && (b->byteAt(ls + il) == ' ' || b->byteAt(ls + il) == 9)) { il++; }
+        if (il > SNIPPET_MAX_INDENT) { return false; }
+        char* indent = asys.alloc(il + 1);
+        for (int i = 0; i < il; i++) { indent[i] = b->byteAt(ls + i); }
         indent[il] = 0;
         char unit[70];
         int ul = 0;
@@ -817,33 +913,18 @@ public class SnippetSet {
         char* src = texts[idx];
         int sl = strlen(src);
         if (sl > 0 && src[sl - 1] == 10) { sl--; }            // a snippet that ends with a line break ends where the line ends
-        char* out = asys.alloc(sl * 4 + 400);
-        int o = 0;
+        // the exact size first (every line break adds the indentation of the line, every group of four spaces the indent unit): a buffer
+        // that is sized by a guess overflows when a short-lined snippet is expanded deep in a block
         int marker = -1;
-        for (int i = 0; i < sl; i++) {
-            if (src[i] == '$' && src[i + 1] == '0') {
-                if (marker < 0) { marker = o; }
-                else {
-                    // a second $0 repeats the text that was typed at the first one: there is none, so it is left out
-                }
-                i++;
-                continue;
-            }
-            if (src[i] == 10) {
-                out[o] = 10; o++;
-                memcpy(&out[o], &indent[0], il); o = o + il;
-                int k = i + 1;
-                while (src[k] == ' ' && src[k + 1] == ' ' && src[k + 2] == ' ' && src[k + 3] == ' ') {
-                    memcpy(&out[o], &unit[0], ul); o = o + ul;
-                    k = k + 4;
-                }
-                i = k - 1;
-                continue;
-            }
-            out[o] = src[i];
-            o++;
+        int need = expandInto(null, src, sl, indent, il, &unit[0], ul, &marker);
+        char* out = (need <= SNIPPET_MAX_TEXT) ? asys.alloc(need + 1) : null;
+        if (out == null) {
+            asys.free(indent);
+            return false;
         }
+        int o = expandInto(out, src, sl, indent, il, &unit[0], ul, &marker);
         out[o] = 0;
+        asys.free(indent);
         if (marker < 0 || marker > o) { marker = o; }
         if (from >= 0) { ed->setSelection(from, caret); }
         ed->insertText(out, o);
