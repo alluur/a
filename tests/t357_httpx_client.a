@@ -1,0 +1,581 @@
+// httpx client against a wshub: redirects (method and body rules, limits, relative locations, credentials across origins), cookies, keep-alive, retries
+// with backoff, timeouts, streaming and downloads (with resume), ranges, chunked uploads, multipart uploads, gzip, and a scripted server for odd answers
+import httpx;
+import wshub;
+import conn;
+import net;
+import zlib;
+import asys;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+wshub.Hub* hub;
+conn.Listener* script;
+int flakyCount = 0;
+int hubPort = 0;
+char* scriptReply = null;          // what the scripted server sends next (a heap string)
+int scriptLen = 0;
+bool scriptKeepOpen = false;
+bool scriptSilent = false;
+int scriptAccepted = 0;
+conn.Connection* scriptConn = null;
+int scriptServed = 0;
+
+// ---- the hub's application
+char* echoText(httpx.Request* q) {
+    char* t = alloc(q->bodyLen + 1000);
+    char* ct = q->header("Content-Type");
+    char* au = q->header("Authorization");
+    char* ck = q->header("Cookie");
+    char* ua = q->header("User-Agent");
+    char* xt = q->header("X-Token");
+    char* ae = q->header("Accept-Encoding");
+    char* rg = q->header("Range");
+    char* ho = q->header("Host");
+    format(t, q->bodyLen + 1000, "method=%s path=%s ct=%s auth=%s cookie=%s ua=%s xtoken=%s ae=%s range=%s host=%s len=%d body=", &q->method[0], &q->path[0], ct == null ? "-" : ct,
+           au == null ? "-" : au, ck == null ? "-" : ck, ua == null ? "-" : ua, xt == null ? "-" : xt, ae == null ? "-" : ae);
+    int o = strlen(t);
+    // too many arguments for one format call: the rest in a second one
+    char* more = alloc(200);
+    format(more, 200, "range=%s host=%s len=%d body=", rg == null ? "-" : rg, ho == null ? "-" : ho, q->bodyLen);
+    strcat(t, more);
+    o = strlen(t);
+    if (q->bodyLen > 0) memcpy(&t[o], q->body, q->bodyLen);
+    t[o + q->bodyLen] = 0;
+    return t;
+}
+
+int hEcho(httpx.Context* x) { x->res->text(200, echoText(x->req)); return 0; }
+int hHello(httpx.Context* x) { x->res->text(200, "hello"); return 0; }
+int hRedirect(httpx.Context* x) {
+    char* kind = x->req->param("code");
+    int code = atoi(kind);
+    char loc[100];
+    char* to = x->req->header("X-Target");
+    format(&loc[0], 100, "%s", to == null ? "/echo" : to);
+    x->res->redirect(code, &loc[0]);
+    return 0;
+}
+int hLoop(httpx.Context* x) { x->res->redirect(302, "/loop"); return 0; }
+int hRel(httpx.Context* x) { x->res->redirect(302, "../echo?from=rel"); return 0; }
+int hAbs(httpx.Context* x) {
+    char loc[100];
+    format(&loc[0], 100, "http://localhost:%d/echo?from=abs", hubPort);
+    x->res->redirect(301, &loc[0]);
+    return 0;
+}
+int hSet(httpx.Context* x) {
+    x->res->addHeader("Set-Cookie", "sid=abc; Path=/");
+    x->res->addHeader("Set-Cookie", "theme=dark; Path=/cookie; HttpOnly");
+    x->res->addHeader("Set-Cookie", "gone=1; Max-Age=0");
+    x->res->redirect(302, "/echo");
+    return 0;
+}
+int hFlaky(httpx.Context* x) {
+    flakyCount++;
+    if (flakyCount <= 2) {
+        x->res->text(503, "try again");
+        x->res->setHeader("Retry-After", "0");
+        return 0;
+    }
+    x->res->text(200, "finally");
+    return 0;
+}
+int hBig(httpx.Context* x) {
+    char* b = alloc(300000);
+    for (int i = 0; i < 300000; i++) b[i] = 'a' + (i * 7) % 26;
+    x->res->bytes(200, "application/octet-stream", b, 300000);
+    return 0;
+}
+int hGzip(httpx.Context* x) {
+    int n;
+    char* z = zlib.gzip("compress me, compress me, compress me, compress me!", 51, &n);
+    x->res->bytes(200, "text/plain", z, n);
+    x->res->setHeader("Content-Encoding", "gzip");
+    return 0;
+}
+int hUpload(httpx.Context* x) {
+    httpx.Part* parts[10];
+    char* ct = x->req->header("Content-Type");
+    int n = ct == null ? -1 : httpx.parseMultipart(ct, x->req->body, x->req->bodyLen, &parts[0], 10);
+    if (n < 0) { x->res->text(400, "bad multipart"); return 0; }
+    char* t = alloc(500);
+    for (int i = 0; i < n; i++) {
+        char piece[100];
+        if (parts[i]->filename != null) format(&piece[0], 100, "[file %s=%s:%d]", parts[i]->name, parts[i]->filename, parts[i]->length);
+        else format(&piece[0], 100, "[field %s=%s]", parts[i]->name, parts[i]->data);
+        strcat(t, &piece[0]);
+    }
+    httpx.freeParts(&parts[0], n);
+    x->res->text(200, t);
+    return 0;
+}
+int hClose(httpx.Context* x) { x->res->text(200, "closing"); x->res->closeAfter = true; return 0; }
+
+int step() {
+    hub->poll(0);
+    // the scripted server: accepts, reads the request head, sends the canned answer
+    if (script != null) {
+        if (scriptConn == null) {
+            scriptConn = script->accept(0);
+            if (scriptConn != null) scriptAccepted++;
+        }
+        if (scriptConn != null && scriptConn->readable(0)) {
+            char line[300];
+            bool any = false;
+            while (scriptConn->buffered() > 0 || scriptConn->readable(0)) {
+                int n = scriptConn->readLine(&line[0], 300);
+                if (n < 0) { scriptConn->close(); scriptConn = null; break; }
+                any = true;
+                if (n == 0) {
+                    // the head is complete
+                    if (!scriptSilent && scriptReply != null) {
+                        scriptConn->write(scriptReply, scriptLen);
+                        scriptConn->flush();
+                        scriptServed++;
+                    }
+                    if (!scriptKeepOpen && !scriptSilent) { scriptConn->close(); scriptConn = null; }
+                    break;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+void setScript(char* text) {
+    scriptReply = strdup(text);
+    scriptLen = strlen(text);
+}
+
+int sizeOf(char* path) {
+    asys.Stat st;
+    if (asys.stat(path, &st) < 0) return -1;
+    return st.size;
+}
+
+int main() {
+    makeDir("build/tests/www357");
+    writeFile("build/tests/www357/a.txt", "0123456789abcdefghij");
+    hub = new wshub.Hub();
+    httpx.Router* r = new httpx.Router();
+    r->any("/echo", hEcho);
+    r->get("/hello", hHello);
+    r->any("/redirect/:code", hRedirect);
+    r->get("/loop", hLoop);
+    r->get("/dir/rel", hRel);
+    r->get("/abs", hAbs);
+    r->get("/cookie/set", hSet);
+    r->get("/flaky", hFlaky);
+    r->get("/big", hBig);
+    r->get("/gzip", hGzip);
+    r->post("/upload", hUpload);
+    r->get("/close", hClose);
+    hub->router = r;
+    hub->staticDir = "build/tests/www357";
+    hub->listen(0);
+    hubPort = hub->port;
+    script = new conn.Listener(0);
+    net.setIdleHook(step);
+    char base[60];
+    format(&base[0], 60, "http://127.0.0.1:%d", hubPort);
+    char url[200];
+
+    httpx.Client* c = new httpx.Client();
+    // --- the basics
+    format(&url[0], 200, "%s/hello", &base[0]);
+    httpx.Reply* a = c->get(&url[0]);
+    check("GET", a != null && a->status == 200 && streq(a->body, "hello") && a->bodyLen == 5 && a->redirects == 0 && streq(a->url, &url[0]));
+    check("headers of the answer", a->header("content-type") != null && contains(a->header("Content-Type"), "text/plain") && streq(a->header("Content-Length"), "5"));
+    a->dispose();
+    format(&url[0], 200, "%s/echo?x=1", &base[0]);
+    c->headers->set("X-Token", "t0k");
+    a = c->get(&url[0]);
+    check("default headers of the client and the User-Agent", contains(a->body, "xtoken=t0k") && contains(a->body, "ua=A-httpx/1.0") && contains(a->body, "path=/echo") && contains(a->body, "host=127.0.0.1:"));
+    a->dispose();
+    a = c->head(&url[0]);
+    check("HEAD: status and headers, no body", a != null && a->status == 200 && a->bodyLen == 0 && a->header("Content-Length") != null);
+    a->dispose();
+    a = c->postJson(&url[0], "{\"a\":1}");
+    check("POST with a JSON body", contains(a->body, "method=POST") && contains(a->body, "ct=application/json") && contains(a->body, "len=7") && endsWith(a->body, "body={\"a\":1}"));
+    a->dispose();
+    a = c->postForm(&url[0], "a=1&b=two");
+    check("POST form", contains(a->body, "ct=application/x-www-form-urlencoded") && endsWith(a->body, "body=a=1&b=two"));
+    a->dispose();
+    a = c->put(&url[0], "data", 4, "text/plain");
+    check("PUT", contains(a->body, "method=PUT") && endsWith(a->body, "body=data"));
+    a->dispose();
+    a = c->patch(&url[0], "p", 1, "text/plain");
+    check("PATCH", contains(a->body, "method=PATCH"));
+    a->dispose();
+    a = c->del(&url[0]);
+    check("DELETE", contains(a->body, "method=DELETE"));
+    a->dispose();
+    char* bin = alloc(10);
+    bin[0] = 0; bin[1] = 1; bin[2] = 255; bin[3] = 13; bin[4] = 10;
+    a = c->post(&url[0], bin, 5, "application/octet-stream");
+    check("a binary body with NUL bytes", a != null && contains(a->body, "len=5"));
+    a->dispose();
+
+    // --- redirects
+    format(&url[0], 200, "%s/redirect/301", &base[0]);
+    a = c->postJson(&url[0], "{\"x\":1}");
+    check("301 turns POST into GET and drops the body", a != null && contains(a->body, "method=GET") && contains(a->body, "len=0") && contains(a->body, "ct=-") && a->redirects == 1 && endsWith(a->url, "/echo"));
+    a->dispose();
+    format(&url[0], 200, "%s/redirect/302", &base[0]);
+    a = c->postForm(&url[0], "a=1");
+    check("302 turns POST into GET", contains(a->body, "method=GET") && contains(a->body, "len=0"));
+    a->dispose();
+    format(&url[0], 200, "%s/redirect/303", &base[0]);
+    a = c->put(&url[0], "data", 4, "text/plain");
+    check("303 turns PUT into GET", contains(a->body, "method=GET") && contains(a->body, "len=0"));
+    a->dispose();
+    a = c->head(&url[0]);
+    check("303 keeps HEAD", a->status == 200 && a->redirects == 1 && a->bodyLen == 0);
+    a->dispose();
+    format(&url[0], 200, "%s/redirect/307", &base[0]);
+    a = c->postJson(&url[0], "{\"x\":1}");
+    check("307 keeps the method and the body", contains(a->body, "method=POST") && contains(a->body, "len=7") && contains(a->body, "ct=application/json"));
+    a->dispose();
+    format(&url[0], 200, "%s/redirect/308", &base[0]);
+    a = c->put(&url[0], "data", 4, "text/plain");
+    check("308 keeps a PUT", contains(a->body, "method=PUT") && endsWith(a->body, "body=data"));
+    a->dispose();
+    format(&url[0], 200, "%s/redirect/302", &base[0]);
+    a = c->put(&url[0], "data", 4, "text/plain");
+    check("302 does not change a PUT", contains(a->body, "method=PUT") && endsWith(a->body, "body=data"));
+    a->dispose();
+    format(&url[0], 200, "%s/loop", &base[0]);
+    c->maxRedirects = 4;
+    a = c->get(&url[0]);
+    check("a redirect loop ends at maxRedirects", a == null && contains(httpx.error(), "too many redirects"));
+    c->maxRedirects = 10;
+    format(&url[0], 200, "%s/dir/rel", &base[0]);
+    a = c->get(&url[0]);
+    check("a relative Location (../echo?from=rel)", a != null && a->status == 200 && contains(a->body, "path=/echo") && endsWith(a->url, "/echo?from=rel"));
+    a->dispose();
+    format(&url[0], 200, "%s/abs", &base[0]);
+    a = c->get(&url[0]);
+    check("an absolute Location", a != null && a->status == 200 && contains(a->url, "localhost") && contains(a->body, "host=localhost:"));
+    a->dispose();
+    format(&url[0], 200, "%s/redirect/302", &base[0]);
+    c->maxRedirects = 0;
+    a = c->get(&url[0]);
+    check("maxRedirects 0: the redirect itself is returned", a != null && a->status == 302 && streq(a->header("Location"), "/echo"));
+    a->dispose();
+    c->maxRedirects = 10;
+    // credentials stay with the origin
+    httpx.Headers* auth = (httpx.Headers*) malloc(sizeof(httpx.Headers));
+    auth->set("Authorization", "Bearer secret");
+    auth->set("X-Target", "/echo");
+    a = c->request("GET", &url[0], auth, null, 0);
+    check("Authorization is kept on a redirect to the same origin", a != null && contains(a->body, "auth=Bearer secret"));
+    a->dispose();
+    auth->set("X-Target", "http://localhost:");
+    char* far = alloc(100);
+    format(far, 100, "http://localhost:%d/echo", hubPort);
+    auth->set("X-Target", far);
+    a = c->request("GET", &url[0], auth, null, 0);
+    check("... and dropped on a redirect to another host name", a != null && a->status == 200 && contains(a->body, "auth=-") && contains(a->body, "host=localhost:"));
+    a->dispose();
+
+    // --- cookies
+    c->cookies = new httpx.CookieJar();
+    format(&url[0], 200, "%s/cookie/set", &base[0]);
+    a = c->get(&url[0]);
+    check("cookies set by a redirect answer are sent to its target", a != null && contains(a->body, "cookie=sid=abc") && !contains(a->body, "theme=dark") && !contains(a->body, "gone="));
+    a->dispose();
+    int nowSecs = asys.nowMs() / 1000;
+    check("the jar has the two cookies, the third was deleted at once", c->cookies->count(nowSecs) == 2);
+    format(&url[0], 200, "%s/echo", &base[0]);
+    a = c->get(&url[0]);
+    check("later requests send them too", contains(a->body, "cookie=sid=abc"));
+    a->dispose();
+    format(&url[0], 200, "%s/cookie/echo", &base[0]);
+    r->get("/cookie/echo", hEcho);
+    a = c->get(&url[0]);
+    check("a cookie with Path=/cookie goes only below that path", contains(a->body, "sid=abc") && contains(a->body, "theme=dark"));
+    a->dispose();
+    c->cookies->clear();
+    c->cookies = null;
+
+    // --- keep-alive
+    c->keepAlive = true;
+    int connects0 = c->connects;
+    format(&url[0], 200, "%s/hello", &base[0]);
+    a = c->get(&url[0]);
+    check("keep-alive: the first request connects", a != null && !a->reused && c->connects == connects0 + 1);
+    a->dispose();
+    a = c->get(&url[0]);
+    check("the second reuses the connection", a != null && a->reused && c->connects == connects0 + 1);
+    a->dispose();
+    int accepted0 = hub->stats->accepted;
+    for (int i = 0; i < 10; i++) { a = c->get(&url[0]); a->dispose(); }
+    check("ten more on the same connection (the hub accepted nothing new)", c->connects == connects0 + 1 && hub->stats->accepted == accepted0);
+    format(&url[0], 200, "%s/close", &base[0]);
+    a = c->get(&url[0]);
+    check("the server announces Connection: close: the client lets go", a != null && streq(a->header("Connection"), "close") && c->pool == null);
+    a->dispose();
+    format(&url[0], 200, "%s/hello", &base[0]);
+    a = c->get(&url[0]);
+    check("the next request opens a new connection", a != null && !a->reused && c->connects == connects0 + 2);
+    a->dispose();
+    // the server closes an idle connection behind the client's back
+    hub->keepAliveMs = 30;
+    int t0 = millis();
+    while (millis() - t0 < 150) hub->poll(5);
+    a = c->get(&url[0]);
+    check("a stale kept connection is replaced without the caller noticing", a != null && a->status == 200 && !a->reused && c->connects == connects0 + 3);
+    a->dispose();
+    hub->keepAliveMs = 10000;
+    c->keepAlive = false;
+    c->close();
+
+    // --- retries
+    format(&url[0], 200, "%s/flaky", &base[0]);
+    flakyCount = 0;
+    c->retries = 0;
+    a = c->get(&url[0]);
+    check("without retries a 503 is returned", a != null && a->status == 503);
+    a->dispose();
+    flakyCount = 0;
+    c->retries = 3;
+    c->retryBackoffMs = 10;
+    c->slept = 0;
+    a = c->get(&url[0]);
+    check("with retries the third try succeeds (Retry-After: 0 is honoured)", a != null && a->status == 200 && streq(a->body, "finally") && flakyCount == 3 && c->slept == 0);
+    a->dispose();
+    // a dead port: backoff 10, 20, 40
+    int deadPort = hubPort;
+    conn.Listener* tmp = new conn.Listener(0);
+    deadPort = tmp->port();
+    tmp->close();
+    char* dead = alloc(100);
+    format(dead, 100, "http://127.0.0.1:%d/x", deadPort);
+    c->slept = 0;
+    c->retries = 3;
+    a = c->get(dead);
+    check("connection refused is retried with a doubling pause, then fails", a == null && c->slept == 70 && streq(httpx.error(), "cannot connect"));
+    c->slept = 0;
+    a = c->postJson(dead, "{}");
+    check("a POST is not retried", a == null && c->slept == 0);
+    c->retryAll = true;
+    a = c->postJson(dead, "{}");
+    check("... unless retryAll", a == null && c->slept == 70);
+    c->retryAll = false;
+    c->retries = 0;
+
+    // --- timeouts with a scripted server that never answers
+    char* surl = alloc(100);
+    format(surl, 100, "http://127.0.0.1:%d/x", script->port());
+    scriptSilent = true;
+    c->headerTimeoutMs = 120;
+    t0 = millis();
+    a = c->get(surl);
+    int took = millis() - t0;
+    check("no answer: the header timeout ends the request", a == null && contains(httpx.error(), "timed out") && took >= 100 && took < 3000);
+    c->headerTimeoutMs = 15000;
+    c->totalTimeoutMs = 150;
+    t0 = millis();
+    a = c->get(surl);
+    took = millis() - t0;
+    check("the total timeout caps the whole request", a == null && took < 3000);
+    c->totalTimeoutMs = 0;
+    scriptSilent = false;
+    if (scriptConn != null) { scriptConn->close(); scriptConn = null; }
+
+    // --- odd answers (scripted)
+    setScript("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n7;ext=1\r\n, world\r\n0\r\nTrailer: x\r\n\r\n");
+    a = c->get(surl);
+    check("a chunked answer", a != null && a->status == 200 && streq(a->body, "hello, world") && a->bodyLen == 12);
+    a->dispose();
+    setScript("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nuntil the connection closes");
+    a = c->get(surl);
+    check("a body without a length runs until the connection closes", a != null && streq(a->body, "until the connection closes"));
+    a->dispose();
+    setScript("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    a = c->get(surl);
+    check("1xx answers are skipped", a != null && a->status == 200 && streq(a->body, "ok"));
+    a->dispose();
+    setScript("HTTP/1.1 204 No Content\r\n\r\n");
+    a = c->get(surl);
+    check("204 has no body", a != null && a->status == 204 && a->bodyLen == 0);
+    a->dispose();
+    setScript("HTTP/1.0 200 OK\r\nContent-Length: 4\r\n\r\ndata");
+    a = c->get(surl);
+    check("HTTP/1.0", a != null && streq(a->body, "data"));
+    a->dispose();
+    setScript("garbage\r\n\r\n");
+    check("not an HTTP answer", c->get(surl) == null && contains(httpx.error(), "not an HTTP"));
+    setScript("HTTP/1.1 999 Nope\r\nContent-Length: 0\r\n\r\n");
+    check("a status code out of range", c->get(surl) == null);
+    setScript("HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nshort");
+    check("a body that ends before Content-Length", c->get(surl) == null && contains(httpx.error(), "Content-Length"));
+    setScript("HTTP/1.1 200 OK\r\nContent-Length: -5\r\n\r\n");
+    check("a bad Content-Length", c->get(surl) == null);
+    setScript("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n");
+    check("a bad chunk size", c->get(surl) == null && contains(httpx.error(), "chunk"));
+    setScript("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n10\r\nabc");
+    check("a chunked body that is cut off", c->get(surl) == null);
+    setScript("HTTP/1.1 200 OK\r\nbroken header line\r\nContent-Length: 0\r\n\r\n");
+    check("a malformed header line", c->get(surl) == null && contains(httpx.error(), "header"));
+    char* longHdr = alloc(9000);
+    strcpy(longHdr, "HTTP/1.1 200 OK\r\nX-Long: ");
+    for (int i = 0; i < 8500; i++) strcat(longHdr, "a");
+    strcat(longHdr, "\r\nContent-Length: 0\r\n\r\n");
+    setScript(longHdr);
+    check("a header line over 8 KB", c->get(surl) == null);
+    c->maxBody = 100;
+    char* bigBody = alloc(400);
+    strcpy(bigBody, "HTTP/1.1 200 OK\r\nContent-Length: 300\r\n\r\n");
+    for (int i = 0; i < 300; i++) strcat(bigBody, "x");
+    setScript(bigBody);
+    check("a body over maxBody is refused", c->get(surl) == null && contains(httpx.error(), "too big"));
+    setScript("HTTP/1.1 200 OK\r\nContent-Length: 300\r\n\r\nxxxxxxxxxxxxxxxxxxxx");
+    check("... also by Content-Length before it is read", c->get(surl) == null && contains(httpx.error(), "too big"));
+    c->maxBody = 67108864;
+    // keep-alive with a server that closes right after its answer although it did not say so
+    c->keepAlive = true;
+    setScript("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
+    scriptServed = 0;
+    a = c->get(surl);
+    httpx.Reply* a2 = c->get(surl);
+    check("keep-alive against a server that closes silently: the second request still works", a != null && a2 != null && streq(a2->body, "hi") && scriptServed == 2 && scriptAccepted >= 2);
+    c->keepAlive = false;
+    c->close();
+
+    // --- streaming
+    format(&url[0], 200, "%s/big", &base[0]);
+    a = c->get(&url[0]);
+    check("a 300000 byte body in memory", a != null && a->bodyLen == 300000 && a->body[0] == 'a' && a->body[299999] == 'a' + (299999 * 7) % 26);
+    a->dispose();
+    c->maxBody = 100000;
+    check("... with maxBody 100000 it is refused", c->get(&url[0]) == null);
+    c->maxBody = 67108864;
+    StreamCount* sc = (StreamCount*) alloc(sizeof(StreamCount));
+    a = c->stream(&url[0], countPieces, (char*) sc);
+    check("stream: the body goes to the callback in pieces, never into the reply", a != null && a->status == 200 && a->body == null && sc->bytes == 300000 && a->bytes == 300000 && sc->pieces > 10 && sc->sum == expectedSum());
+    a->dispose();
+    sc->bytes = 0; sc->pieces = 0; sc->limit = 20000;
+    a = c->stream(&url[0], countPieces, (char*) sc);
+    check("stream: the callback can stop it", c->sinkAborted && sc->bytes >= 20000 && sc->bytes < 300000);
+    if (a != null) a->dispose();
+    // download
+    int written = 0;
+    int st = c->downloadTo(&url[0], "build/tests/dl357.bin", false, &written);
+    check("downloadTo: 200, written to a file", st == 200 && written == 300000 && sizeOf("build/tests/dl357.bin") == 300000);
+    // resume: keep the first 100000 bytes, download the rest
+    char* part = alloc(100000);
+    for (int i = 0; i < 100000; i++) part[i] = 'a' + (i * 7) % 26;
+    asys.writeFile("build/tests/dl357.bin", part, 100000);
+    format(&url[0], 200, "%s/a.txt", &base[0]);
+    asys.writeFile("build/tests/dl357b.txt", "0123", 4);
+    st = c->downloadTo(&url[0], "build/tests/dl357b.txt", true, &written);
+    check("downloadTo with resume asks for a range and appends (206)", st == 206 && written == 16 && streq(readFile("build/tests/dl357b.txt"), "0123456789abcdefghij"));
+    format(&url[0], 200, "%s/missing", &base[0]);
+    st = c->downloadTo(&url[0], "build/tests/dl357c.bin", false, &written);
+    check("a 404 is not written to the file", st == 404 && !fileExists("build/tests/dl357c.bin"));
+
+    // --- ranges
+    format(&url[0], 200, "%s/a.txt", &base[0]);
+    a = c->getRange(&url[0], 5, 9);
+    check("getRange", a != null && a->status == 206 && streq(a->body, "56789") && streq(a->header("Content-Range"), "bytes 5-9/20"));
+    a->dispose();
+    a = c->getRange(&url[0], 15, -1);
+    check("an open range", a->status == 206 && streq(a->body, "fghij"));
+    a->dispose();
+
+    // --- gzip
+    format(&url[0], 200, "%s/gzip", &base[0]);
+    a = c->get(&url[0]);
+    check("a gzip body stays packed by default", a != null && a->header("Content-Encoding") != null && a->bodyLen < 51 + 20 && (a->body[0] & 255) == 0x1F);
+    a->dispose();
+    c->decompress = true;
+    a = c->get(&url[0]);
+    check("with decompress it is unpacked", a != null && streq(a->body, "compress me, compress me, compress me, compress me!") && a->header("Content-Encoding") == null);
+    a->dispose();
+    format(&url[0], 200, "%s/echo", &base[0]);
+    a = c->get(&url[0]);
+    check("... and Accept-Encoding was sent", contains(a->body, "ae=gzip, deflate"));
+    a->dispose();
+    c->decompress = false;
+
+    // --- uploads
+    httpx.Multipart* m = new httpx.Multipart();
+    m->addField("name", "Ada");
+    m->addField("note", "line1\r\nline2");
+    m->addFile("doc", "report.txt", "text/plain", "0123456789", 10);
+    format(&url[0], 200, "%s/upload", &base[0]);
+    a = c->postMultipart(&url[0], m);
+    check("a multipart upload: fields and a file", a != null && a->status == 200 && streq(a->body, "[field name=Ada][field note=line1\r\nline2][file doc=report.txt:10]"));
+    a->dispose();
+    asys.writeFile("build/tests/up357.txt", "from disk", 9);
+    httpx.Multipart* m2 = new httpx.Multipart();
+    check("a file from disk", m2->addFilePath("f", "build/tests/up357.txt", null) && !m2->addFilePath("g", "build/tests/does-not-exist", null));
+    a = c->postMultipart(&url[0], m2);
+    check("... uploaded with its name", a != null && streq(a->body, "[file f=up357.txt:9]"));
+    a->dispose();
+    // a chunked upload
+    format(&url[0], 200, "%s/echo", &base[0]);
+    ChunkSource* cs = (ChunkSource*) alloc(sizeof(ChunkSource));
+    httpx.Headers* ch = (httpx.Headers*) malloc(sizeof(httpx.Headers));
+    ch->set("Content-Type", "text/plain");
+    a = c->requestChunked("POST", &url[0], ch, nextChunk, (char*) cs);
+    check("a chunked upload: the server gets the whole body", a != null && a->status == 200 && contains(a->body, "len=20000") && cs->sent == 20000);
+    a->dispose();
+
+    // --- bad input
+    check("a URL that is not http", c->get("ftp://x/y") == null && contains(httpx.error(), "http"));
+    check("CR LF in a URL", c->get("http://127.0.0.1/a\r\nX: y") == null);
+    httpx.Headers* evil = (httpx.Headers*) malloc(sizeof(httpx.Headers));
+    check("a header with CR LF cannot even be set", !evil->set("X-A", "b\r\nX-Evil: 1"));
+    check("a method with a space", c->request("GET /evil", &url[0], null, null, 0) == null);
+    net.setIdleHook(null);
+    hub->shutdown(100);
+    printf("failures: %d\n", fails);
+    return fails;
+}
+
+class StreamCount {
+    public int bytes;
+    public int pieces;
+    public int limit;
+    public int sum;
+}
+
+int countPieces(char* user, char* data, int n) {
+    StreamCount* s = (StreamCount*) user;
+    s->bytes = s->bytes + n;
+    s->pieces++;
+    for (int i = 0; i < n; i++) s->sum = s->sum + (data[i] & 255);
+    if (s->limit > 0 && s->bytes >= s->limit) return 1;
+    return 0;
+}
+
+int expectedSum() {
+    int sum = 0;
+    for (int i = 0; i < 300000; i++) sum = sum + ('a' + (i * 7) % 26);
+    return sum;
+}
+
+class ChunkSource {
+    public int sent;
+}
+
+int nextChunk(char* user, char* buf, int max) {
+    ChunkSource* c = (ChunkSource*) user;
+    if (c->sent >= 20000) return 0;
+    int n = 5000;
+    for (int i = 0; i < n; i++) buf[i] = 'a' + (c->sent + i) % 26;
+    c->sent = c->sent + n;
+    return n;
+}

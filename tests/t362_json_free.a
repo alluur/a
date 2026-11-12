@@ -1,0 +1,127 @@
+// json values live on the malloc heap and can be freed: dispose frees a whole tree, detach takes a member out, failed parses clean up after themselves,
+// stringify results can be freed; the old behaviour (parse, read, write) is unchanged
+import json;
+import cstdlib;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int main() {
+    // --- the values still behave as before
+    json.Json* o = json.newObject();
+    o->set("name", json.newString("A"));
+    o->set("n", json.newInt(-7));
+    o->set("ok", json.newBool(true));
+    json.Json* arr = json.newArray();
+    arr->push(json.newInt(1));
+    arr->push(json.newNull());
+    arr->push(json.newString("x\ny"));
+    o->set("list", arr);
+    char* text = json.stringify(o);
+    check("stringify", streq(text, "{\"name\":\"A\",\"n\":-7,\"ok\":true,\"list\":[1,null,\"x\\ny\"]}"));
+    check("get, at, size, keyAt", o->get("n")->asInt() == -7 && o->get("list")->size() == 3 && streq(o->keyAt(0), "name") && o->get("list")->at(2)->asString()[1] == '\n');
+    char* pretty = json.pretty(o);
+    check("pretty", startsWith(pretty, "{\n  \"name\": \"A\",") && contains(pretty, "\n    1,\n"));
+    free(text);
+    free(pretty);
+    json.Json* p = json.parse("{\"a\": [1, 2.5, {\"b\": \"\\u00e9\\ud83d\\ude00\"}], \"c\": 1e3, \"d\": -0.5}");
+    check("parse: numbers keep their text, strings are decoded", p != null && p->get("a")->at(1)->asInt() == 2 && streq(json.stringify(p->get("a")->at(1)), "2.5") && streq(p->get("a")->at(2)->get("b")->asString(), "\xc3\xa9\xf0\x9f\x98\x80")
+        && streq(json.stringify(p->get("c")), "1e3") && streq(json.stringify(p->get("d")), "-0.5"));
+    p->dispose();
+    check("errors are reported as before", json.parse("{\"a\":}") == null && contains(json.errorMessage(), "unexpected") && json.parse("[1,2") == null && json.parse("{\"a\" 1}") == null && json.parse("[1] 2") == null && json.parse("\"\\x\"") == null);
+
+    // --- set replaces and frees the old value
+    json.Json* r = json.newObject();
+    r->set("k", json.newString("first"));
+    r->set("k", json.newString("second"));
+    check("set replaces a member", r->size() == 1 && streq(r->get("k")->asString(), "second"));
+    json.Json* same = r->get("k");
+    r->set("k", same);
+    check("setting the member that is already there is harmless", streq(r->get("k")->asString(), "second"));
+
+    // --- detach
+    json.Json* d = json.parse("{\"a\":1,\"b\":[2,3],\"c\":\"x\"}");
+    json.Json* b = d->detach("b");
+    check("detach returns the member and removes it", b != null && b->size() == 2 && d->size() == 2 && !d->has("b") && streq(d->keyAt(1), "c") && streq(json.stringify(d), "{\"a\":1,\"c\":\"x\"}"));
+    check("detach of a missing member is null", d->detach("zz") == null && d->size() == 2);
+    d->dispose();
+    check("the detached member is still alive after its parent is freed", b->at(1)->asInt() == 3);
+    b->dispose();
+
+    // --- memory
+    int heap0 = __heap_pos;
+    for (int i = 0; i < 3000; i++) {
+        json.Json* x = json.parse("{\"id\":123,\"name\":\"a name\",\"tags\":[\"x\",\"y\",\"z\"],\"nested\":{\"f\":1.5,\"g\":[true,false,null,{\"h\":\"deep\"}]},\"s\":\"\\u00e9\\n\"}");
+        char* t = json.stringify(x);
+        free(t);
+        char* pt = json.pretty(x);
+        free(pt);
+        x->dispose();
+    }
+    check("3000 parse / stringify / pretty / dispose rounds do not grow the heap", __heap_pos - heap0 < 20000);
+    heap0 = __heap_pos;
+    char* bad[10] = { "{\"a\":", "[1,2,", "{\"a\":1,\"b\":[1,2,{\"c\":", "[\"unterminated", "{\"a\" 1}", "[1,2] x", "{\"k\":\"\\q\"}", "[[[[[[[[[[1,", "{1:2}", "{\"a\":1,}" };
+    for (int i = 0; i < 3000; i++) {
+        json.Json* x = json.parse(bad[i % 10]);
+        if (x != null) x->dispose();
+    }
+    check("3000 failed parses leave nothing behind", __heap_pos - heap0 < 20000);
+    heap0 = __heap_pos;
+    for (int i = 0; i < 2000; i++) {
+        json.Json* x = json.newObject();
+        for (int k = 0; k < 5; k++) {
+            x->set("a", json.newString("v1"));
+            x->set("b", json.newInt(k));
+            x->set("c", json.newArray());
+        }
+        x->dispose();
+    }
+    check("building objects and replacing members, then dispose", __heap_pos - heap0 < 20000);
+
+    // --- big documents
+    int n = 20000;
+    char* big = malloc(n * 12 + 10);
+    int pos = 0;
+    big[pos] = '['; pos++;
+    for (int i = 0; i < n; i++) {
+        if (i > 0) { big[pos] = ','; pos++; }
+        char num[16];
+        intToStr(i, &num[0]);
+        memcpy(&big[pos], &num[0], strlen(&num[0]));
+        pos = pos + strlen(&num[0]);
+    }
+    big[pos] = ']'; pos++;
+    big[pos] = 0;
+    json.Json* bigDoc = json.parse(big);
+    check("an array of 20000 numbers", bigDoc != null && bigDoc->size() == 20000 && bigDoc->at(19999)->asInt() == 19999);
+    char* back = json.stringify(bigDoc);
+    check("... and back to the same text", streq(back, big));
+    free(back);
+    bigDoc->dispose();
+    free(big);
+
+    // --- nesting
+    char* deep = malloc(500);
+    for (int i = 0; i < 199; i++) deep[i] = '[';
+    for (int i = 0; i < 199; i++) deep[199 + i] = ']';
+    deep[398] = 0;
+    json.Json* dd = json.parse(deep);
+    check("199 levels of nesting are fine", dd != null);
+    if (dd != null) dd->dispose();
+    for (int i = 0; i < 205; i++) deep[i] = '[';
+    for (int i = 0; i < 205; i++) deep[205 + i] = ']';
+    deep[410] = 0;
+    heap0 = __heap_pos;
+    check("205 levels are refused without crashing", json.parse(deep) == null && contains(json.errorMessage(), "deeply"));
+    free(deep);
+    printf("failures: %d\n", fails);
+    return fails;
+}

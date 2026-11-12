@@ -6,7 +6,12 @@
 //    char* plain  = zlib.gunzip(packed, n, &len);      // null when the data is damaged (header, checksum or length wrong)
 //
 //    zlib.compress(data, len, &n) / zlib.decompress(...)   // the zlib container (2-byte header + Adler-32), used by PNG, HTTP "deflate"
+//    zlib.gunzipEx(packed, n, maxOut, &len) / zlib.decompressEx(...)   // the same with a limit for the output (data from strangers: a decompression
+//                                                      // bomb gives null and zlib.inflateTooBig() is true)
 //    zlib.deflate(data, len, &n)  / zlib.inflate(...)      // the raw stream without any container
+//    zlib.deflateSync(data, len, level, maxDist, &n) / zlib.inflateEx(data, n, dict, dictLen, maxOut, sync, &len)
+//        raw streams for WebSocket permessage-deflate: a sync flushed stream (ends with 00 00 FF FF), a preset dictionary
+//        (context takeover), a limit for the output size (decompression bombs) and streams that end after any block
 //
 //  The compressor looks for repeated strings in the last 32 KB with hash chains and writes them with the fixed Huffman code
 //  (or as stored blocks when that is smaller), so text shrinks to about a third and random data grows by a few bytes at most.
@@ -52,12 +57,30 @@ class Inflater {
     public int outLen;
     public int outCap;
     public bool bad;
+    public int base;               // the first base bytes of out are a preset dictionary, not output
+    public int maxOut;             // 0: no limit; otherwise the most output bytes (beyond the dictionary)
+    public bool tooBig;            // the limit was hit
+    public bool sync;              // the stream may end after any block at the end of the input (a sync flushed stream)
 
     public Inflater(char* data, int len) {
         in = data;
         inLen = len;
         outCap = 65536;
         out = malloc(outCap + 1);
+    }
+
+    // the dictionary (the last bytes of earlier output that later back references may point into) goes in front of the output
+    public void preset(char* dict, int dictLen) {
+        if (dictLen > outCap - 1024) {
+            while (dictLen > outCap - 1024) {
+                outCap = outCap * 2;
+            }
+            free(out);
+            out = malloc(outCap + 1);
+        }
+        memcpy(out, dict, dictLen);
+        outLen = dictLen;
+        base = dictLen;
     }
 
     private int bits(int need) {
@@ -76,13 +99,20 @@ class Inflater {
         return v;
     }
 
-    private void room(int more) {
+    // makes room for more output bytes; false (and the stream is bad) when that would pass the limit
+    private bool room(int more) {
+        if (maxOut > 0 && outLen - base + more > maxOut) {
+            tooBig = true;
+            bad = true;
+            return false;
+        }
         if (outLen + more > outCap) {
             while (outLen + more > outCap) {
                 outCap = outCap * 2;
             }
             out = realloc(out, outCap + 1);
         }
+        return true;
     }
 
     private int decode(Huff* h) {
@@ -118,7 +148,9 @@ class Inflater {
                 return;
             }
             if (sym < 256) {
-                room(1);
+                if (!room(1)) {
+                    return;
+                }
                 out[outLen] = sym;
                 outLen++;
             } else if (sym == 256) {
@@ -140,7 +172,9 @@ class Inflater {
                     bad = true;
                     return;
                 }
-                room(len);
+                if (!room(len)) {
+                    return;
+                }
                 for (int i = 0; i < len; i++) {
                     out[outLen] = out[outLen - d];
                     outLen++;
@@ -151,10 +185,15 @@ class Inflater {
 
     // inflates a raw deflate stream; false if it is damaged
     public bool run() {
+        Huff fixedLitObj();                 // (stack objects: `new` memory is never freed, and a stream is inflated per message)
+        Huff fixedDistObj();
         Huff* fixedLit = null;
         Huff* fixedDist = null;
         int last = 0;
         while (last == 0 && !bad) {
+            if (sync && pos >= inLen && bitCnt == 0) {
+                break;                                      // a sync flushed stream ends on a block boundary
+            }
             last = bits(1);
             int type = bits(2);
             if (bad) {
@@ -175,7 +214,9 @@ class Inflater {
                 if (pos + len > inLen) {
                     return false;
                 }
-                room(len);
+                if (!room(len)) {
+                    return false;
+                }
                 memcpy(&out[outLen], &in[pos], len);
                 outLen = outLen + len;
                 pos = pos + len;
@@ -186,10 +227,10 @@ class Inflater {
                     for (int i = 144; i < 256; i++) { l[i] = 9; }
                     for (int i = 256; i < 280; i++) { l[i] = 7; }
                     for (int i = 280; i < 288; i++) { l[i] = 8; }
-                    fixedLit = new Huff();
+                    fixedLit = &fixedLitObj;
                     fixedLit->build(&l[0], 288);
                     for (int i = 0; i < 30; i++) { l[i] = 5; }
-                    fixedDist = new Huff();
+                    fixedDist = &fixedDistObj;
                     fixedDist->build(&l[0], 30);
                 }
                 codes(fixedLit, fixedDist);
@@ -204,7 +245,8 @@ class Inflater {
                 int lengths[320];
                 for (int i = 0; i < 19; i++) { lengths[i] = 0; }
                 for (int i = 0; i < ncode; i++) { lengths[order[i]] = bits(3); }
-                Huff* lencode = new Huff();
+                Huff lencodeObj();                  // on the stack: a `new` here would never be freed (a few KB per dynamic block)
+                Huff* lencode = &lencodeObj;
                 lencode->build(&lengths[0], 19);
                 int idx = 0;
                 int all[320];
@@ -237,9 +279,11 @@ class Inflater {
                         }
                     }
                 }
-                Huff* lit = new Huff();
+                Huff litObj();
+                Huff* lit = &litObj;
                 lit->build(&all[0], nlen);
-                Huff* dist = new Huff();
+                Huff distObj();
+                Huff* dist = &distObj;
                 dist->build(&all[nlen], ndist);
                 codes(lit, dist);
             } else {
@@ -250,10 +294,17 @@ class Inflater {
     }
 }
 
-// the data of a raw deflate stream; *used (if not null) receives how many input bytes the stream took. null when it is damaged.
-private char* inflateAt(char* data, int n, int* len, int* used) {
-    Inflater* z = new Inflater(data, n);
+// the data of a raw deflate stream; *used (if not null) receives how many input bytes the stream took. null when it is damaged (or the output
+// would pass maxOut, if that is above 0: lastTooBig tells the two apart).
+private char* inflateAt(char* data, int n, int* len, int* used, int maxOut) {
+    lastTooBig = false;
+    Inflater zObj(data, n);                 // on the stack: the object is never leaked, only its output buffer is returned
+    Inflater* z = &zObj;
+    z->maxOut = maxOut;
     if (!z->run()) {
+        if (z->tooBig) {
+            lastTooBig = true;
+        }
         free(z->out);
         return null;
     }
@@ -265,8 +316,48 @@ private char* inflateAt(char* data, int n, int* len, int* used) {
     return z->out;
 }
 
+private bool lastTooBig;
+
 public char* inflate(char* data, int n, int* len) {
-    return inflateAt(data, n, len, null);
+    return inflateAt(data, n, len, null, 0);
+}
+
+// true if the last inflateEx failed because the output would have passed the limit (a decompression bomb, not damaged data)
+public bool inflateTooBig() {
+    return lastTooBig;
+}
+
+// Raw inflate with the extras that permessage-deflate (RFC 7692) needs:
+//   dict, dictLen   a preset dictionary: the last bytes (up to 32 KB) of what the same stream produced before (context takeover); null for none
+//   maxOut          the output may not be longer than this (0 = no limit): a bomb makes the call return null and inflateTooBig() true
+//   sync            the stream may end after any block (data from a sync flush, the 00 00 FF FF tail included) instead of needing a final block
+// Bytes after a final block are ignored. Returns a malloc'ed buffer (free it) with a terminating zero byte, or null.
+public char* inflateEx(char* data, int n, char* dict, int dictLen, int maxOut, bool sync, int* len) {
+    lastTooBig = false;
+    Inflater zObj(data, n);
+    Inflater* z = &zObj;
+    z->maxOut = maxOut;
+    z->sync = sync;
+    if (dict != null && dictLen > 0) {
+        z->preset(dict, dictLen);
+    }
+    bool ok = z->run();
+    if (z->tooBig) {
+        lastTooBig = true;
+    }
+    if (!ok) {
+        free(z->out);
+        return null;
+    }
+    int outN = z->outLen - z->base;
+    if (z->base > 0) {
+        for (int i = 0; i < outN; i++) {
+            z->out[i] = z->out[z->base + i];
+        }
+    }
+    z->out[outN] = 0;
+    *len = outN;
+    return z->out;
 }
 
 // ---- deflate -------------------------------------------------------------------------------------------------------------------------
@@ -295,9 +386,7 @@ class BitOut {
     public void put(int v, int n) {
         acc = acc | ((v & ((1 << n) - 1)) << cnt);
         cnt = cnt + n;
-        if (cnt >= 16) {
-            grow(8);
-        }
+        grow(8);                      // room for the bytes that leave below (the old test "cnt >= 16" let a run of 8 bit codes write past the end)
         while (cnt >= 8) {
             buf[len] = acc & 255;
             len++;
@@ -361,11 +450,25 @@ private int hash3(char* p, int i) {
 
 // compresses with the given effort (1 = fast ... 9 = best: how many earlier positions are tried per byte)
 public char* deflateLevel(char* data, int n, int level, int* outLen) {
+    return deflateCore(data, n, level, 32768, false, outLen);
+}
+
+// A raw deflate stream that is flushed like zlib's Z_SYNC_FLUSH: no final block, but an empty stored block at the end (so the stream
+// ends with the bytes 00 00 FF FF). That is what WebSocket's permessage-deflate (RFC 7692) sends (without those four bytes).
+// maxDist (1 .. 32768) is the window size: matches reach back at most that far (2^windowBits for a window of windowBits bits).
+public char* deflateSync(char* data, int n, int level, int maxDist, int* outLen) {
+    return deflateCore(data, n, level, maxDist, true, outLen);
+}
+
+private char* deflateCore(char* data, int n, int level, int maxDist, bool sync, int* outLen) {
     if (level < 1) { level = 1; }
     if (level > 9) { level = 9; }
+    if (maxDist < 1) { maxDist = 1; }
+    if (maxDist > 32768) { maxDist = 32768; }
     int chain = 4 << (level - 1);
-    BitOut* o = new BitOut(n / 2 + 64);
-    o->put(1, 1);                 // the one and only block
+    BitOut oObj(n / 2 + 64);
+    BitOut* o = &oObj;
+    o->put(sync ? 0 : 1, 1);      // the one and only block (not the final one for a sync flushed stream)
     o->put(1, 2);                 // fixed Huffman codes
     int* head = malloc(32768 * 8);
     int* prev = malloc(32768 * 8);
@@ -380,7 +483,7 @@ public char* deflateLevel(char* data, int n, int level, int* outLen) {
             int tries = chain;
             int maxLen = n - i;
             if (maxLen > 258) { maxLen = 258; }
-            while (cand >= 0 && i - cand <= 32768 && tries > 0) {
+            while (cand >= 0 && i - cand <= maxDist && tries > 0) {
                 int l = 0;
                 while (l < maxLen && data[cand + l] == data[i + l]) { l++; }
                 if (l > bestLen) {
@@ -409,20 +512,28 @@ public char* deflateLevel(char* data, int n, int level, int* outLen) {
         }
     }
     literal(o, 256);
-    o->align();
+    if (sync) {
+        o->put(0, 3);             // an empty stored block: header bits, padding to a byte border, LEN 0, NLEN FFFF
+        o->align();
+        o->put(0, 16);
+        o->put(65535, 16);
+    } else {
+        o->align();
+    }
     free(head);
     free(prev);
     // random data can come out larger than it went in: then use stored blocks
-    int stored = n + 5 * (n / 65535 + 1);
+    int stored = n + 5 * (n / 65535 + 1) + (sync ? 5 : 0);
     if (o->len > stored) {
         free(o->buf);
-        BitOut* s = new BitOut(stored + 16);
+        BitOut sObj(stored + 16);
+        BitOut* s = &sObj;
         int pos = 0;
         for (;;) {
             int chunk = n - pos;
             if (chunk > 65535) { chunk = 65535; }
             int fin = (pos + chunk >= n) ? 1 : 0;
-            s->put(fin, 1);
+            s->put((sync || fin == 0) ? 0 : 1, 1);
             s->put(0, 2);
             s->align();
             s->put(chunk, 16);
@@ -430,6 +541,12 @@ public char* deflateLevel(char* data, int n, int level, int* outLen) {
             s->bytes(&data[pos], chunk);
             pos = pos + chunk;
             if (fin == 1) { break; }
+        }
+        if (sync) {
+            s->put(0, 3);
+            s->align();
+            s->put(0, 16);
+            s->put(65535, 16);
         }
         s->buf[s->len] = 0;
         *outLen = s->len;
@@ -465,12 +582,19 @@ public char* compress(char* data, int n, int* outLen) {
 
 // null when the header, the stream or the Adler-32 checksum is wrong
 public char* decompress(char* data, int n, int* outLen) {
+    return decompressEx(data, n, 0, outLen);
+}
+
+// decompress() with a limit for the output (0: none): a longer result gives null and inflateTooBig() is true. Use it for data from strangers: a few
+// KB of compressed data can stand for gigabytes.
+public char* decompressEx(char* data, int n, int maxOut, int* outLen) {
+    lastTooBig = false;
     if (n < 6 || (data[0] & 15) != 8 || (((data[0] & 255) << 8) | (data[1] & 255)) % 31 != 0 || (data[1] & 32) != 0) {
         return null;
     }
     int used;
     int len;
-    char* r = inflateAt(&data[2], n - 2, &len, &used);
+    char* r = inflateAt(&data[2], n - 2, &len, &used, maxOut);
     if (r == null) {
         return null;
     }
@@ -520,6 +644,12 @@ public char* gzip(char* data, int n, int* outLen) {
 
 // null when the header, the stream, the CRC-32 or the stored length is wrong
 public char* gunzip(char* data, int n, int* outLen) {
+    return gunzipEx(data, n, 0, outLen);
+}
+
+// gunzip() with a limit for the output (0: none): a longer result gives null and inflateTooBig() is true (see decompressEx)
+public char* gunzipEx(char* data, int n, int maxOut, int* outLen) {
+    lastTooBig = false;
     if (n < 18 || (data[0] & 255) != 0x1F || (data[1] & 255) != 0x8B || data[2] != 8) {
         return null;
     }
@@ -545,7 +675,7 @@ public char* gunzip(char* data, int n, int* outLen) {
     }
     int used;
     int len;
-    char* r = inflateAt(&data[p], n - p, &len, &used);
+    char* r = inflateAt(&data[p], n - p, &len, &used, maxOut);
     if (r == null) {
         return null;
     }

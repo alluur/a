@@ -1,0 +1,765 @@
+// =============================================================================
+//  sse - Server-Sent Events (text/event-stream, WHATWG HTML section 9.2)                                       import sse;
+//
+//  Server: format events, start a stream on a plain socket handler or on a wshub / httpx response, keep it alive with comments.
+//
+//    void feed(http.Request* q, int client) {                       // a handler for http.serve
+//        char* last = sse.lastEventId(q);                           // "Last-Event-ID" of a reconnecting client, or null
+//        sse.begin(client);                                         // the response head
+//        sse.send(client, "tick", "hello", "1");                    // event: tick / data: hello / id: 1
+//        sse.comment(client, "keep-alive");                         // ": keep-alive"
+//    }                                                              // (one blocking handler per stream: for many clients use wshub)
+//    char* text = sse.eventText("update", "line 1\nline 2", "7", 0);   // the wire text of one event, a heap string (null if event or id contain CR / LF)
+//    sse.startResponse(res);                                        // an httpx.Response becomes an event stream (wshub keeps the connection)
+//
+//  Client with reconnect and Last-Event-ID:
+//    sse.Client* c = sse.connect("http://localhost:8080/events");        // https:// works too; c->dispose() frees it completely
+//    sse.Event* e = c->next(5000);                                       // waits at most 5 s, null: nothing yet (c->closed: given up)
+//    println(e->event);  println(e->data);  println(e->id);  e->dispose();
+//    c->close();
+//
+//  The parser (sse.Parser) is separate: feed(bytes) and take events; it follows the specification: lines end in LF, CR or CRLF, one optional
+//  leading space after the colon, comment lines, data lines joined with LF, id fields with NUL are ignored, retry takes digits only, a byte order
+//  mark at the start is skipped. Limits: a line of at most 64 KB and an event of at most 1 MB (more ends the stream with an error).
+// =============================================================================
+import net;
+import http;
+import tls;
+import httpx;
+import cstdlib;
+module sse;
+
+private char lastErr[200];
+
+public char* error() { return &lastErr[0]; }
+
+private void fail(char* why) {
+    int i = 0;
+    while (why[i] != 0 && i < 199) { lastErr[i] = why[i]; i++; }
+    lastErr[i] = 0;
+}
+
+// ---- the wire format -----------------------------------------------------------------------------------------------------------------------------
+// one event as text: "event: name\nid: 7\nretry: 3000\ndata: line\ndata: line\n\n". event, id may be null, retryMs 0 leaves it out; data may contain
+// newlines (one data line each). Returns null if event or id contain CR, LF or NUL (a header injection into the stream). A heap string.
+public char* eventText(char* event, char* data, char* id, int retryMs) {
+    if (event != null && (indexOf(event, '\n') >= 0 || indexOf(event, '\r') >= 0)) return null;
+    if (id != null && (indexOf(id, '\n') >= 0 || indexOf(id, '\r') >= 0)) return null;
+    int dl = data == null ? 0 : strlen(data);
+    int lines = 1;
+    for (int i = 0; i < dl; i++) if (data[i] == '\n' || data[i] == '\r') lines++;
+    int cap = dl + lines * 8 + 100 + (event == null ? 0 : strlen(event)) + (id == null ? 0 : strlen(id));
+    char* out = malloc(cap);
+    if (out == null) return null;
+    int o = 0;
+    if (event != null && event[0] != 0) {
+        format2(&out[o], cap - o, "event: ", event);
+        o = strlen(out);
+    }
+    if (id != null) {
+        format2(&out[o], cap - o, "id: ", id);
+        o = strlen(out);
+    }
+    if (retryMs > 0) {
+        char r[40];
+        r[0] = 0;
+        char num[24];
+        intToStr(retryMs, &num[0]);
+        strcpy(&r[0], "retry: ");
+        strcat(&r[0], &num[0]);
+        strcat(&r[0], "\n");
+        strcpy(&out[o], &r[0]);
+        o = o + strlen(&r[0]);
+    }
+    // data lines: a newline (LF, CR or CRLF) in the data starts a new data line
+    int i = 0;
+    bool any = false;
+    while (i <= dl) {
+        int s = i;
+        while (i < dl && data[i] != '\n' && data[i] != '\r') i++;
+        if (dl > 0 || !any) {
+            strcpy(&out[o], "data: ");
+            o = o + 6;
+            memcpy(&out[o], &data[s], i - s);
+            o = o + (i - s);
+            out[o] = '\n';
+            o++;
+            any = true;
+        }
+        if (i >= dl) break;
+        if (data[i] == '\r' && data[i + 1] == '\n') i++;
+        i++;
+        if (i == dl) {
+            // the data ended with a newline: an empty last data line
+            strcpy(&out[o], "data: \n");
+            o = o + 7;
+            break;
+        }
+    }
+    out[o] = '\n';
+    out[o + 1] = 0;
+    return out;
+}
+
+private void format2(char* out, int max, char* a, char* b) {
+    int al = strlen(a);
+    int bl = strlen(b);
+    if (al + bl + 2 > max) { out[0] = 0; return; }
+    memcpy(out, a, al);
+    memcpy(&out[al], b, bl);
+    out[al + bl] = '\n';
+    out[al + bl + 1] = 0;
+}
+
+// ": text\n\n" (a comment line; newlines in the text become spaces). Heap string.
+public char* commentText(char* text) {
+    int n = strlen(text);
+    char* out = malloc(n + 8);
+    if (out == null) return null;
+    out[0] = ':';
+    out[1] = ' ';
+    for (int i = 0; i < n; i++) out[2 + i] = (text[i] == '\n' || text[i] == '\r') ? ' ' : text[i];
+    out[n + 2] = '\n';
+    out[n + 3] = '\n';
+    out[n + 4] = 0;
+    return out;
+}
+
+// the head of an event stream answer, for a plain socket
+public bool begin(int fd) {
+    return net.sendText(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n");
+}
+
+// sends one event on a socket (net.send: TLS sockets work too). false if the event is not valid or the connection is gone
+public bool send(int fd, char* event, char* data, char* id) {
+    char* t = eventText(event, data, id, 0);
+    if (t == null) return false;
+    bool ok = net.sendText(fd, t);
+    free(t);
+    return ok;
+}
+
+// tells the client how long to wait before it reconnects
+public bool sendRetry(int fd, int retryMs) {
+    char line[40];
+    char num[24];
+    intToStr(retryMs, &num[0]);
+    strcpy(&line[0], "retry: ");
+    strcat(&line[0], &num[0]);
+    strcat(&line[0], "\n\n");
+    return net.sendText(fd, &line[0]);
+}
+
+public bool comment(int fd, char* text) {
+    char* t = commentText(text);
+    if (t == null) return false;
+    bool ok = net.sendText(fd, t);
+    free(t);
+    return ok;
+}
+
+// the Last-Event-ID header of a request (a heap string), or null when the client did not send one
+public char* lastEventId(http.Request* q) {
+    return q->header("Last-Event-ID");
+}
+
+// turns an httpx.Response into the head of an event stream (wshub keeps the connection open and sends the events)
+public void startResponse(httpx.Response* res) {
+    res->status = 200;
+    res->setHeader("Content-Type", "text/event-stream");
+    res->setHeader("Cache-Control", "no-cache");
+    res->setHeader("X-Accel-Buffering", "no");
+    res->eventStream = true;
+}
+
+// ---- the parser --------------------------------------------------------------------------------------------------------------------------------------------
+// one event; free it with dispose()
+public class Event {
+    public char* event;             // the event name ("message" if the stream gave none)
+    public char* data;              // the data lines joined with LF
+    public int dataLen;
+    public char* id;                // the last event id at the time of this event ("" if none)
+    public bool heap;
+
+    public void dispose() {
+        if (event != null) free(event);
+        if (data != null) free(data);
+        if (id != null) free(id);
+        event = null;
+        data = null;
+        id = null;
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+}
+
+private char* dupN(char* s, int n) {
+    char* r = malloc(n + 1);
+    if (r == null) return null;
+    memcpy(r, s, n);
+    r[n] = 0;
+    return r;
+}
+
+// Reads an event stream from bytes (no I/O of its own).
+public class Parser {
+    public int maxLine;             // default 65536
+    public int maxEvent;            // default 1048576
+    public int retryMs;             // the last retry value of the stream (0: none)
+    public char* lastId;            // the last event id (heap string; "" at the start)
+    public bool failed;             // a limit was passed
+    public int eventsSeen;
+    public Event** q;
+    public int qHead;
+    public int qCount;
+    public int qCap;
+    public int qLimit;              // events waiting for take() (default 1024); feed() stops taking bytes when it is reached
+    // the line being read
+    public char* line;
+    public int lineLen;
+    public int lineCap;
+    public bool cr;                 // the last byte was CR (a following LF belongs to it)
+    public bool bomChecked;
+    public int bomSeen;
+    // the event being built
+    public char* data;
+    public int dataLen;
+    public int dataCap;
+    public char* name;
+    public bool heap;
+
+    private void init() {
+        if (maxLine == 0) maxLine = 65536;
+        if (maxEvent == 0) maxEvent = 1048576;
+        if (qLimit == 0) qLimit = 1024;
+        if (lastId == null) lastId = dupN("", 0);
+    }
+
+    public bool ready() { return qCount > 0; }
+
+    // The next complete event, or null. Free it with dispose().
+    public Event* take() {
+        if (qCount == 0) return null;
+        Event* e = q[qHead];
+        qHead = (qHead + 1) % qCap;
+        qCount--;
+        return e;
+    }
+
+    private void push(Event* e) {
+        if (qCount >= qCap) {
+            int nc = qCap * 2;
+            if (nc < 16) nc = 16;
+            Event** nq = (Event**) malloc(nc * 8);
+            if (nq == null) { e->dispose(); failed = true; return; }
+            for (int i = 0; i < qCount; i++) nq[i] = q[(qHead + i) % qCap];
+            if (q != null) free(q);
+            q = nq;
+            qCap = nc;
+            qHead = 0;
+        }
+        q[(qHead + qCount) % qCap] = e;
+        qCount++;
+    }
+
+    // Takes bytes of the stream. Returns how many it consumed: all, or fewer when qLimit events are waiting (take some and feed the rest again).
+    // After a limit was passed (failed) nothing is consumed.
+    public int feed(char* d, int n) {
+        init();
+        if (failed) return 0;
+        int i = 0;
+        while (i < n) {
+            if (qCount >= qLimit) return i;
+            int c = d[i] & 255;
+            i++;
+            if (!bomChecked) {
+                // a UTF-8 byte order mark at the very start is skipped
+                char* bom = "\xEF\xBB\xBF";
+                if (c == (bom[bomSeen] & 255) && bomSeen < 3) {
+                    bomSeen++;
+                    if (bomSeen == 3) bomChecked = true;
+                    continue;
+                }
+                if (bomSeen > 0) {
+                    // it was not a BOM after all: the bytes that were held back are text
+                    for (int k = 0; k < bomSeen; k++) addByte(bom[k] & 255);
+                }
+                bomChecked = true;
+                bomSeen = 0;
+            }
+            if (cr) {
+                cr = false;
+                if (c == 10) continue;                 // CRLF is one line end
+            }
+            if (c == 13) {
+                cr = true;
+                endLine();
+            } else if (c == 10) {
+                endLine();
+            } else {
+                addByte(c);
+            }
+            if (failed) return i;
+        }
+        return i;
+    }
+
+    private void addByte(int c) {
+        if (lineLen + 2 > lineCap) {
+            int nc = lineCap * 2;
+            if (nc < 256) nc = 256;
+            char* nb = realloc(line, nc);
+            if (nb == null) { failed = true; return; }
+            line = nb;
+            lineCap = nc;
+        }
+        if (lineLen >= maxLine) { failed = true; fail("an event stream line is too long"); return; }
+        line[lineLen] = c;
+        lineLen++;
+    }
+
+    private void appendData(char* s, int n) {
+        if (dataLen + n + 2 > dataCap) {
+            int nc = dataCap * 2;
+            if (nc < 256) nc = 256;
+            while (nc < dataLen + n + 2) nc = nc * 2;
+            char* nb = realloc(data, nc);
+            if (nb == null) { failed = true; return; }
+            data = nb;
+            dataCap = nc;
+        }
+        memcpy(&data[dataLen], s, n);
+        dataLen = dataLen + n;
+        data[dataLen] = '\n';
+        dataLen++;
+    }
+
+    // a line is complete
+    private void endLine() {
+        if (line == null) {
+            // an empty first line: nothing was added yet, so there is no buffer
+            line = malloc(256);
+            if (line == null) { failed = true; return; }
+            lineCap = 256;
+        }
+        line[lineLen] = 0;
+        int n = lineLen;
+        lineLen = 0;
+        if (n == 0) {
+            // an empty line dispatches the event (only if there is data)
+            if (dataLen > 0) {
+                Event* e = (Event*) malloc(sizeof(Event));
+                if (e == null) { failed = true; return; }
+                e->heap = true;
+                bool plain = name == null || name[0] == 0;            // no event field, or an empty one: the type is "message"
+                e->event = dupN(plain ? "message" : name, plain ? 7 : strlen(name));
+                e->dataLen = dataLen - 1;                  // the last LF is not part of the data
+                e->data = dupN(data, e->dataLen);
+                e->id = dupN(lastId, strlen(lastId));
+                push(e);
+                eventsSeen++;
+            }
+            dataLen = 0;
+            if (name != null) { free(name); name = null; }
+            return;
+        }
+        if (line[0] == ':') return;                        // a comment
+        int colon = 0;
+        while (colon < n && line[colon] != ':') colon++;
+        char* value = "";
+        int vl = 0;
+        if (colon < n) {
+            int vs = colon + 1;
+            if (vs < n && line[vs] == ' ') vs++;
+            value = &line[vs];
+            vl = n - vs;
+        }
+        line[colon] = 0;
+        char* field = &line[0];
+        if (streq(field, "event")) {
+            if (name != null) free(name);
+            name = dupN(value, vl);
+        } else if (streq(field, "data")) {
+            if (dataLen + vl + 1 > maxEvent) { failed = true; fail("an event is too big"); return; }
+            appendData(value, vl);
+        } else if (streq(field, "id")) {
+            bool nul = false;
+            for (int i = 0; i < vl; i++) if (value[i] == 0) nul = true;
+            if (!nul) {
+                if (lastId != null) free(lastId);
+                lastId = dupN(value, vl);
+            }
+        } else if (streq(field, "retry")) {
+            bool digits = vl > 0 && vl < 10;
+            int v = 0;
+            for (int i = 0; i < vl; i++) {
+                if (!isDigit(value[i])) digits = false;
+                else v = v * 10 + (value[i] - '0');
+            }
+            if (digits) retryMs = v;
+        }
+    }
+
+    // forgets the event that was being built (after a reconnect the stream starts again); the last event id and the retry value stay
+    public void restart() {
+        lineLen = 0;
+        dataLen = 0;
+        cr = false;
+        bomChecked = false;
+        bomSeen = 0;
+        if (name != null) { free(name); name = null; }
+    }
+
+    public void dispose() {
+        while (qCount > 0) {
+            Event* e = take();
+            e->dispose();
+        }
+        if (q != null) free(q);
+        if (line != null) free(line);
+        if (data != null) free(data);
+        if (name != null) free(name);
+        if (lastId != null) free(lastId);
+        q = null; line = null; data = null; name = null; lastId = null;
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+}
+
+public Parser* newParser() {
+    Parser* p = (Parser*) malloc(sizeof(Parser));
+    if (p != null) p->heap = true;
+    return p;
+}
+
+// true if the header line starts with the lower case name (a name with its colon, "content-type:"), whatever the letter case
+private bool headerIs(char* line, char* name) {
+    for (int i = 0; name[i] != 0; i++) {
+        int c = line[i] & 255;
+        if (c >= 'A' && c <= 'Z') c = c + 32;
+        if (c != (name[i] & 255)) return false;
+    }
+    return true;
+}
+
+// copies the value of a header line (after the name of nameLen bytes and the spaces) into out of max bytes, cut if it is longer
+private void copyValue(char* out, int max, char* line, int nameLen) {
+    int s = nameLen;
+    while (line[s] == ' ' || line[s] == 9) s++;
+    int k = 0;
+    while (line[s] != 0 && k < max - 1) {
+        out[k] = line[s];
+        k++;
+        s++;
+    }
+    out[k] = 0;
+}
+
+// ---- the client ---------------------------------------------------------------------------------------------------------------------------------------------
+// A connection to an event stream that comes back after it drops. It sends Last-Event-ID, honours the server's retry value and doubles the
+// pause after every failed attempt (up to maxRetryMs). Calls block.
+public class Client {
+    public char* url;
+    public char* headers;           // extra request header lines ("Authorization: Bearer x\r\n")
+    public bool verify;             // https: check the certificate (default true)
+    public int retryMs;             // the pause before a reconnect (default 3000; a retry field of the server replaces it)
+    public int maxRetryMs;          // the longest pause after repeated failures (default 30000)
+    public int maxRetries;          // failed attempts in a row before giving up (-1: never give up, default 5)
+    public int connectTimeoutMs;    // default 5000
+    public int maxRedirects;        // default 3
+    public bool closed;             // given up or close() was called
+    public int status;              // the HTTP status of the last answer
+    public int reconnects;          // how many times the stream was opened again
+    public char* lastEventId;       // the id the client sends (a heap string, "" if none)
+    public Parser* parser;
+    public int fd;
+    public int failures;
+    public int nextAttempt;         // millis() before which no attempt is made
+    public bool chunked;
+    public int chunkLeft;
+    public int chunkState;          // 0 size line, 1 data, 2 CR LF after data, 3 trailer
+    public char chunkLine[40];
+    public int chunkLineLen;
+    public bool headDone;
+    public bool heap;
+    private char* hopUrl;           // the target of a redirect that is being followed (a heap string)
+
+    public Client(char* streamUrl) {
+        init(streamUrl);
+    }
+
+    public void init(char* streamUrl) {
+        url = malloc(strlen(streamUrl) + 1);
+        strcpy(url, streamUrl);
+        verify = true;
+        retryMs = 3000;
+        maxRetryMs = 30000;
+        maxRetries = 5;
+        connectTimeoutMs = 5000;
+        maxRedirects = 3;
+        fd = -1;
+        parser = newParser();
+        lastEventId = null;
+    }
+
+    private bool open() {
+        if (hopUrl != null) { free(hopUrl); hopUrl = null; }
+        http.Url* u = (http.Url*) malloc(sizeof(http.Url));
+        char* target = url;
+        bool ok = false;
+        for (int hop = 0; hop <= maxRedirects && !ok; hop++) {
+            if (!http.parseUrl(target, u)) { fail("not an http:// or https:// URL"); free(u); return false; }
+            int h = net.connectTimeout(&u->host[0], u->port, connectTimeoutMs);
+            if (h < 0) { fail("cannot connect"); free(u); return false; }
+            net.setTimeout(h, 0);
+            if (streq(&u->scheme[0], "https")) {
+                if (!tls.wrap(h, &u->host[0], verify)) {
+                    char* why = tls.lastError();
+                    fail(why == null ? "the TLS handshake failed" : why);
+                    net.rawClose(h);
+                    free(u);
+                    return false;
+                }
+            }
+            int rcap = strlen(&u->path[0]) + strlen(&u->host[0]) + (headers == null ? 0 : strlen(headers)) + (lastEventId == null ? 0 : strlen(lastEventId)) + 400;
+            char* req = malloc(rcap);
+            format(req, rcap, "GET %s HTTP/1.1\r\nHost: %s:%d\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n", &u->path[0], &u->host[0], u->port);
+            if (lastEventId != null && lastEventId[0] != 0) {
+                strcat(req, "Last-Event-ID: ");
+                strcat(req, lastEventId);
+                strcat(req, "\r\n");
+            }
+            if (headers != null) strcat(req, headers);
+            strcat(req, "\r\n");
+            bool sent = net.sendText(h, req);
+            free(req);
+            if (!sent) { net.close(h); fail("sending the request failed"); free(u); return false; }
+            // the answer: status line and headers
+            char line[1024];
+            if (net.recvLine(h, &line[0], 1024) < 0 || !startsWith(&line[0], "HTTP/1.")) {
+                net.close(h);
+                fail("no HTTP answer");
+                free(u);
+                return false;
+            }
+            int sp = indexOf(&line[0], ' ');
+            status = sp < 0 ? 0 : atoi(&line[sp + 1]);
+            char loc[1024];
+            loc[0] = 0;
+            char ctype[200];
+            ctype[0] = 0;
+            bool isChunked = false;
+            for (int k = 0; k < 100; k++) {
+                int n = net.recvLine(h, &line[0], 1024);
+                if (n < 0) { net.close(h); fail("the answer ended in the headers"); free(u); return false; }
+                if (n == 0) break;
+                // header names are not case sensitive; a value that is too long for its buffer is cut (the Content-Type check only needs the start)
+                if (headerIs(&line[0], "location:")) {
+                    copyValue(&loc[0], 1024, &line[0], 9);
+                } else if (headerIs(&line[0], "content-type:")) {
+                    copyValue(&ctype[0], 200, &line[0], 13);
+                } else if (headerIs(&line[0], "transfer-encoding:")) {
+                    if (contains(&line[0], "chunked")) isChunked = true;
+                }
+            }
+            if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+                net.close(h);
+                if (loc[0] == 0) { fail("a redirect without a Location"); free(u); return false; }
+                char* nt = httpx.resolveUrl(target, &loc[0]);              // absolute, //host, /path and relative forms; other schemes are refused
+                if (nt == null) { fail("a redirect to a URL that cannot be followed"); free(u); return false; }
+                if (hopUrl != null) free(hopUrl);
+                hopUrl = nt;
+                target = nt;
+                continue;
+            }
+            if (status == 204) {
+                net.close(h);
+                fail("the server ended the stream (204)");
+                closed = true;
+                free(u);
+                return false;
+            }
+            if (status != 200) {
+                net.close(h);
+                char msg[80];
+                format(&msg[0], 80, "the server answered %d", status);
+                fail(&msg[0]);
+                closed = true;                    // the specification: anything but 200 fails the connection for good
+                free(u);
+                return false;
+            }
+            if (!startsWith(&ctype[0], "text/event-stream")) {
+                net.close(h);
+                fail("the answer is not text/event-stream");
+                closed = true;
+                free(u);
+                return false;
+            }
+            fd = h;
+            chunked = isChunked;
+            chunkState = 0;
+            chunkLineLen = 0;
+            parser->restart();
+            ok = true;
+        }
+        free(u);
+        if (!ok) fail("too many redirects");
+        return ok;
+    }
+
+    // feeds stream bytes to the parser (chunked framing removed)
+    private void ingest(char* d, int n) {
+        if (!chunked) {
+            int off = 0;
+            while (off < n) {
+                int r = parser->feed(&d[off], n - off);
+                off = off + r;
+                if (r == 0) break;
+            }
+            return;
+        }
+        int i = 0;
+        while (i < n) {
+            if (chunkState == 0) {
+                int c = d[i] & 255;
+                i++;
+                if (c == 10) {
+                    chunkLine[chunkLineLen] = 0;
+                    int size = 0;
+                    int k = 0;
+                    while (isHex(chunkLine[k])) { size = size * 16 + hexValue(chunkLine[k]); k++; if (k > 8) break; }
+                    chunkLineLen = 0;
+                    if (size == 0) { chunkState = 3; } else { chunkLeft = size; chunkState = 1; }
+                } else if (chunkLineLen < 38) {
+                    chunkLine[chunkLineLen] = c;
+                    chunkLineLen++;
+                }
+            } else if (chunkState == 1) {
+                int take = n - i;
+                if (take > chunkLeft) take = chunkLeft;
+                int off = 0;
+                while (off < take) {
+                    int r = parser->feed(&d[i + off], take - off);
+                    off = off + r;
+                    if (r == 0) break;
+                }
+                i = i + take;
+                chunkLeft = chunkLeft - take;
+                if (chunkLeft == 0) chunkState = 2;
+            } else if (chunkState == 2) {
+                if ((d[i] & 255) == 10) chunkState = 0;
+                i++;
+            } else {
+                i = n;                       // the trailer: the stream is over
+            }
+        }
+    }
+
+    private bool isHex(int c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+    private int hexValue(int c) {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return c - 'A' + 10;
+    }
+
+    private void dropConnection() {
+        if (fd >= 0) {
+            net.close(fd);
+            fd = -1;
+        }
+    }
+
+    // The next event. Waits up to timeoutMs (< 0: as long as it takes). Reconnects by itself when the stream drops. null: no event yet
+    // (check `closed`: true means the client gave up, or close() was called, or the stream broke the limits)
+    public Event* next(int timeoutMs) {
+        int t0 = millis();
+        char buf[2048];
+        for (;;) {
+            Event* e = parser->take();
+            if (e != null) {
+                if (lastEventId != null) free(lastEventId);
+                lastEventId = malloc(strlen(e->id) + 1);
+                strcpy(lastEventId, e->id);
+                return e;
+            }
+            if (closed) return null;
+            if (parser->failed) {
+                closed = true;
+                dropConnection();
+                return null;
+            }
+            if (timeoutMs >= 0 && millis() - t0 >= timeoutMs) return null;
+            if (fd < 0) {
+                // (re)connect, after the pause
+                int wait = nextAttempt - millis();
+                if (wait > 0) {
+                    int left = timeoutMs < 0 ? wait : timeoutMs - (millis() - t0);
+                    if (left <= 0) return null;
+                    if (left < wait) wait = left;
+                    sleepMs(wait);
+                    continue;
+                }
+                if (open()) {
+                    failures = 0;
+                    reconnects++;
+                } else {
+                    if (closed) return null;
+                    failures++;
+                    if (maxRetries >= 0 && failures > maxRetries) { closed = true; return null; }
+                    int pause = parser->retryMs > 0 ? parser->retryMs : retryMs;
+                    for (int k = 1; k < failures && pause < maxRetryMs; k++) pause = pause * 2;
+                    if (pause > maxRetryMs) pause = maxRetryMs;
+                    nextAttempt = millis() + pause;
+                }
+                continue;
+            }
+            // read
+            int ms = timeoutMs < 0 ? -1 : timeoutMs - (millis() - t0);
+            if (ms >= 0 && !net.waitReadable(fd, ms)) return null;
+            int n = net.recv(fd, &buf[0], 2048);
+            if (n <= 0) {
+                // the stream ended: reconnect after the pause
+                dropConnection();
+                int pause = parser->retryMs > 0 ? parser->retryMs : retryMs;
+                nextAttempt = millis() + pause;
+                continue;
+            }
+            ingest(&buf[0], n);
+        }
+        return null;
+    }
+
+    public void close() {
+        closed = true;
+        dropConnection();
+    }
+
+    public void dispose() {
+        close();
+        if (parser != null) parser->dispose();
+        parser = null;
+        if (url != null) free(url);
+        url = null;
+        if (hopUrl != null) free(hopUrl);
+        hopUrl = null;
+        if (lastEventId != null) free(lastEventId);
+        lastEventId = null;
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+}
+
+// an event stream client that dispose() frees completely (a `new sse.Client(url)` object is never given back)
+public Client* connect(char* streamUrl) {
+    Client* c = (Client*) malloc(sizeof(Client));
+    if (c == null) return null;
+    c->init(streamUrl);
+    c->heap = true;
+    return c;
+}

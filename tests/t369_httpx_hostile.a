@@ -1,0 +1,377 @@
+// Regression tests for review findings on httpx and zlib: resolveUrl with Location values far longer than its old stack buffers (4200 bytes; the line limit
+// is 8200) and with other schemes, the client's default Authorization / Cookie headers across origins (they used to follow every redirect), compressed
+// answers held to maxBody (a 300 KB gzip body used to be inflated into 300 MB), a damaged gzip body is an error, chunked trailers, and a Range number that is
+// too big for an integer
+import httpx;
+import wshub;
+import conn;
+import net;
+import zlib;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+wshub.Hub* hubA;
+wshub.Hub* hubB;
+conn.Listener* script;
+conn.Connection* scriptConn = null;
+char* scriptReply = null;
+int scriptLen = 0;
+int portA = 0;
+int portB = 0;
+
+// ---- the two servers of the redirect tests
+int hEcho(httpx.Context* x) {
+    char* au = x->req->header("Authorization");
+    char* ck = x->req->header("Cookie");
+    char* xt = x->req->header("X-Token");
+    char t[400];
+    format(&t[0], 400, "auth=%s cookie=%s token=%s", au == null ? "-" : au, ck == null ? "-" : ck, xt == null ? "-" : xt);
+    x->res->text(200, &t[0]);
+    return 0;
+}
+int hToB(httpx.Context* x) {
+    char loc[100];
+    format(&loc[0], 100, "http://127.0.0.1:%d/echo", portB);
+    x->res->redirect(302, &loc[0]);
+    return 0;
+}
+int hToBRelative(httpx.Context* x) {
+    char loc[100];
+    format(&loc[0], 100, "//localhost:%d/echo", portB);              // a scheme relative URL: another host name, so another origin
+    x->res->redirect(302, &loc[0]);
+    return 0;
+}
+int hSame(httpx.Context* x) { x->res->redirect(302, "/echo"); return 0; }
+int hBackToA(httpx.Context* x) {
+    char loc[100];
+    format(&loc[0], 100, "http://127.0.0.1:%d/echo", portA);
+    x->res->redirect(302, &loc[0]);
+    return 0;
+}
+int hToBBack(httpx.Context* x) {
+    char loc[100];
+    format(&loc[0], 100, "http://127.0.0.1:%d/back", portB);
+    x->res->redirect(302, &loc[0]);
+    return 0;
+}
+
+int step() {
+    hubA->poll(0);
+    hubB->poll(0);
+    // the scripted server: accepts, reads the request head, sends the canned answer and hangs up
+    if (scriptConn == null) scriptConn = script->accept(0);
+    if (scriptConn != null && scriptConn->readable(0)) {
+        char line[300];
+        while (scriptConn->buffered() > 0 || scriptConn->readable(0)) {
+            int n = scriptConn->readLine(&line[0], 300);
+            if (n < 0) { scriptConn->close(); scriptConn = null; break; }
+            if (n == 0) {
+                if (scriptReply != null) {
+                    scriptConn->write(scriptReply, scriptLen);
+                    scriptConn->flush();
+                }
+                scriptConn->close();
+                scriptConn = null;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+void setScriptBytes(char* head, char* body, int bodyLen) {
+    int hl = strlen(head);
+    scriptReply = malloc(hl + bodyLen + 1);
+    memcpy(scriptReply, head, hl);
+    if (bodyLen > 0) memcpy(&scriptReply[hl], body, bodyLen);
+    scriptLen = hl + bodyLen;
+}
+
+void setScript(char* text) {
+    setScriptBytes(text, "", 0);
+}
+
+// a canned answer with a body of the given encoding
+void setEncoded(char* encoding, char* body, int bodyLen) {
+    char head[200];
+    format(&head[0], 200, "HTTP/1.1 200 OK\r\nContent-Encoding: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", encoding, bodyLen);
+    setScriptBytes(&head[0], body, bodyLen);
+}
+
+// a canned redirect to a Location of the given text
+void setRedirect(char* location) {
+    int cap = strlen(location) + 200;
+    char* t = malloc(cap);
+    format(t, cap, "HTTP/1.1 302 Found\r\nLocation: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", location);
+    setScript(t);
+    free(t);
+}
+
+// n 'a' after the prefix
+char* aaa(char* prefix, int n) {
+    int pl = strlen(prefix);
+    char* s = malloc(pl + n + 1);
+    memcpy(s, prefix, pl);
+    for (int i = 0; i < n; i++) s[pl + i] = 'a';
+    s[pl + n] = 0;
+    return s;
+}
+
+bool resolvesTo(char* base, char* ref, char* want) {
+    char* r = httpx.resolveUrl(base, ref);
+    bool ok = r != null && streq(r, want);
+    if (!ok) printf("   resolveUrl(\"%s\", \"%s\") gave \"%s\", wanted \"%s\"\n", base, ref, r == null ? "(null)" : r, want);
+    if (r != null) free(r);
+    return ok;
+}
+
+int main() {
+    // ===== 1. resolveUrl on its own
+    char* base = "http://127.0.0.1:8080/a/b/c?x=1";
+    check("the examples of RFC 3986: ../d", resolvesTo(base, "../d", "http://127.0.0.1:8080/a/d"));
+    check("./e", resolvesTo(base, "./e", "http://127.0.0.1:8080/a/b/e"));
+    check("/z", resolvesTo(base, "/z?y=2", "http://127.0.0.1:8080/z?y=2"));
+    check("?q=2", resolvesTo(base, "?q=2", "http://127.0.0.1:8080/a/b/c?q=2"));
+    check("//host/path", resolvesTo(base, "//other.example/p", "http://other.example/p"));
+    check("../../../x (above the root)", resolvesTo(base, "../../../x", "http://127.0.0.1:8080/x"));
+    check("an absolute URL stays", resolvesTo(base, "https://x.example/y", "https://x.example/y"));
+    check("a relative path with a colon after a slash is a path", resolvesTo(base, "q/r:s", "http://127.0.0.1:8080/a/b/q/r:s"));
+    check("HTTP:// in capitals is http (the scheme in lower case)", resolvesTo(base, "HTTP://Up.example/Path", "http://Up.example/Path"));
+    check("a dot segment at the end: /a/b/.. gives /a/", resolvesTo(base, "..", "http://127.0.0.1:8080/a/"));
+    // schemes that are not http(s) are refused, they are not relative paths
+    check("ftp: is refused", httpx.resolveUrl(base, "ftp://x.example/file") == null);
+    check("file: is refused", httpx.resolveUrl(base, "file:///etc/passwd") == null);
+    check("javascript: is refused", httpx.resolveUrl(base, "javascript:alert(1)") == null);
+    check("data: is refused", httpx.resolveUrl(base, "data:text/plain,hi") == null);
+    check("http:foo (no //) is refused", httpx.resolveUrl(base, "http:foo") == null);
+    check("a name and a colon (localhost:8080/x) is a scheme to the syntax: refused", httpx.resolveUrl(base, "localhost:8080/x") == null);
+    // far longer than the buffers it used to have (the line limit for a header is 8200)
+    int sizes[5];
+    sizes[0] = 2100; sizes[1] = 4300; sizes[2] = 6000; sizes[3] = 7000; sizes[4] = 8100;
+    int good = 0;
+    for (int i = 0; i < 5; i++) {
+        int n = sizes[i];
+        char* ref1 = aaa("/", n);
+        char* want1 = aaa("http://127.0.0.1:8080/", n);
+        char* ref2 = aaa("", n);
+        char* want2 = aaa("http://127.0.0.1:8080/a/b/", n);
+        char* ref3 = aaa("../", n);
+        char* want3 = aaa("http://127.0.0.1:8080/a/", n);
+        char* ref4 = aaa("x/../", n);
+        char* want4 = aaa("http://127.0.0.1:8080/a/b/", n);
+        bool a1 = resolvesTo(base, ref1, want1);
+        bool a2 = resolvesTo(base, ref2, want2);
+        bool a3 = resolvesTo(base, ref3, want3);
+        bool a4 = resolvesTo(base, ref4, want4);
+        if (a1 && a2 && a3 && a4) good++;
+        free(ref1); free(want1); free(ref2); free(want2); free(ref3); free(want3); free(ref4); free(want4);
+    }
+    check("a path, a relative path, one with .. and one with a removed segment, 2100 to 8100 bytes long: exact results", good == 5);
+    // many dot segments
+    int dn = 1500;
+    char* dots = malloc(dn * 5 + 10);
+    dots[0] = 0;
+    for (int i = 0; i < dn; i++) strcat(dots, "x/../");
+    strcat(dots, "end?k=v");
+    check("1500 segments that cancel out", resolvesTo(base, dots, "http://127.0.0.1:8080/a/b/end?k=v"));
+    char* qlong = aaa("?q=", 7000);
+    char* qwant = aaa("http://127.0.0.1:8080/a/b/c?q=", 7000);
+    check("a 7000 byte query", resolvesTo(base, qlong, qwant));
+
+    // ===== 2. a hostile server (and a hub) for the client
+    makeDir("build/tests/www369");
+    writeFile("build/tests/www369/a.txt", "0123456789abcdefghij");
+    hubA = new wshub.Hub();
+    httpx.Router* ra = new httpx.Router();
+    ra->any("/echo", hEcho);
+    ra->get("/tob", hToB);
+    ra->get("/tobrel", hToBRelative);
+    ra->get("/same", hSame);
+    ra->get("/tobback", hToBBack);
+    hubA->router = ra;
+    hubA->staticDir = "build/tests/www369";
+    hubA->listen(0);
+    portA = hubA->port;
+    hubB = new wshub.Hub();
+    httpx.Router* rb = new httpx.Router();
+    rb->any("/echo", hEcho);
+    rb->get("/back", hBackToA);
+    hubB->router = rb;
+    hubB->listen(0);
+    portB = hubB->port;
+    script = new conn.Listener(0);
+    int sport = script->port();
+    net.setIdleHook(step);
+    char url[200];
+    char surl[100];
+    format(&surl[0], 100, "http://127.0.0.1:%d/x", sport);
+    httpx.Client* c = new httpx.Client();
+
+    setRedirect(aaa("/", 7000));
+    httpx.Reply* a = c->get(&surl[0]);
+    check("a 302 with a 7000 byte Location: an error, no crash", a == null && contains(httpx.error(), "cannot be followed"));
+    setRedirect(aaa("", 7000));
+    a = c->get(&surl[0]);
+    check("... a relative one too", a == null && contains(httpx.error(), "cannot be followed"));
+    setRedirect(aaa("../", 6000));
+    a = c->get(&surl[0]);
+    check("... one with .. too", a == null && contains(httpx.error(), "cannot be followed"));
+    setRedirect(aaa("http://127.0.0.1/", 5000));
+    a = c->get(&surl[0]);
+    check("... an absolute one", a == null && contains(httpx.error(), "cannot be followed"));
+    setRedirect("ftp://example.org/file");
+    a = c->get(&surl[0]);
+    check("a Location with another scheme (ftp) is refused", a == null && contains(httpx.error(), "cannot be followed"));
+    setRedirect("file:///etc/passwd");
+    a = c->get(&surl[0]);
+    check("... file:", a == null && contains(httpx.error(), "cannot be followed"));
+    format(&url[0], 200, "http://127.0.0.1:%d/echo", portA);
+    a = c->get(&url[0]);
+    check("the client works after all that", a != null && a->status == 200 && contains(a->body, "auth=-"));
+    a->dispose();
+
+    // ===== 3. the client's default headers do not follow a redirect to another origin
+    c->headers->set("Authorization", "Bearer SECRET");
+    c->headers->set("Cookie", "session=SECRETCOOKIE");
+    c->headers->set("X-Token", "t0k");
+    format(&url[0], 200, "http://127.0.0.1:%d/echo", portA);
+    a = c->get(&url[0]);
+    check("without a redirect the default headers are sent", a != null && contains(a->body, "auth=Bearer SECRET") && contains(a->body, "cookie=session=SECRETCOOKIE") && contains(a->body, "token=t0k"));
+    a->dispose();
+    format(&url[0], 200, "http://127.0.0.1:%d/same", portA);
+    a = c->get(&url[0]);
+    check("a redirect inside the origin keeps them", a != null && a->redirects == 1 && contains(a->body, "auth=Bearer SECRET") && contains(a->body, "cookie=session=SECRETCOOKIE"));
+    a->dispose();
+    format(&url[0], 200, "http://127.0.0.1:%d/tob", portA);
+    a = c->get(&url[0]);
+    check("a redirect to another port: Authorization and Cookie stay home", a != null && a->redirects == 1 && contains(a->body, "auth=- cookie=-"));
+    check("... other default headers go on", contains(a->body, "token=t0k"));
+    a->dispose();
+    format(&url[0], 200, "http://127.0.0.1:%d/tobrel", portA);
+    a = c->get(&url[0]);
+    check("a scheme relative redirect to another host name: the same", a != null && a->redirects == 1 && contains(a->url, "localhost") && contains(a->body, "auth=- cookie=-"));
+    a->dispose();
+    format(&url[0], 200, "http://127.0.0.1:%d/tobback", portA);
+    a = c->get(&url[0]);
+    check("A to B and back to A: they are not sent again (the first change of origin takes them away for the rest of the request)", a != null && a->redirects == 2 && contains(a->body, "auth=- cookie=-"));
+    a->dispose();
+    format(&url[0], 200, "http://127.0.0.1:%d/echo", portA);
+    a = c->get(&url[0]);
+    check("the next request starts fresh", a != null && contains(a->body, "auth=Bearer SECRET"));
+    a->dispose();
+    // per request headers behave the same way
+    c->headers->remove("Authorization");
+    c->headers->remove("Cookie");
+    httpx.Headers* extra = new httpx.Headers();
+    extra->set("Authorization", "Bearer PERREQUEST");
+    format(&url[0], 200, "http://127.0.0.1:%d/tob", portA);
+    a = c->request("GET", &url[0], extra, null, 0);
+    check("a per request Authorization does not follow either", a != null && contains(a->body, "auth=- cookie=-"));
+    a->dispose();
+
+    // ===== 4. compressed answers are held to maxBody
+    int zn = 200000;
+    char* zeros = calloc(zn, 1);
+    int gn;
+    char* gz = zlib.gzip(zeros, zn, &gn);
+    int cn;
+    char* zl = zlib.compress(zeros, zn, &cn);
+    int rn;
+    char* raw = zlib.deflate(zeros, zn, &rn);
+    check("the bombs are small (200000 bytes become a few KB)", gn < 3000 && cn < 3000 && rn < 3000);
+    int on = 0;
+    char* o1 = zlib.gunzipEx(gz, gn, 50000, &on);
+    check("zlib.gunzipEx with a limit: null and inflateTooBig", o1 == null && zlib.inflateTooBig());
+    o1 = zlib.gunzipEx(gz, gn, 200000, &on);
+    check("... exactly the size of the data is fine", o1 != null && on == zn && !zlib.inflateTooBig());
+    o1 = zlib.gunzipEx(gz, gn, 199999, &on);
+    check("... one byte less is not", o1 == null && zlib.inflateTooBig());
+    o1 = zlib.decompressEx(zl, cn, 50000, &on);
+    check("zlib.decompressEx with a limit", o1 == null && zlib.inflateTooBig());
+    o1 = zlib.decompressEx(zl, cn, 0, &on);
+    check("... and without", o1 != null && on == zn);
+    char* damaged = malloc(40);
+    memcpy(damaged, "this is not gzip data at all, no.", 34);
+    o1 = zlib.gunzipEx(damaged, 34, 50000, &on);
+    check("damaged data is null but not 'too big'", o1 == null && !zlib.inflateTooBig());
+    o1 = zlib.gunzip(gz, gn, &on);
+    check("gunzip without a limit works as before", o1 != null && on == zn);
+
+    c->headers->remove("X-Token");
+    c->decompress = true;
+    c->maxBody = 50000;
+    setEncoded("gzip", gz, gn);
+    a = c->get(&surl[0]);
+    check("gzip bomb over maxBody: the request fails", a == null && contains(httpx.error(), "too big"));
+    setEncoded("deflate", zl, cn);
+    a = c->get(&surl[0]);
+    check("zlib (deflate) bomb: the same", a == null && contains(httpx.error(), "too big"));
+    setEncoded("deflate", raw, rn);
+    a = c->get(&surl[0]);
+    check("raw deflate bomb: the same", a == null && contains(httpx.error(), "too big"));
+    setEncoded("gzip", damaged, 34);
+    a = c->get(&surl[0]);
+    check("a damaged gzip body is an error, not the raw bytes with status 200", a == null && contains(httpx.error(), "damaged"));
+    c->maxBody = 300000;
+    setEncoded("gzip", gz, gn);
+    a = c->get(&surl[0]);
+    check("with room enough the same body is unpacked", a != null && a->status == 200 && a->bodyLen == zn && a->header("Content-Encoding") == null);
+    if (a != null) a->dispose();
+    setEncoded("br", damaged, 34);
+    a = c->get(&surl[0]);
+    check("an encoding it does not know is left alone (the body and the header stay)", a != null && a->bodyLen == 34 && a->header("Content-Encoding") != null);
+    if (a != null) a->dispose();
+    c->decompress = false;
+    c->maxBody = 67108864;
+
+    // ===== 5. chunked trailers
+    setScript("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\nX-Sum: 1\r\nX-Other: 2\r\n\r\n");
+    a = c->get(&surl[0]);
+    check("a chunked body with two trailer lines", a != null && streq(a->body, "hello"));
+    if (a != null) a->dispose();
+    char* manyTrailers = malloc(5000);
+    strcpy(manyTrailers, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n");
+    for (int i = 0; i < 150; i++) strcat(manyTrailers, "X-T: 1\r\n");
+    strcat(manyTrailers, "\r\n");
+    setScript(manyTrailers);
+    a = c->get(&surl[0]);
+    check("150 trailer lines: an error (the cap is 100)", a == null && contains(httpx.error(), "trailer"));
+    setScript("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\nX-Sum: 1\r\n");
+    a = c->get(&surl[0]);
+    check("trailers that end with the connection: an error", a == null);
+
+    // ===== 6. Range numbers too big for an integer are clamped, not ignored
+    format(&url[0], 200, "http://127.0.0.1:%d/a.txt", portA);
+    httpx.Headers* rh = new httpx.Headers();
+    rh->set("Range", "bytes=5-99999999999999999999");
+    a = c->request("GET", &url[0], rh, null, 0);
+    check("bytes=5-<huge>: 206 with the rest of the file", a != null && a->status == 206 && streq(a->body, "56789abcdefghij") && streq(a->header("Content-Range"), "bytes 5-19/20"));
+    if (a != null) a->dispose();
+    rh->set("Range", "bytes=99999999999999999999-");
+    a = c->request("GET", &url[0], rh, null, 0);
+    check("bytes=<huge>-: 416", a != null && a->status == 416);
+    if (a != null) a->dispose();
+    rh->set("Range", "bytes=-99999999999999999999");
+    a = c->request("GET", &url[0], rh, null, 0);
+    check("bytes=-<huge>: the whole file as 206", a != null && a->status == 206 && a->bodyLen == 20 && streq(a->header("Content-Range"), "bytes 0-19/20"));
+    if (a != null) a->dispose();
+    rh->set("Range", "bytes=5-4");
+    a = c->request("GET", &url[0], rh, null, 0);
+    check("bytes=5-4 is invalid and ignored: 200", a != null && a->status == 200 && a->bodyLen == 20);
+    if (a != null) a->dispose();
+    rh->set("Range", "bytes=0-4");
+    a = c->request("GET", &url[0], rh, null, 0);
+    check("a normal range still works", a != null && a->status == 206 && streq(a->body, "01234"));
+    if (a != null) a->dispose();
+    printf("failures: %d\n", fails);
+    return fails;
+}

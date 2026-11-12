@@ -1,0 +1,332 @@
+// wshub memory: a server that serves connections for months must not grow. Raw sockets talk to an in-process hub (so only the hub's own
+// allocations are measured: raw clients allocate nothing) and the heap position (what `new`, alloc and strdup use up, which is never given back)
+// must stay exactly where it is after a warm-up, for every kind of connection: WebSocket (plain and permessage-deflate), rooms, refused and
+// broken upgrades, plain HTTP (keep-alive, files, ranges, bodies, errors), event streams. An earlier version leaked 176 bytes in every
+// WebSocket handshake (SHA-1 and base64 temporaries) and 10 KB in every compressed message (inflater tables), which no test noticed.
+import wshub;
+import websocket;
+import httpx;
+import sse;
+import zlib;
+import net;
+import asys;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+wshub.Hub* hub;
+
+int hook() {
+    hub->poll(0);
+    return 0;
+}
+
+void settle() {
+    for (int i = 0; i < 30; i++) hub->poll(0);
+}
+
+// the client hangs up and the hub gets its turn: every connection is over before the next one starts, so the heap position shows what
+// one connection costs and not how many connections were open at the same time (the hub keeps its client objects for reuse)
+void shut(int h) {
+    net.close(h);
+    settle();
+}
+
+// ---- the application
+int onOpen(wshub.Hub* h, wshub.Client* c) {
+    if (c->isEventStream()) {
+        h->join(c, "news");
+        h->sendEvent(c, "hello", "welcome", "0");
+    } else {
+        h->join(c, "all");
+    }
+    return 0;
+}
+
+int onMessage(wshub.Hub* h, wshub.Client* c, char* data, int n, int isText) {
+    if (isText == 0) { h->sendBinary(c, data, n); return 0; }
+    char t[200];
+    int k = n > 150 ? 150 : n;
+    memcpy(&t[0], data, k);
+    t[k] = 0;
+    if (startsWith(&t[0], "join ")) h->join(c, &t[5]);
+    else if (startsWith(&t[0], "leave ")) h->leave(c, &t[6]);
+    else if (startsWith(&t[0], "pub ")) h->publish("all", data, n, true, 0);
+    else h->sendText(c, data);
+    return 0;
+}
+
+int onHttp(wshub.Hub* h, wshub.Client* c, httpx.Request* req, httpx.Response* res) {
+    if (streq(&req->path[0], "/events")) {
+        sse.startResponse(res);
+        return 1;
+    }
+    if (streq(&req->path[0], "/echo") && req->isMethod("POST")) {
+        char t[60];
+        format(&t[0], 60, "got %d bytes", req->bodyLen);
+        res->text(200, &t[0]);
+        return 1;
+    }
+    return 0;
+}
+
+// ---- raw clients
+int dial(int port) {
+    int h = net.connect("127.0.0.1", port);
+    return h;
+}
+
+// reads up to the end of the head; returns the status code
+int readHead(int h) {
+    char c;
+    int state = 0;
+    char first[16];
+    int n = 0;
+    for (int guard = 0; guard < 4000; guard++) {
+        if (net.recv(h, &c, 1) != 1) return -1;
+        if (n < 12) { first[n] = c; n++; }
+        if (c == 13 && (state == 0 || state == 2)) state++;
+        else if (c == 10 && (state == 1 || state == 3)) state++;
+        else state = 0;
+        if (state == 4) break;
+    }
+    first[n] = 0;
+    if (n < 12) return -1;
+    return (first[9] - '0') * 100 + (first[10] - '0') * 10 + (first[11] - '0');
+}
+
+// reads until the peer closes (or max bytes)
+int drain(int h, int max) {
+    char b[1024];
+    int total = 0;
+    while (total < max) {
+        int n = net.recv(h, &b[0], 1024);
+        if (n <= 0) break;
+        total = total + n;
+    }
+    return total;
+}
+
+// the client sends text/binary/close frames (masked); returns the frame size
+char frameBuf[4300];                      // (not alloc: the test must not use up heap itself)
+
+int sendFrame(int h, int op, char* data, int n, bool rsv1) {
+    char* f = &frameBuf[0];
+    int fl = websocket.buildFrame(op, true, true, 0x01020304, data, n, f);
+    if (rsv1) f[0] = f[0] | 0x40;
+    net.send(h, f, fl);
+    return fl;
+}
+
+// reads one frame from the server; returns its opcode (the payload goes to buf, its length to *len), -1 when the connection ended
+int readFrame(int h, char* buf, int* len) {
+    char hd[2];
+    if (net.recv(h, &hd[0], 2) != 2) return -1;
+    int op = hd[0] & 15;
+    int n = hd[1] & 127;
+    if (n == 126) {
+        char e[2];
+        if (net.recv(h, &e[0], 2) != 2) return -1;
+        n = (e[0] & 255) * 256 + (e[1] & 255);
+    }
+    int got = 0;
+    while (got < n) {
+        int r = net.recv(h, &buf[got], n - got);
+        if (r <= 0) return -1;
+        got = got + r;
+    }
+    *len = n;
+    return op;
+}
+
+int upgrade(int port, char* extra) {
+    int h = dial(port);
+    char req[400];
+    format(&req[0], 400, "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s\r\n", extra);
+    net.send(h, &req[0], strlen(&req[0]));
+    int st = readHead(h);
+    if (st != 101) { shut(h); return -st - 1000; }
+    return h;
+}
+
+char* PLAIN_TEXT;
+char* PACKED;
+int packedLen;
+
+// one WebSocket connection: echo, a room, close handshake
+void scenarioWs(int port) {
+    int h = upgrade(port, "");
+    if (h < 0) { printf("FAIL upgrade %d\n", h); fails++; return; }
+    char buf[2000];
+    int n = 0;
+    sendFrame(h, 1, "hello", 5, false);
+    readFrame(h, &buf[0], &n);
+    sendFrame(h, 1, "join room1", 10, false);
+    sendFrame(h, 2, "\x01\x02\x03", 3, false);
+    readFrame(h, &buf[0], &n);
+    sendFrame(h, 9, "p", 1, false);
+    readFrame(h, &buf[0], &n);
+    sendFrame(h, 8, "\x03\xe8", 2, false);
+    readFrame(h, &buf[0], &n);
+    shut(h);
+}
+
+void scenarioDeflate(int port) {
+    int h = upgrade(port, "Sec-WebSocket-Extensions: permessage-deflate\r\n");
+    if (h < 0) { printf("FAIL deflate upgrade %d\n", h); fails++; return; }
+    char buf[4000];
+    int n = 0;
+    sendFrame(h, 1, PACKED, packedLen, true);
+    int op = readFrame(h, &buf[0], &n);
+    if (op != 1) { printf("FAIL no compressed echo (%d)\n", op); fails++; }
+    sendFrame(h, 1, "short", 5, false);
+    readFrame(h, &buf[0], &n);
+    sendFrame(h, 8, "\x03\xe8", 2, false);
+    readFrame(h, &buf[0], &n);
+    shut(h);
+}
+
+// a client that vanishes in the middle of things: no close frame, half a frame
+void scenarioAbort(int port) {
+    int h = upgrade(port, "");
+    if (h < 0) return;
+    char f[40];
+    int fl = websocket.buildFrame(1, true, true, 0x01020304, "abcdef", 6, &f[0]);
+    net.send(h, &f[0], fl - 3);
+    shut(h);
+    h = dial(port);                                                  // not even a request
+    shut(h);
+    h = dial(port);
+    net.send(h, "GARBAGE\r\n\r\n", 11);                              // nonsense: 400
+    drain(h, 1000);
+    shut(h);
+}
+
+void scenarioRefused(int port) {
+    int h = dial(port);
+    char* req = "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n";
+    net.send(h, req, strlen(req));
+    drain(h, 1000);                                                // 426 Upgrade Required, then the hub closes
+    shut(h);
+}
+
+void get(int port, char* path, char* extra) {
+    int h = dial(port);
+    char req[400];
+    format(&req[0], 400, "GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n%s\r\n", path, extra);
+    net.send(h, &req[0], strlen(&req[0]));
+    drain(h, 100000);
+    shut(h);
+}
+
+void scenarioHttp(int port) {
+    get(port, "/healthz", "");
+    get(port, "/index.html", "");
+    get(port, "/index.html", "Range: bytes=2-5\r\n");
+    get(port, "/index.html", "If-None-Match: *\r\n");
+    get(port, "/nothing", "");
+    get(port, "/../etc/passwd", "");
+    // keep-alive: two requests on one connection, then a POST with a body and a chunked POST
+    int h = dial(port);
+    char* r1 = "GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n";
+    net.send(h, r1, strlen(r1));
+    readHead(h);
+    char b[400];
+    net.recv(h, &b[0], 1);                                           // (the body is small: the first byte shows it arrived; the rest is drained below)
+    char* r2 = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+    net.send(h, r2, strlen(r2));
+    drain(h, 10000);
+    shut(h);
+    h = dial(port);
+    char* r3 = "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n";
+    net.send(h, r3, strlen(r3));
+    drain(h, 10000);
+    shut(h);
+    h = dial(port);
+    char* r4 = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\nConnection: close\r\n\r\n";      // too big: 413
+    net.send(h, r4, strlen(r4));
+    drain(h, 10000);
+    shut(h);
+}
+
+void scenarioSse(int port) {
+    int h = dial(port);
+    char* req = "GET /events HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n";
+    net.send(h, req, strlen(req));
+    int st = readHead(h);
+    if (st != 200) { printf("FAIL sse status %d\n", st); fails++; }
+    char b[100];
+    net.recv(h, &b[0], 20);                                          // the greeting event
+    hub->publish("news", "tick", 4, true, 0);
+    settle();
+    shut(h);
+}
+
+int main() {
+    PLAIN_TEXT = alloc(2016);
+    for (int k = 0; k < 2000; k++) PLAIN_TEXT[k] = "the rain in spain stays mainly in the plain. "[k % 45];
+    int zl = 0;
+    char* z = zlib.deflateSync(PLAIN_TEXT, 2000, 6, 32768, &zl);
+    packedLen = zl - 4;                                              // permessage-deflate leaves out the 00 00 ff ff tail
+    PACKED = alloc(zl + 8);
+    memcpy(PACKED, z, zl);
+    free(z);
+
+    makeDir("build/tests/www365");
+    writeFile("build/tests/www365/index.html", "0123456789 a small file");
+
+    hub = new wshub.Hub();
+    hub->onOpen = onOpen;
+    hub->onMessage = onMessage;
+    hub->onHttp = onHttp;
+    hub->staticDir = "build/tests/www365";
+    hub->wsOptions->deflate = true;
+    hub->maxBody = 4096;
+    check("listen", hub->listen(0) && hub->port > 0);
+    net.setIdleHook(hook);
+    int port = hub->port;
+
+    // the first rounds make the hub create what it keeps (client objects, buffers, tables)
+    for (int i = 0; i < 3; i++) {
+        scenarioWs(port); scenarioDeflate(port); scenarioAbort(port); scenarioRefused(port); scenarioHttp(port); scenarioSse(port);
+    }
+    settle();
+    int h0 = __heap_pos;
+    for (int i = 0; i < 12; i++) scenarioWs(port);
+    settle();
+    check("12 WebSocket connections (echo, binary, ping, a room, close handshake) leave the heap where it was", __heap_pos == h0);
+    h0 = __heap_pos;
+    for (int i = 0; i < 12; i++) scenarioDeflate(port);
+    settle();
+    check("12 connections with compressed messages leave the heap where it was", __heap_pos == h0);
+    h0 = __heap_pos;
+    for (int i = 0; i < 12; i++) scenarioAbort(port);
+    settle();
+    check("12 broken connections (half a frame, no request, garbage) leave the heap where it was", __heap_pos == h0);
+    h0 = __heap_pos;
+    for (int i = 0; i < 12; i++) scenarioRefused(port);
+    settle();
+    check("12 refused upgrades leave the heap where it was", __heap_pos == h0);
+    h0 = __heap_pos;
+    for (int i = 0; i < 8; i++) scenarioHttp(port);
+    settle();
+    check("8 rounds of HTTP (files, ranges, 304, 404, traversal, keep-alive, bodies, chunked, 413) leave the heap where it was", __heap_pos == h0);
+    h0 = __heap_pos;
+    for (int i = 0; i < 12; i++) scenarioSse(port);
+    settle();
+    check("12 event streams leave the heap where it was", __heap_pos == h0);
+    check("the hub counted everything and kept no client", hub->count() == 0 && hub->stats->opened > 50);
+
+    net.setIdleHook(null);
+    hub->shutdown(200);
+    printf("failures: %d\n", fails);
+    return fails;
+}

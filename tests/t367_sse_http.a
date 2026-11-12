@@ -1,0 +1,116 @@
+// Server-Sent Events from the plain http server (http.readRequest and a handler that writes to the socket): the helpers sse.begin, sse.send,
+// sse.sendRetry, sse.comment and sse.lastEventId, byte for byte on the wire, rejection of CR / LF in names and ids, and the sse.Client that
+// reconnects with Last-Event-ID to such a server. Client and server run in one thread (the server answers from the idle hook).
+import sse;
+import http;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int server;
+int mode = 0;                        // 0: the wire format test, 1: reconnect test
+int served = 0;
+bool inHook = false;
+char lastSeen[64];                   // the Last-Event-ID of the latest request ("" if none)
+bool badRefused = false;
+int keepOpen = -1;                   // a stream that stays open (mode 1, second connection)
+
+void handler(http.Request* q, int c) {
+    char* last = sse.lastEventId(q);
+    lastSeen[0] = 0;
+    if (last != null && strlen(last) < 60) strcpy(&lastSeen[0], last);
+    sse.begin(c);
+    if (mode == 0) {
+        sse.sendRetry(c, 20);
+        sse.send(c, "update", "line1\nline2", "5");
+        sse.comment(c, "keep-alive");
+        sse.send(c, null, "plain", null);
+        bool r1 = sse.send(c, "bad\nname", "x", null);
+        bool r2 = sse.send(c, "ok", "x", "i\r\nd");
+        badRefused = !r1 && !r2;
+        net.close(c);
+    } else if (last == null) {
+        sse.send(c, "tick", "first", "5");
+        net.close(c);                // the connection breaks: the client must come back with Last-Event-ID: 5
+    } else {
+        sse.send(c, "tick", "second", "6");
+        keepOpen = c;
+    }
+    served++;
+}
+
+int hook() {
+    if (inHook) return 0;
+    inHook = true;
+    if (net.waitReadable(server, 0)) {
+        int c = net.acceptSome(server);
+        if (c >= 0) {
+            net.setTimeout(c, 2000);
+            http.Request* q = (http.Request*) malloc(sizeof(http.Request));
+            if (http.readRequest(c, q)) handler(q, c); else net.close(c);
+            free(q);
+        }
+    }
+    inHook = false;
+    return 0;
+}
+
+int main() {
+    server = net.listenOn("127.0.0.1", 0, 8);
+    int port = net.localPort(server);
+    net.setIdleHook(hook);
+
+    // --- the wire format
+    int fd = net.connect("127.0.0.1", port);
+    char* req = "GET /events HTTP/1.1\r\nHost: x\r\nLast-Event-ID: 4\r\nAccept: text/event-stream\r\n\r\n";
+    net.send(fd, req, strlen(req));
+    char* got = alloc(2000);
+    int n = 0;
+    for (;;) {
+        int r = net.recv(fd, &got[n], 2000 - n - 1);
+        if (r <= 0) break;
+        n = n + r;
+    }
+    got[n] = 0;
+    net.close(fd);
+    check("the handler saw Last-Event-ID", streq(&lastSeen[0], "4"));
+    check("the head: 200, text/event-stream, no caching, no buffering",
+          startsWith(got, "HTTP/1.1 200 OK\r\n") && contains(got, "Content-Type: text/event-stream\r\n") && contains(got, "Cache-Control: no-cache\r\n")
+          && contains(got, "X-Accel-Buffering: no\r\n"));
+    int body = find(got, "\r\n\r\n");
+    check("the events: retry, a named event with an id and two data lines, a comment, an event without a name",
+          body > 0 && streq(&got[body + 4], "retry: 20\n\nevent: update\nid: 5\ndata: line1\ndata: line2\n\n: keep-alive\n\ndata: plain\n\n"));
+    check("a newline in an event name or an id is refused, nothing is written for it", badRefused && !contains(got, "bad") && !contains(got, "i\r"));
+
+    // --- the client reconnects with Last-Event-ID
+    mode = 1;
+    served = 0;
+    char* url = alloc(100);
+    format(url, 100, "http://127.0.0.1:%d/events", port);
+    sse.Client* c = sse.connect(url);
+    c->retryMs = 20;
+    c->maxRetries = 5;
+    sse.Event* e = c->next(2000);
+    check("the client gets the first event", e != null && streq(e->event, "tick") && streq(e->data, "first") && streq(e->id, "5"));
+    if (e != null) e->dispose();
+    e = c->next(3000);
+    check("after the break it comes back and the server sees Last-Event-ID: 5", streq(&lastSeen[0], "5") && served == 2);
+    check("... and gets the next event", e != null && streq(e->event, "tick") && streq(e->data, "second") && streq(e->id, "6"));
+    if (e != null) e->dispose();
+    check("the client remembers id 6", streq(c->lastEventId, "6"));
+    c->dispose();
+    if (keepOpen >= 0) net.close(keepOpen);
+    net.setIdleHook(null);
+    net.close(server);
+    printf("failures: %d\n", fails);
+    return fails;
+}

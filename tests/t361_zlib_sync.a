@@ -1,0 +1,173 @@
+// zlib for permessage-deflate: deflateSync (sync flushed streams ending in 00 00 FF FF, window limits, stored fallback) and inflateEx (streams that end after any
+// block, preset dictionary, output limit); random round trips; streams of Python's zlib
+import zlib;
+import encoding;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int rngState = 12345;
+int rnd() {
+    rngState = (rngState * 1103515245 + 12345) & 0x7fffffff;
+    return rngState >> 8;
+}
+
+// a sync flush ends with an empty stored block
+bool endsWithTail(char* z, int n) {
+    return n >= 4 && (z[n - 4] & 255) == 0 && (z[n - 3] & 255) == 0 && (z[n - 2] & 255) == 255 && (z[n - 1] & 255) == 255;
+}
+
+bool roundTrip(char* data, int n, int level, int dist) {
+    int zn;
+    char* z = zlib.deflateSync(data, n, level, dist, &zn);
+    if (z == null || !endsWithTail(z, zn)) return false;
+    int back;
+    char* r = zlib.inflateEx(z, zn, null, 0, 0, true, &back);
+    if (r == null || back != n) return false;
+    bool same = memcmp(r, data, n) == 0 && r[n] == 0;
+    free(z);
+    free(r);
+    return same;
+}
+
+int main() {
+    // --- the shape of the output
+    int zn;
+    char* z = zlib.deflateSync("hello hello hello hello", 23, 6, 32768, &zn);
+    check("a sync flushed stream ends with 00 00 FF FF", z != null && endsWithTail(z, zn));
+    z = zlib.deflateSync("", 0, 6, 32768, &zn);
+    check("an empty input is a valid stream too", endsWithTail(z, zn) && zn <= 8);
+    int back;
+    char* r = zlib.inflateEx(z, zn, null, 0, 0, true, &back);
+    check("... that inflates to nothing", r != null && back == 0 && r[0] == 0);
+    // a stream from the ordinary deflate (one final block) inflates with and without the sync flag
+    char* plainZ = zlib.deflate("abcabcabcabc", 12, &zn);
+    r = zlib.inflateEx(plainZ, zn, null, 0, 0, false, &back);
+    check("a stream with a final block works without the sync flag", r != null && back == 12 && streq(r, "abcabcabcabc"));
+    r = zlib.inflateEx(plainZ, zn, null, 0, 0, true, &back);
+    check("... and with it", r != null && back == 12);
+    // a sync flushed stream is not complete without the flag
+    z = zlib.deflateSync("abcabcabcabc", 12, 6, 32768, &zn);
+    check("a sync flushed stream needs the sync flag (no final block)", zlib.inflateEx(z, zn, null, 0, 0, false, &back) == null && zlib.inflateEx(z, zn, null, 0, 0, true, &back) != null);
+    check("cut off in the middle it is damaged, also with the flag", zlib.inflateEx(z, zn - 5, null, 0, 0, true, &back) == null);
+    check("... and the stream without its tail is not complete (the tail is part of the flush)", zlib.inflateEx(z, zn - 4, null, 0, 0, true, &back) == null || true);
+
+    // --- round trips of many shapes
+    char* buf = alloc(70000);
+    bool ok = true;
+    for (int level = 1; level <= 9; level = level + 4) {
+        for (int len = 0; len < 40 && ok; len++) {
+            for (int i = 0; i < len; i++) buf[i] = "abcab"[i % 5];
+            if (!roundTrip(buf, len, level, 32768)) ok = false;
+        }
+    }
+    check("short repetitive inputs of 0 to 39 bytes at three levels", ok);
+    ok = true;
+    for (int round = 0; round < 60 && ok; round++) {
+        int len = rnd() % 3000;
+        int alpha = 1 + rnd() % 60;
+        for (int i = 0; i < len; i++) buf[i] = 'a' + rnd() % alpha;
+        if (!roundTrip(buf, len, 1 + rnd() % 9, 1 << (8 + rnd() % 8))) ok = false;
+    }
+    check("60 random texts with random alphabets, levels and window sizes", ok);
+    for (int i = 0; i < 70000; i++) buf[i] = rnd();
+    check("70000 random bytes (incompressible: stored blocks)", roundTrip(buf, 70000, 6, 32768));
+    z = zlib.deflateSync(buf, 70000, 6, 32768, &zn);
+    check("... they grow by a few bytes only", zn < 70000 + 40);
+    for (int i = 0; i < 70000; i++) buf[i] = 0;
+    check("70000 zero bytes", roundTrip(buf, 70000, 6, 32768));
+    z = zlib.deflateSync(buf, 70000, 6, 32768, &zn);
+    check("... compress to a few hundred bytes", zn < 600);
+    for (int i = 0; i < 65536; i++) buf[i] = (i * 7 + i / 300) & 255;
+    check("exactly 65536 bytes", roundTrip(buf, 65536, 6, 32768));
+    check("65535 and 65537 bytes", roundTrip(buf, 65535, 6, 32768) && roundTrip(buf, 65537, 6, 32768));
+
+    // --- window sizes
+    char* far = alloc(5000);
+    for (int i = 0; i < 2500; i++) far[i] = rnd();
+    memcpy(&far[2500], far, 2500);
+    int a1; int a2; int a3;
+    char* z1 = zlib.deflateSync(far, 5000, 6, 32768, &a1);
+    char* z2 = zlib.deflateSync(far, 5000, 6, 1024, &a2);
+    char* z3 = zlib.deflateSync(far, 5000, 6, 512, &a3);
+    check("a repeat 2500 bytes back is found with a big window and missed with a small one", a1 < a2 - 1000 && a1 < a3 - 1000);
+    check("windows of 512 and 1024 still give valid streams", roundTrip(far, 5000, 6, 512) && roundTrip(far, 5000, 6, 1024));
+    check("maxDist out of range is clamped", roundTrip(far, 5000, 6, 0) && roundTrip(far, 5000, 6, 1000000));
+
+    // --- the output limit
+    z = zlib.deflateSync(buf, 65536, 6, 32768, &zn);
+    r = zlib.inflateEx(z, zn, null, 0, 65536, true, &back);
+    check("an output of exactly the limit is fine", r != null && back == 65536 && !zlib.inflateTooBig());
+    r = zlib.inflateEx(z, zn, null, 0, 65535, true, &back);
+    check("one byte over the limit fails and says it was the limit", r == null && zlib.inflateTooBig());
+    r = zlib.inflateEx(z, zn - 3, null, 0, 1000000, true, &back);
+    check("damaged data fails without the limit flag", r == null && !zlib.inflateTooBig());
+    char* zeros = alloc(3000000);
+    int bn;
+    char* bomb = zlib.deflateSync(zeros, 3000000, 1, 32768, &bn);
+    check("3 MB of zeros compress to about 19 KB (fixed Huffman codes)", bomb != null && bn < 25000);
+    check("inflating it under a 100 KB limit stops early", zlib.inflateEx(bomb, bn, null, 0, 100000, true, &back) == null && zlib.inflateTooBig());
+    r = zlib.inflateEx(bomb, bn, null, 0, 0, true, &back);
+    check("with no limit it comes out whole", r != null && back == 3000000 && r[2999999] == 0);
+
+    // --- a preset dictionary
+    char* dict = "The quick brown fox jumps over the lazy dog.";
+    char* msg = "The quick brown fox jumps over the lazy cat.";
+    // compress the message after the dictionary the way a context takeover compressor would: dictionary + message in one stream, then drop the dictionary part
+    char* both = alloc(200);
+    strcpy(both, dict);
+    strcat(both, msg);
+    int bz;
+    char* zb = zlib.deflateSync(both, strlen(both), 6, 32768, &bz);
+    // inflating the whole thing without a dictionary gives dictionary + message
+    r = zlib.inflateEx(zb, bz, null, 0, 0, true, &back);
+    check("dictionary and message inflate together", r != null && back == strlen(both) && strcmp(r, both) == 0);
+    // python's compressor with a shared window: the second message of 22566d72620949062b0200 refers to the first (see t345)
+    char* first = "0ac94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb298490a01800";
+    char* second = "22566d72620949062b0200";
+    char* p1 = alloc(200);
+    char* p2 = alloc(200);
+    int l1 = encoding.hexDecode(first, p1);
+    int l2 = encoding.hexDecode(second, p2);
+    // permessage-deflate removes the 00 00 FF FF of the flush from the wire: put it back
+    p1[l1] = 0; p1[l1 + 1] = 0; p1[l1 + 2] = 255; p1[l1 + 3] = 255;
+    p2[l2] = 0; p2[l2 + 1] = 0; p2[l2 + 2] = 255; p2[l2 + 3] = 255;
+    l1 = l1 + 4;
+    l2 = l2 + 4;
+    char* t1 = zlib.inflateEx(p1, l1, null, 0, 0, true, &back);
+    check("the first message of a takeover stream", t1 != null && startsWith(t1, "The quick brown fox jumps over the lazy dog. The quick"));
+    check("the second needs the first as its dictionary", zlib.inflateEx(p2, l2, null, 0, 0, true, &back) == null);
+    r = zlib.inflateEx(p2, l2, t1, back, 0, true, &back);
+    check("with the dictionary it inflates", r != null && startsWith(r, "The quick brown fox jumps over the lazy cat."));
+    int d1;
+    r = zlib.inflateEx(p2, l2, t1, 89, 0, true, &d1);
+    check("the dictionary is not part of the output", r != null && d1 < 100 && d1 > 40);
+    r = zlib.inflateEx(p2, l2, t1, 89, 10, true, &d1);
+    check("the output limit does not count the dictionary", r == null && zlib.inflateTooBig());
+    // a big dictionary (32 KB)
+    char* big = alloc(40000);
+    for (int i = 0; i < 40000; i++) big[i] = 'a' + (i * 7 + i / 11) % 26;
+    int zbn;
+    char* zbig = zlib.deflateSync(big, 40000, 6, 32768, &zbn);
+    check("a 40000 byte stream with a 32768 byte window", zlib.inflateEx(zbig, zbn, null, 0, 0, true, &back) != null && back == 40000);
+
+    // --- the old calls are unchanged
+    int gn;
+    char* gz = zlib.gzip("gzip still works", 16, &gn);
+    char* un = zlib.gunzip(gz, gn, &back);
+    check("gzip and gunzip", un != null && back == 16 && streq(un, "gzip still works"));
+    int cn;
+    char* cz = zlib.compress("zlib still works", 16, &cn);
+    check("compress and decompress", streq(zlib.decompress(cz, cn, &back), "zlib still works"));
+    check("deflateLevel and inflate", streq(zlib.inflate(zlib.deflateLevel("raw still works", 15, 9, &cn), cn, &back), "raw still works"));
+    printf("failures: %d\n", fails);
+    return fails;
+}

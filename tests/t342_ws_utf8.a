@@ -1,0 +1,257 @@
+// websocket: UTF-8 of text messages and close reasons is validated (close code 1007), also when a character is split between
+// fragments or arrives byte by byte; text that this side sends is validated too
+import websocket;
+import encoding;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// the bytes of a hex text (a heap buffer), the length in *n
+char* bytes(char* hex, int* n) {
+    char* b = alloc(strlen(hex) / 2 + 8);
+    *n = encoding.hexDecode(hex, b);
+    return b;
+}
+
+bool valid(char* hex) {
+    int n;
+    char* b = bytes(hex, &n);
+    return websocket.isUtf8(b, n);
+}
+
+// an independent reference: decode by the book (RFC 3629)
+bool reference(char* b, int n) {
+    int i = 0;
+    while (i < n) {
+        int c = b[i] & 255;
+        int len;
+        int cp;
+        if (c < 0x80) { i++; continue; }
+        else if (c >= 0xC0 && c <= 0xDF) { len = 2; cp = c & 0x1F; }
+        else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0F; }
+        else if (c >= 0xF0 && c <= 0xF7) { len = 4; cp = c & 0x07; }
+        else return false;
+        if (i + len > n) return false;
+        for (int k = 1; k < len; k++) {
+            if ((b[i + k] & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (b[i + k] & 0x3F);
+        }
+        if (len == 2 && cp < 0x80) return false;
+        if (len == 3 && cp < 0x800) return false;
+        if (len == 4 && cp < 0x10000) return false;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;
+        if (cp > 0x10FFFF) return false;
+        i = i + len;
+    }
+    return true;
+}
+
+// the close code a WebSocket queued (0: none); a client masks its frames
+int outCloseCode(websocket.WebSocket* w) {
+    int n = w->outPending();
+    if (n < 4) return 0;
+    char b[200];
+    if (n > 200) n = 200;
+    memcpy(&b[0], w->outData(), n);
+    if ((b[0] & 15) != 8) return 0;
+    int len = b[1] & 127;
+    int off = 2;
+    if ((b[1] & 128) != 0) {
+        websocket.unmask(&b[6], len, ((b[2] & 255) << 24) | ((b[3] & 255) << 16) | ((b[4] & 255) << 8) | (b[5] & 255));
+        off = 6;
+    }
+    if (len < 2) return 0;
+    return (b[off] & 255) * 256 + (b[off + 1] & 255);
+}
+
+// a text message of `payload` bytes as one unmasked frame (for a client)
+int textFrame(char* payload, int n, bool fin, int op, char* out) {
+    return websocket.buildFrame(op, fin, false, 0, payload, n, out);
+}
+
+int main() {
+    // the standard sequences
+    check("empty", valid(""));
+    check("ascii", valid("48656c6c6f"));
+    check("U+0080", valid("c280"));
+    check("U+07FF", valid("dfbf"));
+    check("U+0800", valid("e0a080"));
+    check("U+D7FF", valid("ed9fbf"));
+    check("U+E000", valid("ee8080"));
+    check("U+FFFF", valid("efbfbf"));
+    check("U+10000", valid("f0908080"));
+    check("U+10FFFF", valid("f48fbfbf"));
+    check("kosme", valid("cebae1bdb9cf83cebcceb5"));
+    check("lone continuation byte", !valid("80"));
+    check("lone continuation byte BF", !valid("bf"));
+    check("overlong C0 80", !valid("c080"));
+    check("overlong C1 BF", !valid("c1bf"));
+    check("overlong E0 80 80", !valid("e08080"));
+    check("overlong E0 9F BF", !valid("e09fbf"));
+    check("overlong F0 80 80 80", !valid("f0808080"));
+    check("overlong F0 8F BF BF", !valid("f08fbfbf"));
+    check("surrogate D800", !valid("eda080"));
+    check("surrogate DFFF", !valid("edbfbf"));
+    check("above 10FFFF", !valid("f4908080"));
+    check("F5", !valid("f5808080"));
+    check("F8", !valid("f888808080"));
+    check("FE", !valid("fe"));
+    check("FF", !valid("ff"));
+    check("truncated 2 byte", !valid("c2"));
+    check("truncated 3 byte", !valid("e0a0"));
+    check("truncated 4 byte", !valid("f09080"));
+    check("bad continuation", !valid("c241"));
+    check("bad second continuation", !valid("e0a041"));
+
+    // exhaustive against the reference: all 1 and 2 byte sequences, and the interesting 3 and 4 byte ones
+    int bad = 0;
+    char t[4];
+    for (int a = 0; a < 256; a++) {
+        t[0] = a;
+        if (websocket.isUtf8(&t[0], 1) != reference(&t[0], 1)) bad++;
+        for (int b = 0; b < 256; b++) {
+            t[1] = b;
+            if (websocket.isUtf8(&t[0], 2) != reference(&t[0], 2)) bad++;
+        }
+    }
+    check("all 1 and 2 byte sequences agree with the reference", bad == 0);
+    int leads[8] = { 0xE0, 0xE1, 0xED, 0xEF, 0xF0, 0xF1, 0xF4, 0xF5 };
+    int mids[10] = { 0x00, 0x41, 0x7F, 0x80, 0x8F, 0x90, 0x9F, 0xA0, 0xBF, 0xC0 };
+    bad = 0;
+    int tested = 0;
+    for (int a = 0; a < 8; a++) {
+        for (int b = 0; b < 10; b++) {
+            for (int c = 0; c < 10; c++) {
+                char u[4];
+                u[0] = leads[a]; u[1] = mids[b]; u[2] = mids[c];
+                tested++;
+                if (websocket.isUtf8(&u[0], 3) != reference(&u[0], 3)) bad++;
+                for (int d = 0; d < 10; d++) {
+                    u[3] = mids[d];
+                    tested++;
+                    if (websocket.isUtf8(&u[0], 4) != reference(&u[0], 4)) bad++;
+                }
+            }
+        }
+    }
+    check("the 3 and 4 byte boundary cases agree with the reference", bad == 0 && tested == 8800);
+
+    // every split point of valid text gives the same result as the whole
+    int n;
+    char* text = bytes("cebae1bdb9cf83cebcceb5f09f9880e282ac61", &n);
+    int whole = websocket.utf8Step(0, text, n);
+    int splitBad = 0;
+    for (int k = 0; k <= n; k++) {
+        int s = websocket.utf8Step(0, text, k);
+        if (s < 0) { splitBad++; continue; }
+        if (websocket.utf8Step(s, &text[k], n - k) != whole) splitBad++;
+    }
+    check("incremental validation at every split point", whole == 0 && splitBad == 0);
+    check("an incomplete character leaves a state", websocket.utf8Step(0, text, 1) > 0);
+
+    // messages through the state machine (a client receives unmasked frames)
+    char* fr = alloc(300);
+    websocket.WebSocket* w = websocket.create(null, true);
+    char* good = bytes("cebae1bdb9cf83cebcceb5", &n);
+    int fl = textFrame(good, n, true, 1, fr);
+    check("valid text is delivered", w->feed(fr, fl) == fl && w->takeMessage() != null);
+    char* badText = bytes("cebae1bdb9cf83cebcceb5eda080656469746564", &n);
+    fl = textFrame(badText, n, true, 1, fr);
+    check("a surrogate in a text message ends the connection", w->feed(fr, fl) == -1 && outCloseCode(w) == 1007 && w->failed);
+    w->dispose();
+
+    // fail fast: the invalid byte is in the first fragment, the connection ends before the message is complete
+    w = websocket.create(null, true);
+    char* first = bytes("cebae1bdb9ff", &n);
+    fl = textFrame(first, n, false, 1, fr);
+    check("an invalid byte in the first fragment fails at once", w->feed(fr, fl) == -1 && outCloseCode(w) == 1007);
+    w->dispose();
+    // ... and even in the middle of a frame that is still arriving
+    w = websocket.create(null, true);
+    char* partial = bytes("ffffffffffffffff", &n);
+    fl = textFrame(partial, n, true, 1, fr);
+    check("a frame that is only half there already fails", w->feed(fr, 4) == -1 && outCloseCode(w) == 1007);
+    w->dispose();
+    w->dispose();
+
+    // a character split between two fragments is fine
+    w = websocket.create(null, true);
+    char* p1 = bytes("cebae1", &n);
+    fl = textFrame(p1, n, false, 1, fr);
+    w->feed(fr, fl);
+    char* p2 = bytes("bdb9cf83", &n);
+    fl = textFrame(p2, n, true, 0, fr);
+    w->feed(fr, fl);
+    websocket.Message* m = w->takeMessage();
+    check("a character split between fragments", m != null && m->length == 7 && !w->failed);
+    m->dispose();
+    // a message that stops inside a character
+    char* cut = bytes("cebae1bd", &n);
+    fl = textFrame(cut, n, true, 1, fr);
+    check("a text message ending inside a character -> 1007", w->feed(fr, fl) == -1 && outCloseCode(w) == 1007);
+    w->dispose();
+    // a character split between two feed calls, and a valid message fed byte by byte
+    w = websocket.create(null, true);
+    fl = textFrame(text, 11, true, 1, fr);
+    int got = 0;
+    for (int i = 0; i < fl; i++) got = got + w->feed(&fr[i], 1);
+    m = w->takeMessage();
+    check("valid text byte by byte", got == fl && m != null && m->length == 11);
+    m->dispose();
+    // binary is not checked
+    fl = textFrame(badText, 20, true, 2, fr);
+    check("binary data may be anything", w->feed(fr, fl) == fl && w->takeMessage() != null && !w->failed);
+    w->dispose();
+    // the streaming handler checks too
+    w = websocket.create(null, true);
+    w->setStreamHandler(null);
+    fl = textFrame(badText, 20, true, 1, fr);
+    check("without a handler the message is queued and checked", w->feed(fr, fl) == -1 && outCloseCode(w) == 1007);
+    w->dispose();
+
+    // close reasons
+    w = websocket.create(null, false);
+    char* closeOk = bytes("03e8cebae1bdb9", &n);
+    int cl = websocket.buildFrame(websocket.OP_CLOSE, true, true, 0, closeOk, n, fr);
+    w->feed(fr, cl);
+    check("a UTF-8 close reason is kept", w->closed && !w->failed && w->closeCode == 1000 && w->closeReason != null && strlen(w->closeReason) == 5);
+    w->dispose();
+    w = websocket.create(null, false);
+    char* closeBad = bytes("03e8cebaff", &n);
+    cl = websocket.buildFrame(websocket.OP_CLOSE, true, true, 0, closeBad, n, fr);
+    check("an invalid close reason -> 1007", w->feed(fr, cl) == -1 && w->failed && outCloseCode(w) == 1007);
+    w->dispose();
+
+    // sending
+    w = websocket.create(null, false);
+    char* bad1 = bytes("ff", &n);
+    check("sendTextN refuses invalid UTF-8", !w->sendTextN(bad1, 1) && w->outPending() == 0);
+    check("sendTextN accepts valid UTF-8", w->sendTextN(good, 11) && w->outPending() == 13);
+    w->outConsumed(13);
+    check("sendBinary accepts anything", w->sendBinary(bad1, 1) && w->outPending() == 3);
+    w->outConsumed(3);
+    check("a text fragment may split a character", w->beginMessage(websocket.OP_TEXT) && w->sendFragment(good, 3) && w->sendFragment(&good[3], 8));
+    check("the next fragment is checked", !w->sendFragment(bad1, 1));
+    check("a message that is complete can end", w->endMessage());
+    w->outConsumed(w->outPending());
+    check("a text message cannot end inside a character", w->beginMessage(websocket.OP_TEXT) && w->sendFragment(good, 3) && !w->endMessage());
+    check("... but can go on", w->sendFragment(&good[3], 8) && w->endMessage());
+    w->outConsumed(w->outPending());
+    check("a close reason must be UTF-8", !w->closeWith(1000, "\xff"));
+    char* longReason = alloc(130);
+    for (int i = 0; i < 124; i++) longReason[i] = 'a';
+    check("a close reason has at most 123 bytes", !w->closeWith(1000, longReason));
+    longReason[123] = 0;
+    check("123 bytes are fine", w->closeWith(1000, longReason) && w->outPending() == 127);
+    w->dispose();
+    printf("failures: %d\n", fails);
+    return fails;
+}

@@ -1,0 +1,861 @@
+// =============================================================================
+//  jsonrpc - JSON-RPC 2.0 client and dispatcher over streams, HTTP and WebSocket                                   import jsonrpc;
+//
+//  Server side: a method table, requests, notifications and batches exactly as the specification says (error codes -32700 -32600 -32601 -32602 -32603).
+//
+//    json.Json* add(jsonrpc.Call* c) {                                   // a handler gets the call and returns the result (a NEW value: never params or a part of them)
+//        json.Json* a = c->param(0, "a");  json.Json* b = c->param(1, "b");        // positional ([1,2]) or named ({"a":1,"b":2}) parameters
+//        if (a == null || b == null || !a->isNumber() || !b->isNumber()) { c->fail(jsonrpc.INVALID_PARAMS, "need numbers a and b", null); return null; }
+//        return json.newInt(a->asInt() + b->asInt());
+//    }
+//    jsonrpc.Dispatcher* d = new jsonrpc.Dispatcher();
+//    d->add("add", add);
+//    int n;  char* reply = d->handleText("{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":1}", -1, &n);    // a heap string, or null when
+//    free(reply);                                                                                                        // no answer is due (notifications)
+//
+//  Transports for the server:
+//    jsonrpc.serveStream(d, connection, jsonrpc.FRAME_LINES, 0)        newline delimited messages, or FRAME_LENGTH: "Content-Length: N" headers (as LSP)
+//    router->add("POST", "/rpc", jsonrpc.httpHandler, (char*) d)       an httpx route (wshub's HTTP side, any httpx.Router)
+//    hub->onMessage = jsonrpc.hubMessage;  hub->user = (char*) d;      WebSocket clients of a wshub
+//
+//  Client:
+//    jsonrpc.Client* c = jsonrpc.connectWebSocket("ws://localhost:8080/rpc");     // or connectStream(connection, framing) / connectHttp("http://localhost/rpc")
+//    json.Json* params = json.parse("[1, 2]");
+//    json.Json* r = c->call("add", params);                          // the result (free it with r->dispose()), null on an error: c->errCode, c->errMessage
+//    c->notify("log", params);
+//    jsonrpc.Batch* b = c->batch();  int i1 = b->add("add", p1);  int i2 = b->add("sub", p2);  b->notify("log", p3);  b->send();
+//    b->result(i1) / b->errorCode(i1) ...   b->dispose();
+//    c->dispose();                                                   // closes the connection and frees the client completely
+//
+//  Params you pass stay yours (the client does not free them). Results and the values a handler returns are freed by the module (a handler's result by the
+//  dispatcher after it was written), so a server runs in constant memory. Limits: maxBatch 100 requests per batch, maxRequest 1 MiB per message.
+// =============================================================================
+import json;
+import conn;
+import websocket;
+import httpx;
+import net;
+import wshub;
+import cstdlib;
+module jsonrpc;
+
+public const PARSE_ERROR = -32700;
+public const INVALID_REQUEST = -32600;
+public const METHOD_NOT_FOUND = -32601;
+public const INVALID_PARAMS = -32602;
+public const INTERNAL_ERROR = -32603;
+public const SERVER_ERROR = -32000;           // -32000 .. -32099 are for implementation defined server errors
+
+public const FRAME_LINES = 0;                 // one message per line
+public const FRAME_LENGTH = 1;                // "Content-Length: N\r\n\r\n" and N bytes
+
+private char* dupStr(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r == null) return null;
+    memcpy(r, s, n + 1);
+    return r;
+}
+
+// ---- a call (what a handler sees) ------------------------------------------------------------------------------------------------------------
+public class Call {
+    public json.Json* params;       // the params member (an array or an object), null if the request had none
+    public char* method;
+    public json.Json* id;           // the id of the request, null for a notification
+    public bool notification;
+    public char* user;              // the dispatcher's user pointer
+    public bool failed;
+    public int errCode;
+    public char* errMessage;
+    public json.Json* errData;
+
+    // makes the answer an error response (code: INVALID_PARAMS ... or your own in -32000 .. -32099 or above); data (may be null) is added as error.data and then
+    // belongs to the module
+    public void fail(int code, char* message, json.Json* data) {
+        failed = true;
+        errCode = code;
+        if (errMessage != null) free(errMessage);
+        errMessage = dupStr(message);
+        if (errData != null) errData->dispose();
+        errData = data;
+    }
+
+    // a positional parameter (params is an array), or null
+    public json.Json* arg(int index) {
+        if (params == null || !params->isArray()) return null;
+        return params->at(index);
+    }
+
+    // a named parameter (params is an object), or null
+    public json.Json* named(char* name) {
+        if (params == null || !params->isObject()) return null;
+        return params->get(name);
+    }
+
+    // the parameter at `index` when params is an array, else the one called `name`
+    public json.Json* param(int index, char* name) {
+        if (params != null && params->isArray()) return params->at(index);
+        return named(name);
+    }
+}
+
+// ---- building responses ---------------------------------------------------------------------------------------------------------------------------
+// a copy of an id (a string, a whole number or null)
+private json.Json* cloneId(json.Json* id) {
+    if (id == null || id->isNull()) return json.newNull();
+    if (id->isString()) return json.newString(id->asString());
+    if (id->isNumber()) {
+        if (id->text != null) {
+            json.Json* j = json.parse(id->text);
+            if (j != null) return j;
+        }
+        return json.newInt(id->asInt());
+    }
+    return json.newNull();
+}
+
+private json.Json* errorResponse(json.Json* id, int code, char* message, json.Json* data) {
+    json.Json* r = json.newObject();
+    r->set("jsonrpc", json.newString("2.0"));
+    json.Json* e = json.newObject();
+    e->set("code", json.newInt(code));
+    e->set("message", json.newString(message));
+    if (data != null) e->set("data", data);
+    r->set("error", e);
+    r->set("id", cloneId(id));
+    return r;
+}
+
+private json.Json* resultResponse(json.Json* id, json.Json* result) {
+    json.Json* r = json.newObject();
+    r->set("jsonrpc", json.newString("2.0"));
+    r->set("result", result);
+    r->set("id", cloneId(id));
+    return r;
+}
+
+// ---- the dispatcher ---------------------------------------------------------------------------------------------------------------------------------
+public class Dispatcher {
+    public char* names[64];
+    public func handlers[64];
+    public int n;
+    public int maxBatch;            // requests in a batch (default 100)
+    public int maxRequest;          // bytes of a message (default 1 MiB)
+    public char* user;              // handed to every handler as call->user
+    public int requests;            // requests handled (statistics)
+    public int errors;              // error responses produced
+
+    public Dispatcher() {
+        maxBatch = 100;
+        maxRequest = 1048576;
+    }
+
+    // registers a method: handler(Call*) returns the result (a json.Json* that the dispatcher frees) or null for a result of null; to answer with an
+    // error call c->fail(code, message, data) and return null. A name may be registered once; names starting with "rpc." are reserved by the specification
+    // and refused. 64 methods fit.
+    public bool add(char* method, func handler) {
+        if (n >= 64 || startsWith(method, "rpc.") || method[0] == 0) return false;
+        for (int i = 0; i < n; i++) if (streq(names[i], method)) return false;
+        names[n] = dupStr(method);
+        handlers[n] = handler;
+        n++;
+        return true;
+    }
+
+    public bool has(char* method) {
+        for (int i = 0; i < n; i++) if (streq(names[i], method)) return true;
+        return false;
+    }
+
+    private func find(char* method) {
+        for (int i = 0; i < n; i++) if (streq(names[i], method)) return handlers[i];
+        return null;
+    }
+
+    // handles one request object. Returns the response (the caller disposes it) or null for a notification
+    public json.Json* handleOne(json.Json* req) {
+        requests++;
+        if (!req->isObject()) {
+            errors++;
+            return errorResponse(null, INVALID_REQUEST, "Invalid Request", null);
+        }
+        json.Json* id = req->get("id");
+        bool hasId = req->has("id");
+        // an id must be a string, a number or null
+        if (hasId && !(id->isString() || id->isNumber() || id->isNull())) {
+            errors++;
+            return errorResponse(null, INVALID_REQUEST, "Invalid Request", null);
+        }
+        json.Json* ver = req->get("jsonrpc");
+        json.Json* method = req->get("method");
+        json.Json* params = req->get("params");
+        bool valid = ver != null && ver->isString() && streq(ver->asString(), "2.0") && method != null && method->isString();
+        if (valid && req->has("params") && !(params->isArray() || params->isObject())) valid = false;
+        if (!valid) {
+            errors++;
+            return errorResponse(hasId ? id : null, INVALID_REQUEST, "Invalid Request", null);
+        }
+        func h = find(method->asString());
+        bool notification = !hasId;
+        if (h == null) {
+            if (notification) return null;
+            errors++;
+            return errorResponse(id, METHOD_NOT_FOUND, "Method not found", null);
+        }
+        Call* c = (Call*) malloc(sizeof(Call));
+        c->params = req->has("params") ? params : null;
+        c->method = method->asString();
+        c->id = hasId ? id : null;
+        c->notification = notification;
+        c->user = user;
+        json.Json* result = (json.Json*) h(c);
+        json.Json* response = null;
+        if (c->failed) {
+            if (result != null) result->dispose();
+            if (!notification) {
+                errors++;
+                response = errorResponse(id, c->errCode, c->errMessage == null ? "Error" : c->errMessage, c->errData);
+                c->errData = null;
+            }
+        } else if (!notification) {
+            response = resultResponse(id, result == null ? json.newNull() : result);
+        } else if (result != null) {
+            result->dispose();
+        }
+        if (c->errMessage != null) free(c->errMessage);
+        if (c->errData != null) c->errData->dispose();
+        free(c);
+        return response;
+    }
+
+    // handles a parsed message: one request or a batch. Returns the response (an object or an array; the caller disposes it) or null when nothing is to be sent
+    public json.Json* handle(json.Json* msg) {
+        if (!msg->isArray()) return handleOne(msg);
+        int count = msg->size();
+        if (count == 0) {
+            errors++;
+            return errorResponse(null, INVALID_REQUEST, "Invalid Request", null);
+        }
+        if (count > maxBatch) {
+            errors++;
+            return errorResponse(null, INVALID_REQUEST, "Batch too large", null);
+        }
+        json.Json* out = json.newArray();
+        for (int i = 0; i < count; i++) {
+            json.Json* r = handleOne(msg->at(i));
+            if (r != null) out->push(r);
+        }
+        if (out->size() == 0) {
+            out->dispose();
+            return null;
+        }
+        return out;
+    }
+
+    // Handles the text of a message (n bytes, or -1 for a NUL terminated text). Returns the response text (free it) or null when nothing is to be sent
+    // (a notification, or a batch of notifications). A message that is not JSON gets a Parse error, one that is too long an Invalid Request.
+    public char* handleText(char* text, int n, int* outLen) {
+        if (n < 0) n = strlen(text);
+        *outLen = 0;
+        if (n > maxRequest) {
+            errors++;
+            json.Json* e = errorResponse(null, INVALID_REQUEST, "Request too large", null);
+            char* t = json.stringify(e);
+            e->dispose();
+            *outLen = strlen(t);
+            return t;
+        }
+        // json.parse wants a text that ends with a 0 byte
+        char* copy = malloc(n + 1);
+        memcpy(copy, text, n);
+        copy[n] = 0;
+        // JSON is UTF-8 (RFC 8259) and a C string cannot hold a NUL: bad UTF-8, a NUL byte or a \u0000 escape (which would cut a method name short
+        // so that "ad\u0000d" ran "ad") make the whole message a Parse error
+        json.Json* msg = null;
+        if (websocket.isUtf8(text, n) && !hasNul(text, n)) msg = json.parse(copy);
+        free(copy);
+        if (msg == null) {
+            errors++;
+            json.Json* e = errorResponse(null, PARSE_ERROR, "Parse error", null);
+            char* t = json.stringify(e);
+            e->dispose();
+            *outLen = strlen(t);
+            return t;
+        }
+        json.Json* resp = handle(msg);
+        msg->dispose();
+        if (resp == null) return null;
+        char* t = json.stringify(resp);
+        resp->dispose();
+        *outLen = strlen(t);
+        return t;
+    }
+
+    public void dispose() {
+        for (int i = 0; i < n; i++) free(names[i]);
+        n = 0;
+    }
+}
+
+// does the JSON text contain a NUL byte or a \u0000 escape inside a string?
+private bool hasNul(char* t, int n) {
+    bool inStr = false;
+    for (int i = 0; i < n; i++) {
+        int c = t[i] & 255;
+        if (c == 0) return true;
+        if (!inStr) {
+            if (c == '"') inStr = true;
+            continue;
+        }
+        if (c == '"') { inStr = false; continue; }
+        if (c == '\\') {
+            if (i + 5 < n && t[i + 1] == 'u' && t[i + 2] == '0' && t[i + 3] == '0' && t[i + 4] == '0' && t[i + 5] == '0') return true;
+            i++;                                    // the escaped character is not looked at
+        }
+    }
+    return false;
+}
+
+// ---- framed streams -----------------------------------------------------------------------------------------------------------------------------------
+// Reads one message from a connection: a line (FRAME_LINES) or a Content-Length framed body (FRAME_LENGTH). Returns a heap string (the length in *n) or null at the end
+// of the connection or when the message breaks a limit (max bytes; *n is -1 then)
+public char* readMessage(conn.Connection* c, int framing, int max, int* n) {
+    *n = 0;
+    if (framing == FRAME_LINES) {
+        int cap = 256;
+        char* b = malloc(cap);
+        int len = 0;
+        for (;;) {
+            int ch = c->readByte();
+            if (ch < 0) {
+                free(b);
+                return null;
+            }
+            if (ch == 10) {
+                if (len == 0) continue;               // an empty line is no message
+                break;
+            }
+            if (ch == 13) continue;
+            if (len + 2 > cap) {
+                cap = cap * 2;
+                b = realloc(b, cap);
+            }
+            if (len >= max) { free(b); *n = -1; return null; }
+            b[len] = ch;
+            len++;
+        }
+        b[len] = 0;
+        *n = len;
+        return b;
+    }
+    // headers up to an empty line
+    int length = -1;
+    char line[300];
+    for (int i = 0; i < 20; i++) {
+        int r = c->readLine(&line[0], 300);
+        if (r < 0) return null;
+        if (r == 0) {
+            if (length < 0 && i == 0) continue;
+            break;
+        }
+        if (startsWith(&line[0], "Content-Length:") || startsWith(&line[0], "content-length:")) {
+            int p = 15;
+            while (line[p] == ' ') p++;
+            int v = 0;
+            int d = 0;
+            while (isDigit(line[p]) && d < 12) { v = v * 10 + (line[p] - '0'); p++; d++; }
+            if (d == 0 || line[p] != 0) { *n = -1; return null; }
+            length = v;
+        }
+    }
+    if (length < 0 || length > max) { *n = -1; return null; }
+    char* body = malloc(length + 1);
+    if (c->readExact(body, length) != length) {
+        free(body);
+        return null;
+    }
+    body[length] = 0;
+    *n = length;
+    return body;
+}
+
+// writes one message with the framing
+public bool writeMessage(conn.Connection* c, int framing, char* text, int n) {
+    if (framing == FRAME_LINES) {
+        // a line cannot contain a newline: the stringify output never does (it is compact), a hand made text must not
+        for (int i = 0; i < n; i++) if (text[i] == 10) return false;
+        return c->write(text, n) && c->write("\n", 1) && c->flush();
+    }
+    char head[60];
+    format(&head[0], 60, "Content-Length: %d\r\n\r\n", n);
+    return c->writeText(&head[0]) && c->write(text, n) && c->flush();
+}
+
+// Serves requests from a connection until it ends (or `limit` messages were answered, 0: no limit). A message that breaks the size limit gets an
+// Invalid Request answer and ends the session. Returns the number of messages handled.
+public int serveStream(Dispatcher* d, conn.Connection* c, int framing, int limit) {
+    int served = 0;
+    for (;;) {
+        int n;
+        char* msg = readMessage(c, framing, d->maxRequest, &n);
+        if (msg == null) {
+            if (n < 0) {
+                json.Json* e = errorResponse(null, INVALID_REQUEST, "Request too large", null);
+                char* et = json.stringify(e);
+                e->dispose();
+                writeMessage(c, framing, et, strlen(et));
+                free(et);
+            }
+            return served;
+        }
+        int rn;
+        char* reply = d->handleText(msg, n, &rn);
+        free(msg);
+        served++;
+        if (reply != null) {
+            bool ok = writeMessage(c, framing, reply, rn);
+            free(reply);
+            if (!ok) return served;
+        }
+        if (limit > 0 && served >= limit) return served;
+    }
+    return served;
+}
+
+// ---- HTTP and WebSocket on the server side ---------------------------------------------------------------------------------------------------------------------
+// an httpx route handler:  router->add("POST", "/rpc", jsonrpc.httpHandler, (char*) dispatcher). The body is the request, the answer is application/json;
+// a notification (or a batch of notifications) gets 204 No Content
+public int httpHandler(httpx.Context* x) {
+    Dispatcher* d = (Dispatcher*) x->data;
+    httpx.Request* q = x->req;
+    if (!q->isMethod("POST")) {
+        x->res->error(405);
+        x->res->setHeader("Allow", "POST");
+        return 0;
+    }
+    int n;
+    char* reply = d->handleText(q->body == null ? "" : q->body, q->bodyLen, &n);
+    if (reply == null) {
+        x->res->status = 204;
+        x->res->setBody("", 0);
+        return 0;
+    }
+    x->res->bytes(200, "application/json", reply, n);
+    free(reply);
+    return 0;
+}
+
+// a wshub onMessage callback:  hub->onMessage = jsonrpc.hubMessage;  hub->user = (char*) dispatcher.  Text messages are requests; the answer goes back
+// to the same client (binary messages are ignored)
+public int hubMessage(wshub.Hub* hub, wshub.Client* c, char* data, int n, int isText) {
+    if (isText == 0) return 0;
+    Dispatcher* d = (Dispatcher*) hub->user;
+    int rn;
+    char* reply = d->handleText(data, n, &rn);
+    if (reply != null) {
+        hub->sendData(c, reply, rn, true);
+        free(reply);
+    }
+    return 0;
+}
+
+// ---- the client -------------------------------------------------------------------------------------------------------------------------------------------
+// a batch of calls and notifications
+public class Batch {
+    public char* client;            // the Client (a pointer: Client is declared first)
+    public char* texts[100];        // the request objects as text
+    public int ids[100];            // the id of each (-1 for a notification)
+    public int count;
+    public json.Json* answers;      // the parsed answer array after send()
+    public bool sentOk;
+
+    // adds a call; returns its index for result() / errorCode() (-1 if the batch is full)
+    public int add(char* method, json.Json* params) {
+        if (count >= 100) return -1;
+        Client* c = (Client*) client;
+        int id = c->nextId;
+        c->nextId++;
+        int n;
+        texts[count] = c->requestPublic(method, params, id, &n);
+        ids[count] = id;
+        count++;
+        return count - 1;
+    }
+
+    // adds a notification; returns its index (it has no result)
+    public int notify(char* method, json.Json* params) {
+        if (count >= 100) return -1;
+        Client* c = (Client*) client;
+        int n;
+        texts[count] = c->requestPublic(method, params, -1, &n);
+        ids[count] = -1;
+        count++;
+        return count - 1;
+    }
+
+    // sends the batch and reads the answers. false if the transport failed (client->transportError says why). A batch of only notifications sends and returns true.
+    public bool send() {
+        Client* c = (Client*) client;
+        c->clearErrorPublic();
+        int total = 4;
+        for (int i = 0; i < count; i++) total = total + strlen(texts[i]) + 1;
+        char* body = malloc(total);
+        strcpy(body, "[");
+        bool anyCall = false;
+        for (int i = 0; i < count; i++) {
+            if (i > 0) strcat(body, ",");
+            strcat(body, texts[i]);
+            if (ids[i] >= 0) anyCall = true;
+        }
+        strcat(body, "]");
+        json.Json* resp = c->exchangePublic(body, strlen(body), anyCall, -1);
+        free(body);
+        for (int i = 0; i < count; i++) free(texts[i]);
+        if (!anyCall) { sentOk = c->transportError[0] == 0; return sentOk; }
+        if (resp == null) return false;
+        if (!resp->isArray()) {
+            // a single error object: the whole batch was refused
+            json.Json* single = resp;
+            c->setErrorFrom(single);
+            single->dispose();
+            return false;
+        }
+        answers = resp;
+        sentOk = true;
+        return true;
+    }
+
+    // the answer object for request i, or null
+    private json.Json* answerOf(int i) {
+        if (answers == null || i < 0 || i >= count || ids[i] < 0) return null;
+        for (int k = 0; k < answers->size(); k++) {
+            json.Json* a = answers->at(k);
+            json.Json* id = a->isObject() ? a->get("id") : null;
+            if (id != null && id->isNumber() && id->asInt() == ids[i]) return a;
+        }
+        return null;
+    }
+
+    // the result of request i (a pointer into the batch, valid until dispose()), or null if it failed or did not answer
+    public json.Json* result(int i) {
+        json.Json* a = answerOf(i);
+        if (a == null || !a->has("result")) return null;
+        return a->get("result");
+    }
+
+    // the error code of request i (0: no error answer)
+    public int errorCode(int i) {
+        json.Json* a = answerOf(i);
+        if (a == null || !a->has("error")) return 0;
+        json.Json* e = a->get("error");
+        if (!e->isObject() || e->get("code") == null) return 0;
+        return e->get("code")->asInt();
+    }
+
+    public char* errorMessage(int i) {
+        json.Json* a = answerOf(i);
+        if (a == null || !a->has("error")) return "";
+        json.Json* e = a->get("error");
+        if (!e->isObject() || e->get("message") == null) return "";
+        return e->get("message")->asString();
+    }
+
+    // did the server answer request i at all?
+    public bool answered(int i) { return answerOf(i) != null; }
+
+    public void dispose() {
+        if (answers != null) answers->dispose();
+        answers = null;
+        free(this);
+    }
+}
+
+public const MODE_STREAM = 1;
+public const MODE_HTTP = 2;
+public const MODE_WEBSOCKET = 3;
+
+public class Client {
+    public int mode;
+    public conn.Connection* link;
+    public int framing;
+    public httpx.Client* http;
+    public char* url;
+    public websocket.WebSocket* ws;
+    public int timeoutMs;           // how long a call waits for its answer (default 10000)
+    public int maxResponse;         // default 1 MiB
+    public int nextId;
+    public func onNotification;     // onNotification(client, method, params): a message from the server that is not an answer (the params are freed after the call)
+    public char* user;
+    // what the last call left
+    public int errCode;             // the code of the error answer (0: none)
+    public char errMessage[200];
+    public json.Json* errData;      // error.data of the last error answer (owned by the client, freed by the next call)
+    public char transportError[120];// a problem below JSON-RPC (connection lost, time out, invalid answer)
+    public int sent;
+    public int received;
+
+    public bool heap;               // made by connectStream, connectHttp, connectWebSocket ...: dispose() frees it
+
+    public Client() {
+        timeoutMs = 10000;
+        maxResponse = 1048576;
+        nextId = 1;
+    }
+
+    public void clearErrorPublic() { clearError(); }
+
+    private void clearError() {
+        errCode = 0;
+        errMessage[0] = 0;
+        transportError[0] = 0;
+        if (errData != null) { errData->dispose(); errData = null; }
+    }
+
+    private void transportFail(char* why) {
+        int i = 0;
+        while (why[i] != 0 && i < 119) { transportError[i] = why[i]; i++; }
+        transportError[i] = 0;
+    }
+
+    // sends a message and (when want is true) waits for the next message that answers: matchId >= 0 looks for an object with that id, -1 for a batch (an array).
+    // Returns the parsed answer (the caller disposes it) or null
+    public json.Json* exchangePublic(char* text, int n, bool want, int matchId) { return exchange(text, n, want, matchId); }
+
+    private json.Json* exchange(char* text, int n, bool want, int matchId) {
+        sent++;
+        if (mode == MODE_HTTP) {
+            httpx.Headers* h = (httpx.Headers*) malloc(sizeof(httpx.Headers));
+            h->set("Content-Type", "application/json");
+            h->set("Accept", "application/json");
+            httpx.Reply* r = http->request("POST", url, h, text, n);
+            h->dispose();
+            free(h);
+            if (r == null) { transportFail(httpx.error()); return null; }
+            if (!want) { r->dispose(); return null; }
+            if (r->status == 204 || r->bodyLen == 0) { transportFail("the server sent no answer"); r->dispose(); return null; }
+            if (r->status != 200 && r->status != 400 && r->status != 500) {
+                char msg[60];
+                format(&msg[0], 60, "the server answered HTTP %d", r->status);
+                transportFail(&msg[0]);
+                r->dispose();
+                return null;
+            }
+            json.Json* j = json.parse(r->body);
+            r->dispose();
+            if (j == null) { transportFail("the answer is not JSON"); return null; }
+            received++;
+            return j;
+        }
+        if (mode == MODE_STREAM) {
+            if (!writeMessage(link, framing, text, n)) { transportFail("sending failed"); return null; }
+        } else {
+            char* copy = malloc(n + 1);
+            memcpy(copy, text, n);
+            copy[n] = 0;
+            bool ok = ws->sendText(copy);
+            free(copy);
+            if (!ok) { transportFail("sending failed"); return null; }
+        }
+        if (!want) return null;
+        int t0 = millis();
+        for (;;) {
+            char* msg = null;
+            int mn = 0;
+            websocket.Message* wm = null;
+            if (mode == MODE_STREAM) {
+                link->setTimeout(timeoutMs);
+                msg = readMessage(link, framing, maxResponse, &mn);
+                if (msg == null) { transportFail(mn < 0 ? "an answer is too big" : "the connection ended or timed out"); return null; }
+            } else {
+                int left = timeoutMs - (millis() - t0);
+                if (left < 0) left = 0;
+                wm = ws->waitMessage(left);
+                if (wm == null) { transportFail(ws->closed ? "the connection was closed" : "timed out waiting for the answer"); return null; }
+                if (wm->opcode != websocket.OP_TEXT) { wm->dispose(); continue; }
+                msg = wm->data;
+            }
+            json.Json* j = json.parse(msg);
+            if (wm != null) wm->dispose(); else free(msg);
+            if (j == null) { transportFail("the answer is not JSON"); return null; }
+            received++;
+            if (matchId < 0) {
+                if (j->isArray()) return j;
+            } else if (j->isObject() && j->has("id") && !j->has("method")) {
+                json.Json* id = j->get("id");
+                if (id->isNumber() && id->asInt() == matchId) return j;
+                if (id->isNull() && j->has("error")) return j;           // the server could not tell which request was wrong
+            }
+            // a notification or a request from the server
+            json.Json* m = j->isObject() ? j->get("method") : null;
+            if (m != null && m->isString() && onNotification != null) {
+                func cb = onNotification;
+                cb(this, m->asString(), j->get("params"));
+            }
+            j->dispose();
+            if (millis() - t0 > timeoutMs) { transportFail("timed out waiting for the answer"); return null; }
+        }
+        return null;
+    }
+
+    // the request text of one call: {"jsonrpc":"2.0","method":...,"params":...,"id":N}; params may be null; id < 0 makes a notification
+    public char* requestPublic(char* method, json.Json* params, int id, int* n) { return requestText(method, params, id, n); }
+
+    // fills errCode / errMessage from an error answer object (does not free it)
+    public void setErrorFrom(json.Json* resp) {
+        json.Json* e = resp->isObject() ? resp->get("error") : null;
+        if (e != null && e->isObject() && e->get("code") != null && e->get("message") != null) {
+            errCode = e->get("code")->asInt();
+            char* mt = e->get("message")->asString();
+            int i = 0;
+            while (mt[i] != 0 && i < 199) { errMessage[i] = mt[i]; i++; }
+            errMessage[i] = 0;
+        } else {
+            transportFail("an unexpected answer to a batch");
+        }
+    }
+
+    private char* requestText(char* method, json.Json* params, int id, int* n) {
+        json.Json* r = json.newObject();
+        r->set("jsonrpc", json.newString("2.0"));
+        r->set("method", json.newString(method));
+        if (params != null) r->set("params", params);
+        if (id >= 0) r->set("id", json.newInt(id));
+        char* t = json.stringify(r);
+        if (params != null) r->detach("params");            // the params stay the caller's
+        r->dispose();
+        *n = strlen(t);
+        return t;
+    }
+
+    // one call: returns the result (the caller disposes it) or null; then errCode / errMessage / errData (a JSON-RPC error answer) or transportError say what
+    // happened. params may be null (no params member); they are not freed.
+    public json.Json* call(char* method, json.Json* params) {
+        clearError();
+        int id = nextId;
+        nextId++;
+        int n;
+        char* text = requestText(method, params, id, &n);
+        json.Json* resp = exchange(text, n, true, id);
+        free(text);
+        if (resp == null) return null;
+        return takeResult(resp);
+    }
+
+    // a notification: no answer is expected. false if sending failed
+    public bool notify(char* method, json.Json* params) {
+        clearError();
+        int n;
+        char* text = requestText(method, params, -1, &n);
+        exchange(text, n, false, 0);
+        free(text);
+        return transportError[0] == 0;
+    }
+
+    // checks an answer object and gives back its result (the answer is freed); an error answer fills errCode / errMessage / errData
+    private json.Json* takeResult(json.Json* resp) {
+        if (!resp->isObject()) { transportFail("the answer is not an object"); resp->dispose(); return null; }
+        json.Json* ver = resp->get("jsonrpc");
+        if (ver == null || !ver->isString() || !streq(ver->asString(), "2.0")) { transportFail("the answer is not JSON-RPC 2.0"); resp->dispose(); return null; }
+        bool hasErr = resp->has("error");
+        bool hasRes = resp->has("result");
+        if (hasErr == hasRes) { transportFail("an answer needs exactly one of result and error"); resp->dispose(); return null; }
+        if (hasErr) {
+            json.Json* e = resp->get("error");
+            json.Json* code = e->isObject() ? e->get("code") : null;
+            json.Json* msg = e->isObject() ? e->get("message") : null;
+            if (code == null || !code->isNumber() || msg == null || !msg->isString()) { transportFail("a malformed error object"); resp->dispose(); return null; }
+            errCode = code->asInt();
+            int i = 0;
+            char* mt = msg->asString();
+            while (mt[i] != 0 && i < 199) { errMessage[i] = mt[i]; i++; }
+            errMessage[i] = 0;
+            json.Json* data = e->get("data");
+            if (data != null) { errData = e->detach("data"); }
+            resp->dispose();
+            return null;
+        }
+        json.Json* res = resp->detach("result");
+        resp->dispose();
+        return res;
+    }
+
+    // a batch: add requests, then send() once
+    public Batch* batch() {
+        Batch* b = (Batch*) malloc(sizeof(Batch));
+        b->client = (char*) this;
+        return b;
+    }
+
+    public void close() {
+        if (mode == MODE_STREAM && link != null) link->close();
+        if (mode == MODE_WEBSOCKET && ws != null) { ws->closeWith(1000, null); ws->dispose(); ws = null; }
+        if (mode == MODE_HTTP && http != null) http->close();
+    }
+
+    // close() and free everything the client owns: the answer of the last call, the URL, the HTTP client it made, the WebSocket it holds. A connection
+    // that was given to connectStream stays yours. The pointer is invalid afterwards.
+    public void dispose() {
+        close();
+        clearError();
+        if (url != null) { free(url); url = null; }
+        if (http != null) {
+            http->dispose();
+            http = null;
+        }
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+}
+
+private Client* newClient() {
+    Client* cl = (Client*) malloc(sizeof(Client));
+    if (cl == null) return null;
+    cl->timeoutMs = 10000;
+    cl->maxResponse = 1048576;
+    cl->nextId = 1;
+    cl->heap = true;
+    return cl;
+}
+
+// ---- connecting ---------------------------------------------------------------------------------------------------------------------------------------
+// a client over a connection that carries framed messages (a socket you opened, or a pipe)
+public Client* connectStream(conn.Connection* c, int framing) {
+    Client* cl = newClient();
+    if (cl == null) return null;
+    cl->mode = MODE_STREAM;
+    cl->link = c;
+    cl->framing = framing;
+    return cl;
+}
+
+// a client that posts every call to an HTTP endpoint (httpx.Client: redirects, cookies, https ...; set cl->http->... before the first call)
+public Client* connectHttp(char* url) {
+    Client* cl = newClient();
+    if (cl == null) return null;
+    cl->mode = MODE_HTTP;
+    cl->url = dupStr(url);
+    cl->http = httpx.newClient();
+    return cl;
+}
+
+// a client over a WebSocket (ws:// or wss://); null if the connection fails
+public Client* connectWebSocket(char* url) {
+    websocket.WebSocket* w = websocket.connect(url);
+    if (w == null) return null;
+    Client* cl = newClient();
+    if (cl == null) { w->closeWith(1011, null); w->dispose(); return null; }
+    cl->mode = MODE_WEBSOCKET;
+    cl->ws = w;
+    return cl;
+}
+
+// a client over a WebSocket that you opened yourself (websocket.connectWith, ...)
+public Client* useWebSocket(websocket.WebSocket* w) {
+    Client* cl = newClient();
+    if (cl == null) return null;
+    cl->mode = MODE_WEBSOCKET;
+    cl->ws = w;
+    return cl;
+}

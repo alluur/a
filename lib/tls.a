@@ -125,7 +125,42 @@ public class Tls {
 private char* lastErr = null;
 public char* lastError() { return lastErr; }
 
+// Sessions that were given back with release() (or by net.close of a socket that tls.wrap / tls.wrapServer made secure): their buffers are reused,
+// so a server that handles many connections does not use up memory with every one of them
+private Tls* sessionPool[64];
+private int sessionPoolN;
+
+// Gives a session that is finished (the connection is closed) back for reuse by the next client() / accept() / wrap(). The session must not be used afterwards.
+public void release(Tls* t) {
+    if (t == null || sessionPoolN >= 64) { return; }
+    if (t->inb->cap > 131072 || t->outb->cap > 131072 || t->app->cap > 131072 || t->hs->cap > 131072 || t->tx->cap > 131072) { return; }
+    for (int i = 0; i < sessionPoolN; i++) { if (sessionPool[i] == t) { return; } }
+    sessionPool[sessionPoolN] = t;
+    sessionPoolN++;
+}
+
+// a pooled session made ready for a new connection
+private Tls* reuseSession(Tls* t, bool server) {
+    Buf* inb = t->inb; Buf* outb = t->outb; Buf* app = t->app; Buf* hs = t->hs; Buf* tx = t->tx;
+    char* scratch = t->scratch; char* priv = t->priv; x509.Cert** chain = t->chain;
+    memset((char*) t, 0, sizeof(Tls));
+    t->inb = inb; t->outb = outb; t->app = app; t->hs = hs; t->tx = tx;
+    inb->len = 0; outb->len = 0; app->len = 0; hs->len = 0; tx->len = 0;
+    t->scratch = scratch;
+    t->priv = priv;
+    for (int i = 0; i < 32; i++) { priv[i] = 0; }
+    t->chain = chain;
+    for (int i = 0; i < 16; i++) { chain[i] = null; }
+    t->server = server;
+    t->verifyPeer = true;
+    return t;
+}
+
 private Tls* newSession(bool server) {
+    if (sessionPoolN > 0) {
+        sessionPoolN--;
+        return reuseSession(sessionPool[sessionPoolN], server);
+    }
     Tls* t = new Tls();
     t->server = server;
     t->inb = newBuf(4096);
@@ -1049,6 +1084,8 @@ private int hookClose(int stream) {
     Stream* s = (Stream*) stream;
     shutdown(s->t);
     flush(s);
+    release(s->t);                       // net.close: the session's buffers are reused by the next one
+    s->t = null;
     return 0;
 }
 
@@ -1072,7 +1109,7 @@ public bool wrap(int fd, char* host, bool verify) {
     s->t = client(host, verify);
     if (!handshake(s)) { return false; }
     installHooks();
-    net.secureAttach(fd, (int) s);
+    if (!net.secureAttach(fd, (int) s)) { lastErr = "too many secure sockets at the same time"; return false; }
     return true;
 }
 
@@ -1081,7 +1118,7 @@ public bool wrapServer(int fd, Config* cfg) {
     Stream* s = acceptStream(fd, cfg);
     if (s == null) { return false; }
     installHooks();
-    net.secureAttach(fd, (int) s);
+    if (!net.secureAttach(fd, (int) s)) { lastErr = "too many secure sockets at the same time"; return false; }
     return true;
 }
 
