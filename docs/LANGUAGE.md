@@ -262,7 +262,7 @@ The object is evaluated once and the count is read once, before the first round,
 (the standard collections `IntList` and `StrList` of `collections` return 0 / null for a bad index). Both methods may be inherited
 and virtual. `foreach (int x in list)` works with `collections.IntList` and `StrList` (`size()` and `get()`) without any change to them.
 The element type is the result type of `get`; a struct result is copied. (The maps and sets of `collections` keep their elements in slots
-and have no `get(i)`: they are not iterable with `foreach`; use their `capacity()` / `usedAt()` / `valueAt()` functions.) The methods have to be visible from where the loop is
+and have no `get(i)`: they are not iterable with `foreach`; walk their slots with `capacity()`, `usedAt()`, `keyAt()` and `valueAt()`.) The methods have to be visible from where the loop is
 (`private` ones are an error).
 
 ```c
