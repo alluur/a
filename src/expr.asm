@@ -683,12 +683,16 @@ is_type_start_impl:
     test rax, rax
     jz .la_done
     mov ecx, [rax+SYM_KIND]
-    cmp ecx, S_STRUCT
-    je .la_yes
     cmp ecx, S_TYPEDEF
     je .la_yes
+    cmp ecx, S_STRUCT
+    je .la_cls
     cmp ecx, S_ENUM
     jne .la_done
+.la_cls:
+    call next_token                     ; module.Class.member / module.Enum.Value is an expression, module.Class a type
+    cmp qword [tk], '.'
+    je .la_done
 .la_yes:
     mov ebx, 1
 .la_done:

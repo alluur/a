@@ -75,9 +75,11 @@ the data section, filled by `R_CODE64` relocations; virtual methods are roots of
 unless it comes from `super.`; objects get their vtable pointer from `emit_vptr_init` (new, locals) or a
 `R_DATA64` relocation (globals).
 
-Every vtable starts with one header word (`st_vt` points at slot 0, the header is at slot -1): the address of the vtable of the base
-class (an `R_DATA64` relocation; 0 for a root class). `x is C` / `x as C` push `x`, the offset of the vtable pointer (`st_vptr`) and the
-address of the vtable of `C` and call `__isa` (lib/std.a), which walks the chain. An abstract method (`F_ABSTRACT`, no body) keeps its slot
+Every vtable starts with two header words (`st_vt` points at slot 0): slot -2 is the address of the text that names the class
+(`module.Class`, or `Class` in the global module; made by `class_key_string`, an `R_DATA64` relocation) and slot -1 the address of the
+vtable of the base class (an `R_DATA64` relocation; 0 for a root class). `x is C` / `x as C` push `x`, the offset of the vtable pointer
+(`st_vptr`) and the address of the vtable of `C` and call `__isa` (lib/std.a), which walks the chain. Every translation unit has its own copy
+of the vtable of a class from a header, so `__isa` accepts the same vtable address at once and otherwise compares the name texts. An abstract method (`F_ABSTRACT`, no body) keeps its slot
 (0, no relocation); at the end of a class that is not `SF_ABSTRACT` (`st_flags`) every slot is checked for an abstract method.
 `check_method_mods` (decl.asm) enforces `override` / `final` / `abstract` in pass 1, `check_concrete` the "no objects of abstract classes" rule.
 

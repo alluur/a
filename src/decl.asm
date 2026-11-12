@@ -169,6 +169,8 @@ func_register:
     mov r15d, ecx
     mov ebx, r8d
 .retok:
+    mov rdi, r14
+    call check_concrete                 ; a function cannot return an object of an abstract class by value
     cmp r15d, -1
     jne .member
     mov rdi, r12
@@ -820,6 +822,12 @@ parse_aggregate:
     call skip_to_semi
     jmp .mloop
 .f1:
+    mov edi, ebx
+    mov rsi, [agg_mname]
+    mov edx, [agg_mnlen]
+    call struct_find_static_here        ; a static field of this class with the same name
+    test rax, rax
+    jnz .sf_redef
     mov rdi, [agg_mtype]
     call check_concrete                 ; a field cannot be an object of an abstract class
     mov r13, [agg_mtype]
@@ -910,7 +918,14 @@ parse_aggregate:
     mov edx, [agg_mnlen]
     call struct_find_static_here
     test rax, rax
+    jnz .sf_redef
+    mov edi, ebx
+    mov rsi, [agg_mname]
+    mov edx, [agg_mnlen]
+    call struct_find_field              ; an instance field (also an inherited one) with the same name
+    test rax, rax
     jz .sf2
+.sf_redef:
     mov edi, msg_redef
     mov rax, [agg_mname]
     mov [tk_ptr], rax
@@ -1117,15 +1132,24 @@ parse_aggregate:
     inc r14d
     jmp .abs_l
 .abs_ok:
-    ; the vtable is one header word (the address of the vtable of the base class, 0 if there is none: the chain that 'is' and
-    ; 'as' walk) and one code address per slot, filled in by the linker
-    lea rdi, [r12*8 + 8]
+    ; the vtable has two header words and one code address per slot (filled in by the linker): the address of the text that names the
+    ; class ("module.Class"; vtable copies of one class in several translation units are told apart from other classes by it) and the
+    ; address of the vtable of the base class (0 if there is none): the chain that 'is' and 'as' walk (see __isa in lib/std.a)
+    mov edi, ebx
+    call class_key_string
+    mov r13d, eax                       ; the data offset of the class name
+    lea rdi, [r12*8 + 16]
     mov esi, 8
     call data_alloc
-    lea ecx, [rax+9]
+    lea ecx, [rax+17]
     mov [st_vt + rbx*4], ecx
     mov r15d, eax                       ; the header
-    lea r13d, [rax+8]                   ; slot 0
+    mov [data_buf + r15], r13           ; the data offset of the class name, made an address by the relocation
+    mov edi, r15d
+    mov esi, R_DATA64
+    xor edx, edx
+    call add_reloc
+    lea r13d, [r15+16]                  ; slot 0
     mov eax, [st_base + rbx*4]
     test eax, eax
     jz .vt_nohdr
@@ -1134,8 +1158,8 @@ parse_aggregate:
     test edx, edx
     jz .vt_nohdr
     dec edx
-    mov [data_buf + r15], rdx           ; the data offset of the base vtable, made an address by the relocation
-    mov edi, r15d
+    mov [data_buf + r15 + 8], rdx       ; the data offset of the base vtable, made an address by the relocation
+    lea edi, [r15+8]
     mov esi, R_DATA64
     xor edx, edx
     call add_reloc
@@ -1173,6 +1197,61 @@ parse_aggregate:
 next_token_ret:
     call next_token
     jmp parse_aggregate.out
+
+; class_key_string: edi = struct index (a class of the current module) -> rax = data offset of its text "module.Class" (NUL terminated;
+; just "Class" in the global module). Every translation unit has its own copy of a vtable, so the class of an object is told by this text.
+class_key_string:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov rax, rdi
+    shl rax, 5
+    add rax, struct_tab
+    mov r12, [rax+ST_NAME]
+    mov r13d, [rax+ST_NLEN]
+    xor r14d, r14d                      ; length of the module name
+    xor ebx, ebx
+    mov eax, [cur_module]
+    test eax, eax
+    jz .alloc
+    xor ecx, ecx
+.m: cmp ecx, [sym_count]
+    jae .alloc
+    mov rdx, rcx
+    shl rdx, 6
+    add rdx, symtab
+    inc ecx
+    cmp dword [rdx+SYM_KIND], S_MODULE
+    jne .m
+    cmp [rdx+SYM_VAL], rax
+    jne .m
+    mov rbx, [rdx+SYM_NAME]
+    mov r14d, [rdx+SYM_NLEN]
+.alloc:
+    lea rdi, [r14+r13+2]
+    mov esi, 1
+    call data_alloc
+    push rax
+    lea rdi, [data_buf+rax]
+    test r14d, r14d
+    jz .name
+    mov rsi, rbx
+    mov ecx, r14d
+    rep movsb
+    mov byte [rdi], '.'
+    inc rdi
+.name:
+    mov rsi, r12
+    mov ecx, r13d
+    rep movsb
+    mov byte [rdi], 0
+    pop rax
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
 
 ; inherit_base: edi = derived struct index, esi = base struct index. The derived class starts with a
 ; copy of the fields (and the vtable layout) of its base, so the base part lives at offset 0.

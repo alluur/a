@@ -231,7 +231,7 @@ What can be iterated, and what the variable gets:
 |---|---|
 | an **array** whose length the compiler knows: a local, global or `static` array, an array field (`s.items`, `p->items`, `this.items`, a bare field name in a method), a compound literal `(int[]){1, 2, 3}` | the array elements, in order. A `char buf[32]` has 32 elements; the array is **not** copied, so changes made by the body to elements that come later are seen |
 | **text** (`char*`, also a string literal) | the bytes up to the NUL (not including it). A null pointer is an empty text. `rev` measures the text first |
-| a **range** `a..b`, `a..=b` | the integers `a`, `a+1`, ... up to `b-1` (`..`, half open) or `b` (`..=`, closed). Empty when `b <= a` (`b < a` for `..=`). `rev a..b` counts down from `b-1` to `a`. The bounds are evaluated once, in that order; `b` must be smaller than the largest `int` for `..=` |
+| a **range** `a..b`, `a..=b` | the integers `a`, `a+1`, ... up to `b-1` (`..`, half open) or `b` (`..=`, closed). Empty when `b <= a` (`b < a` for `..=`). `rev a..b` counts down from `b-1` to `a`, `rev a..=b` from `b` to `a`. The bounds are evaluated once, in that order. `..=` has no limit: it works up to the largest `int` (and `rev a..=b` down to the smallest) without wrapping around |
 | **`pointer, count`**: `foreach (int x in p, n)` | `n` elements starting at `p` (a `void*` is an error; `n <= 0` runs nothing). This is how an array parameter or `argv` is iterated: `foreach (char* a in argv, argc)` |
 | an object (or a pointer to one) of a **class with the iteration protocol** | `get(0)` ... `get(n-1)`, see below |
 
@@ -804,7 +804,7 @@ Shape* s = new Rect();                         // pointers to the abstract class
 ```
 
 * `abstract class X` and `abstract` / `= 0` methods: a class with an abstract method has to be declared `abstract` (the error says so).
-  **No objects of an abstract class**: `new X`, a local, global, `static` local, field or by-value parameter of that type, is
+  **No objects of an abstract class**: `new X`, a local, global, `static` local, field, by-value parameter or by-value function result of that type, is
   a compile error (pointers to it are the way to use it). A class that is **not** abstract has to implement every abstract method it
   inherits (an abstract class may implement some and leave others): the error names the method that is missing. An abstract
   method has no body (a body is an error) and a call through the base class pointer dispatches virtually; `super.name()` to an abstract method is an error. An abstract
@@ -842,6 +842,10 @@ Counter.next();                                // a statement may start with a c
   and not instance fields or methods** (the error says that a static method has no object). Call it as `Class.method(args)`, or
   by its plain name inside the class. A static method is not virtual and cannot be `abstract`, `override` or `final`, and a static
   method cannot have the name of a virtual method of a base class.
+* A static field and an instance field of one class cannot have the same name (`redefinition of 'x'`, in either order; a static field
+  cannot take the name of an inherited instance field either). A static field may have the name of a static field or a global of another class.
+* A class in a module is used as `module.Class.name` in every place where an expression can stand (as a statement, after `(`, in arguments
+  and conditions: `cfg.Cfg.bump();  int y = (cfg.Cfg.counter + 1);`), and so is a module enum value `module.Enum.Value`.
 * Static members follow the access labels (`private` / `protected` / `public`). They are used with the class name, not through an object
   (`obj.count` and `obj.square(2)` are errors with that advice). Structs can have them too.
 * With separate compilation (`ac -c`) a static field is an exported global of the unit that defines the class: define a class with static
@@ -860,10 +864,14 @@ if (!(a is Cat) && b is Dog) { ... }           // is / as bind like ->: use pare
 * The left side is a pointer to a class **with virtual methods** (the object finds its class through its vtable pointer, so a class
   without any virtual method has no run time class: the error says so). A null pointer is not a Dog (`is` gives false, `as` gives null).
   The right side is a class name (`Dog` or `Dog*`) with virtual methods, which has to be related to the class of the pointer (a derived class
-  or a base class; two unrelated classes are an error). Objects created with `new`, as locals and as globals have the information; an object in raw memory (`alloc`, `memset`
-  of a buffer, a cast of bytes) has no vtable pointer and is "not a Dog" for every class.
-* How it works: each vtable begins with one word, the address of the vtable of the base class (0 for a root), and `__isa` of `lib/std.a` walks that
-  chain comparing with the vtable of the wanted class; it costs a call and one step per level of inheritance.
+  or a base class; two unrelated classes are an error). Objects created with `new`, as locals and as globals have the information. These do **not** (they are "not a Dog" for every class, and a virtual
+  call on them does not work either): the elements of an array of objects (`Dog dogs[2];`, local or global; use an array of pointers made with `new`),
+  and objects in raw memory (`alloc`, `memset` of a buffer, a cast of bytes).
+* How it works: each vtable begins with two words: the address of a text that names the class (`Class`, or `module.Class` for a class in a module)
+  and the address of the vtable of the base class (0 for a root). `__isa` of `lib/std.a` walks the chain of the object: the same vtable address
+  is a match at once; a different address is a match when the class name text is the same, because **every unit compiled with `ac -c` that
+  includes a class from a header has its own copy of that class's vtable** (an object made in one unit and tested in another still works:
+  `tests/link/isas`). It costs a call and one step per level of inheritance (plus a short text comparison for each step that is not the same vtable).
 
 ## 9. Enums
 

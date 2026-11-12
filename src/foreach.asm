@@ -244,11 +244,6 @@ parse_foreach:
     call parse_ternary
     call to_rvalue
     call fe_int_check
-    cmp qword [rbx+FE_INCL], 0
-    je .rng_ex
-    mov edi, 1
-    CG add_imm_a
-.rng_ex:
     mov rdi, [rbx+FE_HN]
     cmp qword [rbx+FE_REV], 0
     je .rng3
@@ -592,12 +587,30 @@ parse_foreach:
     CG store_local_a
 .ini_done:
     mov r13, [code_pos]                 ; the top of the loop
+    cmp qword [rbx+FE_INCL], 0
+    jne .lp                             ; a closed range tests for the last value before it steps: continue lands there
     cmp qword [rbx+FE_REV], 0
     je .lp
     mov [r12+16], r13                   ; rev: continue goes straight to the top
 .lp:
 
     ; ---- the test at the top
+    cmp qword [rbx+FE_INCL], 0
+    je .c_open
+    ; a..=b: the limit slot holds b itself (no b+1, which would wrap for the largest int); the loop ends when the counter is past it
+    mov edi, [rbx+FE_HIDX]
+    CG load_local_a
+    mov edi, [rbx+FE_HN]
+    CG load_local_b
+    mov edi, CC_GT
+    cmp qword [rbx+FE_REV], 0
+    je .c_inc1
+    mov edi, CC_LT
+.c_inc1:
+    mov rsi, r12
+    CG jcmp_chain
+    jmp .c_done
+.c_open:
     mov rax, [rbx+FE_KIND]
     cmp rax, FK_TEXT
     je .c_text
@@ -721,6 +734,30 @@ parse_foreach:
 
     ; ---- the body
     call parse_stmt
+    cmp qword [rbx+FE_INCL], 0
+    je .step_open
+    ; a..=b: leave the loop after the last value; only otherwise step (the counter never goes past b, so nothing wraps)
+    mov rdi, [r12+8]
+    call patch_here                     ; continue lands here
+    mov edi, [rbx+FE_HIDX]
+    CG load_local_a
+    mov edi, [rbx+FE_HN]
+    CG load_local_b
+    mov edi, CC_EQ
+    mov rsi, r12
+    CG jcmp_chain
+    mov edi, [rbx+FE_HIDX]
+    CG load_local_a
+    mov edi, 1
+    cmp qword [rbx+FE_REV], 0
+    je .step_incl
+    mov edi, -1
+.step_incl:
+    CG add_imm_a
+    mov edi, [rbx+FE_HIDX]
+    CG store_local_a
+    jmp .back
+.step_open:
     cmp qword [rbx+FE_REV], 0
     jne .back
     mov rdi, [r12+8]
