@@ -1,0 +1,370 @@
+// jsonrpc over three transports in one thread: framed streams (lines and Content-Length), HTTP POST (an httpx route) and WebSocket (a wshub): calls,
+// notifications, batches, error answers, server notifications, transport failures and odd answers
+import jsonrpc;
+import json;
+import wshub;
+import httpx;
+import websocket;
+import conn;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int notified = 0;
+char* lastNote = null;
+
+json.Json* add(jsonrpc.Call* c) {
+    json.Json* a = c->param(0, "a");
+    json.Json* b = c->param(1, "b");
+    if (a == null || b == null || !a->isNumber() || !b->isNumber()) { c->fail(jsonrpc.INVALID_PARAMS, "need numbers a and b", null); return null; }
+    return json.newInt(a->asInt() + b->asInt());
+}
+json.Json* echo(jsonrpc.Call* c) {
+    json.Json* r = json.newObject();
+    r->set("method", json.newString(c->method));
+    if (c->params != null) r->set("params", json.parse(json.stringify(c->params)));
+    return r;
+}
+json.Json* note(jsonrpc.Call* c) { notified++; lastNote = strdup(c->method); return null; }
+json.Json* boom(jsonrpc.Call* c) {
+    json.Json* d = json.newObject();
+    d->set("hint", json.newString("try again"));
+    c->fail(-32050, "boom", d);
+    return null;
+}
+json.Json* text(jsonrpc.Call* c) {
+    char* s = "line one\nline two \"quoted\" \xc3\xa9 \xe2\x82\xac";
+    return json.newString(s);
+}
+
+wshub.Hub* hub;
+conn.Listener* listener;
+conn.Connection* sconn = null;
+jsonrpc.Dispatcher* disp;
+int framing = 0;
+char* scripted = null;               // when set the stream server answers with this text instead of dispatching
+bool silent = false;
+bool tickBefore = false;
+int served = 0;
+
+int hook() {
+    hub->poll(0);
+    if (listener != null) {
+        if (sconn == null) sconn = listener->accept(0);
+        if (sconn != null && sconn->readable(0) && !silent) {
+            if (scripted != null) {
+                int n;
+                char* m = jsonrpc.readMessage(sconn, framing, 1048576, &n);
+                if (m == null) { sconn->close(); sconn = null; }
+                else {
+                    // @ID in the scripted answer stands for the id of the request
+                    json.Json* q = json.parse(m);
+                    char idText[30];
+                    idText[0] = 0;
+                    if (q != null && q->get("id") != null) intToStr(q->get("id")->asInt(), &idText[0]);
+                    char* answer = alloc(strlen(scripted) + 30);
+                    int o = 0;
+                    for (int i = 0; scripted[i] != 0; i++) {
+                        if (scripted[i] == '@' && scripted[i + 1] == 'I' && scripted[i + 2] == 'D') { strcpy(&answer[o], &idText[0]); o = o + strlen(&idText[0]); i = i + 2; }
+                        else { answer[o] = scripted[i]; o++; }
+                    }
+                    jsonrpc.writeMessage(sconn, framing, answer, strlen(answer));
+                    free(m);
+                    served++;
+                }
+            } else {
+                int k = jsonrpc.serveStream(disp, sconn, framing, 1);
+                if (k == 0) { sconn->close(); sconn = null; }
+                served = served + k;
+            }
+        }
+    }
+    return 0;
+}
+
+int onNote(char* client, char* method, json.Json* params) {
+    notified++;
+    lastNote = strdup(method);
+    return 0;
+}
+
+// the server of the WebSocket test sends a notification before it answers
+int ticking(wshub.Hub* h, wshub.Client* c, char* data, int n, int isText) {
+    if (tickBefore) h->sendText(c, "{\"jsonrpc\":\"2.0\",\"method\":\"tick\",\"params\":[1]}");
+    return jsonrpc.hubMessage(h, c, data, n, isText);
+}
+
+void exercise(jsonrpc.Client* c, char* label) {
+    char name[120];
+    // a call with positional parameters
+    json.Json* p = json.parse("[2, 3]");
+    json.Json* r = c->call("add", p);
+    format(&name[0], 120, "%s: a call with positional parameters", label);
+    check(&name[0], r != null && r->isNumber() && r->asInt() == 5 && c->errCode == 0);
+    r->dispose();
+    p->dispose();
+    p = json.parse("{\"a\": 40, \"b\": 2}");
+    r = c->call("add", p);
+    format(&name[0], 120, "%s: named parameters", label);
+    check(&name[0], r != null && r->asInt() == 42);
+    r->dispose();
+    p->dispose();
+    // no params
+    r = c->call("echo", null);
+    format(&name[0], 120, "%s: a call without params", label);
+    check(&name[0], r != null && r->isObject() && streq(r->get("method")->asString(), "echo") && !r->has("params"));
+    r->dispose();
+    // strings with newlines and unicode survive the framing
+    r = c->call("text", null);
+    format(&name[0], 120, "%s: a string with a newline, quotes and UTF-8", label);
+    check(&name[0], r != null && streq(r->asString(), "line one\nline two \"quoted\" \xc3\xa9 \xe2\x82\xac"));
+    r->dispose();
+    // an error answer
+    p = json.parse("[1, \"x\"]");
+    r = c->call("add", p);
+    format(&name[0], 120, "%s: an error answer: code, message", label);
+    check(&name[0], r == null && c->errCode == -32602 && streq(&c->errMessage[0], "need numbers a and b") && c->transportError[0] == 0);
+    p->dispose();
+    r = c->call("boom", null);
+    format(&name[0], 120, "%s: error data", label);
+    check(&name[0], r == null && c->errCode == -32050 && c->errData != null && streq(c->errData->get("hint")->asString(), "try again"));
+    r = c->call("nope", null);
+    format(&name[0], 120, "%s: method not found", label);
+    check(&name[0], r == null && c->errCode == -32601 && streq(&c->errMessage[0], "Method not found"));
+    // the next call clears the error
+    p = json.parse("[1, 1]");
+    r = c->call("add", p);
+    format(&name[0], 120, "%s: the next call starts clean", label);
+    check(&name[0], r != null && c->errCode == 0 && c->errData == null && r->asInt() == 2);
+    r->dispose();
+    p->dispose();
+    // a notification
+    int before = notified;
+    p = json.parse("[\"x\"]");
+    bool ok = c->notify("log", p);
+    for (int i = 0; i < 20; i++) hook();
+    format(&name[0], 120, "%s: a notification reaches the server (no answer)", label);
+    check(&name[0], ok && notified == before + 1 && streq(lastNote, "log"));
+    p->dispose();
+    // a batch
+    jsonrpc.Batch* b = c->batch();
+    json.Json* p1 = json.parse("[1, 2]");
+    json.Json* p2 = json.parse("{\"a\": 10, \"b\": 20}");
+    json.Json* p3 = json.parse("[\"bad\"]");
+    int i1 = b->add("add", p1);
+    int i2 = b->add("add", p2);
+    int i3 = b->add("add", p3);
+    int i4 = b->notify("log", null);
+    int i5 = b->add("nope", null);
+    ok = b->send();
+    format(&name[0], 120, "%s: a batch is sent and answered", label);
+    check(&name[0], ok && i1 == 0 && i2 == 1 && i3 == 2 && i4 == 3 && i5 == 4);
+    format(&name[0], 120, "%s: ... results by index", label);
+    check(&name[0], b->result(i1)->asInt() == 3 && b->result(i2)->asInt() == 30);
+    format(&name[0], 120, "%s: ... errors by index", label);
+    check(&name[0], b->result(i3) == null && b->errorCode(i3) == -32602 && b->errorCode(i5) == -32601 && streq(b->errorMessage(i5), "Method not found") && b->errorCode(i1) == 0);
+    format(&name[0], 120, "%s: ... a notification has no answer", label);
+    check(&name[0], !b->answered(i4) && b->answered(i1));
+    b->dispose();
+    p1->dispose(); p2->dispose(); p3->dispose();
+    // a batch of notifications only
+    b = c->batch();
+    b->notify("log", null);
+    b->notify("log", null);
+    before = notified;
+    ok = b->send();
+    for (int i = 0; i < 20; i++) hook();
+    format(&name[0], 120, "%s: a batch of notifications gets no answer", label);
+    check(&name[0], ok && notified == before + 2);
+    b->dispose();
+    // many calls in a row: constant memory on the client side
+    int heap0 = __heap_pos;
+    int sum = 0;
+    p = json.parse("[1, 2]");
+    for (int i = 0; i < 60; i++) {
+        r = c->call("add", p);
+        if (r != null) { sum = sum + r->asInt(); r->dispose(); }
+    }
+    p->dispose();
+    format(&name[0], 120, "%s: 60 more calls, no growth of the heap", label);
+    check(&name[0], sum == 180 && __heap_pos - heap0 < 20000);
+}
+
+int main() {
+    disp = new jsonrpc.Dispatcher();
+    disp->add("add", add);
+    disp->add("echo", echo);
+    disp->add("log", note);
+    disp->add("boom", boom);
+    disp->add("text", text);
+    hub = new wshub.Hub();
+    httpx.Router* router = new httpx.Router();
+    router->add("*", "/rpc", jsonrpc.httpHandler, (char*) disp);
+    hub->router = router;
+    hub->onMessage = ticking;
+    hub->user = (char*) disp;
+    hub->listen(0);
+    listener = new conn.Listener(0);
+    net.setIdleHook(hook);
+
+    // --- streams, one message per line
+    framing = jsonrpc.FRAME_LINES;
+    conn.Connection* cc = conn.open("127.0.0.1", listener->port(), 1000);
+    jsonrpc.Client* c = jsonrpc.connectStream(cc, jsonrpc.FRAME_LINES);
+    exercise(c, "lines");
+    c->close();
+    if (sconn != null) { sconn->close(); sconn = null; }
+
+    // --- streams with Content-Length
+    framing = jsonrpc.FRAME_LENGTH;
+    cc = conn.open("127.0.0.1", listener->port(), 1000);
+    c = jsonrpc.connectStream(cc, jsonrpc.FRAME_LENGTH);
+    exercise(c, "content-length");
+    c->close();
+    if (sconn != null) { sconn->close(); sconn = null; }
+
+    // --- HTTP
+    char* url = alloc(100);
+    format(url, 100, "http://127.0.0.1:%d/rpc", hub->port);
+    c = jsonrpc.connectHttp(url);
+    c->http->keepAlive = true;
+    exercise(c, "http");
+    check("http: the connection was reused", c->http->connects <= 3);
+    httpx.Client* plain = new httpx.Client();
+    httpx.Reply* r = plain->get(url);
+    check("http: GET is refused with 405 and Allow", r != null && r->status == 405 && streq(r->header("Allow"), "POST"));
+    r->dispose();
+    r = plain->postJson(url, "{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":1}");
+    check("http: the answer is application/json", r != null && r->status == 200 && contains(r->header("Content-Type"), "application/json") && streq(r->body, "{\"jsonrpc\":\"2.0\",\"result\":3,\"id\":1}"));
+    r->dispose();
+    r = plain->postJson(url, "{\"jsonrpc\":\"2.0\",\"method\":\"log\"}");
+    check("http: a notification gets 204 and no body", r != null && r->status == 204 && r->bodyLen == 0);
+    r->dispose();
+    r = plain->postJson(url, "{not json");
+    check("http: a parse error is an answer too", r != null && contains(r->body, "-32700"));
+    r->dispose();
+    c->close();
+
+    // --- WebSocket
+    format(url, 100, "ws://127.0.0.1:%d/", hub->port);
+    c = jsonrpc.connectWebSocket(url);
+    check("websocket: connected", c != null);
+    exercise(c, "websocket");
+    // a notification from the server arrives while a call waits
+    c->onNotification = (func) onNote;
+    tickBefore = true;
+    notified = 0;
+    json.Json* p = json.parse("[5, 6]");
+    json.Json* res = c->call("add", p);
+    check("websocket: a server notification during a call goes to onNotification, the call still returns", res != null && res->asInt() == 11 && notified == 1 && streq(lastNote, "tick"));
+    res->dispose();
+    p->dispose();
+    tickBefore = false;
+    c->close();
+
+    // --- transport failures
+    framing = jsonrpc.FRAME_LINES;
+    cc = conn.open("127.0.0.1", listener->port(), 1000);
+    c = jsonrpc.connectStream(cc, jsonrpc.FRAME_LINES);
+    c->timeoutMs = 150;
+    silent = true;
+    int t0 = millis();
+    res = c->call("add", null);
+    int took = millis() - t0;
+    check("a server that does not answer: the call times out", res == null && c->errCode == 0 && c->transportError[0] != 0 && took >= 100 && took < 3000);
+    silent = false;
+    c->close();
+    if (sconn != null) { sconn->close(); sconn = null; }
+    // odd answers
+    cc = conn.open("127.0.0.1", listener->port(), 1000);
+    c = jsonrpc.connectStream(cc, jsonrpc.FRAME_LINES);
+    c->timeoutMs = 150;
+    scripted = "this is not json";
+    res = c->call("add", null);
+    check("an answer that is not JSON", res == null && contains(&c->transportError[0], "not JSON"));
+    scripted = "{\"jsonrpc\":\"2.0\",\"result\":1,\"error\":{\"code\":1,\"message\":\"both\"},\"id\":@ID}";
+    res = c->call("add", null);
+    check("an answer with both result and error is refused", res == null && contains(&c->transportError[0], "exactly one"));
+    scripted = "{\"jsonrpc\":\"1.0\",\"result\":1,\"id\":@ID}";
+    res = c->call("add", null);
+    check("an answer of another version", res == null && contains(&c->transportError[0], "2.0"));
+    scripted = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":\"x\"},\"id\":@ID}";
+    res = c->call("add", null);
+    check("a malformed error object", res == null && contains(&c->transportError[0], "malformed"));
+    scripted = "[1,2]";
+    res = c->call("add", null);
+    check("a batch answer to a single call is not an answer: waits and times out", res == null);
+    scripted = null;
+    c->close();
+    if (sconn != null) { sconn->close(); sconn = null; }
+    // the server closes the connection
+    cc = conn.open("127.0.0.1", listener->port(), 1000);
+    c = jsonrpc.connectStream(cc, jsonrpc.FRAME_LINES);
+    c->timeoutMs = 300;
+    cc->writeText("");
+    sconn = listener->accept(500);
+    if (sconn != null) { sconn->close(); sconn = null; }
+    res = c->call("add", null);
+    check("a closed connection is reported", res == null && c->transportError[0] != 0);
+    c->close();
+    // limits of the framing
+    framing = jsonrpc.FRAME_LENGTH;
+    cc = conn.open("127.0.0.1", listener->port(), 1000);
+    cc->writeText("Content-Length: 99999999\r\n\r\n");
+    cc->flush();
+    sconn = listener->accept(500);
+    int served0 = jsonrpc.serveStream(disp, sconn, jsonrpc.FRAME_LENGTH, 0);
+    char line[300];
+    cc->readLine(&line[0], 300);
+    cc->readLine(&line[0], 300);
+    int got = cc->read(&line[0], 299);
+    line[got] = 0;
+    check("a Content-Length over the limit gets Invalid Request and ends the session", served0 == 0 && contains(&line[0], "Request too large"));
+    cc->close();
+    sconn->close();
+    sconn = null;
+    cc = conn.open("127.0.0.1", listener->port(), 1000);
+    cc->writeText("Content-Length: abc\r\n\r\n{}");
+    cc->flush();
+    sconn = listener->accept(500);
+    served0 = jsonrpc.serveStream(disp, sconn, jsonrpc.FRAME_LENGTH, 0);
+    check("a bad Content-Length ends the session", served0 == 0);
+    cc->close();
+    sconn->close();
+    sconn = null;
+    // a message split into several writes still arrives whole
+    framing = jsonrpc.FRAME_LINES;
+    cc = conn.open("127.0.0.1", listener->port(), 1000);
+    cc->writeText("{\"jsonrpc\":\"2.0\",\"method\":\"add\",");
+    cc->flush();
+    cc->writeText("\"params\":[4,5],\"id\":1}\n");
+    cc->flush();
+    sconn = listener->accept(500);
+    served0 = jsonrpc.serveStream(disp, sconn, jsonrpc.FRAME_LINES, 1);
+    cc->readLine(&line[0], 300);
+    check("a request in two pieces", served0 == 1 && streq(&line[0], "{\"jsonrpc\":\"2.0\",\"result\":9,\"id\":1}"));
+    // many requests on one connection
+    cc->writeText("{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,1],\"id\":1}\n{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[2,2],\"id\":2}\n\n{\"jsonrpc\":\"2.0\",\"method\":\"log\"}\n{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[3,3],\"id\":3}\n");
+    cc->flush();
+    served0 = jsonrpc.serveStream(disp, sconn, jsonrpc.FRAME_LINES, 4);
+    cc->readLine(&line[0], 300);
+    cc->readLine(&line[0], 300);
+    cc->readLine(&line[0], 300);
+    check("a pipelined session: four messages, empty lines ignored, the notification unanswered", served0 == 4 && streq(&line[0], "{\"jsonrpc\":\"2.0\",\"result\":6,\"id\":3}"));
+    cc->close();
+    sconn->close();
+    sconn = null;
+    net.setIdleHook(null);
+    hub->shutdown(100);
+    printf("failures: %d\n", fails);
+    return fails;
+}
