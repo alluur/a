@@ -1,0 +1,179 @@
+// websocket: RFC 6455 violations are refused with the right close code (reserved bits, opcodes, control frames, masking,
+// length encodings, continuation rules, close frames), and the legal edge cases are accepted
+import websocket;
+import encoding;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// the status code of the close frame a WebSocket has queued (0: none)
+int outCloseCode(websocket.WebSocket* w) {
+    int n = w->outPending();
+    if (n < 4) return 0;
+    char b[200];
+    if (n > 200) n = 200;
+    memcpy(&b[0], w->outData(), n);
+    if ((b[0] & 15) != 8) return 0;
+    int len = b[1] & 127;
+    int off = 2;
+    if ((b[1] & 128) != 0) {
+        websocket.unmask(&b[6], len, ((b[2] & 255) << 24) | ((b[3] & 255) << 16) | ((b[4] & 255) << 8) | (b[5] & 255));
+        off = 6;
+    }
+    if (len < 2) return 0;
+    return (b[off] & 255) * 256 + (b[off + 1] & 255);
+}
+
+int feedHex(websocket.WebSocket* w, char* hex) {
+    char buf[600];
+    int n = encoding.hexDecode(hex, &buf[0]);
+    return w->feed(&buf[0], n);
+}
+
+// a server (client frames come in, so they have to be masked: mask 00000000) must fail with `code`
+void server(char* name, char* hex, int code) {
+    websocket.WebSocket* w = websocket.create(null, false);
+    w->maxFrame = 1000;
+    w->maxMessage = 2000;
+    int r = feedHex(w, hex);
+    char label[100];
+    format(&label[0], 100, "server: %s -> %d", name, code);
+    check(&label[0], r == -1 && w->closed && w->failed && outCloseCode(w) == code);
+    // nothing more is read
+    check("   ... and later bytes are refused", feedHex(w, "818000000000") == -1);
+    w->dispose();
+}
+
+void client(char* name, char* hex, int code) {
+    websocket.WebSocket* w = websocket.create(null, true);
+    w->maxFrame = 1000;
+    w->maxMessage = 2000;
+    int r = feedHex(w, hex);
+    char label[100];
+    format(&label[0], 100, "client: %s -> %d", name, code);
+    check(&label[0], r == -1 && w->closed && w->failed && outCloseCode(w) == code);
+    w->dispose();
+}
+
+// a server that must accept the frames
+bool accepts(char* hex) {
+    websocket.WebSocket* w = websocket.create(null, false);
+    int r = feedHex(w, hex);
+    bool ok = r > 0 && !w->closed && !w->failed;
+    w->dispose();
+    return ok;
+}
+
+int main() {
+    // reserved bits and opcodes
+    server("RSV1 without an extension", "c180" "00000000", 1002);
+    server("RSV2", "a180" "00000000", 1002);
+    server("RSV3", "9180" "00000000", 1002);
+    server("RSV1 on a ping", "c980" "00000000", 1002);
+    server("opcode 3", "8380" "00000000", 1002);
+    server("opcode 4", "8480" "00000000", 1002);
+    server("opcode 5", "8580" "00000000", 1002);
+    server("opcode 6", "8680" "00000000", 1002);
+    server("opcode 7", "8780" "00000000", 1002);
+    server("opcode 11", "8b80" "00000000", 1002);
+    server("opcode 12", "8c80" "00000000", 1002);
+    server("opcode 13", "8d80" "00000000", 1002);
+    server("opcode 14", "8e80" "00000000", 1002);
+    server("opcode 15", "8f80" "00000000", 1002);
+    // control frames
+    server("ping with 126 bytes", "89fe007e" "00000000", 1002);
+    server("fragmented ping", "0980" "00000000", 1002);
+    server("fragmented close", "0880" "00000000", 1002);
+    server("fragmented pong", "0a80" "00000000", 1002);
+    client("ping with 126 bytes", "897e007e", 1002);
+    // masking
+    server("unmasked client frame", "810548656c6c6f", 1002);
+    server("unmasked ping", "8900", 1002);
+    client("masked server frame", "818500000000" "48656c6c6f", 1002);
+    client("masked server ping", "898000000000", 1002);
+    // continuation rules
+    server("continuation without a message", "8080" "00000000", 1002);
+    server("a new text frame inside a fragmented message", "0180" "00000000" "0180" "00000000", 1002);
+    server("a new binary frame inside a fragmented message", "0180" "00000000" "0280" "00000000", 1002);
+    server("a continuation after the final frame", "8180" "00000000" "8080" "00000000", 1002);
+    client("a continuation without a message", "8000", 1002);
+    // lengths
+    server("16 bit length that fits 7 bits", "81fe0005" "00000000", 1002);
+    server("64 bit length that fits 16 bits", "82ff0000000000000100" "00000000", 1002);
+    server("64 bit length with the top bit", "82ff8000000000000000" "00000000", 1002);
+    server("64 bit length 2^63 - 1", "82ff7fffffffffffffff" "00000000", 1009);
+    server("a frame over maxFrame", "82fe03e9" "00000000", 1009);
+    client("a frame over maxFrame", "827e03e9", 1009);
+    // messages over maxMessage in fragments (maxFrame 1000, maxMessage 2000)
+    {
+        websocket.WebSocket* w = websocket.create(null, true);
+        w->maxFrame = 1000;
+        w->maxMessage = 2000;
+        char* chunk = alloc(1000);
+        char* fr = alloc(1100);
+        int n = websocket.buildFrame(websocket.OP_BINARY, false, false, 0, chunk, 1000, fr);
+        bool a = w->feed(fr, n) == n;
+        n = websocket.buildFrame(websocket.OP_CONT, false, false, 0, chunk, 1000, fr);
+        bool b = w->feed(fr, n) == n;
+        n = websocket.buildFrame(websocket.OP_CONT, true, false, 0, chunk, 1, fr);
+        bool c = w->feed(fr, n) == -1;
+        check("fragments adding up over maxMessage -> 1009", a && b && c && outCloseCode(w) == 1009);
+        w->dispose();
+    }
+    // close frames
+    server("close with a one byte payload", "8881" "00000000" "03", 1002);
+    server("close code 0", "8882" "00000000" "0000", 1002);
+    server("close code 999", "8882" "00000000" "03e7", 1002);
+    server("close code 1004", "8882" "00000000" "03ec", 1002);
+    server("close code 1005", "8882" "00000000" "03ed", 1002);
+    server("close code 1006", "8882" "00000000" "03ee", 1002);
+    server("close code 1015", "8882" "00000000" "03f7", 1002);
+    server("close code 1016", "8882" "00000000" "03f8", 1002);
+    server("close code 2000", "8882" "00000000" "07d0", 1002);
+    server("close code 2999", "8882" "00000000" "0bb7", 1002);
+    server("close code 5000", "8882" "00000000" "1388", 1002);
+    server("close reason is not UTF-8", "8884" "00000000" "03e8" "c328", 1007);
+    // what is fine
+    check("ping between fragments", accepts("0180" "00000000" "8980" "00000000" "8080" "00000000"));
+    check("a pong without a ping", accepts("8a80" "00000000"));
+    check("an empty text message", accepts("8180" "00000000"));
+    check("an empty binary message", accepts("8280" "00000000"));
+    check("an empty fragmented message", accepts("0180" "00000000" "8080" "00000000"));
+    {
+        char* zeros = alloc(125);
+        char* fr = alloc(200);
+        int n = websocket.buildFrame(websocket.OP_PING, true, true, 0, zeros, 125, fr);
+        websocket.WebSocket* w = websocket.create(null, false);
+        check("a 125 byte ping", w->feed(fr, n) == n && !w->closed && w->outPending() == 127);
+        w->dispose();
+    }
+    int codes[16] = { 1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 3000, 3999, 4000, 4999 };
+    int good = 0;
+    for (int i = 0; i < 16; i++) {
+        websocket.WebSocket* w = websocket.create(null, false);
+        char fr[20];
+        int n = websocket.buildFrame(websocket.OP_CLOSE, true, true, 0, "xx", 2, &fr[0]);
+        fr[6] = (codes[i] >> 8) & 255;
+        fr[7] = codes[i] & 255;
+        w->feed(&fr[0], n);
+        if (w->closed && !w->failed && w->closeCode == codes[i] && outCloseCode(w) == codes[i]) good++;
+        w->dispose();
+    }
+    check("every legal close code is accepted and echoed", good == 16);
+    // after a failure the output holds the close frame and nothing else
+    websocket.WebSocket* w = websocket.create(null, false);
+    feedHex(w, "c180" "00000000");
+    check("the failure reason is kept", w->outPending() == 4 && streq(&w->failReason[0], "unexpected RSV1 bit"));
+    check("the failure code is reported", w->closeCode == 1006 && w->localCloseCode == 1002);
+    w->dispose();
+    printf("failures: %d\n", fails);
+    return fails;
+}
