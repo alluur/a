@@ -1,6 +1,6 @@
 # Collections and algorithms
 
-Arrays in A have a fixed size and no operations of their own. When a program needs a list that grows, a table that finds a value by name, a queue or a sorted order, it imports a module. This chapter covers the nine collection classes of `collections`, sorting and searching with `sort` and `algo`, and the two modules for working at the level of bits and bytes: `bits` and `bytebuf`.
+Arrays in A have a fixed size and no operations of their own. When a program needs a list that grows, a table that finds a value by name, a queue or a sorted order, it imports a module. This chapter covers the nine collection classes of `collections`, sorting and searching with `sort` and `algo`, and the two modules for working at the level of bits and bytes: `bits` and `bytebuf`. For a deque, ring buffers, a priority queue with handles, an ordered map, a trie, advanced string algorithms and random generators, read the follow-up chapter [data structures, string algorithms and random numbers](#chap-data-structures-strings-random): it covers the modules `ds`, `strx` and `rng`.
 
 **In this chapter**
 
@@ -9,6 +9,8 @@ Arrays in A have a fixed size and no operations of their own. When a program nee
 * `algo`: sorting with your own order, searching, dynamic programming, union-find and graphs;
 * `bits`: counting, rotating and extracting bits;
 * `bytebuf`: reading and writing integers in a chosen byte order, building binary messages, hex dumps and sizes.
+
+What is **not** in this chapter: a double ended queue, a ring buffer, an ordered (sorted) map or set, a priority queue that can change or remove an element, a trie, a Bloom filter or an LRU cache (all in `ds`), and anything beyond simple string searching (`strx`). See [data structures, string algorithms and random numbers](#chap-data-structures-strings-random).
 
 ## The collection classes
 
@@ -28,7 +30,7 @@ All collections live in the module `collections`. Objects can be created on the 
 Three rules hold for all of them:
 
 * **No errors, only defaults.** Reading outside a list or from an empty queue does not crash: it returns 0 (or `null` for strings) and changes nothing. Use `size()` (or `isEmpty()`, which the lists of ints, the queue, the heap and the priority queue have) when 0 is a valid value.
-* **Memory is never freed** (see [memory and pointers](#chap-memory-and-pointers)). When a collection grows it leaves the old storage behind, which is fine for programs that finish and worth knowing for programs that run for days.
+* **Memory is never freed** (see [memory and pointers](#chap-memory-and-pointers)). When a collection grows it leaves the old storage behind, which is fine for programs that finish and worth knowing for programs that run for days. (The containers of `ds` are different: they have a `dispose()` that frees everything.)
 * **They store `int` and `char*` only.** To keep a struct, store a pointer to it as an `int`, or keep the structs in an array and store the index.
 
 ### Lists: `IntList` and `StrList`
@@ -60,7 +62,7 @@ What to notice:
 
 * `get(key, fallback)` returns the fallback for a missing key. Together with `put`, that gives you a counter in one line: `counts.put(w, counts.get(w, 0) + 1)`.
 * A `StrMap` **copies its keys**, so the buffer you passed can be reused.
-* The map has no ordered iteration. You walk its *slots*: `for (int s = 0; s < m.capacity(); s++)` and use the slots where `keyAt(s)` is not `null`. The order is that of the hash table, not of insertion. The sample collects the keys and sorts them to get a stable listing.
+* The map has no ordered iteration. You walk its *slots*: `for (int s = 0; s < m.capacity(); s++)` and use the slots where `keyAt(s)` is not `null`. The order is that of the hash table, not of insertion. The sample collects the keys and sorts them to get a stable listing. When you need the keys in sorted order all the time, or the nearest key, a range of keys or the k-th key, use `ds.OrderedTextMap` or `ds.OrderedMap`; `ds.HashMap` and `ds.TextHashMap` walk their entries in insertion order (see [data structures](#chap-data-structures-strings-random)).
 * `remove` returns true when the key was there.
 
 {{sample collections/intmap}}
@@ -97,6 +99,7 @@ What to notice:
 * `push(priority, value)` stores a value with a priority and `pop()` returns the value with the **smallest** priority. Here the values are job numbers, which index the array of names.
 * `peekPriority()` shows the priority of the next element, before you pop it.
 * Elements with equal priority come out in no particular order.
+* Once an element is in, you cannot change its priority or take it out of the middle. `ds.PriorityQueue` of the follow-up chapter hands out a **handle** for every element, so that `update(handle, newPriority)` and `remove(handle)` work. The same module has `ds.Deque` (a queue that works at both ends) and `ds.RingBuffer` (the last N values).
 
 See the [API reference of `collections`](#api-collections).
 
@@ -124,8 +127,8 @@ What to notice:
 What to notice:
 
 * The order is by byte value, so all capital letters come before all lower case letters.
-* `sortStrings` is an insertion sort: fine for hundreds of strings, slow for tens of thousands.
-* For a case-blind order, sort lower-case copies, as the sample does, or sort an array of indexes with `algo.sortBy` and a comparator that looks the strings up by index.
+* `sortStrings` is an insertion sort: fine for hundreds of strings, slow for tens of thousands (measured natively: 20,000 random eight letter strings took about 0.9 seconds). For big arrays use the stable merge sort with a text comparator: `algo.sortBy((int*) items, n, ds.cmpText)` sorted the same 20,000 strings in 9 milliseconds and gave the same order. (`ds.cmpText` compares like `strcmp`; the cast to `int*` is needed because `sortBy` sorts ints, and a `char*` is one.)
+* For a case-blind order, sort lower-case copies, as the sample does, or sort an array of indexes with `algo.sortBy` and a comparator that looks the strings up by index. `strx.naturalSort(items, n, true)` is a stable sort that ignores case, but it also compares runs of digits by value (`img2` before `img10`), which is not the alphabetical order.
 
 See the [API reference of `sort`](#api-sort).
 
@@ -155,6 +158,7 @@ What to notice:
 * `editDistance` is the Levenshtein distance: the fewest insertions, deletions and replacements that turn one text into the other.
 * `kmpFind(text, pattern)` searches in linear time and returns the index of the first match or -1. `countOccurrences` counts matches that overlap, and `isSubsequence(small, big)` asks whether the letters of `small` appear in `big` in order, with gaps allowed.
 * `sieve(limit, flags)` fills `flags[0..limit]` with 1 for primes and returns how many there are. `flags` is a `char` array of `limit + 1` bytes.
+* These string functions are the simple versions. `kmpFind` builds its table on every call and `countOccurrences` starts again after every match, so on a long, repetitive text they are quadratic (40,000 letters `a` searched for 400 of them took 222 milliseconds natively; `strx.countOf` took less than one). The module `strx` has linear-time searches (`Kmp`, `AhoCorasick` for many patterns, `SuffixArray`), and edit distance with a limit, with UTF-8 and with transpositions (`levenshteinMax`, `osa`, `damerau`), the longest common subsequence itself (`lcs`), a line diff and more. See [string algorithms](#chap-data-structures-strings-random).
 
 ### Union-find
 
@@ -166,6 +170,7 @@ What to notice:
 
 * `unite(a, b)` returns true when it joined two different groups and false when they were already connected. The field `groups` counts the groups that are left.
 * `same(a, b)` asks whether two elements are in the same group; `find(a)` returns the representative of its group.
+* This `UnionFind` has a fixed number of elements. `ds.DisjointSet` can grow (`add()`), knows the size of every group (`sizeOf`), numbers the groups (`labels`) and can free its memory (`dispose()`).
 
 ### Graphs
 
@@ -263,10 +268,12 @@ See the [API reference of `bytebuf`](#api-bytebuf).
 * `algo` has binary search helpers, permutations, dynamic programming, string distance, a prime sieve, union-find and a graph class with BFS, DFS, Dijkstra and topological order.
 * `bits` counts, rotates, swaps and extracts bits; a bit width at the end of a function's name (`rotl32`, `bswap16`) is the exact width it works on, the other functions use the whole 64 bit `int`.
 * `bytebuf` reads and writes integers in big or little endian, builds messages with `Buf` and parses them with the range-checked `Reader`.
+* The modules `ds`, `strx` and `rng` go further: deque, ring buffers, heaps with handles, ordered maps, tries, Bloom filters, string algorithms and random generators (see [data structures, string algorithms and random numbers](#chap-data-structures-strings-random)).
 
 ## Where next
 
+* [Data structures, string algorithms and random numbers](#chap-data-structures-strings-random): the modules `ds`, `strx` and `rng`.
 * [Numbers](#chap-numbers): the number types beyond `int`.
 * [Data formats](#chap-data-formats): JSON, CSV, tar archives and zlib, which work with the same kind of byte data.
 * [Text and strings](#chap-text-and-strings): splitting and searching the text that goes into these collections.
-* API references: [`collections`](#api-collections), [`sort`](#api-sort), [`algo`](#api-algo), [`bits`](#api-bits), [`bytebuf`](#api-bytebuf).
+* API references: [`collections`](#api-collections), [`sort`](#api-sort), [`algo`](#api-algo), [`bits`](#api-bits), [`bytebuf`](#api-bytebuf), [`ds`](#api-ds), [`strx`](#api-strx).
