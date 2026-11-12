@@ -2,7 +2,7 @@
 
 The module `gui` has the basic widgets. `guix` adds the ones that real applications need: menus with keyboard accelerators, combo boxes, radio buttons, tabs, scroll views, spin boxes,
 splitters, tables, trees, toolbars with icons, a status bar, text blocks and a calendar, and **dialogs** that ask a question and call you back with the answer. (Tool tips are part of `gui` itself: every widget has a `tooltip` field.)
-`gchart` adds data widgets: charts, gauges, switches and star ratings. All of them are ordinary `gui.Widget`s: you put them into a `Box`, give them `flex` or a size, and handle them with callbacks.
+`gchart` adds data widgets: charts, gauges, switches and star ratings. The widgets of both modules are ordinary `gui.Widget`s: you put them into a `Box`, give them `flex` or a size, and handle them with callbacks.
 
 In this chapter:
 
@@ -56,8 +56,8 @@ A program that needs accelerators but no visible menu can still use a `MenuBar`:
 
 ### Context menus
 
-Every widget has an `onContext` callback, `int f(int widget)`, called on a right click. In it, show a menu where the pointer is: `menu->popup(window, x, y)` with `window->lastMouseX` and `lastMouseY`.
-A menu that does not fit below the point opens above it, and one that is too wide is moved to the left, so that it stays inside the window. The keyboard and mouse work in it as in a menu of a bar.
+Every widget has an `onContext` callback, `int f(int widget)`, called on a right click. Only the widget under the pointer is asked: if it has no `onContext`, the call does not go on to its parent. In it, show a menu where the pointer is: `menu->popup(window, x, y)` with `window->lastMouseX` and `lastMouseY`.
+A menu that does not fit below the point opens above it (or is pushed up as far as needed when there is no room above either), and one that is too wide is moved to the left, so that it stays inside the window. The keyboard and mouse work in it as in a menu of a bar.
 
 {{sample gui/context_menu src}}
 
@@ -132,13 +132,13 @@ A splitter is a flexible widget (`flex = 1`) from the start.
 The picture was taken after the divider had been dragged to the right, so the list is wider than the 120 pixels it started with. The stacked form works the same with the mouse moving up and down; this was tried with a small test program (a splitter of height 300 and `firstSize` 100:
 dragging down 80 pixels gave `pos` 180, and dragging far down stopped at 254, leaving the second pane its 40 pixels), but no sample shows it.
 
-Every widget has a `tooltip` field. When the pointer rests on the widget for half a second, a small pale yellow card with the text appears just below and to the right of the pointer, and goes away when the pointer leaves the widget or a button is pressed.
+Every widget has a `tooltip` field (null, the default, means no tip; a widget without one shows nothing, even when its parent has a tip). Half a second after the pointer has come onto the widget, a small pale yellow card with the text appears just below and to the right of the pointer, and goes away when the pointer leaves the widget or a key or a mouse button is pressed. The pointer may keep moving over the widget during the half second.
 
 {{sample gui/tooltips src}}
 
 {{shot gui/tooltips}}
 
-The picture needed a pointer that stays where it is (`pointer=keep`) and a pause: the tip only appears while the pointer rests.
+The picture needed a pause of more than half a second after the pointer had moved onto the button, and `pointer=keep`, which leaves the pointer where it is instead of moving it into the corner before the photograph.
 
 `guix.Swatch(colour, w, h)` is a rectangle of one colour with a thin border; change `swatch->color` and call `invalidate()`. A colour with an alpha below 255 shows the checkerboard behind it.
 In the sample below the sliders mix a colour; the picture was taken after the three sliders had been dragged, and the label shows the result as `#C854FF`.
@@ -164,7 +164,7 @@ The picture was taken after a click on the header "Size": the rows are sorted by
 The `Size` cells are right-aligned because of `setAlign(1, 1)`.
 
 A `guix.TreeView` shows nodes that can have children. `tree->addRoot("text")` adds a top level node and returns a `guix.TreeNode*`; `node->add("child")` adds a child. `tree->expand(node, true)` opens a node (or closes it with `false`),
-`select(node)` chooses one; `selected` (a `TreeNode*`, null for none), `onSelect` and `onActivate` work like the list's. A node has `text`, `userData`, `expanded`, `parent`, `count` and `lazy`.
+`select(node)` chooses one (and calls `onSelect` at once, even when the node was already chosen); `selected` (a `TreeNode*`, null for none), `onSelect` and `onActivate` work like the list's. A node has `text`, `userData`, `expanded`, `parent`, `count` and `lazy`.
 With the mouse, click the arrow to open or close a node, or double-click the node (which also calls `onActivate`). With the keyboard: Right opens a closed node, or moves to the first child of an open one; Left closes an open node, or moves to its parent;
 Enter opens or closes the node and calls `onActivate`; Up, Down, Home, End, PageUp and PageDown move.
 
@@ -172,11 +172,11 @@ Enter opens or closes the node and calls `onActivate`; Up, Down, Home, End, Page
 
 {{shot gui/tree_view}}
 
-In the picture, `tree->select(src)` made the label read "Selected: src": `select` calls `onSelect` at once, like the other widgets, and here `onSelect` had been set first.
+In the picture, `tree->select(src)` made the label read "Selected: src": `select` calls `onSelect` at once, and here `onSelect` had been set first.
 
 ### Loading children on demand
 
-A tree of a whole disk cannot be built before the window opens. Set `node->lazy = true` on a folder that has no children yet: it gets the open arrow anyway. When the node is opened, the tree calls `tree->onExpand` (`int f(int tree)`), and `tree->expandedNode` is the node:
+A tree of a whole disk cannot be built before the window opens. Set `node->lazy = true` on a folder that has no children yet: it gets the open arrow anyway. When a node is opened (by the user, or by your own `tree->expand(node, true)`; lazy or not), the tree calls `tree->onExpand` (`int f(int tree)`), and `tree->expandedNode` is the node:
 add its children there. `onExpand` runs **every time** the node is opened (also after a close and an open), not only the first time, so check `node->count == 0` before you add children again. `lazy` stays on: a lazy node always shows its arrow, even when it ended up with no children.
 No sample shows this; it was checked with a small test program in which a lazy node got "child A" and "child B" in `onExpand`, a second open called `onExpand` again (with `count` already 2), and Right on an empty lazy node opened it and left the arrow in place.
 
@@ -195,7 +195,7 @@ A `guix.StatusBar` has up to eight sections: `addSection(width)` returns its num
 
 * The click on the Save icon calls `tool`, and the status bar shows its tip, "Save". The star is a toggle that starts pressed.
 * A section is exactly `width` pixels wide and cuts its text: the second section is 90 pixels so that "Ln 1, Col 1" fits.
-* The status bar paints a fixed light grey and ignores the colour variables of the section "Colours and icons of your own program" below; the toolbar has its own `background` field.
+* The status bar paints its background in a fixed light grey and has no field for it, so it stays light in a dark colour scheme (its text and its top line do follow `gui.cTextDim` and `gui.cBorder`, see the section "Colours and icons of your own program" below); the toolbar has its own `background` field.
 
 There are 31 icons, numbered from `guix.ICON_NEW` (1) to `guix.ICON_PANEL` (31). `guix.drawIcon(surface, icon, x, y, colour)` draws one, 16 x 16 pixels with its top left corner at `x, y`, on **any** surface in any colour, so it works outside toolbars too; the sample draws them without a window,
 and the output shows three of the numbers: `ICON_NEW` is 1, `ICON_SETTINGS` is 20 and `ICON_PANEL` is 31. The picture names all of them.
@@ -234,7 +234,7 @@ The dialogs are not modal: the user can still click in the other windows of your
 | `guix.openFile(d, title, startDir, f)` | the chosen path as a `char*`, 0 when cancelled or closed; only a file that exists is accepted |
 | `guix.saveFile(d, title, startDir, name, f)` | the path as a `char*`; the dialog asks before it replaces a file that exists |
 | `guix.chooseColor(d, title, 0xFFRRGGBB, f)` | the colour as `0xFFRRGGBB`, 0 when cancelled |
-| `guix.chooseDate(d, title, year, month, day, f)` | `year * 10000 + month * 100 + day`, 0 when cancelled |
+| `guix.chooseDate(d, title, year, month, day, f)` | `year * 10000 + month * 100 + day`, 0 when cancelled (a `year` of 0 or less starts on today's date) |
 
 Each of `confirm`, `prompt`, `openFile` and `saveFile` has an `...Arg` version (`confirmArg`, `promptArg`, `openFileArg`, `saveFileArg`) that takes **one more `int` as its last argument**; your function reads it from `guix.dialogArg`, which is handy when several dialogs share one callback.
 For example, `guix.confirmArg(d, "Delete", "Sure?", answered, 42)` calls `answered(1)` with `guix.dialogArg` equal to 42 when the user presses Yes. `dialogArg` is only meaningful inside the callback; it is 0 for the plain versions.
@@ -277,7 +277,7 @@ the list in the picture also holds the sample's own source file, because the pro
 
 ### Notifications
 
-`guix.notify(d, title, text, kind, ms)` shows a card in the top right corner of the screen: `kind` 0 is information (blue stripe), 1 a warning (orange), 2 an error (red). The card shows the title and at most two lines of the text.
+`guix.notify(d, title, text, kind, ms)` shows a card in the top right corner of the screen: `kind` 0 is information (a stripe in the accent colour `gui.cAccent`, blue by default), 1 a warning (orange), 2 an error (red). The card shows the title and at most two lines of the text.
 It disappears after `ms` milliseconds or on a click. Up to six cards are shown at a time, one below the other; a seventh call shows nothing and returns `null` (otherwise `notify` returns the window of the card).
 It is for events that arrive while the user does something else: a download that finished, a message from a friend. The card never takes the keyboard focus.
 
@@ -312,7 +312,7 @@ In a program you would put them in a box and let the layout size them (the last 
 The values are `int`s. Give the chart data with `setValues(series, array, n)` (it copies the numbers) or one point at a time with `push(series, value)`: the chart keeps the last `maxPoints` points (60 by default) and the oldest drop out, so a live chart scrolls by itself.
 `setLabels(names, n)` gives names to the bars, to the points of a line or area chart on the x axis, or to the slices of a pie; it keeps your array instead of copying it, so the array must stay alive as long as the chart.
 `setRange(lo, hi)` fixes the vertical axis (it is ignored unless `hi` is larger than `lo`). Without it the axis starts at 0 (or at the smallest value when that is negative) and ends at the largest value rounded up to 1, 2, 5 or 10 times a power of ten.
-`title`, `legend`, `grid` and `stacked` change the look. `seriesCount()`, `pointCount(s)`, `valueAt(s, i)` (0 for a number that is out of range) and `clearData()` read and reset the data.
+`title`, `legend`, `grid` and `stacked` change the look (`stacked` is for bar charts only). `seriesCount()`, `pointCount(s)`, `valueAt(s, i)` (0 for a number that is out of range) and `clearData()` read and reset the data.
 
 {{sample gfx/chart_bar}}
 
@@ -328,7 +328,7 @@ The values are `int`s. Give the chart data with `setValues(series, array, n)` (i
 
 **What to notice**
 
-* In the bar chart with `stacked = true` the series are piled up instead of drawn side by side, and the axis is sized for the sum of the series (95 for Q4 here). Both charts end up with a top of 100: the largest single value, 60, is rounded up to 100, too. `stacked` only changes bar charts.
+* In the bar chart with `stacked = true` the series are piled up instead of drawn side by side, and the axis is sized for the sum of the series (95 for Q4 here). Both charts end up with a top of 100: the largest single value, 60, is rounded up to 100, too. Only bar charts are drawn piled up; do not set `stacked` on another kind (on an area chart it would not pile the areas up, but it would still size the axis for the sums).
 * The output line says `value at 3: 60`: `valueAt(a, 3)` is the fourth sales number.
 * The line chart shows two series with different colours from the palette and a legend; `setRange(0, 100)` keeps the axis from moving. Each series got 40 points, one per call of `push`. A line chart draws a dot on every point only while a series has 30 points or fewer.
 * `maxPoints = 30` made the area chart keep 30 of the 100 values pushed; `valueAt(load, 0)` is the oldest one that is left (66 here, the 71st value pushed).
@@ -342,7 +342,7 @@ In the sample, the output line says that the four values add up to 1700 and that
 
 ### Gauge, switch and rating
 
-A `gchart.Gauge(min, max)` is a dial with coloured zones: green, then amber from `warn` percent of the range (60 by default) and red from `critical` (85); set both to 100 for one colour. `setValue(v)` clamps to the range, `caption` is a text below the value.
+A `gchart.Gauge(min, max)` is a dial with coloured zones: the arc is filled up to the value (the rest of the track stays grey), green first, then amber from `warn` percent of the range (60 by default) and red from `critical` (85); set both to 100 for one colour. `setValue(v)` clamps to the range, `caption` is a text below the value.
 A `gchart.Switch(initial)` is an on/off toggle (`on`, `set(b)`, `onChange`; click it, or press Space while it has the focus). A `gchart.Rating(stars, initial)` is a row of stars to click (`value`, `max`, `set(n)`, `onChange`);
 `set` cuts the number to 0 .. `max`, and a click on the star that is already the value sets it back to 0. `onChange` of both runs only when the value really changes, and is a function `int f(int widget)`.
 In the first picture the CPU gauge (35) is all green, the memory gauge (72) has passed the amber mark at 60, and the disk gauge (94) reaches into the red zone that starts at 85. In the second, the first switch is off, the second is on, and the ratings show 3 of 5 stars and 5 of 5.

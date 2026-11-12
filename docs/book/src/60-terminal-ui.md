@@ -2,7 +2,9 @@
 
 Some programs belong in a terminal: an editor you use over SSH, a file manager, a monitor, an installer. The toolkit in this chapter builds
 **full screen terminal programs** in A: it reads keys and the mouse, adapts to the colours the terminal has, writes only what changed on the
-screen, and brings menus, dialogs, lists, trees, tables, tabs and a command palette. The same code runs on Linux terminals and on the terminals of AOS.
+screen, and brings menus, dialogs, lists, trees, tables, tabs and a command palette. It is written for Linux terminals; the source also has code for AOS.
+
+Every program in this chapter was run in a **pseudo terminal**: a software terminal that a test program can type into and read the screen of. It behaves like an `xterm-256color` terminal. The book did not try the programs in real terminal programs of other kinds, so where the text says what a terminal "can do", it means what the toolkit assumes from its tables.
 
 In this chapter:
 
@@ -21,20 +23,23 @@ The graphical counterpart of this toolkit is described in the [GUI chapters](#ch
 
 | Module | What it is | Needs a terminal? |
 |---|---|---|
-| `term` | decoding of keys, mouse and paste (`Decoder`, `Event`), key names, terminal capabilities (`Caps`), the terminal itself (`Terminal`: raw mode, size, waiting for input), child programs (`Process`) | only `Terminal` and `Process` |
+| `term` | decoding of keys, mouse and paste (`Decoder`, `Event`), key names, terminal capabilities (`Caps`), the terminal itself (`Terminal`: raw mode, size, waiting for input), child programs (`Process`) | only `Terminal` |
 | `tscreen` | cells, colours, character widths, drawing, and the diff renderer (`Screen`, `Out`) | no |
 | `tui` | `Widget`, boxes, buttons, text fields, lists, menus, `Dialog`, `Theme` and the `App` loop | only `App.start()` |
-| `tuix` | the bigger parts: `TreeView`, `Table`, `TextPane`, message, prompt, file and colour dialogs, the command palette, `DirList` | no |
+| `tuix` | the bigger parts: `TreeView`, `Table`, `TextPane`, ready-made dialogs (`messageBox`, `askYesNo`, `prompt`, file and colour dialogs), the command palette, `DirList` | no |
 
 `import tuix;` also loads `tui`, `tscreen` and `term`. All modules are built into the compiler, so `ac program.a -o program` is all you need.
-Only `Terminal.open()` and `App.start()` touch a real terminal. Everything else, including a whole `App`, runs without one (`App.initHeadless`),
-which is how the examples in this chapter can print the screen of a "terminal program".
+Only `Terminal.open()` and `App.start()` (which calls it) touch a real terminal. Everything else, including a whole `App`, runs without one (`App.initHeadless`),
+which is how many examples in this chapter can print the screen of a "terminal program".
 
 ::: warning
 
-An object whose class has a constructor must be made with parentheses or with `new`: `tui.Label l("x");` or `new tui.Label("x")`. A plain
-`tui.Label l;` only zeroes the memory and does **not** run the constructor. The same goes for `term.Terminal` and `term.Decoder`: write
-`term.Terminal t();`. A constructor of your own widget class must start with `super();`.
+A class that has a constructor must be made with parentheses or with `new`: `term.Terminal t();`, `tui.Label l("x");` or `new tui.Label("x")`. A declaration without parentheses (`term.Terminal t;`, `tui.Label l;`) only fills the object with zeroes and does **not** run the constructor; [chapter 15](#chap-structs-and-classes) has the rules. For this toolkit that is a trap, not just untidiness:
+
+* `term.Decoder d;` and `term.Terminal t;` crash with `SIGFPE` (a division by zero). This is the form shown in the header comment of `lib/term.a` and in `docs/TUI.md`. The decoder keeps its events in a queue whose size the constructor sets, so in a zeroed decoder the size is 0: the first call that decodes bytes (`d.feedText(...)`), or the first key that reaches a `Terminal`, divides by zero. The program is killed by signal 8 (a program that is in raw mode prints "fatal signal 8" first, and the terminal is put back). Write `term.Decoder d();` and `term.Terminal t();`, or use `new`.
+* A zeroed `term.Terminal` also has `useAlt`, `useMouse` and `usePaste` off, because the constructor is what turns them on.
+* A zeroed widget (`tui.Label l;`) has `visible`, `enabled`, `w` and `h` all zero or false, so nothing is drawn.
+* The constructor of your own widget class must start with `super();`. Without it the base class constructor does not run, with the same result as above.
 
 :::
 
@@ -48,13 +53,12 @@ A terminal program makes an `App`, calls `start()`, builds a tree of widgets, ha
 
 **What to notice**
 
-* `start()` switches the terminal to raw mode, the alternate screen and mouse reporting, and returns `false` when there is no terminal (output
-  redirected to a file, `TERM=dumb`). Nothing has been changed in that case, so you can print a message and exit. `run()` returns when
+* `start()` switches the terminal to **raw mode** (every key arrives at once and is not echoed, and there are no line editing keys), to the **alternate screen** (a second screen, so that the text of your shell is back when the program ends) and to mouse reporting, as far as the terminal has them (see [what the terminal can do](#what-the-terminal-can-do)). It returns `false` when it has no terminal to use: the program has no controlling terminal at all (started by `cron`, for example), or `TERM` is `dumb`. Redirecting input or output is not a reason: with `./prog > file` the toolkit opens `/dev/tty` and the program still works. Nothing has been changed when `start()` returns `false`, so you can print a message and exit. `run()` returns when
   something calls `quit()`; the terminal is put back, also when the program ends through `exit()` or a fatal signal.
 * The `&` in `"&Greet"` marks the mnemonic: Alt+G presses the button. Tab moves the focus, Enter or Space presses the focused button.
 * `isDefault` on a button means "Enter in a **dialog** presses it". On a plain screen Enter goes to the focused widget, so the text field
   has its own `onEnter` callback. The screen above is what the program shows after typing `Ada` and pressing Enter.
-* Callbacks are plain functions: `int f(int widget)`. The widget arrives as an `int`; cast it back (`(tui.Button*) arg`) when you need it.
+* Callbacks are plain functions that take `int` arguments and return `int`. For a button or a text field the argument is the widget itself: `int f(int widget)`; cast it back (`(tui.Button*) arg`) when you need it. Other hooks pass something else (a menu item, the data you gave a timer, a file descriptor); each is described where it is introduced below.
 * In raw mode the keyboard does not send signals: **Ctrl+C is an ordinary key**. A program that should quit on Ctrl+C says so with
   `app->addShortcut("Ctrl+C", doQuit)`.
 
@@ -64,7 +68,7 @@ sample (`tools/tuishot.py`, see [the last section](#terminal-programs-in-the-boo
 ## Trying programs without a terminal
 
 `app->initHeadless(columns, rows)` makes an `App` that reads its events from a decoder you feed yourself and whose screen you can read as text.
-`type("text")`, `press("Ctrl+S")`, `click(x, y)` and `text()` are the whole interface. This is how the tests of the toolkit work, and how the samples in the rest of this
+`type("text")`, `press("Ctrl+S")`, `click(x, y)` and `text()` are the calls you use most (there are also `paste`, `wheel`, `mouseDown`, `mouseDrag`, `mouseUp`, `inject` and `advanceClock`). A third argument of `initHeadless` sets the colour depth of the pretend terminal (24 bit by default). This is how the tests of the toolkit work, and how most samples in the rest of this
 chapter show screens in the book.
 
 {{sample tui/headless}}
@@ -78,8 +82,8 @@ chapter show screens in the book.
 
 ## Keys, the mouse and paste
 
-A terminal sends bytes, and the bytes of a key are not always the same: `ESC [ A`, `ESC O A` and `ESC [ 1 ; 1 A` all mean "Up" on some terminal. `term.Decoder` turns the bytes into
-`term.Event` values. It is pure code, with no system calls, so you can feed it a string.
+A terminal sends bytes, and the bytes of a key are not always the same: `ESC [ A`, `ESC O A` and `ESC [ 1 ; 1 A` all mean "Up" on some terminal, and the decoder accepts all three. `term.Decoder` turns the bytes into
+`term.Event` values. It is pure code, with no system calls, so you can feed it a string. (Make a decoder with `new term.Decoder()` or `term.Decoder d();`, never `term.Decoder d;`: see the warning above.)
 
 {{sample tui/decoder}}
 
@@ -89,7 +93,7 @@ A terminal sends bytes, and the bytes of a key are not always the same: `ESC [ A
   terminal, which counts from 1, became `(9,4)`.
 * A character key is its Unicode code point, `Ctrl+S` is `'s'` with the modifier bit `MOD_CTRL`. Named keys start at `KEY_BASE`: `KEY_UP`, `KEY_ENTER`, `fkey(5)` ...
 * A lone Esc is ambiguous: it could be the start of a sequence. The decoder waits for 40 ms (`dec.escMs`); `flush()` is what happens when the wait is over.
-* A bracketed paste (`ESC [ 200 ~ ... ESC [ 201 ~`) arrives as **one** `EV_PASTE` event, not as 11 key presses, and a `Ctrl+Q` inside a paste does not quit.
+* A bracketed paste (`ESC [ 200 ~ ... ESC [ 201 ~`) arrives as **one** `EV_PASTE` event, not as 11 key presses, and a control character such as `Ctrl+Q` inside a paste does not become a key event, so it cannot quit the program. (A terminal only wraps a paste in these sequences after the program has switched bracketed paste on, which `App.start()` and `Terminal.enter()` do.)
 * A terminal cannot tell some keys apart: Ctrl+H is Backspace, Ctrl+I is Tab, Ctrl+M is Enter, Ctrl+[ is Esc. Do not give them different meanings.
 
 Keys have names, which is what menus, shortcuts and `keyIs` use.
@@ -99,25 +103,27 @@ Keys have names, which is what menus, shortcuts and `keyIs` use.
 **What to notice**
 
 * `parseKey` and `keyName` go back and forth between `"Ctrl+Alt+Up"` and a key code plus modifiers (`ctrl-alt-up` and `Ctrl+Alt+Up` are the same).
-* `encodeKey` produces the bytes a terminal would send; the tests use it to drive programs. `Alt+Enter` is `ESC` followed by Enter.
+* `encodeKey` produces the bytes a terminal would send; `App.press` uses it to drive a headless program. `Alt+Enter` is `ESC` followed by Enter.
 * `keyIs(&event, "Alt+Shift+F")` compares an event with a name. An upper case letter counts as Shift plus the letter.
 
 ## What the terminal can do
 
-Terminals differ: the Linux console has 16 colours and no mouse, an xterm has 256 or 24 bit colours, a serial line may have nothing at all. `term.Caps` records what the terminal
-can do, made from `TERM`, `COLORTERM`, the locale and `NO_COLOR`. `capsFor` is the pure function behind it.
+Terminals differ: some show 24 bit colours, some only 8 or none, some report the mouse, some have an alternate screen. The toolkit does not read a terminfo database. `term.Caps` records what the toolkit **assumes** the terminal can do, and works it out from the name in `TERM`
+with a small built-in table (read `capsFor` in `lib/term.a` for the complete rules), from `COLORTERM`, from the locale (`LC_ALL`, `LC_CTYPE`, `LANG`) and from `NO_COLOR`. `capsFor` is the pure function behind it, so you can try any name without a terminal.
+The sample below only runs names through that function; it does not talk to terminals of these kinds.
 
 {{sample tui/caps}}
 
 **What to notice**
 
-* `dumb` has no cursor addressing, so `App.start()` refuses to run. `vt100` has no colours, `linux` has 16 but no mouse and no alternate screen.
-* `COLORTERM=truecolor` lifts an xterm to 24 bit colours, `NO_COLOR` removes all colours (bold and underline stay), and a locale that is not UTF-8 turns box drawing characters into ASCII.
+* `dumb` (and `unknown`) have no cursor addressing, so `App.start()` returns `false`. Any name that starts with `vt` (`vt100`) gets no colours and no mouse, `ansi` gets 8 colours, and `linux` gets 16 colours but no mouse and no alternate screen. A `TERM` that is not set is treated as `ansi`.
+* Every other name is treated like an xterm: mouse, alternate screen, bracketed paste and a window title, with 16 colours (`xterm-color` gets 8). A name with `256color` in it, or one starting with `st`, `konsole` or `gnome`, gets 256 colours; `xterm-direct`, `kitty`, `alacritty` and a few more get 24 bit. A name the table does not know (`foobar`) gets the xterm defaults.
+* `COLORTERM=truecolor` (or `24bit`) lifts such a terminal to 24 bit colours, `NO_COLOR` removes all colours (bold and underline stay), and a locale that is not UTF-8 (`C`, `POSIX`) turns box drawing characters into ASCII. An unset or empty locale counts as UTF-8.
 * Programs never test for these themselves: colours are downgraded to the nearest colour the terminal has, symbols fall back to ASCII, and `App.start()` picks a theme
-  (dark for 256 and more colours, classic blue and cyan for 16, a monochrome one without colours).
+  (dark for 256 and more colours, classic blue and cyan for 8 and 16, a monochrome one without colours).
 
-You can force a setting for a test or for yourself: `TUI_COLORS=0|8|16|256|truecolor`, `TUI_MOUSE=0|1`, `TUI_ASCII=1`. The next program shows its own capabilities and runs on a Linux console
-with ASCII drawing, as set by the `env:` lines of its key file.
+You can force a setting for a test or for yourself: `TUI_COLORS=0|8|16|256|truecolor`, `TUI_MOUSE=0|1`, `TUI_ASCII=1`, `TUI_SYNC=0|1` (synchronized output) and `TUI_MOTION=1` (all mouse motion). The next program shows its own capabilities. Its key file sets `TERM=linux` and `TUI_ASCII=1` with `env:` lines, so the toolkit
+assumes 16 colours, no mouse and ASCII drawing. (It is still the same pseudo terminal: only the toolkit's assumptions change.)
 
 {{sample tui/fallback}}
 
@@ -125,12 +131,13 @@ with ASCII drawing, as set by the `env:` lines of its key file.
 
 **What to notice**
 
-* The box is drawn with `+`, `-` and `|`, the check box shows `[x]`, and the progress bar shows only its percentage: no colour, no Unicode, and the same program.
+* The box is drawn with `+`, `-` and `|` instead of line drawing characters, and the program is the same program.
+* The progress bar is a bar of coloured blanks with its percentage on top; a screen shown as text has no colours, so only the `60%` is visible. (The check box looks the same with and without Unicode: its `[x]` is always plain ASCII.)
 * `app->caps` is the capability record the toolkit uses. A program can look at it (here: colours, `utf8`, `mouse`) but normally does not need to.
 
 ## The terminal layer
 
-The widgets are built on `term.Terminal`. You can use it directly for a small program that does not need widgets: open it, `enter()` the full screen mode, wait for events.
+The widgets are built on `term.Terminal`. You can use it directly for a small program that does not need widgets: open it, `enter()` the full screen mode, wait for events. Remember the parentheses: `term.Terminal t();`.
 
 {{sample tui/events}}
 
@@ -138,22 +145,22 @@ The widgets are built on `term.Terminal`. You can use it directly for a small pr
 
 **What to notice**
 
-* `t.enter()` writes the sequences that switch to raw mode, the alternate screen, the mouse and bracketed paste, and installs the handlers that restore everything. `leave()` (or `exit()`, or a fatal signal) undoes it.
+* `t.open()` checks that there is a terminal and reads its capabilities and size; it returns `false` when there is none. `t.enter()` writes the sequences that switch to raw mode, the alternate screen, the mouse and bracketed paste (as far as the capabilities allow), and installs the handlers that restore everything. `leave()` (or `exit()`, or a fatal signal) undoes it.
 * `t.wait(250)` returns after input, a resize or 250 ms. It uses `ppoll`, never a blocking read, so a timeout or a signal always returns. `watch(fd)` adds a file descriptor: an `EV_FD` event arrives when it is readable.
 * The screen above is what the program drew with `writeStr` and cursor positioning escape sequences. The mouse click, the wheel and the paste are all events that arrived through the same loop.
-* A window resize arrives as `EV_RESIZE`; a hang up as `EV_HUP`. `Terminal.softExit(true)` turns a `SIGHUP` or `SIGTERM` into an `EV_HUP` event so that a program can save its work before it ends.
+* A window resize arrives as `EV_RESIZE`; a hang up as `EV_HUP`. `Terminal.softExit(true)` turns a `SIGHUP`, `SIGTERM` or `SIGINT` sent from outside into an `EV_HUP` event (its `key` is the signal number) so that a program can save its work before it ends.
 
 ::: note
 
-The terminal layer does not know the cell size of the window or the shape of characters: it only moves a cursor and writes text. The next section is about the part that
-remembers what is on the screen.
+The terminal layer does not remember what is on the screen: it only moves a cursor and writes text. The next section is about the part that
+remembers it.
 
 :::
 
 ## The screen buffer
 
 A `tscreen.Screen` is a grid of cells with two copies: the **back buffer** you draw into, and a record of what the terminal shows. `render` writes the escape sequences that bring
-the terminal up to date. You can draw into a screen and look at it as text without any terminal.
+the terminal up to date. You can draw into a screen and look at it as text without any terminal. Make one with `tscreen.Screen s(34, 7);` or `new tscreen.Screen(34, 7)`: it needs the parentheses too.
 
 {{sample tui/screen}}
 
@@ -173,7 +180,7 @@ has fewer colours than you used, the colour is replaced by the **nearest** one i
 
 **What to notice**
 
-* Orange (255, 128, 0) becomes palette entry 208 on a 256 colour terminal and plain yellow (3) on a 16 or 8 colour one: the nearest colour by a perceptual distance.
+* Orange (255, 128, 0) becomes palette entry 208 on a 256 colour terminal and plain yellow (3) on a 16 or 8 colour one: the nearest colour by the "redmean" distance, a cheap approximation of how different two colours look.
 * An 8 colour terminal has no bright colours, so `BRIGHT_RED` (9) becomes red (1), which the renderer shows in bold.
 * The default colour is never changed, and with no colours at all everything becomes the default colour.
 
@@ -209,7 +216,7 @@ down, preferred sizes flow up. In a `vbox`, children are stretched to the full w
 **What to notice**
 
 * `Frame` draws a border and a title; `Splitter(true)` puts two children side by side with a divider the mouse can drag; `TabView` shows one page at a time, with Alt+1 to Alt+9 and Ctrl+PgUp / Ctrl+PgDn to switch.
-* The splitter's `ratio` (400 of 1000) gave the first pane 40 per cent of the width, and `flex = 1` made the splitter take all the height that the label and the status bar did not need.
+* The splitter's `ratio` (400 of 1000) gave the first pane 40 per cent of the 43 columns that are left after the one column of the divider: `firstSize()` says 17 cells. `flex = 1` made the splitter take all the height that the label and the status bar did not need.
 * Overlays (dialogs, menus, toasts) have absolute positions and live outside the tree of widgets.
 
 ### Lists
@@ -220,9 +227,9 @@ A `ListView` holds text items, each with a number for your own data. With `filte
 
 **What to notice**
 
-* The list has 10 items and 7 rows, so it shows a scroll bar (the `█` and `░` on the right). The filter text is shown at the bottom. A substring match with no regard to case is the default; `matcher` replaces it.
+* The list has 10 items and 7 rows, so it shows a scroll bar (the `█` and `░` on the right). The filter text is shown at the bottom, and takes one of the rows. A substring match with no regard to case is the default; `matcher` replaces it.
 * `onActivate` runs on Enter or a double click, `onSelect` when the selection moves. `selectedText()` and `selectedData()` read the choice.
-* Typed characters go to the filter and Backspace edits it, so a list in a dialog needs no extra text field. Up, Down, PgUp, PgDn, Home and End move the selection.
+* Typed characters go to the filter, Backspace edits it and Esc clears it, so a list in a dialog needs no extra text field. Up, Down, PgUp, PgDn, Home and End move the selection.
 
 ### Trees and tables
 
@@ -232,15 +239,15 @@ A `ListView` holds text items, each with a number for your own data. With `filte
 
 * A tree node can be **lazy**: it shows an arrow, and `onExpand` fills it the first time it opens. The hook ran once, although the node was opened twice.
 * Node 0 is the invisible root. Keys: Right expands (or goes to the first child), Left collapses (or goes to the parent), Enter and Space toggle.
-* The tree never copies your data: a node has text and an `int` of user data (a file name, an index ...).
+* A node has a text (the tree keeps its own copy of it) and an `int` of user data (an index, or a pointer cast to `int` ...), which `addNode` takes as its third argument and `nodeData(node)` gives back.
 
 {{sample tui/table}}
 
 **What to notice**
 
-* `addColumn(title, width, align)`: width 0 takes the space that is left, align 2 is right. A click on a header sorts by that column, again reverses; the arrow shows which way.
-* Numbers sort as numbers (`98`, `412`, `1204`, `3500`), text without regard to case. The sort is stable and fast (40,000 rows in well under a second).
-* `selectedRow()` is the row in the table's own order; use it with `cell(row, column)`.
+* `addColumn(title, width, align)`: width 0 takes the space that is left, align 0 is left, 1 centred and 2 right. A table has at most 8 columns, and `addRow` takes up to 8 cells. A click on a header sorts by that column, again reverses; the arrow shows which way.
+* Numbers sort as numbers (`98`, `412`, `1204`, `3500`), text without regard to case; a column sorts as numbers only when both cells being compared are numbers. The sort is stable and fast (a test with 40,000 rows took well under a second).
+* `selectedRow()` is the number `addRow` returned for that row, **not** its place on the screen: sorting does not change it. Use it with `cell(row, column)`. It is -1 when nothing is selected.
 
 ### Text output
 
@@ -252,7 +259,7 @@ A `TextPane` is read only: it shows the output of a program. Text arrives in any
 
 * `done` was appended without a newline and is already on the screen: an unfinished line is shown.
 * `\e[31m` made `error` red: the colour is in the cell's style, so `styleAt` can check it. `\r\n` counts as one newline.
-* The pane keeps 5000 lines by default (`maxLines`) and appended six more lines than there were rows, so the first lines scrolled away.
+* The pane has 5 rows and the sample added 9 lines in all (the three above and six more), so the first lines scrolled away and the scroll bar appeared. It keeps 5000 lines by default (`maxLines`; you may lower it, but not raise it, because the pane allocates room for 5000 lines when it is made). When the lines or its 1 MiB of text are used up, the oldest quarter of the lines is dropped.
 
 ## Menus
 
