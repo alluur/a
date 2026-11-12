@@ -251,7 +251,7 @@ SPEEDTABLE
 
 ## Tests
 
-Tests t410 to t419 (`ds`), t420 to t428 (`strx`) and t430 to t436 (`rng`) in `tests/`; they run on all five targets and, as the `algo` test of `tests/boot_test.py` of the AOS repository, inside AOS.
+Tests t410 to t419 (`ds`), t420 to t428 (`strx`), t429 (null pointers, negative and absurd arguments in all three modules) and t430 to t436 (`rng`) in `tests/`; they run on all five targets and, as the `algo` test of `tests/boot_test.py` of the AOS repository, inside AOS.
 
 * **Differential tests** compare every structure with a plain model that is easy to get right (arrays, brute force, a full dynamic programming table) on thousands of random operations.
 * **Expected outputs from independent implementations**: t430 (all generator sequences) was produced by Python implementations that were first checked against NumPy, Python's `random`, `cryptography`
