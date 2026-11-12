@@ -186,23 +186,63 @@ What to notice:
 
 ## Floating point with double
 
-`double` is an IEEE 754 binary64 number, and `float` is another name for it. A has no hardware floating point instructions in its output: the compiler calls a built-in **software** implementation (`dfloat`, loaded only when a program uses doubles), so results are bit for bit identical on every processor and system. Literals like `1.5`, `2e-3` and `1_000.25` are rounded exactly like a C compiler does.
+`double` is an IEEE 754 binary64 number, the same format as the `double` of C, and `float` is another name for it: both are 8 bytes. The compiler calls a built-in **software** implementation (the module `dfloat`, loaded only when a program uses a floating point value), so results are bit for bit identical on every processor and system. The price is speed: an addition takes tens of nanoseconds instead of one, which is fine for tools, simulations and plots, but not for millions of calls. This section stays at the language level; [the numbers chapter](#chap-numbers) goes deeper into `double`, `dfloat` and `dmath`.
 
-The compiler converts between `int` and `double` automatically: an `int` in a mixed expression becomes a `double`, and assigning a `double` to an `int` needs a cast, which truncates toward zero. The operators `+ - * /`, unary `-`, the six comparisons, `+= -= *= /=`, `++`, `--`, `?:` and the truth test work on doubles, and doubles can be fields, array elements, parameters and results. `printlnDouble`, `printDouble`, `doubleToText`, `doubleToFixed(d, n)`, `doubleToSci(d, n)`, `parseDouble(text)`, `isNaN`, `isInf` and `isFinite` are the conversion helpers, and the `dmath` module has `sqrt`, `pow`, `sin`, `cos`, `exp`, `log`, `floor`, `ceil` and many more.
+### Literals, conversions and operators
 
-{{sample lang/double_basics}}
+A floating point literal has a decimal point or an exponent: `1.5`, `2e-3`, `1_000.25`. It is rounded exactly (to nearest, ties to even), like a C compiler does. An `int` in a mixed expression is converted to `double`. Assigning a `double` to an `int` needs a **cast**, which truncates toward zero. The operators `+ - * /`, unary `-`, the six comparisons, `+= -= *= /=`, `++`, `--`, `?:` and the truth test (`if (d)` is true when `d != 0`) all work.
+
+{{sample lang/double_values}}
 
 What to notice:
 
-- `0.1 + 0.2` is `0.30000000000000004`: binary floating point cannot represent 0.1 exactly. That is how every IEEE system behaves.
-- `10 / 4` is the integer division 2, converted afterwards to `2.0`. Write `10.0 / 4` for 2.5.
-- `__bits(d)` returns the 64 raw bits of a double as an `int` and `__dbl(i)` converts back; `1.0` is `3ff0000000000000`.
-- `printf` from the prelude does not know `%f` and prints it unchanged. Use `printlnDouble`, `doubleToFixed`, or `printfd` from the `cfloat` module, which understands `%f %e %g %a` but takes the raw bits of the value: `printfd("%.2f", __bits(d))`.
-- Software arithmetic is fast enough for tools and simulations, but each operation is far slower than a hardware instruction: a million additions in a loop took about 75 milliseconds on the machine this book was written on.
+- `n * a` converts `n` first; `n / 2` divides two `int`s **before** the conversion, so it is 1, not 1.5. Write `n / 2.0` for a real division.
+- `(int) -7.75` is -7: truncation toward zero, not rounding down. `(int) 7.9` is 7.
+- Comparisons give 0 or 1, and may mix `int` and `double` (`n > 2.5`).
+- `total++` adds 1.0.
+- `float` and `double` are the same type, so `sizeof(float)` is 8.
+
+### Doubles in data
+
+A double can be a variable, a global, a struct field, an array element, a parameter and a result, like any other type. A pointer to `double` steps by 8 bytes.
+
+{{sample lang/double_data}}
+
+What to notice:
+
+- `v.x = 3;` converted the `int` 3 to `3.0` when it was stored.
+- `dot` receives two structs by value, and `scaled` returns a struct of doubles: all the rules of [chapter 14](#chap-functions) apply.
+- `samples[i] = i * 0.25;` is an `int` times a `double`: the result is a double.
+
+### Printing, parsing and inspecting
+
+`printf` from the prelude does not understand `%f`. Use the double helpers: `printlnDouble(d)` and `printDouble(d)` write the **shortest text that reads back as exactly the same number**; `doubleToText(d)` returns the same text as a string; `doubleToFixed(d, n)` rounds to `n` decimals; `doubleToSci(d, n)` writes scientific notation; `parseDouble(text)` reads a number; `isNaN`, `isInf` and `isFinite` classify a value. `__bits(d)` returns the 64 raw bits of a double as an `int`, and `__dbl(i)` builds a double from 64 bits.
+
+{{sample lang/double_text}}
+
+What to notice:
+
+- `0.1 + 0.2` prints as `0.30000000000000004`, and `2.0 / 3` as `0.6666666666666666`: those are the shortest texts that identify the numbers. Binary floating point cannot hold 0.1 exactly; every IEEE system behaves like this.
+- Division by zero gives infinity and `inf - inf` is **NaN** ("not a number"). A NaN is not equal to anything, not even itself: `nan == nan` is 0. Use `isNaN`.
+- `__bits(1.0)` is `3ff0000000000000`. Adding 1 to the bits of `1.0` gives the next larger double, `1.0000000000000002`.
+- The C library functions `printfd`, `sprintfd` and the like (module `cfloat`) understand `%f %e %g %a` but take **bit patterns**, not doubles: write `printfd("%.2f", __bits(d))`. Passing the double itself converts it to an `int` first and prints nonsense, without a warning.
+
+### Mathematics
+
+The mathematical functions live in the `dmath` module: `sqrt cbrt pow exp exp2 expm1 log log2 log10 log1p hypot sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh floor ceil round trunc fabs fmod fmin fmax copysign`, the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`, and `nan()`. They are the functions of C's `<math.h>`, correctly rounded.
+
+{{sample lang/double_math}}
+
+What to notice:
+
+- Call them with the module name: `dmath.sqrt(2)`. A bare `sqrt(...)` after `import dmath;` is **not** the same function: it is the C library's version, which expects a bit pattern. In a test, `sqrt(2.0)` printed `2.1906148709472164e+18`, a wrong result, while `dmath.sqrt(2.0)` printed `1.4142135623730951`.
+- The functions take `int` arguments too, as in `dmath.sqrt(2)`: the compiler converts them to `double`.
+- `dmath.round(area)` is a `double` (`20.0`); the `(int)` cast makes it an integer.
+- `sin(PI / 6)` is `0.49999999999999994`, as in C: the result is exact for the rounded input, which is not exactly pi / 6.
 
 ::: note
 
-Older parts of the C library reference describe a double as an `int` that holds the bit pattern, handled by functions such as `dlit("2.5")`, `itod(1)` and `dadd(a, b)`. Those functions still exist, and `printfd` still expects bit patterns, but you can simply write `a + b` with `double` variables.
+Older parts of the C library reference describe a double as an `int` that holds the bit pattern, handled by functions such as `dlit("2.5")`, `itod(1)` and `dadd(a, b)`. Those functions still exist, and `printfd` still expects bit patterns, but with the `double` type you can simply write `a + b`.
 
 :::
 
@@ -215,10 +255,10 @@ Older parts of the C library reference describe a double as an `int` that holds 
 - `size_t` is `uint64`; `ssize_t`, `intptr_t` and `ptrdiff_t` are `int64`.
 - A cast `(type) x` truncates, extends or reinterprets; `sizeof` gives sizes in bytes at compile time.
 - Literals: `42`, `0xFF`, `0b1010`, `1_000`, `'a'`, `"text\n"`, `true`, `false`, `null`; adjacent strings are joined.
-- `double` is software IEEE 754: exact and portable, but not fast.
+- `double` (alias `float`) is IEEE 754 binary64, done in software: identical on every target, but not fast. Mix it with `int` freely, cast with `(int)` to truncate, print with `printlnDouble` or `doubleToFixed`, and call the maths functions as `dmath.sqrt(x)`.
 
 ## Where next
 
 - [Variables and operators](#chap-variables-and-operators) shows how to declare and combine values.
 - [Memory and pointers](#chap-memory-and-pointers) goes deeper into pointers and the heap.
-- [The API reference of dmath](#api-dmath) lists the floating point functions.
+- [The numbers chapter](#chap-numbers) covers `double`, `dfloat` and `dmath` in depth; the [API reference of dmath](#api-dmath) lists the functions.
