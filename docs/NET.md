@@ -1,4 +1,4 @@
-# Web protocols: WebSocket, wshub, SSE, httpx and JSON-RPC
+# Network protocols: WebSocket, wshub, SSE, httpx, JSON-RPC, MQTT, Redis and syslog
 
 Five modules for programs that talk HTTP and WebSocket, written in A, running on every target (Linux x86-64, ARM64, RISC-V, LoongArch,
 Windows and AOS) with the same code. They sit on `net`, `conn`, `tls` (TLS 1.3, [TLS.md](TLS.md)), `zlib` and `json`.
@@ -10,6 +10,18 @@ Windows and AOS) with the same code. They sit on `net`, `conn`, `tls` (TLS 1.3, 
 | `sse` | Server-Sent Events: the wire format, a parser, a client that reconnects with `Last-Event-ID` |
 | `httpx` | an HTTP toolkit: client (redirects, cookies, keep-alive, retries, streaming), request parser, router, middleware, static files, CORS, auth, multipart |
 | `jsonrpc` | JSON-RPC 2.0: dispatcher and client over framed streams, HTTP and WebSocket |
+
+A second group does messaging and logging (below, from the section "MQTT"): every protocol as a **client and as a small server**, both usable in tests and on AOS.
+
+| Module | What it is |
+|---|---|
+| `mqtt` | an MQTT 3.1.1 client (QoS 0 / 1 / 2, sessions, will, TLS, keep-alive, reconnect with resubscribe; a poll based and a blocking API) and the packet codec |
+| `mqttd` | an MQTT broker: many clients in one loop, topic tree with wildcards, retained messages, QoS 0 / 1 / 2 to subscribers, persistent sessions, wills, `$SYS` counters, queue caps |
+| `redis` | a RESP2 client (all reply types, pipelining, MULTI / EXEC, AUTH, SELECT, pub/sub, TLS, time outs, reconnect) and the RESP codec |
+| `redisd` | a small in-memory Redis server (strings, lists, hashes, sets, sorted sets, expiry, pub/sub, transactions, 16 databases) with limits |
+| `syslog` | RFC 5424 and RFC 3164 messages (build and parse, structured data) and a sender over UDP, TCP and TLS |
+| `syslogd` | a syslog collector (UDP, TCP, TLS) with filters, files with rotation, a bounded ring buffer and forwarding |
+| `netio`, `netsrv` | the layers under them: a byte queue and a non-blocking client link (plain or TLS); a poll based TCP / TLS / UDP server core |
 
 Also changed underneath: `net` got non-blocking calls and a cooperative waiting hook, `conn` frees its buffers, `tls` reuses finished sessions,
 `zlib` got the calls permessage-deflate needs, `json` values can be freed.
@@ -276,3 +288,220 @@ behind a TLS terminating proxy. On AOS blocks over 128 KiB are never reused addr
 `tests/t340` to `t370` run in the normal suite on every target (client and server in one thread, ephemeral ports): frames and strictness (`t340`-`t344`), permessage-deflate (`t345`), sockets, options, non-blocking and keepalive (`t346`-`t349`), the hub (`t350`-`t354`), SSE (`t355`, and from the plain `http` server `t367`), httpx (`t356`, `t357`), JSON-RPC (`t358`, `t359`), and the layers underneath: conn and net (`t360`), zlib (`t361`), json (`t362`), TLS session reuse (`t363`), memory (`t364` zlib and permessage-deflate, `t365` the hub, `t366` clients and toolkits), and regression tests for what independent reviewers found: `t368` (a recycled WebSocket object after a half message, pongs against `maxQueued`, the Origin policy, a finished `Connection: close` answer), `t369` (Locations of 8000 bytes and other schemes, default credentials across origins, compressed bombs, trailers, huge Range numbers), `t370` (an event stream that starts with an empty line, header names and long headers of the SSE client, NUL and bad UTF-8 in JSON-RPC). `tests/net.sh` (Linux x86-64; needs python3, curl, openssl; uses the python packages
 `websockets` and `requests` when they are installed) checks the modules against independent implementations: python websockets as client and server (permessage-deflate, subprotocols, Origin, wss with a
 verified certificate, 160 KB and 300 KB messages), raw frames with every RFC 6455 violation, curl (Range, ETag, chunked uploads, `Expect: 100-continue`, multipart, JSON-RPC, https) and a python SSE client.
+
+# MQTT, Redis and syslog
+
+Three protocol families, each with a client and a server module. The servers are built so that they can run for months: every queue has a limit, every limit is a setting, memory is
+freed (a strict test per family compares the heap position before and after many operations), malformed input gets an error and a closed connection. All six modules work on every
+target and on AOS (they use only `net`, `netio`, `tls` and `asys`).
+
+## The layers underneath: netio and netsrv
+
+```c
+import netio;
+netio.Link* l = netio.newLink();
+if (!l->open("broker.example.org", 8883, 5000, true, true)) println(l->error);     // TCP connect (blocks up to 5 s), then the TLS handshake
+int n = l->send(data, len);                       // bytes taken (0: the socket is full right now), -1: the connection failed. Never blocks.
+if (l->waitReadable(100)) { int got = l->recv(buf, 4096); }       // > 0 bytes, 0 closed, -2 nothing now, -1 failed
+l->dispose();
+netio.Queue q;  q.max = 65536;  q.add(bytes, n);  /* net.sendSome(fd, q.data(), q.pending()); q.consume(sent); */
+```
+
+`netio.Queue` is a first-in first-out byte buffer with an optional limit (`add` fails and sets `overflow` instead of growing). `netio.Link` drives the TLS session of the `tls` module as a state
+machine, so a TLS connection is non-blocking too (`tls.wrap` is not: it installs blocking hooks). `net.setIdleHook` works with it.
+
+`netsrv.Server` is the core of the three servers (and of anything you write): one thread, `net.poll`, no blocking call in the loop, TLS handshakes included.
+
+```c
+int onOpen(netsrv.Server* s, netsrv.Conn* c)                      { c->user = (char*) newState();  return 0; }          // < 0 refuses the connection
+int onData(netsrv.Server* s, netsrv.Conn* c, char* data, int n)  { c->out.add("+OK\r\n", 5);  return 0; }              // < 0 closes it after the output
+int onClose(netsrv.Server* s, netsrv.Conn* c)                    { freeState(c->user);  return 0; }                    // c->closeReason says why
+netsrv.Server* s = new netsrv.Server();  s->onOpen = onOpen;  s->onData = onData;  s->onClose = onClose;
+s->listen(7777);  s->listenTls(7778, cfg);  s->addUdp(7779);  s->onDatagram = ...;   s->run();      // or  for (;;) s->poll(50);
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `maxConns` | 1000 (the most) | connections; more are closed at once (`stats->rejected`) |
+| `maxPerIp` | 0 (off) | connections from one address |
+| `maxOut` | 1 MiB | bytes queued for one connection (`c->out.max`): a client that does not read is cut off (`R_EVICTED`) instead of growing the queue |
+| `handshakeTimeoutMs`, `idleTimeoutMs`, `lingerMs` | 5000, 0 (off), 1000 | TLS handshake time, silence (nothing received), the time a closing connection reads away what the peer still sends |
+
+`close(c)` sends what is queued, says goodbye (TLS close_notify, FIN) and reads away the peer's remaining bytes for `lingerMs` (so the last bytes are not lost to a reset); `kill(c)` drops it at once. `onClose` runs
+exactly once for every connection that `onOpen` saw. Conn objects, buffers and TLS sessions are reused. `killAll()` drops every connection, `shutdown()` everything.
+
+## MQTT: `mqtt` and `mqttd`
+
+```c
+import mqtt;
+mqtt.Client* c = mqtt.connect("mqtt://user:secret@broker.example.org:1883/");      // mqtts:// = TLS (certificate checked); null: mqtt.error()
+c->subscribeWait("sensors/+/temp", 1, 3000);                                        // the granted QoS (0..2), 128 refused, -1 time out
+c->publishWait("sensors/kitchen/temp", "21.5", 4, 1, false, 3000);                  // QoS 1: returns when the PUBACK is there
+mqtt.Message* m = c->waitMessage(5000);  if (m != null) { println(m->topic); println(m->payload); m->dispose(); }
+c->disconnect();  c->dispose();
+```
+
+**Client.** CONNECT with clean or persistent session, will (topic, payload, QoS, retain), user name and password, keep-alive (a PINGREQ after three quarters of the interval, a dead connection when the PINGRESP does not come), TLS.
+PUBLISH with QoS 0, 1 and 2: the sender keeps every QoS 1 / 2 message until PUBACK / PUBCOMP, resends it with DUP (and the PUBREL of a message that reached PUBREC) after a reconnect with a persistent
+session, and sends it again as a new message when the broker has no session (the messages that already reached PUBREC count as delivered); the receiver delivers a QoS 2 message once (it remembers the packet identifier until PUBREL).
+SUBSCRIBE / UNSUBSCRIBE with the filters `+` and `#`, the SUBACK return codes (128: refused; the filter is then not remembered), invalid filters and topics are refused before anything is sent.
+Subscriptions are repeated after a reconnect that did not keep the session. Two ways to use it:
+
+* **blocking**: `publishWait`, `subscribeWait`, `unsubscribeWait`, `waitMessage`, `flushAll`;
+* **non-blocking**: `publish` returns a token at once (the message waits in a queue while the client is offline or the window is full), `poll(ms)` serves the connection (reads, answers, pings, reconnects) for at most `ms`,
+  `next()` takes a received message, or `c->onMessage = fn` (`fn(client, topic, payload, length, qos, retain)`, the payload is valid during the call and followed by a 0 byte), `onConnect`, `onDisconnect`, `onPublished(client, token)`.
+
+`Options` (pass to `mqtt.newClient(host, port, options)` or `mqtt.connectWith(url, options)`; the client works on its own copy): `clientId` (empty: a random one, needs `cleanSession`), `cleanSession`, `keepAliveSec` (60), `username`, `password`, `willTopic`, `willPayload`, `willQos`,
+`willRetain`, `useTls`, `verify`, `connectTimeoutMs` (5000: TCP, TLS and CONNACK each), `maxPacket` (1 MiB), `maxInflight` (20, at most 1024), `maxQueued` (1000 messages) and `maxQueuedBytes` (8 MiB) for what waits to be sent, `maxIncoming` (1000: more received
+messages than that, when nobody calls `next()`, are dropped and counted in `dropped`), `maxOut` (4 MiB), `autoReconnect` (false), `reconnectMinMs` / `reconnectMaxMs` (500, 30000: the pause doubles). **Connecting blocks** for the TCP connection, the TLS handshake and the CONNACK
+(each at most `connectTimeoutMs`), also when `poll` reconnects.
+
+**The engine** (`begin(now)`, `feed(bytes, n)`, `outData()` / `outPending()` / `outConsumed(n)`, `tick(now)`, `lost(reason)`) has no sockets and no clock of its own: the tests drive it with a clock they set and with packets they lose on purpose.
+
+**The codec** is usable alone: `Parser` (bytes in, `Packet` out, pointers into its buffer; limit `maxPacket` checked at the header; reserved types, wrong flags for every type, QoS 3, DUP on QoS 0, packet identifier 0, bad CONNECT flags,
+strings that are not UTF-8 (overlong forms, surrogates, NUL), wildcards in topic names, invalid filters, lengths that lie: all are errors and the parser stays failed), `putConnect putConnack putPublish putAck putSubscribe putUnsubscribe putSuback putEmpty` (each writes a whole packet or nothing),
+`topicMatches(filter, topic)` (`$`-topics are not matched by a filter that starts with `+` or `#`), `validTopicFilter`, `validTopicName`, `validUtf8`.
+
+```c
+import mqttd;
+mqttd.Server* s = mqttd.newServer();
+s->broker->addUser("alice", "secret");  s->broker->allowAnonymous = false;           // or s->broker->authHook / aclHook
+if (!s->listen(1883)) { ... }                                                       // s->listenTls(8883, cfg); port 0 picks a free one (s->port)
+s->run();                                                                           // or for (;;) { s->poll(50); }
+```
+
+**Broker.** One loop for all clients (`netsrv`). CONNACK codes 1 (protocol level other than 4: MQTT 3.1 and 5 are refused), 2 (empty client id with a persistent session), 3 (too many clients), 4, 5 (credentials); session present; a second connection with the same client id takes over
+(its will is sent); persistent sessions keep subscriptions and the QoS 1 / 2 messages for an offline client (QoS 0 is not kept) and resend what is in flight with DUP; a topic tree with wildcards, one copy per client for overlapping subscriptions
+(the highest QoS); QoS downgrade to the subscription's QoS; retained messages (an empty payload removes one; the retain flag is off for live deliveries and on for the ones sent at SUBSCRIBE); will messages (when the connection ends without DISCONNECT, on keep-alive time out
+(1.5 times the interval), on a protocol violation, on takeover); `$SYS/broker/clients/connected`, `clients/total`, `clients/disconnected` (published at once when they change), and every `sysIntervalMs` (10 s) messages received / sent / dropped, subscriptions, retained messages, uptime and version (all
+retained; `sysIntervalMs = 0` turns `$SYS` off); clients cannot publish to `$` topics.
+
+| Limit (setting of `broker`) | Default | What happens over it |
+|---|---|---|
+| `maxClients` | 1000 | CONNACK 3 |
+| `maxPacket` | 1 MiB | the connection is closed at the header (nothing is buffered) |
+| `maxInflight` | 20 (at most 256) | further QoS 1 / 2 messages wait in the client's queue |
+| `maxQueue`, `maxQueueBytes` | 1000, 1 MiB | a message for a client (offline or slow) is dropped and counted (`stats->dropped`); `maxQueuedTotal` (32 MiB) for all clients together |
+| `maxOut` | 4 MiB | bytes waiting for one socket: QoS 0 messages are dropped above half of it; a client that cannot take its acknowledgements is cut off |
+| `maxSubsPerClient`, `maxSubscriptions` | 200, 20000 | SUBACK 128 |
+| `maxRetained`, `maxSessions` | 10000, 1000 | a retained message is not stored; the offline persistent session that has been gone longest is dropped (also `sessionExpirySec`) |
+| `maxLevels`, `maxTopicLength`, `maxClientIdLength` | 64, 1024, 256 | refused subscription, dropped publish, CONNACK 2 |
+| `connectTimeoutMs` | 10000 | a connection that sends no CONNECT is closed |
+
+The broker core (`mqttd.Broker`) has no sockets either: `open(now)` makes a `Peer`, `feed(peer, bytes, n)` runs them, `peer->out` is what to send, `tick(now)` does the timers (`setClock` sets a fake clock), `closed(peer)` releases it.
+Not supported: MQTT 5, the old 3.1 (answered with CONNACK 1), WebSocket transport, bridges, persistence on disk, shared subscriptions, message expiry.
+
+## Redis: `redis` and `redisd`
+
+```c
+import redis;
+redis.Client* c = redis.connect("redis://:password@localhost:6379/2");              // rediss:// = TLS; /2 = SELECT 2; null: redis.error()
+c->set("greeting", "hello");  char* v = c->get("greeting");  println(v);  free(v);    // null when the key does not exist
+redis.Reply* r = c->call("LRANGE", "mylist", "0", "-1");                           // any command, up to 6 arguments (callv for more and for binary data)
+if (r->type == redis.T_ARRAY) for (int i = 0; i < r->count; i++) println(r->elems[i]->str);
+r->dispose();                                                                      // every Reply you get is yours
+```
+
+**Client.** All RESP2 reply types (`T_STATUS T_ERROR T_INT T_BULK T_ARRAY T_NIL T_NILARRAY`; bulk strings are binary safe: `str`, `len`, and a 0 byte behind them). An error reply is a `Reply` of type `T_ERROR`; `call` returns null only
+when the connection failed or timed out (`c->error`). Helpers: strings (`set setEx setBin get getBin incr decr incrBy append strLength del exists expire ttl keys mget mset dbsize flushAll info echo publish`), lists (`lpush rpush lpop rpop llen lrange`),
+hashes (`hset hget hgetall hdel`), sets (`sadd srem smembers sismember`), sorted sets (`zadd zrange zscore zrem zcard`; scores as text). `redis.pipeline(c)` makes a `Pipeline`: `add(...)` as often as you like,
+`run()` (one write, then all replies), `reply(i)`. `c->multi()`, `c->call(...)` (answers "QUEUED"), `c->exec()` (the array of the replies), `c->discard()`. `redis.pubsub(c)` makes a `PubSub` on a connection of its own (RESP2 allows nothing else on a subscribed connection):
+`subscribe psubscribe unsubscribe punsubscribe ping`, `next(timeoutMs)` returns a `PubMessage` (channel, pattern, data) or null, and reconnects and subscribes again after a connection loss. AUTH (`redis://:pw@host`, or `redis://user:pw@host`) and SELECT are repeated after a reconnect.
+`Options`: `timeoutMs` for every reply (5000; the connection is closed on a time out because the reply could still arrive), `connectTimeoutMs`, `autoReconnect` (true: the next call connects again), `maxBulk` (64 MiB), `maxOut` (64 MiB), `useTls`, `verify`, `db`, `password`, `username`.
+**A command whose reply did not come is not sent again after a reconnect** (Redis commands are not idempotent in general).
+
+**The codec.** `ReplyParser` (replies: nothing is buffered except the reply being built; a bulk string grows as its bytes arrive; `maxBulk` 64 MiB, `maxElements` 1,000,000, `maxDepth` 32, `maxTotal` 128 MiB, a line of 64 KiB; every length is checked before memory is taken; `maxReady` makes `feed`
+stop so that a flood of messages is not buffered), `CmdParser` (requests as a server reads them: RESP arrays of bulk strings and inline commands with quotes; `maxBulk` 16 MiB, `maxArgs` 1024, `maxCommand` 32 MiB, `maxInline` 64 KiB), writers `putCommand putStatus putError putInt putBulk putNil putNilArray putArray`
+(CR and LF in a status or error line become blanks: no reply injection). Malformed input is an error code and the parser stays failed.
+
+```c
+import redisd;
+redisd.Server* s = redisd.newServer();  s->store->requirepass = "secret";  s->listen(6379);  s->run();
+```
+
+**Server.** `PING ECHO QUIT AUTH SELECT` (16 databases), `GET SET` (`EX PX NX XX KEEPTTL`) `SETNX SETEX PSETEX GETSET DEL EXISTS EXPIRE PEXPIRE TTL PTTL PERSIST INCR DECR INCRBY DECRBY APPEND STRLEN MGET MSET KEYS` (glob with `* ? [a-z] [^a] \x`, no exponential backtracking) `TYPE RENAME`,
+`LPUSH RPUSH LPOP RPOP` (with a count) `LRANGE LLEN LINDEX`, `HSET HGET HGETALL HDEL HLEN HEXISTS HKEYS HVALS`, `SADD SREM SMEMBERS SISMEMBER SCARD`, `ZADD` (`NX XX CH`) `ZRANGE` (`WITHSCORES`) `ZSCORE ZREM ZCARD ZRANK` (scores are doubles: `-inf`, `1e+22`, `0.1`),
+`PUBLISH SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE` (subscribe mode as in Redis: only those, `PING` and `QUIT` are allowed), `MULTI EXEC DISCARD` (errors while queueing make `EXEC` answer `-EXECABORT`, errors inside `EXEC` are elements of the result),
+`FLUSHALL FLUSHDB DBSIZE INFO COMMAND CLIENT`. Errors read like Redis' (`-WRONGTYPE ...`, `-ERR wrong number of arguments for 'get' command`, `-NOAUTH`, `-OOM`, ...). Keys expire lazily and by a sweep in the loop; a key that expired is still counted by `DBSIZE` until it is removed, as in Redis.
+
+| Limit | Default | What happens over it |
+|---|---|---|
+| `maxBulk`, `maxArgs`, `maxCommand`, `maxInline` (of `store`) | 16 MiB, 1024, 32 MiB, 64 KiB | `-ERR Protocol error: ...` and the connection is closed (a bulk length is judged at its header: nothing is buffered) |
+| `maxQueued` (commands after MULTI) | 1000 | `-ERR too many commands in the transaction`, then `EXEC` aborts |
+| `maxSubs` (channels and patterns of a client) | 1000 | `-ERR too many subscriptions` |
+| `maxMemory` | 64 MiB of data (approximate: keys, values, entries) | write commands answer `-OOM`; reads and deletes still work |
+| `net->maxConns`, `net->maxPerIp`, `net->idleTimeoutMs` | 1000, 0, 0 | closed at once / closed |
+| `net->maxOut` | 16 MiB | a client that does not read its replies (or a subscriber that does not read its messages) is cut off |
+
+The worst case of memory is `maxConns` times `maxCommand` for requests and `maxConns` times `net->maxOut` for replies: lower them for a small machine (AOS needs 128 MB of RAM at least). Not supported: persistence, replication, scripting, streams, `WATCH`, RESP3, blocking commands, cluster, `OBJECT`/`SCAN` and most of the rarer commands (`-ERR unknown command`).
+The core (`store->open()`, `c->feed(bytes, n)`, `c->out`, `store->setClock(ms)`) has no sockets: the tests check the bytes of the replies.
+
+## syslog: `syslog` and `syslogd`
+
+```c
+import syslog;
+char buf[2048];
+int n = syslog.build5424(&buf[0], 2048, syslog.FAC_AUTH, syslog.SEV_WARNING, datetime.now(), 0, "myhost", "sshd", "4711", "AUTHFAIL", "-", "login failed", 12);
+//  <36>1 2026-10-11T22:14:15.000Z myhost sshd 4711 AUTHFAIL - login failed
+syslog.Message m;  if (syslog.parse(&buf[0], n, &m, datetime.now()) == 0) { println(m.app); }          // RFC 5424, RFC 3164 or a text without <PRI>
+
+syslog.Sender* s = syslog.newSender("tls://logs.example.org:6514");           // udp://host[:514]  tcp://host[:514]  tls://host[:6514]
+s->setApp("myapp", "42");  s->facility = syslog.FAC_LOCAL0;
+s->info("service started");  s->error("disk almost full");  s->flush(2000);  s->dispose();
+```
+
+**Messages.** Priority = facility * 8 + severity (`FAC_*`, `SEV_*`, `facilityName`, `parseFacility` ...). `build5424` and `build3164` write one message into a buffer (the length, or -1): header fields with blanks or control characters get `_`, empty ones become `-`, long ones are cut to the RFC's limits
+(host 255, app 48, procid 128, msgid 32). `parse` reads either format and finds out which: RFC 5424 (timestamp with fraction and offset checked down to the calendar: February 30, hour 24 and offset 24:00 are errors; structured data checked element by element; the UTF-8 BOM) or RFC 3164
+(`Mmm dd hh:mm:ss host tag[pid]: text`; the year is guessed from the clock you pass; a word that looks like a tag is not taken for a host) or a text without `<PRI>` (facility user, severity notice). It never reads beyond the length you give; the fields are copies and `msg`, `sd` point into your text. Errors: `E_PRI E_VERSION E_TIMESTAMP E_FIELD E_SD E_EMPTY E_TRUNCATED`.
+`buildSd` writes structured data with the escaping of `"`, `\` and `]` and checks names; `sdParam` finds a parameter and unescapes it.
+
+**Sender.** UDP: one datagram per message, cut at 2048 bytes. TCP and TLS: framing is octet counting (RFC 6587 and RFC 5425, the default) or newline (control characters in the text become blanks). The connection is made lazily (`connectTimeoutMs`, default 1000) and at most once per `retryIntervalMs` (2000): a collector that is down does not
+slow the caller down. What cannot be sent yet is queued (`maxQueueBytes` 256 KiB, `maxQueueMessages` 1000; more is dropped and counted in `dropped`). A frame is only taken out of the queue when all of it is written: after a lost connection it is sent again completely (a frame that was cut in the middle is never continued on the new connection).
+A collector that closed the connection is noticed at the next send. `sent`, `dropped`, `reconnects`, `errors` are counters; `s->now` fixes the clock of the timestamps.
+
+```c
+import syslogd;
+syslogd.Server* s = syslogd.newServer();
+s->listenUdp(514);  s->listenTcp(514);                                              // s->listenTls(6514, cfg); port 0 picks a free one (s->udpPort, s->tcpPort)
+syslogd.Filter* f = syslogd.newFilter();  f->setSeverityUpTo(syslog.SEV_WARNING);  f->program = "sshd";  f->setPattern("Failed|refused");
+s->collector->addFile(f, "/var/log/auth-problems.log", 1048576, 5);                // rotates at 1 MiB, keeps .1 ... .5
+s->collector->addForward(null, "tls://central.example.org:6514");                   // everything goes on
+s->run();                                                                           // or: for (;;) { s->poll(50); ... s->collector->ring->line(0) ... }
+```
+
+**Collector.** UDP: one message per datagram (a trailing line end is not part of it). TCP and TLS: octet counting and newline framing are told apart for every message (a digit starts an octet count, `<` or anything else a line; a line that starts with digits but has no blank after them is a line);
+an octet count that is not a number, longer than 6 digits or over `maxMessage` (16 KiB), and a line that does not end within `maxMessage`, close the connection (`stats->framingErrors`). A message that cannot be parsed is counted and dropped (`keepMalformed` stores it as user.notice); a missing timestamp is replaced by the time of reception, a missing host by the address of the sender.
+**Filters** (`Filter`): facilities and severities as bit masks (`addFacility`, `addSeverity`, `setSeverityUpTo(n)`: n and worse), `program` and `host` globs (`*`, `?`), a regular expression over the text (`setPattern`, the `regex` module), `invert`. `collector->dropFilter` drops what matches it.
+**Routes**: `addFile` (a text file, size based rotation with kept files `path.1` ... `path.N`, a file that cannot be opened is counted and tried again after `retryMs`, lines are lost meanwhile), `addRing` (a bounded in-memory ring: lines and bytes), `addForward` (a `syslog.Sender`; the original text is passed on; forwarding a collector to itself loops: do not).
+The default ring `collector->ring` takes everything that is not dropped; a message goes to every route whose filter matches.
+**Lines** (`lineFormat`): `LINE_TRADITIONAL` "Oct 11 22:14:15 host app[pid]: text", `LINE_DETAIL` "2003-10-11T22:14:15Z host auth.warning app[pid]: text", `LINE_RAW`. Control characters in a message (line feed, carriage return, ESC, NUL ...) are written as `#ooo` (octal): a message cannot forge a log line or a terminal sequence.
+File names are always yours: nothing from a message becomes part of a path. On AOS file names are limited to 55 characters: `path.N` must fit.
+Not supported: reading `/dev/log` or the journal, RELP, TLS client certificates, file names built from message fields.
+
+## Tests (MQTT, Redis, syslog)
+
+`tests/t371` to `t389` run in the normal suite on every target (client and server in one thread from `net.setIdleHook`, ephemeral ports, nothing depends on time except small time outs):
+
+| Test | What |
+|---|---|
+| `t371` `t372` | MQTT codec byte for byte (every packet type; the remaining length table; the topic matching tables of the specification), malformed packets (every error code), a fuzz run |
+| `t373` `t374` | client against broker: every QoS, wildcards, retained, overlapping subscriptions, QoS downgrade, ACL, order under a small window, callbacks; the QoS 1 and 2 state machines with a packet lost at every step (both directions, both sides reconnect) |
+| `t375` `t376` | broker core: sessions, wills, takeover, keep-alive with a fake clock, queue caps, `$SYS`; the broker on sockets against garbage, announced sizes of 256 MB, silent connections, clients that never read, floods, 60 clients at once |
+| `t377` `t378` `t379` | client resilience (URLs, reconnect and resubscribe, restart of the broker, misbehaving brokers, limits), MQTT over TLS, strict memory test |
+| `t380` `t381` | RESP examples byte for byte, every malformed input, limits; every command of the server with the exact bytes of its reply (380 checks) |
+| `t382` `t383` `t384` `t385` | client against server (all helpers, binary values of 1 MB, pipelines, transactions, pub/sub, AUTH, SELECT, reconnect, time outs, garbage replies), the server against hostile peers, TLS, strict memory test |
+| `t386` `t387` | syslog formats (the RFC examples byte for byte, timestamps, structured data, every malformed message, a round trip with random fields, a fuzz run); sender against collector over UDP, TCP (both framings), TLS, reconnect, a frame cut in the middle, raw TCP framing cases |
+| `t388` `t389` | filters, ring, files and rotation, forwarding, floods; strict memory test |
+
+What the strict memory tests do: they compare `__heap_pos` (what `new`, `alloc` and `strdup` use up and never give back) before and after 10 operations that followed a warm-up, and demand that it did not move at all. They found real leaks while the modules were written
+(for example the score text of a sorted set came from `dtostr`, which takes 40 bytes of never-freed heap per call). What is **not** freed: the cryptography inside a TLS handshake (about 20 KB per handshake, see Memory above), objects made with `new` (the settings objects `Filter`, `Ring`, `FileSink`, `Options`, which are meant to live as long as the program).
+
+## Limits: what these modules do not do
+
+* **TLS speed.** As for `wshub`: a handshake costs about 150 ms of processor time and `netsrv` serves one thread; for many new TLS connections per second put a terminating proxy in front.
+* **IPv4 only**, like `net`. **No IPv6, no proxies, no client certificates.**
+* **Servers are for small installations and tests.** `mqttd`, `redisd` and `syslogd` keep everything in memory and have no persistence; they are not a replacement for Mosquitto, Redis or rsyslog under heavy load (the arithmetic is software, a request costs microseconds to milliseconds on the targets).
+* **Connecting blocks.** `mqtt.connect`, a reconnect inside `poll`, `redis` commands on a closed connection and the first send of a TCP `syslog.Sender` block up to the connect time out (the TLS handshake counts again): a program with its own loop should connect where blocking is fine.
+* **One thread.** The clients are not thread safe; one `netsrv.Server` serves all its sockets from the thread that calls `poll`.
+* **Memory worst cases are products of limits** (clients times queue size): the defaults suit a normal machine; lower them for AOS (128 MB) as the tables above say.
+* **Tested against** the modules themselves and against hand written Python raw-socket peers (MQTT: connect, subscribe, QoS 0 / 1 / 2, retained, will, ping, malformed packet) during development; there is no automatic interoperability test against mosquitto, redis or rsyslog in this repository.
