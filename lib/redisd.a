@@ -1,0 +1,1616 @@
+// =============================================================================
+//  redisd - a small Redis server (RESP2) for tests, for AOS and for small installations                         import redisd;
+//
+//    redisd.Server* s = redisd.newServer();
+//    s->store->requirepass = "secret";                         // AUTH (optional)
+//    if (!s->listen(6379)) { ... }                             // s->listenTls(6380, tls.loadConfig(certPem, keyPem)); port 0: a free one (s->port)
+//    s->run();                                                 // or for (;;) { s->poll(50); }
+//
+//  redis-cli, redis-py and the redis client module talk to it. Commands: PING ECHO QUIT AUTH SELECT (16 databases) | GET SET (EX PX NX XX KEEPTTL)
+//  SETNX SETEX PSETEX GETSET DEL EXISTS EXPIRE PEXPIRE TTL PTTL PERSIST INCR DECR INCRBY DECRBY APPEND STRLEN MGET MSET KEYS (glob) TYPE RENAME |
+//  LPUSH RPUSH LPOP RPOP (with a count) LRANGE LLEN LINDEX | HSET HGET HGETALL HDEL HLEN HEXISTS HKEYS HVALS | SADD SREM SMEMBERS SISMEMBER SCARD |
+//  ZADD (NX XX CH) ZRANGE (WITHSCORES) ZSCORE ZREM ZCARD ZRANK | PUBLISH SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE | MULTI EXEC DISCARD |
+//  FLUSHALL FLUSHDB DBSIZE INFO COMMAND CLIENT. Keys and values are binary safe, keys expire (lazily and by a sweep), errors read like Redis'.
+//  Not supported: persistence, replication, scripting, streams, WATCH, RESP3, blocking commands, cluster.
+//
+//  Limits (settable): maxBulk (a bulk string, default 16 MiB), maxArgs (1024), maxCommand (bytes of one command, 32 MiB), maxInline (64 KiB), maxQueued
+//  (commands after MULTI, 1000), maxSubs (channels and patterns per client, 1000), maxMemory (bytes of data, default 64 MiB: writes then answer -OOM),
+//  and in the network layer s->net: maxConns (1000), maxPerIp, maxOut (bytes waiting for one client, 16 MiB: a client that does not read is cut
+//  off), idleTimeoutMs. Malformed input gets a protocol error and the connection is closed.
+//
+//  The server core has no sockets: store->open() makes a client, c->feed(bytes, n) runs the commands in them, c->out holds the RESP bytes of the
+//  replies. The tests drive it directly and check the bytes; redisd.Server connects it to netsrv.
+// =============================================================================
+import redis;
+import netio;
+import netsrv;
+import tls;
+import cfloat;
+import cmath;
+import cstdlib;
+module redisd;
+
+public const TYPE_STRING = 1;
+public const TYPE_LIST = 2;
+public const TYPE_HASH = 3;
+public const TYPE_SET = 4;
+public const TYPE_ZSET = 5;
+
+private const ENT_OVERHEAD = 56;
+
+// ---- the command table --------------------------------------------------------------------------------------------------------------
+private const NCMD = 78;
+private char* cmdNames[78];
+private int cmdArity[78];
+private int cmdFlags[78];
+private int cmdCount;
+
+
+// ---- a hash table with binary keys -------------------------------------------------------------------------------------------------
+class Ent {
+    public Ent* next;
+    public char* key;
+    public int klen;
+    public int hash;
+    public char* val;                   // a Value (keyspace), bytes (hash fields), null (sets)
+    public int vlen;
+    public int num;                     // the score of a sorted set member (the bits of a double)
+}
+
+class Ht {
+    public Ent** tab;
+    public int cap;
+    public int count;
+    public int* acct;                   // the store's byte counter
+
+    private int hashOf(char* k, int n) {
+        int h = 0x811C9DC5;
+        for (int i = 0; i < n; i++) h = ((h ^ (k[i] & 255)) * 16777619) & 0xFFFFFFFF;
+        return h;
+    }
+
+    public Ent* find(char* k, int n) {
+        if (count == 0) return null;
+        int h = hashOf(k, n);
+        Ent* e = tab[h & (cap - 1)];
+        while (e != null) {
+            if (e->hash == h && e->klen == n && memcmp(e->key, k, n) == 0) return e;
+            e = e->next;
+        }
+        return null;
+    }
+
+    private void resize(int nc) {
+        Ent** nt = (Ent**) malloc(nc * 8);
+        for (int i = 0; i < cap; i++) {
+            Ent* e = tab[i];
+            while (e != null) {
+                Ent* nx = e->next;
+                int s = e->hash & (nc - 1);
+                e->next = nt[s];
+                nt[s] = e;
+                e = nx;
+            }
+        }
+        if (tab != null) free((char*) tab);
+        tab = nt;
+        cap = nc;
+    }
+
+    // the entry for the key, made if it is not there (created: true)
+    public Ent* put(char* k, int n, bool* created) {
+        Ent* e = find(k, n);
+        if (e != null) { *created = false; return e; }
+        if (cap == 0) resize(8);
+        else if (count >= cap) resize(cap * 2);
+        e = (Ent*) malloc(sizeof(Ent));
+        e->key = malloc(n + 1);
+        memcpy(e->key, k, n);
+        e->klen = n;
+        e->hash = hashOf(k, n);
+        int s = e->hash & (cap - 1);
+        e->next = tab[s];
+        tab[s] = e;
+        count++;
+        *acct = *acct + ENT_OVERHEAD + n;
+        *created = true;
+        return e;
+    }
+
+    // takes the entry out of the table (the caller frees its value and calls release)
+    public Ent* detach(char* k, int n) {
+        if (count == 0) return null;
+        int h = hashOf(k, n);
+        int s = h & (cap - 1);
+        Ent* e = tab[s];
+        Ent* prev = null;
+        while (e != null) {
+            if (e->hash == h && e->klen == n && memcmp(e->key, k, n) == 0) {
+                if (prev == null) tab[s] = e->next; else prev->next = e->next;
+                e->next = null;
+                count--;
+                return e;
+            }
+            prev = e;
+            e = e->next;
+        }
+        return null;
+    }
+
+    public void release(Ent* e) {
+        *acct = *acct - ENT_OVERHEAD - e->klen;
+        free(e->key);
+        free((char*) e);
+        if (cap > 64 && count < cap / 8) resize(cap / 2);
+    }
+
+    // entries in table order: start with pos = 0, e = null
+    public Ent* nextEnt(Ent* e, int* pos) {
+        if (e != null && e->next != null) return e->next;
+        int i = e == null ? 0 : *pos + 1;
+        while (i < cap) {
+            if (tab[i] != null) { *pos = i; return tab[i]; }
+            i++;
+        }
+        return null;
+    }
+
+    public void dispose() {
+        if (tab != null) free((char*) tab);
+        free((char*) this);
+    }
+}
+
+// ---- values ---------------------------------------------------------------------------------------------------------------------------
+class Value {
+    public int type;
+    public int expireAt;                // 0: none, else the store's clock in ms
+    public char* s;                     // string
+    public int slen;
+    public char** items;                // list: a ring
+    public int* ilens;
+    public int head;
+    public int count;
+    public int cap;
+    public Ht* ht;                      // hash fields or set members
+    public Ht* zmem;                    // sorted set: member -> score (in num)
+    public Ent** zord;                  // ... and the members in order
+    public int zn;
+    public int zcap;
+}
+
+class QCmd {
+    public int argc;
+    public char* blob;
+    public int* offs;
+    public int* lens;
+}
+
+public class Rclient {
+    public netio.Queue* out;
+    public netio.Queue ownOut;
+    public redis.CmdParser* parser;
+    public int db;
+    public bool authed;
+    public bool multi;
+    public bool dirty;                  // a command failed while queueing: EXEC is refused
+    public bool closing;                // QUIT or a protocol error: close after the replies
+    public bool evict;                  // a reply did not fit into the output queue
+    public char* cookie;                // the transport's (netsrv connection)
+    public int id;
+    public QCmd** queued;
+    public int nqueued;
+    public int qcap;
+    public char** subs;
+    public int nsubs;
+    public char** psubs;
+    public int npsubs;
+    public int commands;
+
+    public bool inSubMode() { return nsubs + npsubs > 0; }
+}
+
+// ---- the store ----------------------------------------------------------------------------------------------------------------------
+class Db {
+    public Ht* keys;
+    public int expires;
+    public int cursor;
+}
+
+public class Stats {
+    public int commands;
+    public int connections;
+    public int errors;
+    public int expired;
+    public int evicted;
+    public int rejected;                // commands refused with -OOM
+}
+
+public class Store {
+    public char* requirepass;
+    public int maxBulk;
+    public int maxArgs;
+    public int maxCommand;
+    public int maxInline;
+    public int maxQueued;
+    public int maxSubs;
+    public int maxMemory;
+    public int maxOut;                  // bytes queued for one client (the sans-IO clients; netsrv has its own setting)
+    public int used;                    // bytes of data (approximate: keys, values and entries)
+    public int now;                     // the clock in ms
+    public Stats* stats;
+    public int clients;                 // connected clients
+    public func closeHook;              // closeHook(store, client): the client's connection should be closed
+
+    private Db* dbs[16];
+    private Rclient** cl;
+    private int ncl;
+    private int clCap;
+    private int nextId;
+    private char* scratch;
+
+    public Store() {
+        maxBulk = 16777216;
+        maxArgs = 1024;
+        maxCommand = 33554432;
+        maxInline = 65536;
+        maxQueued = 1000;
+        maxSubs = 1000;
+        maxMemory = 67108864;
+        maxOut = 16777216;
+        stats = new Stats();
+        nextId = 1;
+        now = millis();
+    }
+
+    public void setClock(int ms) { now = ms; }
+
+    // ---- clients -------------------------------------------------------------------------------------------------------------------------------
+    public Rclient* open() {
+        Rclient* c = (Rclient*) malloc(sizeof(Rclient));
+        if (c == null) return null;
+        c->parser = redis.newCmdParser();
+        if (c->parser == null) { free((char*) c); return null; }
+        c->parser->maxBulk = maxBulk;
+        c->parser->maxArgs = maxArgs > 1024 ? 1024 : maxArgs;
+        c->parser->maxCommand = maxCommand;
+        c->parser->maxInline = maxInline;
+        c->out = &c->ownOut;
+        c->ownOut.max = maxOut;
+        c->authed = requirepass == null;
+        c->id = nextId;
+        nextId++;
+        if (ncl >= clCap) {
+            int nc = clCap == 0 ? 16 : clCap * 2;
+            Rclient** n2 = (Rclient**) malloc(nc * 8);
+            for (int i = 0; i < ncl; i++) n2[i] = cl[i];
+            if (cl != null) free((char*) cl);
+            cl = n2;
+            clCap = nc;
+        }
+        cl[ncl] = c;
+        ncl++;
+        clients++;
+        stats->connections++;
+        return c;
+    }
+
+    // the connection is gone: frees the client
+    public void close(Rclient* c) {
+        for (int i = 0; i < ncl; i++) {
+            if (cl[i] == c) { cl[i] = cl[ncl - 1]; ncl--; cl[ncl] = null; break; }
+        }
+        clients--;
+        dropQueue(c);
+        for (int i = 0; i < c->nsubs; i++) free(c->subs[i]);
+        for (int i = 0; i < c->npsubs; i++) free(c->psubs[i]);
+        if (c->subs != null) free((char*) c->subs);
+        if (c->psubs != null) free((char*) c->psubs);
+        if (c->queued != null) free((char*) c->queued);
+        c->parser->dispose();
+        c->ownOut.release();
+        free((char*) c);
+    }
+
+    private void dropQueue(Rclient* c) {
+        for (int i = 0; i < c->nqueued; i++) {
+            QCmd* q = c->queued[i];
+            used = used - q->argc * 16 - 32;
+            free(q->blob);
+            free((char*) q->offs);
+            free((char*) q->lens);
+            free((char*) q);
+            c->queued[i] = null;
+        }
+        c->nqueued = 0;
+    }
+
+    // ---- replies ---------------------------------------------------------------------------------------------------------------------------------
+    private void sent(Rclient* c, bool ok) {
+        if (!ok && !c->evict) {
+            c->evict = true;
+            stats->evicted++;
+            if (closeHook != null) closeHook(this, c);
+        }
+    }
+    private void ok(Rclient* c) { sent(c, redis.putStatus(c->out, "OK")); }
+    private void err(Rclient* c, char* text) { stats->errors++; sent(c, redis.putError(c->out, text)); }
+    private void num(Rclient* c, int n) { sent(c, redis.putInt(c->out, n)); }
+    private void bulk(Rclient* c, char* d, int n) { sent(c, redis.putBulk(c->out, d, n)); }
+    private void nil(Rclient* c) { sent(c, redis.putNil(c->out)); }
+    private void arr(Rclient* c, int n) { sent(c, redis.putArray(c->out, n)); }
+    private void wrongType(Rclient* c) { err(c, "WRONGTYPE Operation against a key holding the wrong kind of value"); }
+    private void notInt(Rclient* c) { err(c, "ERR value is not an integer or out of range"); }
+    private void syntax(Rclient* c) { err(c, "ERR syntax error"); }
+
+    // ---- databases -------------------------------------------------------------------------------------------------------------------------------
+    private Db* db(int i) {
+        if (dbs[i] == null) {
+            Db* d = (Db*) malloc(sizeof(Db));
+            d->keys = (Ht*) malloc(sizeof(Ht));
+            d->keys->acct = &used;
+            dbs[i] = d;
+        }
+        return dbs[i];
+    }
+
+    private void freeBytes(int n) { used = used - n; }
+
+    private void freeValue(Value* v) {
+        if (v->s != null) { free(v->s); used = used - v->slen; }
+        if (v->items != null) {
+            for (int i = 0; i < v->count; i++) {
+                int at = (v->head + i) % v->cap;
+                used = used - v->ilens[at] - 16;
+                free(v->items[at]);
+            }
+            free((char*) v->items);
+            free((char*) v->ilens);
+        }
+        if (v->ht != null) {
+            Ent* e = null;
+            int pos = 0;
+            for (;;) {
+                e = v->ht->nextEnt(e, &pos);
+                if (e == null) break;
+                if (e->val != null) { free(e->val); used = used - e->vlen; }
+            }
+            freeHt(v->ht);
+        }
+        if (v->zmem != null) {
+            freeHt(v->zmem);
+            if (v->zord != null) { free((char*) v->zord); used = used - v->zcap * 8; }
+        }
+        used = used - 64;
+        free((char*) v);
+    }
+
+    // frees every entry of a table and the table
+    private void freeHt(Ht* h) {
+        for (int i = 0; i < h->cap; i++) {
+            Ent* x = h->tab[i];
+            while (x != null) {
+                Ent* nx = x->next;
+                used = used - ENT_OVERHEAD - x->klen;
+                free(x->key);
+                free((char*) x);
+                x = nx;
+            }
+        }
+        if (h->tab != null) free((char*) h->tab);
+        free((char*) h);
+    }
+
+    // the value of a key, null if there is none (an expired key is deleted now)
+    private Value* lookup(Rclient* c, char* k, int n) {
+        Db* d = db(c->db);
+        Ent* e = d->keys->find(k, n);
+        if (e == null) return null;
+        Value* v = (Value*) e->val;
+        if (v->expireAt != 0 && v->expireAt <= now) {
+            removeKey(d, k, n);
+            stats->expired++;
+            return null;
+        }
+        return v;
+    }
+
+    private void removeKey(Db* d, char* k, int n) {
+        Ent* e = d->keys->detach(k, n);
+        if (e == null) return;
+        Value* v = (Value*) e->val;
+        if (v->expireAt != 0) d->expires--;
+        freeValue(v);
+        d->keys->release(e);
+    }
+
+    // a new value for a key (the old one is replaced)
+    private Value* create(Rclient* c, char* k, int n, int type) {
+        Db* d = db(c->db);
+        bool created = false;
+        Ent* e = d->keys->put(k, n, &created);
+        if (!created) {
+            Value* old = (Value*) e->val;
+            if (old->expireAt != 0) d->expires--;
+            freeValue(old);
+        }
+        Value* v = (Value*) malloc(sizeof(Value));
+        v->type = type;
+        e->val = (char*) v;
+        used = used + 64;
+        return v;
+    }
+
+    private void setString(Value* v, char* d, int n) {
+        char* ns = malloc(n + 1);
+        memcpy(ns, d, n);
+        if (v->s != null) { free(v->s); used = used - v->slen; }
+        v->s = ns;
+        v->slen = n;
+        used = used + n;
+    }
+
+    private void setExpire(Rclient* c, Value* v, int at) {
+        Db* d = db(c->db);
+        if (v->expireAt == 0 && at != 0) d->expires++;
+        if (v->expireAt != 0 && at == 0) d->expires--;
+        v->expireAt = at;
+    }
+
+    // ---- a glob pattern (KEYS, PSUBSCRIBE): * ? [abc] [a-z] [^a] \x ---------------------------------------------------------------------------------
+    public bool glob(char* p, int pn, char* s, int sn) {
+        int pi = 0;
+        int si = 0;
+        int starP = -1;
+        int starS = 0;
+        while (si < sn) {
+            if (pi < pn && p[pi] == '*') {
+                starP = pi;
+                starS = si;
+                pi++;
+                continue;
+            }
+            bool matched = false;
+            int adv = 1;
+            if (pi < pn) {
+                int pc = p[pi] & 255;
+                if (pc == '?') {
+                    matched = true;
+                } else if (pc == '[') {
+                    int j = pi + 1;
+                    bool neg = false;
+                    if (j < pn && p[j] == '^') { neg = true; j++; }
+                    bool hit = false;
+                    while (j < pn && p[j] != ']') {
+                        int lo = p[j] & 255;
+                        if (lo == '\\' && j + 1 < pn) { j++; lo = p[j] & 255; }
+                        if (j + 2 < pn && p[j + 1] == '-' && p[j + 2] != ']') {
+                            int hi = p[j + 2] & 255;
+                            if (lo > hi) { int t = lo; lo = hi; hi = t; }
+                            if ((s[si] & 255) >= lo && (s[si] & 255) <= hi) hit = true;
+                            j = j + 3;
+                        } else {
+                            if ((s[si] & 255) == lo) hit = true;
+                            j++;
+                        }
+                    }
+                    matched = hit != neg;
+                    adv = j < pn ? j - pi + 1 : j - pi;
+                } else if (pc == '\\' && pi + 1 < pn) {
+                    matched = (p[pi + 1] & 255) == (s[si] & 255);
+                    adv = 2;
+                } else {
+                    matched = pc == (s[si] & 255);
+                }
+            }
+            if (matched) {
+                pi = pi + adv;
+                si++;
+            } else if (starP >= 0) {
+                starS++;
+                si = starS;
+                pi = starP + 1;
+            } else {
+                return false;
+            }
+        }
+        while (pi < pn && p[pi] == '*') pi++;
+        return pi == pn;
+    }
+
+    // ---- running commands ------------------------------------------------------------------------------------------------------------------------
+    // Bytes from a client: runs every complete command. < 0: the connection must be closed (after the replies).
+    public int feed(Rclient* c, char* d, int n) {
+        if (c->closing || c->evict) return -1;
+        now = millis();
+        return feedAt(c, d, n);
+    }
+
+    // the same with the clock as it is (tests set it with setClock)
+    public int feedAt(Rclient* c, char* d, int n) {
+        int off = 0;
+        while (off < n) {
+            int used2 = c->parser->feed(&d[off], n - off);
+            off = off + used2;
+            if (c->parser->error != 0) {
+                char msg[100];
+                format(&msg[0], 100, "ERR %s", redis.errorText(c->parser->error), 0, 0, 0);
+                err(c, &msg[0]);
+                c->closing = true;
+                return -1;
+            }
+            if (c->parser->ready) {
+                run(c, c->parser->argc(), c->parser);
+                c->parser->clear();
+                if (c->closing || c->evict) return -1;
+            }
+        }
+        return 0;
+    }
+
+    private void run(Rclient* c, int argc, redis.CmdParser* p) {
+        char* argv[1024];
+        int lens[1024];
+        for (int i = 0; i < argc; i++) { argv[i] = p->arg(i); lens[i] = p->argLen(i); }
+        stats->commands++;
+        c->commands++;
+        exec(c, argc, &argv[0], &lens[0]);
+    }
+
+    private char lname[40];
+
+    // the command table: name, arity (negative: at least), flags 1 = write (refused when out of memory), 2 = allowed in subscribe mode
+    private int cmdIndex(char* name, int n) {
+        if (n > 20) return -1;
+        for (int i = 0; i < n; i++) lname[i] = toLower(name[i]);
+        lname[n] = 0;
+        for (int i = 0; i < NCMD; i++) {
+            if (cmdNames[i][0] == lname[0] && streq(cmdNames[i], &lname[0])) return i;
+        }
+        return -1;
+    }
+
+    // Runs one command (argv[0] is the name). The reply goes to c->out.
+    public void exec(Rclient* c, int argc, char** argv, int* lens) {
+        int ci = cmdIndex(argv[0], lens[0]);
+        // authentication
+        if (!c->authed && !(ci >= 0 && (streq(cmdNames[ci], "auth") || streq(cmdNames[ci], "quit")))) {
+            err(c, "NOAUTH Authentication required.");
+            return;
+        }
+        if (ci < 0) {
+            char msg[120];
+            char shown[40];
+            int sn = lens[0] > 30 ? 30 : lens[0];
+            memcpy(&shown[0], argv[0], sn);
+            shown[sn] = 0;
+            format(&msg[0], 120, "ERR unknown command '%s', with args beginning with: ", &shown[0], 0, 0, 0);
+            if (c->multi) c->dirty = true;
+            err(c, &msg[0]);
+            return;
+        }
+        int arity = cmdArity[ci];
+        if ((arity > 0 && argc != arity) || (arity < 0 && argc < -arity)) {
+            char msg[120];
+            format(&msg[0], 120, "ERR wrong number of arguments for '%s' command", cmdNames[ci], 0, 0, 0);
+            if (c->multi) c->dirty = true;
+            err(c, &msg[0]);
+            return;
+        }
+        int flags = cmdFlags[ci];
+        if (c->inSubMode() && (flags & 2) == 0) {
+            char msg[200];
+            format(&msg[0], 200, "ERR Can't execute '%s': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", cmdNames[ci], 0, 0, 0);
+            err(c, &msg[0]);
+            return;
+        }
+        char* name = cmdNames[ci];
+        // transactions
+        if (c->multi && !streq(name, "exec") && !streq(name, "discard") && !streq(name, "multi") && !streq(name, "quit") && !streq(name, "auth")) {
+            if (c->nqueued >= maxQueued) { c->dirty = true; err(c, "ERR too many commands in the transaction"); return; }
+            if (!queueCmd(c, argc, argv, lens)) { c->dirty = true; err(c, "ERR out of memory"); return; }
+            sent(c, redis.putStatus(c->out, "QUEUED"));
+            return;
+        }
+        if ((flags & 1) != 0 && used > maxMemory) {
+            stats->rejected++;
+            err(c, "OOM command not allowed when used memory > 'maxmemory'.");
+            return;
+        }
+        command(c, ci, argc, argv, lens);
+    }
+
+    private bool queueCmd(Rclient* c, int argc, char** argv, int* lens) {
+        int total = 0;
+        for (int i = 0; i < argc; i++) total = total + lens[i] + 1;
+        if (used + total > maxMemory) return false;
+        QCmd* q = (QCmd*) malloc(sizeof(QCmd));
+        q->argc = argc;
+        q->blob = malloc(total + 1);
+        q->offs = (int*) malloc(argc * 8);
+        q->lens = (int*) malloc(argc * 8);
+        int at = 0;
+        for (int i = 0; i < argc; i++) {
+            memcpy(&q->blob[at], argv[i], lens[i]);
+            q->blob[at + lens[i]] = 0;
+            q->offs[i] = at;
+            q->lens[i] = lens[i];
+            at = at + lens[i] + 1;
+        }
+        if (c->queued == null) { c->queued = (QCmd**) malloc(maxQueued * 8 + 8); c->qcap = maxQueued; }
+        if (c->nqueued >= c->qcap) { free(q->blob); free((char*) q->offs); free((char*) q->lens); free((char*) q); return false; }
+        c->queued[c->nqueued] = q;
+        c->nqueued++;
+        used = used + argc * 16 + 32;
+        return true;
+    }
+
+    private int parseNum(char* s, int n, int* out) {
+        return redis.parseInt(s, n, out) ? 1 : 0;
+    }
+
+    // ---- the commands ------------------------------------------------------------------------------------------------------------------------------
+    private void command(Rclient* c, int ci, int argc, char** a, int* l) {
+        char* name = cmdNames[ci];
+        // connection
+        if (streq(name, "ping")) {
+            if (c->inSubMode()) { arr(c, 2); bulk(c, "pong", 4); bulk(c, argc > 1 ? a[1] : "", argc > 1 ? l[1] : 0); return; }
+            if (argc > 2) { err(c, "ERR wrong number of arguments for 'ping' command"); return; }
+            if (argc == 2) bulk(c, a[1], l[1]); else sent(c, redis.putStatus(c->out, "PONG"));
+            return;
+        }
+        if (streq(name, "echo")) { bulk(c, a[1], l[1]); return; }
+        if (streq(name, "quit")) { ok(c); c->closing = true; return; }
+        if (streq(name, "auth")) { auth(c, argc, a, l); return; }
+        if (streq(name, "select")) {
+            int n = 0;
+            if (!redis.parseInt(a[1], l[1], &n)) { notInt(c); return; }
+            if (n < 0 || n > 15) { err(c, "ERR DB index is out of range"); return; }
+            c->db = n;
+            ok(c);
+            return;
+        }
+        if (streq(name, "command")) { arr(c, 0); return; }
+        if (streq(name, "client")) { ok(c); return; }
+        // server
+        if (streq(name, "dbsize")) { num(c, db(c->db)->keys->count); return; }
+        if (streq(name, "flushall")) { flush(-1); ok(c); return; }
+        if (streq(name, "flushdb")) { flush(c->db); ok(c); return; }
+        if (streq(name, "info")) { info(c); return; }
+        // transactions
+        if (streq(name, "multi")) {
+            if (c->multi) { err(c, "ERR MULTI calls can not be nested"); return; }
+            c->multi = true;
+            c->dirty = false;
+            ok(c);
+            return;
+        }
+        if (streq(name, "discard")) {
+            if (!c->multi) { err(c, "ERR DISCARD without MULTI"); return; }
+            dropQueue(c);
+            c->multi = false;
+            c->dirty = false;
+            ok(c);
+            return;
+        }
+        if (streq(name, "exec")) { execTx(c); return; }
+        // pub/sub
+        if (streq(name, "publish")) { num(c, publish(a[1], l[1], a[2], l[2])); return; }
+        if (streq(name, "subscribe") || streq(name, "psubscribe")) { subscribe(c, streq(name, "psubscribe"), argc, a, l); return; }
+        if (streq(name, "unsubscribe") || streq(name, "punsubscribe")) { unsubscribe(c, streq(name, "punsubscribe"), argc, a, l); return; }
+        // keys
+        if (streq(name, "del")) {
+            int n = 0;
+            for (int i = 1; i < argc; i++) {
+                if (lookup(c, a[i], l[i]) != null) { removeKey(db(c->db), a[i], l[i]); n++; }
+            }
+            num(c, n);
+            return;
+        }
+        if (streq(name, "exists")) {
+            int n = 0;
+            for (int i = 1; i < argc; i++) { if (lookup(c, a[i], l[i]) != null) n++; }
+            num(c, n);
+            return;
+        }
+        if (streq(name, "keys")) { keys(c, a[1], l[1]); return; }
+        if (streq(name, "type")) {
+            Value* v = lookup(c, a[1], l[1]);
+            char* t = "none";
+            if (v != null) t = v->type == TYPE_STRING ? "string" : (v->type == TYPE_LIST ? "list" : (v->type == TYPE_HASH ? "hash" : (v->type == TYPE_SET ? "set" : "zset")));
+            sent(c, redis.putStatus(c->out, t));
+            return;
+        }
+        if (streq(name, "rename")) {
+            Value* v = lookup(c, a[1], l[1]);
+            if (v == null) { err(c, "ERR no such key"); return; }
+            if (l[1] == l[2] && memcmp(a[1], a[2], l[1]) == 0) { ok(c); return; }
+            Db* d = db(c->db);
+            Ent* e = d->keys->detach(a[1], l[1]);
+            Value* old = lookup(c, a[2], l[2]);
+            if (old != null) removeKey(d, a[2], l[2]);
+            bool created = false;
+            Ent* ne = d->keys->put(a[2], l[2], &created);
+            ne->val = e->val;
+            d->keys->release(e);
+            ok(c);
+            return;
+        }
+        if (streq(name, "expire") || streq(name, "pexpire")) {
+            int t = 0;
+            if (!redis.parseInt(a[2], l[2], &t)) { notInt(c); return; }
+            Value* v = lookup(c, a[1], l[1]);
+            if (v == null) { num(c, 0); return; }
+            if (streq(name, "expire")) { if (t > 4000000000000) t = 4000000000000; t = t * 1000; }
+            if (t <= 0) { removeKey(db(c->db), a[1], l[1]); num(c, 1); return; }
+            setExpire(c, v, now + t);
+            num(c, 1);
+            return;
+        }
+        if (streq(name, "ttl") || streq(name, "pttl")) {
+            Value* v = lookup(c, a[1], l[1]);
+            if (v == null) { num(c, -2); return; }
+            if (v->expireAt == 0) { num(c, -1); return; }
+            int ms = v->expireAt - now;
+            num(c, streq(name, "ttl") ? (ms + 500) / 1000 : ms);
+            return;
+        }
+        if (streq(name, "persist")) {
+            Value* v = lookup(c, a[1], l[1]);
+            if (v == null || v->expireAt == 0) { num(c, 0); return; }
+            setExpire(c, v, 0);
+            num(c, 1);
+            return;
+        }
+        // strings
+        if (streq(name, "get")) {
+            Value* v = lookup(c, a[1], l[1]);
+            if (v == null) { nil(c); return; }
+            if (v->type != TYPE_STRING) { wrongType(c); return; }
+            bulk(c, v->s, v->slen);
+            return;
+        }
+        if (streq(name, "set")) { setCmd(c, argc, a, l); return; }
+        if (streq(name, "setnx")) {
+            if (lookup(c, a[1], l[1]) != null) { num(c, 0); return; }
+            Value* v = create(c, a[1], l[1], TYPE_STRING);
+            setString(v, a[2], l[2]);
+            num(c, 1);
+            return;
+        }
+        if (streq(name, "setex") || streq(name, "psetex")) {
+            int t = 0;
+            if (!redis.parseInt(a[2], l[2], &t) || t <= 0) { err(c, "ERR invalid expire time in 'setex' command"); return; }
+            if (streq(name, "setex")) { if (t > 4000000000000) t = 4000000000000; t = t * 1000; }
+            Value* v = create(c, a[1], l[1], TYPE_STRING);
+            setString(v, a[3], l[3]);
+            setExpire(c, v, now + t);
+            ok(c);
+            return;
+        }
+        if (streq(name, "getset")) {
+            Value* v = lookup(c, a[1], l[1]);
+            if (v != null && v->type != TYPE_STRING) { wrongType(c); return; }
+            if (v == null) nil(c); else bulk(c, v->s, v->slen);
+            Value* nv = v != null ? v : create(c, a[1], l[1], TYPE_STRING);
+            if (v != null) setExpire(c, v, 0);
+            setString(nv, a[2], l[2]);
+            return;
+        }
+        if (streq(name, "incr") || streq(name, "decr") || streq(name, "incrby") || streq(name, "decrby")) {
+            int by = 1;
+            if (streq(name, "decr")) by = -1;
+            if (streq(name, "incrby") || streq(name, "decrby")) {
+                if (!redis.parseInt(a[2], l[2], &by)) { notInt(c); return; }
+                if (streq(name, "decrby")) { if (by == -9223372036854775807 - 1) { notInt(c); return; } by = -by; }
+            }
+            incr(c, a[1], l[1], by);
+            return;
+        }
+        if (streq(name, "append")) {
+            Value* v = lookup(c, a[1], l[1]);
+            if (v != null && v->type != TYPE_STRING) { wrongType(c); return; }
+            if (v == null) {
+                v = create(c, a[1], l[1], TYPE_STRING);
+                setString(v, a[2], l[2]);
+                num(c, l[2]);
+                return;
+            }
+            if (v->slen + l[2] > maxBulk * 2) { err(c, "ERR string exceeds maximum allowed size"); return; }
+            char* ns = malloc(v->slen + l[2] + 1);
+            memcpy(ns, v->s, v->slen);
+            memcpy(&ns[v->slen], a[2], l[2]);
+            free(v->s);
+            used = used + l[2];
+            v->s = ns;
+            v->slen = v->slen + l[2];
+            num(c, v->slen);
+            return;
+        }
+        if (streq(name, "strlen")) {
+            Value* v = lookup(c, a[1], l[1]);
+            if (v == null) { num(c, 0); return; }
+            if (v->type != TYPE_STRING) { wrongType(c); return; }
+            num(c, v->slen);
+            return;
+        }
+        if (streq(name, "mget")) {
+            arr(c, argc - 1);
+            for (int i = 1; i < argc; i++) {
+                Value* v = lookup(c, a[i], l[i]);
+                if (v == null || v->type != TYPE_STRING) nil(c); else bulk(c, v->s, v->slen);
+            }
+            return;
+        }
+        if (streq(name, "mset")) {
+            if (argc % 2 != 1) { err(c, "ERR wrong number of arguments for 'mset' command"); return; }
+            for (int i = 1; i < argc; i = i + 2) {
+                Value* v = create(c, a[i], l[i], TYPE_STRING);
+                setString(v, a[i + 1], l[i + 1]);
+            }
+            ok(c);
+            return;
+        }
+        // lists, hashes, sets, sorted sets
+        if (name[0] == 'l' || name[0] == 'r') { listCmd(c, name, argc, a, l); return; }
+        if (name[0] == 'h') { hashCmd(c, name, argc, a, l); return; }
+        if (name[0] == 's') { setCmdFamily(c, name, argc, a, l); return; }
+        if (name[0] == 'z') { zsetCmd(c, name, argc, a, l); return; }
+        err(c, "ERR unknown command");
+    }
+
+    private void auth(Rclient* c, int argc, char** a, int* l) {
+        if (requirepass == null) {
+            err(c, "ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?");
+            return;
+        }
+        if (argc > 3) { err(c, "ERR syntax error"); return; }
+        char* pass = argc == 3 ? a[2] : a[1];
+        int pl = argc == 3 ? l[2] : l[1];
+        if (argc == 3 && !(l[1] == 7 && memcmp(a[1], "default", 7) == 0)) { err(c, "WRONGPASS invalid username-password pair or user is disabled."); return; }
+        int want = strlen(requirepass);
+        int diff = want ^ pl;
+        int n = want < pl ? want : pl;
+        for (int i = 0; i < n; i++) diff = diff | (requirepass[i] ^ pass[i]);
+        if (diff != 0) { err(c, "WRONGPASS invalid username-password pair or user is disabled."); return; }
+        c->authed = true;
+        ok(c);
+    }
+
+    private void flush(int dbi) {
+        for (int i = 0; i < 16; i++) {
+            if (dbs[i] == null || (dbi >= 0 && i != dbi)) continue;
+            Db* d = dbs[i];
+            for (int sl = 0; sl < d->keys->cap; sl++) {
+                Ent* x = d->keys->tab[sl];
+                while (x != null) {
+                    Ent* nx = x->next;
+                    freeValue((Value*) x->val);
+                    used = used - ENT_OVERHEAD - x->klen;
+                    free(x->key);
+                    free((char*) x);
+                    x = nx;
+                }
+                d->keys->tab[sl] = null;
+            }
+            d->keys->count = 0;
+            d->expires = 0;
+        }
+    }
+
+    private void info(Rclient* c) {
+        char buf[1200];
+        int keysTotal = 0;
+        char ks[400];
+        int kn = 0;
+        ks[0] = 0;
+        for (int i = 0; i < 16; i++) {
+            if (dbs[i] != null && dbs[i]->keys->count > 0) {
+                keysTotal = keysTotal + dbs[i]->keys->count;
+                kn = kn + format(&ks[kn], 400 - kn, "db%d:keys=%d,expires=%d,avg_ttl=0\r\n", i, dbs[i]->keys->count, dbs[i]->expires, 0);
+            }
+        }
+        int n = format(&buf[0], 1200, "# Server\r\nredis_version:7.0.0-redisd\r\nredis_mode:standalone\r\nprocess_id:1\r\n\r\n# Clients\r\nconnected_clients:%d\r\n\r\n# Memory\r\nused_memory:%d\r\nmaxmemory:%d\r\n\r\n", clients, used, maxMemory, 0);
+        n = n + format(&buf[n], 1200 - n, "# Stats\r\ntotal_connections_received:%d\r\ntotal_commands_processed:%d\r\nexpired_keys:%d\r\nevicted_clients:%d\r\n\r\n# Keyspace\r\n", stats->connections, stats->commands, stats->expired, stats->evicted);
+        n = n + format(&buf[n], 1200 - n, "%s", &ks[0], 0, 0, 0);
+        bulk(c, &buf[0], n);
+    }
+
+    private void keys(Rclient* c, char* pat, int pn) {
+        Db* d = db(c->db);
+        int cnt = 0;
+        Ent* e = null;
+        int pos = 0;
+        for (;;) {
+            e = d->keys->nextEnt(e, &pos);
+            if (e == null) break;
+            Value* v = (Value*) e->val;
+            if (v->expireAt != 0 && v->expireAt <= now) continue;
+            if (glob(pat, pn, e->key, e->klen)) cnt++;
+        }
+        arr(c, cnt);
+        e = null;
+        pos = 0;
+        for (;;) {
+            e = d->keys->nextEnt(e, &pos);
+            if (e == null) break;
+            Value* v = (Value*) e->val;
+            if (v->expireAt != 0 && v->expireAt <= now) continue;
+            if (glob(pat, pn, e->key, e->klen)) bulk(c, e->key, e->klen);
+        }
+    }
+
+    private void setCmd(Rclient* c, int argc, char** a, int* l) {
+        bool nx = false;
+        bool xx = false;
+        bool keepTtl = false;
+        int ttl = 0;
+        for (int i = 3; i < argc; i++) {
+            char* o = a[i];
+            if (streqi(o, "nx")) nx = true;
+            else if (streqi(o, "xx")) xx = true;
+            else if (streqi(o, "keepttl")) keepTtl = true;
+            else if ((streqi(o, "ex") || streqi(o, "px")) && i + 1 < argc) {
+                int t = 0;
+                if (!redis.parseInt(a[i + 1], l[i + 1], &t)) { notInt(c); return; }
+                if (t <= 0) { err(c, "ERR invalid expire time in 'set' command"); return; }
+                if (streqi(o, "ex")) { if (t > 4000000000000) t = 4000000000000; t = t * 1000; }
+                ttl = t;
+                i++;
+            } else { syntax(c); return; }
+        }
+        if ((nx && xx) || (keepTtl && ttl != 0)) { syntax(c); return; }
+        Value* v = lookup(c, a[1], l[1]);
+        if ((nx && v != null) || (xx && v == null)) { nil(c); return; }
+        int keep = (v != null && keepTtl) ? v->expireAt : 0;
+        Value* nv = create(c, a[1], l[1], TYPE_STRING);
+        setString(nv, a[2], l[2]);
+        if (ttl != 0) setExpire(c, nv, now + ttl);
+        else if (keep != 0) setExpire(c, nv, keep);
+        ok(c);
+    }
+
+    private void incr(Rclient* c, char* k, int kn, int by) {
+        Value* v = lookup(c, k, kn);
+        int cur = 0;
+        if (v != null) {
+            if (v->type != TYPE_STRING) { wrongType(c); return; }
+            if (!redis.parseInt(v->s, v->slen, &cur)) { notInt(c); return; }
+        }
+        int r = cur + by;
+        // overflow: the signs of cur and by agree and the sign of r differs
+        if ((by > 0 && r < cur) || (by < 0 && r > cur)) { err(c, "ERR increment or decrement would overflow"); return; }
+        char t[24];
+        int tn = format(&t[0], 24, "%d", r, 0, 0, 0);
+        if (v == null) v = create(c, k, kn, TYPE_STRING);
+        setString(v, &t[0], tn);
+        num(c, r);
+    }
+
+    private void execTx(Rclient* c) {
+        if (!c->multi) { err(c, "ERR EXEC without MULTI"); return; }
+        if (c->dirty) {
+            dropQueue(c);
+            c->multi = false;
+            c->dirty = false;
+            err(c, "EXECABORT Transaction discarded because of previous errors.");
+            return;
+        }
+        c->multi = false;
+        int n = c->nqueued;
+        arr(c, n);
+        for (int i = 0; i < n; i++) {
+            QCmd* q = c->queued[i];
+            char* argv[1024];
+            int lens[1024];
+            for (int k = 0; k < q->argc; k++) { argv[k] = &q->blob[q->offs[k]]; lens[k] = q->lens[k]; }
+            int flagsOf = cmdFlags[cmdIndex(argv[0], lens[0])];
+            if ((flagsOf & 1) != 0 && used > maxMemory) { stats->rejected++; err(c, "OOM command not allowed when used memory > 'maxmemory'."); continue; }
+            command(c, cmdIndex(argv[0], lens[0]), q->argc, &argv[0], &lens[0]);
+        }
+        dropQueue(c);
+    }
+
+    // ---- publish / subscribe -----------------------------------------------------------------------------------------------------------------------
+    private int publish(char* ch, int cn, char* msg, int mn) {
+        int count = 0;
+        for (int i = 0; i < ncl; i++) {
+            Rclient* t = cl[i];
+            if (t->evict) continue;
+            for (int k = 0; k < t->nsubs; k++) {
+                if (strlen(t->subs[k]) == cn && memcmp(t->subs[k], ch, cn) == 0) {
+                    sent(t, redis.putArray(t->out, 3));
+                    sent(t, redis.putBulk(t->out, "message", 7));
+                    sent(t, redis.putBulk(t->out, ch, cn));
+                    sent(t, redis.putBulk(t->out, msg, mn));
+                    count++;
+                    break;
+                }
+            }
+            for (int k = 0; k < t->npsubs; k++) {
+                if (glob(t->psubs[k], strlen(t->psubs[k]), ch, cn)) {
+                    sent(t, redis.putArray(t->out, 4));
+                    sent(t, redis.putBulk(t->out, "pmessage", 8));
+                    sent(t, redis.putBulk(t->out, t->psubs[k], strlen(t->psubs[k])));
+                    sent(t, redis.putBulk(t->out, ch, cn));
+                    sent(t, redis.putBulk(t->out, msg, mn));
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    private void subReply(Rclient* c, char* kind, char* ch, int cn) {
+        arr(c, 3);
+        bulk(c, kind, strlen(kind));
+        if (ch == null) nil(c); else bulk(c, ch, cn);
+        num(c, c->nsubs + c->npsubs);
+    }
+
+    private void subscribe(Rclient* c, bool pattern, int argc, char** a, int* l) {
+        for (int i = 1; i < argc; i++) {
+            char*** list = pattern ? &c->psubs : &c->subs;
+            int* cnt = pattern ? &c->npsubs : &c->nsubs;
+            bool have = false;
+            for (int k = 0; k < *cnt; k++) {
+                if (strlen((*list)[k]) == l[i] && memcmp((*list)[k], a[i], l[i]) == 0) { have = true; break; }
+            }
+            if (!have) {
+                if (c->nsubs + c->npsubs >= maxSubs) { err(c, "ERR too many subscriptions"); return; }
+                if (*list == null) *list = (char**) malloc(maxSubs * 8);
+                char* copy = malloc(l[i] + 1);
+                memcpy(copy, a[i], l[i]);
+                (*list)[*cnt] = copy;
+                *cnt = *cnt + 1;
+            }
+            subReply(c, pattern ? "psubscribe" : "subscribe", a[i], l[i]);
+        }
+    }
+
+    private void unsubscribe(Rclient* c, bool pattern, int argc, char** a, int* l) {
+        char*** list = pattern ? &c->psubs : &c->subs;
+        int* cnt = pattern ? &c->npsubs : &c->nsubs;
+        char* kind = pattern ? "punsubscribe" : "unsubscribe";
+        if (argc == 1) {
+            if (*cnt == 0) { subReply(c, kind, null, 0); return; }
+            while (*cnt > 0) {
+                char* name = (*list)[*cnt - 1];
+                int nl = strlen(name);
+                *cnt = *cnt - 1;
+                subReply(c, kind, name, nl);
+                free(name);
+            }
+            return;
+        }
+        for (int i = 1; i < argc; i++) {
+            for (int k = 0; k < *cnt; k++) {
+                if (strlen((*list)[k]) == l[i] && memcmp((*list)[k], a[i], l[i]) == 0) {
+                    free((*list)[k]);
+                    for (int j = k; j + 1 < *cnt; j++) (*list)[j] = (*list)[j + 1];
+                    *cnt = *cnt - 1;
+                    break;
+                }
+            }
+            subReply(c, kind, a[i], l[i]);
+        }
+    }
+
+    // ---- lists ----------------------------------------------------------------------------------------------------------------------------------
+    private void listPush(Value* v, char* d, int n, bool front) {
+        if (v->count >= v->cap) {
+            int nc = v->cap == 0 ? 8 : v->cap * 2;
+            char** ni = (char**) malloc(nc * 8);
+            int* nl = (int*) malloc(nc * 8);
+            for (int i = 0; i < v->count; i++) { int at = (v->head + i) % v->cap; ni[i] = v->items[at]; nl[i] = v->ilens[at]; }
+            if (v->items != null) { free((char*) v->items); free((char*) v->ilens); }
+            v->items = ni;
+            v->ilens = nl;
+            v->head = 0;
+            v->cap = nc;
+        }
+        char* copy = malloc(n + 1);
+        memcpy(copy, d, n);
+        int at = front ? (v->head + v->cap - 1) % v->cap : (v->head + v->count) % v->cap;
+        if (front) v->head = at;
+        v->items[at] = copy;
+        v->ilens[at] = n;
+        v->count++;
+        used = used + n + 16;
+    }
+
+    private void listCmd(Rclient* c, char* name, int argc, char** a, int* l) {
+        if (streq(name, "lpush") || streq(name, "rpush")) {
+            Value* v = lookup(c, a[1], l[1]);
+            if (v != null && v->type != TYPE_LIST) { wrongType(c); return; }
+            if (v == null) v = create(c, a[1], l[1], TYPE_LIST);
+            for (int i = 2; i < argc; i++) listPush(v, a[i], l[i], name[0] == 'l');
+            num(c, v->count);
+            return;
+        }
+        Value* v = lookup(c, a[1], l[1]);
+        if (v != null && v->type != TYPE_LIST) { wrongType(c); return; }
+        if (streq(name, "llen")) { num(c, v == null ? 0 : v->count); return; }
+        if (streq(name, "lpop") || streq(name, "rpop")) {
+            int cnt = 1;
+            if (argc > 3) { syntax(c); return; }
+            if (argc == 3) {
+                if (!redis.parseInt(a[2], l[2], &cnt) || cnt < 0) { err(c, "ERR value is out of range, must be positive"); return; }
+            }
+            if (v == null) { if (argc == 3) redis.putNilArray(c->out); else nil(c); return; }
+            int take = cnt < v->count ? cnt : v->count;
+            if (argc == 3) arr(c, take);
+            for (int i = 0; i < take; i++) {
+                int at = name[0] == 'l' ? v->head : (v->head + v->count - 1) % v->cap;
+                bulk(c, v->items[at], v->ilens[at]);
+                used = used - v->ilens[at] - 16;
+                free(v->items[at]);
+                v->items[at] = null;
+                if (name[0] == 'l') v->head = (v->head + 1) % v->cap;
+                v->count--;
+            }
+            if (v->count == 0) removeKey(db(c->db), a[1], l[1]);
+            return;
+        }
+        if (streq(name, "lrange") || streq(name, "lindex")) {
+            int s = 0;
+            int e = 0;
+            if (streq(name, "lindex")) {
+                if (!redis.parseInt(a[2], l[2], &s)) { notInt(c); return; }
+                if (v == null) { nil(c); return; }
+                if (s < 0) s = s + v->count;
+                if (s < 0 || s >= v->count) { nil(c); return; }
+                int at = (v->head + s) % v->cap;
+                bulk(c, v->items[at], v->ilens[at]);
+                return;
+            }
+            if (!redis.parseInt(a[2], l[2], &s) || !redis.parseInt(a[3], l[3], &e)) { notInt(c); return; }
+            if (v == null) { arr(c, 0); return; }
+            if (s < 0) s = s + v->count;
+            if (e < 0) e = e + v->count;
+            if (s < 0) s = 0;
+            if (e >= v->count) e = v->count - 1;
+            if (s > e || s >= v->count) { arr(c, 0); return; }
+            arr(c, e - s + 1);
+            for (int i = s; i <= e; i++) {
+                int at = (v->head + i) % v->cap;
+                bulk(c, v->items[at], v->ilens[at]);
+            }
+            return;
+        }
+        err(c, "ERR unknown command");
+    }
+
+    // ---- hashes and sets -------------------------------------------------------------------------------------------------------------------------
+    private Ht* newHt() {
+        Ht* h = (Ht*) malloc(sizeof(Ht));
+        h->acct = &used;
+        return h;
+    }
+
+    private void hashCmd(Rclient* c, char* name, int argc, char** a, int* l) {
+        Value* v = lookup(c, a[1], l[1]);
+        if (v != null && v->type != TYPE_HASH) { wrongType(c); return; }
+        if (streq(name, "hset")) {
+            if (argc % 2 != 0) { err(c, "ERR wrong number of arguments for 'hset' command"); return; }
+            if (v == null) { v = create(c, a[1], l[1], TYPE_HASH); v->ht = newHt(); }
+            int added = 0;
+            for (int i = 2; i < argc; i = i + 2) {
+                bool created = false;
+                Ent* e = v->ht->put(a[i], l[i], &created);
+                if (created) added++;
+                char* nv = malloc(l[i + 1] + 1);
+                memcpy(nv, a[i + 1], l[i + 1]);
+                if (e->val != null) { free(e->val); used = used - e->vlen; }
+                e->val = nv;
+                e->vlen = l[i + 1];
+                used = used + e->vlen;
+            }
+            num(c, added);
+            return;
+        }
+        if (streq(name, "hget")) {
+            Ent* e = v == null ? null : v->ht->find(a[2], l[2]);
+            if (e == null) nil(c); else bulk(c, e->val, e->vlen);
+            return;
+        }
+        if (streq(name, "hexists")) { num(c, (v != null && v->ht->find(a[2], l[2]) != null) ? 1 : 0); return; }
+        if (streq(name, "hlen")) { num(c, v == null ? 0 : v->ht->count); return; }
+        if (streq(name, "hdel")) {
+            int n = 0;
+            if (v != null) {
+                for (int i = 2; i < argc; i++) {
+                    Ent* e = v->ht->detach(a[i], l[i]);
+                    if (e != null) { free(e->val); used = used - e->vlen; v->ht->release(e); n++; }
+                }
+                if (v->ht->count == 0) removeKey(db(c->db), a[1], l[1]);
+            }
+            num(c, n);
+            return;
+        }
+        if (streq(name, "hgetall") || streq(name, "hkeys") || streq(name, "hvals")) {
+            bool both = streq(name, "hgetall");
+            int cnt = v == null ? 0 : v->ht->count * (both ? 2 : 1);
+            arr(c, cnt);
+            if (v == null) return;
+            Ent* e = null;
+            int pos = 0;
+            for (;;) {
+                e = v->ht->nextEnt(e, &pos);
+                if (e == null) break;
+                if (both || name[2] == 'k') bulk(c, e->key, e->klen);
+                if (both || name[2] == 'v') bulk(c, e->val, e->vlen);
+            }
+            return;
+        }
+        err(c, "ERR unknown command");
+    }
+
+    private void setCmdFamily(Rclient* c, char* name, int argc, char** a, int* l) {
+        if (streq(name, "set") || streq(name, "setnx") || streq(name, "setex") || streq(name, "strlen")) { err(c, "ERR unknown command"); return; }
+        Value* v = lookup(c, a[1], l[1]);
+        if (v != null && v->type != TYPE_SET) { wrongType(c); return; }
+        if (streq(name, "sadd")) {
+            if (v == null) { v = create(c, a[1], l[1], TYPE_SET); v->ht = newHt(); }
+            int added = 0;
+            for (int i = 2; i < argc; i++) {
+                bool created = false;
+                v->ht->put(a[i], l[i], &created);
+                if (created) added++;
+            }
+            num(c, added);
+            return;
+        }
+        if (streq(name, "srem")) {
+            int n = 0;
+            if (v != null) {
+                for (int i = 2; i < argc; i++) {
+                    Ent* e = v->ht->detach(a[i], l[i]);
+                    if (e != null) { v->ht->release(e); n++; }
+                }
+                if (v->ht->count == 0) removeKey(db(c->db), a[1], l[1]);
+            }
+            num(c, n);
+            return;
+        }
+        if (streq(name, "sismember")) { num(c, (v != null && v->ht->find(a[2], l[2]) != null) ? 1 : 0); return; }
+        if (streq(name, "scard")) { num(c, v == null ? 0 : v->ht->count); return; }
+        if (streq(name, "smembers")) {
+            arr(c, v == null ? 0 : v->ht->count);
+            if (v == null) return;
+            Ent* e = null;
+            int pos = 0;
+            for (;;) {
+                e = v->ht->nextEnt(e, &pos);
+                if (e == null) break;
+                bulk(c, e->key, e->klen);
+            }
+            return;
+        }
+        err(c, "ERR unknown command");
+    }
+
+    // ---- sorted sets -------------------------------------------------------------------------------------------------------------------------------
+    // order: by score, then by member bytes
+    private int zcmp(int sa, char* ma, int la, int sb, char* mb, int lb) {
+        int cmp = dcmp(sa, sb);
+        if (cmp != 0) return cmp;
+        int n = la < lb ? la : lb;
+        int r = memcmp(ma, mb, n);
+        if (r != 0) return r < 0 ? -1 : 1;
+        return la < lb ? -1 : (la > lb ? 1 : 0);
+    }
+
+    // where the member with this score belongs (the first position that is not smaller)
+    private int zpos(Value* v, int score, char* m, int ml) {
+        int lo = 0;
+        int hi = v->zn;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            Ent* e = v->zord[mid];
+            if (zcmp(e->num, e->key, e->klen, score, m, ml) < 0) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+
+    private void zinsert(Value* v, Ent* e) {
+        if (v->zn >= v->zcap) {
+            int nc = v->zcap == 0 ? 8 : v->zcap * 2;
+            Ent** no = (Ent**) malloc(nc * 8);
+            for (int i = 0; i < v->zn; i++) no[i] = v->zord[i];
+            if (v->zord != null) { free((char*) v->zord); used = used - v->zcap * 8; }
+            v->zord = no;
+            v->zcap = nc;
+            used = used + nc * 8;
+        }
+        int at = zpos(v, e->num, e->key, e->klen);
+        for (int i = v->zn; i > at; i--) v->zord[i] = v->zord[i - 1];
+        v->zord[at] = e;
+        v->zn++;
+    }
+
+    private void zremoveOrd(Value* v, Ent* e) {
+        int at = zpos(v, e->num, e->key, e->klen);
+        for (int i = at; i + 1 < v->zn; i++) v->zord[i] = v->zord[i + 1];
+        v->zn--;
+    }
+
+    private bool parseScore(char* s, int n, int* bits) {
+        if (n == 0 || n > 400) return false;
+        char* end = null;
+        int b = strtod(s, &end);
+        if (end == null || end != &s[n]) return false;
+        if (isnan(b)) return false;
+        *bits = b;
+        return true;
+    }
+
+    private void putScore(Rclient* c, int bits) {
+        char* t = dtostr(bits);
+        int n = strlen(t);
+        if (n > 2 && t[n - 1] == '0' && t[n - 2] == '.') n = n - 2;
+        bulk(c, t, n);
+    }
+
+    private void zsetCmd(Rclient* c, char* name, int argc, char** a, int* l) {
+        Value* v = lookup(c, a[1], l[1]);
+        if (v != null && v->type != TYPE_ZSET) { wrongType(c); return; }
+        if (streq(name, "zadd")) {
+            bool nx = false;
+            bool xx = false;
+            bool ch = false;
+            int i = 2;
+            while (i < argc) {
+                if (streqi(a[i], "nx")) nx = true;
+                else if (streqi(a[i], "xx")) xx = true;
+                else if (streqi(a[i], "ch")) ch = true;
+                else break;
+                i++;
+            }
+            if (nx && xx) { err(c, "ERR XX and NX options at the same time are not compatible"); return; }
+            if (i >= argc || (argc - i) % 2 != 0) { syntax(c); return; }
+            // all scores are checked before anything changes
+            for (int k = i; k < argc; k = k + 2) {
+                int dummy = 0;
+                if (!parseScore(a[k], l[k], &dummy)) { err(c, "ERR value is not a valid float"); return; }
+            }
+            if (v == null && xx) { num(c, 0); return; }
+            if (v == null) { v = create(c, a[1], l[1], TYPE_ZSET); v->zmem = newHt(); }
+            int added = 0;
+            int changed = 0;
+            for (int k = i; k < argc; k = k + 2) {
+                int score = 0;
+                parseScore(a[k], l[k], &score);
+                bool created = false;
+                Ent* e = null;
+                Ent* existing = v->zmem->find(a[k + 1], l[k + 1]);
+                if (existing != null) {
+                    if (nx) continue;
+                    if (dcmp(existing->num, score) != 0) {
+                        zremoveOrd(v, existing);
+                        existing->num = score;
+                        zinsert(v, existing);
+                        changed++;
+                    }
+                    continue;
+                }
+                if (xx) continue;
+                e = v->zmem->put(a[k + 1], l[k + 1], &created);
+                e->num = score;
+                zinsert(v, e);
+                added++;
+            }
+            if (v->zn == 0) removeKey(db(c->db), a[1], l[1]);
+            num(c, ch ? added + changed : added);
+            return;
+        }
+        if (streq(name, "zscore")) {
+            Ent* e = v == null ? null : v->zmem->find(a[2], l[2]);
+            if (e == null) nil(c); else putScore(c, e->num);
+            return;
+        }
+        if (streq(name, "zcard")) { num(c, v == null ? 0 : v->zn); return; }
+        if (streq(name, "zrem")) {
+            int n = 0;
+            if (v != null) {
+                for (int i = 2; i < argc; i++) {
+                    Ent* e = v->zmem->find(a[i], l[i]);
+                    if (e == null) continue;
+                    zremoveOrd(v, e);
+                    Ent* d = v->zmem->detach(a[i], l[i]);
+                    v->zmem->release(d);
+                    n++;
+                }
+                if (v->zn == 0) removeKey(db(c->db), a[1], l[1]);
+            }
+            num(c, n);
+            return;
+        }
+        if (streq(name, "zrank")) {
+            Ent* e = v == null ? null : v->zmem->find(a[2], l[2]);
+            if (e == null) nil(c); else num(c, zpos(v, e->num, e->key, e->klen));
+            return;
+        }
+        if (streq(name, "zrange")) {
+            int s = 0;
+            int e = 0;
+            if (!redis.parseInt(a[2], l[2], &s) || !redis.parseInt(a[3], l[3], &e)) { notInt(c); return; }
+            bool withScores = false;
+            if (argc == 5 && streqi(a[4], "withscores")) withScores = true;
+            else if (argc != 4) { syntax(c); return; }
+            if (v == null) { arr(c, 0); return; }
+            if (s < 0) s = s + v->zn;
+            if (e < 0) e = e + v->zn;
+            if (s < 0) s = 0;
+            if (e >= v->zn) e = v->zn - 1;
+            if (s > e || s >= v->zn) { arr(c, 0); return; }
+            arr(c, (e - s + 1) * (withScores ? 2 : 1));
+            for (int i = s; i <= e; i++) {
+                bulk(c, v->zord[i]->key, v->zord[i]->klen);
+                if (withScores) putScore(c, v->zord[i]->num);
+            }
+            return;
+        }
+        err(c, "ERR unknown command");
+    }
+
+    // ---- expiry sweep and tick ---------------------------------------------------------------------------------------------------------------------
+    // Removes expired keys: looks at up to `budget` entries of each database per call (a cursor remembers where it was).
+    public void sweep(int budget) {
+        for (int i = 0; i < 16; i++) {
+            Db* d = dbs[i];
+            if (d == null || d->expires == 0 || d->keys->cap == 0) continue;
+            int looked = 0;
+            while (looked < budget && looked < d->keys->cap) {
+                int slot = d->cursor % d->keys->cap;
+                d->cursor++;
+                looked++;
+                Ent* e = d->keys->tab[slot];
+                while (e != null) {
+                    Ent* nx = e->next;
+                    Value* v = (Value*) e->val;
+                    if (v->expireAt != 0 && v->expireAt <= now) {
+                        removeKey(d, e->key, e->klen);
+                        stats->expired++;
+                        // the chain may have changed: start the slot again
+                        nx = d->keys->tab[slot];
+                    }
+                    e = nx;
+                }
+            }
+        }
+    }
+
+    public int keyCount(int dbi) { return dbs[dbi] == null ? 0 : dbs[dbi]->keys->count; }
+    public int expiringCount(int dbi) { return dbs[dbi] == null ? 0 : dbs[dbi]->expires; }
+
+    // frees everything
+    public void dispose() {
+        while (ncl > 0) close(cl[ncl - 1]);
+        flush(-1);
+        for (int i = 0; i < 16; i++) {
+            if (dbs[i] != null) { if (dbs[i]->keys->tab != null) free((char*) dbs[i]->keys->tab); free((char*) dbs[i]->keys); free((char*) dbs[i]); dbs[i] = null; }
+        }
+        if (cl != null) free((char*) cl);
+        cl = null;
+    }
+}
+
+private void cmd(char* name, int arity, int flags) {
+    cmdNames[cmdCount] = name;
+    cmdArity[cmdCount] = arity;
+    cmdFlags[cmdCount] = flags;
+    cmdCount++;
+}
+
+// the table is made on the first use of a Server (a global array cannot be initialised with text pointers)
+private bool tableMade;
+private void makeTable() {
+    if (tableMade) return;
+    tableMade = true;
+    cmd("ping", -1, 2); cmd("echo", 2, 0); cmd("quit", 1, 2); cmd("auth", -2, 0); cmd("select", 2, 0); cmd("command", -1, 0); cmd("client", -2, 0);
+    cmd("dbsize", 1, 0); cmd("flushall", -1, 0); cmd("flushdb", -1, 0); cmd("info", -1, 0);
+    cmd("multi", 1, 0); cmd("exec", 1, 0); cmd("discard", 1, 0);
+    cmd("publish", 3, 0); cmd("subscribe", -2, 2); cmd("unsubscribe", -1, 2); cmd("psubscribe", -2, 2); cmd("punsubscribe", -1, 2);
+    cmd("del", -2, 0); cmd("exists", -2, 0); cmd("keys", 2, 0); cmd("type", 2, 0); cmd("rename", 3, 1);
+    cmd("expire", 3, 0); cmd("pexpire", 3, 0); cmd("ttl", 2, 0); cmd("pttl", 2, 0); cmd("persist", 2, 0);
+    cmd("get", 2, 0); cmd("set", -3, 1); cmd("setnx", 3, 1); cmd("setex", 4, 1); cmd("psetex", 4, 1); cmd("getset", 3, 1);
+    cmd("incr", 2, 1); cmd("decr", 2, 1); cmd("incrby", 3, 1); cmd("decrby", 3, 1); cmd("append", 3, 1); cmd("strlen", 2, 0);
+    cmd("mget", -2, 0); cmd("mset", -3, 1);
+    cmd("lpush", -3, 1); cmd("rpush", -3, 1); cmd("lpop", -2, 0); cmd("rpop", -2, 0); cmd("lrange", 4, 0); cmd("llen", 2, 0); cmd("lindex", 3, 0);
+    cmd("hset", -4, 1); cmd("hget", 3, 0); cmd("hgetall", 2, 0); cmd("hdel", -3, 0); cmd("hlen", 2, 0); cmd("hexists", 3, 0); cmd("hkeys", 2, 0); cmd("hvals", 2, 0);
+    cmd("sadd", -3, 1); cmd("srem", -3, 0); cmd("smembers", 2, 0); cmd("sismember", 3, 0); cmd("scard", 2, 0);
+    cmd("zadd", -4, 1); cmd("zrange", -4, 0); cmd("zscore", 3, 0); cmd("zrem", -3, 0); cmd("zcard", 2, 0); cmd("zrank", 3, 0);
+}
+
+// ---- the server: the store on sockets ------------------------------------------------------------------------------------------------------
+public class Server {
+    public Store* store;
+    public netsrv.Server* net;
+    public int port;
+
+    public Server() {
+        makeTable();
+        store = new Store();
+        net = new netsrv.Server();
+        net->user = (char*) this;
+        net->onOpen = srvOpen;
+        net->onData = srvData;
+        net->onClose = srvClose;
+        net->onTick = srvTick;
+        net->maxOut = 16777216;
+        net->handshakeTimeoutMs = 5000;
+        store->closeHook = srvKick;
+        store->clients = 0;
+    }
+
+    public bool listen(int p) {
+        bool ok = net->listen(p);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenTls(int p, tls.Config* cfg) {
+        bool ok = net->listenTls(p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenOn(char* host, int p, tls.Config* cfg) {
+        bool ok = net->listenOn(host, p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public int poll(int ms) { return net->poll(ms); }
+    public void run() { net->run(); }
+    public void stop() { net->stop(); }
+
+    public void shutdown() {
+        net->shutdown();
+        store->dispose();
+    }
+}
+
+private int srvOpen(netsrv.Server* s, netsrv.Conn* c) {
+    Server* sv = (Server*) s->user;
+    Rclient* rc = sv->store->open();
+    if (rc == null) return -1;
+    rc->out = &c->out;
+    rc->cookie = (char*) c;
+    c->user = (char*) rc;
+    return 0;
+}
+
+private int srvData(netsrv.Server* s, netsrv.Conn* c, char* data, int n) {
+    Server* sv = (Server*) s->user;
+    Rclient* rc = (Rclient*) c->user;
+    if (rc == null) return -1;
+    return sv->store->feed(rc, data, n);
+}
+
+private int srvClose(netsrv.Server* s, netsrv.Conn* c) {
+    Server* sv = (Server*) s->user;
+    Rclient* rc = (Rclient*) c->user;
+    if (rc == null) return 0;
+    c->user = null;
+    sv->store->close(rc);
+    return 0;
+}
+
+private int sweepAt;
+private int srvTick(netsrv.Server* s, int now) {
+    Server* sv = (Server*) s->user;
+    sv->store->now = now;
+    if (now - sweepAt >= 100 || now < sweepAt) {
+        sweepAt = now;
+        sv->store->sweep(20);
+    }
+    return 0;
+}
+
+private int srvKick(Store* st, Rclient* rc) {
+    netsrv.Conn* c = (netsrv.Conn*) rc->cookie;
+    if (c == null) return 0;
+    // the store cannot reach its server: the connection's own queue overflow makes netsrv evict it; this closes it softly
+    return 0;
+}
+
+public Server* newServer() { return new Server(); }
