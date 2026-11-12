@@ -63,7 +63,7 @@ pperror.a:2: error: #error
 
 ## Including files
 
-`#include "file"` inserts the file at that place. The compiler looks next to the including file first, then at the path as given, then in the library directories (`lib/`, `/usr/lib/a/` and `/usr/local/lib/a/`). `#include <file>` is looked up in exactly the same way: the compiler does not tell the two forms apart. Includes may be nested 12 levels deep. The same file can be included many times; guard it so that its content appears only once, either with `#pragma once` at the top, or with the classic `#ifndef` guard.
+`#include "file"` inserts the file at that place. The compiler looks next to the including file first, then at the path as given, then in the library directories (a `lib/` directory in the current directory, `/usr/lib/a/`, `/usr/local/lib/a/`, and a `lib/` directory next to the main source file). `#include <file>` is looked up in exactly the same way: the compiler does not tell the two forms apart. Includes may be nested 12 levels deep. The same file can be included many times; guard it so that its content appears only once, either with `#pragma once` at the top, or with the classic `#ifndef` guard.
 
 {{sample lang/pp_include}}
 
@@ -146,51 +146,38 @@ What to notice:
 
 Besides compiling a whole program from one file, `ac` can compile files **separately** and link them, like a C toolchain. `ac -c util.a -o util.ao` compiles one **unit** to an object file; `ac main.ao util.ao -o prog` links objects into a program. Units share declarations the C way, through a header that both `#include`: function prototypes, `extern` variables, and the definitions of structs, classes and constants.
 
-A small program in three files: `util.h` holds the shared declarations, `util.a` the definitions and `main.a` the program. The session shows the files with `cat` and then compiles and links them:
+{{sample lang/link_units}}
+
+The directory of this sample holds three files. `shapes.h` has the shared declarations: a constant, a struct, a class, an `extern` variable and the prototypes of three functions. `shapes.a` holds their definitions. `main.a` is the program. Its first lines contain `// book: link`, a directive for the book's sample checker: the checker builds the sample exactly the way you would by hand, with these commands:
 
 ```sh
-$ cat util.h
-// util.h: what the two units share
-int add(int a, int b);
-extern int counter;
-struct Pair { int x; int y; }
-$ cat util.a
-// util.a: the definitions
-#include "util.h"
+ac -c main.a -o main.ao
+ac -c shapes.a -o shapes.ao
+ac main.ao shapes.ao -o prog
+./prog
+```
 
-int counter = 100;
+The link errors are easy to provoke. These commands use `main.ao` and `shapes.ao` from above; the messages are the real ones:
 
-int add(int a, int b) {
-    return a + b;
-}
-$ cat main.a
-// main.a: the program
-#include "util.h"
-
-int main() {
-    Pair p = {20, 22};
-    printlnInt(add(p.x, p.y));
-    return counter;
-}
-$ ac -c util.a -o util.ao
-$ ac -c main.a -o main.ao
-$ ac main.ao util.ao -o prog
-$ ./prog; echo "exit code $?"
-42
-exit code 100
+```sh
 $ ac main.ao -o broken
-ac: error: undefined reference to 'add'
-$ ac -c main.a -o again.ao && ac main.ao again.ao util.ao -o broken
+ac: error: undefined reference to 'corner'
+$ ac -c main.a -o again.ao && ac main.ao again.ao shapes.ao -o broken
 ac: error: duplicate definition of 'main'
-$ ac -t linux-arm64 -c util.a -o util-arm.ao && ac main.ao util-arm.ao -o mixed
-ac: error: the object was made for another target or architecture 'util-arm.ao'
+$ ac -c shapes.a -o second.ao && ac main.ao shapes.ao second.ao -o broken
+ac: error: duplicate definition of 'created'
+$ ac -t linux-arm64 -c shapes.a -o shapes-arm.ao && ac main.ao shapes-arm.ao -o mixed
+ac: error: the object was made for another target or architecture 'shapes-arm.ao'
 ```
 
 What to notice:
 
-- Each `ac -c` produced one `.ao` file. The link step took both and made the program, whose output is 42 and whose exit code is 100 (`return counter;`). `Pair` is a struct defined in the header, so both units know it.
+- Each `ac -c` produced one `.ao` file, and the link step joined the two into one program. The program's output is the recorded output above.
+- `Point` and `Counter` are defined in the header, so both units know them. The methods of a class that is defined in a header may be compiled into every unit that includes it; this is the one kind of definition that is allowed to appear twice.
+- `created` is one variable: it is defined in `shapes.a` (`int created = 0;`), declared with `extern` in the header, and `main.a` reads and writes the very same variable. The `100` that `main` stores is what `createdTwice()` in `shapes.a` sees.
+- `scale()` is `static`, so only `shapes.a` can call it. Two units may each have their own `static` function of the same name.
 - The order of the objects on the command line does not matter, and `main` must be defined in exactly one object.
-- A name that nobody defines is `undefined reference to 'add'`. A name defined in two objects is `duplicate definition of 'main'`.
+- A name that nobody defines is `undefined reference to 'corner'`. A name defined in two objects is `duplicate definition of 'main'`; this applies to global variables as well (`created` above). A `static` or `private` name that another unit declares is also an undefined reference, because it is not visible there.
 - Every function and global variable that is not `private` or `static` is visible to the other objects; `static` and `private` ones belong to their own object.
 - A unit contains the code and data of its own file, and of the files it `#include`s or `import`s from disk. The built-in library (`println`, `collections`, `net`, ...) is not part of an object: the link step compiles the parts the objects use, so there is only one copy, and library state (the heap, `rand`) is shared.
 - Because every unit is compiled without seeing the others, an `import` of a user file in two units would make two copies of it. Put shared declarations in a header and the definitions in exactly one unit.

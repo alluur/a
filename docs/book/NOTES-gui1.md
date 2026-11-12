@@ -71,9 +71,27 @@ first, then set `onChange` and the start value.
 
 ## (c) What is not covered, and why
 
-* `gterm`, `gcode`, `ghtml`, `gnet`, `wweb`, `wvnc`, `wfb`, `glock`, `dm`: not in my assignment (the guide `GUI.md` describes them; the chapters only point to the API references).
+* `gterm`, `gcode`, `ghtml`, `gnet`, `wweb`, `wvnc`, `wfb`, `glock`, `dm`: not in my assignment (other chapters or the reference guide `GUI.md`); my chapters only point to them.
 * The busy progress bar (`ProgressBar.start()`) is described but has no picture: it animates on a timer, so a screenshot would not be reproducible.
-* Keyboard-only features of `guix` (Alt+letter menu opening, arrow keys in menus, type-ahead) are described in the text but only the accelerators have a sample.
-* `guix.ScrollBar` on its own, `TabView.closable`, `Splitter` with `sideBySide = false`, `TreeView.lazy` / `onExpand`, `IconButton` outside a `Toolbar`: mentioned in tables, not run.
-* Other targets: all samples were compiled for the eight targets with `samples.py --targets`; the drawing samples print checksums only where noted, and only the Linux x64 results were recorded
-  (the books claims that gfx output is identical on every target; I did not run Windows, ARM or RISC-V binaries).
+* Keyboard-only features of `guix` (Alt+letter opening menus, F10, arrow keys inside menus, type-ahead in the file dialogs) are described in the text; only the accelerators
+  (`menu_accelerators`) and Enter / Tab / arrows in text widgets are driven by a sample.
+* `guix.ScrollBar` on its own, `TabView.closable` / `onTabClose`, `Splitter` with `sideBySide = false`, `TreeView.lazy` / `onExpand`, `IconButton` outside a `Toolbar`,
+  the `...Arg` dialog variants and `guix.dialogArg`, `RadioGroup` keyboard movement, `gui.Display.watch` and `requestPasteTo`: mentioned in the chapters, **not run**.
+* `gfx.loadFont` with `$AFONT_CONF` / `/etc/fonts.conf` (a configured font replacing `sans()`): described from `GUI.md` and `gfx.a`, not tried.
+  Note that every sample that draws text depends on those two files **not** overriding the fonts: on a machine with an `/etc/fonts.conf` that names other fonts the pictures and the text widths in the `.out` files would differ.
+* Only the Linux x86-64 results were recorded. All 83 samples compile for the eight targets (`samples.py --targets gfx gui`), but I ran no Windows, ARM, RISC-V or LoongArch binary, so the claim
+  "the same program draws the same pixels on every target" is quoted from the documentation and not checked here.
+* Real input devices (framebuffer, evdev, a VNC viewer): everything was driven through the display protocol (`shots.py` speaks it directly, `actl` was used once for the session in chapter 51).
+
+## (d) Notes about the tools
+
+* `tools/shots.py` talks the display protocol itself (screenshot request 15 / answer 112, input injection 16, see `lib/wsrv.a`) instead of starting `actl` for every event, so it can send key combinations with
+  modifiers and drags. `actl` is still the documented way for a reader (chapter 51).
+* Determinism: two complete runs of `shots.py` (100 pictures, including the ones of the other contributors) gave pixel-identical PNGs. What can break it: a blinking caret (`gui.caretBlinks = false` is needed), the pointer
+  (parked in the bottom right corner), animations (a busy progress bar), and anything that shows the time or a path (the file dialogs show `.`, the scratch directory is not displayed).
+* Running `shots.py` without a selector photographs **every** group, also those of other contributors; pass `gfx gui` to rewrite only these two.
+* `build.py` shows the whole sample file in the listing, including the `// book:` lines that only `shots.py` reads, and (for a directory sample) the other files below `main.a` (so `clockface.a` is visible).
+  Chapter 51 has a note that explains the lines. Stripping them in `build.py` would make the listings shorter; it is the coordinator's decision.
+* The window of a program is cut out by comparing with a screenshot of the empty desktop (threshold 12 per channel, so the faint window shadow is below it) and adding 8 pixels, so the pictures show a
+  dark blue strip of desktop around each window. If that is not wanted, change `MARGIN` or crop to the window frame in `crop_box`.
+* The click coordinates in the samples assume the window cascade of `wsrv` (first client area at 40,74). If the server's placement changes, the `click=` lines of the samples need new numbers.
