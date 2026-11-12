@@ -181,8 +181,25 @@ public double erfc(double x) { return __dbl(::erfc(__bits(x))); }
 public double lgamma(double x) { return __dbl(::lgamma(__bits(x))); }
 public double gamma(double x) { return __dbl(::tgamma(__bits(x))); }
 
-// ln B(a, b) = lgamma(a) + lgamma(b) - lgamma(a + b)
-public double lbeta(double a, double b) { return lgamma(a) + lgamma(b) - lgamma(a + b); }
+// ln B(a, b) = lgamma(a) + lgamma(b) - lgamma(a + b), computed without cancellation for large arguments (Stirling series with the correction stirlerr) and
+// from the gamma function itself for small ones (R's algorithm)
+public double lbeta(double a, double b) {
+    if (a != a || b != b || a < 0.0 || b < 0.0) { return nanValue(); }
+    double p = (a < b) ? a : b;
+    double q = (a < b) ? b : a;
+    if (p == 0.0) { return infValue(); }
+    if (!finite(q)) { return -infValue(); }
+    if (p >= 10.0) {
+        double corr = stirlerr(p) + stirlerr(q) - stirlerr(p + q);
+        return dmath.log(q) * -0.5 + LN_SQRT_2PI + corr + (p - 0.5) * dmath.log(p / (p + q)) + q * dmath.log1p(-p / (p + q));
+    }
+    if (q >= 10.0) {
+        double corr = stirlerr(q) - stirlerr(p + q);
+        return lgamma(p) + corr + p - p * dmath.log(p + q) + (q - 0.5) * dmath.log1p(-p / (p + q));
+    }
+    if (p < 1.0e-306) { return lgamma(p) + (lgamma(q) - lgamma(p + q)); }
+    return dmath.log(gamma(p) * (gamma(q) / gamma(p + q)));
+}
 public double beta(double a, double b) { return dmath.exp(lbeta(a, b)); }
 
 // the digamma function psi(x) = d/dx ln Gamma(x) (recurrence up to x >= 10, then the asymptotic series; reflection for x < 0)
@@ -304,7 +321,7 @@ private void incGammaBoth(double a, double x, double* P, double* Q) {
         *Q = 0.0;
         return;
     }
-    double lg = a * dmath.log(x) - x - lgamma(a);
+    double pre = a * dpoisRaw(a, x);                       // x^a e^-x / Gamma(a), by Loader's saddle point method (accurate for large a)
     if (x < a + 1.0) {
         double ap = a;
         double del = 1.0 / a;
@@ -315,7 +332,7 @@ private void incGammaBoth(double a, double x, double* P, double* Q) {
             sum += del;
             if (absd(del) < absd(sum) * 1.0e-17) { break; }
         }
-        double p = sum * dmath.exp(lg);
+        double p = sum * pre;
         if (p > 1.0) { p = 1.0; }
         *P = p;
         *Q = 1.0 - p;
@@ -336,7 +353,7 @@ private void incGammaBoth(double a, double x, double* P, double* Q) {
             h *= del;
             if (absd(del - 1.0) < 1.0e-16) { break; }
         }
-        double q = dmath.exp(lg) * h;
+        double q = pre * h;
         if (q > 1.0) { q = 1.0; }
         *Q = q;
         *P = 1.0 - q;
@@ -391,12 +408,6 @@ private double betaCf(double a, double b, double x) {
     return h;
 }
 
-// ln(1 - x) given x and y = 1 - x (as accurately as the caller knows it)
-private double ln1m(double x, double y) {
-    if (x < 0.5) { return dmath.log1p(-x); }
-    return dmath.log(y);
-}
-
 // I_x(a, b) and 1 - I_x(a, b), both without cancellation; y must be 1 - x (the caller computes it from the exact data where possible)
 private void incBetaBoth(double x, double y, double a, double b, double* lo, double* up) {
     if (a != a || b != b || x != x || y != y || !(a > 0.0) || !(b > 0.0) || x < 0.0 || y < 0.0) {
@@ -414,9 +425,7 @@ private void incBetaBoth(double x, double y, double a, double b, double* lo, dou
         *up = 0.0;
         return;
     }
-    double lnx = (x > 0.5) ? dmath.log1p(-y) : dmath.log(x);
-    double lny = ln1m(x, y);
-    double bt = dmath.exp(lgamma(a + b) - lgamma(a) - lgamma(b) + a * lnx + b * lny);
+    double bt = dbinomRaw(a, a + b, x, y) * a * b / (a + b);          // x^a y^b / B(a, b) through the binomial probability (Loader)
     if (x < (a + 1.0) / (a + b + 2.0)) {
         double v = bt * betaCf(a, b, x) / a;
         if (v > 1.0) { v = 1.0; }
@@ -441,8 +450,31 @@ public double incBeta(double x, double a, double b) {
 // ============================================================================================================================================
 //  Normal distribution
 // ============================================================================================================================================
-public double stdNormalCdf(double x) { return 0.5 * erfc(-x / SQRT_2); }
-public double stdNormalSf(double x) { return 0.5 * erfc(x / SQRT_2); }
+// P(Z > z) for the standard normal Z. For |z| >= 2 the argument z / sqrt(2) of erfc is computed as a sum of two doubles (an exact product by Dekker's method plus the
+// error of the constant sqrt(2) / 2), because erfc(t) changes by the relative amount 2 t dt: the rounding of t alone would cost 1e-16 z^2 in the tail (1.5e-14 at z = 10)
+private double normalTail(double z) {
+    if (z != z) { return z; }
+    double c = 0.7071067811865476;
+    if (z < 2.0) { return 0.5 * erfc(z * c); }
+    if (z > 38.6) { return 0.0; }
+    double p = z * c;
+    // z * c = p + e exactly: split both factors into halves of 26 bits
+    double zs = 134217729.0 * z;
+    double zh = zs - (zs - z);
+    double zl = z - zh;
+    double cs = 134217729.0 * c;
+    double ch = cs - (cs - c);
+    double cl = c - ch;
+    double e = ((zh * ch - p) + zh * cl + zl * ch) + zl * cl;
+    double delta = e + z * -4.833646656726457e-17;          // z / sqrt(2) = p + delta
+    double ec = erfc(p);
+    if (!(ec > 0.0)) { return 0.0; }
+    double slope = 1.1283791670955126 * dmath.exp(-p * p) / ec;       // -d ln erfc / dt
+    return 0.5 * ec * (1.0 - slope * delta);
+}
+
+public double stdNormalCdf(double x) { return normalTail(-x); }
+public double stdNormalSf(double x) { return normalTail(x); }
 public double stdNormalPdf(double x) { return dmath.exp(-0.5 * x * x) / SQRT_2PI; }
 
 // the inverse of the standard normal cdf: Acklam-free: a rational start (Abramowitz and Stegun 26.2.23) polished by Halley steps on the exact erfc based cdf
@@ -611,9 +643,28 @@ private double solveQuantile(int kind, double p, double a, double b, double lowB
 // ============================================================================================================================================
 public double tPdf(double x, double df) {
     if (x != x || !(df > 0.0)) { return nanValue(); }
+    if (!finite(x)) { return 0.0; }
     if (!finite(df)) { return stdNormalPdf(x); }
-    double lg = lgamma(0.5 * (df + 1.0)) - lgamma(0.5 * df) - 0.5 * dmath.log(df * dmath.PI);
-    return dmath.exp(lg - 0.5 * (df + 1.0) * dmath.log1p(x * x / df));
+    // Loader's saddle point formula (the method of R's dt): no cancellation between lgamma values, accurate for any df
+    double t = -bd0(df * 0.5, (df + 1.0) * 0.5) + stirlerr((df + 1.0) * 0.5) - stirlerr(df * 0.5);
+    double x2n = x * x / df;
+    double ax = 0.0;
+    double lx2n;
+    double u;
+    bool lrg = x2n > 1.0 / DBL_EPS;
+    if (lrg) {
+        ax = absd(x);
+        lx2n = dmath.log(ax) - dmath.log(df) * 0.5;
+        u = df * lx2n;
+    } else if (x2n > 0.2) {
+        lx2n = dmath.log(1.0 + x2n) * 0.5;
+        u = df * lx2n;
+    } else {
+        lx2n = dmath.log1p(x2n) * 0.5;
+        u = -bd0(df * 0.5, (df + x * x) * 0.5) + x * x * 0.5;
+    }
+    double isq = lrg ? dmath.sqrt(df) / ax : dmath.exp(-lx2n);
+    return dmath.exp(t - u) * (1.0 / SQRT_2PI) * isq;
 }
 
 public double tCdf(double x, double df) {

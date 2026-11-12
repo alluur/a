@@ -12,11 +12,11 @@ PREC = 70
 getcontext().prec = PREC
 
 def dpi():
-    # Machin / Chudnovsky is overkill: use the Gauss-Legendre algorithm
+    # Machin / Chudnovsky is overkill: use the Gauss-Legendre algorithm; 900 digits, because erfc(x) = 1 - erf(x) needs about x^2 / 2.3 extra digits
     with localcontext() as c:
-        c.prec = PREC + 10
+        c.prec = 900
         a = D(1); b = 1 / D(2).sqrt(); t = D(1) / 4; p = D(1)
-        for _ in range(12):
+        for _ in range(13):
             an = (a + b) / 2
             b = (a * b).sqrt()
             t -= p * (a - an) ** 2
@@ -25,8 +25,10 @@ def dpi():
         return (a + b) ** 2 / (4 * t)
 
 PI = dpi()
-SQRT_PI = PI.sqrt()
-LN2PI = (2 * PI).ln()
+with localcontext() as _c:
+    _c.prec = 900
+    SQRT_PI = PI.sqrt()
+    LN2PI = (2 * PI).ln()
 
 def erf(x):
     x = D(x)
@@ -40,7 +42,7 @@ def erf(x):
             s += term
             n += 1
             term = term * 2 * x * x / (2 * n + 1)
-            if abs(term) < abs(s) * D(10) ** (-(PREC + 15)) and n > 5:
+            if (abs(term) < abs(s) * D(10) ** (-(PREC + 15)) and n > 5) or term == 0:
                 break
         return 2 / SQRT_PI * (-(x * x)).exp() * s
 
@@ -60,28 +62,43 @@ def erf_hp(x, extra):
             s += term
             n += 1
             term = term * 2 * x * x / (2 * n + 1)
-            if abs(term) < abs(s) * D(10) ** (-(PREC + extra + 15)) and n > 5:
+            if (abs(term) < abs(s) * D(10) ** (-(PREC + extra + 15)) and n > 5) or term == 0:
                 break
         return 2 / SQRT_PI * (-(x * x)).exp() * s
 
-BERN = [D(1), D(-1) / 2, D(1) / 6, D(0), D(-1) / 30, D(0), D(1) / 42, D(0), D(-1) / 30, D(0), D(5) / 66, D(0), D(-691) / 2730,
+def _bernoulli_fractions(n):
+    from fractions import Fraction as F
+    A = [F(0)] * (n + 1)
+    out = []
+    for m in range(n + 1):
+        A[m] = F(1, m + 1)
+        for j in range(m, 0, -1):
+            A[j - 1] = j * (A[j - 1] - A[j])
+        out.append(A[0])
+    return out
+
+BERN_F = _bernoulli_fractions(90)
+BERN_OLD = [D(1), D(-1) / 2, D(1) / 6, D(0), D(-1) / 30, D(0), D(1) / 42, D(0), D(-1) / 30, D(0), D(5) / 66, D(0), D(-691) / 2730,
         D(0), D(7) / 6, D(0), D(-3617) / 510, D(0), D(43867) / 798, D(0), D(-174611) / 330, D(0), D(854513) / 138,
         D(0), D(-236364091) / 2730, D(0), D(8553103) / 6]
+
+def BERN(k):
+    f = BERN_F[k]
+    return D(f.numerator) / D(f.denominator)
 
 def lgamma(x):
     x = D(x)
     with localcontext() as c:
-        c.prec = PREC + 20
+        c.prec = PREC + 40
         shift = D(0)
-        while x < 60:
+        while x < 150:
             shift += x.ln()
             x += 1
-        # Stirling series
+        # Stirling series: the terms fall below 1e-130 for x >= 150 and 40 terms
         s = (x - D('0.5')) * x.ln() - x + LN2PI / 2
         xp = x
-        for k in range(1, 14):
-            b = BERN[2 * k]
-            s += b / (2 * k * (2 * k - 1) * xp)
+        for k in range(1, 41):
+            s += BERN(2 * k) / (2 * k * (2 * k - 1) * xp)
             xp *= x * x
         return s - shift
 
@@ -105,19 +122,41 @@ def inc_gamma_p(a, x):
         return (a * x.ln() - x - lgamma(a + 1)).exp() * s
 
 def inc_gamma_q(a, x):
+    """regularized upper incomplete gamma Q(a, x): 1 - P for x < a + 1, the continued fraction (modified Lentz) above, so that tiny tails keep their digits"""
     a = D(a); x = D(x)
     with localcontext() as c:
         c.prec = PREC + 60
-        return 1 - inc_gamma_p(a, x)
+        if x < a + 1:
+            return 1 - inc_gamma_p(a, x)
+        tiny = D(10) ** -(2 * PREC)
+        b = x + 1 - a
+        cc = 1 / tiny
+        dd = 1 / b
+        h = dd
+        i = 1
+        while True:
+            an = -i * (i - a)
+            b += 2
+            dd = an * dd + b
+            if dd == 0: dd = tiny
+            cc = b + an / cc
+            if cc == 0: cc = tiny
+            dd = 1 / dd
+            delta = dd * cc
+            h *= delta
+            if abs(delta - 1) < D(10) ** -(PREC + 30):
+                break
+            i += 1
+        return (a * x.ln() - x - lgamma(a)).exp() * h
 
 def inc_beta(x, a, b):
-    """regularized incomplete beta I_x(a, b) by the hypergeometric series (x < 1)"""
+    """regularized incomplete beta I_x(a, b) by the hypergeometric series; the series in x converges like x^n, so x > 1/2 uses the complement"""
     x = D(x); a = D(a); b = D(b)
     if x <= 0: return D(0)
     if x >= 1: return D(1)
     with localcontext() as c:
         c.prec = PREC + 40
-        if x > (a + 1) / (a + b + 2):
+        if x > D('0.5'):
             return 1 - inc_beta(1 - x, b, a)
         lb = lgamma(a + b) - lgamma(a) - lgamma(b)
         pre = (lb + a * x.ln() + b * (1 - x).ln()).exp() / a
@@ -127,15 +166,20 @@ def inc_beta(x, a, b):
             term = term * (a + b + n) / (a + 1 + n) * x
             n += 1
             s += term
-            if term < s * D(10) ** (-(PREC + 20)) or n > 200000:
+            if term < s * D(10) ** -(PREC + 20):
                 break
+            if n > 5000000:
+                raise RuntimeError('inc_beta series did not converge')
         return pre * s
 
 def inc_beta_upper(x, a, b):
+    """1 - I_x(a, b) without cancellation: for x > 1/2 it is the lower function of the complement"""
     x = D(x)
     with localcontext() as c:
         c.prec = PREC + 60
-        return 1 - inc_beta(x, a, b) if x <= (D(a) + 1) / (D(a) + D(b) + 2) else inc_beta(1 - x, b, a)
+        if x > D('0.5'):
+            return inc_beta(1 - x, b, a)
+        return 1 - inc_beta(x, a, b)
 
 # ---- distributions -----------------------------------------------------------------------------------------------------------
 def norm_cdf(x, mu=0, sigma=1):
@@ -247,3 +291,61 @@ def fmt(v, digits=9):
     """the text an A program prints with doubleToSci(v, digits - 1): digits significant digits, e.g. 1.23456789e+00"""
     v = float(v)
     return ('%.' + str(digits - 1) + 'e') % v
+
+def digamma(x):
+    x = D(x)
+    with localcontext() as c:
+        c.prec = PREC + 20
+        if x < 0:
+            # reflection: psi(1 - x) - psi(x) = pi cot(pi x)
+            return digamma(1 - x) - PI * cos(PI * x) / sin(PI * x)
+        shift = D(0)
+        while x < 100:
+            shift += 1 / x
+            x += 1
+        s = x.ln() - 1 / (2 * x)
+        xp = x * x
+        for k in range(1, 30):
+            s -= BERN(2 * k) / (2 * k * xp)
+            xp *= x * x
+        return s - shift
+
+def sin(x):
+    x = D(x)
+    with localcontext() as c:
+        c.prec = PREC + 20
+        # reduce modulo pi
+        k = (x / PI).to_integral_value()
+        r = x - k * PI
+        term = r; s = r; n = 1
+        while abs(term) > D(10) ** -(PREC + 10):
+            term = -term * r * r / ((2 * n) * (2 * n + 1))
+            s += term
+            n += 1
+        return s if int(k) % 2 == 0 else -s
+
+def cos(x):
+    return sin(D(x) + PI / 2)
+
+def tan(x):
+    return sin(x) / cos(x)
+
+def t_quantile_ref(p_d, df):
+    """the exact quantile of the double p_d: x0 + (p_d - cdf(x0)) / pdf(x0) with x0 a close double; second order error ~ 1e-30"""
+    raise NotImplementedError
+
+def refine(cdf, pdf, x0, p_d):
+    """x0 (a decimal close to the true quantile): one Newton step in 70 digits is exact to ~30 digits when x0 is within 1e-14 relative"""
+    x0 = D(x0)
+    return x0 + (D(p_d) - cdf(x0)) / pdf(x0)
+
+# ---- more reference distributions (cdf and pdf with exact decimal parameters) ---------------------------------------------------------
+def expon_cdf(x, rate): return 1 - (-D(rate) * D(x)).exp()
+def expon_sf(x, rate): return (-D(rate) * D(x)).exp()
+def expon_pdf(x, rate): return D(rate) * (-D(rate) * D(x)).exp()
+def lognorm_cdf(x, mu, sigma): return norm_cdf(D(x).ln(), mu, sigma)
+def lognorm_pdf(x, mu, sigma):
+    x = D(x)
+    return norm_pdf(x.ln(), mu, sigma) / x
+def gamma_sf(x, a, scale=1): return inc_gamma_q(a, D(x) / D(scale))
+def beta_sf(x, a, b): return inc_beta_upper(x, a, b)
