@@ -167,7 +167,10 @@ work on all cursors from the last to the first, inside one undo group. Highlight
 
 `import asyntax;`
 
-* **Lexers** for A, C, C++, Python, shell, JSON, Markdown, INI, TOML, HTML, XML, Makefile and plain text. `lexLine(lang, state, text,
+* **Lexers** for A, C, C++, Python, shell, JSON, Markdown, INI, TOML, HTML, XML, Makefile and plain text. The A keywords include the words of
+  the second tier of the language: `foreach in rev` (loops), `abstract override final` (classes), `is as` (type checks) and `static_assert`
+  (`in`, `rev`, `is`, `as` are only keywords where the compiler reads them as such, so a variable called `in` is highlighted as a keyword
+  anyway; the highlighter does not parse; `t316_asyntax_newkw` checks the lists). `lexLine(lang, state, text,
   len, tokens, max, &endState)` is a pure function: spans `(start, len, kind)` that cover the line without gaps, kinds from the fixed
   enum `Tok` (`Plain Keyword Type Builtin Constant Number String Char Escape Comment DocComment Preproc Operator Punct Function
   Variable Tag Attribute Heading Emphasis Link Code Quote Error`). The state is a small integer (in block comment, in a triple
@@ -367,6 +370,7 @@ Missing in AOS, and what asys does:
 | `t207_acode_file` | LF / CRLF / CR / mixed / BOM / binary / UTF-16 round trips, external changes, FIFO, listeners, memory cycles of big texts |
 | `t208_asyntax_lex` | token dumps of 13 languages, language detection |
 | `t209_asyntax_inc` | incremental = fresh after random edits in 10 languages; work after an edit; symbols; completion |
+| `t316_asyntax_newkw` | the keywords of the second-tier language features in A code (and that C and Python do not get them) |
 | `t210_atheme` | colour conversions and WCAG values, 9 themes validated, theme / settings round trips, corrupt files |
 | `t211_aproject_tree` | globs, ignore rules, tree (links, FIFOs, bounds, names), watcher, recent files, quick open |
 | `t212_aproject_find` | find in files: modes, context, steps, cancel, limits, FIFO, link loops |

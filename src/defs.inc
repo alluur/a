@@ -31,6 +31,7 @@
 %define NAMEPOOL_MAX    (1024*1024)
 %define FILE_MAX        256
 %define MAXLOOP         64
+%define CASE_MAX        4096    ; case labels of the switch statements being compiled (nested ones together)
 %define MAXPARAM        64
 %define EDGE_MAX        262144
 
@@ -71,6 +72,12 @@
 %define T_XORXOR        150     ; ^^   logical exclusive or
 %define T_CMP3          151     ; <=>  three way comparison: -1, 0 or 1
 %define T_QQ            152     ; ??   a ?? b  is a unless it is 0 / null, else b
+%define T_DOTDOT        153     ; ..   range: foreach (int i in 0..n), case 1..5:
+%define T_ELLIPSIS      154     ; ...  the end of a parameter list
+%define T_OROREQ        155     ; ||=
+%define T_ANDANDEQ      156     ; &&=
+%define T_QQEQ          157     ; ??=
+%define T_DOTDOTEQ      158     ; ..=  inclusive range: foreach (int i in 1..=10)
 ; keywords
 %define K_INT           160
 %define K_CHAR          161
@@ -115,6 +122,7 @@
 %define K_INTMOD        201     ; short long signed unsigned (all the same 64-bit int, see LANGUAGE.md)
 %define K_DEFER         199     ; defer expression;
 %define K_DOUBLE        198     ; double, float     ; asm(a, b, c) { x64: ...; arm64: ...; }
+%define K_FOREACH       203     ; foreach (T x in values) ...
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1
@@ -159,6 +167,12 @@
 %define F_PROTECTED     8192
 %define F_EXTERN        16384   ; extern declaration: the storage is defined in another object
 %define F_BYREF         2048    ; a struct parameter: the slot holds the address of the caller's copy
+%define F_STATIC        0x8000  ; a class member that belongs to the class (static method: no 'this'; static field: a global with F_METHOD)
+%define F_ABSTRACT      0x10000 ; an abstract method: no body, every concrete subclass has to override it
+%define F_FINAL         0x20000 ; a method that subclasses may not override
+; per class flags (st_flags)
+%define SF_ABSTRACT     1       ; abstract class: no objects of it
+%define SF_FINAL        2       ; final class: nothing derives from it
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
 %define ST_NAME         0       ; qword
@@ -185,7 +199,8 @@
 %define LB_CHAIN        24
 
 ; ---- types -------------------------------------------------------------------
-; bits 0-7 kind, bits 8-15 pointer depth, bits 16-31 struct index, bit 32 array
+; bits 0-7 kind, bits 8-15 pointer depth, bits 16-31 struct index, bit 32 array,
+; bits 40-63 the number of elements of an array whose length is known (0 = unknown); cleared when the array decays
 %define TY_VOID         0
 %define TY_INT          1
 %define TY_CHAR         2
@@ -202,6 +217,15 @@
 %define TY_U64          12      ; 64 bits, unsigned division / remainder / right shift / comparisons
 %define TY_PTR1         0x100
 %define TF_ARRAY_BIT    32
+%define TF_LEN_SHIFT    40
+%define TF_LEN_MAX      0xFFFFFF
+
+; TY_DECAY reg: an array type becomes the plain pointer type (clears the array flag and the length)
+%macro TY_DECAY 1
+    btr %1, TF_ARRAY_BIT
+    shl %1, 64 - TF_LEN_SHIFT
+    shr %1, 64 - TF_LEN_SHIFT
+%endmacro
 
 ; ---- relocations (code/data references that need final addresses) ------------
 %define R_DATA          0       ; rel32 in code -> data + target

@@ -26,6 +26,8 @@ section .text
 %include "expr.asm"
 %include "float.asm"
 %include "stmt.asm"
+%include "foreach.asm"
+%include "switch.asm"
 %include "decl.asm"
 %include "pp.asm"
 %include "link.asm"

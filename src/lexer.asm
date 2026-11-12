@@ -57,12 +57,18 @@ kw_table:
     KW "or",       T_OROR
     KW "not",      '!'
     KW "xor",      T_XORXOR
+    KW "foreach",  K_FOREACH
     db 0
 
 ops3:
     db "<=>", T_CMP3
     db "<<=", T_SHLEQ
     db ">>=", T_SHREQ
+    db "...", T_ELLIPSIS
+    db "..=", T_DOTDOTEQ
+    db "||=", T_OROREQ
+    db "&&=", T_ANDANDEQ
+    db "??=", T_QQEQ
     db 0
 ops2:
     db "==", T_EQ
@@ -87,6 +93,7 @@ ops2:
     db "::", T_SCOPE
     db "^^", T_XORXOR
     db "??", T_QQ
+    db "..", T_DOTDOT
     db 0
 singles:
     db "(){}[];,.:?~=!<>&|^+-*/%", 0
@@ -814,6 +821,8 @@ lex_float:
     ja .conv                        ; not an exponent after all
     xor r11d, r11d
 .ed:movzx eax, byte [rcx]
+    cmp al, '_'
+    je .eskip                       ; 1e1_0: underscores are ignored in the exponent too
     sub eax, '0'
     cmp eax, 9
     ja .edone

@@ -137,6 +137,11 @@ int main() {
 * **Modules:** `module geometry;` at the top of a file, `import geometry;` (or `import a.b.c;`)
   elsewhere, then `geometry.area(...)`. `private` hides a declaration from other files.
 * **Everything is zero-initialised**, including locals and heap memory.
+* **Iteration and selection:** `foreach (int x in values)` over arrays, text, ranges (`0..n`, `rev 0..n`), `(pointer, count)` and classes with
+  `count()` / `get(i)`; `switch` on text (fast for hundreds of labels), `case 1, 2:` and `case 10..20:`; labeled `break outer;` / `continue outer;`.
+* **Operators:** `||=`, `&&=`, `??=` (short-circuit assignment), `^^`, `<=>`, `??`, operator overloading; `static_assert(cond, "message")`.
+* **Classes:** single inheritance, `virtual`, `abstract` classes and methods, `override` / `final` with signature checks, `static` fields and
+  methods (`Counter.count`, `Util.square(3)`), and the run time checks `x is Dog` / `x as Dog`.
 * **No hidden runtime:** the "standard library" is written in A itself (`lib/std.a`) and
   compiled into your program, on top of a handful of built-in system-call stubs.
 
@@ -155,6 +160,8 @@ src/            the compiler (NASM assembly)
   symtab.asm      symbols, structs, types
   expr.asm        types, expressions, constant expressions, calls
   stmt.asm        statements and local variables
+  foreach.asm     the foreach statement
+  switch.asm      the switch statement (integers and text)
   decl.asm        functions, classes, enums, globals, modules
   cg_x86.asm      x86-64 backend
   cg_a64.asm      AArch64 backend
@@ -195,7 +202,7 @@ Version 0.1.0 is deliberately small. Known limitations — all of them are on th
 * Function pointers are the type `func` (no signature checking); no bit-fields; a C-style preprocessor (`#define`, `#include`, `#if`) is built in.
   `typedef`, `union`, `static` locals, structs by value, default parameter values and `...` with `va_arg` exist.
 
-* **Single inheritance only:** `class D : B`, `virtual`, `super`, `protected`; no multiple inheritance, abstract classes or destructors.
+* **Single inheritance only:** `class D : B`, `virtual`, `abstract`, `override`, `final`, `super`, `protected`; no multiple inheritance, interfaces (an abstract class with only abstract methods does the job) or destructors.
 * **`new` / `alloc` never free** (a bump allocator); `malloc` / `free` of the C library do.
 * **Light type checking:** pointer types convert freely; this is a systems language in the C
   tradition. Syntax errors, undeclared names, wrong argument counts, private access and similar

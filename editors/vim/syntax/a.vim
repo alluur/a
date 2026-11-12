@@ -4,14 +4,14 @@ if exists("b:current_syntax") | finish | endif
 
 
 syn keyword aConditional if else switch case default
-syn keyword aRepeat      while do for
+syn keyword aRepeat      while do for foreach
 syn keyword aStatement   break continue return
 syn keyword aStructure   struct class enum
 syn keyword aStorage     const static typedef union asm double float defer goto extern
-syn keyword aAccess      public private protected virtual super
+syn keyword aAccess      public private protected virtual super abstract override final
 syn keyword aModule      module import a_module a_import
 syn keyword aType        int long char byte bool void func
-syn keyword aOperatorKw  new sizeof asm
+syn keyword aOperatorKw  new sizeof asm is as static_assert
 syn keyword aSelf        this
 syn keyword aBoolean     true false
 syn keyword aNull        null

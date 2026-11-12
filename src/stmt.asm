@@ -13,6 +13,14 @@ loop_push:
     cmp eax, MAXLOOP
     jae .full
     inc dword [loop_sp]
+    mov edx, eax
+    ; a label in front of the statement ("outer: for (...)") names this loop for  break outer;  continue outer;
+    mov rcx, [stmt_lbl_ptr]
+    mov [loop_lbl_ptr + rdx*8], rcx
+    mov ecx, [stmt_lbl_len]
+    mov [loop_lbl_len + rdx*4], ecx
+    mov qword [stmt_lbl_ptr], 0
+    mov dword [stmt_lbl_len], 0
     shl rax, 5
     add rax, loop_stack
     mov qword [rax], 0
@@ -105,6 +113,12 @@ emit_defers:
 
 parse_stmt:
     STACKCHK
+    mov rax, [pend_lbl_ptr]             ; the label (if any) that stands directly in front of this statement
+    mov [stmt_lbl_ptr], rax
+    mov eax, [pend_lbl_len]
+    mov [stmt_lbl_len], eax
+    mov qword [pend_lbl_ptr], 0
+    mov dword [pend_lbl_len], 0
     mov eax, [tk]
     cmp eax, '{'
     je parse_block
@@ -116,6 +130,8 @@ parse_stmt:
     je parse_do
     cmp eax, K_FOR
     je parse_for
+    cmp eax, K_FOREACH
+    je parse_foreach
     cmp eax, K_RETURN
     je parse_return
     cmp eax, K_EXTERN
@@ -146,6 +162,10 @@ parse_stmt:
     je parse_asm_stmt
     cmp eax, T_ID
     jne .notlabel
+    mov rdi, w_static_assert
+    call tk_is_word
+    test eax, eax
+    jnz parse_static_assert
     mov rax, [tk_ptr]
     mov [lbl_tmp], rax
     mov eax, [tk_len]
@@ -173,6 +193,10 @@ parse_stmt:
     call next_token                     ; past ':'
     cmp qword [tk], '}'
     je .lblend
+    mov rax, [lbl_tmp]
+    mov [pend_lbl_ptr], rax
+    mov eax, [lbl_tlen]
+    mov [pend_lbl_len], eax
     jmp parse_stmt
 .lblend:
     ret
@@ -398,8 +422,56 @@ parse_return:
     CG jmp_chain
     ret
 
+; find_loop_label: rsi = name, edx = length -> rax = the record of the innermost loop or switch that has this label (0 = none)
+find_loop_label:
+    mov ecx, [loop_sp]
+.l:
+    test ecx, ecx
+    jz .none
+    dec ecx
+    cmp [loop_lbl_len + rcx*4], edx
+    jne .l
+    mov rdi, [loop_lbl_ptr + rcx*8]
+    test rdi, rdi
+    jz .l
+    push rsi
+    push rcx
+    mov r8d, edx
+    mov r9, rsi
+    mov rsi, r9
+    mov ecx, r8d
+    repe cmpsb
+    pop rcx
+    pop rsi
+    jne .l
+    mov rax, rcx
+    shl rax, 5
+    add rax, loop_stack
+    ret
+.none:
+    xor eax, eax
+    ret
+
 parse_break:
     call next_token
+    cmp qword [tk], T_ID
+    jne .plain
+    mov rsi, [tk_ptr]
+    mov edx, [tk_len]
+    call find_loop_label
+    test rax, rax
+    jnz .lab1
+    mov edi, msg_nolabel
+    call fatal_error_tok
+.lab1:
+    push rax
+    call next_token
+    mov edi, ';'
+    call expect
+    pop rdi
+    CG jmp_chain
+    ret
+.plain:
     mov edi, ';'
     call expect
     mov eax, [loop_sp]
@@ -416,6 +488,28 @@ parse_break:
 
 parse_continue:
     call next_token
+    cmp qword [tk], T_ID
+    jne .plain
+    mov rsi, [tk_ptr]
+    mov edx, [tk_len]
+    call find_loop_label
+    test rax, rax
+    jnz .lab1
+    mov edi, msg_nolabel
+    call fatal_error_tok
+.lab1:
+    mov rdx, rax
+    cmp qword [rdx+24], 0
+    je .lab2
+    ERR "'continue' needs a loop, this label is on a switch"
+.lab2:
+    push rdx
+    call next_token
+    mov edi, ';'
+    call expect
+    pop rdx
+    jmp .target
+.plain:
     mov edi, ';'
     call expect
     mov eax, [loop_sp]
@@ -430,6 +524,7 @@ parse_continue:
     add rdx, loop_stack
     cmp qword [rdx+24], 0
     jne .find
+.target:
     cmp qword [rdx+16], 0
     je .chain
     mov rdi, [rdx+16]
@@ -438,122 +533,6 @@ parse_continue:
 .chain:
     lea rdi, [rdx+8]
     CG jmp_chain
-    ret
-
-; ---- switch ------------------------------------------------------------------------
-; switch (expr) { case C: ... default: ... }
-; The value is kept in a hidden local; the case comparisons are emitted after
-; the body and jump back into it.
-parse_switch:
-    push rbx
-    push r12
-    push r13
-    push r14
-    push r15
-    call next_token
-    mov edi, '('
-    call expect
-    call parse_expr
-    call to_rvalue
-    mov edi, ')'
-    call expect
-    add dword [frame_size], 8
-    mov ebx, [frame_size]
-    neg rbx
-    mov edi, ebx
-    CG store_local_a
-    xor edi, edi
-    mov esi, 1
-    call loop_push
-    mov r12, rax
-    mov r13d, [case_sp]
-    push 0
-    push 0
-    mov rdi, rsp
-    CG jmp_chain
-    mov edi, '{'
-    call expect
-    mov r14d, [sym_count]
-.items:
-    mov eax, [tk]
-    cmp eax, '}'
-    je .done
-    cmp eax, K_CASE
-    je .case
-    cmp eax, K_DEFAULT
-    je .default
-    cmp eax, T_EOF
-    jne .stmt
-    ERR "unexpected end of file in switch"
-.stmt:
-    call parse_stmt
-    jmp .items
-.case:
-    call next_token
-    call const_expr
-    mov r15, rax
-    mov edi, ':'
-    call expect
-    mov eax, [case_sp]
-    cmp eax, 1024
-    jb .c1
-    ERR "too many case labels"
-.c1:
-    inc dword [case_sp]
-    mov [case_val+rax*8], r15
-    mov rcx, [code_pos]
-    mov [case_pos+rax*8], rcx
-    jmp .items
-.default:
-    call next_token
-    mov edi, ':'
-    call expect
-    cmp qword [rsp+8], 0
-    je .d1
-    ERR "duplicate 'default' label"
-.d1:
-    mov rax, [code_pos]
-    mov [rsp+8], rax
-    jmp .items
-.done:
-    call next_token
-    mov [sym_count], r14d
-    ; end of the body falls out of the switch
-    mov rdi, r12
-    CG jmp_chain
-    ; dispatch code
-    pop rdi
-    call patch_here
-    mov r15d, r13d
-.disp:
-    cmp r15d, [case_sp]
-    jae .nomore
-    mov edi, ebx
-    mov rsi, [case_val+r15*8]
-    mov rdx, [case_pos+r15*8]
-    CG case_jump
-    inc r15d
-    jmp .disp
-.nomore:
-    pop rax
-    test rax, rax
-    jz .nodef
-    mov rdi, rax
-    CG jmp_back
-    jmp .end
-.nodef:
-    mov rdi, r12
-    CG jmp_chain
-.end:
-    mov rdi, [r12]
-    call patch_here
-    mov [case_sp], r13d
-    call loop_pop
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop rbx
     ret
 
 ; ---- local declarations ------------------------------------------------------------
@@ -566,8 +545,11 @@ parse_local_decl:
     call parse_type
     mov r12, rax
     cmp rax, TY_VOID
-    jne .decl
+    jne .decl0
     ERR "a variable cannot have type void"
+.decl0:
+    mov rdi, rax
+    call check_concrete                 ; no variables of an abstract class
 .decl:
     cmp qword [tk], T_ID
     je .d1
@@ -594,6 +576,12 @@ parse_local_decl:
     imul rax, r15
     add rbx, TY_PTR1
     bts rbx, TF_ARRAY_BIT
+    push rax
+    mov rdi, rbx
+    mov rsi, r15
+    call type_with_len
+    mov rbx, rax
+    pop rax
     jmp .size
 .scalar:
     mov qword [init_count], 0
@@ -828,6 +816,8 @@ parse_static_local:
     push r15
     call parse_type
     mov r12, rax                        ; element type
+    mov rdi, rax
+    call check_concrete
     cmp qword [tk], T_ID
     je .name
     ERR "expected a variable name"
@@ -852,6 +842,10 @@ parse_static_local:
     call expect
     add rbx, TY_PTR1
     bts rbx, TF_ARRAY_BIT
+    mov rdi, rbx
+    mov rsi, r14
+    call type_with_len
+    mov rbx, rax
     mov rdi, r12
     call type_size
     imul rax, r14
@@ -1030,7 +1024,7 @@ init_elem:
     ERR "an array is initialized with a {...} list (or a string for a char array)"
 .str:
     mov rax, rbx
-    btr rax, TF_ARRAY_BIT
+    TY_DECAY rax
     sub rax, TY_PTR1
     cmp rax, TY_CHAR
     je .s1
@@ -1210,7 +1204,7 @@ init_local_list:
     push rcx
     push rdi
     push rsi
-    btr rdi, TF_ARRAY_BIT
+    TY_DECAY rdi
     sub rdi, TY_PTR1
     call type_size
     mov r8, rax
@@ -1230,7 +1224,7 @@ init_local_list:
     jmp .sloop
 .array:
     mov r15, rbx
-    btr r15, TF_ARRAY_BIT
+    TY_DECAY r15
     sub r15, TY_PTR1
     mov rdi, r15
     call type_size
@@ -1427,6 +1421,69 @@ parse_typedef_enum:
     mov edi, ';'
     call expect
 .out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ---- static_assert(condition, "message");   checked while compiling, at top level, in classes and in function bodies
+section .rodata
+w_static_assert: db "static_assert", 0
+CSTR msg_nolabel, "no enclosing loop or switch has the label"
+CSTR msg_assert, "static assertion failed"
+section .text
+
+parse_static_assert:
+    push rbx
+    push r12
+    push r13
+    mov r12, [tk_start]
+    mov r13, [tk_line]
+    call next_token
+    mov edi, '('
+    call expect
+    call const_expr
+    mov rbx, rax
+    mov byte [assertbuf], 0
+    cmp qword [tk], ','
+    jne .nomsg
+    call next_token
+    cmp qword [tk], T_STR
+    je .msg
+    ERR "static_assert: the message must be a text in quotes"
+.msg:
+    ; "static assertion failed: " + the message (cut at 400 bytes)
+    mov rdi, assertbuf
+    mov rsi, msg_assert
+    call cstr_copy
+    mov byte [rdi], ':'
+    mov byte [rdi+1], ' '
+    add rdi, 2
+    mov rsi, [tk_ptr]
+    mov rcx, [tk_len]
+    cmp rcx, 400
+    jbe .cp
+    mov ecx, 400
+.cp:
+    rep movsb
+    mov byte [rdi], 0
+    call next_token
+.nomsg:
+    mov edi, ')'
+    call expect
+    mov edi, ';'
+    call expect
+    test rbx, rbx
+    jnz .ok
+    mov [tk_start], r12                 ; the error points at the static_assert
+    mov [tk_line], r13
+    mov edi, assertbuf
+    cmp byte [assertbuf], 0
+    jne .fail
+    mov edi, msg_assert
+.fail:
+    jmp fatal_error
+.ok:
     pop r13
     pop r12
     pop rbx

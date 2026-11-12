@@ -2301,8 +2301,16 @@ candbuf:        resb 2048
 maindirbuf:     resb 1024
 outnamebuf:     resb 1024
 loop_stack:     resb MAXLOOP * 32
-case_val:       resq 1024
-case_pos:       resq 1024
+case_val:       resq CASE_MAX            ; per label: the value (the low end of a range) or the data offset of a text
+case_hi:        resq CASE_MAX            ; the high end of a range (or of a single value)
+case_pos:       resq CASE_MAX            ; code position of the statements that follow the label
+case_key:       resq CASE_MAX            ; sort key: the value / the FNV-1a hash of the text
+case_ord:       resd CASE_MAX            ; labels in key order (while the dispatch code is made)
+sw_def:         resq 1
+sw_rec:         resq 1
+sw_text:        resd 1
+sw_vslot:       resd 1
+sw_sval:        resd 1
 ptmp_type:      resq MAXPARAM
 ptmp_def:       resq MAXPARAM
 ptmp_name:      resq MAXPARAM
@@ -2371,6 +2379,18 @@ cur_va_cnt:     resd 1
 agg_vis:        resd 1
 agg_union:      resd 1
 agg_virtual:    resd 1
+agg_cmods:      resd 1                  ; SF_ABSTRACT / SF_FINAL written before 'class'
+agg_mflags:     resd 1                  ; modifiers of the member being parsed: 1 static, 2 abstract, 4 override, 8 final
+cur_static:     resd 1                  ; compiling a static method
+any_static:     resd 1                  ; the program has declared a static field
+pend_lbl_ptr:   resq 1                 ; a label that stands directly in front of the next statement
+pend_lbl_len:   resd 1
+stmt_lbl_ptr:   resq 1                  ; the label of the statement being parsed (taken by loop_push)
+stmt_lbl_len:   resd 1
+loop_lbl_ptr:   resq MAXLOOP            ; per loop / switch record: its label
+loop_lbl_len:   resd MAXLOOP
+assertbuf:      resb 512
+st_flags:       resd STRUCT_MAX         ; SF_* of every class
 in_amodule:     resd 1
 need_float:     resd 1
 float_entry:    resq 1
