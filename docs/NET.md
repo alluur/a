@@ -248,7 +248,7 @@ behind a TLS terminating proxy. On AOS blocks over 128 KiB are never reused addr
   `tests/net.sh`-style clients against `hub_demo`), and a `wshub` is one thread: while it computes a handshake it serves nobody else. Plain `ws://` and `http://` ports are not affected;
   for many new `wss://` connections per second put a TLS terminating proxy in front.
 * **permessage-deflate.** Receiving is complete (every parameter, context takeover, dynamic and fixed blocks). Our compressor writes fixed Huffman blocks with a hash chain match finder and never
-  keeps its window between messages, so it compresses less than zlib (text usually to 30 to 50 percent) but every peer accepts it.
+  keeps its window between messages, so it compresses a little less than zlib (measured: English and source text of 13 to 126 KB came out at 30 to 55 percent of their size, zlib level 6 at 25 to 44 percent) but every peer accepts it.
 * **HTTP.** HTTP/1.0 and 1.1 only (no HTTP/2, no h2c upgrade, no proxies, no `CONNECT`, no trailers in answers). The client does not keep a cache. `Expect` values other than `100-continue` are ignored.
   Method names are compared as they come (`get` is not `GET`).
 * **JSON-RPC.** The server cannot call the client over the connection it came in on; messages that the server sends on its own arrive in `onNotification` of the client.
