@@ -36,7 +36,17 @@ public const TYPE_HASH = 3;
 public const TYPE_SET = 4;
 public const TYPE_ZSET = 5;
 
-private const ENT_OVERHEAD = 56;
+// Memory accounting: what a block really takes from the heap. cstdlib rounds every block up to a power of two (16 bytes at least) and gives it a
+// 16-byte header; malloc_usable_size is the rounded size, so counting a block when it is made and when it is freed always matches. Plus a share
+// of the hash table (a slot or two per entry). The total (store->used) is what maxMemory is compared with.
+private const SLOT_SHARE = 16;
+private const HT_BASE = 96;                 // a table's own struct and its first slots
+private const ZBLK = 256;                   // members in one block of a sorted set
+
+private int bc(char* p) {
+    if (p == null) return 0;
+    return malloc_usable_size(p) + 16;
+}
 
 // ---- the command table --------------------------------------------------------------------------------------------------------------
 private const NCMD = 90;
@@ -112,7 +122,7 @@ class Ht {
         e->next = tab[s];
         tab[s] = e;
         count++;
-        *acct = *acct + ENT_OVERHEAD + n;
+        *acct = *acct + bc((char*) e) + bc(e->key) + SLOT_SHARE;
         *created = true;
         return e;
     }
@@ -138,7 +148,7 @@ class Ht {
     }
 
     public void release(Ent* e) {
-        *acct = *acct - ENT_OVERHEAD - e->klen;
+        *acct = *acct - bc((char*) e) - bc(e->key) - SLOT_SHARE;
         free(e->key);
         free((char*) e);
         if (cap > 64 && count < cap / 8) resize(cap / 2);
@@ -174,9 +184,10 @@ class Value {
     public int cap;
     public Ht* ht;                      // hash fields or set members
     public Ht* zmem;                    // sorted set: member -> score (in num)
-    public Ent** zord;                  // ... and the members in order
-    public int zn;
-    public int zcap;
+    public Ent*** zb;                   // ... and the members in order: blocks of up to ZBLK members (an insert moves at most one block)
+    public int* zbn;                    // members in each block
+    public int nzb;                     // blocks in use (the arrays zb / zbn have room for the next power of two of them)
+    public int zn;                      // members
 }
 
 class QCmd {
@@ -196,6 +207,9 @@ public class Rclient {
     public bool dirty;                  // a command failed while queueing: EXEC is refused
     public bool closing;                // QUIT or a protocol error: close after the replies
     public bool evict;                  // a reply did not fit into the output queue
+    public bool paused;                 // too much output is unsent: the next command (and the bytes behind it) wait until resume()
+    public netio.Queue pendIn;          // the bytes that wait while paused
+    public int pushMax;                 // the limit of the output queue for what is pushed to the client (pub/sub); a reply may use up to replyLimit()
     public char* cookie;                // the transport's (netsrv connection)
     public int id;
     public QCmd** queued;
@@ -235,7 +249,10 @@ public class Store {
     public int maxQueued;
     public int maxSubs;
     public int maxMemory;
-    public int maxOut;                  // bytes queued for one client (the sans-IO clients; netsrv has its own setting)
+    public int maxOut;                  // bytes waiting for one client because messages are pushed to it (pub/sub): over it the subscriber is cut off. Default 16 MiB
+    public int maxReply;                // the most one client's output queue may hold for replies, 0: automatic (outHigh + maxMemory + maxBulk + 64 KiB, the most a
+                                        // reasonable reply can be); a command whose reply goes beyond it (MGET of the same big key a thousand times) cuts the client off
+    public int outHigh;                 // while this many bytes of replies are unsent the client's next command waits (backpressure), default 1 MiB; 0: never
     public int used;                    // bytes of data (approximate: keys, values and entries)
     public int now;                     // the clock in ms
     public Stats* stats;
@@ -259,6 +276,7 @@ public class Store {
         maxSubs = 1000;
         maxMemory = 67108864;
         maxOut = 16777216;
+        outHigh = 1048576;
         stats = new Stats();
         nextId = 1;
         now = millis();
@@ -278,6 +296,8 @@ public class Store {
         c->parser->maxInline = maxInline;
         c->out = &c->ownOut;
         c->ownOut.max = maxOut;
+        c->pushMax = maxOut;
+        c->pendIn.max = 1048576;
         c->authed = requirepass == null;
         c->id = nextId;
         nextId++;
@@ -310,13 +330,14 @@ public class Store {
         if (c->queued != null) free((char*) c->queued);
         c->parser->dispose();
         c->ownOut.release();
+        c->pendIn.release();
         free((char*) c);
     }
 
     private void dropQueue(Rclient* c) {
         for (int i = 0; i < c->nqueued; i++) {
             QCmd* q = c->queued[i];
-            used = used - q->argc * 16 - 32;
+            used = used - bc((char*) q) - bc(q->blob) - bc((char*) q->offs) - bc((char*) q->lens);
             free(q->blob);
             free((char*) q->offs);
             free((char*) q->lens);
@@ -358,13 +379,14 @@ public class Store {
     private void freeBytes(int n) { used = used - n; }
 
     private void freeValue(Value* v) {
-        if (v->s != null) { free(v->s); used = used - v->slen; }
+        if (v->s != null) { used = used - bc(v->s); free(v->s); }
         if (v->items != null) {
             for (int i = 0; i < v->count; i++) {
                 int at = (v->head + i) % v->cap;
-                used = used - v->ilens[at] - 16;
+                used = used - bc(v->items[at]);
                 free(v->items[at]);
             }
+            used = used - bc((char*) v->items) - bc((char*) v->ilens);
             free((char*) v->items);
             free((char*) v->ilens);
         }
@@ -374,15 +396,20 @@ public class Store {
             for (;;) {
                 e = v->ht->nextEnt(e, &pos);
                 if (e == null) break;
-                if (e->val != null) { free(e->val); used = used - e->vlen; }
+                if (e->val != null) { used = used - bc(e->val); free(e->val); }
             }
             freeHt(v->ht);
         }
         if (v->zmem != null) {
             freeHt(v->zmem);
-            if (v->zord != null) { free((char*) v->zord); used = used - v->zcap * 8; }
+            for (int i = 0; i < v->nzb; i++) { used = used - bc((char*) v->zb[i]); free((char*) v->zb[i]); }
+            if (v->zb != null) {
+                used = used - bc((char*) v->zb) - bc((char*) v->zbn);
+                free((char*) v->zb);
+                free((char*) v->zbn);
+            }
         }
-        used = used - 64;
+        used = used - bc((char*) v);
         free((char*) v);
     }
 
@@ -392,13 +419,14 @@ public class Store {
             Ent* x = h->tab[i];
             while (x != null) {
                 Ent* nx = x->next;
-                used = used - ENT_OVERHEAD - x->klen;
+                used = used - bc((char*) x) - bc(x->key) - SLOT_SHARE;
                 free(x->key);
                 free((char*) x);
                 x = nx;
             }
         }
         if (h->tab != null) free((char*) h->tab);
+        used = used - bc((char*) h) - HT_BASE;
         free((char*) h);
     }
 
@@ -438,17 +466,17 @@ public class Store {
         Value* v = (Value*) malloc(sizeof(Value));
         v->type = type;
         e->val = (char*) v;
-        used = used + 64;
+        used = used + bc((char*) v);
         return v;
     }
 
     private void setString(Value* v, char* d, int n) {
         char* ns = malloc(n + 1);
         memcpy(ns, d, n);
-        if (v->s != null) { free(v->s); used = used - v->slen; }
+        if (v->s != null) { used = used - bc(v->s); free(v->s); }
         v->s = ns;
         v->slen = n;
-        used = used + n;
+        used = used + bc(ns);
     }
 
     private void setExpire(Rclient* c, Value* v, int at) {
@@ -527,26 +555,65 @@ public class Store {
         return feedAt(c, d, n);
     }
 
+    // the most a command's replies may add to a client's output queue
+    public int replyLimit() {
+        if (maxReply > 0) return maxReply;
+        int lim = outHigh + maxMemory + maxBulk + 65536;
+        return lim > 0 ? lim : 2147483647;
+    }
+
     // the same with the clock as it is (tests set it with setClock)
     public int feedAt(Rclient* c, char* d, int n) {
+        if (c->paused) {
+            // the transport should not feed a paused client (netsrv does not read it); if bytes come anyway they wait in order
+            if (!c->pendIn.add(d, n)) { c->evict = true; stats->evicted++; return -1; }
+            return 0;
+        }
         int off = 0;
-        while (off < n) {
-            int used2 = c->parser->feed(&d[off], n - off);
-            off = off + used2;
-            if (c->parser->error != 0) {
-                char msg[100];
-                format(&msg[0], 100, "ERR %s", redis.errorText(c->parser->error), 0, 0, 0);
-                err(c, &msg[0]);
-                c->closing = true;
-                return -1;
+        while (off < n || c->parser->ready) {
+            if (!c->parser->ready) {
+                int used2 = c->parser->feed(&d[off], n - off);
+                off = off + used2;
+                if (c->parser->error != 0) {
+                    char msg[100];
+                    format(&msg[0], 100, "ERR %s", redis.errorText(c->parser->error), 0, 0, 0);
+                    err(c, &msg[0]);
+                    c->closing = true;
+                    return -1;
+                }
             }
             if (c->parser->ready) {
+                if (outHigh > 0 && c->out->pending() >= outHigh) {
+                    // Backpressure: the client has not taken its replies yet. The command stays in the parser, the bytes behind it are kept, nothing is run
+                    // (and netsrv reads nothing more from the connection) until the output has drained and resume() is called.
+                    if (off < n && !c->pendIn.add(&d[off], n - off)) { c->evict = true; stats->evicted++; return -1; }
+                    c->paused = true;
+                    return 0;
+                }
                 run(c, c->parser->argc(), c->parser);
                 c->parser->clear();
                 if (c->closing || c->evict) return -1;
             }
         }
         return 0;
+    }
+
+    // The output of a paused client has drained: runs the command that waited and the bytes behind it (it can pause again). < 0: close the connection.
+    public int resume(Rclient* c) {
+        if (!c->paused) return 0;
+        c->paused = false;
+        now = millis();
+        int n = c->pendIn.pending();
+        char* tmp = null;
+        if (n > 0) {
+            tmp = malloc(n);
+            if (tmp == null) { c->evict = true; stats->evicted++; return -1; }
+            memcpy(tmp, c->pendIn.data(), n);
+            c->pendIn.clear();
+        }
+        int r = feedAt(c, tmp == null ? "" : tmp, n);
+        if (tmp != null) free(tmp);
+        return r;
     }
 
     private void run(Rclient* c, int argc, redis.CmdParser* p) {
@@ -573,6 +640,12 @@ public class Store {
 
     // Runs one command (argv[0] is the name). The reply goes to c->out.
     public void exec(Rclient* c, int argc, char** argv, int* lens) {
+        c->out->max = replyLimit();                 // replies may be big; what is pushed to a client (pub/sub) is held to pushMax (restored below)
+        exec1(c, argc, argv, lens);
+        c->out->max = c->pushMax;
+    }
+
+    private void exec1(Rclient* c, int argc, char** argv, int* lens) {
         int ci = cmdIndex(argv[0], lens[0]);
         // authentication
         if (!c->authed && !(ci >= 0 && (streq(cmdNames[ci], "auth") || streq(cmdNames[ci], "quit")))) {
@@ -601,7 +674,7 @@ public class Store {
         int flags = cmdFlags[ci];
         if (c->inSubMode() && (flags & 2) == 0) {
             char msg[200];
-            format(&msg[0], 200, "ERR Can't execute '%s': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", cmdNames[ci], 0, 0, 0);
+            format(&msg[0], 200, "ERR Can't execute '%s': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", cmdNames[ci], 0, 0, 0);
             err(c, &msg[0]);
             return;
         }
@@ -624,7 +697,7 @@ public class Store {
     private bool queueCmd(Rclient* c, int argc, char** argv, int* lens) {
         int total = 0;
         for (int i = 0; i < argc; i++) total = total + lens[i] + 1;
-        if (used + total > maxMemory) return false;
+        if (used + total + 2 * argc * 8 + 160 > maxMemory) return false;
         QCmd* q = (QCmd*) malloc(sizeof(QCmd));
         q->argc = argc;
         q->blob = malloc(total + 1);
@@ -642,7 +715,7 @@ public class Store {
         if (c->nqueued >= c->qcap) { free(q->blob); free((char*) q->offs); free((char*) q->lens); free((char*) q); return false; }
         c->queued[c->nqueued] = q;
         c->nqueued++;
-        used = used + argc * 16 + 32;
+        used = used + bc((char*) q) + bc(q->blob) + bc((char*) q->offs) + bc((char*) q->lens);
         return true;
     }
 
@@ -738,14 +811,47 @@ public class Store {
             return;
         }
         if (streq(name, "expire") || streq(name, "pexpire")) {
+            bool secs = streq(name, "expire");
             int t = 0;
             if (!redis.parseInt(a[2], l[2], &t)) { notInt(c); return; }
+            bool nx = false;
+            bool xx = false;
+            bool gt = false;
+            bool lt = false;
+            for (int i = 3; i < argc; i++) {
+                if (streqi(a[i], "nx")) nx = true;
+                else if (streqi(a[i], "xx")) xx = true;
+                else if (streqi(a[i], "gt")) gt = true;
+                else if (streqi(a[i], "lt")) lt = true;
+                else {
+                    char msg[100];
+                    int sn = l[i] > 40 ? 40 : l[i];
+                    char shown[48];
+                    memcpy(&shown[0], a[i], sn);
+                    shown[sn] = 0;
+                    format(&msg[0], 100, "ERR Unsupported option %s", &shown[0], 0, 0, 0);
+                    err(c, &msg[0]);
+                    return;
+                }
+            }
+            if (nx && (xx || gt || lt)) { err(c, "ERR NX and XX, GT or LT options at the same time are not compatible"); return; }
+            if (gt && lt) { err(c, "ERR GT and LT options at the same time are not compatible"); return; }
+            // the time is checked before the key is looked at (Redis does too): an absurd time is an error even for a key that does not exist
+            if (secs) {
+                if (t > 9223372036854775 || t < -9223372036854775) { err(c, "ERR invalid expire time in 'expire' command"); return; }
+                t = t * 1000;
+            }
+            if (t > 9223372036854775807 - now) { err(c, secs ? "ERR invalid expire time in 'expire' command" : "ERR invalid expire time in 'pexpire' command"); return; }
+            int when = now + t;
             Value* v = lookup(c, a[1], l[1]);
             if (v == null) { num(c, 0); return; }
-            if (t > 4000000000000000 || t < -4000000000000000 || (streq(name, "expire") && (t > 4000000000000 || t < -4000000000000))) { err(c, "ERR invalid expire time in 'expire' command"); return; }
-            if (streq(name, "expire")) t = t * 1000;
-            if (t <= 0) { removeKey(db(c->db), a[1], l[1]); num(c, 1); return; }
-            setExpire(c, v, now + t);
+            int cur = v->expireAt;                          // 0: none
+            if (nx && cur != 0) { num(c, 0); return; }
+            if (xx && cur == 0) { num(c, 0); return; }
+            if (gt && (cur == 0 || when <= cur)) { num(c, 0); return; }
+            if (lt && cur != 0 && when >= cur) { num(c, 0); return; }
+            if (when <= now) { removeKey(db(c->db), a[1], l[1]); num(c, 1); return; }
+            setExpire(c, v, when);
             num(c, 1);
             return;
         }
@@ -782,8 +888,13 @@ public class Store {
         }
         if (streq(name, "setex") || streq(name, "psetex")) {
             int t = 0;
-            if (!redis.parseInt(a[2], l[2], &t) || t <= 0 || t > 4000000000000000 || (streq(name, "setex") && t > 4000000000000)) { err(c, "ERR invalid expire time in 'setex' command"); return; }
-            if (streq(name, "setex")) t = t * 1000;
+            bool secs = streq(name, "setex");
+            if (!redis.parseInt(a[2], l[2], &t)) { notInt(c); return; }
+            if (t <= 0 || t > 4000000000000000 || (secs && t > 4000000000000)) {
+                err(c, secs ? "ERR invalid expire time in 'setex' command" : "ERR invalid expire time in 'psetex' command");
+                return;
+            }
+            if (secs) t = t * 1000;
             Value* v = create(c, a[1], l[1], TYPE_STRING);
             setString(v, a[3], l[3]);
             setExpire(c, v, now + t);
@@ -804,7 +915,7 @@ public class Store {
             if (streq(name, "decr")) by = -1;
             if (streq(name, "incrby") || streq(name, "decrby")) {
                 if (!redis.parseInt(a[2], l[2], &by)) { notInt(c); return; }
-                if (streq(name, "decrby")) { if (by == -9223372036854775807 - 1) { notInt(c); return; } by = -by; }
+                if (streq(name, "decrby")) { if (by == -9223372036854775807 - 1) { err(c, "ERR decrement would overflow"); return; } by = -by; }
             }
             incr(c, a[1], l[1], by);
             return;
@@ -819,12 +930,19 @@ public class Store {
                 return;
             }
             if (v->slen + l[2] > maxBulk * 2) { err(c, "ERR string exceeds maximum allowed size"); return; }
-            char* ns = malloc(v->slen + l[2] + 1);
-            memcpy(ns, v->s, v->slen);
-            memcpy(&ns[v->slen], a[2], l[2]);
-            free(v->s);
-            used = used + l[2];
-            v->s = ns;
+            // the block of a string is as big as its size class: appending to it in place costs only the new bytes, and when it is full the new block
+            // is the next class (twice as big), so n appends cost O(n) in all (copying the whole value every time made them O(n squared))
+            if (v->slen + l[2] + 1 <= malloc_usable_size(v->s)) {
+                memcpy(&v->s[v->slen], a[2], l[2]);
+                v->s[v->slen + l[2]] = 0;
+            } else {
+                char* ns = malloc(v->slen + l[2] + 1);
+                memcpy(ns, v->s, v->slen);
+                memcpy(&ns[v->slen], a[2], l[2]);
+                used = used - bc(v->s) + bc(ns);
+                free(v->s);
+                v->s = ns;
+            }
             v->slen = v->slen + l[2];
             num(c, v->slen);
             return;
@@ -888,7 +1006,7 @@ public class Store {
                 while (x != null) {
                     Ent* nx = x->next;
                     freeValue((Value*) x->val);
-                    used = used - ENT_OVERHEAD - x->klen;
+                    used = used - bc((char*) x) - bc(x->key) - SLOT_SHARE;
                     free(x->key);
                     free((char*) x);
                     x = nx;
@@ -946,30 +1064,45 @@ public class Store {
         bool nx = false;
         bool xx = false;
         bool keepTtl = false;
-        int ttl = 0;
+        bool get = false;
+        int exIdx = 0;                              // the argument that holds the time, 0: none
+        bool seconds = false;
         for (int i = 3; i < argc; i++) {
             char* o = a[i];
-            if (streqi(o, "nx")) nx = true;
-            else if (streqi(o, "xx")) xx = true;
-            else if (streqi(o, "keepttl")) keepTtl = true;
-            else if ((streqi(o, "ex") || streqi(o, "px")) && i + 1 < argc) {
-                int t = 0;
-                if (!redis.parseInt(a[i + 1], l[i + 1], &t)) { notInt(c); return; }
-                if (t <= 0 || t > 4000000000000000 || (streqi(o, "ex") && t > 4000000000000)) { err(c, "ERR invalid expire time in 'set' command"); return; }
-                if (streqi(o, "ex")) t = t * 1000;
-                ttl = t;
+            if (streqi(o, "nx") && !xx) nx = true;
+            else if (streqi(o, "xx") && !nx) xx = true;
+            else if (streqi(o, "get")) get = true;
+            else if (streqi(o, "keepttl") && exIdx == 0) keepTtl = true;
+            else if ((streqi(o, "ex") || streqi(o, "px")) && !keepTtl && (exIdx == 0 || seconds == streqi(o, "ex")) && i + 1 < argc) {
+                seconds = streqi(o, "ex");                  // EX twice is fine (the last one counts), EX with PX is not
+                exIdx = i + 1;
                 i++;
             } else { syntax(c); return; }
         }
-        if ((nx && xx) || (keepTtl && ttl != 0)) { syntax(c); return; }
+        int ttl = 0;
+        if (exIdx != 0) {
+            int t = 0;
+            if (!redis.parseInt(a[exIdx], l[exIdx], &t)) { notInt(c); return; }
+            if (t <= 0 || t > 4000000000000000 || (seconds && t > 4000000000000)) { err(c, "ERR invalid expire time in 'set' command"); return; }
+            if (seconds) t = t * 1000;
+            ttl = t;
+        }
         Value* v = lookup(c, a[1], l[1]);
-        if ((nx && v != null) || (xx && v == null)) { nil(c); return; }
+        if (get) {
+            // the old value is the reply, also when NX / XX stop the write
+            if (v != null && v->type != TYPE_STRING) { wrongType(c); return; }
+            if (v == null) nil(c); else bulk(c, v->s, v->slen);
+        }
+        if ((nx && v != null) || (xx && v == null)) {
+            if (!get) nil(c);
+            return;
+        }
         int keep = (v != null && keepTtl) ? v->expireAt : 0;
         Value* nv = create(c, a[1], l[1], TYPE_STRING);
         setString(nv, a[2], l[2]);
         if (ttl != 0) setExpire(c, nv, now + ttl);
         else if (keep != 0) setExpire(c, nv, keep);
-        ok(c);
+        if (!get) ok(c);
     }
 
     private void incr(Rclient* c, char* k, int kn, int by) {
@@ -1105,6 +1238,7 @@ public class Store {
             char** ni = (char**) malloc(nc * 8);
             int* nl = (int*) malloc(nc * 8);
             for (int i = 0; i < v->count; i++) { int at = (v->head + i) % v->cap; ni[i] = v->items[at]; nl[i] = v->ilens[at]; }
+            used = used - bc((char*) v->items) - bc((char*) v->ilens) + bc((char*) ni) + bc((char*) nl);
             if (v->items != null) { free((char*) v->items); free((char*) v->ilens); }
             v->items = ni;
             v->ilens = nl;
@@ -1118,7 +1252,7 @@ public class Store {
         v->items[at] = copy;
         v->ilens[at] = n;
         v->count++;
-        used = used + n + 16;
+        used = used + bc(copy);
     }
 
     private void listCmd(Rclient* c, char* name, int argc, char** a, int* l) {
@@ -1131,21 +1265,29 @@ public class Store {
             return;
         }
         Value* v = lookup(c, a[1], l[1]);
-        if (v != null && v->type != TYPE_LIST) { wrongType(c); return; }
-        if (streq(name, "llen")) { num(c, v == null ? 0 : v->count); return; }
+        bool wrong = v != null && v->type != TYPE_LIST;
+        int cnt = 1;
+        int rs = 0;
+        int re = 0;
+        // arguments that are not numbers are an error before the type of the key matters (as in Redis)
         if (streq(name, "lpop") || streq(name, "rpop")) {
-            int cnt = 1;
             if (argc > 3) { syntax(c); return; }
             if (argc == 3) {
                 if (!redis.parseInt(a[2], l[2], &cnt) || cnt < 0) { err(c, "ERR value is out of range, must be positive"); return; }
             }
+        } else if (streq(name, "lrange")) {
+            if (!redis.parseInt(a[2], l[2], &rs) || !redis.parseInt(a[3], l[3], &re)) { notInt(c); return; }
+        }
+        if (wrong) { wrongType(c); return; }
+        if (streq(name, "llen")) { num(c, v == null ? 0 : v->count); return; }
+        if (streq(name, "lpop") || streq(name, "rpop")) {
             if (v == null) { if (argc == 3) redis.putNilArray(c->out); else nil(c); return; }
             int take = cnt < v->count ? cnt : v->count;
             if (argc == 3) arr(c, take);
             for (int i = 0; i < take; i++) {
                 int at = name[0] == 'l' ? v->head : (v->head + v->count - 1) % v->cap;
                 bulk(c, v->items[at], v->ilens[at]);
-                used = used - v->ilens[at] - 16;
+                used = used - bc(v->items[at]);
                 free(v->items[at]);
                 v->items[at] = null;
                 if (name[0] == 'l') v->head = (v->head + 1) % v->cap;
@@ -1158,15 +1300,16 @@ public class Store {
             int s = 0;
             int e = 0;
             if (streq(name, "lindex")) {
+                if (v == null) { nil(c); return; }                  // a key that is not there answers before the index is looked at
                 if (!redis.parseInt(a[2], l[2], &s)) { notInt(c); return; }
-                if (v == null) { nil(c); return; }
                 if (s < 0) s = s + v->count;
                 if (s < 0 || s >= v->count) { nil(c); return; }
                 int at = (v->head + s) % v->cap;
                 bulk(c, v->items[at], v->ilens[at]);
                 return;
             }
-            if (!redis.parseInt(a[2], l[2], &s) || !redis.parseInt(a[3], l[3], &e)) { notInt(c); return; }
+            s = rs;
+            e = re;
             if (v == null) { arr(c, 0); return; }
             if (s < 0) s = s + v->count;
             if (e < 0) e = e + v->count;
@@ -1187,6 +1330,7 @@ public class Store {
     private Ht* newHt() {
         Ht* h = (Ht*) malloc(sizeof(Ht));
         h->acct = &used;
+        used = used + bc((char*) h) + HT_BASE;
         return h;
     }
 
@@ -1203,10 +1347,10 @@ public class Store {
                 if (created) added++;
                 char* nv = malloc(l[i + 1] + 1);
                 memcpy(nv, a[i + 1], l[i + 1]);
-                if (e->val != null) { free(e->val); used = used - e->vlen; }
+                if (e->val != null) { used = used - bc(e->val); free(e->val); }
                 e->val = nv;
                 e->vlen = l[i + 1];
-                used = used + e->vlen;
+                used = used + bc(nv);
             }
             num(c, added);
             return;
@@ -1223,7 +1367,7 @@ public class Store {
             if (v != null) {
                 for (int i = 2; i < argc; i++) {
                     Ent* e = v->ht->detach(a[i], l[i]);
-                    if (e != null) { free(e->val); used = used - e->vlen; v->ht->release(e); n++; }
+                    if (e != null) { used = used - bc(e->val); free(e->val); v->ht->release(e); n++; }
                 }
                 if (v->ht->count == 0) removeKey(db(c->db), a[1], l[1]);
             }
@@ -1240,8 +1384,8 @@ public class Store {
             for (;;) {
                 e = v->ht->nextEnt(e, &pos);
                 if (e == null) break;
-                if (both || name[2] == 'k') bulk(c, e->key, e->klen);
-                if (both || name[2] == 'v') bulk(c, e->val, e->vlen);
+                if (both || name[1] == 'k') bulk(c, e->key, e->klen);
+                if (both || name[1] == 'v') bulk(c, e->val, e->vlen);
             }
             return;
         }
@@ -1303,46 +1447,153 @@ public class Store {
         return la < lb ? -1 : (la > lb ? 1 : 0);
     }
 
-    // where the member with this score belongs (the first position that is not smaller)
-    private int zpos(Value* v, int score, char* m, int ml) {
+    // The members of a sorted set in order live in blocks of up to ZBLK entries (v->zb[block][i]); a block that is full is split in two. Finding a place
+    // is a binary search over the blocks and then inside one, an insert or a removal moves at most one block, and the position of a member (ZRANK) or the
+    // member at a position (ZRANGE) is found by adding up the sizes of the blocks before it. (A plain sorted array made 100000 inserts in random order
+    // move 20 GB.)
+
+    // the block and the place in it of the first member that is not smaller than (score, m); a score that is greater than every member: the end of
+    // the last block. v must have at least one block.
+    private void zfind(Value* v, int score, char* m, int ml, int* blk, int* off) {
         int lo = 0;
-        int hi = v->zn;
-        while (lo < hi) {
+        int hi = v->nzb;
+        while (lo < hi) {                                   // the first block whose last member is not smaller
             int mid = (lo + hi) / 2;
-            Ent* e = v->zord[mid];
-            if (zcmp(e->num, e->key, e->klen, score, m, ml) < 0) lo = mid + 1; else hi = mid;
+            Ent* last = v->zb[mid][v->zbn[mid] - 1];
+            if (zcmp(last->num, last->key, last->klen, score, m, ml) < 0) lo = mid + 1; else hi = mid;
         }
-        return lo;
+        if (lo == v->nzb) {
+            *blk = v->nzb - 1;
+            *off = v->zbn[v->nzb - 1];
+            return;
+        }
+        int a = 0;
+        int b = v->zbn[lo];
+        while (a < b) {
+            int mid = (a + b) / 2;
+            Ent* e = v->zb[lo][mid];
+            if (zcmp(e->num, e->key, e->klen, score, m, ml) < 0) a = mid + 1; else b = mid;
+        }
+        *blk = lo;
+        *off = a;
+    }
+
+    // the position (from 0) of the first member that is not smaller than (score, m)
+    private int zpos(Value* v, int score, char* m, int ml) {
+        if (v->nzb == 0) return 0;
+        int blk = 0;
+        int off = 0;
+        zfind(v, score, m, ml, &blk, &off);
+        int pos = off;
+        for (int i = 0; i < blk; i++) pos = pos + v->zbn[i];
+        return pos;
+    }
+
+    // makes room for one more block pointer
+    private void zroom(Value* v) {
+        int cap = 4;
+        while (cap < v->nzb) cap = cap * 2;                 // the arrays hold the next power of two of nzb entries (at least 4)
+        if (v->zb != null && v->nzb < cap) return;
+        int nc = v->zb == null ? 4 : cap * 2;
+        Ent*** nb = (Ent***) malloc(nc * 8);
+        int* nn = (int*) malloc(nc * 8);
+        for (int i = 0; i < v->nzb; i++) { nb[i] = v->zb[i]; nn[i] = v->zbn[i]; }
+        if (v->zb != null) {
+            used = used - bc((char*) v->zb) - bc((char*) v->zbn);
+            free((char*) v->zb);
+            free((char*) v->zbn);
+        }
+        used = used + bc((char*) nb) + bc((char*) nn);
+        v->zb = nb;
+        v->zbn = nn;
+    }
+
+    // a new, empty block at position at
+    private void znewBlock(Value* v, int at) {
+        zroom(v);
+        Ent** blk = (Ent**) malloc(ZBLK * 8);
+        used = used + bc((char*) blk);
+        for (int i = v->nzb; i > at; i--) { v->zb[i] = v->zb[i - 1]; v->zbn[i] = v->zbn[i - 1]; }
+        v->zb[at] = blk;
+        v->zbn[at] = 0;
+        v->nzb++;
     }
 
     private void zinsert(Value* v, Ent* e) {
-        if (v->zn >= v->zcap) {
-            int nc = v->zcap == 0 ? 8 : v->zcap * 2;
-            Ent** no = (Ent**) malloc(nc * 8);
-            for (int i = 0; i < v->zn; i++) no[i] = v->zord[i];
-            if (v->zord != null) { free((char*) v->zord); used = used - v->zcap * 8; }
-            v->zord = no;
-            v->zcap = nc;
-            used = used + nc * 8;
+        int blk = 0;
+        int off = 0;
+        if (v->nzb == 0) {
+            znewBlock(v, 0);
+        } else {
+            zfind(v, e->num, e->key, e->klen, &blk, &off);
+            if (v->zbn[blk] >= ZBLK) {                      // full: the upper half moves to a new block behind it
+                znewBlock(v, blk + 1);
+                int half = ZBLK / 2;
+                for (int i = half; i < ZBLK; i++) v->zb[blk + 1][i - half] = v->zb[blk][i];
+                v->zbn[blk + 1] = ZBLK - half;
+                v->zbn[blk] = half;
+                if (off > half) { blk++; off = off - half; }
+            }
         }
-        int at = zpos(v, e->num, e->key, e->klen);
-        for (int i = v->zn; i > at; i--) v->zord[i] = v->zord[i - 1];
-        v->zord[at] = e;
+        Ent** b = v->zb[blk];
+        for (int i = v->zbn[blk]; i > off; i--) b[i] = b[i - 1];
+        b[off] = e;
+        v->zbn[blk]++;
         v->zn++;
     }
 
     private void zremoveOrd(Value* v, Ent* e) {
-        int at = zpos(v, e->num, e->key, e->klen);
-        for (int i = at; i + 1 < v->zn; i++) v->zord[i] = v->zord[i + 1];
+        if (v->nzb == 0) return;
+        int blk = 0;
+        int off = 0;
+        zfind(v, e->num, e->key, e->klen, &blk, &off);
+        if (off >= v->zbn[blk] || v->zb[blk][off] != e) return;      // not there (cannot happen)
+        Ent** b = v->zb[blk];
+        for (int i = off; i + 1 < v->zbn[blk]; i++) b[i] = b[i + 1];
+        v->zbn[blk]--;
         v->zn--;
+        if (v->zbn[blk] == 0) {                             // an empty block goes
+            used = used - bc((char*) b);
+            free((char*) b);
+            for (int i = blk; i + 1 < v->nzb; i++) { v->zb[i] = v->zb[i + 1]; v->zbn[i] = v->zbn[i + 1]; }
+            v->nzb--;
+            v->zb[v->nzb] = null;
+            v->zbn[v->nzb] = 0;
+        }
+    }
+
+    // the member at a position (0 <= idx < zn)
+    private Ent* zat(Value* v, int idx) {
+        for (int b = 0; b < v->nzb; b++) {
+            if (idx < v->zbn[b]) return v->zb[b][idx];
+            idx = idx - v->zbn[b];
+        }
+        return null;
     }
 
     private bool parseScore(char* s, int n, int* bits) {
         if (n == 0 || n > 400) return false;
+        if (s[0] == ' ' || (s[0] >= 9 && s[0] <= 13)) return false;          // Redis refuses leading white space
         char* end = null;
         int b = strtod(s, &end);
         if (end == null || end != &s[n]) return false;
         if (isnan(b)) return false;
+        int ax = b & 0x7FFFFFFFFFFFFFFF;
+        if (ax == 0x7FF0000000000000) {
+            // infinity is a score when it is written as a word (inf, -inf, infinity); a number that only overflows (1e400) is not a valid float
+            bool word = false;
+            for (int i = 0; i < n; i++) { if (s[i] == 'i' || s[i] == 'I') word = true; }
+            if (!word) return false;
+        } else if (ax == 0) {
+            // a number that underflows to zero (1e-400) is refused too; 0, 0.0, 0e5 and -0 are fine
+            bool hex = n > 2 && (s[0] == '0' || ((s[0] == '-' || s[0] == '+') && s[1] == '0')) && (s[1] == 'x' || s[1] == 'X' || s[2] == 'x' || s[2] == 'X');
+            for (int i = 0; i < n; i++) {
+                int ch = s[i];
+                if (!hex && (ch == 'e' || ch == 'E')) break;
+                if (hex && (ch == 'p' || ch == 'P')) break;
+                if ((ch >= '1' && ch <= '9') || (hex && ((ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')))) return false;
+            }
+        }
         *bits = b;
         return true;
     }
@@ -1352,10 +1603,10 @@ public class Store {
     private int scoreText(int x, char* out) {
         int pos = 0;
         if (isnan(x)) { strcpy(out, "nan"); return 3; }
-        if (x < 0) { out[pos] = '-'; pos++; }
         int ax = x & 0x7FFFFFFFFFFFFFFF;
+        if (ax == 0) { out[0] = '0'; return 1; }                  // -0 reads "0" (as Redis 7.0 prints it)
+        if (x < 0) { out[pos] = '-'; pos++; }
         if (ax == 0x7FF0000000000000) { strcpy(&out[pos], "inf"); return pos + 3; }
-        if (ax == 0) { out[pos] = '0'; return pos + 1; }
         int n = __shortest_digits(ax);
         __dtoa_sci(ax, n - 1);
         int d10 = __d10;
@@ -1405,7 +1656,9 @@ public class Store {
 
     private void zsetCmd(Rclient* c, char* name, int argc, char** a, int* l) {
         Value* v = lookup(c, a[1], l[1]);
-        if (v != null && v->type != TYPE_ZSET) { wrongType(c); return; }
+        bool wrong = v != null && v->type != TYPE_ZSET;
+        // ZADD and ZRANGE check their arguments before the type of the key (as Redis does); the others look at the type first
+        if (wrong && !streq(name, "zadd") && !streq(name, "zrange")) { wrongType(c); return; }
         if (streq(name, "zadd")) {
             bool nx = false;
             bool xx = false;
@@ -1425,6 +1678,7 @@ public class Store {
                 int dummy = 0;
                 if (!parseScore(a[k], l[k], &dummy)) { err(c, "ERR value is not a valid float"); return; }
             }
+            if (wrong) { wrongType(c); return; }
             if (v == null && xx) { num(c, 0); return; }
             if (v == null) { v = create(c, a[1], l[1], TYPE_ZSET); v->zmem = newHt(); }
             int added = 0;
@@ -1489,6 +1743,7 @@ public class Store {
             bool withScores = false;
             if (argc == 5 && streqi(a[4], "withscores")) withScores = true;
             else if (argc != 4) { syntax(c); return; }
+            if (wrong) { wrongType(c); return; }
             if (v == null) { arr(c, 0); return; }
             if (s < 0) s = s + v->zn;
             if (e < 0) e = e + v->zn;
@@ -1496,9 +1751,16 @@ public class Store {
             if (e >= v->zn) e = v->zn - 1;
             if (s > e || s >= v->zn) { arr(c, 0); return; }
             arr(c, (e - s + 1) * (withScores ? 2 : 1));
+            // find the block of the first member, then walk on from there
+            int blk = 0;
+            int off = s;
+            while (blk < v->nzb && off >= v->zbn[blk]) { off = off - v->zbn[blk]; blk++; }
             for (int i = s; i <= e; i++) {
-                bulk(c, v->zord[i]->key, v->zord[i]->klen);
-                if (withScores) putScore(c, v->zord[i]->num);
+                Ent* m = v->zb[blk][off];
+                bulk(c, m->key, m->klen);
+                if (withScores) putScore(c, m->num);
+                off++;
+                if (off >= v->zbn[blk]) { blk++; off = 0; }
             }
             return;
         }
@@ -1565,7 +1827,7 @@ private void makeTable() {
     cmd("multi", 1, 0); cmd("exec", 1, 0); cmd("discard", 1, 0);
     cmd("publish", 3, 0); cmd("subscribe", -2, 2); cmd("unsubscribe", -1, 2); cmd("psubscribe", -2, 2); cmd("punsubscribe", -1, 2);
     cmd("del", -2, 0); cmd("exists", -2, 0); cmd("keys", 2, 0); cmd("type", 2, 0); cmd("rename", 3, 1);
-    cmd("expire", 3, 0); cmd("pexpire", 3, 0); cmd("ttl", 2, 0); cmd("pttl", 2, 0); cmd("persist", 2, 0);
+    cmd("expire", -3, 0); cmd("pexpire", -3, 0); cmd("ttl", 2, 0); cmd("pttl", 2, 0); cmd("persist", 2, 0);
     cmd("get", 2, 0); cmd("set", -3, 1); cmd("setnx", 3, 1); cmd("setex", 4, 1); cmd("psetex", 4, 1); cmd("getset", 3, 1);
     cmd("incr", 2, 1); cmd("decr", 2, 1); cmd("incrby", 3, 1); cmd("decrby", 3, 1); cmd("append", 3, 1); cmd("strlen", 2, 0);
     cmd("mget", -2, 0); cmd("mset", -3, 1);
@@ -1590,6 +1852,7 @@ public class Server {
         net->onData = srvData;
         net->onClose = srvClose;
         net->onTick = srvTick;
+        net->onResume = srvResume;
         net->maxOut = 16777216;
         net->handshakeTimeoutMs = 5000;
         store->closeHook = srvKick;
@@ -1629,6 +1892,7 @@ private int srvOpen(netsrv.Server* s, netsrv.Conn* c) {
     Rclient* rc = sv->store->open();
     if (rc == null) return -1;
     rc->out = &c->out;
+    rc->pushMax = c->out.max;                            // net->maxOut: the limit for what is pushed to the client
     rc->cookie = (char*) c;
     c->user = (char*) rc;
     return 0;
@@ -1638,7 +1902,19 @@ private int srvData(netsrv.Server* s, netsrv.Conn* c, char* data, int n) {
     Server* sv = (Server*) s->user;
     Rclient* rc = (Rclient*) c->user;
     if (rc == null) return -1;
-    return sv->store->feed(rc, data, n);
+    int r = sv->store->feed(rc, data, n);
+    if (rc->paused) s->pause(c, sv->store->outHigh / 2);          // nothing more is read until half of the limit has been sent
+    return r;
+}
+
+private int srvResume(netsrv.Server* s, netsrv.Conn* c) {
+    Server* sv = (Server*) s->user;
+    Rclient* rc = (Rclient*) c->user;
+    if (rc == null) return 0;
+    int r = sv->store->resume(rc);
+    if (rc->paused) s->pause(c, sv->store->outHigh / 2);
+    if (r < 0) s->close(c);
+    return 0;
 }
 
 private int srvClose(netsrv.Server* s, netsrv.Conn* c) {

@@ -20,8 +20,15 @@
 //  bytes are not lost to a connection reset); kill(c) drops the connection at once. onClose runs exactly once for every connection
 //  that onOpen has seen, after the turn in which it ended: c->user may be freed there. Conn objects, buffers and TLS sessions are reused.
 //
+//  Backpressure: a protocol that does not want more input while a lot of output is unsent (redisd: a client that pipelines commands with big replies)
+//  calls s->pause(c, resumeBelow) from onData: nothing more is read from that connection (and delivered) until its output queue is down to
+//  resumeBelow bytes, then onResume(server, conn) runs (it may pause again). stallTimeoutMs cuts off a connection that has output and has not
+//  been able to send a single byte for that long (a client that does not read), 30 s by default, 0: never.
+//
 //  Limits: maxConns (at most 1000: net.poll takes 1024 sockets), maxPerIp, maxOut, handshakeTimeoutMs (accept to a finished TLS
-//  handshake), idleTimeoutMs (nothing received), lingerMs. Datagram sockets: addUdp(port) and onDatagram.
+//  handshake), idleTimeoutMs (nothing received), stallTimeoutMs, lingerMs. Datagram sockets: addUdp(port) and onDatagram.
+//  When accept() fails because the process is out of file descriptors (or memory) the listener rests for 50 ms instead of spinning on it
+//  (stats->acceptFailures); maxConns is not tied to the descriptor limit: keep it below `ulimit -n` minus what the program has open.
 // =============================================================================
 import net;
 import tls;
@@ -59,6 +66,7 @@ public class Stats {
     public int timeouts;
     public int tlsFailures;
     public int datagrams;
+    public int acceptFailures;      // accept() failed for a reason other than "nothing there" (out of descriptors, memory ...)
 }
 
 public class Conn {
@@ -78,6 +86,9 @@ public class Conn {
     public netio.Queue out;
     public tls.Tls* t;
     public int slot;
+    public bool paused;             // pause(): nothing is read until the output queue is down to resumeBelow bytes
+    public int resumeBelow;
+    public int txAt;                // the last time the connection had no output or sent some (stall detection)
 }
 
 public class Server {
@@ -86,6 +97,7 @@ public class Server {
     public func onClose;            // onClose(server, conn)
     public func onTick;             // onTick(server, nowMs): once per poll turn
     public func onDatagram;         // onDatagram(server, udpIndex, ip, port, data, n)
+    public func onResume;           // onResume(server, conn): the output queue of a paused connection has drained, it is reading again
     public char* user;
     public Stats* stats;
 
@@ -94,6 +106,7 @@ public class Server {
     public int maxOut;              // bytes queued for one connection, default 1 MiB
     public int handshakeTimeoutMs;  // default 5000
     public int idleTimeoutMs;       // nothing received for this long: closed. 0: never (default)
+    public int stallTimeoutMs;      // output waiting and not one byte sent for this long: cut off (R_EVICTED). Default 30000, 0: never
     public int lingerMs;            // default 1000
     public int port;                // the port of the first listener (after listen)
     public bool running;
@@ -101,6 +114,7 @@ public class Server {
     private int lfd[8];
     private tls.Config* lcfg[8];
     private int lport[8];
+    private int lrest[8];               // a listener whose accept() failed rests until this time
     private int nl;
     private int ufd[4];
     private int uport[4];
@@ -125,6 +139,7 @@ public class Server {
         maxOut = 1048576;
         handshakeTimeoutMs = 5000;
         lingerMs = 1000;
+        stallTimeoutMs = 30000;
         stats = new Stats();
         nextId = 1;
         now = millis();
@@ -143,6 +158,7 @@ public class Server {
         if (h < 0) return false;
         net.setNonBlocking(h, true);
         lfd[nl] = h;
+        lrest[nl] = 0;
         lcfg[nl] = cfg;
         lport[nl] = net.localPort(h);
         if (nl == 0) port = lport[0];
@@ -190,6 +206,7 @@ public class Server {
         c->out.max = 0;
         c->id = 0; c->fd = -1; c->ip = 0; c->port = 0; c->state = ST_FREE; c->listener = 0; c->secure = false; c->opened = false;
         c->closeReason = 0; c->user = null; c->acceptedAt = 0; c->lastRx = 0; c->lingerAt = 0; c->t = null; c->slot = 0;
+        c->paused = false; c->resumeBelow = 0; c->txAt = 0;
         if (nfree < 64) {
             freeList[nfree] = c;
             nfree++;
@@ -210,7 +227,16 @@ public class Server {
     private void acceptOn(int li) {
         for (int k = 0; k < 32; k++) {
             int fd = net.acceptSome(lfd[li]);
-            if (fd < 0) return;
+            if (fd < 0) {
+                // -11 (EAGAIN): nothing more to take. -4, -103, -71: interrupted, or the peer gave up before we took it: try again. Anything else with
+                // nothing accepted yet (out of descriptors, out of memory, ...): the listener stays readable, so polling it again at once would spin
+                if (fd == -4 || fd == -103 || fd == -71) continue;
+                if (fd != -11 && k == 0) {
+                    stats->acceptFailures++;
+                    lrest[li] = now + 50;
+                }
+                return;
+            }
             if (stopped) { net.rawClose(fd); continue; }
             net.setNonBlocking(fd, true);
             net.setNoDelay(fd, true);
@@ -234,6 +260,7 @@ public class Server {
             c->listener = li;
             c->acceptedAt = now;
             c->lastRx = now;
+            c->txAt = now;
             c->out.max = maxOut;
             c->slot = nconns;
             conns[nconns] = c;
@@ -282,6 +309,12 @@ public class Server {
     // drops the connection at once (unsent output is lost)
     public void kill(Conn* c) { end(c, R_LOCAL); }
 
+    // Stops reading from the connection until its output queue holds at most resumeBelow bytes (then onResume runs). Call it from onData / onResume.
+    public void pause(Conn* c, int resumeBelow) {
+        c->paused = true;
+        c->resumeBelow = resumeBelow < 0 ? 0 : resumeBelow;
+    }
+
     // ---- sending ---------------------------------------------------------------------------------------------------------------------------------
     private bool hasOutput(Conn* c) {
         if (c->out.pending() > 0) return true;
@@ -301,6 +334,7 @@ public class Server {
                     if (r == 0) return true;
                     tls.outConsumed(t, r);
                     stats->bytesOut = stats->bytesOut + r;
+                    c->txAt = now;
                     continue;
                 }
                 int pn = c->out.pending();
@@ -319,6 +353,7 @@ public class Server {
             if (r == 0) return true;
             c->out.consume(r);
             stats->bytesOut = stats->bytesOut + r;
+            c->txAt = now;
         }
         return true;
     }
@@ -347,6 +382,28 @@ public class Server {
         }
         if (c->state == ST_CLOSING && !hasOutput(c)) finishClosing(c);
         if (c->out.pending() == 0) c->out.shrink(65536);
+        if (!hasOutput(c)) {
+            c->txAt = now;
+        } else if (c->state == ST_OPEN && stallTimeoutMs > 0 && now - c->txAt > stallTimeoutMs) {
+            stats->evicted++;
+            end(c, R_EVICTED);                  // output waiting and the peer takes nothing: it does not read
+            return;
+        }
+        if (c->paused && c->state == ST_OPEN && c->out.pending() <= c->resumeBelow) resumeConn(c);
+    }
+
+    // the output of a paused connection has drained: the protocol layer gets to run again (and the data that TLS has already decrypted is delivered)
+    private void resumeConn(Conn* c) {
+        c->paused = false;
+        if (onResume != null) onResume(this, c);
+        if (c->secure && c->t != null) {
+            while (c->state == ST_OPEN && !c->paused && tls.available(c->t) > 0) {
+                int pn = tls.readApp(c->t, rbuf, 16384);
+                if (pn <= 0) break;
+                deliver(c, rbuf, pn);
+                if (c->out.overflow) return;
+            }
+        }
     }
 
     // ---- reading ---------------------------------------------------------------------------------------------------------------------------------
@@ -359,7 +416,7 @@ public class Server {
     }
 
     private void readConn(Conn* c) {
-        for (int round = 0; round < 4 && c->state != ST_DEAD; round++) {
+        for (int round = 0; round < 4 && c->state != ST_DEAD && !c->paused; round++) {
             int n = net.recvSome(c->fd, rbuf, 16384);
             if (n == -2) return;
             if (n <= 0) {
@@ -391,7 +448,7 @@ public class Server {
                     opened(c);
                 }
                 if (!pumpOut(c)) { end(c, R_ERROR); return; }
-                while (c->state == ST_OPEN && tls.available(t) > 0) {
+                while (c->state == ST_OPEN && !c->paused && tls.available(t) > 0) {
                     int pn = tls.readApp(t, rbuf, 16384);
                     if (pn <= 0) break;
                     deliver(c, rbuf, pn);
@@ -430,7 +487,12 @@ public class Server {
         for (int i = 0; i < nconns; i++) flushConn(conns[i]);          // output queued since the last turn
         reap();
         int n = 0;
+        int wait = ms;
         for (int i = 0; i < nl; i++) {
+            if (lrest[i] > now) {                           // accept() failed a moment ago: not polled until the rest is over
+                if (wait < 0 || lrest[i] - now < wait) wait = lrest[i] - now;
+                continue;
+            }
             ph[n] = lfd[i]; pe[n] = net.READABLE; pkind[n] = 0; pconn[n] = null; pr[n] = i; n++;
         }
         for (int i = 0; i < nu; i++) {
@@ -441,7 +503,7 @@ public class Server {
             Conn* c = conns[i];
             if (c->state == ST_DEAD) continue;
             ph[n] = c->fd;
-            pe[n] = net.READABLE;
+            pe[n] = c->paused ? 0 : net.READABLE;
             if (hasOutput(c) && c->state != ST_LINGER) pe[n] = pe[n] | net.WRITABLE;
             pkind[n] = 2;
             pconn[n] = c;
@@ -450,7 +512,12 @@ public class Server {
         // pr[] is reused for the results: remember the listener indexes first
         int idx[24];
         for (int i = 0; i < fixed; i++) idx[i] = pr[i];
-        int r = net.poll(&ph[0], &pe[0], &pr[0], n, ms);
+        int r = 0;
+        if (n > 0) {
+            r = net.poll(&ph[0], &pe[0], &pr[0], n, wait);
+        } else if (wait > 0) {
+            sleepMs(wait > 50 ? 50 : wait);                 // only resting listeners: nothing to poll
+        }
         now = millis();
         int ready = 0;
         if (r > 0) {
@@ -465,7 +532,11 @@ public class Server {
                     Conn* c = pconn[i];
                     if (c->state == ST_DEAD || c->state == ST_FREE) continue;
                     if ((pr[i] & (net.WRITABLE)) != 0) flushConn(c);
-                    if ((pr[i] & (net.READABLE | net.HUNGUP | net.FAILED)) != 0 && c->state != ST_DEAD) readConn(c);
+                    if (c->paused) {
+                        if ((pr[i] & (net.HUNGUP | net.FAILED)) != 0 && c->state != ST_DEAD) end(c, R_ERROR);       // nothing is read while paused
+                    } else if ((pr[i] & (net.READABLE | net.HUNGUP | net.FAILED)) != 0 && c->state != ST_DEAD) {
+                        readConn(c);
+                    }
                 }
             }
         }
