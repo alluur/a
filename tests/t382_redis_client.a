@@ -1,0 +1,336 @@
+// The Redis client against the server module over loopback (one thread: the server runs from net.setIdleHook): URLs, AUTH and SELECT, the helpers for
+// the five data types, binary safe values (a 0 byte, 1 MB), every reply type, pipelining, MULTI / EXEC, publish / subscribe with channels and patterns
+// (also after a connection loss), reconnecting (AUTH and SELECT are repeated), time outs, a server that answers with garbage, limits of the client.
+import redis;
+import redisd;
+import net;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+redisd.Server* srv;
+int PORT;
+char url[100];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+void settle(int rounds = 15) {
+    for (int i = 0; i < rounds; i++) srv->poll(1);
+}
+
+// the text of a reply of any kind, for comparing
+bool isText(redis.Reply* r, char* text) {
+    bool ok = r != null && (r->type == redis.T_BULK || r->type == redis.T_STATUS) && streq(r->str, text);
+    if (r != null) r->dispose();
+    return ok;
+}
+
+bool isInt(redis.Reply* r, int n) {
+    bool ok = r != null && r->type == redis.T_INT && r->num == n;
+    if (r != null) r->dispose();
+    return ok;
+}
+
+bool eq(char* got, char* want) {
+    bool ok = got != null && streq(got, want);
+    if (got != null) free(got);
+    return ok;
+}
+
+int main() {
+    srv = redisd.newServer();
+    check("the server listens", srv->listenOn("127.0.0.1", 0, null));
+    PORT = srv->port;
+    format(&url[0], 100, "redis://127.0.0.1:%d", PORT, 0, 0, 0);
+    net.setIdleHook(hook);
+    redisd.Store* store = srv->store;
+
+    // ---- URLs -----------------------------------------------------------------------------------------------------------------------------------------
+    check("a URL that is not redis:// is refused", redis.connect("http://127.0.0.1:6379") == null && startsWith(redis.error(), "the URL must start with"));
+    check("a URL without a host is refused", redis.connect("redis://") == null && streq(redis.error(), "no host in the URL"));
+    check("port 0 and port 70000 are refused", redis.connect("redis://127.0.0.1:0") == null && redis.connect("redis://127.0.0.1:70000") == null);
+    check("a database number that is not a number is refused", redis.connect("redis://127.0.0.1:6379/abc") == null && streq(redis.error(), "bad database number"));
+    int dead = net.listen(0, 4);
+    int deadPort = net.localPort(dead);
+    net.close(dead);
+    char deadUrl[100];
+    format(&deadUrl[0], 100, "redis://127.0.0.1:%d", deadPort, 0, 0, 0);
+    check("nothing listens there: no client, the reason is given", redis.connect(&deadUrl[0]) == null && streq(redis.error(), "cannot connect"));
+
+    redis.Client* c = redis.connect(&url[0]);
+    check("connect", c != null && c->isConnected());
+    if (c == null) return 1;
+    check("PING", c->ping());
+
+    // ---- strings ----------------------------------------------------------------------------------------------------------------------------------------
+    check("SET and GET", c->set("greeting", "hello world") && eq(c->get("greeting"), "hello world"));
+    check("GET of a key that does not exist is null", c->get("nokey") == null);
+    check("SETEX and TTL", c->setEx("temp", "v", 100) && c->ttl("temp") == 100 && c->ttl("greeting") == -1 && c->ttl("nokey") == -2);
+    check("EXPIRE", c->expire("greeting", 50) && c->ttl("greeting") == 50 && !c->expire("nokey", 5));
+    check("INCR, DECR, INCRBY", c->incr("n") == 1 && c->incr("n") == 2 && c->decr("n") == 1 && c->incrBy("n", 41) == 42);
+    check("INCR on text is an error (-1, error text)", c->incr("greeting") == -1 && streq(c->error, "ERR value is not an integer or out of range"));
+    check("APPEND and STRLEN", c->append("s", "abc") == 3 && c->append("s", "def") == 6 && c->strLength("s") == 6);
+    check("EXISTS and DEL", c->exists("s") == 1 && c->del("s") == 1 && c->exists("s") == 0 && c->del("s") == 0);
+    check("MSET and MGET", c->mset("a", "1", "b", "2") && true);
+    redis.Reply* r = c->mget("a", "nokey", "b");
+    check("... MGET gives nil for what is not there", r != null && r->count == 3 && streq(r->elems[0]->str, "1") && r->elems[1]->type == redis.T_NIL && streq(r->elems[2]->str, "2"));
+    r->dispose();
+    r = c->keys("[ab]");
+    check("KEYS with a pattern", r != null && r->count == 2);
+    r->dispose();
+    check("ECHO", eq(c->echo("echo this"), "echo this"));
+    check("DBSIZE", c->dbsize() > 3);
+
+    // ---- binary values -----------------------------------------------------------------------------------------------------------------------------------
+    char bin[16];
+    bin[0] = 'a'; bin[1] = 0; bin[2] = 13; bin[3] = 10; bin[4] = 255; bin[5] = '$'; bin[6] = '*'; bin[7] = 'z';
+    check("a value with 0, CR, LF and 255 inside", c->setBin("binary", &bin[0], 8));
+    int len = 0;
+    char* back = c->getBin("binary", &len);
+    check("... comes back intact (length 8)", back != null && len == 8 && memcmp(back, &bin[0], 8) == 0 && back[8] == 0);
+    if (back != null) free(back);
+    char* big = alloc(1048576);
+    for (int i = 0; i < 1048576; i++) big[i] = i * 31;
+    check("a value of 1 MB", c->setBin("big", big, 1048576));
+    back = c->getBin("big", &len);
+    check("... comes back intact", back != null && len == 1048576 && memcmp(back, big, 1048576) == 0);
+    if (back != null) free(back);
+    check("STRLEN of it", c->strLength("big") == 1048576);
+    c->del("big");
+
+    // ---- lists, hashes, sets, sorted sets -------------------------------------------------------------------------------------------------------------
+    check("RPUSH and LPUSH", c->rpush("list", "b") == 1 && c->rpush("list", "c") == 2 && c->lpush("list", "a") == 3 && c->llen("list") == 3);
+    r = c->lrange("list", 0, -1);
+    check("LRANGE", r != null && r->count == 3 && streq(r->elems[0]->str, "a") && streq(r->elems[2]->str, "c"));
+    r->dispose();
+    check("LPOP and RPOP", eq(c->lpop("list"), "a") && eq(c->rpop("list"), "c") && c->llen("list") == 1 && c->lpop("nolist") == null);
+    check("HSET, HGET, HDEL", c->hset("h", "f1", "v1") == 1 && c->hset("h", "f2", "v2") == 1 && c->hset("h", "f1", "x") == 0 && eq(c->hget("h", "f1"), "x") && c->hget("h", "no") == null && c->hdel("h", "f2") == 1);
+    r = c->hgetall("h");
+    check("HGETALL (a flat array of field, value)", r != null && r->count == 2 && streq(r->elems[0]->str, "f1") && streq(r->elems[1]->str, "x"));
+    r->dispose();
+    check("SADD, SISMEMBER, SREM", c->sadd("set", "x") == 1 && c->sadd("set", "x") == 0 && c->sadd("set", "y") == 1 && c->sismember("set", "x") && !c->sismember("set", "q") && c->srem("set", "x") == 1);
+    r = c->smembers("set");
+    check("SMEMBERS", r != null && r->count == 1 && streq(r->elems[0]->str, "y"));
+    r->dispose();
+    check("ZADD", c->zadd("zs", "2", "b") == 1 && c->zadd("zs", "1", "a") == 1 && c->zadd("zs", "3.5", "c") == 1 && c->zcard("zs") == 3);
+    r = c->zrange("zs", 0, -1, true);
+    check("ZRANGE WITHSCORES", r != null && r->count == 6 && streq(r->elems[0]->str, "a") && streq(r->elems[1]->str, "1") && streq(r->elems[5]->str, "3.5"));
+    r->dispose();
+    check("ZSCORE and ZREM", eq(c->zscore("zs", "c"), "3.5") && c->zscore("zs", "q") == null && c->zrem("zs", "a") == 1);
+    check("a command on a key of the wrong type: the error reply", c->get("list") == null && streq(c->error, "WRONGTYPE Operation against a key holding the wrong kind of value"));
+
+    // ---- replies of every kind ---------------------------------------------------------------------------------------------------------------------------
+    check("a status reply", isText(c->call("SET", "k", "v"), "OK"));
+    check("an integer reply", isInt(c->call("DEL", "k"), 1));
+    r = c->call("GET", "k");
+    check("a nil reply", r != null && r->type == redis.T_NIL && r->isNil());
+    r->dispose();
+    r = c->call("BOGUS");
+    check("an error reply is a Reply, not null", r != null && r->type == redis.T_ERROR && r->isError() && startsWith(r->str, "ERR unknown command"));
+    r->dispose();
+    r = c->call("LRANGE", "empty-list", "0", "-1");
+    check("an empty array", r != null && r->type == redis.T_ARRAY && r->count == 0);
+    r->dispose();
+    r = c->call("LPOP", "empty-list", "2");
+    check("a null array", r != null && r->type == redis.T_NILARRAY);
+    r->dispose();
+    check("six arguments", isInt(c->call("ZADD", "six", "NX", "CH", "1", "a"), 1));
+    char* argv[5];
+    int lens[5];
+    argv[0] = "SET"; lens[0] = 3;
+    argv[1] = "with space and \r\n"; lens[1] = 17;
+    argv[2] = ""; lens[2] = 0;
+    check("callv: a key with CR LF and an empty value", isText(c->callv(3, &argv[0], &lens[0]), "OK") && c->exists("with space and \r\n") == 1);
+    check("an empty argument", isText(c->call("ECHO", ""), ""));
+
+    // ---- pipelining ----------------------------------------------------------------------------------------------------------------------------------------
+    redis.Pipeline* p = redis.pipeline(c);
+    for (int i = 0; i < 500; i++) {
+        char key[24];
+        char val[24];
+        format(&key[0], 24, "pk%d", i, 0, 0, 0);
+        format(&val[0], 24, "%d", i * 3, 0, 0, 0);
+        p->add("SET", &key[0], &val[0]);
+    }
+    p->add("GET", "pk499");
+    p->add("INCR", "pk10");
+    p->add("INCR", "greeting");
+    p->add("DBSIZE");
+    check("500 + 4 commands are queued", p->count == 504);
+    check("one write, 504 replies", p->run() && p->got == 504);
+    check("the replies are in order", streq(p->reply(0)->str, "OK") && streq(p->reply(500)->str, "1497") && p->reply(501)->num == 31 && p->reply(503)->num > 500);
+    check("an error in the middle does not stop the others", p->reply(502)->isError() && p->reply(503)->type == redis.T_INT);
+    check("reply(i) of a reply that does not exist is null", p->reply(504) == null && p->reply(-1) == null);
+    p->reset();
+    p->add("PING");
+    p->add("ECHO", "again");
+    check("a pipeline can be used again after reset()", p->run() && p->got == 2 && streq(p->reply(1)->str, "again"));
+    p->dispose();
+
+    // ---- transactions -----------------------------------------------------------------------------------------------------------------------------------------
+    check("MULTI", c->multi() && c->inMulti);
+    check("commands are queued", isText(c->call("SET", "tx1", "10"), "QUEUED") && isText(c->call("INCR", "tx1"), "QUEUED") && isText(c->call("GET", "tx1"), "QUEUED") && isText(c->call("INCR", "greeting"), "QUEUED"));
+    r = c->exec();
+    check("EXEC gives the replies of all of them (an error inside is just an element)", r != null && r->type == redis.T_ARRAY && r->count == 4 && streq(r->elems[0]->str, "OK") && r->elems[1]->num == 11 && streq(r->elems[2]->str, "11") && r->elems[3]->isError() && !c->inMulti);
+    r->dispose();
+    c->multi();
+    c->call("SET", "tx2", "1");
+    check("DISCARD", c->discard() && c->exists("tx2") == 0 && !c->inMulti);
+    c->multi();
+    r = c->call("BOGUS");
+    r->dispose();
+    r = c->exec();
+    check("EXEC after an error while queueing: EXECABORT", r != null && r->isError() && startsWith(r->str, "EXECABORT"));
+    r->dispose();
+
+    // ---- publish / subscribe -------------------------------------------------------------------------------------------------------------------------------
+    redis.PubSub* ps = redis.pubsub(c);
+    check("a subscriber has a connection of its own", ps != null && ps->subscribe("news") && ps->psubscribe("log.*"));
+    check("nothing yet: next() times out and the connection stays", ps->next(80) == null && ps->channels == 2);
+    check("PUBLISH reaches one subscriber (the channel)", c->publish("news", "headline") == 1);
+    redis.PubMessage* m = ps->next(1000);
+    check("the message: channel and data", m != null && streq(m->channel, "news") && streq(m->data, "headline") && m->pattern == null && m->len == 8);
+    if (m != null) m->dispose();
+    check("PUBLISH to a pattern", c->publish("log.error", "disk full") == 1);
+    m = ps->next(1000);
+    check("the pmessage: pattern, channel and data", m != null && streq(m->channel, "log.error") && streq(m->pattern, "log.*") && streq(m->data, "disk full"));
+    if (m != null) m->dispose();
+    check("no subscriber for another channel", c->publish("other", "x") == 0);
+    char* msg = alloc(70000);
+    memset(msg, 'm', 70000);
+    msg[69999] = 0;
+    check("a message of 70000 bytes", c->publish("news", msg) == 1);
+    m = ps->next(2000);
+    check("... arrives whole", m != null && m->len == 69999 && m->data[0] == 'm' && m->data[69998] == 'm');
+    if (m != null) m->dispose();
+    check("unsubscribe from a channel", ps->unsubscribe("news") && ps->next(50) == null && c->publish("news", "gone") == 0 && ps->channels == 1);
+    check("a normal client can still publish and run commands meanwhile", c->ping());
+    // the subscriber's connection is dropped: it comes back and subscribes again
+    srv->dropClients();
+    settle();
+    check("after a connection loss next() reconnects and subscribes again", ps->next(50) == null);
+    settle();
+    c->ping();                                          // the normal client was dropped too: its next call fails, then it reconnects
+    check("... the pattern still works", c->ping() && c->publish("log.warn", "again") == 1);
+    m = ps->next(2000);
+    check("... and the message arrives", m != null && streq(m->channel, "log.warn") && streq(m->data, "again"));
+    if (m != null) m->dispose();
+    ps->dispose();
+    settle();
+
+    // ---- AUTH and SELECT ---------------------------------------------------------------------------------------------------------------------------------------
+    redis.Client* c2 = redis.connect(&url[0]);
+    c2->set("in0", "db0");
+    char u3[120];
+    format(&u3[0], 120, "redis://127.0.0.1:%d/3", PORT, 0, 0, 0);
+    redis.Client* d3 = redis.connect(&u3[0]);
+    check("a URL with /3 selects database 3", d3 != null && d3->get("in0") == null && d3->set("in3", "db3") && c2->get("in3") == null);
+    check("SELECT on a client", c2->select(3) && eq(c2->get("in3"), "db3") && c2->select(0));
+    store->requirepass = "s3cret";
+    char ua[160];
+    format(&ua[0], 160, "redis://:s3cret@127.0.0.1:%d/2", PORT, 0, 0, 0);
+    redis.Client* au = redis.connect(&ua[0]);
+    check("a URL with a password: AUTH and SELECT 2", au != null && au->set("secret-key", "v") && au->select(2));
+    format(&ua[0], 160, "redis://:wrong@127.0.0.1:%d", PORT, 0, 0, 0);
+    check("a wrong password: no client, the server's reason", redis.connect(&ua[0]) == null && startsWith(redis.error(), "WRONGPASS"));
+    redis.Client* na = redis.connect(&url[0]);
+    check("no password at all: the first command is refused", na != null && !na->ping() && startsWith(na->error, "NOAUTH"));
+    na->dispose();
+    format(&ua[0], 160, "redis://default:s3cret@127.0.0.1:%d", PORT, 0, 0, 0);
+    redis.Client* au2 = redis.connect(&ua[0]);
+    check("user name and password (the default user)", au2 != null && au2->ping());
+    check("AUTH on a client that is connected", c2->auth("s3cret") && c2->ping());
+    // reconnect: AUTH and SELECT are repeated
+    int rc0 = au->reconnects;
+    srv->dropClients();
+    settle();
+    check("the connection is dropped: the next call fails (the command is not sent again)", au->get("secret-key") == null && !au->isConnected());
+    check("the call after that reconnects, authenticates and selects the database again", au->set("again", "yes") && au->reconnects == rc0 + 1 && au->commands > 0);
+    check("... it is in database 2", au->exists("again") == 1);
+    au->select(0);
+    check("... and database 0 does not have it", au->exists("again") == 0);
+    store->requirepass = null;
+    au->dispose();
+    au2->dispose();
+    d3->dispose();
+    c2->dispose();
+
+    // ---- time outs and bad servers ---------------------------------------------------------------------------------------------------------------------------
+    int mute = net.listen(0, 4);
+    char mu[100];
+    format(&mu[0], 100, "redis://127.0.0.1:%d", net.localPort(mute), 0, 0, 0);
+    redis.Options o1();
+    o1.timeoutMs = 300;
+    o1.connectTimeoutMs = 500;
+    int t0 = millis();
+    redis.Client* mc = redis.connectWith(&mu[0], &o1);
+    check("a server that accepts and never answers: connect works (no AUTH), the call times out", mc != null);
+    bool timedOut = mc != null && mc->call("PING") == null && streq(mc->error, "timed out waiting for the reply") && !mc->isConnected() && millis() - t0 < 3000;
+    check("... the call returns null after the time out and the connection is closed", timedOut);
+    if (mc != null) mc->dispose();
+    net.close(mute);
+
+    // a server that answers with something that is not RESP
+    int fake = net.listen(0, 4);
+    char fu[100];
+    format(&fu[0], 100, "redis://127.0.0.1:%d", net.localPort(fake), 0, 0, 0);
+    redis.Client* fc = redis.connect(&fu[0]);
+    int conn1 = net.accept(fake);
+    net.send(conn1, "HTTP/1.1 200 OK\r\n\r\n", 19);
+    check("garbage as a reply: null, the connection is closed, the reason is given", fc != null && fc->call("PING") == null && streq(fc->error, "Protocol error: unexpected data") && !fc->isConnected());
+    net.close(conn1);
+    fc->options->autoReconnect = false;
+    check("with autoReconnect off the next call fails at once", fc->call("PING") == null && streq(fc->error, "not connected"));
+    fc->dispose();
+    // a bulk string that is announced bigger than maxBulk
+    redis.Options o2();
+    o2.maxBulk = 1000;
+    redis.Client* bc = redis.connectWith(&fu[0], &o2);
+    int conn2 = net.accept(fake);
+    net.send(conn2, "$2000\r\n", 7);
+    check("a reply over maxBulk: refused before any of it is read", bc != null && bc->call("GET", "x") == null && streq(bc->error, "Protocol error: too big"));
+    net.close(conn2);
+    bc->dispose();
+    // a server that closes the connection while the client waits
+    redis.Client* cc = redis.connect(&fu[0]);
+    int conn3 = net.accept(fake);
+    net.close(conn3);
+    check("a server that closes the connection: null and the reason", cc != null && cc->call("PING") == null && (streq(cc->error, "the server closed the connection") || streq(cc->error, "the connection failed")));
+    cc->dispose();
+    net.close(fake);
+
+    // ---- limits of the client ---------------------------------------------------------------------------------------------------------------------------------
+    redis.Options o3();
+    o3.maxOut = 1000;
+    redis.Client* lc = redis.connectWith(&url[0], &o3);
+    check("a command over maxOut is refused before anything is sent", lc->call("SET", "k", msg) == null && streq(lc->error, "the command is too large") && lc->isConnected());
+    check("... and the connection still works", lc->ping());
+    lc->dispose();
+
+    // ---- INFO -----------------------------------------------------------------------------------------------------------------------------------------------------
+    c->ping();                                          // the drops above cut this connection too: one failed call, then it reconnects
+    char* info = c->info();
+    check("INFO", info != null && contains(info, "redis_version:") && contains(info, "connected_clients:"));
+    if (info != null) free(info);
+    check("FLUSHALL", c->flushAll() && c->dbsize() == 0);
+
+    c->dispose();
+    settle();
+    check("at the end every client is gone and nothing is in use", store->clients == 0 && store->used == 0);
+    printf("%d checks, %d failed\n", checks, fails);
+    srv->shutdown();
+    return fails == 0 ? 0 : 1;
+}

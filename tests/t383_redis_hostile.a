@@ -1,0 +1,342 @@
+// The Redis server on sockets against hostile peers: protocol errors of every kind (and the connection is closed after the error reply), sizes announced
+// before the data is there, floods of pipelined commands, a client that sends and never reads (cut off, the others are served), a subscriber that does
+// not read, too many connections, idle and half sent commands, huge argument lists, a transaction queue that grows, the memory limit, pathological
+// glob patterns, the expiry sweep in real time. The server must survive all of it and keep serving a well behaved client.
+import redis;
+import redisd;
+import netsrv;
+import net;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+redisd.Server* srv;
+int PORT;
+char url[100];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+void settle(int rounds = 20) {
+    for (int i = 0; i < rounds; i++) srv->poll(1);
+}
+
+int raw() {
+    int h = net.connect("127.0.0.1", PORT);
+    net.setTimeout(h, 2000);
+    return h;
+}
+
+void sendText(int h, char* text) { net.send(h, text, strlen(text)); }
+
+char rbuf[70000];
+
+// reads what comes (until the peer closes or ms pass) into rbuf; returns the number of bytes, -1 if the connection was closed by the peer
+int readSome(int h, int ms, bool* closed) {
+    int t0 = millis();
+    int total = 0;
+    int lastData = 0;
+    *closed = false;
+    while (millis() - t0 < ms) {
+        srv->poll(0);
+        if (!net.waitReadable(h, 5)) {
+            if (total > 0 && millis() - lastData > 30) break;          // it has said what it had to say
+            continue;
+        }
+        int n = net.recv(h, &rbuf[total], 70000 - total);
+        if (n <= 0) { *closed = true; break; }
+        total = total + n;
+        lastData = millis();
+        if (total >= 69000) break;
+    }
+    rbuf[total] = 0;
+    return total;
+}
+
+// the first bytes of what the server sends (text) and whether it closed the connection
+bool answers(int h, char* start, int ms = 1500) {
+    bool closed = false;
+    int n = readSome(h, ms, &closed);
+    return n >= strlen(start) && memcmp(&rbuf[0], start, strlen(start)) == 0;
+}
+
+bool closedBy(int h, int ms) {
+    bool closed = false;
+    readSome(h, ms, &closed);
+    return closed;
+}
+
+int main() {
+    srv = redisd.newServer();
+    check("the server listens", srv->listenOn("127.0.0.1", 0, null));
+    PORT = srv->port;
+    format(&url[0], 100, "redis://127.0.0.1:%d", PORT, 0, 0, 0);
+    net.setIdleHook(hook);
+    redisd.Store* st = srv->store;
+    redis.Client* good = redis.connect(&url[0]);
+    check("a well behaved client is connected", good != null && good->set("canary", "alive"));
+
+    // ---- protocol errors --------------------------------------------------------------------------------------------------------------------------------
+    int h = raw();
+    sendText(h, "*abc\r\n");
+    check("an array length that is not a number: the error, then the connection is closed", answers(h, "-ERR Protocol error: invalid number\r\n") && closedBy(h, 1500));
+    net.close(h);
+    h = raw();
+    sendText(h, "*1\r\n+OK\r\n");
+    check("something other than $ in a request", answers(h, "-ERR Protocol error: unexpected data\r\n") && closedBy(h, 1500));
+    net.close(h);
+    h = raw();
+    sendText(h, "*1\r\n$3\r\nabcXY");
+    check("no CR LF behind an argument", answers(h, "-ERR Protocol error: unexpected data\r\n") && closedBy(h, 1500));
+    net.close(h);
+    h = raw();
+    sendText(h, "*1\r\n$-5\r\n");
+    check("a negative bulk length", answers(h, "-ERR Protocol error: invalid number\r\n") && closedBy(h, 1500));
+    net.close(h);
+    h = raw();
+    sendText(h, "set \"unbalanced\r\n");
+    check("an inline command with an unbalanced quote", answers(h, "-ERR Protocol error: unexpected data\r\n") && closedBy(h, 1500));
+    net.close(h);
+    h = raw();
+    sendText(h, "GET canary\r\n");
+    check("an inline command works", answers(h, "$5\r\nalive\r\n"));
+    net.close(h);
+
+    // ---- sizes that are announced -------------------------------------------------------------------------------------------------------------------------
+    h = raw();
+    sendText(h, "*2\r\n$3\r\nSET\r\n$99999999999\r\n");
+    check("a bulk length of 99999999999 is refused before any data", answers(h, "-ERR Protocol error: too big\r\n") && closedBy(h, 1500));
+    net.close(h);
+    h = raw();
+    sendText(h, "*2\r\n$3\r\nSET\r\n$536870912\r\n");
+    check("a bulk length of 512 MB is over maxBulk (16 MiB by default)", answers(h, "-ERR Protocol error: too big\r\n") && closedBy(h, 1500));
+    net.close(h);
+    h = raw();
+    sendText(h, "*100000000\r\n");
+    check("100 million arguments are refused", answers(h, "-ERR Protocol error: too many elements\r\n") && closedBy(h, 1500));
+    net.close(h);
+    h = raw();
+    sendText(h, "*1025\r\n");
+    check("1025 arguments are over maxArgs", answers(h, "-ERR Protocol error: too many elements\r\n") && closedBy(h, 1500));
+    net.close(h);
+    char* longLine = alloc(70000);
+    memset(longLine, 'a', 70000);
+    longLine[69999] = 0;
+    h = raw();
+    sendText(h, longLine);
+    check("an inline line without an end, over maxInline: error and closed", answers(h, "-ERR Protocol error: too big\r\n") && closedBy(h, 1500));
+    net.close(h);
+    st->maxBulk = 65536;
+    h = raw();
+    sendText(h, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$65537\r\n");
+    check("maxBulk is settable: 65537 is refused", answers(h, "-ERR Protocol error: too big\r\n") && closedBy(h, 1500));
+    net.close(h);
+    check("... 65536 is fine", good->setBin("k64", longLine, 65536) && good->strLength("k64") == 65536);
+    st->maxBulk = 16777216;
+    check("the server serves the good client still", good->ping());
+
+    // ---- many arguments, long pipelines -------------------------------------------------------------------------------------------------------------------
+    redis.Pipeline* p = redis.pipeline(good);
+    char* argv[1024];
+    char* keyText = alloc(12 * 1024);
+    for (int i = 0; i < 1000; i++) {
+        format(&keyText[i * 12], 12, "ak%d", i, 0, 0, 0);
+        argv[i + 1] = &keyText[i * 12];
+    }
+    argv[0] = "MGET";
+    redis.Reply* r = good->callv(1001, &argv[0], null);
+    check("a command with 1000 arguments", r != null && r->type == redis.T_ARRAY && r->count == 1000);
+    r->dispose();
+    p->dispose();
+    h = raw();
+    char* ping = alloc(60000);
+    for (int i = 0; i < 10000; i++) { memcpy(&ping[i * 6], "PING\r\n", 6); }
+    net.send(h, ping, 60000);
+    int got = 0;
+    int t0 = millis();
+    while (got < 70000 && millis() - t0 < 3000) {
+        bool cl = false;
+        int n = readSome(h, 200, &cl);
+        got = got + n;
+        if (n == 0 || cl) break;
+        if (got >= 70000) break;
+    }
+    check("10000 inline PINGs in one write: 10000 answers (70000 bytes)", got >= 69000 || got == 70000);
+    net.close(h);
+    settle();
+
+    // ---- a client that sends a lot and never reads ----------------------------------------------------------------------------------------------------------
+    good->set("value1k", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    int evicted0 = srv->net->stats->evicted;
+    srv->net->maxOut = 65536;
+    h = raw();
+    char* gets = alloc(12 * 3000);
+    for (int i = 0; i < 3000; i++) memcpy(&gets[i * 12], "GET value1k\n", 12);
+    for (int round = 0; round < 40; round++) {
+        net.send(h, gets, 12 * 3000);
+        settle(3);
+        if (srv->net->stats->evicted > evicted0) break;
+    }
+    settle(10);
+    check("a client that pipelines GETs and never reads is cut off (output limit)", srv->net->stats->evicted > evicted0);
+    net.close(h);
+    settle();
+    check("... the other client does not notice", good->ping() && srv->net->count() == 1);
+    srv->net->maxOut = 16777216;
+
+    // a subscriber that does not read
+    srv->net->maxOut = 65536;
+    h = raw();
+    sendText(h, "SUBSCRIBE flood\r\n");
+    settle(5);
+    int ev1 = srv->net->stats->evicted;
+    char* msg = alloc(30000);
+    memset(msg, 'z', 29999);
+    msg[29999] = 0;
+    for (int i = 0; i < 4000 && srv->net->stats->evicted == ev1; i++) {
+        good->publish("flood", msg);
+    }
+    settle(10);
+    check("a subscriber that does not read is cut off when its queue is full, the publisher is not hurt", srv->net->stats->evicted > ev1 && good->ping());
+    net.close(h);
+    settle();
+    srv->net->maxOut = 16777216;
+
+    // ---- connections ---------------------------------------------------------------------------------------------------------------------------------------
+    srv->net->maxConns = srv->net->count() + 2;
+    int hs[6];
+    for (int i = 0; i < 5; i++) hs[i] = raw();
+    settle();
+    int served = 0;
+    for (int i = 0; i < 5; i++) {
+        sendText(hs[i], "PING\r\n");
+        if (answers(hs[i], "+PONG\r\n", 300)) served++;
+    }
+    check("maxConns: two more connections are served, the rest is closed at once", served == 2 && srv->net->stats->rejected >= 3);
+    for (int i = 0; i < 5; i++) net.close(hs[i]);
+    settle();
+    srv->net->maxConns = 1000;
+    srv->net->idleTimeoutMs = 200;
+    h = raw();
+    sendText(h, "PING\r\n");
+    answers(h, "+PONG", 500);
+    check("an idle connection is closed after idleTimeoutMs", closedBy(h, 2000));
+    net.close(h);
+    srv->net->idleTimeoutMs = 0;
+    good->ping();                                       // the good client was idle too: its connection is gone, one call fails, then it reconnects
+    check("(the well behaved client came back after its idle connection was closed)", good->ping());
+    h = raw();
+    sendText(h, "*3\r\n$3\r\nSET\r\n$3\r\nabc\r\n$10\r\n12345");
+    settle(5);
+    int clients0 = st->clients;
+    net.close(h);
+    settle(10);
+    check("a connection that ends in the middle of a command leaves nothing behind", st->clients == clients0 - 1 && srv->net->count() == 1);
+    for (int i = 0; i < 60; i++) {
+        h = raw();
+        if (i % 2 == 0) sendText(h, "SET churn 1\r\n");
+        net.close(h);
+        if (i % 10 == 9) settle(5);
+    }
+    settle(20);
+    check("60 connections that come and go", st->clients == 1 && srv->net->count() == 1);
+
+    // random garbage on many connections
+    int rng = 99;
+    for (int i = 0; i < 30; i++) {
+        h = raw();
+        char junk[100];
+        for (int k = 0; k < 100; k++) { rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF; junk[k] = rng >> 9; }
+        net.send(h, &junk[0], 100);
+        settle(2);
+        net.close(h);
+    }
+    settle(20);
+    check("30 connections with random bytes: the server is fine", good->ping() && st->clients == 1);
+
+    // ---- a transaction queue that grows ---------------------------------------------------------------------------------------------------------------------
+    h = raw();
+    sendText(h, "MULTI\r\n");
+    answers(h, "+OK", 300);
+    char* queued = alloc(8 * 2000);
+    for (int i = 0; i < 2000; i++) memcpy(&queued[i * 6], "PING\r\n", 6);
+    net.send(h, queued, 6 * 2000);
+    bool closed = false;
+    int n = readSome(h, 1500, &closed);
+    int queuedCount = 0;
+    int errCount = 0;
+    for (int i = 0; i + 7 <= n; i++) {
+        if (memcmp(&rbuf[i], "+QUEUED", 7) == 0) queuedCount++;
+        if (memcmp(&rbuf[i], "-ERR too many", 13 < n - i ? 13 : 1) == 0 && rbuf[i] == '-') errCount++;
+    }
+    check("2000 commands after MULTI: 1000 are queued, the rest is refused", queuedCount == 1000 && errCount == 1000);
+    sendText(h, "EXEC\r\n");
+    check("EXEC after that is aborted", answers(h, "-EXECABORT", 500));
+    net.close(h);
+    settle();
+
+    // ---- the memory limit ---------------------------------------------------------------------------------------------------------------------------------
+    st->maxMemory = st->used + 100000;
+    int okCount = 0;
+    int oomCount = 0;
+    for (int i = 0; i < 40; i++) {
+        char k[24];
+        format(&k[0], 24, "mem%d", i, 0, 0, 0);
+        redis.Reply* rr = good->call("SET", &k[0], longLine);
+        if (rr != null && rr->isStatus("OK")) okCount++;
+        if (rr != null && rr->isError() && startsWith(rr->str, "OOM")) oomCount++;
+        if (rr != null) rr->dispose();
+    }
+    check("with a memory limit the writes that pass it are answered with -OOM", okCount >= 1 && oomCount >= 30 && okCount + oomCount == 40);
+    check("reads and deletes still work, then writes work again", good->get("canary") != null && good->del("mem0") + good->del("mem1") + good->del("mem2") + good->del("mem3") >= 1 && good->set("after", "ok"));
+    st->maxMemory = 67108864;
+    good->flushAll();
+    good->set("canary", "alive");
+
+    // ---- glob patterns that are built to hurt ---------------------------------------------------------------------------------------------------------------
+    for (int i = 0; i < 100; i++) {
+        char k[100];
+        memset(&k[0], 'a', 60);
+        format(&k[60], 20, "%d", i, 0, 0, 0);
+        good->set(&k[0], "x");
+    }
+    t0 = millis();
+    r = good->keys("*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b");
+    int dt = millis() - t0;
+    check("a pattern with sixteen stars against 100 keys of 60 a's: answered at once (no exponential backtracking)", r != null && r->count == 0 && dt < 1500);
+    r->dispose();
+    good->flushAll();
+    good->set("canary", "alive");
+
+    // ---- expiry in real time ---------------------------------------------------------------------------------------------------------------------------------
+    redis.Reply* e = good->call("SET", "short1", "x", "PX", "60");
+    e->dispose();
+    e = good->call("SET", "short2", "x", "PX", "60");
+    e->dispose();
+    check("two keys with a short life", st->keyCount(0) == 3 && st->expiringCount(0) == 2);
+    t0 = millis();
+    while (millis() - t0 < 600 && st->expiringCount(0) > 0) { srv->poll(10); }
+    check("the sweep of the server loop removes them without anybody asking", st->keyCount(0) == 1 && st->expiringCount(0) == 0);
+
+    // ---- the end -------------------------------------------------------------------------------------------------------------------------------------------------
+    check("the good client works at the end of all this", good->get("canary") != null && good->ping());
+    good->dispose();
+    settle(20);
+    check("everything is closed and the books are empty after FLUSHALL", st->clients == 0 && srv->net->count() == 0);
+    printf("%d checks, %d failed\n", checks, fails);
+    srv->shutdown();
+    return fails == 0 ? 0 : 1;
+}
