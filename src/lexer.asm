@@ -821,6 +821,8 @@ lex_float:
     ja .conv                        ; not an exponent after all
     xor r11d, r11d
 .ed:movzx eax, byte [rcx]
+    cmp al, '_'
+    je .eskip                       ; 1e1_0: underscores are ignored in the exponent too
     sub eax, '0'
     cmp eax, 9
     ja .edone
