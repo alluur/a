@@ -292,8 +292,9 @@ verified certificate, 160 KB and 300 KB messages), raw frames with every RFC 645
 # MQTT, Redis and syslog
 
 Three protocol families, each with a client and a server module (and a small server program each in `examples/`: `mqttd_demo.a`, `redisd_demo.a`, `syslogd_demo.a`). The servers are built so that they can run for months: every queue has a limit, every limit is a setting, memory is
-freed (a strict test per family compares the heap position before and after many operations), malformed input gets an error and a closed connection. All six modules work on every
-target and on AOS (they use only `net`, `netio`, `tls` and `asys`).
+freed (a strict test per family compares the heap position before and after many operations), malformed input gets an error and a closed connection. The tests run on all five
+targets (Linux x86-64, ARM64, RISC-V, LoongArch, Windows). The modules use only layers that AOS also has (`net`, `netio`, `tls`, `asys`, `datetime`, `os`), but **they have not been run on AOS in QEMU yet**: UDP
+sockets that are non-blocking (`syslogd`) and `poll` on UDP sockets are the parts that depend on the AOS kernel.
 
 ## The layers underneath: netio and netsrv
 
@@ -504,4 +505,4 @@ What the strict memory tests do: they compare `__heap_pos` (what `new`, `alloc` 
 * **Connecting blocks.** `mqtt.connect`, a reconnect inside `poll`, `redis` commands on a closed connection and the first send of a TCP `syslog.Sender` block up to the connect time out (the TLS handshake counts again): a program with its own loop should connect where blocking is fine.
 * **One thread.** The clients are not thread safe; one `netsrv.Server` serves all its sockets from the thread that calls `poll`.
 * **Memory worst cases are products of limits** (clients times queue size): the defaults suit a normal machine; lower them for AOS (128 MB) as the tables above say.
-* **Tested against** the modules themselves and against hand written Python raw-socket peers (MQTT: connect, subscribe, QoS 0 / 1 / 2, retained, will, ping, malformed packet) during development; there is no automatic interoperability test against mosquitto, redis or rsyslog in this repository.
+* **Interoperability** was checked by hand during development, with independent programs where the machine had them: `redis-cli` against `redisd` (commands of every type, `--pipe`, `SUBSCRIBE` / `PUBLISH`, `--raw`, error replies), util-linux `logger` against `syslogd` (UDP and TCP, RFC 3164 and RFC 5424 with structured data), `nc` as the receiver of the `syslog` sender (the bytes of datagrams and of both TCP framings) and a hand written Python raw-socket MQTT client against `mqttd` (connect, subscribe, QoS 0 / 1 / 2, retained, will, ping, a malformed packet). There is no MQTT client or broker from another vendor on the development machine, and no automatic interoperability test in this repository (the tests use the modules against each other and byte-exact examples from the specifications).
