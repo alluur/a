@@ -1,0 +1,58 @@
+"""Expected output of tests/t454_optim_roots.a: the roots are computed in 60 digit decimals (Newton iteration with the exact derivative; closed forms for
+the logarithms, powers and the square roots of the system); the statuses are the documented behaviour of each method."""
+import sys
+sys.path.insert(0, '.')
+from decimal import Decimal as D, getcontext
+import refspecial as R
+getcontext().prec = 60
+g11 = lambda v: '%.11g' % float(v)
+
+def newton(f, df, x0, n=60):
+    x = D(x0)
+    for _ in range(n):
+        x = x - f(x) / df(x)
+    return x
+dottie = newton(lambda x: R.cos(x) - x, lambda x: -R.sin(x) - 1, '0.7')
+cubic = newton(lambda x: x ** 3 - 2 * x - 5, lambda x: 3 * x * x - 2, '2')
+ln2h = D(2).ln() / 2
+exp2 = 2 * D(1000).ln()
+steep = (D(10) ** -30) ** (D(1) / 9)
+e = D(1).exp()
+root3 = D(3).sqrt()
+sx = (2 + root3).sqrt(); sy = (2 - root3).sqrt()
+
+out = []
+for name in ('bisection', 'brent', 'newton', 'newton (numerical derivative)', 'secant'):
+    out.append('%s cos(x) - x: status 0 x %s' % (name, g11(dottie)))
+for name in ('bisection', 'brent', 'newton', 'secant'):
+    out.append('%s x^3 - 2x - 5: status 0 x %s' % (name, g11(cubic)))
+out.append('brent exp(-2x) = 0.5 with a context: status 0 x %s' % g11(ln2h))
+out.append('the callback was called 11 times (evals 11), at most 15: 1')
+out.append('brent exp(-x/2) = 0.001 (the same function with other parameters): status 0 x %s' % g11(exp2))
+out += ['bisection iterations: between 40 and 46: 1', 'brent iterations below 12: 1, evals below 14: 1', 'newton iterations below 8: 1',
+        'newton (x - 1)^3 from 2: status 0, within 1e-3 of the root 1',
+        'brent (x - 1)^3 on [0, 3] (slow for a triple root: more than 100 iterations): status 0, within 1e-9 of the root 1, iterations above 50 1',
+        'bisection (x - 1)^3 on [0, 3]: status 0 x 1',
+        'brent on a very steep function x^9 = 1e-30: status 0 x %s' % g11(steep),
+        'brent on arctan with a far away bracket: status 0, root within 1e-9 of 0: 1',
+        'brent log(x) = 1: status 0 x %s' % g11(e)]
+out.append('bisection with a > b: status 0 x %s' % g11(dottie))
+out.append('brent with a > b: status 0 x %s' % g11(dottie))
+out += ['root at the left end point: status 0, x 2, iterations 0', 'bisection root at the left end: status 0, x -2', 'newton starting at the root: status 0, x 0, iterations 1',
+        'no sign change: brent status 2 (ERR_BRACKET = 2), bisection status 2', 'function returns NaN at the end point: 4',
+        'a pole inside the interval (a sign change, but no root): status 0, x is the pole 1, |f| is huge 1',
+        'bisection with 5 iterations: status 3 (ERR_NO_CONVERGE = 3)', 'brent with 3 iterations: status 3',
+        'newton with a zero derivative: status 5 (ERR_SINGULAR = 5)', 'newton on x^2 - 4 from 0 (the numerical derivative is exactly 0 there): status 5',
+        'newton on log(x) - 1 from 0.01 converges: status 0; from 10 it leaves the domain: status 4 (ERR_NAN = 4)', 'secant with equal values: status 5',
+        'secant that does not converge in 2 iterations: 3', 'tolerance below zero: 1, NaN start: 1, infinite bracket: 1',
+        'errorText: ok | the interval does not bracket a root (no sign change) | unknown error',
+        'findBracket for x^2 - 4 from 3: status 0, sign change 1', 'brent in that bracket: status 0 x 2', 'findBracket for cos(x) - x from 5: status 0, sign change 1',
+        'findBracket for a constant function: status 2 (ERR_BRACKET = 2)', 'findBracket with step 0: status 1 (ERR_ARG = 1)',
+        'system x^2 + y^2 = 4, x y = 1: status 0 x %s y %s' % (g11(sx), g11(sy)), '  residual below 1e-12: 1, iterations below 12: 1',
+        'three equations: status 0 x 1 y 2 z 3', 'a singular Jacobian: status 5 (ERR_SINGULAR = 5)', 'a far away start still finds a solution: status 0, residual below 1e-12 1',
+        'null x: status 1 (ERR_ARG = 1)', 'one iteration only: status 3 (ERR_NO_CONVERGE = 3)',
+        'derivative of sin at 1 within 1e-8 of cos(1): 1, five point formula within 1e-10: 1',
+        'derivative of x^3 - 2x - 5 at 2 (exact 10): central within 1e-8 1, five point within 1e-9 1', 'with an explicit step: within 1e-6 1',
+        'gradient of x^2 y + z sin y (1e-8): 1', 'x unchanged by the numerical gradient: 1', 'Jacobian by forward differences (1e-6): 1',
+        'Hessian by central differences (1e-5): 1, symmetric: 1', 'memory leaked: 0']
+sys.stdout.write('\n'.join(out) + '\n')
