@@ -116,7 +116,10 @@ What to notice:
 
 * A byte that cannot start or continue a character decodes as U+FFFD (the replacement character) and uses exactly one byte. A loop over broken text therefore always makes progress.
 * `isValid` checks the structure: lead bytes and continuation bytes, and it rejects the bytes C0, C1 and F5 to FF.
-* It does **not** reject overlong three and four byte forms, surrogate halves (U+D800 to U+DFFF) or code points above U+10FFFF. If you must be strict with untrusted input, add your own check.
+
+::: warning
+`isValid` does **not** reject overlong three and four byte forms, surrogate halves (U+D800 to U+DFFF) or code points above U+10FFFF. If you must be strict with untrusted input, add your own check.
+:::
 
 See the [API reference of `utf8`](#api-utf8).
 
@@ -258,7 +261,7 @@ What to notice:
 
 What to notice:
 
-* `${2}_$1` is needed when a digit or a letter would follow the group number.
+* `$1` takes **one** digit, so `$10` is group 1 followed by a 0. Use `${10}` for groups from 10 on; `${2}` is the same as `$2`. A group number that does not exist gives an empty text, and a `$` that is not followed by a digit, `{` or `$` stays as it is.
 * An empty match is replaced as well: `x*` on `abc` puts a dash before and after every letter, like Python 3.7 and newer.
 * A group that did not take part in the match contributes nothing.
 * `replaceAll` uses the replacement literally and the *simple dialect* described at the end of this section.
@@ -323,7 +326,11 @@ What to notice:
 
 * A pattern that does not compile sets `ok` to false. Using such a `Regex` is safe: searches simply find nothing.
 * A pattern can have at most 32 capturing groups (`regex.MAXGROUPS`).
-* Nested quantifiers such as `(a+)+b` can take exponential time on text that does not match. The engine stops after **5 million steps**, `search` returns -1 and `exceeded` is true. Check `exceeded` when you cannot tell "no match" from "gave up". You can change the limit per pattern with `stepLimit`.
+* The engine stops after **5 million steps**: `search` returns -1 and `exceeded` is true. You can change the limit per pattern with `stepLimit`.
+
+::: warning
+Nested quantifiers such as `(a+)+b` can take exponential time on text that does not match, and someone who controls the pattern or the text can use that to freeze a program. The step limit keeps your program running. Look at `exceeded` when a search finds nothing, because "no match" and "gave up" both return -1.
+:::
 
 ### The simple functions
 

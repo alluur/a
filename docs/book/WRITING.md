@@ -29,7 +29,7 @@ standard input comes from `NAME.in`.
   pointer, or thread timing in the output. A sample runs in a scratch directory, so it may create and delete files there.
 * **No network except loopback**, and then with an ephemeral port: `net.listen(0, ...)` and read the port back (`net.localPort`).
   Never hard code a port. Prefer one process: `thread`, or `net` with non-blocking sockets, or a fork, so the sample is self-contained.
-* **No floats**: A has no `float` / `double` type. Doubles are software values in an `int` (`dlit("3.14")`, `dadd`, `printfd`, see `docs/CLIB.md`).
+* **Floating point**: `double` (and `float`, its alias) is a real type, implemented in software (module `dfloat`, loaded when a program uses it; `dmath` has `sqrt sin pow log ...`), so results are identical on every target. Read `docs/LANGUAGE.md` section 7 ("static if, :: and floating point") and `tests/t92_double.a`. Print doubles with `printlnDouble` / `doubleToFixed`; the `printfd` family of the C library takes raw bit patterns (`__bits(d)`), not `double` values. Note: `docs/CLIB.md` and `README.md` still claim that A has no `float` / `double`; they are out of date.
 * Use only what the **compiler on this branch** does (`build/ac`). If a feature in the docs does not work, do not hide it:
   work around it in the sample and write the problem into `docs/book/NOTES-<yourname>.md` (see section 5).
 * Compiles for **every target**: `python3 docs/book/tools/samples.py --targets NAME`. Needs Linux only (fork, signals, `/proc`)?

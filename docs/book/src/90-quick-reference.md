@@ -10,7 +10,7 @@ One page of facts to keep open while you write A. Everything here is explained i
 | Declarations | `const` `static` `extern` `typedef` `struct` `class` `union` `enum` |
 | Classes | `public` `private` `protected` `virtual` `super` `this` `new` |
 | Modules | `module` `import` `a_module` `a_import` |
-| Types | `int` `long` `char` `byte` `bool` `void` `func` `int8` `int16` `int32` `int64` `uint8` `uint16` `uint32` `uint64` `size_t` `uintptr_t` `ssize_t` `intptr_t` `ptrdiff_t` |
+| Types | `int` `long` `char` `byte` `bool` `double` `float` `void` `func` `int8` `int16` `int32` `int64` `uint8` `uint16` `uint32` `uint64` `size_t` `uintptr_t` `ssize_t` `intptr_t` `ptrdiff_t` |
 | Values | `true` `false` `null` |
 | Operators as words | `and` `or` `not` `xor` `sizeof` |
 | Low level | `asm` |
@@ -22,6 +22,7 @@ One page of facts to keep open while you write A. Everything here is explained i
 | `int` (also `long`) | 8 bytes | signed 64-bit |
 | `char` (also `byte`) | 1 byte | unsigned 8-bit; text and raw bytes |
 | `bool` | 1 byte | `true` / `false`; stores 0 or 1 |
+| `double` (also `float`) | 8 bytes | IEEE 754 binary64, arithmetic in software; `1.5`, `2e-3` literals |
 | `void` | none | no value; `void*` is the generic pointer |
 | `T*` | 8 bytes | pointer to `T` |
 | `T name[N]` | `N * sizeof(T)` | fixed array, `N` a constant expression |

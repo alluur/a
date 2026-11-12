@@ -32,7 +32,7 @@ In this chapter:
 | exchange messages with a browser in both directions | `websocket` (next chapter) |
 | encrypt a connection | `tls`, usually through `http` (next chapter) |
 
-The modules form layers. Everything is built on `net`; `packet` and `netaddr` are pure computation and need no operating system at all.
+The modules form layers. Everything is built on `net`, except `packet` and `netaddr`, which only compute and do no network I/O at all.
 
 ```text
 http  websocket          protocols
@@ -58,7 +58,7 @@ samples talk to themselves over the loopback address `127.0.0.1`, which never le
 
 ::: note
 
-A thread (module `thread`) would also work as the "other side", but A's allocator is not thread safe, so a server thread that allocates
+A thread (module [thread](#api-thread)) would also work as the "other side", but A's allocator is not thread safe, so a server thread that allocates
 (an HTTP handler always does) can damage the heap while the main thread allocates as well. A second process has no such problem, and a
 real server is usually a separate program anyway: see `examples/net_server.a` and `examples/net_client.a`.
 
@@ -204,7 +204,7 @@ puts the server in a child process made by `fork`.
 * The program listens **before** `fork`, so the port exists when the child starts and the parent cannot connect too early. The parent
   closes its copy of the listening socket; the child keeps serving.
 * `fork` returns `0` in the child and the child's process id in the parent. `waitpid` collects the exit code, which is in bits 8 to 15
-  of the status. Use `_exit` in the child so it does not run the parent's cleanup.
+  of the status. The child ends with `_exit(0)`, so that it never falls through into the parent's code.
 * This server handles one client at a time. For many clients in one thread use `net.poll` or a `conn.Poller` (below), or fork a child
   per connection.
 
@@ -456,10 +456,16 @@ The text parsers behind it are public, so they can be tested with fixed text.
   table away. Use the counts from the parser's return value in a test.
 * The kernel writes addresses in `/proc/net/route` as little-endian hexadecimal: `0101A8C0` is `192.168.1.1`.
 
-Live facts differ from one computer to the next, but the loopback interface is always there and a socket you just opened shows up in
-the table:
+Live facts differ from one computer to the next, but the loopback interface is always there, and its counters show that traffic
+happened:
 
 {{sample net/netif_loopback}}
+
+**What to notice.** Every lookup (`findInterface`, `interfaceCount`) reads the system again and makes **new** `Iface` objects, so an
+object you kept does not change: fetch it again to see new numbers. Two limits to know when you list sockets: the table holds at most
+512 sockets, and a machine with more (a busy server, or one with many connections in `TIME_WAIT`) silently loses the rest; and the
+kernel's table can change while it is being read, so an entry may be missed or listed twice. Do not build logic on "this socket must
+be in the list".
 
 For everything else (interfaces with their MAC addresses and counters, the gateway, the ARP cache) the sample below only compiles.
 `examples/netinfo.a` is a complete version.
@@ -515,7 +521,7 @@ ARP frame:       [ dst MAC | src MAC | 0x0806 ][ ARP packet ]
 {{sample net/packet_arp}}
 
 **What to notice.** An ARP request is a broadcast (`ff:ff:ff:ff:ff:ff`) asking "who has 10.0.0.2?", and the owner answers directly.
-`describe(frame, n)` prints one line in the style of `tcpdump`, and `hexdump(data, n)` shows the bytes with their ASCII.
+`describe(frame, n)` returns a one-line description in the style of `tcpdump`, and `hexdump(data, n)` a dump of the bytes with their ASCII.
 
 ### UDP over IPv4 over Ethernet
 

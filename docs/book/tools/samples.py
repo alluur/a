@@ -130,16 +130,16 @@ def run_one(path, ac, update, targets, verbose):
         op = out_path(path) if not multi else os.path.join(srcdir, "main.out")
         norm = (lambda s: "\n".join(sorted(s.splitlines())) + "\n") if d.get("sorted") else (lambda s: s)
         if os.path.exists(op):
-            want = open(op, encoding="utf-8", errors="replace").read()
+            want = open(op, encoding="utf-8", errors="replace", newline="").read()
             if norm(want) == norm(got):
                 return name, True, "ok"
             if update:
-                open(op, "w", encoding="utf-8").write(got)
+                open(op, "w", encoding="utf-8", newline="").write(got)
                 return name, True, "output rewritten"
             diff = "".join(difflib.unified_diff(want.splitlines(True), got.splitlines(True), "expected", "got", n=2))
             return name, False, "output differs:\n" + diff[:1500]
         if update:
-            open(op, "w", encoding="utf-8").write(got)
+            open(op, "w", encoding="utf-8", newline="").write(got)
             return name, True, "output recorded (%d bytes)" % len(got)
         return name, False, "no .out file (run with --update, then read the output and commit it)"
     except Exception as e:  # keep going with the other samples

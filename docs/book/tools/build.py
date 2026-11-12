@@ -166,7 +166,7 @@ def expand_directives(text, chapter_name):
                 out += listing("", os.path.relpath(o, SAMPLES), open(o, encoding="utf-8", errors="replace").read())
             if flag != "src" and not meta.get("compile-only") and not meta.get("gui"):
                 if os.path.exists(outp):
-                    got = open(outp, encoding="utf-8", errors="replace").read()
+                    got = open(outp, encoding="utf-8", errors="replace", newline="").read().replace("\r\n", "\n").replace("\r", "")
                     if got.strip():
                         f = fence_for(got)
                         out += [":::: output", "::: ltitle", "Output", ":::", "", f + "text", got.rstrip("\n"), f, "::::", ""]

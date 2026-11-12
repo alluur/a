@@ -173,7 +173,10 @@ What to notice:
 
 * The private exponent `d` comes from `arith.modInverse(e, phi)`.
 * Encrypting and decrypting are the same operation with a different exponent, `powMod(m, message, e)` and `powMod(m, cipher, d)`.
-* The code is **not constant time**. The header of the module says it plainly: use it for verification and for short-lived keys, not for long-lived secrets. See [the cryptography chapter](#chap-cryptography) for the complete tools.
+
+::: warning
+The code of `bn` is **not constant time**: how long it runs can depend on the secret numbers. The header of the module says so plainly. Use it for verification and for short-lived keys, not for long-lived secrets. [The cryptography chapter](#chap-cryptography) shows the complete tools.
+:::
 
 See the [API reference of `bn`](#api-bn).
 

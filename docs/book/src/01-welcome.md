@@ -16,6 +16,7 @@ This book is the complete guide to the language, the compiler and everything tha
 |---|---|
 | **`ac`** | The compiler: one static program of about 3 MB. It reads A source and writes executables (ELF for Linux and Android, PE for Windows) by itself, with a built-in preprocessor and a built-in linker. Compiling "Hello, world" takes a few milliseconds. |
 | **Eight documented targets** | Linux on x86-64, ARM64, RISC-V 64 and LoongArch64; Windows on x86-64; Android on ARM64, x86-64 and RISC-V 64. The same source compiles for all of them. |
+| **Real numbers** | `double` (alias `float`) with the usual operators, literals and conversions; the maths library `dmath` (`sqrt`, `sin`, `pow`, `log` ...); exact, the same result on every target. |
 | **The standard library** | More than 100 modules written in A and compiled into your program: text, collections, numbers, JSON, regular expressions, cryptography, TLS 1.3, TCP/UDP/HTTP/WebSocket, the C library and more. Only what a program really uses ends up in its executable. |
 | **GUI programming** | A 2D graphics library, a widget toolkit, a display server with a window manager, and a code editor widget set, all written in A. |
 | **Terminal programs** | A toolkit for full screen text programs with mouse, colours and widgets. |
@@ -42,7 +43,7 @@ What to notice:
 
 An honest list helps you decide whether A fits your project.
 
-* **There is no `float` or `double` type.** Floating point numbers are 64-bit patterns stored in an `int`, and arithmetic is done by functions (`dadd`, `dmul`, `sqrt` ...) in software. The results are exact and identical on every target, but slower than hardware floating point. See [the C library tour](#chap-c-library-tour).
+* **Floating point is done in software.** `double` (and `float`, an alias of it) is a real IEEE 754 binary64 type, with literals like `1.5` and `2e-3` and automatic conversion between `int` and `double`. The arithmetic is carried out by a built-in software implementation, so the results are bit for bit identical on every target, but it is much slower than a hardware floating point unit. It does not use the processor's floating point unit at all, and `float` is only another name for `double`, so A is not the tool for number crunching. See [the numbers chapter](#chap-numbers).
 * **There is no garbage collector.** Memory from `new` and `alloc` is never freed; programs that run for a long time use `malloc` and `free`. See [Memory and pointers](#chap-memory-and-pointers).
 * **There is no bounds checking.** Pointers are plain addresses, as in C. The type checking is light: pointer types convert freely.
 * **The compiler runs on Linux x86-64.** It produces programs for the other systems, but to compile on Windows or macOS you use WSL, a container or a virtual machine.
