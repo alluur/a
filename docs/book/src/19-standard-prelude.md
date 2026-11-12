@@ -1,10 +1,11 @@
 # The standard prelude
 
-Every A program starts with a library already in it. The **standard prelude**, the file `lib/std.a`, is compiled into every program automatically, with no `import`. It has the functions you used in the first chapter (`println`, `printf`, `readLine`) and many more for strings, numbers, files, the environment and time. Underneath it sits a handful of **built-in runtime functions** that the compiler itself provides. This chapter tours both, shows what the compiler says when something is wrong, and ends with a table of the differences from C.
+Every A program starts with a library already in it. The **standard prelude**, the file `lib/std.a`, is compiled into every program automatically, with no `import`. It has the functions you met in [First programs](#chap-first-programs) (`println`, `printf`, `readLine`) and many more for strings, numbers, files, the environment and time. Underneath it sits a handful of **built-in runtime functions** that the compiler itself provides. This chapter tours both, shows what the compiler says when something is wrong, and ends with a table of the differences from C.
 
 In this chapter:
 
 - the prelude as a tour: strings, characters, numbers, random numbers, the environment, time and the terminal
+- two worked examples: copying a file in pieces and a small text statistics tool
 - the built-in runtime functions (`__write`, `__open`, `__syscall`, ...)
 - typical compile errors and how to read them
 - the differences between A and C
@@ -33,7 +34,7 @@ The output, input, file and formatting functions were introduced in [chapter 10]
 
 ## Strings
 
-A string in A is a `char*` that points to bytes ending with a zero byte. There is no string type with a length or a copy: you pass pointers around, and the string functions work on them.
+A string in A is a `char*` that points to bytes ending with a zero byte. There is no built-in string type that knows its length or copies itself: you pass pointers around, and the string functions work on them. (The `strings` module adds a `StringBuilder` for building text piece by piece.)
 
 | Function | Result |
 |---|---|
@@ -49,7 +50,7 @@ A string in A is a `char*` that points to bytes ending with a zero byte. There i
 
 What to notice:
 
-- `strcpy` and `strcat` do **not** check the size of the destination. `buf` held 32 characters and the text needed 13: you must make sure the buffer is big enough, or use `format` with a size.
+- `strcpy` and `strcat` do **not** check the size of the destination. `buf` held 32 bytes and the text needed 13 (12 characters and the zero byte): you must make sure the buffer is big enough, or use `format` with a size.
 - Never compare strings with `==`: that compares the pointers. Use `streq`, or `strcmp` when you need the order.
 - `strdup` made a copy, so changing `copy[0]` left `buf` alone. The copy lives on the heap and is never freed.
 - `memset` and `memcpy` work on bytes, and `memcpy` returns nothing: it does not return `dst` as in C.
@@ -88,7 +89,7 @@ What to notice:
 
 ### Converting between numbers and text
 
-`intToStr(n, buf)` writes the decimal form of `n` into `buf` (at least 21 bytes, for the largest 64-bit number with a sign) and returns `buf`. `hexToStr(n, buf)` writes the lowercase hexadecimal form (the buffer needs at least 17 bytes). Going the other way, `atoi(s)` is lenient: it reads an optional minus sign and then digits, and stops at the first other character, so it returns 0 for text that is not a number. `parseInt(s, &value)` is strict: it accepts white space around a number and an optional `+` or `-`, stores the value and returns `true`, or returns `false` for anything else and leaves `value` alone.
+`intToStr(n, buf)` writes the decimal form of `n` into `buf` (at least 21 bytes, for the largest 64-bit number with a sign) and returns `buf`. `hexToStr(n, buf)` writes the lowercase hexadecimal form (the buffer needs at least 17 bytes; a negative number gives its 16 digits of two's complement) and returns nothing. Going the other way, `atoi(s)` is lenient: it reads an optional minus sign and then digits, and stops at the first other character, so it returns 0 for text that is not a number. A leading space or `+` also gives 0. `parseInt(s, &value)` is strict: it accepts white space around a number and an optional `+` or `-`, stores the value and returns `true`, or returns `false` for anything else and leaves `value` alone.
 
 {{sample std/number_text}}
 
@@ -107,7 +108,7 @@ What to notice:
 What to notice:
 
 - The functions take exactly two numbers (`min`, `max`); for a list of values keep a running result in a loop, as the last block does. The `math` module has `minOf` and `maxOf` for arrays and `clamp` for ranges.
-- `abs` of the smallest 64-bit number stays negative, because its positive twin does not exist in 64 bits.
+- The sample does not show it, but `abs` of the smallest 64-bit number (-9223372036854775808) stays negative, because its positive twin does not exist in 64 bits.
 
 ### Random numbers
 
@@ -123,14 +124,14 @@ What to notice:
 
 ## The environment and time
 
-`getEnv(argc, argv, "NAME")` returns the value of an environment variable as a new heap string, or `null` if it is not set. It needs `argc` and `argv` from `main`, because on Linux and Android the environment follows `argv` in memory. `fileExists`, `fileDelete` and `makeDir` handle the file system (see chapter 10).
+`getEnv(argc, argv, "NAME")` returns the value of an environment variable as a new heap string, or `null` if it is not set. It needs `argc` and `argv` from `main`, because on Linux and Android the environment follows `argv` in memory. `fileExists`, `fileDelete` and `makeDir` handle the file system (see [chapter 10](#chap-first-programs)).
 
 {{sample std/env_vars}}
 
 What to notice:
 
 - The sample is run with a tiny environment in which `TERM` is `dumb` and `LANG` is `C`; on your machine the values will be your own.
-- `getEnv(...) ?? "unset"` gives a default for a missing variable. The `??` operator (see [chapter 12](#chap-variables-and-operators)) replaces `null`.
+- `getEnv(...) ?? "unset"` gives a default for a missing variable. The `??` operator (see [chapter 12](#chap-variables-and-operators)) takes the right side when the left side is `null` (or 0).
 
 `millis()` returns a monotonic millisecond counter that starts at an arbitrary moment, so only **differences** are meaningful. `sleepMs(ms)` waits.
 
@@ -154,7 +155,7 @@ What to notice:
 
 ## Files in pieces
 
-Chapter 10 showed `readFile`, `writeFile` and the handle functions one at a time. Here they work together in a function that copies a file:
+[Chapter 10](#chap-first-programs) showed `readFile`, `writeFile` and the handle functions one at a time. Here they work together in a function that copies a file:
 
 {{sample std/file_copy}}
 
@@ -162,7 +163,7 @@ What to notice:
 
 - Two handles are open at the same time, and each error path closes what was opened.
 - `fileRead` returned fewer bytes than asked at the end of the file (96 bytes as 64 plus 32), then 0.
-- The function returns the number of bytes, or -1 on error: the usual convention for functions that cannot use a result type like `bool` to say more.
+- The function returns the number of bytes copied, or -1 on error. A count is never negative, so -1 can safely mean "failed"; the caller does not learn which step failed.
 
 ## A small tool
 
@@ -189,8 +190,8 @@ These functions are provided by the compiler for the target platform. The standa
 
 | Function | Description |
 |---|---|
-| `__write(fd, buf, n)` | writes `n` bytes to a file descriptor (0 standard input, 1 standard output, 2 standard error; other values are handles from `__open`) |
-| `__read(fd, buf, n)` | reads up to `n` bytes |
+| `__write(fd, buf, n)` | writes `n` bytes to a file descriptor (1 is standard output, 2 standard error; other values are handles from `__open`) and returns the number written |
+| `__read(fd, buf, n)` | reads up to `n` bytes (fd 0 is standard input) and returns the count, 0 at the end |
 | `__open(path, mode)` / `__close(h)` | opens a file (`mode` is 0 read, 1 write, 2 append) / closes it |
 | `__exit(code)` | ends the process at once |
 | `__syscall(nr, a1, ..., a6)` | a raw system call (Linux and Android only; the numbers differ between x86-64 and ARM64) |
@@ -217,7 +218,7 @@ A raw system call goes straight to the kernel. The system call numbers belong to
 
 What to notice:
 
-- `write` is number 1 on x86-64 and 64 on ARM64, RISC-V and LoongArch. Windows has no `__syscall`; there you would use `__winapi`.
+- `write` is number 1 on x86-64 and 64 on ARM64, RISC-V and LoongArch. `__syscall` is for Linux and Android only; on Windows you would call imported functions with `__winapi`.
 - The six arguments after the number are always given; unused ones are 0. The call returned 29, the number of bytes written.
 - Prefer the prelude and the library modules (`asys`, the C library) for anything portable. `__syscall` is for the code that builds those libraries.
 
@@ -304,7 +305,7 @@ Other messages you will meet:
 | `the string is longer than the array` | a `char` array initialised with a longer string |
 | `unterminated string literal` | a missing closing `"` |
 | `unexpected end of file, missing '}'` | unbalanced braces |
-| `unknown type 'B'` | a class used before it is defined, or a misspelt type |
+| `unknown type 'B'` | a misspelt type, or a class used before it is defined, in a parameter list or a field (in a function body the same mistake is reported as `undeclared identifier 'B'`) |
 | `no such member 'z'` | a field or enum member that does not exist |
 | `member access on a value that is not a struct, class or pointer to one` | `x.y` where `x` is an `int` or a `char*` |
 | `access to private declaration 'secret'` | a `private` function or constant of a module used from another file |
@@ -344,7 +345,7 @@ A looks like C, and most C knowledge carries over. This table lists what is diff
 | struct values | by value | by value too (a hidden copy); `==` does not compare the fields |
 | default arguments | none | `int f(int a, int b = 1)` |
 | variable arguments | `va_list` | `...`, `va_arg(i)`, `va_count()` |
-| `printf` | any number of arguments, `%f` | up to 8 values, `%b` for binary, no `%f` (see `printfd`) |
+| `printf` | any number of arguments, `%f` | up to 8 values, `%b` for binary, no `%f` (it is printed as the two characters `%f`; see `printfd`) |
 | floating point | `float`, `double` in hardware | `double` (and `float` as an alias) in software, same result everywhere |
 | `switch` | constant labels | constant labels that fit in 32 bits |
 | extras | | `defer`, `static if`, `??`, `<=>`, `xor` / `^^`, `and` / `or` / `not`, designated initializers, compound literals |

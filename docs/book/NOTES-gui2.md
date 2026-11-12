@@ -114,7 +114,6 @@ Cosmetic.
 * `docs/GUI.md`, display server: `new wsrv.Server(b, 7000)` is shown, and `7000` is the only port the text mentions; nothing says how to run a second server in the same machine (use another port: `adisplayd -p 24612`,
   `ADISPLAY=127.0.0.1:24612`). The sentence "`ADISPLAY=N` = port 7000+N" only holds below 100: a number of 100 or more is the port itself (`adp.portOf`).
 * `docs/AIDE.md`, section 1 and 3: "Objects with a constructor are declared with parentheses: `acode.Buffer b();`" is right inside functions only (a5).
-* `docs/TUI.md` "Testing": the `tests/tui.sh` description lists `tests/tui/ptyterm.py` as a Python terminal emulator; it is also what `tools/tuishot.py` uses for the book, and it works well for that.
 
 ## (c) Not covered, not verified, and why
 
