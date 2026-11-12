@@ -1,0 +1,142 @@
+// Memory: inflating and deflating (and so every permessage-deflate message of a WebSocket) leaves nothing behind. Earlier versions made their
+// Huffman tables and workers with `new`, memory that is never freed: about 10 KB per message, so a server with compression ran out of memory.
+// The heap position (what `new`, alloc and strdup use up) must stay where it is; blocks of malloc are reused after free.
+import websocket;
+import zlib;
+import encoding;
+import cstdlib;
+import cstring;
+
+int fails = 0;
+
+void check(char* what, bool ok) {
+    if (ok) printf("ok   %s\n", what);
+    else { printf("FAIL %s\n", what); fails++; }
+}
+
+// a stream with a dynamic Huffman block, made by zlib at level 9 (raw deflate): 300 words, 1579 bytes
+char* DYN = "65545b6283300cbb4aae062bac6c2d7414cadad32f966247e93e0013bf243fd22fbfe9b47ca6eee89ee93e3c86396de7219df7791bd674e95ecff4b34f1fdf6979e4ff315bc3f2384f9781ea715daee9985edd7abac320db0fdbe549ad05f3c7f2308cb940ead7e598d3d77ebddd539f7ded29b979c8b746b107be7875f329adfb4c1347112626209999d90fc0879ac10d1671209099f642c3aced1f4ada99092299c052408ba0fce71b07ac9f650904c0f48eb86a3475a98634c1c08058fea2c6c5445a28a2e52d06da9c80cfc020096e26810cdd7bef386b058d8574e0b52051bc7f8dad55927ad0c0c2c7ec14ea59095a915a28183a06a521dfd282c6004ceb0419ff180b21554b60487956f2f5eec26a9453c947111b142c4184612c65b32032227564588b1a8ac9dc455a5aaa6da2d323f8984877428f1a6c359d8e579956f18a16fb58655f81101d89558280c03a8832432c05e5b6fecc8e8d8be18b197798f556f2d554b8cd95e02eefddc33cc9f0c9f525a7b565efdbacab5aa745e9a2c9b8c140444b8c346db560ede84761e4ad358cbe61b60699f858beed5800692cb54f417b6bbaba49d2dcb251f3e6faa9dc61f507";
+// the same data from a sync flush (no final block, ends with 00 00 ff ff)
+char* DYN2 = "64545b6283300cbb4aae062bac6c2d7414cadad32f966247e93e0013bf243fd22fbfe9b47ca6eee89ee93e3c86396de7219df7791bd674e95ecff4b34f1fdf6979e4ff315bc3f2384f9781ea715daee9985edd7abac320db0fdbe549ad05f3c7f2308cb940ead7e598d3d77ebddd539f7ded29b979c8b746b107be7875f329adfb4c1347112626209999d90fc0879ac10d1671209099f642c3aced1f4ada99092299c052408ba0fce71b07ac9f650904c0f48eb86a3475a98634c1c08058fea2c6c5445a28a2e52d06da9c80cfc020096e26810cdd7bef386b058d8574e0b52051bc7f8dad55927ad0c0c2c7ec14ea59095a915a28183a06a521dfd282c6004ceb0419ff180b21554b60487956f2f5eec26a9453c947111b142c4184612c65b32032227564588b1a8ac9dc455a5aaa6da2d323f8984877428f1a6c359d8e579956f18a16fb58655f81101d89558280c03a8832432c05e5b6fecc8e8d8be18b197798f556f2d554b8cd95e02eefddc33cc9f0c9f525a7b565efdbacab5aa745e9a2c9b8c140444b8c346db560ede84761e4ad358cbe61b60699f858beed5800692cb54f417b6bbaba49d2dcb251f3e6faa9dc61f5070000ffff";
+int DATALEN = 1579;
+int DATASUM = 149486;
+
+int sumOf(char* p, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) s = (s + (p[i] & 255)) & 0xffffffff;
+    return s;
+}
+
+int move(websocket.WebSocket* a, websocket.WebSocket* b) {
+    int n = a->outPending();
+    if (n == 0) return 0;
+    b->feed(a->outData(), n);
+    a->outConsumed(n);
+    return n;
+}
+
+int main() {
+    char* z1 = alloc(strlen(DYN) / 2 + 8);
+    int n1 = encoding.hexDecode(DYN, z1);
+    char* z2 = alloc(strlen(DYN2) / 2 + 8);
+    int n2 = encoding.hexDecode(DYN2, z2);
+    check("the dynamic Huffman stream is one (block type 2)", ((z1[0] >> 1) & 3) == 2 && ((z2[0] >> 1) & 3) == 2);
+    int len = 0;
+    char* o = zlib.inflate(z1, n1, &len);
+    check("zlib.inflate of a dynamic block", o != null && len == DATALEN && sumOf(o, len) == DATASUM);
+    free(o);
+    o = zlib.inflateEx(z2, n2, null, 0, 100000, true, &len);
+    check("zlib.inflateEx of a sync flushed dynamic block", o != null && len == DATALEN && sumOf(o, len) == DATASUM);
+    free(o);
+
+    // warm up (the first calls may extend the free lists), then the heap must not move
+    int h0 = 0;
+    for (int it = 0; it < 220; it++) {
+        if (it == 20) h0 = __heap_pos;
+        o = zlib.inflate(z1, n1, &len);
+        free(o);
+    }
+    check("200 inflates of a dynamic block: the heap does not grow", __heap_pos == h0);
+
+    for (int it = 0; it < 220; it++) {
+        if (it == 20) h0 = __heap_pos;
+        o = zlib.inflateEx(z2, n2, null, 0, 100000, true, &len);
+        free(o);
+    }
+    check("200 sync inflates: the heap does not grow", __heap_pos == h0);
+
+    // damaged data and the size limit: the error paths free as well
+    char* bad = alloc(n1 + 8);
+    memcpy(bad, z1, n1);
+    for (int i = 40; i < 60; i++) bad[i] = bad[i] ^ 0x5a;
+    for (int it = 0; it < 220; it++) {
+        if (it == 20) h0 = __heap_pos;
+        o = zlib.inflate(bad, n1, &len);
+        if (o != null) free(o);
+        o = zlib.inflateEx(z2, n2, null, 0, 100, true, &len);        // a limit of 100 bytes: "too big"
+        if (o != null) free(o);
+    }
+    check("200 damaged streams and 200 limit hits: the heap does not grow", __heap_pos == h0);
+    check("... and the limit is reported", zlib.inflateEx(z2, n2, null, 0, 100, true, &len) == null && zlib.inflateTooBig());
+
+    // deflating
+    char* text = alloc(3016);
+    for (int k = 0; k < 3000; k++) text[k] = "the rain in spain stays mainly in the plain. "[k % 45];
+    char* rnd = alloc(2016);
+    int x = 99;
+    for (int k = 0; k < 2000; k++) { x = (x * 1103515245 + 12345) & 0x7fffffff; rnd[k] = x >> 16; }
+    int m = 0;
+    for (int it = 0; it < 220; it++) {
+        if (it == 20) h0 = __heap_pos;
+        char* c = zlib.deflateSync(text, 3000, 6, 32768, &m);
+        free(c);
+        c = zlib.deflateSync(rnd, 2000, 6, 32768, &m);              // incompressible: stored blocks
+        free(c);
+        c = zlib.deflateLevel(text, 3000, 9, &m);
+        free(c);
+    }
+    check("200 rounds of deflateSync, stored blocks and deflateLevel: the heap does not grow", __heap_pos == h0);
+
+    // a WebSocket pair with permessage-deflate, in memory: every message goes through both directions
+    for (int it = 0; it < 220; it++) {
+        if (it == 20) h0 = __heap_pos;
+        websocket.WebSocket* c = websocket.create(null, true);
+        websocket.WebSocket* s = websocket.create(null, false);
+        c->deflate = true;
+        s->deflate = true;
+        c->sendTextN(text, 3000);
+        move(c, s);
+        websocket.Message* msg = s->takeMessage();
+        if (msg == null || msg->length != 3000) { printf("FAIL the message did not arrive in round %d\n", it); fails++; }
+        if (msg != null) msg->dispose();
+        s->sendTextN(text, 3000);
+        move(s, c);
+        msg = c->takeMessage();
+        if (msg != null) msg->dispose();
+        c->dispose();
+        s->dispose();
+    }
+    check("200 WebSocket pairs with compressed messages both ways: the heap does not grow", __heap_pos == h0);
+
+    // one long connection: many messages, with and without context takeover on the receiving side
+    websocket.WebSocket* c = websocket.create(null, true);
+    websocket.WebSocket* s = websocket.create(null, false);
+    c->deflate = true;
+    s->deflate = true;
+    s->rxTakeover = true;
+    int got = 0;
+    for (int it = 0; it < 320; it++) {
+        if (it == 20) h0 = __heap_pos;
+        c->sendTextN(text, 3000);
+        move(c, s);
+        websocket.Message* msg = s->takeMessage();
+        if (msg != null) { if (msg->length == 3000) got++; msg->dispose(); }
+    }
+    check("300 compressed messages on one connection all arrive", got == 320);
+    check("... and the heap does not grow", __heap_pos == h0);
+    c->dispose();
+    s->dispose();
+
+    printf("failures: %d\n", fails);
+    return fails == 0 ? 0 : 1;
+}
