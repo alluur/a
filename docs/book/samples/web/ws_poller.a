@@ -1,0 +1,85 @@
+// One thread, several WebSocket clients: your own loop with a conn.Poller
+import websocket;
+import conn;
+import net;
+
+int listener;
+conn.Poller* poller;
+websocket.WebSocket* peers[8];                           // the server's end of every connection
+int names[8];                                            // 1, 2, 3 ... in the order of arrival
+int nextName = 1;
+
+// Sends one text to every peer that is still open.
+void broadcast(char* text) {
+    for (int i = 0; i < 8; i++) {
+        if (peers[i] != null && !peers[i]->closed) peers[i]->sendText(text);
+    }
+}
+
+// The server's work for one peer whose socket has data (or has been closed).
+void service(int i) {
+    websocket.WebSocket* ws = peers[i];
+    ws->pump();                                          // read what is there; pings are answered, close frames noticed
+    websocket.Message* m = ws->takeMessage();
+    while (m != null) {
+        char text[120];
+        format(&text[0], 120, "%d says %s", names[i], m->data);
+        broadcast(&text[0]);
+        m->dispose();
+        m = ws->takeMessage();
+    }
+    if (ws->closed) {                                    // the peer closed: forget it
+        printf("server: client %d is gone (code %d)\n", names[i], ws->closeCode);
+        poller->remove(ws->fd());
+        ws->dispose();
+        peers[i] = null;
+    }
+}
+
+// One turn of the server: ask the poller which sockets are ready, never wait.
+int step() {
+    int tags[16];
+    int n = poller->wait(0);
+    for (int k = 0; k < n && k < 16; k++) tags[k] = poller->readyTag(k);    // copy them: remove() reorders the poller
+    for (int k = 0; k < n && k < 16; k++) {
+        if (tags[k] == 100) {                            // the listener: a new client
+            websocket.WebSocket* ws = websocket.accept(conn.create(net.acceptSome(listener)), null, 0);
+            if (ws == null) continue;
+            ws->setNonBlocking(true);                    // pump() and the sends never wait now
+            for (int i = 0; i < 8; i++) {
+                if (peers[i] == null) { peers[i] = ws; names[i] = nextName++; poller->add(ws->fd(), i); break; }
+            }
+        } else {
+            service(tags[k]);                            // the tag is the slot we gave to add()
+        }
+    }
+    return 0;
+}
+
+void hear(char* who, websocket.WebSocket* ws) {
+    websocket.Message* m = ws->receiveMessage();
+    printf("%s hears: %s\n", who, m->data);
+    m->dispose();
+}
+
+int main() {
+    listener = net.listenOn("127.0.0.1", 0, 4);
+    net.setNonBlocking(listener, true);
+    poller = new conn.Poller();
+    poller->add(listener, 100);
+    net.setIdleHook(step);
+
+    char url[80];
+    format(&url[0], 80, "ws://127.0.0.1:%d/", net.localPort(listener));
+    websocket.WebSocket* a = websocket.connect(&url[0]);
+    websocket.WebSocket* b = websocket.connect(&url[0]);
+    websocket.WebSocket* c = websocket.connect(&url[0]);
+
+    a->sendText("hello");
+    hear("a", a); hear("b", b); hear("c", c);            // one message, three listeners
+
+    b->closeWith(1000, "bye");                           // b leaves
+    c->sendText("anyone there?");
+    hear("a", a); hear("c", c);                          // only a and c are left
+    return 0;
+}

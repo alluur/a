@@ -1,0 +1,105 @@
+// JSON-RPC over three transports: lines on a TCP stream, HTTP POST and WebSocket
+import jsonrpc;
+import json;
+import wshub;
+import httpx;
+import conn;
+import net;
+
+jsonrpc.Dispatcher* dispatcher;
+wshub.Hub* hub;
+int listener;                                            // for the plain stream
+conn.Connection* streamPeer;
+int notified = 0;
+
+json.Json* add(jsonrpc.Call* c) {
+    json.Json* a = c->param(0, "a");
+    json.Json* b = c->param(1, "b");
+    if (a == null || b == null || !a->isNumber() || !b->isNumber()) { c->fail(jsonrpc.INVALID_PARAMS, "need numbers a and b", null); return null; }
+    return json.newInt(a->asInt() + b->asInt());
+}
+
+json.Json* note(jsonrpc.Call* c) { notified++; return null; }
+
+// Serves the three transports while a client waits (see ws_echo).
+int serve() {
+    hub->poll(0);                                        // HTTP and WebSocket
+    if (streamPeer == null) {
+        int fd = net.acceptSome(listener);
+        if (fd >= 0) streamPeer = conn.create(fd);
+    }
+    if (streamPeer != null && streamPeer->readable(0)) {
+        if (jsonrpc.serveStream(dispatcher, streamPeer, jsonrpc.FRAME_LINES, 1) == 0) { streamPeer->close(); streamPeer = null; }
+    }
+    return 0;
+}
+
+// The same calls, whatever the transport.
+void exercise(jsonrpc.Client* c) {
+    json.Json* p = json.parse("[2, 3]");
+    json.Json* r = c->call("add", p);                    // null when the answer is an error: errCode and errMessage say which
+    printf("  add [2,3]       = %d\n", r->asInt());
+    r->dispose(); p->dispose();
+
+    p = json.parse("{\"a\": 40, \"b\": 2}");
+    r = c->call("add", p);
+    printf("  add {a:40,b:2}  = %d\n", r->asInt());
+    r->dispose(); p->dispose();
+
+    p = json.parse("[1, \"x\"]");
+    r = c->call("add", p);
+    printf("  add [1,\"x\"]     = %s, error %d \"%s\"\n", r == null ? "no result" : "?", c->errCode, &c->errMessage[0]);
+    p->dispose();
+    c->call("nope", null);
+    printf("  nope            -> error %d \"%s\"\n", c->errCode, &c->errMessage[0]);
+
+    c->notify("log", null);                              // a notification: no answer, nothing to wait for
+
+    jsonrpc.Batch* b = c->batch();                       // several calls in one message
+    json.Json* p1 = json.parse("[1, 2]");
+    json.Json* p2 = json.parse("[10, 20]");
+    int i1 = b->add("add", p1);
+    int i2 = b->add("add", p2);
+    int i3 = b->add("nope", null);
+    b->notify("log", null);
+    b->send();
+    printf("  batch: %d, %d, error %d\n", b->result(i1)->asInt(), b->result(i2)->asInt(), b->errorCode(i3));
+    b->dispose(); p1->dispose(); p2->dispose();
+}
+
+int main() {
+    dispatcher = new jsonrpc.Dispatcher();
+    dispatcher->add("add", add);
+    dispatcher->add("log", note);
+
+    hub = new wshub.Hub();
+    hub->router = new httpx.Router();
+    hub->router->add("POST", "/rpc", jsonrpc.httpHandler, (char*) dispatcher);   // HTTP: one request, one answer
+    hub->onMessage = jsonrpc.hubMessage;                                        // WebSocket: one message, one answer
+    hub->user = (char*) dispatcher;
+    hub->listenOn("127.0.0.1", 0, null);
+    listener = net.listenOn("127.0.0.1", 0, 4);
+    net.setNonBlocking(listener, true);
+    net.setIdleHook(serve);
+
+    println("TCP stream, one JSON text per line:");
+    jsonrpc.Client* c = jsonrpc.connectStream(conn.open("127.0.0.1", net.localPort(listener), 1000), jsonrpc.FRAME_LINES);
+    exercise(c);
+    c->close();
+
+    println("HTTP POST /rpc:");
+    char url[80];
+    format(&url[0], 80, "http://127.0.0.1:%d/rpc", hub->port);
+    c = jsonrpc.connectHttp(&url[0]);
+    exercise(c);
+    c->close();
+
+    println("WebSocket:");
+    format(&url[0], 80, "ws://127.0.0.1:%d/", hub->port);
+    c = jsonrpc.connectWebSocket(&url[0]);
+    exercise(c);
+    c->close();
+    for (int i = 0; i < 20; i++) serve();
+    printf("notifications the server received: %d\n", notified);
+    return 0;
+}

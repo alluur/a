@@ -1,0 +1,82 @@
+// permessage-deflate: compressed messages, and what it saves
+import websocket;
+import conn;
+import net;
+
+int listener;
+websocket.WebSocket* server;
+websocket.ServerOptions* serverOptions;
+
+// An echo server (see ws_echo), now with options for the upgrade.
+int serve() {
+    if (server == null) {
+        int fd = net.acceptSome(listener);
+        if (fd < 0) return 0;
+        server = websocket.acceptWith(conn.create(fd), serverOptions, null);
+        server->setNonBlocking(true);
+        return 0;
+    }
+    server->pump();
+    websocket.Message* m = server->takeMessage();
+    while (m != null) {
+        server->sendTextN(m->data, m->length);
+        m->dispose();
+        m = server->takeMessage();
+    }
+    return 0;
+}
+
+// Sends one message and reads the echo; the counters say what travelled on the wire.
+void trial(char* label, bool compress, char* text) {
+    serverOptions = new websocket.ServerOptions();
+    serverOptions->deflate = compress;                    // the server agrees to compress...
+    websocket.Options* o = new websocket.Options();
+    o->deflate = compress;                                // ...if the client asks for it
+    char url[80];
+    format(&url[0], 80, "ws://127.0.0.1:%d/", net.localPort(listener));
+    websocket.WebSocket* ws = websocket.connectWith(&url[0], o);
+    int before = ws->bytesOut;                            // the handshake does not count: bytesOut is frames only
+    ws->sendText(text);
+    websocket.Message* m = ws->receiveMessage();
+    printf("%-11s deflate=%d  text %d bytes: sent %4d on the wire, received %4d, echo intact: %d\n",
+           label, ws->deflate, strlen(text), ws->bytesOut - before, ws->bytesIn, streq(m->data, text));
+    m->dispose();
+    ws->closeWith(1000, null);
+    ws->dispose();
+    server->dispose();
+    server = null;
+}
+
+int main() {
+    listener = net.listenOn("127.0.0.1", 0, 4);
+    net.setNonBlocking(listener, true);
+    net.setIdleHook(serve);
+
+    char* json = alloc(4000);                             // 60 similar records: the kind of text that compresses well
+    for (int i = 0; i < 60; i++) {
+        char rec[60];
+        format(&rec[0], 60, "{\"id\":%d,\"name\":\"item-%d\",\"ok\":true},", i, i % 7);
+        strcat(json, &rec[0]);
+    }
+    trial("plain", false, json);
+    trial("compressed", true, json);
+    trial("short text", true, "hello");                  // under 64 bytes: sent as it is
+
+    // A decompression bomb: 400000 equal bytes shrink to a few hundred. The server's limit applies to the INFLATED size.
+    serverOptions = new websocket.ServerOptions();
+    serverOptions->deflate = true;
+    serverOptions->maxMessage = 100000;
+    websocket.Options* o = new websocket.Options();
+    o->deflate = true;
+    char url[80];
+    format(&url[0], 80, "ws://127.0.0.1:%d/", net.localPort(listener));
+    websocket.WebSocket* ws = websocket.connectWith(&url[0], o);
+    char* zeros = alloc(400001);
+    memset(zeros, 'a', 400000);
+    int before = ws->bytesOut;
+    ws->sendText(zeros);
+    websocket.Message* m = ws->receiveMessage();
+    printf("bomb: %d bytes became %d on the wire; reply %s, close code %d, server failed: %d (%s)\n", 400000, ws->bytesOut - before,
+           m == null ? "none" : "a message", ws->closeCode, server->failed, &server->failReason[0]);
+    return 0;
+}

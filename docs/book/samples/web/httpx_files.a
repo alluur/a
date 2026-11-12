@@ -1,0 +1,69 @@
+// Files: ranges, conditional requests, downloads that resume, gzip
+import httpx;
+import wshub;
+import zlib;
+import asys;
+import net;
+
+wshub.Hub* hub;
+
+int serve() { hub->poll(0); return 0; }
+
+int zipped(httpx.Context* x) {                           // a gzip body with the header that says so
+    char* text = "squeeze me, squeeze me, squeeze me, squeeze me, squeeze me!";
+    int n;
+    char* gz = zlib.gzip(text, strlen(text), &n);
+    x->res->bytes(200, "text/plain", gz, n);
+    x->res->setHeader("Content-Encoding", "gzip");
+    return 0;
+}
+
+char url[100];
+char* urlOf(char* path) {
+    format(&url[0], 100, "http://127.0.0.1:%d%s", hub->port, path);
+    return &url[0];
+}
+
+int main() {
+    makeDir("www");
+    char* text = alloc(1100);                            // a file of 1000 bytes: the digits 0-9, repeated
+    for (int i = 0; i < 1000; i++) text[i] = '0' + i % 10;
+    asys.writeFile("www/digits.txt", text, 1000);
+
+    hub = new wshub.Hub();
+    hub->staticDir = "www";                              // ETag, Last-Modified, Range and 304 come with it
+    hub->router = new httpx.Router();
+    hub->router->get("/zipped", zipped);
+    hub->listenOn("127.0.0.1", 0, null);
+    net.setIdleHook(serve);
+    httpx.Client* c = httpx.newClient();
+
+    httpx.Reply* r = c->get(urlOf("/digits.txt"));
+    printf("whole file: %d, %d bytes, Accept-Ranges: %s\n", r->status, r->bodyLen, r->header("Accept-Ranges"));
+    char* etag = strdup(r->header("ETag"));              // a validator for this version of the file
+
+    r = c->getRange(urlOf("/digits.txt"), 995, -1);      // the last 5 bytes
+    printf("range 995-: %d, \"%s\", Content-Range: %s\n", r->status, r->body, r->header("Content-Range"));
+    r = c->getRange(urlOf("/digits.txt"), 5000, -1);
+    printf("range 5000-: %d (past the end)\n", r->status);
+
+    httpx.Headers* h = new httpx.Headers();
+    h->set("If-None-Match", etag);                       // "send it only if it changed"
+    r = c->request("GET", urlOf("/digits.txt"), h, null, 0);
+    printf("If-None-Match: %d, %d body bytes\n", r->status, r->bodyLen);
+
+    // a download goes to a file and never sits in memory; with resume it goes on where the file ends
+    int got;
+    asys.writeFile("copy.txt", text, 400);               // an interrupted download: the first 400 bytes
+    int status = c->downloadTo(urlOf("/digits.txt"), "copy.txt", true, &got);
+    asys.Stat st;
+    asys.stat("copy.txt", &st);
+    printf("resumed download: status %d, %d bytes fetched, file is now %d bytes\n", status, got, st.size);
+
+    r = c->get(urlOf("/zipped"));
+    printf("gzip, decompress=false: %d bytes, starts with %02x %02x\n", r->bodyLen, r->body[0] & 255, r->body[1] & 255);
+    c->decompress = true;                                // ask for gzip and unpack it
+    r = c->get(urlOf("/zipped"));
+    printf("gzip, decompress=true:  %d bytes: %s\n", r->bodyLen, r->body);
+    return 0;
+}
