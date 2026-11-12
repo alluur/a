@@ -291,7 +291,7 @@ verified certificate, 160 KB and 300 KB messages), raw frames with every RFC 645
 
 # MQTT, Redis and syslog
 
-Three protocol families, each with a client and a server module. The servers are built so that they can run for months: every queue has a limit, every limit is a setting, memory is
+Three protocol families, each with a client and a server module (and a small server program each in `examples/`: `mqttd_demo.a`, `redisd_demo.a`, `syslogd_demo.a`). The servers are built so that they can run for months: every queue has a limit, every limit is a setting, memory is
 freed (a strict test per family compares the heap position before and after many operations), malformed input gets an error and a closed connection. All six modules work on every
 target and on AOS (they use only `net`, `netio`, `tls` and `asys`).
 
