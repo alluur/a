@@ -1,0 +1,150 @@
+// websocket keepalive: pings after silence, pongs measure the round trip, any traffic counts as life, a silent peer is failed with 1011;
+// the same over real sockets with the blocking API
+import websocket;
+import conn;
+import net;
+import encoding;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int outCloseCode(websocket.WebSocket* w) {
+    int n = w->outPending();
+    if (n < 4) return 0;
+    char b[200];
+    if (n > 200) n = 200;
+    memcpy(&b[0], w->outData(), n);
+    if ((b[0] & 15) != 8) return 0;
+    int len = b[1] & 127;
+    int off = 2;
+    if ((b[1] & 128) != 0) {
+        websocket.unmask(&b[6], len, ((b[2] & 255) << 24) | ((b[3] & 255) << 16) | ((b[4] & 255) << 8) | (b[5] & 255));
+        off = 6;
+    }
+    return (b[off] & 255) * 256 + (b[off + 1] & 255);
+}
+
+int pingsSeen = 0;
+int onEvent(websocket.WebSocket* w, int event, int op, char* data, int n) {
+    if (event == websocket.EV_PING) pingsSeen++;
+    return 0;
+}
+
+conn.Listener* listener;
+websocket.WebSocket* sws;
+bool answer = true;
+int serve() {
+    if (sws == null && listener != null) {
+        conn.Connection* sc = listener->accept(0);
+        if (sc != null) {
+            sws = websocket.accept(sc, null, 0);
+            if (sws != null) {
+                sws->setNonBlocking(true);
+                sws->setHandler(onEvent);
+            }
+        }
+    }
+    if (sws != null && answer) sws->pump();
+    return 0;
+}
+
+int main() {
+    // --- a deterministic clock: tick(now) is given the time
+    websocket.WebSocket* c = websocket.create(null, true);
+    websocket.WebSocket* s = websocket.create(null, false);
+    c->setKeepalive(1000, 500);
+    c->clockNow = 0;
+    c->lastRx = 0;
+    c->tick(500);
+    check("no ping before the interval", c->outPending() == 0);
+    c->tick(999);
+    check("... not even a millisecond before", c->outPending() == 0);
+    c->tick(1000);
+    check("a ping after 1000 ms of silence", c->outPending() == 14 && (c->outData()[0] & 255) == 0x89);
+    s->feed(c->outData(), c->outPending());
+    c->outConsumed(c->outPending());
+    check("the server answers with a pong", s->outPending() == 10 && (s->outData()[0] & 255) == 0x8A);
+    c->tick(1100);
+    c->tick(1400);
+    check("no second ping while one is outstanding", c->outPending() == 0 && !c->closed);
+    c->tick(1450);
+    c->feed(s->outData(), s->outPending());
+    s->outConsumed(s->outPending());
+    check("the pong gives the round trip", c->rttMs == 450 && c->pingSentAt == 0);
+    c->tick(2000);
+    check("the interval starts again from the pong", c->outPending() == 0);
+    c->tick(2450);
+    check("next ping", c->outPending() == 14);
+    c->outConsumed(c->outPending());
+    // any traffic is proof of life: a text message answers the ping
+    c->tick(2600);
+    s->sendText("hi");
+    c->feed(s->outData(), s->outPending());
+    s->outConsumed(s->outPending());
+    check("a message counts as a sign of life", c->pingSentAt == 0 && !c->closed);
+    c->tick(2900);
+    c->tick(3500);
+    check("... and the interval restarts after it", c->outPending() == 0);
+    c->tick(3600);
+    check("then the next ping", c->outPending() == 14);
+    c->outConsumed(c->outPending());
+    c->tick(4000);
+    check("not yet failed", !c->closed);
+    c->tick(4100);
+    check("no answer within 500 ms: failed with 1011", c->closed && c->failed && outCloseCode(c) == 1011 && streq(&c->failReason[0], "keepalive ping timeout"));
+    c->dispose();
+    // the other side does not need keepalive to answer
+    s->dispose();
+    // turned off
+    c = websocket.create(null, true);
+    c->setKeepalive(0, 0);
+    c->tick(100000);
+    check("keepalive 0 does nothing", c->outPending() == 0 && !c->closed);
+    c->setKeepalive(100, 100);
+    c->clockNow = 0;
+    c->lastRx = 0;
+    c->tick(100);
+    check("... and can be turned on", c->outPending() == 14);
+    c->outConsumed(c->outPending());
+    c->closeWith(1000, null);
+    c->outConsumed(c->outPending());
+    c->tick(5000);
+    check("no ping and no failure after our close frame", c->outPending() == 0 && !c->failed);
+    c->dispose();
+
+    // --- real time over sockets
+    net.setIdleHook(serve);
+    listener = new conn.Listener(0);
+    char* u = alloc(100);
+    format(u, 100, "ws://127.0.0.1:%d/", listener->port());
+    websocket.WebSocket* ws = websocket.connect(u);
+    ws->setKeepalive(40, 400);
+    websocket.Message* m = ws->waitMessage(300);
+    check("a live peer answers the pings: the connection stays", m == null && !ws->closed && !ws->failed);
+    check("the server saw several pings", pingsSeen >= 3);
+    check("the round trip was measured", ws->rttMs >= 0 && ws->rttMs < 300);
+    // the peer stops answering
+    answer = false;
+    int t0 = millis();
+    m = ws->waitMessage(-1);
+    int took = millis() - t0;
+    check("a peer that stays silent: receive returns null", m == null && ws->closed && ws->failed);
+    check("... after about the timeout", took >= 300 && took < 4000);
+    check("... with 1011 and the reason", ws->localCloseCode == 1011 && streq(&ws->failReason[0], "keepalive ping timeout") && ws->closeCode == 1006);
+    ws->dispose();
+    answer = true;
+    sws->abort();
+    sws->dispose();
+    net.setIdleHook(null);
+    listener->close();
+    printf("failures: %d\n", fails);
+    return fails;
+}

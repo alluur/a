@@ -1,0 +1,445 @@
+// httpx: headers, percent encoding, the request parser (framing, limits, smuggling defences), HTTP dates, URL resolution, the router (parameters,
+// wildcards, middleware, 404 / 405), CORS, authentication helpers, cookie jar (RFC 6265), multipart building and parsing, static file answers
+import httpx;
+import asys;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// parses one request given as text; returns the parser (state, errorStatus, request)
+httpx.RequestParser* parse(char* text, httpx.Request* req) {
+    httpx.RequestParser* p = httpx.newParser();
+    p->reset(req);
+    p->feed(text, strlen(text));
+    return p;
+}
+
+int parseStatus(char* text) {
+    httpx.Request* r = httpx.newRequest();
+    httpx.RequestParser* p = parse(text, r);
+    int s = p->failed() ? p->errorStatus : (p->done() ? 0 : -1);
+    p->dispose();
+    r->dispose();
+    return s;
+}
+
+// ---- handlers for the router tests
+int hUser(httpx.Context* x) { char t[100]; format(&t[0], 100, "user %s", x->req->param("id")); x->res->text(200, &t[0]); return 0; }
+int hPost(httpx.Context* x) { char t[100]; format(&t[0], 100, "%s/%s", x->req->param("user"), x->req->param("post")); x->res->text(200, &t[0]); return 0; }
+int hAll(httpx.Context* x) { char t[100]; format(&t[0], 100, "rest=%s", x->req->param("*")); x->res->text(200, &t[0]); return 0; }
+int hRoot(httpx.Context* x) { x->res->text(200, "root"); return 0; }
+int hAny(httpx.Context* x) { x->res->text(200, "any"); return 0; }
+int hNf(httpx.Context* x) { x->res->text(404, "custom not found"); return 0; }
+char* trace;
+int mwA(httpx.Context* x) { strcat(trace, "A>"); x->next(); strcat(trace, "<A"); return 0; }
+int mwB(httpx.Context* x) { strcat(trace, "B>"); if (x->req->header("X-Stop") != null) { x->res->text(403, "stopped"); strcat(trace, "stop"); return 0; } x->next(); strcat(trace, "<B"); return 0; }
+
+httpx.Response* route(httpx.Router* r, char* method, char* target) {
+    httpx.Request* q = httpx.newRequest();
+    char text[400];
+    format(&text[0], 400, "%s %s HTTP/1.1\r\nHost: x\r\n\r\n", method, target);
+    httpx.RequestParser* p = parse(&text[0], q);
+    httpx.Response* res = httpx.newResponse();
+    if (p->done()) r->handle(q, res); else res->status = -1;
+    return res;
+}
+
+int main() {
+    // --- Headers
+    httpx.Headers* h = (httpx.Headers*) malloc(sizeof(httpx.Headers));
+    check("add and get, case does not matter", h->add("Content-Type", "text/plain") && streq(h->get("content-type"), "text/plain") && h->has("CONTENT-TYPE"));
+    h->add("Set-Cookie", "a=1");
+    h->add("Set-Cookie", "b=2");
+    char joined[100];
+    check("repeated headers: get is the first, joined gives all", streq(h->get("Set-Cookie"), "a=1") && h->joined("set-cookie", &joined[0], 100) && streq(&joined[0], "a=1, b=2"));
+    check("set replaces, remove removes", h->set("Set-Cookie", "c=3") && streq(h->get("Set-Cookie"), "c=3") && h->count() == 2);
+    h->remove("set-cookie");
+    check("remove", !h->has("Set-Cookie") && h->count() == 1);
+    check("values are trimmed", h->add("X-A", "  padded \t") && streq(h->get("X-A"), "padded"));
+    check("CR or LF in a value is refused (header injection)", !h->add("X-B", "a\r\nX-Evil: 1") && !h->set("X-B", "a\nb") && !h->has("X-B"));
+    check("a name that is not a token is refused", !h->add("Bad Name", "x") && !h->add("A:B", "x") && !h->add("", "x"));
+    check("a tab in a value is fine", h->add("X-C", "a\tb"));
+    for (int i = 0; i < 100; i++) { char nm[20]; format(&nm[0], 20, "X-N%d", i); h->add(&nm[0], "v"); }
+    check("many headers", h->count() == 103 && streq(h->get("x-n99"), "v"));
+    h->dispose();
+
+    // --- percent encoding and queries
+    char out[100];
+    check("percentDecode", httpx.percentDecode("a%20b%2Fc+d", 11, &out[0], 100, false) == 7 && streq(&out[0], "a b/c+d"));
+    check("... plus becomes a space in a query", httpx.percentDecode("a+b", 3, &out[0], 100, true) == 3 && streq(&out[0], "a b"));
+    check("a bad escape is refused", httpx.percentDecode("a%2", 3, &out[0], 100, false) < 0 && httpx.percentDecode("a%zz", 4, &out[0], 100, false) < 0 && httpx.percentDecode("%", 1, &out[0], 100, false) < 0);
+    check("an escape at the very end", httpx.percentDecode("a%41", 4, &out[0], 100, false) == 2 && streq(&out[0], "aA"));
+    check("percentEncode", streq(httpx.percentEncode("a b&c/d\xc3\xa9", false), "a%20b%26c%2Fd%C3%A9") && streq(httpx.percentEncode("a/b c", true), "a/b%20c"));
+    check("queryParam", httpx.queryParam("a=1&b=two%20words&c&d=", "b", &out[0], 100) && streq(&out[0], "two words"));
+    check("... a parameter without value, an empty value, a missing one", httpx.queryParam("a=1&c&d=", "c", &out[0], 100) && out[0] == 0 && httpx.queryParam("a=1&d=", "d", &out[0], 100) && !httpx.queryParam("a=1", "x", &out[0], 100));
+
+    // --- the request parser
+    httpx.Request* req = httpx.newRequest();
+    httpx.RequestParser* p = parse("GET /a%20b/c?x=1&y=%7e HTTP/1.1\r\nHost: example.org\r\nCookie: a=1; b=2\r\nX-Multi: one\r\nX-Multi: two\r\n\r\n", req);
+    check("a simple GET", p->done() && streq(&req->method[0], "GET") && streq(&req->path[0], "/a b/c") && streq(&req->rawPath[0], "/a%20b/c") && streq(req->query, "x=1&y=%7e") && req->minor == 1 && req->keepAlive);
+    check("headers and cookies", streq(req->header("host"), "example.org") && streq(req->header("X-Multi"), "one"));
+    check("cookie lookup", req->cookie("b", &out[0], 100) && streq(&out[0], "2") && !req->cookie("zz", &out[0], 100) && req->cookie("a", &out[0], 100) && streq(&out[0], "1"));
+    p->reset(req);
+    char* two = "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nhelloGET /y HTTP/1.1\r\nHost: h\r\n\r\n";
+    int took = p->feed(two, strlen(two));
+    check("a request with a body stops where the body ends (pipelining)", p->done() && req->bodyLen == 5 && streq(req->body, "hello") && took < strlen(two) && startsWith(&two[took], "GET /y"));
+    p->reset(req);
+    p->feed(&two[took], strlen(&two[took]));
+    check("the next request follows", p->done() && streq(&req->path[0], "/y"));
+    // byte by byte
+    char* chunked = "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n5;name=value\r\npedia\r\nE\r\n in\r\n\r\nchunks.\r\n0\r\nX-Trailer: t\r\n\r\n";
+    p->reset(req);
+    for (int i = 0; i < strlen(chunked); i++) p->feed(&chunked[i], 1);
+    check("chunked body, one byte at a time", p->done() && req->bodyLen == 23 && streq(req->body, "Wikipedia in\r\n\r\nchunks."));
+    p->reset(req);
+    p->feed(chunked, strlen(chunked));
+    check("chunked body in one piece", p->done() && streq(req->body, "Wikipedia in\r\n\r\nchunks."));
+    check("HTTP/1.0 closes unless it asks for keep-alive", parseStatus("GET / HTTP/1.0\r\n\r\n") == 0);
+    p->reset(req);
+    p->feed("GET / HTTP/1.0\r\n\r\n", 18);
+    check("... keepAlive false", p->done() && req->minor == 0 && !req->keepAlive);
+    p->reset(req);
+    p->feed("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", 42);
+    check("... true with the header", req->keepAlive);
+    p->reset(req);
+    p->feed("GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 45);
+    check("HTTP/1.1 with Connection: close", !req->keepAlive);
+    p->reset(req);
+    p->feed("OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n", 32);
+    check("OPTIONS *", p->done() && streq(&req->path[0], "*"));
+    p->reset(req);
+    p->feed("GET http://example.org/abs/path?q=1 HTTP/1.1\r\nHost: example.org\r\n\r\n", 69);
+    check("an absolute URL as the target", p->done() && streq(&req->path[0], "/abs/path") && streq(req->query, "q=1"));
+    p->reset(req);
+    p->feed("GET http://example.org HTTP/1.1\r\nHost: example.org\r\n\r\n", 55);
+    check("... without a path", p->done() && streq(&req->path[0], "/"));
+    p->reset(req);
+    p->feed("\r\n\r\nGET /after HTTP/1.1\r\nHost: x\r\n\r\n", 37);
+    check("empty lines before the request line are ignored", p->done() && streq(&req->path[0], "/after"));
+    // errors
+    check("garbage: 400", parseStatus("this is not http\r\n\r\n") == 400);
+    check("a bad method character: 400", parseStatus("GE T / HTTP/1.1\r\nHost: x\r\n\r\n") == 400);
+    check("HTTP/2.0: 505", parseStatus("GET / HTTP/2.0\r\nHost: x\r\n\r\n") == 505);
+    check("HTTP/1.2: 505", parseStatus("GET / HTTP/1.2\r\nHost: x\r\n\r\n") == 505);
+    check("HTTP/1.1 without Host: 400", parseStatus("GET / HTTP/1.1\r\n\r\n") == 400);
+    check("a folded header: 400", parseStatus("GET / HTTP/1.1\r\nHost: x\r\n  continued\r\n\r\n") == 400);
+    check("a header without a colon: 400", parseStatus("GET / HTTP/1.1\r\nHost: x\r\nnonsense\r\n\r\n") == 400);
+    check("a bad header name: 400", parseStatus("GET / HTTP/1.1\r\nHost: x\r\nBad Name: v\r\n\r\n") == 400);
+    check("a NUL in the path: 400", parseStatus("GET /a%00b HTTP/1.1\r\nHost: x\r\n\r\n") == 400);
+    check("a bad escape in the path: 400", parseStatus("GET /a%zz HTTP/1.1\r\nHost: x\r\n\r\n") == 400);
+    check("a space in the target: 400", parseStatus("GET /a b HTTP/1.1\r\nHost: x\r\n\r\n") == 400);
+    check("Content-Length and chunked together: 400", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n") == 400);
+    check("conflicting Content-Length values: 400", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\n") == 400);
+    check("equal repeated Content-Length values are fine", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc") == 0);
+    check("a negative Content-Length: 400", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n") == 400);
+    check("Content-Length: 1e3: 400", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1e3\r\n\r\n") == 400);
+    check("Content-Length with 20 digits: 400", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 12345678901234567890\r\n\r\n") == 400);
+    check("a body over maxBody: 413", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n") == 413);
+    check("an unknown transfer coding: 501", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n") == 501);
+    check("a bad chunk size: 400", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n") == 400);
+    check("a chunk size that is huge: 413", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFF\r\n") == 413);
+    check("a missing CRLF after chunk data: 400", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcXX") == 400);
+    check("an unknown Expect: 417", parseStatus("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nExpect: magic\r\n\r\n") == 417);
+    httpx.Request* r2 = httpx.newRequest();
+    httpx.RequestParser* p2 = httpx.newParser();
+    p2->maxHead = 100;
+    p2->reset(r2);
+    char* longHead = alloc(500);
+    strcpy(longHead, "GET / HTTP/1.1\r\nHost: x\r\nX-Long: ");
+    for (int i = 0; i < 200; i++) strcat(longHead, "a");
+    strcat(longHead, "\r\n\r\n");
+    p2->feed(longHead, strlen(longHead));
+    check("a head over maxHead: 431", p2->failed() && p2->errorStatus == 431);
+    p2->maxHead = 0;
+    p2->maxHeaders = 3;
+    p2->reset(r2);
+    char* many = "GET / HTTP/1.1\r\nHost: x\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n";
+    p2->feed(many, strlen(many));
+    check("more headers than maxHeaders: 431", p2->failed() && p2->errorStatus == 431);
+    char* longTarget = alloc(3000);
+    strcpy(longTarget, "GET /");
+    for (int i = 0; i < 2500; i++) strcat(longTarget, "a");
+    strcat(longTarget, " HTTP/1.1\r\nHost: x\r\n\r\n");
+    check("a target over 2048 bytes: 414", parseStatus(longTarget) == 414);
+    p2->reset(r2);
+    p2->feed("POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1\r\nExpect: 100-continue\r\n\r\n", 69);
+    check("Expect: 100-continue is noted", r2->expectContinue && !p2->done() && p2->state == httpx.PS_BODY);
+    // memory: parsing and resetting many requests does not grow the heap
+    int heap0 = __heap_pos;
+    char* post = "POST /x?a=1 HTTP/1.1\r\nHost: x\r\nX-A: 1\r\nContent-Length: 4\r\n\r\nabcd";
+    for (int i = 0; i < 300; i++) {
+        p2->reset(r2);
+        p2->feed(post, strlen(post));
+    }
+    check("300 requests through one parser use no more memory (everything is reused)", __heap_pos - heap0 < 4096 && p2->done());
+
+    // --- HTTP dates
+    char date[40];
+    httpx.formatHttpDate(784111777, &date[0]);
+    check("formatHttpDate: the example of RFC 9110", streq(&date[0], "Sun, 06 Nov 1994 08:49:37 GMT"));
+    check("parseHttpDate", httpx.parseHttpDate("Sun, 06 Nov 1994 08:49:37 GMT") == 784111777);
+    httpx.formatHttpDate(0, &date[0]);
+    check("the epoch", streq(&date[0], "Thu, 01 Jan 1970 00:00:00 GMT") && httpx.parseHttpDate("Thu, 01 Jan 1970 00:00:00 GMT") == 0);
+    httpx.formatHttpDate(951782400, &date[0]);
+    check("a leap day", streq(&date[0], "Tue, 29 Feb 2000 00:00:00 GMT") && httpx.parseHttpDate(&date[0]) == 951782400);
+    httpx.formatHttpDate(2147483647, &date[0]);
+    check("2038", streq(&date[0], "Tue, 19 Jan 2038 03:14:07 GMT") && httpx.parseHttpDate(&date[0]) == 2147483647);
+    check("bad dates", httpx.parseHttpDate("yesterday") == -1 && httpx.parseHttpDate("Sun, 06 Nov 1994 08:49:37 PST") == -1 && httpx.parseHttpDate("Sun, 06 Xyz 1994 08:49:37 GMT") == -1 && httpx.parseHttpDate("Sun, 06 Nov 1994 25:49:37 GMT") == -1 && httpx.parseHttpDate("") == -1);
+    bool roundTrip = true;
+    for (int t = 0; t < 4000000000; t = t + 86400 * 97 + 3661) {
+        httpx.formatHttpDate(t, &date[0]);
+        if (httpx.parseHttpDate(&date[0]) != t) roundTrip = false;
+    }
+    check("format and parse agree over 130 years", roundTrip);
+
+    // --- URLs
+    httpx.Url u;
+    check("parseUrl", httpx.parseUrl("https://Example.ORG:8443/a/b?c=d#frag", &u) && streq(&u.scheme[0], "https") && streq(&u.host[0], "example.org") && u.port == 8443 && streq(&u.path[0], "/a/b?c=d"));
+    check("default ports and path", httpx.parseUrl("http://example.org", &u) && u.port == 80 && streq(&u.path[0], "/") && httpx.parseUrl("https://x", &u) && u.port == 443);
+    check("a query without a path", httpx.parseUrl("http://x?a=1", &u) && streq(&u.path[0], "/?a=1"));
+    check("bad URLs", !httpx.parseUrl("ftp://x/", &u) && !httpx.parseUrl("http://", &u) && !httpx.parseUrl("http://x:0/", &u) && !httpx.parseUrl("http://x:99999/", &u) && !httpx.parseUrl("http://user@x/", &u) && !httpx.parseUrl("http://x/a b", &u) && !httpx.parseUrl("example.org", &u));
+    check("resolve: absolute", streq(httpx.resolveUrl("http://a/b", "https://c/d"), "https://c/d"));
+    check("resolve: absolute path", streq(httpx.resolveUrl("http://a/b/c?q=1", "/x/y"), "http://a/x/y"));
+    check("resolve: relative path", streq(httpx.resolveUrl("http://a/b/c", "d"), "http://a/b/d") && streq(httpx.resolveUrl("http://a/b/", "d/e"), "http://a/b/d/e"));
+    check("resolve: parent directories", streq(httpx.resolveUrl("http://a/b/c/d", "../e"), "http://a/b/e") && streq(httpx.resolveUrl("http://a/b/c/d", "../../e"), "http://a/e") && streq(httpx.resolveUrl("http://a/b", "../../../e"), "http://a/e"));
+    check("resolve: dot segments", streq(httpx.resolveUrl("http://a/b/c", "./d"), "http://a/b/d") && streq(httpx.resolveUrl("http://a/b/c", "d/./e/../f"), "http://a/b/d/f") && streq(httpx.resolveUrl("http://a/b/c", "."), "http://a/b/") && streq(httpx.resolveUrl("http://a/b/c/", ".."), "http://a/b/"));
+    check("resolve: a query only", streq(httpx.resolveUrl("http://a/b/c?old=1", "?new=2"), "http://a/b/c?new=2"));
+    check("resolve: scheme relative", streq(httpx.resolveUrl("https://a/b", "//c/d"), "https://c/d"));
+    check("resolve: a non-default port is kept", streq(httpx.resolveUrl("http://a:8080/b", "/c"), "http://a:8080/c"));
+    check("resolve: a query on the reference path", streq(httpx.resolveUrl("http://a/b/c", "d?x=1"), "http://a/b/d?x=1"));
+
+    // --- the router
+    trace = alloc(100);
+    httpx.Router* r = new httpx.Router();
+    r->get("/", hRoot);
+    r->get("/users/:id", hUser);
+    r->get("/users/:user/posts/:post", hPost);
+    r->get("/static/*", hAll);
+    r->post("/users", hAny);
+    r->put("/users", hAny);
+    r->any("/anything", hAny);
+    httpx.Response* res = route(r, "GET", "/");
+    check("route /", res->status == 200 && streq(res->body, "root"));
+    res = route(r, "GET", "/users/42");
+    check("a parameter", res->status == 200 && streq(res->body, "user 42"));
+    res = route(r, "GET", "/users/a%2Fb");
+    check("a decoded parameter (an encoded slash stays inside)", streq(res->body, "user a/b"));
+    res = route(r, "GET", "/users/7/posts/9");
+    check("two parameters", streq(res->body, "7/9"));
+    res = route(r, "GET", "/static/css/site.css");
+    check("a wildcard takes the rest", streq(res->body, "rest=css/site.css"));
+    res = route(r, "GET", "/static/");
+    check("a wildcard may be empty", res->status == 200 && streq(res->body, "rest="));
+    res = route(r, "GET", "/users/42/");
+    check("a trailing slash matches", res->status == 200 && streq(res->body, "user 42"));
+    res = route(r, "GET", "/nothing");
+    check("404 for an unknown path", res->status == 404);
+    res = route(r, "GET", "/users");
+    check("405 with the allowed methods", res->status == 405 && streq(res->headers->get("Allow"), "POST, PUT"));
+    res = route(r, "OPTIONS", "/users");
+    check("OPTIONS answers 204 with Allow", res->status == 204 && streq(res->headers->get("Allow"), "POST, PUT"));
+    res = route(r, "HEAD", "/users/3");
+    check("HEAD matches GET routes and marks the response", res->status == 200 && res->head);
+    res = route(r, "DELETE", "/anything");
+    check("a route for every method", res->status == 200 && streq(res->body, "any"));
+    res = route(r, "GET", "/users/");
+    check("an empty parameter does not match the parameter route (the /users route takes the trailing slash: 405)", res->status == 405);
+    res = route(r, "GET", "/users/1/posts");
+    check("too few segments do not match", res->status == 404);
+    res = route(r, "GET", "/users/1/x/2");
+    check("a different literal does not match", res->status == 404);
+    r->onNotFound(hNf);
+    res = route(r, "GET", "/nothing");
+    check("a custom 404 handler", res->status == 404 && streq(res->body, "custom not found"));
+    check("patterns that are not valid are refused", !r->add("GET", "nope", hRoot, null) && !r->add("GET", "/a/:", hRoot, null));
+    // middleware
+    r->use(mwA, null);
+    r->use(mwB, null);
+    trace[0] = 0;
+    res = route(r, "GET", "/users/1");
+    check("middleware wraps the route in order", streq(trace, "A>B><B<A") && res->status == 200);
+    trace[0] = 0;
+    httpx.Request* q = httpx.newRequest();
+    httpx.RequestParser* qp = parse("GET /users/1 HTTP/1.1\r\nHost: x\r\nX-Stop: 1\r\n\r\n", q);
+    res = httpx.newResponse();
+    r->handle(q, res);
+    check("a middleware that does not call next() stops the chain", streq(trace, "A>B>stop<A") && res->status == 403 && streq(res->body, "stopped"));
+    // many routes
+    httpx.Router* big = new httpx.Router();
+    bool added = true;
+    for (int i = 0; i < 128; i++) { char pat[30]; format(&pat[0], 30, "/r%d/:id", i); if (!big->get(&pat[0], hUser)) added = false; }
+    check("128 routes fit", added && !big->get("/one/too/many", hUser));
+    res = route(big, "GET", "/r100/abc");
+    check("the last ones work", streq(res->body, "user abc"));
+
+    // --- CORS
+    httpx.Cors* cors = new httpx.Cors();
+    cors->origins = "https://app.example, https://other.example";
+    httpx.Router* cr = new httpx.Router();
+    cr->use(httpx.corsMiddleware, (char*) cors);
+    cr->get("/data", hRoot);
+    cr->post("/data", hRoot);
+    httpx.Request* cq = httpx.newRequest();
+    parse("GET /data HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\n\r\n", cq);
+    res = httpx.newResponse();
+    cr->handle(cq, res);
+    check("an allowed origin is echoed, Vary: Origin is added", res->status == 200 && streq(res->headers->get("Access-Control-Allow-Origin"), "https://app.example") && streq(res->headers->get("Vary"), "Origin"));
+    parse("GET /data HTTP/1.1\r\nHost: x\r\nOrigin: https://evil.example\r\n\r\n", cq);
+    cr->handle(cq, res);
+    check("another origin gets no CORS headers", res->status == 200 && res->headers->get("Access-Control-Allow-Origin") == null);
+    parse("GET /data HTTP/1.1\r\nHost: x\r\n\r\n", cq);
+    cr->handle(cq, res);
+    check("no Origin: nothing added", res->headers->get("Access-Control-Allow-Origin") == null);
+    parse("OPTIONS /data HTTP/1.1\r\nHost: x\r\nOrigin: https://app.example\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type, x-token\r\n\r\n", cq);
+    cr->handle(cq, res);
+    check("a preflight: 204 with methods, headers and max-age", res->status == 204 && streq(res->headers->get("Access-Control-Allow-Methods"), "GET, POST, PUT, DELETE, PATCH, OPTIONS")
+        && streq(res->headers->get("Access-Control-Allow-Headers"), "content-type, x-token") && streq(res->headers->get("Access-Control-Max-Age"), "600") && streq(res->headers->get("Access-Control-Allow-Origin"), "https://app.example"));
+    cors->origins = "*";
+    parse("GET /data HTTP/1.1\r\nHost: x\r\nOrigin: https://anything.example\r\n\r\n", cq);
+    cr->handle(cq, res);
+    check("* answers * (and needs no Vary)", streq(res->headers->get("Access-Control-Allow-Origin"), "*") && res->headers->get("Vary") == null);
+    cors->credentials = true;
+    cr->handle(cq, res);
+    check("with credentials the origin is echoed instead of *", streq(res->headers->get("Access-Control-Allow-Origin"), "https://anything.example") && streq(res->headers->get("Access-Control-Allow-Credentials"), "true"));
+
+    // --- authentication helpers
+    httpx.Request* aq = httpx.newRequest();
+    parse("GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic QWRhOnNlY3JldCBwYXNz\r\n\r\n", aq);
+    char user[40];
+    char pass[40];
+    check("Basic: user and password (the password may contain spaces)", httpx.checkBasic(aq, &user[0], 40, &pass[0], 40) && streq(&user[0], "Ada") && streq(&pass[0], "secret pass"));
+    parse("GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic !!!!\r\n\r\n", aq);
+    check("Basic: bad base64 is refused", !httpx.checkBasic(aq, &user[0], 40, &pass[0], 40));
+    parse("GET / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer abc.def\r\n\r\n", aq);
+    check("Basic: another scheme is refused, Bearer gives the token", !httpx.checkBasic(aq, &user[0], 40, &pass[0], 40) && streq(httpx.bearerToken(aq), "abc.def"));
+    parse("GET / HTTP/1.1\r\nHost: x\r\n\r\n", aq);
+    check("no Authorization: no token", httpx.bearerToken(aq) == null && !httpx.checkBasic(aq, &user[0], 40, &pass[0], 40));
+    res = httpx.newResponse();
+    httpx.unauthorized(res, "Basic", "my \"realm\"\r\nX: y");
+    check("unauthorized: 401 with a clean WWW-Authenticate", res->status == 401 && streq(res->headers->get("WWW-Authenticate"), "Basic realm=\"my realmX: y\""));
+    check("constantTimeEquals", httpx.constantTimeEquals("secret", "secret") && !httpx.constantTimeEquals("secret", "secreT") && !httpx.constantTimeEquals("secret", "secre") && !httpx.constantTimeEquals("", "x") && httpx.constantTimeEquals("", ""));
+
+    // --- the response
+    res = httpx.newResponse();
+    res->text(200, "hello");
+    int hn;
+    char* head = res->buildHead(true, &hn);
+    check("response head: status line, Content-Length, keep-alive", startsWith(head, "HTTP/1.1 200 OK\r\n") && contains(head, "Content-Length: 5\r\n") && contains(head, "Connection: keep-alive\r\n") && endsWith(head, "\r\n\r\n") && hn == strlen(head));
+    res->status = 204;
+    res->setBody("", 0);
+    head = res->buildHead(false, &hn);
+    check("204: no Content-Length, Connection: close", !contains(head, "Content-Length") && contains(head, "Connection: close"));
+    res->reset();
+    res->setHeader("Content-Length", "999");
+    res->setHeader("Connection", "upgrade");
+    res->text(200, "x");
+    head = res->buildHead(true, &hn);
+    check("the head cannot be tampered with: our Content-Length and Connection win", contains(head, "Content-Length: 1\r\n") && !contains(head, "999") && !contains(head, "upgrade"));
+    check("redirect", res->redirect(302, "/elsewhere") && res->status == 302 && streq(res->headers->get("Location"), "/elsewhere"));
+    check("a Location with CR LF is refused", !res->redirect(302, "/x\r\nSet-Cookie: a=b") && res->status == 500);
+
+    // --- cookies
+    httpx.CookieJar* jar = new httpx.CookieJar();
+    int now = 1700000000;
+    check("store a simple cookie", jar->store("sid=abc123; Path=/; HttpOnly", "example.org", "/login", false, now) && jar->count(now) == 1);
+    char* ch = jar->header("example.org", "/", false, false, now);
+    check("... and send it", ch != null && streq(ch, "sid=abc123"));
+    check("not to another host", jar->header("other.org", "/", false, false, now) == null);
+    check("a host-only cookie does not go to subdomains", jar->header("www.example.org", "/", false, false, now) == null);
+    jar->store("wide=1; Domain=example.org", "example.org", "/", false, now);
+    check("a Domain cookie goes to subdomains", streq(jar->header("www.example.org", "/", false, false, now), "wide=1") && streq(jar->header("a.b.example.org", "/", false, false, now), "wide=1"));
+    check("a cookie for a domain that is not the host's is refused", !jar->store("x=1; Domain=evil.org", "example.org", "/", false, now) && !jar->store("x=1; Domain=ample.org", "example.org", "/", false, now));
+    check("a cookie for a top-level name is refused", !jar->store("x=1; Domain=org", "example.org", "/", false, now));
+    check("the default path is the directory of the request", jar->store("p=1", "example.org", "/a/b/page", false, now) && streq(jar->header("example.org", "/a/b/other", false, false, now), "wide=1; p=1; sid=abc123") == false);
+    check("... p goes to /a/b/ and below only", jar->header("example.org", "/a/c", false, false, now) != null && !contains(jar->header("example.org", "/a/c", false, false, now), "p=1") && contains(jar->header("example.org", "/a/b/x", false, false, now), "p=1"));
+    check("path matching is by segments (/a/b does not match /a/bc)", !contains(jar->header("example.org", "/a/bc", false, false, now), "p=1"));
+    check("longer paths come first", startsWith(jar->header("example.org", "/a/b/x", false, false, now), "p=1; "));
+    jar->store("sec=1; Secure", "example.org", "/", true, now);
+    check("a Secure cookie is only sent over https", !contains(jar->header("example.org", "/", false, false, now), "sec=1") && contains(jar->header("example.org", "/", true, false, now), "sec=1"));
+    check("a Secure cookie from a plain http answer is refused", !jar->store("sec2=1; Secure", "example.org", "/", false, now));
+    jar->store("strict=1; SameSite=Strict", "example.org", "/", false, now);
+    check("SameSite=Strict stays home on cross-site requests", contains(jar->header("example.org", "/", false, false, now), "strict=1") && !contains(jar->header("example.org", "/", false, true, now), "strict=1"));
+    jar->store("tmp=1; Max-Age=60", "example.org", "/", false, now);
+    check("Max-Age: sent before it runs out", contains(jar->header("example.org", "/", false, false, now + 59), "tmp=1"));
+    check("... gone after", !contains(jar->header("example.org", "/", false, false, now + 61), "tmp=1"));
+    jar->store("exp=1; Expires=Sun, 06 Nov 1994 08:49:37 GMT", "example.org", "/", false, now);
+    check("an Expires in the past is not stored", !contains(jar->header("example.org", "/", false, false, now), "exp=1"));
+    jar->store("sid=changed; Path=/", "example.org", "/", false, now);
+    check("the same name, domain and path is replaced", contains(jar->header("example.org", "/", false, false, now), "sid=changed") && !contains(jar->header("example.org", "/", false, false, now), "sid=abc123"));
+    jar->store("sid=gone; Path=/; Max-Age=0", "example.org", "/", false, now);
+    check("Max-Age=0 deletes the cookie", !contains(jar->header("example.org", "/", false, false, now), "sid="));
+    check("__Secure- needs Secure, __Host- needs Secure, Path=/ and no Domain", !jar->store("__Secure-a=1", "example.org", "/", true, now) && jar->store("__Secure-a=1; Secure", "example.org", "/", true, now)
+        && !jar->store("__Host-b=1; Secure; Path=/x", "example.org", "/", true, now) && !jar->store("__Host-b=1; Secure; Path=/; Domain=example.org", "example.org", "/", true, now) && jar->store("__Host-b=1; Secure; Path=/", "example.org", "/", true, now));
+    check("a cookie without = is refused", !jar->store("novalue", "example.org", "/", false, now) && !jar->store("=x", "example.org", "/", false, now));
+    check("a cookie value with a control character is refused", !jar->store("a=b\x01c", "example.org", "/", false, now));
+    char* hugeCookie = alloc(5100);
+    strcpy(hugeCookie, "big=");
+    for (int i = 0; i < 5000; i++) strcat(hugeCookie, "a");
+    check("a cookie of 5000 bytes is refused", !jar->store(hugeCookie, "example.org", "/", false, now));
+    // limits: 50 per domain
+    httpx.CookieJar* jar2 = new httpx.CookieJar();
+    for (int i = 0; i < 60; i++) { char c[40]; format(&c[0], 40, "k%d=v", i); jar2->store(&c[0], "a.example", "/", false, now); }
+    check("at most 50 cookies per domain, the oldest go first", jar2->count(now) == 50 && jar2->find("k0", "a.example") == null && jar2->find("k59", "a.example") != null);
+    for (int d = 0; d < 6; d++) for (int i = 0; i < 50; i++) { char c[40]; char host[30]; format(&c[0], 40, "k%d=v", i); format(&host[0], 30, "h%d.example", d); jar2->store(&c[0], &host[0], "/", false, now); }
+    check("at most 256 in all", jar2->count(now) <= 256);
+    jar2->clear();
+    check("clear", jar2->count(now) == 0);
+
+    // --- multipart
+    httpx.Multipart* mp = new httpx.Multipart();
+    mp->addField("name", "Ada Lovelace");
+    mp->addField("quote\"d", "line1\r\nline2");
+    mp->addFile("upload", "note.txt", "text/plain", "file data\r\nwith lines\r\n", 23);
+    char bin[6];
+    bin[0] = 0; bin[1] = 255; bin[2] = 13; bin[3] = 10; bin[4] = '-'; bin[5] = '-';
+    mp->addFile("blob", "a\"b.bin", null, &bin[0], 6);
+    int mn;
+    char* mbody = mp->body(&mn);
+    char* mct = mp->contentType();
+    check("the content type carries the boundary", startsWith(mct, "multipart/form-data; boundary=----AFormBoundary") && contains(mbody, &mp->boundary[0]));
+    check("the body ends with the closing boundary", mn > 10 && memcmp(&mbody[mn - 4], "--\r\n", 4) == 0);
+    check("a quote in a name is escaped, CR LF too", contains(mbody, "name=\"quote%22d\"") && contains(mbody, "filename=\"a%22b.bin\""));
+    httpx.Part* parts[10];
+    int np = httpx.parseMultipart(mct, mbody, mn, &parts[0], 10);
+    check("parse: four parts", np == 4);
+    check("parse: a field", streq(parts[0]->name, "name") && streq(parts[0]->data, "Ada Lovelace") && parts[0]->filename == null);
+    check("parse: a field with CR LF in the value", streq(parts[1]->name, "quote%22d") && streq(parts[1]->data, "line1\r\nline2"));
+    check("parse: a file with its type and name", streq(parts[2]->name, "upload") && streq(parts[2]->filename, "note.txt") && streq(parts[2]->contentType, "text/plain") && parts[2]->length == 23 && streq(parts[2]->data, "file data\r\nwith lines\r\n"));
+    check("parse: binary data that contains CR LF and dashes", parts[3]->length == 6 && memcmp(parts[3]->data, &bin[0], 6) == 0 && streq(parts[3]->contentType, "application/octet-stream"));
+    httpx.freeParts(&parts[0], np);
+    // a form written by a browser
+    char* browser = "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--XyZ\r\nContent-Disposition: form-data; name=\"f\"; filename=\"x y.txt\"\r\nContent-Type: text/plain\r\n\r\nhi\r\n--XyZ--\r\n";
+    np = httpx.parseMultipart("multipart/form-data; boundary=XyZ", browser, strlen(browser), &parts[0], 10);
+    check("a form from a browser", np == 2 && streq(parts[0]->data, "1") && streq(parts[1]->filename, "x y.txt") && streq(parts[1]->data, "hi"));
+    httpx.freeParts(&parts[0], np);
+    np = httpx.parseMultipart("multipart/form-data; boundary=\"XyZ\"", browser, strlen(browser), &parts[0], 10);
+    check("a quoted boundary", np == 2);
+    httpx.freeParts(&parts[0], np);
+    check("a part limit", httpx.parseMultipart("multipart/form-data; boundary=XyZ", browser, strlen(browser), &parts[0], 1) == -1);
+    check("not multipart", httpx.parseMultipart("text/plain", browser, strlen(browser), &parts[0], 10) == -1);
+    check("no boundary parameter", httpx.parseMultipart("multipart/form-data", browser, strlen(browser), &parts[0], 10) == -1);
+    check("the wrong boundary", httpx.parseMultipart("multipart/form-data; boundary=Other", browser, strlen(browser), &parts[0], 10) == -1);
+    char* cut = "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1 and no end";
+    check("a body that is cut off", httpx.parseMultipart("multipart/form-data; boundary=XyZ", cut, strlen(cut), &parts[0], 10) == -1);
+    char* nameless = "--XyZ\r\nContent-Type: text/plain\r\n\r\n1\r\n--XyZ--\r\n";
+    check("a part without a name", httpx.parseMultipart("multipart/form-data; boundary=XyZ", nameless, strlen(nameless), &parts[0], 10) == -1);
+    char* preamble = "ignored preamble\r\n--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--XyZ--\r\nepilogue";
+    np = httpx.parseMultipart("multipart/form-data; boundary=XyZ", preamble, strlen(preamble), &parts[0], 10);
+    check("a preamble and an epilogue are ignored", np == 1 && streq(parts[0]->data, "1"));
+    httpx.freeParts(&parts[0], np);
+    // the data may contain the boundary text without CR LF before it
+    char* tricky = "--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nabc--XyZdef\r\n--XyZ--\r\n";
+    np = httpx.parseMultipart("multipart/form-data; boundary=XyZ", tricky, strlen(tricky), &parts[0], 10);
+    check("the boundary text inside data is data", np == 1 && streq(parts[0]->data, "abc--XyZdef"));
+    httpx.freeParts(&parts[0], np);
+    printf("failures: %d\n", fails);
+    return fails;
+}

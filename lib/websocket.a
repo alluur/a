@@ -1,16 +1,38 @@
 // =============================================================================
-//  websocket - WebSocket client and server (RFC 6455)               import websocket;
+//  websocket - WebSocket client and server (RFC 6455, RFC 7692)               import websocket;
 //
-//    websocket.WebSocket* ws = websocket.connect("ws://localhost:8080/chat");
+//  A client and a server in a few lines (blocking calls):
+//
+//    websocket.WebSocket* ws = websocket.connect("ws://localhost:8080/chat");       // "wss://..." uses TLS (certificate checked)
 //    ws->sendText("hello");
-//    char buf[1024]; int op;
-//    int n = ws->receive(buf, 1024, &op);        // n < 0: the connection was closed
-//    ws->close(1000);
+//    websocket.Message* m = ws->receiveMessage();         // null when the connection ended (ws->closeCode says why)
+//    println(m->data);   m->dispose();
+//    ws->close(1000);                                     // closing handshake, then the socket is closed
+//    ws->dispose();                                       // frees everything (the pointer is invalid afterwards)
 //
-//  Server side: take a conn.Connection from a conn.Listener and call websocket.accept(c); it reads the
-//  HTTP upgrade request, answers it and returns the WebSocket. Pings are answered automatically, fragmented
-//  messages are put together. Plain ws:// only (no TLS). Text frames are not checked for UTF-8.
+//    conn.Connection* c = listener->accept(5000);
+//    websocket.WebSocket* s = websocket.accept(c, path, 256);       // reads the upgrade request, answers it
 //
+//  What the module checks (RFC 6455, strict): reserved bits, unknown opcodes, control frames (at most 125 bytes, never
+//  fragmented), unmasked client frames (a server refuses them), masked server frames (a client refuses them), minimal length
+//  encodings, continuation rules, UTF-8 of text messages and close reasons (close code 1007), valid close codes, message and
+//  frame size limits (close code 1009). A violation sends a close frame with the right code (1002 protocol error, 1003, 1007
+//  invalid data, 1008, 1009 too big, 1011) and ends the connection. A ping is answered with a pong automatically.
+//
+//  Options for a client (websocket.Options) or a server (websocket.ServerOptions): subprotocols, Origin, Cookie, Authorization
+//  and other request headers, Origin checks, permessage-deflate (RFC 7692: negotiation with no_context_takeover and window
+//  bits; every inflated message is limited to maxMessage, so a decompression bomb ends the connection with 1009), size limits.
+//
+//    websocket.Options* o = new websocket.Options();
+//    o->protocols = "chat, superchat";  o->origin = "https://example.org";  o->deflate = true;  o->verify = false;   // see docs/NET.md
+//    websocket.WebSocket* ws = websocket.connectWith("wss://example.org/ws", o);        // null: websocket.error() says why
+//
+//  Fragments: ws->beginMessage(websocket.OP_TEXT); ws->sendFragment(data, n); ...; ws->endMessage();  or ws->setFragmentSize(n) to
+//  split every message. Receiving into a callback (no buffering): ws->setStreamHandler(cb). Keepalive: ws->setKeepalive(ms, timeoutMs).
+//
+//  No thread per socket: the object is also a state machine without any I/O of its own (feed / outData / outConsumed, a handler
+//  or message queue), which is how wshub serves thousands of clients from one loop. For your own loop: ws->setNonBlocking(true),
+//  put ws->fd() into a conn.Poller, call ws->pump() when it is readable and ws->takeMessage() for what arrived.
 //  The frame functions (buildFrame, parseHeader, unmask, acceptKey) work on byte buffers.
 // =============================================================================
 import net;
@@ -18,8 +40,13 @@ import conn;
 import hash;
 import encoding;
 import http;
+import tls;
+import zlib;
+import secure;
+import cstdlib;
 module websocket;
 
+public const ORIGIN_MAX = 300;       // room for an Origin header value (with its end byte); a longer one is refused
 public const OP_CONT = 0;
 public const OP_TEXT = 1;
 public const OP_BINARY = 2;
@@ -27,13 +54,116 @@ public const OP_CLOSE = 8;
 public const OP_PING = 9;
 public const OP_PONG = 10;
 
+// close codes (RFC 6455 section 7.4.1). 1005 and 1006 are never sent: they only describe what happened to a connection
+public const CLOSE_NORMAL = 1000;
+public const CLOSE_GOING_AWAY = 1001;
+public const CLOSE_PROTOCOL = 1002;
+public const CLOSE_UNSUPPORTED = 1003;
+public const CLOSE_NO_STATUS = 1005;
+public const CLOSE_ABNORMAL = 1006;
+public const CLOSE_BAD_DATA = 1007;
+public const CLOSE_POLICY = 1008;
+public const CLOSE_TOO_BIG = 1009;
+public const CLOSE_EXTENSION = 1010;
+public const CLOSE_INTERNAL = 1011;
+public const CLOSE_RESTART = 1012;
+public const CLOSE_TRY_LATER = 1013;
+
+// events of a handler (WebSocket.setHandler)
+public const EV_MESSAGE = 1;
+public const EV_PING = 2;
+public const EV_PONG = 3;
+public const EV_CLOSE = 4;
+
+private char lastErr[200];
+private int lastStatus;
+private bool verifyTls = true;
+
+// wss:// clients: check the server certificate (default true); Options.verify overrides it per connection
+public void setVerify(bool on) {
+    verifyTls = on;
+}
+
+// why the last connect / accept / handshake failed
+public char* error() {
+    return &lastErr[0];
+}
+
+// the HTTP status the server answered to the last client handshake (101 = success, 0 = no answer)
+public int status() {
+    return lastStatus;
+}
+
+private void fail1(char* why) {
+    int i = 0;
+    while (why[i] != 0 && i < 199) { lastErr[i] = why[i]; i++; }
+    lastErr[i] = 0;
+}
+
 // the Sec-WebSocket-Accept value for a Sec-WebSocket-Key (a new heap string)
 public char* acceptKey(char* clientKey) {
+    char* r = alloc(32);
+    acceptKeyInto(clientKey, r);
+    return r;
+}
+
+// the same without allocating: out needs 29 bytes (the handshakes of a long running server use this one: alloc memory is never given back)
+private void acceptKeyInto(char* clientKey, char* out) {
     char joined[100];
     format(&joined[0], 100, "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", clientKey);
     char digest[20];
     hash.sha1Raw(&joined[0], strlen(&joined[0]), &digest[0]);
-    return encoding.base64Encode(&digest[0], 20);
+    encoding.base64EncodeInto(&digest[0], 20, out);
+}
+
+// ---- UTF-8 ----------------------------------------------------------------------------------------------------------------------------
+// Incremental UTF-8 validation (RFC 3629: no overlong forms, no surrogates, nothing above U+10FFFF). state is 0 at a character border;
+// pass the result of the last call for the next piece of the same text. Returns the new state, or -1 if the bytes are not UTF-8.
+// A text is complete and valid when the final state is 0.
+public int utf8Step(int state, char* p, int n) {
+    int rem = state >> 16;
+    int lo = (state >> 8) & 255;
+    int hi = state & 255;
+    for (int i = 0; i < n; i++) {
+        int b = p[i] & 255;
+        if (rem == 0) {
+            if (b < 0x80) {
+                continue;
+            } else if (b >= 0xC2 && b <= 0xDF) {
+                rem = 1; lo = 0x80; hi = 0xBF;
+            } else if (b == 0xE0) {
+                rem = 2; lo = 0xA0; hi = 0xBF;
+            } else if (b == 0xED) {
+                rem = 2; lo = 0x80; hi = 0x9F;
+            } else if (b >= 0xE1 && b <= 0xEF) {
+                rem = 2; lo = 0x80; hi = 0xBF;
+            } else if (b == 0xF0) {
+                rem = 3; lo = 0x90; hi = 0xBF;
+            } else if (b >= 0xF1 && b <= 0xF3) {
+                rem = 3; lo = 0x80; hi = 0xBF;
+            } else if (b == 0xF4) {
+                rem = 3; lo = 0x80; hi = 0x8F;
+            } else {
+                return -1;
+            }
+        } else {
+            if (b < lo || b > hi) {
+                return -1;
+            }
+            rem--;
+            lo = 0x80;
+            hi = 0xBF;
+        }
+    }
+    if (rem == 0) {
+        return 0;
+    }
+    return (rem << 16) | (lo << 8) | hi;
+}
+
+// true if the n bytes are well formed UTF-8
+public bool isUtf8(char* data, int n) {
+    return utf8Step(0, data, n) == 0;
 }
 
 // ---- frames -------------------------------------------------------------------------------------------------------------------------
@@ -48,8 +178,20 @@ public class Frame {
 
 // xor n bytes with the 4 byte mask key (the same call masks and unmasks)
 public void unmask(char* data, int n, int key) {
+    maskCopy(data, data, n, key, 0);
+}
+
+// dst = src xor mask, where the first byte is at position `off` of the payload (so a payload can be unmasked in pieces)
+private void maskCopy(char* dst, char* src, int n, int key, int off) {
+    int k[4];
+    k[0] = (key >> 24) & 255;
+    k[1] = (key >> 16) & 255;
+    k[2] = (key >> 8) & 255;
+    k[3] = key & 255;
+    int j = off & 3;
     for (int i = 0; i < n; i++) {
-        data[i] = data[i] ^ ((key >> (24 - 8 * (i % 4))) & 255);
+        dst[i] = src[i] ^ k[j];
+        j = (j + 1) & 3;
     }
 }
 
@@ -78,9 +220,10 @@ public int buildFrame(int opcode, bool fin, bool mask, int maskKey, char* payloa
         out[o] = (maskKey >> 24) & 255; out[o + 1] = (maskKey >> 16) & 255;
         out[o + 2] = (maskKey >> 8) & 255; out[o + 3] = maskKey & 255;
         o = o + 4;
+        maskCopy(&out[o], payload, n, maskKey, 0);
+    } else {
+        memcpy(&out[o], payload, n);
     }
-    memcpy(&out[o], payload, n);
-    if (mask) unmask(&out[o], n, maskKey);
     return o + n;
 }
 
@@ -116,205 +259,2101 @@ public int parseHeader(char* buf, int n, Frame* f) {
     return o;
 }
 
-// ---- a connection -------------------------------------------------------------------------------------------------------------------
-public class WebSocket {
-    public conn.Connection* c;
-    public bool isClient;
-    public bool closed;
-    public int closeCode;
+// is this a close code that may appear in a close frame we receive? (1000-1003, 1007-1014, 3000-4999)
+public bool validCloseCode(int code) {
+    if (code >= 1000 && code <= 1003) return true;
+    if (code >= 1007 && code <= 1014) return true;
+    return code >= 3000 && code <= 4999;
+}
 
-    public WebSocket(conn.Connection* connection, bool client) {
-        c = connection;
-        isClient = client;
-        closeCode = 0;
-    }
+// a short name for a close code
+public char* closeName(int code) {
+    if (code == 1000) return "normal closure";
+    if (code == 1001) return "going away";
+    if (code == 1002) return "protocol error";
+    if (code == 1003) return "unsupported data";
+    if (code == 1005) return "no status received";
+    if (code == 1006) return "abnormal closure";
+    if (code == 1007) return "invalid payload data";
+    if (code == 1008) return "policy violation";
+    if (code == 1009) return "message too big";
+    if (code == 1010) return "extension required";
+    if (code == 1011) return "internal error";
+    if (code == 1012) return "service restart";
+    if (code == 1013) return "try again later";
+    return "";
+}
 
-    private bool sendFrame(int opcode, char* data, int n) {
-        if (closed) return false;
-        char* out = alloc(n + 20);
-        int key = 0;
-        if (isClient) key = ((rand() & 0xFFFF) << 16) | (rand() & 0xFFFF);
-        int len = buildFrame(opcode, true, isClient, key, data, n, out);
-        bool ok = c->write(out, len) && c->flush();
-        return ok;
-    }
-
-    public bool sendText(char* text) { return sendFrame(OP_TEXT, text, strlen(text)); }
-    public bool sendBinary(char* data, int n) { return sendFrame(OP_BINARY, data, n); }
-    public bool ping() { return sendFrame(OP_PING, "", 0); }
-
-    // starts the closing handshake (code 1000 = normal)
-    public void close(int code) {
-        if (!closed) {
-            char p[2];
-            p[0] = (code >> 8) & 255;
-            p[1] = code & 255;
-            sendFrame(OP_CLOSE, p, 2);
-            closed = true;
-            // finish politely: say that nothing more follows and read what the other side still sends, so the
-            // close frame is not lost to a connection reset
-            net.shutdown(c->handle(), 1);
-            c->setTimeout(200);
-            char junk[256];
-            while (c->read(&junk[0], 256) > 0) { }
+// ---- header text helpers --------------------------------------------------------------------------------------------------------------
+// the value of header `name` in raw header text ("A: b\r\nC: d\r\n"); the values of a repeated header are joined with ", ".
+// Returns false if there is no such header
+private bool hv(char* raw, char* name, char* out, int max) {
+    int nl = strlen(name);
+    int o = 0;
+    bool found = false;
+    out[0] = 0;
+    int i = 0;
+    while (raw[i] != 0) {
+        bool match = true;
+        for (int k = 0; k < nl; k++) {
+            if (toLower(raw[i + k]) != toLower(name[k])) { match = false; break; }
         }
-        c->close();
-    }
-
-    // Reads one message into buf (at most max bytes, a longer message is cut). *opcode is OP_TEXT or OP_BINARY.
-    // Returns the length, or -1 when the connection was closed (closeCode tells why, 0 = it just ended)
-    public int receive(char* buf, int max, int* opcode) {
-        int total = 0;
-        int msgOp = 0;
-        for (;;) {
-            char head[16];
-            int have = 0;
-            Frame* f = new Frame();
-            int hl = 0;
-            while (hl == 0) {
-                int b = c->readByte();
-                if (b < 0) {
-                    closed = true;
-                    return -1;
-                }
-                head[have] = b;
-                have++;
-                hl = parseHeader(&head[0], have, f);
-                if (hl < 0 || have >= 14) {
-                    if (hl <= 0) {
-                        close(1002);
-                        return -1;
-                    }
-                }
-            }
-            char* payload = alloc(f->length + 1);
-            if (c->readExact(payload, f->length) != f->length) {
-                closed = true;
-                return -1;
-            }
-            if (f->masked) unmask(payload, f->length, f->maskKey);
-            if (f->opcode == OP_PING) {
-                sendFrame(OP_PONG, payload, f->length);
-                continue;
-            }
-            if (f->opcode == OP_PONG) {
-                continue;
-            }
-            if (f->opcode == OP_CLOSE) {
-                if (f->length >= 2) closeCode = payload[0] * 256 + payload[1];
-                if (!closed) {
-                    sendFrame(OP_CLOSE, payload, f->length);
-                    closed = true;
-                }
-                c->close();
-                return -1;
-            }
-            if (f->opcode != OP_CONT) msgOp = f->opcode;
-            int take = f->length;
-            if (total + take > max) take = max - total;
-            if (take > 0) {
-                memcpy(&buf[total], payload, take);
-                total = total + take;
-            }
-            if (f->fin) {
-                if (total < max) buf[total] = 0;
-                *opcode = msgOp;
-                return total;
-            }
+        if (match && raw[i + nl] == ':') {
+            int j = i + nl + 1;
+            while (raw[j] == ' ' || raw[j] == 9) j++;
+            int e = j;
+            while (raw[e] != 0 && raw[e] != 13 && raw[e] != 10) e++;
+            while (e > j && (raw[e - 1] == ' ' || raw[e - 1] == 9)) e--;
+            if (found && o + 2 < max) { out[o] = ','; out[o + 1] = ' '; o = o + 2; }
+            while (j < e && o < max - 1) { out[o] = raw[j]; o++; j++; }
+            out[o] = 0;
+            found = true;
         }
-        return -1;
+        while (raw[i] != 0 && raw[i] != 10) i++;
+        if (raw[i] == 10) i++;
+    }
+    return found;
+}
+
+// does the comma separated list contain the token (case does not matter)?
+private bool hasToken(char* list, char* token) {
+    int tl = strlen(token);
+    int i = 0;
+    while (list[i] != 0) {
+        while (list[i] == ' ' || list[i] == 9 || list[i] == ',') i++;
+        int s = i;
+        while (list[i] != 0 && list[i] != ',') i++;
+        int e = i;
+        while (e > s && (list[e - 1] == ' ' || list[e - 1] == 9)) e--;
+        if (e - s == tl) {
+            bool same = true;
+            for (int k = 0; k < tl; k++) {
+                if (toLower(list[s + k]) != toLower(token[k])) { same = false; break; }
+            }
+            if (same) return true;
+        }
+    }
+    return false;
+}
+
+// the next item of a comma separated list (trimmed) into out; false at the end of the list
+private bool nextItem(char* list, int* pos, char* out, int max) {
+    int i = *pos;
+    while (list[i] == ' ' || list[i] == 9 || list[i] == ',') i++;
+    if (list[i] == 0) { *pos = i; return false; }
+    int s = i;
+    while (list[i] != 0 && list[i] != ',') i++;
+    int e = i;
+    while (e > s && (list[e - 1] == ' ' || list[e - 1] == 9)) e--;
+    int n = e - s;
+    if (n >= max) n = max - 1;
+    memcpy(out, &list[s], n);
+    out[n] = 0;
+    *pos = i;
+    return true;
+}
+
+// a token as RFC 7230 defines it (what a subprotocol name may be made of)
+private bool isToken(char* s, int n) {
+    if (n <= 0) return false;
+    for (int i = 0; i < n; i++) {
+        int c = s[i] & 255;
+        if (c <= 32 || c >= 127) return false;
+        if (c == '(' || c == ')' || c == '<' || c == '>' || c == '@' || c == ',' || c == ';' || c == ':' || c == '\\' || c == '"'
+            || c == '/' || c == '[' || c == ']' || c == '?' || c == '=' || c == '{' || c == '}') return false;
+    }
+    return true;
+}
+
+// a copy on the malloc heap (what free() may release)
+private char* dupStr(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r == null) return null;
+    memcpy(r, s, n + 1);
+    return r;
+}
+
+// no control characters (CR, LF, NUL ...) in a value that goes into a header line or the request line
+private bool cleanText(char* s) {
+    if (s == null) return true;
+    for (int i = 0; s[i] != 0; i++) {
+        int c = s[i] & 255;
+        if (c < 32 && c != 9) return false;
+        if (c == 127) return false;
+    }
+    return true;
+}
+
+// header lines given as "A: b\r\nC: d\r\n": every line must have a name, a colon and no stray control characters
+private bool cleanHeaderLines(char* s) {
+    if (s == null || s[0] == 0) return true;
+    int i = 0;
+    while (s[i] != 0) {
+        int j = i;
+        while (s[j] != 0 && s[j] != 13 && s[j] != 10) {
+            int c = s[j] & 255;
+            if ((c < 32 && c != 9) || c == 127) return false;
+            j++;
+        }
+        if (s[j] != 13 || s[j + 1] != 10) return false;          // every line ends with CRLF
+        int colon = -1;
+        for (int k = i; k < j; k++) { if (s[k] == ':') { colon = k; break; } }
+        if (colon <= i || !isToken(&s[i], colon - i)) return false;
+        i = j + 2;
+    }
+    return true;
+}
+
+// ---- messages ---------------------------------------------------------------------------------------------------------------------------
+// a received message (from receiveMessage / takeMessage); free it with dispose()
+public class Message {
+    public int opcode;             // OP_TEXT or OP_BINARY
+    public char* data;             // the bytes, followed by a 0 byte (a text message is a string)
+    public int length;
+    public bool heap;
+
+    public bool isText() { return opcode == OP_TEXT; }
+
+    // frees the data (and the message itself: do not use the pointer afterwards)
+    public void dispose() {
+        if (data != null) free(data);
+        data = null;
+        length = 0;
+        if (heap) {
+            heap = false;
+            free(this);
+        }
     }
 }
 
-// ---- handshakes ---------------------------------------------------------------------------------------------------------------------
-private char* readHeaders(conn.Connection* c, char* first, int max) {
-    if (c->readLine(first, max) < 0) return null;
-    char* raw = alloc(8192);
-    int o = 0;
-    char line[1024];
-    for (;;) {
-        int n = c->readLine(&line[0], 1024);
-        if (n < 0) return null;
-        if (n == 0) break;
-        if (o + n + 2 < 8190) {
-            memcpy(&raw[o], &line[0], n);
-            o = o + n;
-            raw[o] = 13; raw[o + 1] = 10;
-            o = o + 2;
+private Message* newMessage(int opcode, char* data, int n) {
+    Message* m = (Message*) malloc(sizeof(Message));
+    if (m == null) return null;
+    m->heap = true;
+    m->opcode = opcode;
+    m->data = malloc(n + 1);
+    if (m->data == null) {
+        free(m);
+        return null;
+    }
+    memcpy(m->data, data, n);
+    m->data[n] = 0;
+    m->length = n;
+    return m;
+}
+
+// ---- options --------------------------------------------------------------------------------------------------------------------------------
+// client options (see connectWith); every field can be left at its default
+public class Options {
+    public bool verify;             // wss: check the server certificate (default: the module's setting, see setVerify)
+    public char* origin;            // Origin header (null: none)
+    public char* protocols;         // subprotocols to offer, comma separated, e.g. "chat, superchat"
+    public char* cookie;            // Cookie header
+    public char* authorization;     // Authorization header value, e.g. "Bearer abc" or "Basic ..."
+    public char* headers;           // more request header lines: "X-One: 1\r\nX-Two: 2\r\n"
+    public bool deflate;            // offer permessage-deflate (default off)
+    public bool offerNoTakeover;    // with deflate: offer client_no_context_takeover and server_no_context_takeover (default true, uses less memory)
+    public int connectTimeoutMs;    // default 5000
+    public int handshakeTimeoutMs;  // time for the HTTP answer (and the TLS handshake), default 10000
+    public int maxMessage;          // largest message (inflated) accepted, default 16 MiB
+    public int maxFrame;            // largest frame accepted, default 16 MiB
+    public int minCompress;         // messages shorter than this are sent uncompressed (default 64)
+
+    public Options() {
+        verify = verifyTls;
+        offerNoTakeover = true;
+        connectTimeoutMs = 5000;
+        handshakeTimeoutMs = 10000;
+        maxMessage = 16777216;
+        maxFrame = 16777216;
+        minCompress = 64;
+    }
+}
+
+// server options (see acceptWith)
+public class ServerOptions {
+    public char* protocols;         // subprotocols this server speaks, comma separated, in order of preference (null: none)
+    public bool requireProtocol;    // refuse (400) a client that offers none of them
+    public char* origins;           // allowed Origin values, comma separated ("*" = any); null: no check. An Origin header that is empty or 300+ bytes is refused (403) in any case
+    public bool requireOrigin;      // with origins: a request without an Origin header is refused (403) too
+    public bool deflate;            // accept permessage-deflate offers (default off)
+    public bool allowTakeover;      // with deflate: accept clients that keep their compression context (default false: always asks for client_no_context_takeover)
+    public int handshakeTimeoutMs;  // time for the upgrade request to arrive (blocking accept), default 10000
+    public int maxMessage;          // default 16 MiB
+    public int maxFrame;            // default 16 MiB
+    public int minCompress;         // default 64
+
+    public ServerOptions() {
+        handshakeTimeoutMs = 10000;
+        maxMessage = 16777216;
+        maxFrame = 16777216;
+        minCompress = 64;
+    }
+}
+
+// what a server learns from an upgrade request; free the buffers with dispose()
+public class HandshakeInfo {
+    public char path[1024];         // the request target ("/chat?room=1")
+    public char* headers;           // the raw header lines (use header(name))
+    public char origin[ORIGIN_MAX];  // the Origin header ("" if none; a header that is empty or longer than 299 bytes is refused with 403)
+    public char protocol[64];       // the subprotocol that was chosen ("" if none)
+    public char* response;          // the complete HTTP answer to send (101, or an error)
+    public int responseLen;
+    public int status;              // 101 = the request is fine, otherwise the status of the error answer
+    public bool deflate;            // permessage-deflate was negotiated
+    public bool rxTakeover;         // the client keeps its compression context between messages
+    public int txDist;              // window size of our compressor (bytes, a power of two)
+    public bool heap;
+
+    // the value of a request header (repeated headers joined with ", "), a new heap string; null if absent
+    public char* header(char* name) {
+        if (headers == null) return null;
+        char tmp[1024];
+        if (hv(headers, name, &tmp[0], 1024)) return strdup(&tmp[0]);
+        return null;
+    }
+
+    // the same without a heap copy: the value goes into out; false if the header is absent
+    public bool headerInto(char* name, char* out, int max) {
+        out[0] = 0;
+        if (headers == null) return false;
+        return hv(headers, name, out, max);
+    }
+
+    public void dispose() {
+        if (headers != null) free(headers);
+        if (response != null) free(response);
+        headers = null;
+        response = null;
+        if (heap) {
+            heap = false;
+            free(this);
         }
     }
-    raw[o] = 0;
-    return raw;
+}
+
+// ---- permessage-deflate negotiation (RFC 7692 section 7) ----------------------------------------------------------------------------------
+class DeflateParams {
+    public bool serverNoTakeover;
+    public bool clientNoTakeover;
+    public int serverBits;          // 0 = not given, else 8..15
+    public int clientBits;          // 0 = not given, else 8..15
+    public bool clientBitsGiven;    // client_max_window_bits appeared (with or without a value)
+}
+
+// reads "; name=value; name" (what follows the extension name). Every parameter may appear once, values are 8..15, unknown names are errors
+private bool parseDeflateParams(char* s, DeflateParams* p) {
+    int seen = 0;
+    int i = 0;
+    while (s[i] != 0) {
+        while (s[i] == ' ' || s[i] == 9) i++;
+        if (s[i] == 0) break;
+        if (s[i] != ';') return false;
+        i++;
+        while (s[i] == ' ' || s[i] == 9) i++;
+        int ns = i;
+        while (s[i] != 0 && s[i] != ';' && s[i] != '=' && s[i] != ' ' && s[i] != 9) i++;
+        int nl = i - ns;
+        if (nl <= 0 || nl >= 40) return false;
+        char name[40];
+        memcpy(&name[0], &s[ns], nl);
+        name[nl] = 0;
+        while (s[i] == ' ' || s[i] == 9) i++;
+        bool hasVal = false;
+        char val[16];
+        val[0] = 0;
+        if (s[i] == '=') {
+            i++;
+            hasVal = true;
+            while (s[i] == ' ' || s[i] == 9) i++;
+            bool quoted = (s[i] == '"');
+            if (quoted) i++;
+            int vs = i;
+            while (s[i] != 0 && s[i] != ';' && s[i] != ' ' && s[i] != 9 && !(quoted && s[i] == '"')) i++;
+            int vl = i - vs;
+            if (vl <= 0 || vl > 2) return false;
+            memcpy(&val[0], &s[vs], vl);
+            val[vl] = 0;
+            if (quoted) {
+                if (s[i] != '"') return false;
+                i++;
+            }
+        }
+        int bit = 0;
+        if (streqi(&name[0], "server_no_context_takeover")) {
+            bit = 1;
+            if (hasVal) return false;
+            p->serverNoTakeover = true;
+        } else if (streqi(&name[0], "client_no_context_takeover")) {
+            bit = 2;
+            if (hasVal) return false;
+            p->clientNoTakeover = true;
+        } else if (streqi(&name[0], "server_max_window_bits") || streqi(&name[0], "client_max_window_bits")) {
+            bool isServer = streqi(&name[0], "server_max_window_bits");
+            bit = isServer ? 4 : 8;
+            int bits = 0;
+            if (hasVal) {
+                for (int k = 0; val[k] != 0; k++) {
+                    if (!isDigit(val[k])) return false;
+                    bits = bits * 10 + (val[k] - '0');
+                }
+                if (bits < 8 || bits > 15) return false;
+            } else if (isServer) {
+                return false;                       // the server's limit needs a value
+            }
+            if (isServer) {
+                p->serverBits = bits;
+            } else {
+                p->clientBits = bits;
+                p->clientBitsGiven = true;
+            }
+        } else {
+            return false;
+        }
+        if ((seen & bit) != 0) return false;        // a parameter must not appear twice
+        seen = seen | bit;
+    }
+    return true;
+}
+
+// Reads an extension header value ("permessage-deflate; a; b=10, other"). Calls back for each element as (start, length)
+// of "name" and the position where its parameters start. Returns the number of elements.
+private int extElement(char* h, int pos, int* nameStart, int* nameLen, int* parStart, int* parEnd) {
+    int n = strlen(h);
+    int i = pos;
+    while (i < n && (h[i] == ' ' || h[i] == 9 || h[i] == ',')) i++;
+    if (i >= n) return -1;
+    int ns = i;
+    while (i < n && h[i] != ';' && h[i] != ',' && h[i] != ' ' && h[i] != 9) i++;
+    *nameStart = ns;
+    *nameLen = i - ns;
+    *parStart = i;
+    while (i < n && h[i] != ',') i++;
+    *parEnd = i;
+    return i;
+}
+
+// server side: looks through the Sec-WebSocket-Extensions offers of a client; fills info (deflate, rxTakeover, txDist) and
+// writes the header value of the answer into out (empty if nothing was accepted)
+private void negotiateDeflate(char* offers, ServerOptions* o, HandshakeInfo* info, char* out, int max) {
+    out[0] = 0;
+    info->deflate = false;
+    if (!o->deflate || offers == null || offers[0] == 0) return;
+    int pos = 0;
+    for (;;) {
+        int ns; int nl; int ps; int pe;
+        int next = extElement(offers, pos, &ns, &nl, &ps, &pe);
+        if (next < 0) break;
+        pos = next;
+        if (nl == 18 && startsWith(&offers[ns], "permessage-deflate")) {
+            char seg[200];
+            int sl = pe - ps;
+            if (sl > 190) continue;
+            memcpy(&seg[0], &offers[ps], sl);
+            seg[sl] = 0;
+            DeflateParams p;
+            if (!parseDeflateParams(&seg[0], &p)) continue;       // an offer that cannot be understood is declined, the next one may do
+            info->deflate = true;
+            info->rxTakeover = o->allowTakeover && !p.clientNoTakeover;
+            info->txDist = 32768;
+            char resp[200];
+            strcpy(&resp[0], "permessage-deflate; server_no_context_takeover");
+            if (p.serverBits != 0) {
+                char tmp[40];
+                format(&tmp[0], 40, "; server_max_window_bits=%d", p.serverBits);
+                strcat(&resp[0], &tmp[0]);
+                info->txDist = 1 << p.serverBits;
+            }
+            if (!info->rxTakeover) strcat(&resp[0], "; client_no_context_takeover");
+            int rl = strlen(&resp[0]);
+            if (rl < max) { memcpy(out, &resp[0], rl + 1); }
+            return;
+        }
+    }
+}
+
+// ---- the WebSocket ----------------------------------------------------------------------------------------------------------------------
+public class WebSocket {
+    public conn.Connection* c;        // the socket (null when something else moves the bytes: wshub, tests)
+    public bool isClient;
+    public bool closed;               // the connection is over: nothing more will be sent or delivered
+    public int closeCode;             // the code of the close frame the peer sent (1005: it had none), 1006: the connection ended without one, 0: still open
+    public char* closeReason;         // the reason text of the peer's close frame ("" if none; a string until dispose())
+    public int localCloseCode;        // the code we sent (0: none yet)
+    public bool closeSent;
+    public bool closeRecvd;
+    public bool failed;               // we ended the connection because the peer broke the rules (failReason says how)
+    public char failReason[100];
+    public char* protocol;            // the subprotocol that was negotiated ("" if none; a string until dispose())
+    public bool deflate;              // permessage-deflate is in use
+    public bool rxTakeover;           // the peer keeps its compression context between messages
+    public int txDist;                // window size of our compressor (bytes)
+    public int minCompress;           // shorter messages are sent uncompressed
+    public int level;                 // deflate effort 1..9 (default 4)
+    public int maxMessage;            // longest message (after inflating) that is accepted; a longer one ends the connection with 1009
+    public int maxFrame;              // longest frame payload that is accepted
+    public int maxQueue;              // messages waiting for takeMessage (when no handler is set): feed() stops consuming bytes when it is reached
+    public int maxOutBuffer;          // bytes waiting to be sent: a send that would pass it fails and sets overflowed (0: no limit)
+    public bool overflowed;
+    public int fragSize;              // longer messages are sent in fragments of this size (0: never)
+    public char* user;                // free for the application
+    public int bytesIn;
+    public int bytesOut;
+    public int messagesIn;
+    public int messagesOut;
+    public int lastRx;                // the clock (see tick) when something last arrived
+    public int clockNow;              // the time of the last tick(now) call
+    public int rttMs;                 // round trip of the last ping that was answered (-1: none yet)
+    public bool nonblocking;
+    public bool heap;
+    public bool disposed;
+    public bool ownsConn;             // the connection was made by connect(): dispose() frees it
+
+    // ---- handler and queue
+    public func handler;              // handler(ws, event, opcode, data, length): see EV_*; data is valid only during the call (a message is followed by a 0 byte)
+    public func streamHandler;        // streamHandler(ws, opcode, data, length, flags): pieces of data messages (flags: 1 first, 2 last)
+    public Message** q;
+    public int qHead;
+    public int qCount;
+    public int qCap;
+
+    // ---- keepalive
+    public int kaInterval;
+    public int kaTimeout;
+    public int pingSentAt;            // millis() of an unanswered ping, 0: none
+    public int pingCounter;
+
+    // ---- output
+    public char* out;
+    public int outLen;
+    public int outPos;
+    public int outCap;
+    public char mpool[64];
+    public int mpos;
+
+    // ---- the frame being read
+    public int fstage;                // 0 header, 1 payload
+    public char hdr[16];
+    public int hdrLen;
+    public int fOp;
+    public bool fFin;
+    public bool fRsv1;
+    public bool fMasked;
+    public int fRemain;
+    public int fMask;
+    public int fMaskOff;
+    public char ctrl[128];
+    public int ctrlLen;
+
+    // ---- the message being assembled
+    public int mOp;                   // 0: none in progress
+    public bool mComp;
+    public char* mBuf;
+    public int mLen;
+    public int mCap;
+    public int mU8;
+    public int mTotal;
+    public bool mFirst;
+
+    // ---- the message being sent in pieces
+    public bool txOpen;
+    public int txOp;
+    public bool txFirst;
+    public int txU8;
+    public char* txBuf;
+    public int txLen;
+    public int txCap;
+
+    // ---- permessage-deflate receive window (the last 32 KB of what was inflated)
+    public char* win;
+    public int winLen;
+
+    public WebSocket(conn.Connection* connection, bool client) {
+        init(connection, client);
+    }
+
+    // (re)starts the object for a new connection; buffers that already exist are kept. The constructor calls it.
+    public void init(conn.Connection* connection, bool client) {
+        c = connection;
+        isClient = client;
+        closed = false;
+        closeCode = 0;
+        if (closeReason != null) free(closeReason);
+        closeReason = dupStr("");
+        localCloseCode = 0;
+        closeSent = false;
+        closeRecvd = false;
+        failed = false;
+        failReason[0] = 0;
+        if (protocol != null) free(protocol);
+        protocol = dupStr("");
+        deflate = false;
+        rxTakeover = false;
+        txDist = 32768;
+        minCompress = 64;
+        level = 4;
+        maxMessage = 16777216;
+        maxFrame = 16777216;
+        maxQueue = 4096;
+        maxOutBuffer = 0;
+        overflowed = false;
+        fragSize = 0;
+        bytesIn = 0;
+        bytesOut = 0;
+        messagesIn = 0;
+        messagesOut = 0;
+        rttMs = -1;
+        clockNow = millis();
+        nonblocking = false;
+        disposed = false;
+        ownsConn = false;
+        handler = null;
+        streamHandler = null;
+        dropQueue();
+        kaInterval = 0;
+        kaTimeout = 0;
+        pingSentAt = 0;
+        outLen = 0;
+        outPos = 0;
+        mpos = 64;
+        fstage = 0;
+        hdrLen = 0;
+        ctrlLen = 0;
+        mOp = 0;
+        mLen = 0;
+        mTotal = 0;                   // a recycled object must not remember the half message of the connection before it
+        mComp = false;
+        mU8 = 0;
+        mFirst = false;
+        fFin = false;
+        fRsv1 = false;
+        fMasked = false;
+        fRemain = 0;
+        fMask = 0;
+        fMaskOff = 0;
+        fOp = 0;
+        pingCounter = 0;
+        txOpen = false;
+        txOp = 0;
+        txFirst = false;
+        txU8 = 0;
+        txLen = 0;
+        winLen = 0;
+        lastRx = clockNow;
+    }
+
+    // ---- settings ----------------------------------------------------------------------------------------------------------------------
+    public void setMaxMessage(int n) { maxMessage = n; if (maxFrame > n) maxFrame = n; }
+    public void setMaxFrame(int n) { maxFrame = n; }
+    public void setFragmentSize(int n) { fragSize = n; }
+    public void setHandler(func h) { handler = h; }
+    public void setStreamHandler(func h) { streamHandler = h; }
+
+    // ping every intervalMs of silence; if nothing at all arrives within timeoutMs after a ping the connection is failed with 1011.
+    // Checked by tick(now), which the blocking receive calls and a loop of yours has to call; 0 turns it off
+    public void setKeepalive(int intervalMs, int timeoutMs) {
+        kaInterval = intervalMs;
+        kaTimeout = timeoutMs;
+        pingSentAt = 0;
+        clockNow = millis();
+        lastRx = clockNow;
+    }
+
+    // ---- output buffer -----------------------------------------------------------------------------------------------------------------
+    // bytes that are queued and not yet sent
+    public int outPending() { return outLen - outPos; }
+    public char* outData() { if (out == null) return ""; return &out[outPos]; }
+
+    // n bytes of outData() were sent
+    public void outConsumed(int n) {
+        outPos = outPos + n;
+        if (outPos >= outLen) {
+            outPos = 0;
+            outLen = 0;
+        }
+    }
+
+    private bool reserve(int more) {
+        if (outPos > 0 && outPos == outLen) {
+            outPos = 0;
+            outLen = 0;
+        }
+        if (outLen + more <= outCap) return true;
+        if (outPos > 0) {
+            int pend = outLen - outPos;
+            for (int i = 0; i < pend; i++) out[i] = out[outPos + i];
+            outPos = 0;
+            outLen = pend;
+            if (outLen + more <= outCap) return true;
+        }
+        int nc = outCap * 2;
+        if (nc < 512) nc = 512;
+        while (nc < outLen + more) nc = nc * 2;
+        char* nb = realloc(out, nc);
+        if (nb == null) return false;
+        out = nb;
+        outCap = nc;
+        return true;
+    }
+
+    private int nextMask() {
+        if (mpos >= 64) {
+            if (!secure.bytes(&mpool[0], 64)) {
+                for (int i = 0; i < 64; i++) mpool[i] = rand() & 255;
+            }
+            mpos = 0;
+        }
+        int k = ((mpool[mpos] & 255) << 24) | ((mpool[mpos + 1] & 255) << 16) | ((mpool[mpos + 2] & 255) << 8) | (mpool[mpos + 3] & 255);
+        mpos = mpos + 4;
+        return k;
+    }
+
+    private int frameSize(int n) {
+        int hl = 2;
+        if (n >= 65536) hl = 10; else if (n >= 126) hl = 4;
+        if (isClient) hl = hl + 4;
+        return hl + n;
+    }
+
+    // appends one frame to the output queue. force: control frames (and the close frame) ignore maxOutBuffer
+    private bool queueFrame(int opcode, bool fin, bool rsv1, char* data, int n, bool force) {
+        if (disposed) return false;
+        int need = frameSize(n);
+        if (!force && !roomFor(need)) return false;
+        if (!reserve(need)) return false;
+        char* o = &out[outLen];
+        int hl = 2;
+        o[0] = opcode | (fin ? 0x80 : 0) | (rsv1 ? 0x40 : 0);
+        int m = isClient ? 0x80 : 0;
+        if (n < 126) {
+            o[1] = m | n;
+        } else if (n < 65536) {
+            o[1] = m | 126;
+            o[2] = (n >> 8) & 255;
+            o[3] = n & 255;
+            hl = 4;
+        } else {
+            o[1] = m | 127;
+            for (int i = 0; i < 8; i++) o[2 + i] = (n >> (56 - 8 * i)) & 255;
+            hl = 10;
+        }
+        if (isClient) {
+            int key = nextMask();
+            o[hl] = (key >> 24) & 255;
+            o[hl + 1] = (key >> 16) & 255;
+            o[hl + 2] = (key >> 8) & 255;
+            o[hl + 3] = key & 255;
+            hl = hl + 4;
+            if (n > 0) maskCopy(&o[hl], data, n, key, 0);
+        } else if (n > 0) {
+            memcpy(&o[hl], data, n);
+        }
+        outLen = outLen + hl + n;
+        bytesOut = bytesOut + hl + n;
+        return true;
+    }
+
+    // is there room in the output queue for `need` more bytes?
+    private bool roomFor(int need) {
+        if (maxOutBuffer <= 0) return true;
+        int p = outLen - outPos;
+        if (need > maxOutBuffer || (p > 0 && p + need > maxOutBuffer)) {
+            overflowed = true;
+            return false;
+        }
+        return true;
+    }
+
+    // after frames were queued: the socket (if there is one) gets them. false when the connection is broken
+    private bool afterQueue() {
+        if (c == null) return true;
+        if (nonblocking) return flushSome();
+        return flushAll();
+    }
+
+    // sends everything that is queued, waiting as long as it takes (blocking mode)
+    private bool flushAll() {
+        if (c == null || !c->isOpen()) return outLen == outPos;
+        int p = outLen - outPos;
+        if (p == 0) return true;
+        if (!c->write(&out[outPos], p) || !c->flush()) {
+            transportEnded();
+            return false;
+        }
+        outPos = 0;
+        outLen = 0;
+        return true;
+    }
+
+    // sends what the socket takes now (non-blocking mode); the rest stays queued. false when the connection is broken
+    private bool flushSome() {
+        if (c == null || !c->isOpen()) return outLen == outPos;
+        while (outLen > outPos) {
+            int r = net.sendSome(c->handle(), &out[outPos], outLen - outPos);
+            if (r < 0) {
+                transportEnded();
+                return false;
+            }
+            if (r == 0) break;
+            outConsumed(r);
+        }
+        return true;
+    }
+
+    // sends what is queued: waits in blocking mode, only what fits in non-blocking mode. false when the connection is broken
+    public bool flush() {
+        if (c == null) return true;
+        return afterQueue();
+    }
+
+    // the connection ended without a closing handshake
+    public void transportEnded() {
+        if (!closed) closed = true;
+        if (closeCode == 0) closeCode = 1006;
+    }
+
+    // ---- sending -----------------------------------------------------------------------------------------------------------------------
+    private bool canSend() {
+        return !closed && !closeSent && !disposed;
+    }
+
+    // queues a whole message, compressed if permessage-deflate is on and it is long enough, split in fragments if fragSize is set
+    private bool sendMessage(int op, char* data, int n) {
+        if (!canSend() || txOpen) return false;
+        if (op == OP_TEXT && !isUtf8(data, n)) return false;
+        bool comp = false;
+        char* z = null;
+        char* payload = data;
+        int pn = n;
+        if (deflate && n >= minCompress) {
+            int zn;
+            z = zlib.deflateSync(data, n, level, txDist, &zn);
+            if (z != null && zn >= 4) {
+                payload = z;
+                pn = zn - 4;                       // RFC 7692 7.2.1: the 00 00 FF FF tail of the flush is removed
+                comp = true;
+            }
+        }
+        bool ok = queueMessage(op, comp, payload, pn);
+        if (z != null) free(z);
+        if (!ok) return false;
+        messagesOut++;
+        return afterQueue();
+    }
+
+    // queues the frames of one message, atomically: either all of them or none
+    private bool queueMessage(int op, bool rsv1, char* payload, int pn) {
+        if (fragSize <= 0 || pn <= fragSize) {
+            return queueFrame(op, true, rsv1, payload, pn, false);
+        }
+        int frames = (pn + fragSize - 1) / fragSize;
+        int total = pn + frames * frameSize(0);
+        if (!roomFor(total)) return false;
+        int off = 0;
+        bool first = true;
+        while (off < pn) {
+            int take = pn - off;
+            if (take > fragSize) take = fragSize;
+            bool fin = (off + take >= pn);
+            if (!queueFrame(first ? op : OP_CONT, fin, first && rsv1, &payload[off], take, true)) return false;
+            first = false;
+            off = off + take;
+        }
+        return true;
+    }
+
+    // a text message (the string must be valid UTF-8, else nothing is sent and false is returned)
+    public bool sendText(char* text) { return sendMessage(OP_TEXT, text, strlen(text)); }
+    public bool sendTextN(char* data, int n) { return sendMessage(OP_TEXT, data, n); }
+    public bool sendBinary(char* data, int n) { return sendMessage(OP_BINARY, data, n); }
+
+    // ping (at most 125 bytes of payload); the answer arrives as a pong (see rttMs)
+    public bool pingWith(char* data, int n) {
+        if (!canSend() || n > 125 || n < 0) return false;
+        if (!queueFrame(OP_PING, true, false, data, n, true)) return false;
+        if (pingSentAt == 0) {
+            pingSentAt = nowMs();
+            if (pingSentAt == 0) pingSentAt = 1;
+        }
+        return afterQueue();
+    }
+    public bool ping() { return pingWith("", 0); }
+
+    // an unsolicited pong (a one way heartbeat)
+    public bool pong(char* data, int n) {
+        if (!canSend() || n > 125 || n < 0) return false;
+        if (!queueFrame(OP_PONG, true, false, data, n, true)) return false;
+        return afterQueue();
+    }
+
+    // Sends a message in pieces: beginMessage(OP_TEXT or OP_BINARY), any number of sendFragment, then endMessage. Pings, pongs and
+    // close frames may be sent in between. A text fragment must keep UTF-8 valid (a character may be split between fragments);
+    // with permessage-deflate the pieces are collected and sent compressed by endMessage.
+    public bool beginMessage(int opcode) {
+        if (!canSend() || txOpen) return false;
+        if (opcode != OP_TEXT && opcode != OP_BINARY) return false;
+        txOpen = true;
+        txOp = opcode;
+        txFirst = true;
+        txU8 = 0;
+        txLen = 0;
+        return true;
+    }
+
+    public bool sendFragment(char* data, int n) {
+        if (!txOpen || !canSend() || n < 0) return false;
+        if (txOp == OP_TEXT) {
+            int st = utf8Step(txU8, data, n);
+            if (st < 0) return false;
+            txU8 = st;
+        }
+        if (deflate) {
+            if (txLen + n > maxMessage) return false;
+            if (txLen + n > txCap) {
+                int nc = txCap * 2;
+                if (nc < 1024) nc = 1024;
+                while (nc < txLen + n) nc = nc * 2;
+                char* nb = realloc(txBuf, nc);
+                if (nb == null) return false;
+                txBuf = nb;
+                txCap = nc;
+            }
+            memcpy(&txBuf[txLen], data, n);
+            txLen = txLen + n;
+            txFirst = false;
+            return true;
+        }
+        if (!queueFrame(txFirst ? txOp : OP_CONT, false, false, data, n, false)) return false;
+        txFirst = false;
+        return afterQueue();
+    }
+
+    // finishes the message; false if a text message stops in the middle of a character (call sendFragment again) or the queue is full
+    public bool endMessage() {
+        if (!txOpen || !canSend()) return false;
+        if (txOp == OP_TEXT && txU8 != 0) return false;
+        bool ok;
+        if (deflate) {
+            // the whole message at once
+            bool comp = false;
+            char* z = null;
+            char* payload = txBuf;
+            int pn = txLen;
+            if (txLen >= minCompress) {
+                int zn;
+                z = zlib.deflateSync(txBuf, txLen, level, txDist, &zn);
+                if (z != null && zn >= 4) { payload = z; pn = zn - 4; comp = true; }
+            }
+            ok = queueMessage(txOp, comp, payload == null ? "" : payload, pn);
+            if (z != null) free(z);
+        } else {
+            ok = queueFrame(txFirst ? txOp : OP_CONT, true, false, "", 0, false);
+        }
+        if (!ok) return false;
+        txOpen = false;
+        txLen = 0;
+        messagesOut++;
+        return afterQueue();
+    }
+
+    // ---- closing -----------------------------------------------------------------------------------------------------------------------
+    // Starts the closing handshake: sends a close frame with a status code (CLOSE_*; 0 or 1005: no code) and a reason (at most 123 bytes of
+    // UTF-8, null for none). Blocking mode: waits for the peer's close frame (closeTimeout 1 second) and closes the socket. Non-blocking mode and
+    // wshub: only queues the frame; keep reading until `closed`. Returns false if the code or the reason is not allowed.
+    public bool closeWith(int code, char* reason) {
+        if (disposed) return false;
+        int rn = 0;
+        if (reason != null) rn = strlen(reason);
+        if (code == 0 || code == 1005) {
+            rn = 0;
+        } else if (!validCloseCode(code)) {
+            return false;
+        }
+        if (rn > 123 || (rn > 0 && !isUtf8(reason, rn))) return false;
+        if (!closed && !closeSent) {
+            sendClose(code, reason, rn);
+        }
+        if (closeRecvd) closed = true;
+        if (c != null && !nonblocking) {
+            flushAll();
+            if (!closed) waitClose(1000);
+            closed = true;
+            if (closeCode == 0) closeCode = 1006;
+            c->close();
+        } else if (c != null) {
+            flushSome();
+        }
+        return true;
+    }
+
+    // the old name: closeWith(code, null)
+    public void close(int code) {
+        closeWith(code, null);
+    }
+
+    // queues a close frame
+    private void sendClose(int code, char* reason, int rn) {
+        char p[125];
+        int n = 0;
+        if (code != 0 && code != 1005) {
+            p[0] = (code >> 8) & 255;
+            p[1] = code & 255;
+            n = 2;
+            if (rn > 0) {
+                memcpy(&p[2], reason, rn);
+                n = n + rn;
+            }
+        }
+        queueFrame(OP_CLOSE, true, false, &p[0], n, true);
+        closeSent = true;
+        localCloseCode = code;
+        pingSentAt = 0;
+    }
+
+    // reads (and throws away) frames until the peer's close frame arrives, the connection ends or ms milliseconds pass
+    private void waitClose(int ms) {
+        int t0 = millis();
+        char buf[1024];
+        while (!closed) {
+            int left = ms - (millis() - t0);
+            if (left <= 0) break;
+            if (c->buffered() == 0 && !c->readable(left < 50 ? left : 50)) continue;
+            int n = c->read(&buf[0], 1024);
+            if (n <= 0) break;
+            if (feedAll(&buf[0], n) < 0) break;
+        }
+    }
+
+    // drops the connection at once without a closing handshake
+    public void abort() {
+        if (c != null) c->close();
+        transportEnded();
+    }
+
+    // ---- the failure of the connection (protocol errors) ----------------------------------------------------------------------------------------
+    // ends the connection because of a violation: queues a close frame with the code and stops reading
+    private bool failWith(int code, char* why) {
+        int i = 0;
+        while (why[i] != 0 && i < 99) { failReason[i] = why[i]; i++; }
+        failReason[i] = 0;
+        failed = true;
+        if (!closeSent) sendClose(code, "", 0);
+        closed = true;
+        if (closeCode == 0) closeCode = 1006;
+        return false;
+    }
+
+    // ---- receiving: the state machine ---------------------------------------------------------------------------------------------------------
+    // Feeds n received bytes into the parser. Returns how many bytes it took (all of them, unless the message queue is full: then call
+    // takeMessage and feed the rest again), or -1 when the connection is over (closed or failed: send outData() and close the socket).
+    public int feed(char* d, int n) {
+        if (disposed || closed) return -1;
+        int i = 0;
+        bytesIn = bytesIn + n;
+        if (kaInterval > 0) lastRx = clockNow;
+        while (i < n) {
+            if (closed) return -1;
+            if (fstage == 0) {
+                if (hdrLen == 0 && handler == null && streamHandler == null && maxQueue > 0 && qCount >= maxQueue) {
+                    bytesIn = bytesIn - (n - i);
+                    return i;
+                }
+                hdr[hdrLen] = d[i];
+                hdrLen++;
+                i++;
+                if (hdrLen >= headerNeed()) {
+                    if (!startFrame()) return -1;
+                }
+            } else {
+                int take = n - i;
+                if (take > fRemain) take = fRemain;
+                if (!payload(&d[i], take)) return -1;
+                i = i + take;
+                fRemain = fRemain - take;
+                if (fRemain == 0) {
+                    if (!endFrame()) return -1;
+                }
+            }
+        }
+        if (closed) return -1;
+        if (kaInterval > 0) pingSentAt = 0;           // anything that arrives shows the peer is alive
+        return n;
+    }
+
+    // like feed, but takes every byte (the message queue may grow past maxQueue): for the loops that read a bounded amount at a time
+    private int feedAll(char* d, int n) {
+        int saved = maxQueue;
+        maxQueue = 0;
+        int r = feed(d, n);
+        maxQueue = saved;
+        return r;
+    }
+
+    private int headerNeed() {
+        if (hdrLen < 2) return 2;
+        int need = 2;
+        int l = hdr[1] & 127;
+        if (l == 126) need = need + 2;
+        else if (l == 127) need = need + 8;
+        if ((hdr[1] & 128) != 0) need = need + 4;
+        return need;
+    }
+
+    // the header of a frame is complete: check it against RFC 6455
+    private bool startFrame() {
+        int b0 = hdr[0] & 255;
+        int b1 = hdr[1] & 255;
+        fFin = (b0 & 0x80) != 0;
+        fRsv1 = (b0 & 0x40) != 0;
+        int op = b0 & 15;
+        if ((b0 & 0x30) != 0) return failWith(1002, "reserved bits are set");
+        if ((op >= 3 && op <= 7) || op >= 11) return failWith(1002, "unknown opcode");
+        bool isCtl = op >= 8;
+        if (fRsv1 && (!deflate || isCtl || op == OP_CONT)) return failWith(1002, "unexpected RSV1 bit");
+        fMasked = (b1 & 0x80) != 0;
+        if (!isClient && !fMasked) return failWith(1002, "client frames must be masked");
+        if (isClient && fMasked) return failWith(1002, "server frames must not be masked");
+        int l7 = b1 & 127;
+        int len = l7;
+        int o = 2;
+        if (l7 == 126) {
+            len = (hdr[2] & 255) * 256 + (hdr[3] & 255);
+            if (len < 126) return failWith(1002, "length not minimal");
+            o = 4;
+        } else if (l7 == 127) {
+            if ((hdr[2] & 128) != 0) return failWith(1002, "length has the top bit set");
+            len = 0;
+            for (int k = 0; k < 8; k++) len = (len << 8) | (hdr[2 + k] & 255);
+            if (len < 65536) return failWith(1002, "length not minimal");
+            o = 10;
+        }
+        if (fMasked) {
+            fMask = ((hdr[o] & 255) << 24) | ((hdr[o + 1] & 255) << 16) | ((hdr[o + 2] & 255) << 8) | (hdr[o + 3] & 255);
+        }
+        fMaskOff = 0;
+        if (isCtl) {
+            if (len > 125) return failWith(1002, "control frame too long");
+            if (!fFin) return failWith(1002, "control frame is fragmented");
+        } else {
+            if (op == OP_CONT) {
+                if (mOp == 0) return failWith(1002, "continuation without a message");
+            } else if (mOp != 0) {
+                return failWith(1002, "new message inside a fragmented one");
+            }
+            if (len > maxFrame) return failWith(1009, "frame too big");
+            if (op != OP_CONT) mTotal = 0;                     // a new message starts from nothing, whatever the last one left behind
+            if (mTotal + len > maxMessage) return failWith(1009, "message too big");
+            if (op != OP_CONT) {
+                mOp = op;
+                mComp = fRsv1;
+                mLen = 0;
+                mU8 = 0;
+                mFirst = true;
+            }
+        }
+        fOp = op;
+        fRemain = len;
+        fstage = 1;
+        ctrlLen = 0;
+        if (len == 0) return endFrame();
+        return true;
+    }
+
+    // payload bytes of the current frame (still masked)
+    private bool payload(char* p, int n) {
+        if (n <= 0) return true;
+        if (fOp >= 8) {
+            if (fMasked) maskCopy(&ctrl[ctrlLen], p, n, fMask, fMaskOff); else memcpy(&ctrl[ctrlLen], p, n);
+            ctrlLen = ctrlLen + n;
+            fMaskOff = fMaskOff + n;
+            return true;
+        }
+        mTotal = mTotal + n;
+        if (streamHandler != null && !mComp) {
+            // handed on piece by piece, never collected
+            char tmp[1024];
+            int done = 0;
+            while (done < n) {
+                int take = n - done;
+                if (take > 1024) take = 1024;
+                if (fMasked) maskCopy(&tmp[0], &p[done], take, fMask, fMaskOff); else memcpy(&tmp[0], &p[done], take);
+                fMaskOff = fMaskOff + take;
+                if (mOp == OP_TEXT) {
+                    mU8 = utf8Step(mU8, &tmp[0], take);
+                    if (mU8 < 0) return failWith(1007, "invalid UTF-8 in a text message");
+                }
+                if (!closeSent) streamHandler(this, mOp, &tmp[0], take, mFirst ? 1 : 0);
+                mFirst = false;
+                done = done + take;
+            }
+            return true;
+        }
+        if (mLen + n + 8 > mCap) {
+            int nc = mCap * 2;
+            if (nc < 256) nc = 256;
+            while (nc < mLen + n + 8) nc = nc * 2;
+            char* nb = realloc(mBuf, nc);
+            if (nb == null) return failWith(1011, "out of memory");
+            mBuf = nb;
+            mCap = nc;
+        }
+        int start = mLen;
+        if (fMasked) maskCopy(&mBuf[mLen], p, n, fMask, fMaskOff); else memcpy(&mBuf[mLen], p, n);
+        fMaskOff = fMaskOff + n;
+        mLen = mLen + n;
+        if (mOp == OP_TEXT && !mComp) {
+            mU8 = utf8Step(mU8, &mBuf[start], n);
+            if (mU8 < 0) return failWith(1007, "invalid UTF-8 in a text message");
+        }
+        return true;
+    }
+
+    // the last byte of a frame arrived
+    private bool endFrame() {
+        fstage = 0;
+        hdrLen = 0;
+        if (fOp >= 8) {
+            int cl = ctrlLen;
+            ctrlLen = 0;
+            return control(fOp, &ctrl[0], cl);
+        }
+        if (fFin) return completeMessage();
+        return true;
+    }
+
+    // the clock for keepalive: the time given to tick() when keepalive is on, else the real one
+    private int nowMs() {
+        if (kaInterval > 0) return clockNow;
+        return millis();
+    }
+
+    private bool control(int op, char* p, int n) {
+        lastRx = nowMs();
+        if (op == OP_PING) {
+            // the pong is not forced past maxOutBuffer: a peer that pings and never reads must not be able to grow the queue without bound (RFC 6455
+            // 5.5.3 lets an endpoint skip pongs); the failed attempt sets overflowed, which a server (wshub) takes as a reason to cut the peer off
+            if (!closeSent) queueFrame(OP_PONG, true, false, p, n, false);
+            if (handler != null && !closeSent) handler(this, EV_PING, OP_PING, p, n);
+            return true;
+        }
+        if (op == OP_PONG) {
+            if (pingSentAt != 0) {
+                rttMs = nowMs() - pingSentAt;
+                pingSentAt = 0;
+            }
+            if (handler != null) handler(this, EV_PONG, OP_PONG, p, n);
+            return true;
+        }
+        // close
+        if (n == 1) return failWith(1002, "close frame with a one byte payload");
+        int code = 1005;
+        char* reason = "";
+        int rn = 0;
+        if (n >= 2) {
+            code = ((p[0] & 255) << 8) | (p[1] & 255);
+            if (!validCloseCode(code)) return failWith(1002, "invalid close code");
+            rn = n - 2;
+            if (rn > 0 && !isUtf8(&p[2], rn)) return failWith(1007, "invalid UTF-8 in the close reason");
+            if (rn > 0) {
+                reason = (char*) malloc(rn + 1);
+                if (reason != null) {
+                    memcpy(reason, &p[2], rn);
+                    reason[rn] = 0;
+                } else {
+                    reason = "";
+                }
+            }
+        }
+        closeCode = code;
+        if (closeReason != null) free(closeReason);
+        closeReason = null;
+        if (rn > 0) closeReason = reason; else closeReason = dupStr("");
+        closeRecvd = true;
+        if (!closeSent) {
+            // answer with the same code
+            if (code == 1005) sendClose(0, "", 0); else sendClose(code, "", 0);
+        }
+        closed = true;
+        if (handler != null) handler(this, EV_CLOSE, OP_CLOSE, p, n);
+        return true;
+    }
+
+    // the final frame of a message arrived
+    private bool completeMessage() {
+        if (mBuf == null && mComp) {
+            mBuf = malloc(256);                       // an empty compressed message still needs room for the 4 byte tail
+            mCap = 256;
+            if (mBuf == null) return failWith(1011, "out of memory");
+        }
+        int op = mOp;
+        char* data = mBuf == null ? "" : mBuf;
+        int n = mLen;
+        char* z = null;
+        mOp = 0;
+        mTotal = 0;
+        messagesIn++;
+        if (mComp) {
+            // RFC 7692 7.2.2: append 00 00 FF FF and inflate (a bomb is stopped by the limit)
+            mBuf[n] = 0; mBuf[n + 1] = 0; mBuf[n + 2] = 255; mBuf[n + 3] = 255;
+            int zn;
+            z = zlib.inflateEx(mBuf, n + 4, rxTakeover ? win : null, rxTakeover ? winLen : 0, maxMessage, true, &zn);
+            if (z == null) {
+                if (zlib.inflateTooBig()) return failWith(1009, "inflated message too big");
+                return failWith(1007, "the compressed data is damaged");
+            }
+            data = z;
+            n = zn;
+            if (op == OP_TEXT && !isUtf8(data, n)) {
+                free(z);
+                return failWith(1007, "invalid UTF-8 in a text message");
+            }
+            if (rxTakeover) keepWindow(data, n);
+        } else if (op == OP_TEXT && mU8 != 0) {
+            return failWith(1007, "a text message ends inside a character");
+        }
+        if (data == mBuf && mBuf != null) mBuf[n] = 0;         // the data of a message is followed by a 0 byte (there is room for it)
+        if (streamHandler != null && !mComp) {
+            if (!closeSent) streamHandler(this, op, "", 0, 2 | (mFirst ? 1 : 0));
+            mFirst = false;
+        } else if (!closeSent) {
+            if (streamHandler != null) {
+                streamHandler(this, op, data, n, 3);
+            } else if (handler != null) {
+                handler(this, EV_MESSAGE, op, data, n);
+            } else {
+                enqueue(op, data, n);
+            }
+        }
+        if (z != null) free(z);
+        if (mCap > 262144) {
+            free(mBuf);
+            mBuf = null;
+            mCap = 0;
+        }
+        return !closed;
+    }
+
+    // the last 32 KB of the inflated data are the dictionary of the next message
+    private void keepWindow(char* data, int n) {
+        if (win == null) win = malloc(32768);
+        if (win == null) return;
+        if (n >= 32768) {
+            memcpy(win, &data[n - 32768], 32768);
+            winLen = 32768;
+            return;
+        }
+        int keep = winLen;
+        if (keep + n > 32768) {
+            int drop = keep + n - 32768;
+            for (int i = 0; i < keep - drop; i++) win[i] = win[drop + i];
+            keep = keep - drop;
+        }
+        memcpy(&win[keep], data, n);
+        winLen = keep + n;
+    }
+
+    // ---- the message queue -------------------------------------------------------------------------------------------------------------------
+    private void enqueue(int op, char* data, int n) {
+        Message* m = newMessage(op, data, n);
+        if (m == null) {
+            failWith(1011, "out of memory");
+            return;
+        }
+        if (qCount >= qCap) {
+            int nc = qCap * 2;
+            if (nc < 16) nc = 16;
+            Message** nq = (Message**) malloc(nc * 8);
+            if (nq == null) {
+                m->dispose();
+                failWith(1011, "out of memory");
+                return;
+            }
+            for (int i = 0; i < qCount; i++) nq[i] = q[(qHead + i) % qCap];
+            if (q != null) free(q);
+            q = nq;
+            qCap = nc;
+            qHead = 0;
+        }
+        q[(qHead + qCount) % qCap] = m;
+        qCount++;
+    }
+
+    private void dropQueue() {
+        while (qCount > 0) {
+            q[qHead]->dispose();
+            qHead = (qHead + 1) % qCap;
+            qCount--;
+        }
+        qHead = 0;
+    }
+
+    // a received message, or null when none is waiting (does not read from the socket)
+    public Message* takeMessage() {
+        if (qCount == 0) return null;
+        Message* m = q[qHead];
+        qHead = (qHead + 1) % qCap;
+        qCount--;
+        return m;
+    }
+
+    public bool messageReady() { return qCount > 0; }
+
+    // ---- keepalive ----------------------------------------------------------------------------------------------------------------------------
+    // call now and then with millis(): sends a ping after kaInterval ms of silence and fails the connection when the answer does not come
+    public void tick(int now) {
+        clockNow = now;
+        if (kaInterval <= 0 || closed || closeSent || disposed) return;
+        if (pingSentAt != 0) {
+            if (now - pingSentAt >= kaTimeout) {
+                failWith(1011, "keepalive ping timeout");
+                if (c != null) { flush(); c->close(); }
+            }
+            return;
+        }
+        if (now - lastRx >= kaInterval) {
+            char pl[8];
+            pingCounter++;
+            for (int i = 0; i < 8; i++) pl[i] = (pingCounter >> (8 * i)) & 255;
+            pingWith(&pl[0], 8);
+        }
+    }
+
+    // ---- blocking receive ------------------------------------------------------------------------------------------------------------------------
+    // Waits for the next message. ms < 0: as long as it takes; otherwise at most ms milliseconds (null: time out, `closed` tells
+    // whether the connection is over). Pings are answered and keepalive is served while waiting. Free the message with dispose().
+    public Message* waitMessage(int ms) {
+        if (c == null || nonblocking) return takeMessage();
+        int t0 = millis();
+        char buf[4096];
+        for (;;) {
+            Message* m = takeMessage();
+            if (m != null) return m;
+            if (closed || disposed) {
+                endBlocking();
+                return null;
+            }
+            int slice = -1;
+            if (kaInterval > 0) {
+                slice = kaInterval / 4;
+                if (slice < 10) slice = 10;
+                if (slice > 100) slice = 100;
+            }
+            if (ms >= 0) {
+                int left = ms - (millis() - t0);
+                if (left < 0) left = 0;
+                if (slice < 0 || left < slice) slice = left;
+            }
+            bool ready = true;
+            if (c->buffered() == 0) {
+                if (slice < 0) {
+                    ready = true;                      // blocking read below
+                } else {
+                    ready = c->readable(slice);
+                }
+            }
+            if (!ready) {
+                tick(millis());
+                if (ms >= 0 && millis() - t0 >= ms) return null;
+                continue;
+            }
+            int n = c->read(&buf[0], 4096);
+            if (n <= 0) {
+                transportEnded();
+                endBlocking();
+                return null;
+            }
+            if (kaInterval > 0) clockNow = millis();
+            feedAll(&buf[0], n);
+            tick(millis());
+            flushAll();
+        }
+        return null;
+    }
+
+    // the connection is over: send what is left (the close frame) and close the socket
+    private void endBlocking() {
+        if (c != null && c->isOpen()) {
+            flushAll();
+            net.shutdown(c->handle(), 1);
+            c->close();
+        }
+    }
+
+    public Message* receiveMessage() { return waitMessage(-1); }
+
+    // Reads one message into buf (at most max bytes, a longer message is cut). *opcode is OP_TEXT or OP_BINARY.
+    // Returns the length, or -1 when the connection was closed (closeCode tells why)
+    public int receive(char* buf, int max, int* opcode) {
+        Message* m = waitMessage(-1);
+        if (m == null) return -1;
+        int n = m->length;
+        if (n > max) n = max;
+        memcpy(buf, m->data, n);
+        if (n < max) buf[n] = 0;
+        if (opcode != null) *opcode = m->opcode;
+        int len = n;
+        m->dispose();
+        return len;
+    }
+
+    // ---- non-blocking use (a conn.Poller loop) ---------------------------------------------------------------------------------------------------
+    // the socket handle for conn.Poller.add (-1 when there is none)
+    public int fd() {
+        if (c == null) return -1;
+        return c->handle();
+    }
+
+    // Switches the socket to non-blocking mode (wss sockets cannot be: use wshub). Then use fd(), pump(), takeMessage() and flush().
+    public bool setNonBlocking(bool on) {
+        if (c == null || !c->isOpen()) return false;
+        if (on && net.secureStream(c->handle()) != 0) return false;
+        net.setNonBlocking(c->handle(), on);
+        nonblocking = on;
+        return true;
+    }
+
+    // true if pump() would find something: bytes already buffered or waiting on the socket
+    public bool inputReady() {
+        if (c == null || !c->isOpen()) return false;
+        return c->buffered() > 0 || net.waitReadable(c->handle(), 0);
+    }
+
+    // Reads what is available now (never waits), feeds the parser and sends the answers (pongs, close frames). Returns the number of
+    // messages waiting for takeMessage(), or -1 when the connection is over.
+    public int pump() {
+        if (c == null || disposed) return -1;
+        char buf[4096];
+        int rounds = 0;
+        while (!closed && rounds < 16 && (maxQueue == 0 || qCount < maxQueue / 2)) {
+            int n;
+            if (c->buffered() > 0) {
+                n = c->read(&buf[0], 4096);
+            } else if (nonblocking) {
+                n = net.recvSome(c->handle(), &buf[0], 4096);
+                if (n == -2) break;
+                if (n < 0) n = 0;
+            } else if (net.waitReadable(c->handle(), 0)) {
+                n = c->read(&buf[0], 4096);
+            } else {
+                break;
+            }
+            if (n <= 0) {
+                transportEnded();
+                break;
+            }
+            feedAll(&buf[0], n);
+            rounds++;
+        }
+        flush();
+        if (closed && qCount == 0) return -1;
+        return qCount;
+    }
+
+    // ---- freeing -----------------------------------------------------------------------------------------------------------------------------------
+    // closes the socket (without a handshake: call closeWith first) and frees all memory, the object included when the module made it.
+    // Do not use the pointer afterwards.
+    public void dispose() {
+        if (disposed) return;
+        if (c != null) {
+            if (ownsConn) c->dispose(); else c->close();
+        }
+        dropQueue();
+        if (q != null) free(q);
+        if (out != null) free(out);
+        if (mBuf != null) free(mBuf);
+        if (txBuf != null) free(txBuf);
+        if (win != null) free(win);
+        if (closeReason != null) free(closeReason);
+        if (protocol != null) free(protocol);
+        q = null; out = null; mBuf = null; txBuf = null; win = null; closeReason = null; protocol = null;
+        qCap = 0; outCap = 0; mCap = 0; txCap = 0;
+        c = null;
+        disposed = true;
+        closed = true;
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+}
+
+// a WebSocket on the heap that dispose() can free completely (connect and accept make theirs like this)
+public WebSocket* create(conn.Connection* connection, bool client) {
+    WebSocket* w = (WebSocket*) malloc(sizeof(WebSocket));
+    if (w == null) return null;
+    w->init(connection, client);
+    w->heap = true;
+    return w;
+}
+
+// ---- reading an HTTP head ----------------------------------------------------------------------------------------------------------
+// Reads the lines of an HTTP request or response head from the connection, up to the empty line. Limits: 16 KB in all, 8 KB per line, 100 lines,
+// and the head must arrive within timeoutMs. The result is a heap string "first line\r\nName: value\r\n..." (every line ends in CRLF), or null.
+private char* readHead(conn.Connection* c, int timeoutMs) {
+    int cap = 1024;
+    char* b = malloc(cap);
+    if (b == null) return null;
+    int n = 0;
+    int lineLen = 0;
+    int lines = 0;
+    int t0 = millis();
+    for (;;) {
+        int ch = c->readByte();
+        if (ch < 0) { free(b); fail1("the connection ended during the handshake"); return null; }
+        if (millis() - t0 > timeoutMs) { free(b); fail1("the handshake took too long"); return null; }
+        if (ch == 0) { free(b); fail1("NUL byte in the HTTP head"); return null; }
+        if (ch == 13) continue;
+        if (ch == 10) {
+            if (lineLen == 0) {
+                if (lines == 0) continue;               // tolerate empty lines before the request line (RFC 7230 3.5)
+                break;
+            }
+            lines++;
+            lineLen = 0;
+            if (lines > 100) { free(b); fail1("too many header lines"); return null; }
+            ch = 13;
+            if (n + 2 >= cap) { cap = cap * 2; char* nb = realloc(b, cap); if (nb == null) { free(b); return null; } b = nb; }
+            b[n] = 13; b[n + 1] = 10; n = n + 2;
+            continue;
+        }
+        lineLen++;
+        if (lineLen > 8192 || n > 16384) { free(b); fail1("the HTTP head is too long"); return null; }
+        if (n + 3 >= cap) { cap = cap * 2; char* nb = realloc(b, cap); if (nb == null) { free(b); return null; } b = nb; }
+        b[n] = ch;
+        n++;
+    }
+    b[n] = 0;
+    return b;
+}
+
+// every header line of a head must look like "Name: value" (no folded lines, no line without a colon)
+private bool headLinesOk(char* head) {
+    int i = 0;
+    // skip the first line
+    while (head[i] != 0 && head[i] != 10) i++;
+    if (head[i] == 10) i++;
+    while (head[i] != 0) {
+        if (head[i] == ' ' || head[i] == 9) return false;
+        int s = i;
+        while (head[i] != 0 && head[i] != ':' && head[i] != 13) i++;
+        if (head[i] != ':' || !isToken(&head[s], i - s)) return false;
+        while (head[i] != 0 && head[i] != 10) i++;
+        if (head[i] == 10) i++;
+    }
+    return true;
+}
+
+// ---- the client handshake -------------------------------------------------------------------------------------------------------------------
+private char* reasonOf(int code) {
+    if (code == 101) return "Switching Protocols";
+    if (code == 400) return "Bad Request";
+    if (code == 403) return "Forbidden";
+    if (code == 404) return "Not Found";
+    if (code == 405) return "Method Not Allowed";
+    if (code == 408) return "Request Timeout";
+    if (code == 414) return "URI Too Long";
+    if (code == 426) return "Upgrade Required";
+    if (code == 431) return "Request Header Fields Too Large";
+    if (code == 500) return "Internal Server Error";
+    if (code == 503) return "Service Unavailable";
+    return "Error";
+}
+
+// builds the upgrade request (a heap string); key (at least 32 bytes) receives the Sec-WebSocket-Key. null if a value has control characters
+private char* buildClientRequest(char* host, int port, bool secureConn, char* path, char* key, Options* o) {
+    if (!cleanText(host) || !cleanText(path) || !cleanText(o->origin) || !cleanText(o->cookie) || !cleanText(o->authorization)) {
+        fail1("a request value contains control characters");
+        return null;
+    }
+    if (path[0] != '/' || contains(path, " ")) {
+        fail1("the path must start with / and contain no spaces");
+        return null;
+    }
+    if (!cleanHeaderLines(o->headers)) {
+        fail1("the extra headers must be lines of the form 'Name: value' ending in CRLF");
+        return null;
+    }
+    if (o->protocols != null && o->protocols[0] != 0) {
+        // a list of tokens separated by commas
+        int pos = 0;
+        char item[100];
+        while (nextItem(o->protocols, &pos, &item[0], 100)) {
+            if (!isToken(&item[0], strlen(&item[0]))) { fail1("bad subprotocol name"); return null; }
+        }
+    }
+    char raw[16];
+    if (!secure.bytes(&raw[0], 16)) {
+        for (int i = 0; i < 16; i++) raw[i] = rand() & 255;
+    }
+    encoding.base64EncodeInto(&raw[0], 16, key);            // (key needs 25 bytes)
+    char* k = key;
+    int cap = strlen(host) + strlen(path) + 700;
+    if (o->origin != null) cap = cap + strlen(o->origin);
+    if (o->cookie != null) cap = cap + strlen(o->cookie);
+    if (o->authorization != null) cap = cap + strlen(o->authorization);
+    if (o->protocols != null) cap = cap + strlen(o->protocols);
+    if (o->headers != null) cap = cap + strlen(o->headers);
+    char* req = malloc(cap);
+    if (req == null) return null;
+    bool defaultPort = (secureConn && port == 443) || (!secureConn && port == 80);
+    if (defaultPort) {
+        format(req, cap, "GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n", path, host, k);
+    } else {
+        format(req, cap, "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n", path, host, port, k);
+    }
+    char* line = malloc(cap);
+    if (line == null) { free(req); return null; }
+    if (o->origin != null && o->origin[0] != 0) { format(line, cap, "Origin: %s\r\n", o->origin); strcat(req, line); }
+    if (o->cookie != null && o->cookie[0] != 0) { format(line, cap, "Cookie: %s\r\n", o->cookie); strcat(req, line); }
+    if (o->authorization != null && o->authorization[0] != 0) { format(line, cap, "Authorization: %s\r\n", o->authorization); strcat(req, line); }
+    if (o->protocols != null && o->protocols[0] != 0) { format(line, cap, "Sec-WebSocket-Protocol: %s\r\n", o->protocols); strcat(req, line); }
+    if (o->deflate) {
+        strcat(req, "Sec-WebSocket-Extensions: permessage-deflate");
+        if (o->offerNoTakeover) strcat(req, "; client_no_context_takeover; server_no_context_takeover");
+        strcat(req, "; client_max_window_bits\r\n");
+    }
+    if (o->headers != null) strcat(req, o->headers);
+    strcat(req, "\r\n");
+    free(line);
+    return req;
+}
+
+private Options* defaultOpts;
+
+private Options* optionsOrDefault(Options* o) {
+    if (o != null) return o;
+    if (defaultOpts == null) defaultOpts = new Options();
+    defaultOpts->verify = verifyTls;
+    return defaultOpts;
 }
 
 // client, first half: sends the upgrade request; key (at least 32 bytes) receives the Sec-WebSocket-Key
 public bool clientSend(conn.Connection* c, char* host, int port, char* path, char* key) {
-    char raw[16];
-    for (int i = 0; i < 16; i++) raw[i] = rand() & 255;
-    char* k = encoding.base64Encode(&raw[0], 16);
-    strcpy(key, k);
-    char req[1400];
-    format(&req[0], 1400, "GET %s HTTP/1.1\r\nHost: %s:%d\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
-           path, host, port, k);
-    return c->writeText(&req[0]) && c->flush();
+    return clientSendWith(c, host, port, false, path, key, null);
+}
+
+// the same with options (secureConn: the connection is TLS, only for the Host header)
+public bool clientSendWith(conn.Connection* c, char* host, int port, bool secureConn, char* path, char* key, Options* o) {
+    o = optionsOrDefault(o);
+    char* req = buildClientRequest(host, port, secureConn, path, key, o);
+    if (req == null) return false;
+    bool ok = c->writeText(req) && c->flush();
+    free(req);
+    if (!ok) fail1("sending the request failed");
+    return ok;
+}
+
+// Client side: checks the server's answer (head: the status line and the header lines, each ending in CRLF) against the key and the options
+// (subprotocol and extensions must be ones that were offered); on success configures ws (protocol, permessage-deflate). error() says what is wrong.
+public bool checkServerResponse(char* head, char* key, Options* o, WebSocket* ws) {
+    lastStatus = 0;
+    if (!startsWith(head, "HTTP/1.")) { fail1("the answer is not an HTTP response"); return false; }
+    int sp = indexOf(head, ' ');
+    if (sp < 0) { fail1("bad status line"); return false; }
+    int code = atoi(&head[sp + 1]);
+    lastStatus = code;
+    if (!headLinesOk(head)) { fail1("the answer has a malformed header line"); return false; }
+    if (code != 101 || !startsWith(head, "HTTP/1.1 ")) {
+        char msg[100];
+        format(&msg[0], 100, "the server did not switch protocols (status %d)", code);
+        fail1(&msg[0]);
+        return false;
+    }
+    char v[400];
+    if (!hv(head, "Upgrade", &v[0], 400) || !hasToken(&v[0], "websocket")) { fail1("no 'Upgrade: websocket' in the answer"); return false; }
+    if (!hv(head, "Connection", &v[0], 400) || !hasToken(&v[0], "upgrade")) { fail1("no 'Connection: Upgrade' in the answer"); return false; }
+    char want[32];
+    acceptKeyInto(key, &want[0]);
+    if (!hv(head, "Sec-WebSocket-Accept", &v[0], 400) || !streq(&v[0], &want[0])) { fail1("wrong Sec-WebSocket-Accept"); return false; }
+    // subprotocol: at most one, and one that we offered
+    if (hv(head, "Sec-WebSocket-Protocol", &v[0], 400)) {
+        int vl = strlen(&v[0]);
+        if (o->protocols == null || !isToken(&v[0], vl) || !hasToken(o->protocols, &v[0])) {
+            fail1("the server chose a subprotocol that was not offered");
+            return false;
+        }
+        ws->protocol = dupStr(&v[0]);
+    }
+    // extensions: only permessage-deflate, only if offered
+    if (hv(head, "Sec-WebSocket-Extensions", &v[0], 400)) {
+        if (!o->deflate) { fail1("the server chose an extension that was not offered"); return false; }
+        int ns; int nl; int ps; int pe;
+        int next = extElement(&v[0], 0, &ns, &nl, &ps, &pe);
+        if (next < 0 || nl != 18 || !startsWith(&v[ns], "permessage-deflate")) { fail1("unknown extension in the answer"); return false; }
+        int more = extElement(&v[0], next, &ns, &nl, &ps, &pe);
+        if (more >= 0) { fail1("more than one extension in the answer"); return false; }
+        char seg[400];
+        extElement(&v[0], 0, &ns, &nl, &ps, &pe);
+        int sl = pe - ps;
+        memcpy(&seg[0], &v[ps], sl);
+        seg[sl] = 0;
+        DeflateParams p;
+        if (!parseDeflateParams(&seg[0], &p)) { fail1("bad permessage-deflate parameters in the answer"); return false; }
+        if (p.clientBitsGiven && p.clientBits == 0) { fail1("client_max_window_bits needs a value in the answer"); return false; }
+        ws->deflate = true;
+        ws->rxTakeover = !p.serverNoTakeover;
+        ws->txDist = 32768;
+        if (p.clientBits != 0) ws->txDist = 1 << p.clientBits;
+    }
+    return true;
 }
 
 // client, second half: reads the answer and checks it. Returns the WebSocket or null
 public WebSocket* clientFinish(conn.Connection* c, char* key) {
-    char first[256];
-    char* raw = readHeaders(c, &first[0], 256);
-    if (raw == null || !startsWith(&first[0], "HTTP/1.1 101")) return null;
-    char got[128];
-    if (!http.headerOf(raw, "Sec-WebSocket-Accept", &got[0], 128)) return null;
-    if (!streq(&got[0], acceptKey(key))) return null;
-    return new WebSocket(c, true);
+    return clientFinishWith(c, key, null);
 }
 
-// connects to ws://host[:port]/path. Returns null if the connection or the handshake fails
-public WebSocket* connect(char* url) {
-    char* httpUrl = alloc(strlen(url) + 8);
-    if (startsWith(url, "ws://")) {
-        strcpy(httpUrl, "http://");
-        strcat(httpUrl, &url[5]);
-    } else {
+public WebSocket* clientFinishWith(conn.Connection* c, char* key, Options* o) {
+    o = optionsOrDefault(o);
+    char* head = readHead(c, o->handshakeTimeoutMs);
+    if (head == null) return null;
+    WebSocket* ws = create(c, true);
+    if (ws == null) { free(head); return null; }
+    ws->maxMessage = o->maxMessage;
+    ws->maxFrame = o->maxFrame;
+    ws->minCompress = o->minCompress;
+    bool ok = checkServerResponse(head, key, o, ws);
+    free(head);
+    if (!ok) {
+        ws->dispose();
         return null;
     }
-    http.Url* u = new http.Url();
-    if (!http.parseUrl(httpUrl, u)) return null;
-    conn.Connection* c = conn.open(&u->host[0], u->port, 5000);
-    if (c == null) return null;
+    c->setTimeout(0);
+    return ws;
+}
+
+// splits ws://host[:port]/path or wss://... ; false if it is not such a URL
+private bool parseWsUrl(char* url, bool* secureConn, char* host, int* port, char* path, int pathMax) {
+    int i;
+    if (startsWith(url, "ws://")) { *secureConn = false; *port = 80; i = 5; }
+    else if (startsWith(url, "wss://")) { *secureConn = true; *port = 443; i = 6; }
+    else return false;
+    int k = 0;
+    while (url[i] != 0 && url[i] != '/' && url[i] != ':' && url[i] != '?' && k < 255) { host[k] = url[i]; k++; i++; }
+    host[k] = 0;
+    if (k == 0) return false;
+    if (url[i] == ':') {
+        i++;
+        int p = 0;
+        int digits = 0;
+        while (isDigit(url[i])) { p = p * 10 + (url[i] - '0'); i++; digits++; if (p > 65535) return false; }
+        if (digits == 0 || p == 0) return false;
+        *port = p;
+    }
+    k = 0;
+    if (url[i] != '/') { path[0] = '/'; k = 1; }
+    while (url[i] != 0 && k < pathMax - 1) { path[k] = url[i]; k++; i++; }
+    if (url[i] != 0) return false;                          // too long
+    path[k] = 0;
+    return true;
+}
+
+// connects to ws://host[:port]/path or wss://host[:port]/path (TLS 1.3, certificate checked unless setVerify(false)). Null if the connection or the handshake fails
+public WebSocket* connect(char* url) {
+    return connectWith(url, null);
+}
+
+// the same with options (subprotocols, Origin, Cookie, Authorization, permessage-deflate, limits ...). error() and status() say what went wrong
+public WebSocket* connectWith(char* url, Options* o) {
+    o = optionsOrDefault(o);
+    lastStatus = 0;
+    fail1("");
+    bool secureConn;
+    char host[256];
+    int port;
+    char path[2048];
+    if (!parseWsUrl(url, &secureConn, &host[0], &port, &path[0], 2048)) {
+        fail1("not a ws:// or wss:// URL");
+        return null;
+    }
     char key[40];
-    if (!clientSend(c, &u->host[0], u->port, &u->path[0], &key[0])) return null;
-    WebSocket* ws = clientFinish(c, &key[0]);
-    if (ws == null) c->close();
+    char* req = buildClientRequest(&host[0], port, secureConn, &path[0], &key[0], o);     // before any connection is made: a bad value sends nothing
+    if (req == null) return null;
+    int h = net.connectTimeout(&host[0], port, o->connectTimeoutMs);
+    if (h < 0) {
+        free(req);
+        fail1("cannot connect");
+        return null;
+    }
+    net.setTimeout(h, o->handshakeTimeoutMs);
+    if (secureConn) {
+        if (!tls.wrap(h, &host[0], o->verify)) {
+            char* why = tls.lastError();
+            fail1(why == null ? "the TLS handshake failed" : why);
+            net.rawClose(h);
+            free(req);
+            return null;
+        }
+    }
+    conn.Connection* c = conn.create(h);
+    if (c == null) {
+        net.close(h);
+        free(req);
+        fail1("out of memory");
+        return null;
+    }
+    bool sent = c->writeText(req) && c->flush();
+    free(req);
+    if (!sent) {
+        fail1("sending the request failed");
+        c->dispose();
+        return null;
+    }
+    WebSocket* ws = clientFinishWith(c, &key[0], o);
+    if (ws == null) {
+        c->dispose();
+    } else {
+        ws->ownsConn = true;
+    }
+    return ws;
+}
+
+// ---- the server handshake -----------------------------------------------------------------------------------------------------------------------
+// the answer of a server that refuses: an error status, no body
+private void rejectInfo(HandshakeInfo* info, int status, char* extra) {
+    info->status = status;
+    if (info->response != null) free(info->response);
+    int cap = 200 + (extra == null ? 0 : strlen(extra));
+    info->response = malloc(cap);
+    if (info->response == null) { info->responseLen = 0; return; }
+    format(info->response, cap, "HTTP/1.1 %d %s\r\n%sConnection: close\r\nContent-Length: 0\r\n\r\n", status, reasonOf(status), extra == null ? "" : extra);
+    info->responseLen = strlen(info->response);
+}
+
+// replaces info->response with an error answer (403 forbidden, 401 ...) and sets info->status: for a server that refuses an upgrade after serverHandshake
+public void setRejection(HandshakeInfo* info, int status) {
+    rejectInfo(info, status, null);
+}
+
+// Judges the head of an upgrade request (the request line and the header lines, every line ending in CRLF) as RFC 6455 section 4.2.1 says.
+// Returns 101 when it is fine: info->response is then the "101 Switching Protocols" answer, info->path, ->origin, ->protocol and ->headers are
+// filled in. Otherwise the HTTP status of an error answer (400, 403, 405, 414, 426 ...), which is in info->response. o may be null.
+public int serverHandshake(char* head, ServerOptions* o, HandshakeInfo* info) {
+    info->path[0] = 0;
+    info->origin[0] = 0;
+    info->protocol[0] = 0;
+    info->deflate = false;
+    // request line: GET target HTTP/1.1
+    int le = 0;
+    while (head[le] != 0 && head[le] != 13 && head[le] != 10) le++;
+    if (le > 1100) { rejectInfo(info, 414, null); return 414; }
+    char line[1110];
+    memcpy(&line[0], head, le);
+    line[le] = 0;
+    int s1 = indexOf(&line[0], ' ');
+    if (s1 <= 0) { rejectInfo(info, 400, null); return 400; }
+    int s2 = s1 + 1;
+    while (line[s2] != 0 && line[s2] != ' ') s2++;
+    if (line[s2] != ' ') { rejectInfo(info, 400, null); return 400; }
+    line[s1] = 0;
+    line[s2] = 0;
+    char* method = &line[0];
+    char* target = &line[s1 + 1];
+    char* version = &line[s2 + 1];
+    if (!streq(method, "GET")) { rejectInfo(info, 405, "Allow: GET\r\n"); return 405; }
+    bool v11 = startsWith(version, "HTTP/1.") && version[7] != 0 && version[7] != '0';
+    if (!v11) { rejectInfo(info, 400, null); return 400; }
+    int tl = strlen(target);
+    if (tl == 0 || tl >= 1024 || target[0] != '/') { rejectInfo(info, tl >= 1024 ? 414 : 400, null); return info->status; }
+    for (int i = 0; i < tl; i++) { if ((target[i] & 255) <= 32 || (target[i] & 255) == 127) { rejectInfo(info, 400, null); return 400; } }
+    strcpy(&info->path[0], target);
+    int hs = le;
+    if (head[hs] == 13) hs++;
+    if (head[hs] == 10) hs++;
+    if (info->headers != null) free(info->headers);
+    info->headers = dupStr(&head[hs]);
+    if (!headLinesOk(head)) { rejectInfo(info, 400, null); return 400; }
+    char* hd = info->headers;
+    char v[1024];
+    if (!hv(hd, "Host", &v[0], 1024) || v[0] == 0) { rejectInfo(info, 400, null); return 400; }
+    if (!hv(hd, "Upgrade", &v[0], 1024) || !hasToken(&v[0], "websocket")) { rejectInfo(info, 400, null); return 400; }
+    if (!hv(hd, "Connection", &v[0], 1024) || !hasToken(&v[0], "upgrade")) { rejectInfo(info, 400, null); return 400; }
+    if (!hv(hd, "Sec-WebSocket-Version", &v[0], 1024) || !streq(&v[0], "13")) { rejectInfo(info, 426, "Sec-WebSocket-Version: 13\r\n"); return 426; }
+    char key[128];
+    if (!hv(hd, "Sec-WebSocket-Key", &key[0], 128) || strlen(&key[0]) != 24) { rejectInfo(info, 400, null); return 400; }
+    char decoded[32];
+    if (encoding.base64Decode(&key[0], &decoded[0]) != 16) { rejectInfo(info, 400, null); return 400; }
+    // Origin. A header that is there but empty or longer than a real origin can be (scheme, a 253 character host name, a port: at most 267 bytes) is
+    // refused: it must neither count as "no Origin header" (that would let a browser past the allow-list) nor be cut short (a prefix could match)
+    if (hv(hd, "Origin", &v[0], 1024)) {
+        int ol = strlen(&v[0]);
+        if (ol == 0 || ol >= ORIGIN_MAX) { rejectInfo(info, 403, null); return 403; }
+        strcpy(&info->origin[0], &v[0]);
+    }
+    if (o != null && o->origins != null) {
+        bool allowed = hasToken(o->origins, "*");
+        if (info->origin[0] != 0) {
+            if (hasToken(o->origins, &info->origin[0])) allowed = true;
+        } else if (!o->requireOrigin) {
+            allowed = true;
+        }
+        if (!allowed) { rejectInfo(info, 403, null); return 403; }
+    }
+    // subprotocol: the first one of the server's list that the client offered
+    char offered[400];
+    bool clientOffered = hv(hd, "Sec-WebSocket-Protocol", &offered[0], 400) && offered[0] != 0;
+    if (o != null && o->protocols != null && o->protocols[0] != 0 && clientOffered) {
+        int pos = 0;
+        char tok[100];
+        while (nextItem(o->protocols, &pos, &tok[0], 100)) {
+            if (isToken(&tok[0], strlen(&tok[0])) && strlen(&tok[0]) < 64 && hasToken(&offered[0], &tok[0])) {
+                strcpy(&info->protocol[0], &tok[0]);
+                break;
+            }
+        }
+    }
+    if (o != null && o->requireProtocol && o->protocols != null && o->protocols[0] != 0 && info->protocol[0] == 0) {
+        rejectInfo(info, 400, null);
+        return 400;
+    }
+    // permessage-deflate
+    char ext[300];
+    ext[0] = 0;
+    char offers[800];
+    if (o != null && hv(hd, "Sec-WebSocket-Extensions", &offers[0], 800)) {
+        negotiateDeflate(&offers[0], o, info, &ext[0], 300);
+    }
+    // the answer
+    char acc[32];
+    acceptKeyInto(&key[0], &acc[0]);
+    int cap = 500 + strlen(&ext[0]);
+    if (info->response != null) free(info->response);
+    info->response = malloc(cap);
+    if (info->response == null) { info->responseLen = 0; info->status = 500; return 500; }
+    format(info->response, cap, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n", &acc[0]);
+    if (info->protocol[0] != 0) {
+        char l2[100];
+        format(&l2[0], 100, "Sec-WebSocket-Protocol: %s\r\n", &info->protocol[0]);
+        strcat(info->response, &l2[0]);
+    }
+    if (ext[0] != 0) {
+        strcat(info->response, "Sec-WebSocket-Extensions: ");
+        strcat(info->response, &ext[0]);
+        strcat(info->response, "\r\n");
+    }
+    strcat(info->response, "\r\n");
+    info->responseLen = strlen(info->response);
+    info->status = 101;
+    return 101;
+}
+
+// takes over what the handshake negotiated (limits, subprotocol, permessage-deflate) into a new server side WebSocket
+public void configure(WebSocket* ws, ServerOptions* o, HandshakeInfo* info) {
+    if (o != null) {
+        ws->maxMessage = o->maxMessage;
+        ws->maxFrame = o->maxFrame;
+        ws->minCompress = o->minCompress;
+    }
+    if (ws->maxFrame > ws->maxMessage) ws->maxFrame = ws->maxMessage;
+    if (ws->protocol != null) free(ws->protocol);
+    ws->protocol = dupStr(&info->protocol[0]);
+    ws->deflate = info->deflate;
+    ws->rxTakeover = info->rxTakeover;
+    ws->txDist = info->txDist > 0 ? info->txDist : 32768;
+}
+
+// a new HandshakeInfo that dispose() frees completely
+public HandshakeInfo* newHandshakeInfo() {
+    HandshakeInfo* i = (HandshakeInfo*) malloc(sizeof(HandshakeInfo));
+    if (i != null) i->heap = true;
+    return i;
+}
+
+private ServerOptions* defaultServerOpts;
+
+private ServerOptions* serverOptionsOrDefault(ServerOptions* o) {
+    if (o != null) return o;
+    if (defaultServerOpts == null) defaultServerOpts = new ServerOptions();
+    return defaultServerOpts;
+}
+
+// Server, first half: reads the upgrade request from a new connection and judges it. true: info says what was asked (path, origin, protocol,
+// header(name)); now call completeUpgrade or rejectUpgrade. false: the request was no valid upgrade, the error answer was sent and the connection closed.
+public bool readUpgrade(conn.Connection* c, ServerOptions* o, HandshakeInfo* info) {
+    o = serverOptionsOrDefault(o);
+    c->setTimeout(o->handshakeTimeoutMs);
+    char* head = readHead(c, o->handshakeTimeoutMs);
+    if (head == null) {
+        c->close();
+        return false;
+    }
+    int st = serverHandshake(head, o, info);
+    free(head);
+    if (st != 101) {
+        c->write(info->response, info->responseLen);
+        c->flush();
+        c->close();
+        return false;
+    }
+    return true;
+}
+
+// Server, second half: sends the 101 answer and returns the WebSocket (null if sending failed)
+public WebSocket* completeUpgrade(conn.Connection* c, ServerOptions* o, HandshakeInfo* info) {
+    o = serverOptionsOrDefault(o);
+    if (!c->write(info->response, info->responseLen) || !c->flush()) {
+        c->close();
+        return null;
+    }
+    WebSocket* ws = create(c, false);
+    if (ws == null) { c->close(); return null; }
+    configure(ws, o, info);
+    c->setTimeout(0);
+    return ws;
+}
+
+// refuses an upgrade request that readUpgrade accepted (403 forbidden, 404 not found ...) and closes the connection
+public void rejectUpgrade(conn.Connection* c, HandshakeInfo* info, int status) {
+    rejectInfo(info, status, null);
+    c->write(info->response, info->responseLen);
+    c->flush();
+    c->close();
+}
+
+// readUpgrade and completeUpgrade in one call; info (may be null) receives the details of the request
+public WebSocket* acceptWith(conn.Connection* c, ServerOptions* o, HandshakeInfo* info) {
+    HandshakeInfo* mine = info;
+    if (mine == null) mine = newHandshakeInfo();
+    if (mine == null) { c->close(); return null; }
+    WebSocket* ws = null;
+    if (readUpgrade(c, o, mine)) ws = completeUpgrade(c, o, mine);
+    if (info == null) mine->dispose();
     return ws;
 }
 
 // server: reads the upgrade request from a new connection and answers it. Returns the WebSocket or null
 // (a plain HTTP request gets "400 Bad Request"). path (may be null) receives the requested path
 public WebSocket* accept(conn.Connection* c, char* path, int pathMax) {
-    char first[1100];
-    char* raw = readHeaders(c, &first[0], 1100);
-    if (raw == null) return null;
-    char key[128];
-    char up[64];
-    if (!startsWith(&first[0], "GET ") || !http.headerOf(raw, "Sec-WebSocket-Key", &key[0], 128)
-        || !http.headerOf(raw, "Upgrade", &up[0], 64) || !contains(&up[0], "ebsocket")) {
-        c->writeText("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        c->flush();
+    HandshakeInfo* info = newHandshakeInfo();
+    if (info == null) { c->close(); return null; }
+    WebSocket* ws = acceptWith(c, null, info);
+    if (ws != null && path != null && pathMax > 0) {
+        int k = 0;
+        while (info->path[k] != 0 && k < pathMax - 1) { path[k] = info->path[k]; k++; }
+        path[k] = 0;
+    }
+    info->dispose();
+    return ws;
+}
+
+// wss:// server: does the TLS handshake on a new connection with cfg = tls.loadConfig(certChainPem, privateKeyPem), then accept
+public WebSocket* acceptTls(conn.Connection* c, tls.Config* cfg, char* path, int pathMax) {
+    if (!tls.wrapServer(c->handle(), cfg)) {
+        char* why = tls.lastError();
+        fail1(why == null ? "the TLS handshake failed" : why);
         c->close();
         return null;
     }
-    if (path != null) {
-        int i = 4;
-        int k = 0;
-        while (first[i] != ' ' && first[i] != 0 && k < pathMax - 1) { path[k] = first[i]; k++; i++; }
-        path[k] = 0;
+    return accept(c, path, pathMax);
+}
+
+public WebSocket* acceptTlsWith(conn.Connection* c, tls.Config* cfg, ServerOptions* o, HandshakeInfo* info) {
+    if (!tls.wrapServer(c->handle(), cfg)) {
+        char* why = tls.lastError();
+        fail1(why == null ? "the TLS handshake failed" : why);
+        c->close();
+        return null;
     }
-    char resp[400];
-    format(&resp[0], 400, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n",
-           acceptKey(&key[0]));
-    c->writeText(&resp[0]);
-    c->flush();
-    return new WebSocket(c, false);
+    return acceptWith(c, o, info);
 }

@@ -1,0 +1,156 @@
+// conn and net: connections give their buffers back on close and are safe to use afterwards, the non-blocking calls (setNonBlocking, sendSome, recvSome,
+// acceptSome), the idle hook (runs while a call waits, honours time limits, is not entered from itself), a connection object costs no buffer memory
+import net;
+import conn;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int hookCalls = 0;
+int nested = 0;
+bool inHook = false;
+int hookH = -1;
+
+int hook() {
+    if (inHook) nested++;
+    inHook = true;
+    hookCalls++;
+    // inside the hook a blocking call would call the hook again: it must not
+    net.waitReadable(hookH, 3);
+    inHook = false;
+    return 0;
+}
+
+int main() {
+    conn.Listener* l = new conn.Listener(0);
+    int port = l->port();
+
+    // --- a connection after close
+    conn.Connection* a = conn.open("127.0.0.1", port, 1000);
+    conn.Connection* b = l->accept(1000);
+    a->writeText("hello\n");
+    a->flush();
+    char line[100];
+    check("a line arrives", b->readLine(&line[0], 100) == 5 && streq(&line[0], "hello"));
+    a->writeText("pending data");
+    a->close();
+    check("close flushes what was written", b->read(&line[0], 100) == 12);
+    check("a closed connection says so", !a->isOpen() && a->handle() < 0);
+    check("reading a closed connection: end of data", a->readByte() < 0 && a->read(&line[0], 10) == 0 && a->readLine(&line[0], 10) < 0 && a->readExact(&line[0], 10) == 0);
+    check("writing a closed connection fails, flushing is harmless", !a->writeText("x") && !a->write("abc", 3) && a->flush() && a->buffered() == 0);
+    a->close();
+    check("closing twice is fine", !a->isOpen());
+    check("the peer sees the end", b->read(&line[0], 10) == 0);
+    b->close();
+    // data that was buffered at close time is gone with the buffer (no stale bytes from freed memory)
+    conn.Connection* c = conn.open("127.0.0.1", port, 1000);
+    conn.Connection* d = l->accept(1000);
+    d->writeText("abcdef");
+    d->flush();
+    check("a byte read fills the buffer", c->readByte() == 'a' && c->buffered() == 5);
+    c->close();
+    check("after close no buffered byte is left", c->buffered() == 0 && c->readByte() < 0);
+    d->close();
+
+    // --- memory: a thousand connections
+    int heap0 = __heap_pos;
+    for (int i = 0; i < 300; i++) {
+        conn.Connection* x = conn.open("127.0.0.1", port, 1000);
+        conn.Connection* y = l->accept(1000);
+        x->writeText("z");
+        x->flush();
+        y->readByte();
+        x->close();
+        y->close();
+    }
+    int per = (__heap_pos - heap0) / 300;
+    check("a connection object costs less than 400 bytes of the never-freed heap (its 8 KB of buffers are reused)", per < 400);
+
+    // --- non-blocking sockets
+    conn.Connection* p = conn.open("127.0.0.1", port, 1000);
+    conn.Connection* q = l->accept(1000);
+    net.setNonBlocking(q->handle(), true);
+    check("recvSome with nothing there: -2, not a wait", net.recvSome(q->handle(), &line[0], 10) == -2);
+    net.setNonBlocking(l->handle(), true);
+    check("on a non-blocking listener acceptSome returns at once", net.acceptSome(l->handle()) < 0);
+    p->writeText("12345");
+    p->flush();
+    net.waitReadable(q->handle(), 1000);
+    check("recvSome returns what is there", net.recvSome(q->handle(), &line[0], 10) == 5);
+    // fill the send buffer of q: the peer does not read
+    char* chunk = alloc(65536);
+    int total = 0;
+    int zero = 0;
+    for (int i = 0; i < 4000; i++) {
+        int r = net.sendSome(q->handle(), chunk, 65536);
+        if (r < 0) break;
+        if (r == 0) { zero++; break; }
+        total = total + r;
+    }
+    check("sendSome fills the buffer and then returns 0 without blocking", zero == 1 && total > 0);
+    check("a waitWritable on the full socket says no", !net.waitWritable(q->handle(), 20));
+    // the peer reads: the socket becomes writable again
+    int got = 0;
+    int guard = 0;
+    while (got < total && guard < 100000) {
+        int r = p->read(chunk, 65536);
+        if (r <= 0) break;
+        got = got + r;
+        guard++;
+    }
+    check("everything that sendSome took arrived", got == total);
+    check("... and the socket takes data again", net.waitWritable(q->handle(), 1000) && net.sendSome(q->handle(), "x", 1) == 1);
+    // end of the stream and failure
+    p->readByte();
+    p->close();
+    net.waitReadable(q->handle(), 1000);
+    int r = net.recvSome(q->handle(), &line[0], 10);
+    check("recvSome after the peer closed cleanly: 0", r == 0);
+    int failed = 0;
+    for (int i = 0; i < 50 && failed == 0; i++) {
+        int s = net.sendSome(q->handle(), chunk, 1000);
+        if (s < 0) failed = 1;
+        else sleepMs(2);
+    }
+    check("sendSome to a peer that is gone fails (no SIGPIPE)", failed == 1);
+    q->close();
+
+    // --- the idle hook
+    conn.Connection* s1 = conn.open("127.0.0.1", port, 1000);
+    conn.Connection* s2 = l->accept(1000);
+    hookH = s2->handle();
+    net.setIdleHook(hook);
+    int t0 = millis();
+    s2->setTimeout(120);
+    int n = s2->readByte();                                      // nothing comes: the time limit of the socket ends the wait
+    int took = millis() - t0;
+    check("a blocking read waits for its time limit and runs the hook meanwhile", n < 0 && took >= 100 && took < 2000 && hookCalls >= 5);
+    check("the hook is never entered from itself", nested == 0);
+    int calls = hookCalls;
+    check("a wait of 0 ms does not run the hook", !net.waitReadable(s2->handle(), 0) && hookCalls == calls);
+    s1->writeText("go");
+    s1->flush();
+    calls = hookCalls;
+    check("data that is already there: no hook call needed", s2->readByte() == 'g');
+    t0 = millis();
+    check("waitReadable with a time runs the hook until the time is over", !net.waitReadable(s2->handle(), 60) && hookCalls > calls && millis() - t0 >= 50);
+    net.setIdleHook(null);
+    calls = hookCalls;
+    s2->setTimeout(50);
+    s2->readByte();
+    s2->readByte();
+    check("after setIdleHook(null) the hook is not called", hookCalls == calls);
+    s1->close();
+    s2->close();
+    l->close();
+    printf("failures: %d\n", fails);
+    return fails;
+}

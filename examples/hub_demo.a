@@ -1,0 +1,144 @@
+// A WebSocket / HTTP / Server-Sent Events / JSON-RPC server for many clients in one thread (wshub).
+//   hub_demo PORT [DIR [CERT.pem KEY.pem]]
+//   ws://localhost:PORT/       text "join ROOM", "leave ROOM", "pub ROOM text" (to the room), anything else is echoed; binary is echoed
+//   GET /healthz               statistics (JSON)
+//   GET /events                Server-Sent Events: the clock of the server, "tick N" every second to every stream (Last-Event-ID is logged)
+//   POST /rpc                  JSON-RPC 2.0: methods add(a, b) and time()
+//   GET /api/hello?name=Ada    a route with a query
+//   POST /upload               a multipart/form-data form: prints the fields and files
+//   everything else            files of DIR (default the current directory)
+// With CERT.pem and KEY.pem the same port speaks wss:// and https://.
+import wshub;
+import httpx;
+import jsonrpc;
+import json;
+import sse;
+import tls;
+
+wshub.Hub* hub;
+
+int onOpen(wshub.Hub* h, wshub.Client* c) {
+    if (c->isEventStream()) {
+        h->join(c, "news");
+        h->sendEvent(c, "hello", "welcome", "0");
+    } else {
+        h->join(c, "everyone");
+    }
+    return 0;
+}
+
+int onMessage(wshub.Hub* h, wshub.Client* c, char* data, int n, int isText) {
+    if (isText == 0) {
+        h->sendBinary(c, data, n);
+        return 0;
+    }
+    // malloc and free, not alloc: memory from alloc is never given back, and a server that runs for months must not grow with every message
+    char* t = malloc(n + 1);
+    if (t == null) return 0;
+    memcpy(t, data, n);
+    t[n] = 0;
+    if (startsWith(t, "join ")) {
+        h->join(c, &t[5]);
+    } else if (startsWith(t, "leave ")) {
+        h->leave(c, &t[6]);
+    } else if (startsWith(t, "pub ")) {
+        int sp = indexOf(&t[4], ' ');
+        if (sp > 0) {
+            t[4 + sp] = 0;
+            h->publish(&t[4], &t[5 + sp], strlen(&t[5 + sp]), true, c->id);
+        }
+    } else {
+        h->sendText(c, t);
+    }
+    free(t);
+    return 0;
+}
+
+json.Json* rpcAdd(jsonrpc.Call* c) {
+    json.Json* a = c->param(0, "a");
+    json.Json* b = c->param(1, "b");
+    if (a == null || b == null || !a->isNumber() || !b->isNumber()) { c->fail(jsonrpc.INVALID_PARAMS, "need numbers a and b", null); return null; }
+    return json.newInt(a->asInt() + b->asInt());
+}
+
+json.Json* rpcTime(jsonrpc.Call* c) { return json.newInt(millis() / 1000); }
+
+int hello(httpx.Context* x) {
+    char name[100];
+    char text[200];
+    if (!x->req->queryValue("name", &name[0], 100)) strcpy(&name[0], "world");
+    format(&text[0], 200, "hello, %s", &name[0]);
+    x->res->text(200, &text[0]);
+    return 0;
+}
+
+int upload(httpx.Context* x) {
+    httpx.Part* parts[20];
+    char* ct = x->req->header("Content-Type");
+    int n = ct == null ? -1 : httpx.parseMultipart(ct, x->req->body, x->req->bodyLen, &parts[0], 20);
+    if (n < 0) { x->res->text(400, "not a multipart form"); return 0; }
+    char t[4300];                                  // at most 20 parts of at most 199 bytes each
+    t[0] = 0;
+    for (int i = 0; i < n; i++) {
+        char piece[200];
+        if (parts[i]->filename != null) format(&piece[0], 200, "file %s=%s:%d\n", parts[i]->name, parts[i]->filename, parts[i]->length);
+        else format(&piece[0], 200, "field %s=%s\n", parts[i]->name, parts[i]->data);
+        strcat(&t[0], &piece[0]);
+    }
+    httpx.freeParts(&parts[0], n);
+    x->res->text(200, &t[0]);
+    return 0;
+}
+
+int onHttp(wshub.Hub* h, wshub.Client* c, httpx.Request* req, httpx.Response* res) {
+    if (streq(&req->path[0], "/events")) {
+        char* last = req->header("Last-Event-ID");
+        if (last != null) println(last);
+        sse.startResponse(res);
+        return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) { println("usage: hub_demo PORT [DIR [CERT.pem KEY.pem]]"); return 1; }
+    hub = new wshub.Hub();
+    hub->onOpen = onOpen;
+    hub->onMessage = onMessage;
+    hub->onHttp = onHttp;
+    hub->wsOptions->deflate = true;
+    hub->wsOptions->protocols = "chat, echo";
+    hub->pingIntervalMs = 20000;
+    hub->staticDir = argc > 2 ? argv[2] : ".";
+    jsonrpc.Dispatcher* d = new jsonrpc.Dispatcher();
+    d->add("add", rpcAdd);
+    d->add("time", rpcTime);
+    httpx.Router* router = new httpx.Router();
+    router->get("/api/hello", hello);
+    router->add("POST", "/rpc", jsonrpc.httpHandler, (char*) d);
+    router->post("/upload", upload);
+    hub->router = router;
+    bool ok;
+    if (argc > 4) {
+        tls.Config* cfg = tls.loadConfig(readFile(argv[3]), readFile(argv[4]));
+        if (cfg == null) { println("cannot load the certificate and key"); return 1; }
+        ok = hub->listenTls(atoi(argv[1]), cfg);
+    } else {
+        ok = hub->listen(atoi(argv[1]));
+    }
+    if (!ok) { println("cannot listen"); return 1; }
+    printf("listening on port %d\n", hub->port);
+    int last = millis();
+    int n = 0;
+    for (;;) {
+        hub->poll(100);
+        if (millis() - last >= 1000) {
+            last = millis();
+            n++;
+            char t[40];
+            format(&t[0], 40, "tick %d", n);
+            hub->publishText("news", &t[0], 0);
+        }
+    }
+    return 0;
+}

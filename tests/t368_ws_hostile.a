@@ -1,0 +1,374 @@
+// Regression tests for review findings on websocket / wshub: a recycled WebSocket object must not remember the half message of the connection before it
+// (one hostile client used to make every later client fail with 1009), pongs must not grow the send queue past its limit (a client that pings and never
+// reads is cut off), the Origin policy must not be bypassed by an empty or over-long Origin header, Sec-WebSocket-Version must be exactly 13, and a finished
+// "Connection: close" answer must not wait for the next timer
+import wshub;
+import websocket;
+import httpx;
+import conn;
+import net;
+import encoding;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+wshub.Hub* hub;
+int lastCode = 0;
+int closes = 0;
+int hookWait = 0;
+char* lastOrigin = null;
+
+int onMessage(wshub.Hub* h, wshub.Client* c, char* data, int n, int isText) {
+    if (isText != 0) {
+        char* t = malloc(n + 8);
+        format(t, n + 8, "got %s", data);
+        h->sendText(c, t);
+        free(t);
+    } else {
+        h->sendBinary(c, data, n);
+    }
+    return 0;
+}
+
+int onClose(wshub.Hub* h, wshub.Client* c, int code) {
+    lastCode = code;
+    closes++;
+    return 0;
+}
+
+int onOpen(wshub.Hub* h, wshub.Client* c) {
+    if (lastOrigin != null) free(lastOrigin);                     // (strdup memory comes from alloc and must not be freed: malloc here)
+    lastOrigin = malloc(strlen(&c->origin[0]) + 1);
+    strcpy(lastOrigin, &c->origin[0]);
+    return 0;
+}
+
+int hook() {
+    hub->poll(hookWait);
+    return 0;
+}
+
+void settle() {
+    for (int i = 0; i < 20; i++) hub->poll(0);
+}
+
+int hHello(httpx.Context* x) { x->res->text(200, "hello"); return 0; }
+
+// ---- helpers for the state machine (no network)
+char* maskedFrame(int op, bool fin, char* data, int n, int* flen) {
+    char* f = malloc(n + 20);
+    *flen = websocket.buildFrame(op, fin, true, 0x01020304, data, n, f);
+    return f;
+}
+
+// feeds one masked frame; returns what feed returned
+int feedFrame(websocket.WebSocket* w, int op, bool fin, char* data, int n) {
+    int fl;
+    char* f = maskedFrame(op, fin, data, n, &fl);
+    int r = w->feed(f, fl);
+    free(f);
+    return r;
+}
+
+// the text of the next message, "(none)" if there is none
+char* nextText(websocket.WebSocket* w) {
+    websocket.Message* m = w->takeMessage();
+    if (m == null) return "(none)";
+    char* t = strdup(m->data);
+    m->dispose();
+    return t;
+}
+
+// ---- helpers for raw clients
+conn.Connection* raw(int port) {
+    return conn.open("127.0.0.1", port, 1000);
+}
+
+int rawUpgrade(conn.Connection* c, char* path, char* extra) {
+    int cap = strlen(extra) + 600;
+    char* req = malloc(cap);
+    format(req, cap, "GET %s HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s\r\n", path, extra);
+    c->writeText(req);
+    c->flush();
+    free(req);
+    char line[300];
+    if (c->readLine(&line[0], 300) < 0) return 0;
+    int status = atoi(&line[9]);
+    while (c->readLine(&line[0], 300) > 0) { }
+    return status;
+}
+
+void rawFrame(conn.Connection* c, int op, bool fin, char* data, int n) {
+    int fl;
+    char* f = maskedFrame(op, fin, data, n, &fl);
+    c->write(f, fl);
+    c->flush();
+    free(f);
+}
+
+// reads one frame from the server: the opcode, -1 at the end of the connection; the payload goes to buf (frames of at most 65535 bytes)
+int rawRead(conn.Connection* c, char* buf, int* len) {
+    char h[2];
+    if (c->readExact(&h[0], 2) != 2) return -1;
+    int n = h[1] & 127;
+    if (n == 126) { char e[2]; if (c->readExact(&e[0], 2) != 2) return -1; n = (e[0] & 255) * 256 + (e[1] & 255); }
+    if (c->readExact(buf, n) != n) return -1;
+    *len = n;
+    return h[0] & 15;
+}
+
+// the status of the handshake for a request with the given extra header lines (each ends in CRLF)
+int handshake(websocket.ServerOptions* o, char* extra, websocket.HandshakeInfo* info) {
+    int cap = strlen(extra) + 400;
+    char* head = malloc(cap);
+    format(head, cap, "GET /chat HTTP/1.1\r\nHost: example.org\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s", extra);
+    int st = websocket.serverHandshake(head, o, info);
+    free(head);
+    return st;
+}
+
+// "Origin: " and a host name of the given length: "https://" + n 'a' + ".example"
+char* originLine(int n, bool withHeaderName) {
+    char* s = malloc(n + 100);
+    s[0] = 0;
+    if (withHeaderName) strcat(s, "Origin: ");
+    strcat(s, "https://");
+    int o = strlen(s);
+    for (int i = 0; i < n; i++) s[o + i] = 'a';
+    s[o + n] = 0;
+    strcat(s, ".example");
+    if (withHeaderName) strcat(s, "\r\n");
+    return s;
+}
+
+int main() {
+    // ===== 1. a recycled WebSocket object starts clean (state machine, no network)
+    char* big = malloc(1100);
+    for (int i = 0; i < 1100; i++) big[i] = 'a' + i % 26;
+    websocket.WebSocket* w = new websocket.WebSocket(null, false);
+    w->maxMessage = 1000;
+    w->maxFrame = 1000;
+    check("a first frame of exactly maxMessage bytes (not final) is taken", feedFrame(w, websocket.OP_BINARY, false, big, 1000) >= 0 && !w->failed);
+    // the peer disconnects here: the object is used again for the next connection (this is what wshub does with its client slots)
+    w->init(null, false);
+    w->maxMessage = 1000;
+    w->maxFrame = 1000;
+    check("after init the next client's first message is not judged by the old one", feedFrame(w, websocket.OP_TEXT, true, "hello", 5) >= 0 && !w->failed && !w->closed);
+    check("... and arrives", streq(nextText(w), "hello"));
+    // a stale half frame: the header and all but one byte of the payload
+    int fl;
+    char* part = maskedFrame(websocket.OP_BINARY, false, big, 1000, &fl);
+    w->feed(part, fl - 1);
+    free(part);
+    w->init(null, false);
+    w->maxMessage = 1000;
+    w->maxFrame = 1000;
+    check("a frame cut in the middle does not break the next connection either", feedFrame(w, websocket.OP_BINARY, true, big, 1000) >= 0 && !w->failed);
+    websocket.Message* m = w->takeMessage();
+    check("a message of exactly maxMessage bytes arrives whole", m != null && m->length == 1000 && memcmp(m->data, big, 1000) == 0);
+    if (m != null) m->dispose();
+    check("one byte more is still too big (1009)", feedFrame(w, websocket.OP_BINARY, true, big, 1001) < 0 && w->closeSent && w->localCloseCode == 1009);
+    // a new message always starts counting from zero, a continuation adds up
+    w->init(null, false);
+    w->maxMessage = 1000;
+    w->maxFrame = 1000;
+    feedFrame(w, websocket.OP_BINARY, false, big, 600);
+    check("the parts of one message add up: 600 + 600 is too big", feedFrame(w, websocket.OP_CONT, true, big, 600) < 0 && w->localCloseCode == 1009);
+
+    // ===== 2. pongs obey maxOutBuffer: a peer that pings and never reads cannot grow the queue
+    websocket.WebSocket* p = new websocket.WebSocket(null, false);
+    p->maxOutBuffer = 500;
+    char* pl = malloc(100);
+    for (int i = 0; i < 100; i++) pl[i] = 'p';
+    int sent = 0;
+    for (int i = 0; i < 50; i++) {
+        feedFrame(p, websocket.OP_PING, true, pl, 100);
+        sent++;
+    }
+    check("50 pings of 100 bytes: the queue stays within maxOutBuffer", p->outPending() <= 500 && p->outPending() > 0);
+    check("... and the object says that it overflowed", p->overflowed);
+    check("... the connection itself is fine (pings are not a violation)", !p->failed && !p->closed);
+    p->outConsumed(p->outPending());
+    p->overflowed = false;
+    feedFrame(p, websocket.OP_PING, true, "x", 1);
+    check("when the queue is empty a ping is answered again", p->outPending() == 3 && !p->overflowed);
+    websocket.WebSocket* q = new websocket.WebSocket(null, false);          // no limit: every ping is answered
+    for (int i = 0; i < 50; i++) feedFrame(q, websocket.OP_PING, true, pl, 100);
+    check("without a limit every ping gets its pong", q->outPending() == 50 * 102);
+
+    // ===== 3. the Origin policy (the handshake alone)
+    websocket.ServerOptions* o = new websocket.ServerOptions();
+    websocket.HandshakeInfo* info = new websocket.HandshakeInfo();
+    char* longGood = originLine(250, false);                          // 8 + 250 + 8 = 266 bytes: a real origin can be this long
+    char* list = malloc(600);
+    format(list, 600, "https://good.example, %s", longGood);
+    o->origins = list;
+    check("no Origin header: allowed (requireOrigin is off)", handshake(o, "", info) == 101);
+    check("an allowed Origin", handshake(o, "Origin: https://good.example\r\n", info) == 101 && streq(&info->origin[0], "https://good.example"));
+    check("a foreign Origin: 403", handshake(o, "Origin: https://evil.example\r\n", info) == 403);
+    check("an empty Origin header is not 'no Origin': 403", handshake(o, "Origin:\r\n", info) == 403);
+    check("an Origin of only spaces: 403", handshake(o, "Origin:   \r\n", info) == 403);
+    char* l = originLine(250, true);
+    check("a long but real Origin (266 bytes) on the list: allowed and seen whole", handshake(o, l, info) == 101 && streq(&info->origin[0], longGood) && strlen(&info->origin[0]) == 266);
+    char* l2 = originLine(251, true);
+    check("... one byte longer and not on the list: 403", handshake(o, l2, info) == 403);
+    int blocked = 0;
+    int lens[5];
+    lens[0] = 280; lens[1] = 291; lens[2] = 292; lens[3] = 600; lens[4] = 3000;
+    for (int i = 0; i < 5; i++) {
+        char* ll = originLine(lens[i], true);
+        if (handshake(o, ll, info) == 403) blocked++;
+        free(ll);
+    }
+    check("over-long Origins (the old code let anything from 256 bytes on through): all 403", blocked == 5);
+    check("two Origin headers are refused even when both are allowed", handshake(o, "Origin: https://good.example\r\nOrigin: https://good.example\r\n", info) == 403);
+    check("a good Origin with a foreign one in a second header: 403", handshake(o, "Origin: https://good.example\r\nOrigin: https://evil.example\r\n", info) == 403);
+    o->requireOrigin = true;
+    check("requireOrigin: no header, 403", handshake(o, "", info) == 403);
+    o->requireOrigin = false;
+    o->origins = "*";
+    check("'*' allows any normal Origin", handshake(o, "Origin: https://anything.example\r\n", info) == 101);
+    check("'*' does not allow an empty or over-long one", handshake(o, "Origin:\r\n", info) == 403 && handshake(o, l2, info) == 101 && handshake(o, originLine(400, true), info) == 403);
+    o->origins = null;
+    check("without a policy a normal Origin is passed on to the callback", handshake(o, "Origin: https://x.example\r\n", info) == 101 && streq(&info->origin[0], "https://x.example"));
+    check("... and an empty or absurdly long one is refused (it would look like 'no Origin' to the callback)", handshake(o, "Origin:\r\n", info) == 403 && handshake(o, originLine(500, true), info) == 403);
+    // the protocol version
+    check("version 13 is accepted", handshake(o, "", info) == 101);
+    char* head = "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13, 8\r\n";
+    check("'13, 8' is not 13: 426", websocket.serverHandshake(head, o, info) == 426);
+    head = "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n";
+    check("version 8: 426", websocket.serverHandshake(head, o, info) == 426);
+
+    // ===== 4. the same through a hub
+    hub = new wshub.Hub();
+    hub->onMessage = onMessage;
+    hub->onClose = onClose;
+    hub->onOpen = onOpen;
+    httpx.Router* r = new httpx.Router();
+    r->get("/hello", hHello);
+    hub->router = r;
+    hub->maxMessage = 1000;
+    hub->listen(0);
+    net.setIdleHook(hook);
+    int port = hub->port;
+    char* u = malloc(100);
+    format(u, 100, "ws://127.0.0.1:%d/", port);
+
+    // 4a. a client that leaves in the middle of a big message; the slot is used by the next ones
+    conn.Connection* c1 = raw(port);
+    check("the hostile client gets in", rawUpgrade(c1, "/", "") == 101);
+    rawFrame(c1, websocket.OP_BINARY, false, big, 1000);
+    settle();
+    c1->close();
+    settle();
+    check("the hub saw it go", hub->count() == 0 && closes == 1);
+    int good = 0;
+    for (int i = 0; i < 4; i++) {
+        websocket.WebSocket* x = websocket.connect(u);
+        if (x != null && x->sendText("hello")) {
+            websocket.Message* a = x->receiveMessage();
+            if (a != null && streq(a->data, "got hello")) good++;
+            if (a != null) a->dispose();
+        }
+        if (x != null) { x->closeWith(1000, null); settle(); x->dispose(); }
+    }
+    check("the four clients after it get their echo (they used to get 1009 at their first message)", good == 4);
+    // a stale value that is smaller: the first big message of the next client
+    c1 = raw(port);
+    rawUpgrade(c1, "/", "");
+    rawFrame(c1, websocket.OP_BINARY, false, big, 900);
+    settle();
+    c1->close();
+    settle();
+    websocket.WebSocket* y = websocket.connect(u);
+    check("after a half message of 900 bytes a message of 1000 bytes from the next client is fine", y != null && y->sendBinary(big, 1000));
+    websocket.Message* b = y == null ? null : y->receiveMessage();
+    check("... and echoed whole", b != null && b->length == 1000);
+    if (b != null) b->dispose();
+    if (y != null) { y->closeWith(1000, null); settle(); y->dispose(); }
+
+    // 4b. pings without reading: the client is cut off (maxQueued is 300 bytes here)
+    hub->maxQueued = 300;
+    int evictedBefore = hub->stats->evicted;
+    c1 = raw(port);
+    check("the pinging client gets in", rawUpgrade(c1, "/", "") == 101);
+    int pn = 160;
+    int tl = pn * 106;
+    char* flood = malloc(tl + 10);
+    int fo = 0;
+    for (int i = 0; i < pn; i++) fo = fo + websocket.buildFrame(websocket.OP_PING, true, true, 0x0a0b0c0d, pl, 100, &flood[fo]);
+    c1->write(flood, fo);
+    c1->flush();
+    settle();
+    check("the hub cut it off (evicted)", hub->stats->evicted == evictedBefore + 1);
+    check("onClose saw 1008 (policy violation)", lastCode == 1008);
+    check("the hub has no client left", hub->count() == 0);
+    c1->close();
+    settle();
+    hub->maxQueued = 1048576;
+    websocket.WebSocket* z = websocket.connect(u);
+    websocket.Message* zm = null;
+    if (z != null && z->sendText("hi")) zm = z->receiveMessage();
+    check("and serves the next one", zm != null && streq(zm->data, "got hi"));
+    if (zm != null) zm->dispose();
+    if (z != null) { z->closeWith(1000, null); settle(); z->dispose(); }
+
+    // 4c. Origin through the hub, and the origin the callback sees
+    hub->wsOptions->origins = list;
+    c1 = raw(port);
+    check("hub: a normal allowed Origin is accepted", rawUpgrade(c1, "/", "Origin: https://good.example\r\n") == 101 && streq(lastOrigin, "https://good.example"));
+    c1->close();
+    settle();
+    c1 = raw(port);
+    check("hub: the 266 byte Origin on the list arrives whole in the callback", rawUpgrade(c1, "/", l) == 101 && streq(lastOrigin, longGood));
+    c1->close();
+    settle();
+    char* bad = originLine(300, true);
+    c1 = raw(port);
+    check("hub: a 308 byte Origin is refused with 403", rawUpgrade(c1, "/", bad) == 403);
+    c1->close();
+    c1 = raw(port);
+    check("hub: an empty Origin is refused with 403", rawUpgrade(c1, "/", "Origin:\r\n") == 403);
+    c1->close();
+    settle();
+    hub->wsOptions->origins = null;
+
+    // 4d. a finished "Connection: close" answer closes the connection at once, it does not wait for the next timer. The hub waits up to 100 ms in
+    // its poll when nothing is ready; before the fix every such request took that long. The fastest of five must be well below it.
+    hookWait = 100;
+    int best = 100000;
+    bool allAnswered = true;
+    for (int i = 0; i < 5; i++) {
+        conn.Connection* h = raw(port);
+        h->writeText("GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n");
+        h->flush();
+        int t0 = millis();
+        char line[300];
+        char status[40];
+        status[0] = 0;
+        int ln = h->readLine(&line[0], 300);
+        if (ln > 0) strcpy(&status[0], &line[0]);
+        int total = 0;
+        while (h->readLine(&line[0], 300) > 0) { }
+        char rest[100];
+        int got = h->read(&rest[0], 100);                           // the body, then the end of the connection
+        while (got > 0) { total = total + got; got = h->read(&rest[0], 100); }
+        int dt = millis() - t0;
+        if (!contains(&status[0], "200") || total != 5) allAnswered = false;
+        if (dt < best) best = dt;
+        h->close();
+    }
+    hookWait = 0;
+    check("five Connection: close requests were answered with the body", allAnswered);
+    check("the connection ends without waiting for the poll timeout", best < 70);
+    printf("failures: %d\n", fails);
+    return fails;
+}

@@ -1,0 +1,157 @@
+// websocket: the example frames of RFC 6455 section 5.7 byte for byte, the handshake key of section 1.3, header parsing, and the same
+// frames fed to the state machine of a client and a server
+import websocket;
+import encoding;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// the queued output of a WebSocket as lower case hex; empties the queue
+char* take(websocket.WebSocket* w) {
+    int n = w->outPending();
+    char* h = encoding.hexEncode(w->outData(), n);
+    w->outConsumed(n);
+    return h;
+}
+
+// feeds hex text to a WebSocket, returns what feed returned
+int feedHex(websocket.WebSocket* w, char* hex) {
+    char buf[70100];
+    int n = encoding.hexDecode(hex, &buf[0]);
+    return w->feed(&buf[0], n);
+}
+
+// the text of the next message ("" if none); the message is freed
+char* nextText(websocket.WebSocket* w) {
+    websocket.Message* m = w->takeMessage();
+    if (m == null) return "(none)";
+    char* t = strdup(m->data);
+    m->dispose();
+    return t;
+}
+
+int main() {
+    // --- the handshake of section 1.3
+    check("accept key", streq(websocket.acceptKey("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="));
+
+    // --- buildFrame: the examples of section 5.7
+    char out[400];
+    int n = websocket.buildFrame(websocket.OP_TEXT, true, false, 0, "Hello", 5, out);
+    check("unmasked text Hello", streq(encoding.hexEncode(out, n), "810548656c6c6f"));
+    n = websocket.buildFrame(websocket.OP_TEXT, true, true, 0x37fa213d, "Hello", 5, out);
+    check("masked text Hello", streq(encoding.hexEncode(out, n), "818537fa213d7f9f4d5158"));
+    n = websocket.buildFrame(websocket.OP_TEXT, false, false, 0, "Hel", 3, out);
+    check("fragment 1", streq(encoding.hexEncode(out, n), "010348656c"));
+    n = websocket.buildFrame(websocket.OP_CONT, true, false, 0, "lo", 2, out);
+    check("fragment 2", streq(encoding.hexEncode(out, n), "80026c6f"));
+    n = websocket.buildFrame(websocket.OP_PING, true, false, 0, "Hello", 5, out);
+    check("ping Hello", streq(encoding.hexEncode(out, n), "890548656c6c6f"));
+    n = websocket.buildFrame(websocket.OP_PONG, true, true, 0x37fa213d, "Hello", 5, out);
+    check("masked pong Hello", streq(encoding.hexEncode(out, n), "8a8537fa213d7f9f4d5158"));
+    char* big = alloc(70000);
+    for (int i = 0; i < 70000; i++) big[i] = i & 255;
+    char* frame = alloc(70100);
+    n = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 256, frame);
+    check("256 bytes: 16 bit length", n == 260 && streq(encoding.hexEncode(frame, 4), "827e0100"));
+    n = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 65536, frame);
+    check("65536 bytes: 64 bit length", n == 65546 && streq(encoding.hexEncode(frame, 10), "827f0000000000010000"));
+    n = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 125, frame);
+    check("125 bytes: 7 bit length", n == 127 && (frame[1] & 255) == 125);
+    n = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 126, frame);
+    check("126 bytes: 16 bit length", n == 130 && (frame[1] & 255) == 126 && frame[3] == 126);
+    n = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 65535, frame);
+    check("65535 bytes: 16 bit length", n == 65539 && (frame[1] & 255) == 126 && frame[2] == 255 && frame[3] == 255);
+
+    // --- parseHeader
+    websocket.Frame* f = new websocket.Frame();
+    char h[20];
+    int hn = encoding.hexDecode("818537fa213d7f9f4d5158", &h[0]);
+    check("parse: needs more bytes", websocket.parseHeader(&h[0], 1, f) == 0 && websocket.parseHeader(&h[0], 5, f) == 0);
+    check("parse: masked header", websocket.parseHeader(&h[0], hn, f) == 6 && f->masked && f->fin && f->opcode == 1 && f->length == 5 && f->headerLen == 6 && f->maskKey == 0x37fa213d);
+    hn = encoding.hexDecode("827f0000000000010000", &h[0]);
+    check("parse: 64 bit length", websocket.parseHeader(&h[0], hn, f) == 10 && f->length == 65536);
+    hn = encoding.hexDecode("827f8000000000000000", &h[0]);
+    check("parse: 64 bit length with the top bit", websocket.parseHeader(&h[0], hn, f) == -1);
+    hn = encoding.hexDecode("c1", &h[0]);
+    check("parse: reserved bit", websocket.parseHeader(&h[0], 2, f) == -1);
+    char data[10];
+    int dn = encoding.hexDecode("7f9f4d5158", &data[0]);
+    websocket.unmask(&data[0], dn, 0x37fa213d);
+    data[dn] = 0;
+    check("unmask", streq(&data[0], "Hello"));
+
+    // --- the state machines
+    websocket.WebSocket* sv = websocket.create(null, false);
+    websocket.WebSocket* cl = websocket.create(null, true);
+    check("server takes the masked frame", feedHex(sv, "818537fa213d7f9f4d5158") == 11);
+    check("... as a text message", streq(nextText(sv), "Hello"));
+    check("client takes the unmasked frame", feedHex(cl, "810548656c6c6f") == 7);
+    check("... as a text message", streq(nextText(cl), "Hello"));
+    feedHex(cl, "010348656c");
+    check("fragment 1 alone is no message", cl->takeMessage() == null);
+    feedHex(cl, "80026c6f");
+    check("fragment 2 completes it", streq(nextText(cl), "Hello"));
+    feedHex(cl, "890548656c6c6f");
+    char* pong = take(cl);
+    check("client answers the ping with a masked pong", strlen(pong) == 22 && startsWith(pong, "8a85"));
+    char pb[20];
+    int pn = encoding.hexDecode(pong, &pb[0]);
+    websocket.unmask(&pb[6], 5, ((pb[2] & 255) << 24) | ((pb[3] & 255) << 16) | ((pb[4] & 255) << 8) | (pb[5] & 255));
+    pb[11] = 0;
+    check("... with the same payload", pn == 11 && streq(&pb[6], "Hello"));
+    feedHex(sv, "898537fa213d7f9f4d5158");
+    check("server answers the ping with an unmasked pong", streq(take(sv), "8a0548656c6c6f"));
+    feedHex(sv, "8a8537fa213d7f9f4d5158");
+    check("a pong is no message", sv->takeMessage() == null && !sv->closed);
+    // 256 and 65536 bytes
+    n = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 256, frame);
+    check("client takes 256 bytes", cl->feed(frame, n) == n);
+    websocket.Message* m = cl->takeMessage();
+    check("... with the right content", m != null && m->length == 256 && m->opcode == 2 && m->data[255] == 255 && m->data[100] == 100);
+    m->dispose();
+    n = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 65536, frame);
+    check("client takes 65536 bytes", cl->feed(frame, n) == n);
+    m = cl->takeMessage();
+    check("... with the right content", m != null && m->length == 65536 && m->data[65535] == 255 && m->data[300] == (300 & 255));
+    m->dispose();
+    // the same frame, one byte at a time
+    int got = 0;
+    n = encoding.hexDecode("810548656c6c6f", frame);
+    for (int i = 0; i < n; i++) got = got + cl->feed(&frame[i], 1);
+    check("byte by byte", got == 7 && streq(nextText(cl), "Hello"));
+
+    // --- what the objects send
+    sv->sendText("Hello");
+    check("server frame is not masked", streq(take(sv), "810548656c6c6f"));
+    sv->sendBinary("abc", 3);
+    check("binary frame", streq(take(sv), "8203616263"));
+    sv->closeWith(1000, "bye");
+    check("close frame", streq(take(sv), "880503e8627965"));
+    check("close is half done", sv->closeSent && !sv->closed);
+    cl->sendText("Hello");
+    char* cf = take(cl);
+    check("client frame is masked", strlen(cf) == 22 && startsWith(cf, "8185"));
+    char cb[20];
+    encoding.hexDecode(cf, &cb[0]);
+    websocket.unmask(&cb[6], 5, ((cb[2] & 255) << 24) | ((cb[3] & 255) << 16) | ((cb[4] & 255) << 8) | (cb[5] & 255));
+    cb[11] = 0;
+    check("... and unmasks to the text", streq(&cb[6], "Hello"));
+    // the masks differ between frames (they are random)
+    cl->sendText("x");
+    char* c1 = take(cl);
+    cl->sendText("x");
+    char* c2 = take(cl);
+    cl->sendText("x");
+    char* c3 = take(cl);
+    check("random masks", !(streq(c1, c2) && streq(c2, c3)));
+    printf("failures: %d\n", fails);
+    return fails;
+}

@@ -1,0 +1,184 @@
+// wshub: one thread serves several WebSocket clients: callbacks, ids, user pointers, echo, broadcast, send by id, close from either side, statistics
+import wshub;
+import websocket;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+wshub.Hub* hub;
+char* log;
+int logLen = 0;
+
+void logAdd(char* s) {
+    int n = strlen(s);
+    memcpy(&log[logLen], s, n);
+    logLen = logLen + n;
+    log[logLen] = 0;
+}
+
+int onOpen(wshub.Hub* h, wshub.Client* c) {
+    char* tag = alloc(40);
+    format(tag, 40, "client-%d", c->id);
+    c->user = tag;
+    char t[100];
+    format(&t[0], 100, "[open %d %s %s]", c->id, &c->path[0], c->isWebSocket() ? "ws" : "?");
+    logAdd(&t[0]);
+    return 0;
+}
+
+int onMessage(wshub.Hub* h, wshub.Client* c, char* data, int n, int isText) {
+    char* copy = alloc(n + 1);
+    memcpy(copy, data, n);
+    if (isText != 0 && startsWith(copy, "all:")) {
+        h->broadcast(data, n, true);
+    } else if (isText != 0 && startsWith(copy, "kick")) {
+        h->close(c, 4001, "kicked");
+    } else if (isText != 0 && startsWith(copy, "who")) {
+        char* t = alloc(60);
+        format(t, 60, "you are %s", c->user);
+        h->sendText(c, t);
+    } else if (isText != 0) {
+        char* t = alloc(n + 20);
+        format(t, n + 20, "echo %s", copy);
+        h->sendText(c, t);
+    } else {
+        h->sendBinary(c, data, n);
+    }
+    return 0;
+}
+
+int onClose(wshub.Hub* h, wshub.Client* c, int code) {
+    char t[100];
+    format(&t[0], 100, "[close %d %d]", c->id, code);
+    logAdd(&t[0]);
+    return 0;
+}
+
+int hook() {
+    hub->poll(0);
+    return 0;
+}
+
+void settle() {
+    for (int i = 0; i < 20; i++) hub->poll(0);
+}
+
+int main() {
+    log = alloc(4000);
+    hub = new wshub.Hub();
+    hub->onOpen = onOpen;
+    hub->onMessage = onMessage;
+    hub->onClose = onClose;
+    check("listen on a free port", hub->listen(0) && hub->port > 0);
+    net.setIdleHook(hook);
+    char* u = alloc(100);
+    format(u, 100, "ws://127.0.0.1:%d/room/1", hub->port);
+    websocket.WebSocket* a = websocket.connect(u);
+    websocket.WebSocket* b = websocket.connect(u);
+    websocket.WebSocket* c = websocket.connect(u);
+    check("three clients connect", a != null && b != null && c != null && hub->count() == 3);
+    check("onOpen ran for each, in order, with the request path", streq(log, "[open 1 /room/1 ws][open 2 /room/1 ws][open 3 /room/1 ws]"));
+    check("ids start at 1", hub->find(1) != null && hub->find(3) != null && hub->find(4) == null && hub->find(0) == null);
+    check("the user pointer is the application's", streq(hub->find(2)->user, "client-2"));
+    int ids[10];
+    check("clientIds", hub->clientIds(&ids[0], 10) == 3 && ids[0] == 1 && ids[2] == 3);
+
+    // echo, text and binary
+    a->sendText("hello");
+    websocket.Message* m = a->receiveMessage();
+    check("text echo", m != null && streq(m->data, "echo hello"));
+    m->dispose();
+    b->sendBinary("\x01\x02\x03\x00\x04", 5);
+    m = b->receiveMessage();
+    check("binary echo", m != null && m->opcode == 2 && m->length == 5 && m->data[3] == 0 && m->data[4] == 4);
+    m->dispose();
+    c->sendText("who");
+    m = c->receiveMessage();
+    check("callbacks see the user pointer of the right client", m != null && streq(m->data, "you are client-3"));
+    m->dispose();
+    // UTF-8 through the hub
+    a->sendText("h\xc3\xa9llo \xe2\x82\xac");
+    m = a->receiveMessage();
+    check("UTF-8 text", m != null && streq(m->data, "echo h\xc3\xa9llo \xe2\x82\xac"));
+    m->dispose();
+    // a big message
+    char* big = alloc(300000);
+    for (int i = 0; i < 300000; i++) big[i] = i * 11;
+    b->sendBinary(big, 300000);
+    m = b->receiveMessage();
+    check("300000 bytes through the hub and back", m != null && m->length == 300000 && memcmp(m->data, big, 300000) == 0);
+    m->dispose();
+
+    // broadcast
+    a->sendText("all:news");
+    int heard = 0;
+    websocket.WebSocket* all[3];
+    all[0] = a; all[1] = b; all[2] = c;
+    for (int i = 0; i < 3; i++) {
+        m = all[i]->receiveMessage();
+        if (m != null && streq(m->data, "all:news")) heard++;
+        if (m != null) m->dispose();
+    }
+    check("broadcast reaches everybody, the sender too", heard == 3);
+    check("hub->broadcastText", hub->broadcastText("direct") == 3);
+    for (int i = 0; i < 3; i++) { m = all[i]->receiveMessage(); m->dispose(); }
+    check("send by id", hub->sendTextTo(2, "just you") && !hub->sendTextTo(99, "nobody"));
+    m = b->receiveMessage();
+    check("... only that client gets it", m != null && streq(m->data, "just you") && a->waitMessage(20) == null);
+    m->dispose();
+
+    // closes
+    c->sendText("kick me");
+    m = c->receiveMessage();
+    check("the hub closes a client with its own code and reason", m == null && c->closed && c->closeCode == 4001 && streq(c->closeReason, "kicked"));
+    settle();
+    check("onClose got the code", contains(log, "[close 3 4001]") && hub->count() == 2 && hub->find(3) == null);
+    c->dispose();
+    check("a client closes itself", a->closeWith(1000, "done"));
+    settle();
+    check("onClose: 1000", contains(log, "[close 1 1000]") && hub->count() == 1);
+    a->dispose();
+    b->abort();
+    settle();
+    check("a dropped connection: onClose with 1006", contains(log, "[close 2 1006]") && hub->count() == 0);
+    b->dispose();
+    check("the log is complete", streq(log, "[open 1 /room/1 ws][open 2 /room/1 ws][open 3 /room/1 ws][close 3 4001][close 1 1000][close 2 1006]"));
+
+    // statistics
+    check("stats: accepted, opened, closed", hub->stats->accepted == 3 && hub->stats->opened == 3 && hub->stats->closed == 3 && hub->stats->current == 0);
+    check("stats: messages", hub->stats->messagesIn == 7 && hub->stats->messagesOut == 12);
+    check("stats: nothing evicted or refused", hub->stats->evicted == 0 && hub->stats->rejected == 0);
+    // ids are not reused
+    websocket.WebSocket* d = websocket.connect(u);
+    check("a later client gets a new id", d != null && hub->find(4) != null && hub->find(1) == null);
+    d->closeWith(1000, null);
+    settle();
+    d->dispose();
+    // memory: connecting and disconnecting many times does not grow the heap
+    int heapBefore = __heap_pos;
+    for (int round = 0; round < 40; round++) {
+        websocket.WebSocket* x = websocket.connect(u);
+        x->sendText("ping");
+        m = x->receiveMessage();
+        m->dispose();
+        x->closeWith(1000, null);
+        settle();
+        x->dispose();
+    }
+    int heapAfter = __heap_pos;
+    check("40 connections and disconnections cost the whole process less than 1 KB each (the hub itself reuses everything)", heapAfter - heapBefore < 40 * 1024);
+    check("the hub reuses its client objects", hub->count() == 0 && hub->stats->opened == 44);
+    net.setIdleHook(null);
+    hub->shutdown(200);
+    printf("failures: %d\n", fails);
+    return fails;
+}

@@ -1,0 +1,174 @@
+// websocket: the closing handshake: every status code with a reason, simultaneous close, data after close, refused sends,
+// invalid codes, connections that end without a close frame
+import websocket;
+import encoding;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// moves the queued bytes of a to b; returns what feed said (0 when there was nothing)
+int move(websocket.WebSocket* a, websocket.WebSocket* b) {
+    int n = a->outPending();
+    if (n == 0) return 0;
+    int r = b->feed(a->outData(), n);
+    a->outConsumed(n);
+    return r;
+}
+
+// lets two objects talk until nothing is left to say
+void settle(websocket.WebSocket* a, websocket.WebSocket* b) {
+    for (int i = 0; i < 6; i++) {
+        move(a, b);
+        move(b, a);
+    }
+}
+
+void pair(websocket.WebSocket** c, websocket.WebSocket** s) {
+    *c = websocket.create(null, true);
+    *s = websocket.create(null, false);
+}
+
+int main() {
+    // every code, client starts
+    int codes[18] = { 1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 3000, 3999, 4000, 4999, 1000, 1001 };
+    int ok = 0;
+    for (int i = 0; i < 16; i++) {
+        websocket.WebSocket* c; websocket.WebSocket* s;
+        pair(&c, &s);
+        bool a = c->closeWith(codes[i], "reason text");
+        settle(c, s);
+        bool good = a && s->closed && c->closed && s->closeCode == codes[i] && streq(s->closeReason, "reason text") && c->closeCode == codes[i]
+            && c->localCloseCode == codes[i] && s->localCloseCode == codes[i] && !s->failed && !c->failed;
+        if (good) ok++;
+        else printf("  code %d: closed %d %d, codes %d %d\n", codes[i], s->closed, c->closed, s->closeCode, c->closeCode);
+        c->dispose();
+        s->dispose();
+    }
+    check("16 codes, client starts: both ends closed, the code echoed", ok == 16);
+    // the server starts
+    ok = 0;
+    for (int i = 0; i < 16; i++) {
+        websocket.WebSocket* c; websocket.WebSocket* s;
+        pair(&c, &s);
+        bool a = s->closeWith(codes[i], "bye");
+        settle(c, s);
+        if (a && c->closed && s->closed && c->closeCode == codes[i] && streq(c->closeReason, "bye") && s->closeCode == codes[i]) ok++;
+        c->dispose();
+        s->dispose();
+    }
+    check("16 codes, server starts", ok == 16);
+
+    // the bytes
+    websocket.WebSocket* c; websocket.WebSocket* s;
+    pair(&c, &s);
+    s->closeWith(1001, "going away");
+    check("close frame bytes", streq(encoding.hexEncode(s->outData(), s->outPending()), "880c03e9676f696e672061776179"));
+    c->dispose(); s->dispose();
+
+    // no status code
+    pair(&c, &s);
+    c->closeWith(0, null);
+    check("an empty close frame is masked and 6 bytes long", c->outPending() == 6 && (c->outData()[0] & 255) == 0x88 && (c->outData()[1] & 255) == 0x80);
+    move(c, s);
+    check("the server sees 'no status' and answers with an empty frame", s->closed && s->closeCode == 1005 && s->outPending() == 2 && (s->outData()[1] & 255) == 0);
+    move(s, c);
+    check("the client sees it too", c->closed && c->closeCode == 1005 && streq(c->closeReason, ""));
+    c->dispose(); s->dispose();
+
+    // both close at the same time
+    pair(&c, &s);
+    c->closeWith(1000, "a");
+    s->closeWith(1001, "b");
+    move(c, s);
+    move(s, c);
+    check("simultaneous close: both are closed", c->closed && s->closed);
+    check("... with the codes of the other side", c->closeCode == 1001 && s->closeCode == 1000);
+    check("... and nobody answers an answer", c->outPending() == 0 && s->outPending() == 0);
+    c->dispose(); s->dispose();
+
+    // refused sends after our close frame
+    pair(&c, &s);
+    c->closeWith(1000, null);
+    check("no text after our close", !c->sendText("x"));
+    check("no binary after our close", !c->sendBinary("x", 1));
+    check("no ping after our close", !c->ping());
+    check("no fragments after our close", !c->beginMessage(websocket.OP_TEXT));
+    c->outConsumed(c->outPending());
+    check("nothing was queued", c->outPending() == 0);
+    // data from the peer while the close is pending is thrown away, the close answer ends it
+    s->sendText("late");
+    move(s, c);
+    check("a message that arrives after our close frame is dropped", c->takeMessage() == null && !c->closed);
+    s->closeWith(1000, null);
+    move(s, c);
+    check("... and the answer ends the handshake", c->closed && c->closeCode == 1000);
+    c->dispose(); s->dispose();
+
+    // a close while a message is being sent in pieces
+    pair(&c, &s);
+    c->beginMessage(websocket.OP_BINARY);
+    c->sendFragment("ab", 2);
+    c->closeWith(1000, null);
+    check("a fragment after the close is refused", !c->sendFragment("cd", 2) && !c->endMessage());
+    c->dispose(); s->dispose();
+
+    // messages before the close frame stay readable
+    pair(&c, &s);
+    s->sendText("one");
+    s->sendText("two");
+    s->closeWith(1000, "end");
+    int n = s->outPending();
+    int r = c->feed(s->outData(), n);
+    check("one chunk with two messages and a close frame", r == n || r == -1);
+    websocket.Message* m = c->takeMessage();
+    check("the first message is delivered", m != null && streq(m->data, "one"));
+    m->dispose();
+    m = c->takeMessage();
+    check("the second message is delivered", m != null && streq(m->data, "two"));
+    m->dispose();
+    check("then the connection is closed", c->takeMessage() == null && c->closed && c->closeCode == 1000 && streq(c->closeReason, "end"));
+    // bytes after a close frame are not read
+    check("bytes after the close frame are refused", c->feed("\x81\x01x", 3) == -1);
+    c->dispose(); s->dispose();
+
+    // codes that cannot be sent
+    pair(&c, &s);
+    check("1006 cannot be sent", !c->closeWith(1006, null));
+    check("999 cannot be sent", !c->closeWith(999, null));
+    check("1004 cannot be sent", !c->closeWith(1004, null));
+    check("1015 cannot be sent", !c->closeWith(1015, null));
+    check("2000 cannot be sent", !c->closeWith(2000, null));
+    check("5000 cannot be sent", !c->closeWith(5000, null));
+    check("nothing was queued by them", c->outPending() == 0 && !c->closeSent);
+    check("1005 and 0 mean no code", c->closeWith(1005, "ignored") && c->outPending() == 6);
+    c->dispose(); s->dispose();
+
+    // a connection that ends without a close frame
+    pair(&c, &s);
+    c->transportEnded();
+    check("end without a close frame: code 1006", c->closed && c->closeCode == 1006 && !c->failed);
+    check("... nothing can be sent", !c->sendText("x"));
+    c->dispose(); s->dispose();
+    // closeWith twice
+    pair(&c, &s);
+    check("closeWith twice sends one frame", c->closeWith(1000, null) && c->closeWith(1001, null) && c->outPending() == 8);
+    c->dispose(); s->dispose();
+    // dispose is safe to repeat and later calls fail instead of crashing
+    pair(&c, &s);
+    c->dispose();
+    websocket.WebSocket* keep = new websocket.WebSocket(null, true);
+    keep->dispose();
+    keep->dispose();
+    check("a second dispose is harmless and sends after dispose fail", !keep->sendText("x") && !keep->ping() && keep->closed && keep->takeMessage() == null && keep->feed("a", 1) == -1);
+    s->dispose();
+    printf("failures: %d\n", fails);
+    return fails;
+}

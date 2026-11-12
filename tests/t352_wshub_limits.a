@@ -1,0 +1,328 @@
+// wshub: limits and timeouts: maxClients (503), maxMessage (1009), slow readers are cut off, idle and ping timeouts, handshake timeout, refusing
+// upgrades (callback, Origin), malformed and oversized request heads, fragments and deflate through the hub, graceful shutdown
+import wshub;
+import websocket;
+import conn;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+wshub.Hub* hub;
+int lastCode = 0;
+int closes = 0;
+int upgradeCalls = 0;
+char* seenAuth = null;
+int messages = 0;
+
+int onMessage(wshub.Hub* h, wshub.Client* c, char* data, int n, int isText) {
+    messages++;
+    if (isText != 0) {
+        char* t = alloc(n + 8);
+        format(t, n + 8, "got %s", data);
+        h->sendText(c, t);
+    } else {
+        h->sendBinary(c, data, n);
+    }
+    return 0;
+}
+
+int onClose(wshub.Hub* h, wshub.Client* c, int code) {
+    lastCode = code;
+    closes++;
+    return 0;
+}
+
+int onUpgrade(wshub.Hub* h, wshub.Client* c, websocket.HandshakeInfo* info) {
+    upgradeCalls++;
+    char auth[100];
+    if (info->headerInto("Authorization", &auth[0], 100)) seenAuth = strdup(&auth[0]);
+    if (startsWith(&info->path[0], "/secret")) return 401;
+    if (startsWith(&info->path[0], "/gone")) return 404;
+    return 0;
+}
+
+int hook() {
+    hub->poll(0);
+    return 0;
+}
+
+void settle() {
+    for (int i = 0; i < 20; i++) hub->poll(0);
+}
+
+// a raw TCP client
+conn.Connection* raw(int port) {
+    return conn.open("127.0.0.1", port, 1000);
+}
+
+// the status of the answer to an upgrade request written by hand; the headers are read up to the empty line
+int rawUpgrade(conn.Connection* c, char* path, char* extra) {
+    char req[600];
+    format(&req[0], 600, "GET %s HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s\r\n", path, extra);
+    c->writeText(&req[0]);
+    c->flush();
+    char line[300];
+    if (c->readLine(&line[0], 300) < 0) return 0;
+    int status = atoi(&line[9]);
+    while (c->readLine(&line[0], 300) > 0) { }
+    return status;
+}
+
+void rawFrame(conn.Connection* c, int op, bool fin, char* data, int n) {
+    char* f = alloc(n + 20);
+    int fl = websocket.buildFrame(op, fin, true, 0x01020304, data, n, f);
+    c->write(f, fl);
+    c->flush();
+}
+
+// reads one frame from the server: returns the opcode, -1 at the end of the connection; the payload goes to buf
+int rawRead(conn.Connection* c, char* buf, int* len) {
+    char h[2];
+    if (c->readExact(&h[0], 2) != 2) return -1;
+    int n = h[1] & 127;
+    if (n == 126) { char e[2]; if (c->readExact(&e[0], 2) != 2) return -1; n = (e[0] & 255) * 256 + (e[1] & 255); }
+    if (c->readExact(buf, n) != n) return -1;
+    *len = n;
+    return h[0] & 15;
+}
+
+int main() {
+    hub = new wshub.Hub();
+    hub->onMessage = onMessage;
+    hub->onClose = onClose;
+    hub->onUpgrade = onUpgrade;
+    hub->listen(0);
+    net.setIdleHook(hook);
+    int port = hub->port;
+    char* u = alloc(100);
+    format(u, 100, "ws://127.0.0.1:%d/", port);
+    websocket.Message* m;
+
+    // --- maxClients
+    hub->maxClients = 3;
+    websocket.WebSocket* a = websocket.connect(u);
+    websocket.WebSocket* b = websocket.connect(u);
+    websocket.WebSocket* c = websocket.connect(u);
+    websocket.WebSocket* d = websocket.connect(u);
+    check("the fourth client is refused with 503", a != null && b != null && c != null && d == null && websocket.status() == 503);
+    check("it is counted", hub->stats->rejected == 1 && hub->count() == 3);
+    c->closeWith(1000, null);
+    settle();
+    c->dispose();
+    d = websocket.connect(u);
+    check("when a client leaves there is room again", d != null);
+    hub->maxClients = 1000;
+    d->closeWith(1000, null); settle(); d->dispose();
+    b->closeWith(1000, null); settle(); b->dispose();
+
+    // --- maxMessage: 1009, the others go on
+    hub->maxMessage = 1000;
+    char* big = alloc(2000);
+    for (int i = 0; i < 2000; i++) big[i] = 'x';
+    websocket.WebSocket* x = websocket.connect(u);
+    check("a message of exactly maxMessage is fine", x->sendBinary(big, 1000) && x->receiveMessage() != null);
+    x->sendBinary(big, 1001);
+    m = x->receiveMessage();
+    check("one byte more: the client is closed with 1009", m == null && x->closeCode == 1009);
+    settle();
+    check("onClose saw 1009", lastCode == 1009);
+    x->dispose();
+    a->sendText("still here");
+    m = a->receiveMessage();
+    check("the other client does not notice", m != null && streq(m->data, "got still here"));
+    m->dispose();
+    hub->maxMessage = 1048576;
+
+    // --- a slow reader is cut off, the others are not
+    hub->maxQueued = 200000;
+    conn.Connection* slow = raw(port);
+    check("a raw client upgrades", rawUpgrade(slow, "/slow", "") == 101);
+    int slowId = 0;
+    int ids[10];
+    int n = hub->clientIds(&ids[0], 10);
+    for (int i = 0; i < n; i++) if (strcmp(&hub->find(ids[i])->path[0], "/slow") == 0) slowId = ids[i];
+    check("the hub knows it", slowId != 0);
+    char* chunk = alloc(50000);
+    int sent = 0;
+    int evictedBefore = hub->stats->evicted;
+    for (int i = 0; i < 4000 && hub->stats->evicted == evictedBefore; i++) {
+        hub->sendBinaryTo(slowId, chunk, 50000);
+        hub->poll(0);
+        sent++;
+    }
+    check("it did not read: after a while its queue overflows and it is cut off", hub->stats->evicted == evictedBefore + 1 && hub->find(slowId) == null);
+    check("onClose with 1008", lastCode == 1008);
+    a->sendText("fine");
+    m = a->receiveMessage();
+    check("healthy clients are not affected", m != null && streq(m->data, "got fine"));
+    m->dispose();
+    slow->close();
+    hub->maxQueued = 1048576;
+
+    // --- idle timeout
+    hub->idleTimeoutMs = 120;
+    websocket.WebSocket* idle = websocket.connect(u);
+    int t0 = millis();
+    m = idle->receiveMessage();
+    check("a silent client is closed with 1001 after the idle timeout", m == null && idle->closeCode == 1001 && streq(idle->closeReason, "idle timeout") && millis() - t0 >= 100 && hub->stats->idleClosed >= 1);
+    idle->dispose();
+    hub->idleTimeoutMs = 0;
+
+    // --- ping keepalive: a client that answers stays, one that does not is closed
+    hub->pingIntervalMs = 40;
+    hub->pongTimeoutMs = 150;
+    websocket.WebSocket* alive = websocket.connect(u);
+    conn.Connection* deaf = raw(port);
+    rawUpgrade(deaf, "/deaf", "");
+    m = alive->waitMessage(300);
+    check("a client that answers pings stays connected", m == null && !alive->closed);
+    // the deaf client got pings and never answered: the hub failed it
+    char buf[200];
+    int len;
+    int op = rawRead(deaf, &buf[0], &len);
+    check("the raw client received a ping", op == websocket.OP_PING);
+    int guard = 0;
+    while (op == websocket.OP_PING && guard < 20) { op = rawRead(deaf, &buf[0], &len); guard++; }
+    check("then a close frame with 1011", op == websocket.OP_CLOSE && len >= 2 && (buf[0] & 255) == 3 && (buf[1] & 255) == 0xF3);
+    check("the hub dropped it", hub->count() == 2 && lastCode != 0);
+    deaf->close();
+    hub->pingIntervalMs = 0;
+    alive->closeWith(1000, null); settle(); alive->dispose();
+
+    // --- handshake timeout and slowloris
+    hub->handshakeTimeoutMs = 100;
+    conn.Connection* silent = raw(port);
+    conn.Connection* drip = raw(port);
+    drip->writeText("GET / HTTP/1.1\r\nHost: x\r\n");
+    drip->flush();
+    int timeoutsBefore = hub->stats->timeouts;
+    int s0 = millis();
+    while (millis() - s0 < 250) hub->poll(10);
+    check("a connection that sends nothing is dropped", hub->stats->timeouts >= timeoutsBefore + 2);
+    check("so is one that sends half a request", hub->count() == 1);
+    silent->close();
+    drip->close();
+    hub->handshakeTimeoutMs = 5000;
+
+    // --- upgrades that are refused
+    websocket.Options* o = new websocket.Options();
+    o->authorization = "Bearer abc";
+    char* secret = alloc(100);
+    format(secret, 100, "ws://127.0.0.1:%d/secret", port);
+    websocket.WebSocket* r = websocket.connectWith(secret, o);
+    check("onUpgrade can refuse with 401", r == null && websocket.status() == 401 && streq(seenAuth, "Bearer abc"));
+    char* gone = alloc(100);
+    format(gone, 100, "ws://127.0.0.1:%d/gone", port);
+    check("... or 404", websocket.connect(gone) == null && websocket.status() == 404);
+    check("the callback ran for each, refused upgrades count as rejected", upgradeCalls >= 2 && hub->stats->rejected == 3);
+    hub->wsOptions->origins = "https://good.example";
+    websocket.Options* bad = new websocket.Options();
+    bad->origin = "https://evil.example";
+    check("a foreign Origin is refused with 403", websocket.connectWith(u, bad) == null && websocket.status() == 403);
+    websocket.Options* good = new websocket.Options();
+    good->origin = "https://good.example";
+    websocket.WebSocket* g = websocket.connectWith(u, good);
+    check("the allowed Origin is accepted", g != null);
+    g->closeWith(1000, null); settle(); g->dispose();
+    hub->wsOptions->origins = null;
+    hub->wsOptions->protocols = "v2, v1";
+    websocket.Options* sp = new websocket.Options();
+    sp->protocols = "v1, v2";
+    g = websocket.connectWith(u, sp);
+    check("subprotocol negotiation through the hub", g != null && streq(g->protocol, "v2"));
+    g->closeWith(1000, null); settle(); g->dispose();
+    hub->wsOptions->protocols = null;
+
+    // --- bad requests
+    conn.Connection* bad1 = raw(port);
+    bad1->writeText("this is not http\r\n\r\n");
+    bad1->flush();
+    char line[200];
+    bad1->readLine(&line[0], 200);
+    check("garbage gets 400", startsWith(&line[0], "HTTP/1.1 400"));
+    bad1->close();
+    hub->maxHead = 1000;
+    conn.Connection* bad2 = raw(port);
+    char* longHead = alloc(3000);
+    strcpy(longHead, "GET / HTTP/1.1\r\nHost: x\r\nX-Long: ");
+    for (int i = 0; i < 1500; i++) strcat(longHead, "a");
+    strcat(longHead, "\r\n\r\n");
+    bad2->writeText(longHead);
+    bad2->flush();
+    bad2->readLine(&line[0], 200);
+    check("a head over maxHead gets 431", startsWith(&line[0], "HTTP/1.1 431"));
+    bad2->close();
+    hub->maxHead = 16384;
+    conn.Connection* bad3 = raw(port);
+    check("an upgrade with the wrong version gets 426", rawUpgrade(bad3, "/", "") == 101);
+    bad3->close();
+    conn.Connection* bad4 = raw(port);
+    bad4->writeText("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 8\r\n\r\n");
+    bad4->flush();
+    bad4->readLine(&line[0], 200);
+    check("version 8 gets 426", startsWith(&line[0], "HTTP/1.1 426"));
+    bad4->close();
+    settle();
+
+    // --- fragments and pings through the hub
+    conn.Connection* fr = raw(port);
+    rawUpgrade(fr, "/frag", "");
+    int before = messages;
+    rawFrame(fr, websocket.OP_TEXT, false, "fra", 3);
+    rawFrame(fr, websocket.OP_PING, true, "p", 1);
+    rawFrame(fr, websocket.OP_CONT, false, "gme", 3);
+    rawFrame(fr, websocket.OP_CONT, true, "nt", 2);
+    op = rawRead(fr, &buf[0], &len);
+    check("the hub answers a ping between fragments", op == websocket.OP_PONG && len == 1 && buf[0] == 'p');
+    op = rawRead(fr, &buf[0], &len);
+    buf[len] = 0;
+    check("and delivers the fragmented message once, whole", op == websocket.OP_TEXT && streq(&buf[0], "got fragment") && messages == before + 1);
+    rawFrame(fr, websocket.OP_CLOSE, true, "\x03\xe8", 2);
+    op = rawRead(fr, &buf[0], &len);
+    check("a close frame is answered", op == websocket.OP_CLOSE && len == 2);
+    fr->close();
+    settle();
+
+    // --- permessage-deflate through the hub
+    hub->wsOptions->deflate = true;
+    websocket.Options* dz = new websocket.Options();
+    dz->deflate = true;
+    websocket.WebSocket* z = websocket.connectWith(u, dz);
+    check("deflate is negotiated", z != null && z->deflate && !z->rxTakeover);
+    char* text = alloc(5000);
+    for (int i = 0; i < 4990; i++) text[i] = "abc def "[i % 8];
+    z->sendTextN(text, 4990);
+    m = z->receiveMessage();
+    check("a compressed message makes the round trip", m != null && m->length == 4994 && startsWith(m->data, "got abc"));
+    m->dispose();
+    check("less than 1 KB went over the wire each way", z->bytesOut < 1000 && z->bytesIn < 1200);
+    z->closeWith(1000, null); settle(); z->dispose();
+    hub->wsOptions->deflate = false;
+
+    // --- graceful shutdown
+    websocket.WebSocket* s1 = websocket.connect(u);
+    websocket.WebSocket* s2 = websocket.connect(u);
+    int before2 = closes;
+    // the clients answer the close frames from inside the shutdown loop (the hook does the hub work only: they read here)
+    net.setIdleHook(null);
+    hub->shutdown(1000);
+    check("shutdown: no client is left", hub->count() == 0);
+    m = s1->receiveMessage();
+    check("every client received a close frame with 1001", m == null && s1->closeCode == 1001 && streq(s1->closeReason, "server is shutting down"));
+    m = s2->receiveMessage();
+    check("... all of them", m == null && s2->closeCode == 1001);
+    check("onClose ran for them", closes >= before2 + 2);
+    check("the port is closed", websocket.connect(u) == null);
+    s1->dispose(); s2->dispose(); a->dispose();
+    printf("failures: %d\n", fails);
+    return fails;
+}
