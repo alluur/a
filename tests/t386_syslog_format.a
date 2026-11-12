@@ -1,0 +1,356 @@
+// syslog messages: priorities and names, timestamps (RFC 3339 as RFC 5424 restricts it, the old "Mmm dd hh:mm:ss" with its year guess), building and parsing RFC 5424
+// (the examples of section 6.5 byte for byte, structured data with escaping, the BOM, NILVALUEs, field limits) and RFC 3164 (the examples of section 5.4, tags and pids,
+// missing hosts and priorities), every kind of malformed message, a build / parse round trip with random fields and a fuzz run over random bytes.
+import syslog;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+syslog.Message m;
+
+// parse a text and keep the message in m
+int parseText(char* text, int ref = 1065910455) {
+    return syslog.parse(text, strlen(text), &m, ref);
+}
+
+bool msgIs(char* want) {
+    return m.msgLen == strlen(want) && memcmp(m.msg, want, m.msgLen) == 0;
+}
+
+void errorCase(char* name, char* text, int want) {
+    int e = parseText(text);
+    char line[200];
+    format(&line[0], 200, "%s -> %s", name, syslog.errorText(want), 0, 0);
+    check(&line[0], e == want);
+    if (e != want) printf("     got %d (%s), wanted %d\n", e, syslog.errorText(e), want);
+}
+
+void timeCase(char* text, bool valid, int unix, int usec, int tz) {
+    int u = 0; int us = 0; int t = 0;
+    bool ok = syslog.parseTime5424(text, strlen(text), &u, &us, &t);
+    char line[200];
+    format(&line[0], 200, "timestamp %s is %s", text, valid ? "valid" : "invalid", 0, 0);
+    check(&line[0], ok == valid && (!valid || (u == unix && us == usec && t == tz)));
+}
+
+int rng = 4242;
+int rnd() {
+    rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF;
+    return rng >> 8;
+}
+
+int main() {
+    // ---- priorities and names ---------------------------------------------------------------------------------------------------------------------------
+    char buf[4096];
+    bool allOk = true;
+    for (int f = 0; f < 24; f++) {
+        for (int s = 0; s < 8; s++) {
+            int n = syslog.build5424(&buf[0], 4096, f, s, 0, 0, "h", "a", null, null, null, "x", 1);
+            int e = syslog.parse(&buf[0], n, &m, 1000);
+            if (e != 0 || m.facility != f || m.severity != s || m.priority() != f * 8 + s || !m.hasPri) allOk = false;
+            n = syslog.build3164(&buf[0], 4096, f, s, 0, "h", "t", -1, "x", 1);
+            e = syslog.parse(&buf[0], n, &m, 1000);
+            if (e != 0 || m.facility != f || m.severity != s) allOk = false;
+        }
+    }
+    check("all 192 priorities survive building and parsing (both formats)", allOk);
+    check("names: facilities", streq(syslog.facilityName(0), "kern") && streq(syslog.facilityName(4), "auth") && streq(syslog.facilityName(10), "authpriv") && streq(syslog.facilityName(16), "local0") && streq(syslog.facilityName(23), "local7") && streq(syslog.facilityName(24), "?"));
+    check("names: severities", streq(syslog.severityName(0), "emerg") && streq(syslog.severityName(3), "err") && streq(syslog.severityName(7), "debug") && streq(syslog.severityName(8), "?"));
+    check("parseFacility", syslog.parseFacility("auth") == 4 && syslog.parseFacility("LOCAL3") == 19 && syslog.parseFacility("security") == 13 && syslog.parseFacility("nope") == -1 && syslog.parseFacility("") == -1);
+    check("parseSeverity (also the old names)", syslog.parseSeverity("warning") == 4 && syslog.parseSeverity("warn") == 4 && syslog.parseSeverity("error") == 3 && syslog.parseSeverity("panic") == 0 && syslog.parseSeverity("INFO") == 6 && syslog.parseSeverity("x") == -1);
+
+    // ---- time -----------------------------------------------------------------------------------------------------------------------------------------------
+    char tb[48];
+    int n = syslog.formatTime5424(&tb[0], 1065910455, 3456, 3);
+    check("formatTime5424 with milliseconds", n == 24 && streq(&tb[0], "2003-10-11T22:14:15.003Z"));
+    n = syslog.formatTime5424(&tb[0], 1065910455, 3456, 6);
+    check("... with microseconds", streq(&tb[0], "2003-10-11T22:14:15.003456Z"));
+    n = syslog.formatTime5424(&tb[0], 1065910455, 3456, 0);
+    check("... without a fraction", n == 20 && streq(&tb[0], "2003-10-11T22:14:15Z"));
+    syslog.formatTime5424(&tb[0], 0, 0, 0);
+    check("the epoch", streq(&tb[0], "1970-01-01T00:00:00Z"));
+    syslog.formatTime5424(&tb[0], 1709208000, 0, 0);
+    check("a leap day", streq(&tb[0], "2024-02-29T12:00:00Z"));
+    syslog.formatTime5424(&tb[0], 2147483648, 0, 0);
+    check("2038", streq(&tb[0], "2038-01-19T03:14:08Z"));
+    syslog.formatTime5424(&tb[0], 951868800, 0, 0);
+    check("the day after 2000-02-29", streq(&tb[0], "2000-03-01T00:00:00Z"));
+    syslog.formatTime5424(&tb[0], -1, 0, 0);
+    check("a second before the epoch", streq(&tb[0], "1969-12-31T23:59:59Z"));
+    n = syslog.formatTime3164(&tb[0], 1065910455);
+    check("formatTime3164", n == 15 && streq(&tb[0], "Oct 11 22:14:15"));
+    syslog.formatTime3164(&tb[0], 1790845507);
+    check("... the day is padded with a blank", streq(&tb[0], "Oct  1 09:05:07"));
+    int y = 0; int mo = 0; int d = 0; int h = 0; int mi = 0; int s = 0;
+    syslog.civil(1709208000, &y, &mo, &d, &h, &mi, &s);
+    check("civil", y == 2024 && mo == 2 && d == 29 && h == 12 && mi == 0 && s == 0);
+    timeCase("2003-10-11T22:14:15Z", true, 1065910455, 0, 0);
+    timeCase("2003-10-11T22:14:15.003Z", true, 1065910455, 3000, 0);
+    timeCase("2003-10-11T22:14:15.000003Z", true, 1065910455, 3, 0);
+    timeCase("2003-10-11T22:14:15.5Z", true, 1065910455, 500000, 0);
+    timeCase("2003-08-24T05:14:15.000003-07:00", true, 1061727255, 3, -420);
+    timeCase("2003-10-11T22:14:15+02:00", true, 1065903255 - 0, 0, 120);
+    timeCase("2003-10-11T22:14:15z", true, 1065910455, 0, 0);
+    timeCase("2003-10-11t22:14:15Z", true, 1065910455, 0, 0);
+    timeCase("2003-10-11T23:59:60Z", true, 1065916800, 0, 0);
+    timeCase("2024-02-29T12:00:00Z", true, 1709208000, 0, 0);
+    timeCase("2023-02-29T12:00:00Z", false, 0, 0, 0);
+    timeCase("2003-13-11T22:14:15Z", false, 0, 0, 0);
+    timeCase("2003-00-11T22:14:15Z", false, 0, 0, 0);
+    timeCase("2003-10-32T22:14:15Z", false, 0, 0, 0);
+    timeCase("2003-04-31T22:14:15Z", false, 0, 0, 0);
+    timeCase("2003-10-11T24:14:15Z", false, 0, 0, 0);
+    timeCase("2003-10-11T22:60:15Z", false, 0, 0, 0);
+    timeCase("2003-10-11T22:14:61Z", false, 0, 0, 0);
+    timeCase("2003-10-11T22:14:15", false, 0, 0, 0);
+    timeCase("2003-10-11T22:14:15.Z", false, 0, 0, 0);
+    timeCase("2003-10-11T22:14:15.1234567Z", false, 0, 0, 0);
+    timeCase("2003-10-11T22:14:15+24:00", false, 0, 0, 0);
+    timeCase("2003-10-11T22:14:15+02:60", false, 0, 0, 0);
+    timeCase("2003-10-11T22:14:15+0200", false, 0, 0, 0);
+    timeCase("2003-10-11 22:14:15Z", false, 0, 0, 0);
+    timeCase("2003/10/11T22:14:15Z", false, 0, 0, 0);
+    timeCase("03-10-11T22:14:15Z", false, 0, 0, 0);
+    timeCase("2003-10-11T22:14:15ZZ", false, 0, 0, 0);
+    timeCase("", false, 0, 0, 0);
+    timeCase("-", false, 0, 0, 0);
+
+    // ---- RFC 5424: the examples of section 6.5 ----------------------------------------------------------------------------------------------------------------
+    char* ex1 = "<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - \xEF\xBB\xBF" "'su root' failed for lonvick on /dev/pts/8";
+    int e = parseText(ex1);
+    check("example 1 parses", e == 0 && m.version == 1 && m.facility == 4 && m.severity == 2 && m.timestamp == 1065910455 && m.usec == 3000 && m.tzOffsetMin == 0);
+    check("... the fields", streq(&m.host[0], "mymachine.example.com") && streq(&m.app[0], "su") && streq(&m.procid[0], "") && streq(&m.msgid[0], "ID47") && m.sd == null && m.sdLen == 0);
+    check("... the BOM is recognised and not part of the text", m.bom && msgIs("'su root' failed for lonvick on /dev/pts/8"));
+    n = syslog.build5424(&buf[0], 4096, syslog.FAC_AUTH, syslog.SEV_CRIT, 1065910455, 3000, "mymachine.example.com", "su", null, "ID47", null, "'su root' failed for lonvick on /dev/pts/8", 42, true);
+    check("... and it is built byte for byte", n == strlen(ex1) && memcmp(&buf[0], ex1, n) == 0);
+    char* ex2 = "<165>1 2003-08-24T05:14:15.000003-07:00 192.0.2.1 myproc 8710 - - %% It's time to make the do-nuts.";
+    e = parseText(ex2);
+    check("example 2 (an offset, microseconds, no message id) parses", e == 0 && m.facility == 20 && m.severity == 5 && m.timestamp == 1061727255 && m.usec == 3 && m.tzOffsetMin == -420 && streq(&m.host[0], "192.0.2.1")
+          && streq(&m.app[0], "myproc") && streq(&m.procid[0], "8710") && streq(&m.msgid[0], "") && !m.bom && msgIs("%% It's time to make the do-nuts."));
+    char* ex3 = "<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"] \xEF\xBB\xBF" "An application event log entry...";
+    e = parseText(ex3);
+    check("example 3 (structured data and a message) parses", e == 0 && m.sd != null && m.sdLen == 68 && m.bom && msgIs("An application event log entry..."));
+    char val[64];
+    check("... sdParam finds iut, eventSource and eventID", syslog.sdParam(m.sd, m.sdLen, "exampleSDID@32473", "iut", &val[0], 64) == 1 && streq(&val[0], "3")
+          && syslog.sdParam(m.sd, m.sdLen, "exampleSDID@32473", "eventSource", &val[0], 64) == 11 && streq(&val[0], "Application") && syslog.sdParam(m.sd, m.sdLen, "exampleSDID@32473", "eventID", &val[0], 64) == 4 && streq(&val[0], "1011"));
+    check("... and nothing that is not there", syslog.sdParam(m.sd, m.sdLen, "exampleSDID@32473", "nope", &val[0], 64) == -1 && syslog.sdParam(m.sd, m.sdLen, "other@1", "iut", &val[0], 64) == -1);
+    char* ex4 = "<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"][examplePriority@32473 class=\"high\"]";
+    e = parseText(ex4);
+    check("example 4 (two elements, no message) parses", e == 0 && m.sd != null && m.msgLen == 0 && syslog.sdParam(m.sd, m.sdLen, "examplePriority@32473", "class", &val[0], 64) == 4 && streq(&val[0], "high"));
+    n = syslog.build5424(&buf[0], 4096, syslog.FAC_LOCAL4, syslog.SEV_NOTICE, 1065910455, 3000, "mymachine.example.com", "evntslog", null, "ID47", "[exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"][examplePriority@32473 class=\"high\"]", "", 0);
+    check("... built byte for byte", n == strlen(ex4) && memcmp(&buf[0], ex4, n) == 0);
+
+    // ---- RFC 5424: building ---------------------------------------------------------------------------------------------------------------------------------
+    n = syslog.build5424(&buf[0], 4096, 1, 6, -1, 0, null, null, null, null, null, "hello", 5);
+    check("NILVALUEs for everything that is not given", n == strlen("<14>1 - - - - - - hello") && memcmp(&buf[0], "<14>1 - - - - - - hello", n) == 0);
+    n = syslog.build5424(&buf[0], 4096, 1, 6, 0, 0, "my host", "a b", "p\tid", "m\x01g", null, "x", 1, false, 0);
+    check("blanks and control characters in header fields become _", n == strlen("<14>1 1970-01-01T00:00:00Z my_host a_b p_id m_g - x") && memcmp(&buf[0], "<14>1 1970-01-01T00:00:00Z my_host a_b p_id m_g - x", n) == 0);
+    char longHost[400];
+    memset(&longHost[0], 'h', 300);
+    longHost[300] = 0;
+    n = syslog.build5424(&buf[0], 4096, 1, 6, -1, 0, &longHost[0], "a", null, null, null, "", 0);
+    e = syslog.parse(&buf[0], n, &m, 0);
+    check("a host name of 300 characters is cut to 255", e == 0 && strlen(&m.host[0]) == 255);
+    char longApp[100];
+    memset(&longApp[0], 'a', 60);
+    longApp[60] = 0;
+    n = syslog.build5424(&buf[0], 4096, 1, 6, -1, 0, "h", &longApp[0], &longApp[0], &longApp[0], null, "", 0);
+    e = syslog.parse(&buf[0], n, &m, 0);
+    check("app name 48, process id 128 (60 fits), message id 32", e == 0 && strlen(&m.app[0]) == 48 && strlen(&m.procid[0]) == 60 && strlen(&m.msgid[0]) == 32);
+    check("a message with binary bytes", syslog.build5424(&buf[0], 4096, 1, 6, -1, 0, "h", "a", null, null, null, "a\x00\xFF\n\rb", 6) > 0);
+    n = syslog.build5424(&buf[0], 4096, 1, 6, -1, 0, "h", "a", null, null, null, "a\x00\xFF\n\rb", 6);
+    e = syslog.parse(&buf[0], n, &m, 0);
+    check("... arrives byte for byte", e == 0 && m.msgLen == 6 && m.msg[0] == 'a' && m.msg[1] == 0 && (m.msg[2] & 255) == 255 && m.msg[3] == 10 && m.msg[4] == 13 && m.msg[5] == 'b');
+    check("a buffer that is too small: -1", syslog.build5424(&buf[0], 100, 1, 6, 0, 0, "h", "a", null, null, null, "x", 1) == -1);
+    check("a facility of 24 or a severity of 8: -1", syslog.build5424(&buf[0], 4096, 24, 6, 0, 0, "h", "a", null, null, null, "x", 1) == -1 && syslog.build5424(&buf[0], 4096, 1, 8, 0, 0, "h", "a", null, null, null, "x", 1) == -1 && syslog.build5424(&buf[0], 4096, -1, 6, 0, 0, "h", "a", null, null, null, "x", 1) == -1);
+    check("structured data that is not well formed is refused", syslog.build5424(&buf[0], 4096, 1, 6, 0, 0, "h", "a", null, null, "[broken", "x", 1) == -1 && syslog.build5424(&buf[0], 4096, 1, 6, 0, 0, "h", "a", null, null, "[id k=v]", "x", 1) == -1);
+
+    // ---- structured data: building, escaping, finding -----------------------------------------------------------------------------------------------------------
+    char sd[300];
+    int sl = 0;
+    char* names[3];
+    char* values[3];
+    names[0] = "plain"; values[0] = "value";
+    names[1] = "tricky"; values[1] = "q\"uote \\slash ]bracket";
+    names[2] = "empty"; values[2] = "";
+    check("buildSd escapes \" \\ and ]", syslog.buildSd(&sd[0], 300, &sl, "meta@32473", &names[0], &values[0], 3) && streq(&sd[0], "[meta@32473 plain=\"value\" tricky=\"q\\\"uote \\\\slash \\]bracket\" empty=\"\"]"));
+    check("buildSd appends a second element", syslog.buildSd(&sd[0], 300, &sl, "second@1", &names[0], &values[0], 1) && streq(&sd[sl - 24], "[second@1 plain=\"value\"]"));
+    n = syslog.build5424(&buf[0], 4096, 1, 6, 0, 0, "h", "a", null, null, &sd[0], "text", 4);
+    e = syslog.parse(&buf[0], n, &m, 0);
+    check("a message with this structured data parses", e == 0 && m.sdLen == sl && msgIs("text"));
+    check("sdParam unescapes the value", syslog.sdParam(m.sd, m.sdLen, "meta@32473", "tricky", &val[0], 64) == 22 && streq(&val[0], "q\"uote \\slash ]bracket"));
+    check("... an empty value", syslog.sdParam(m.sd, m.sdLen, "meta@32473", "empty", &val[0], 64) == 0 && streq(&val[0], ""));
+    check("... a value cut to the buffer", syslog.sdParam(m.sd, m.sdLen, "meta@32473", "tricky", &val[0], 6) == 22 && streq(&val[0], "q\"uot"));
+    check("... the second element", syslog.sdParam(m.sd, m.sdLen, "second@1", "plain", &val[0], 64) == 5 && streq(&val[0], "value"));
+    sl = 0;
+    char* badNames[1];
+    badNames[0] = "has space";
+    check("buildSd refuses a parameter name with a blank", !syslog.buildSd(&sd[0], 300, &sl, "id@1", &badNames[0], &values[0], 1));
+    badNames[0] = "a=b";
+    check("... with =", !syslog.buildSd(&sd[0], 300, &sl, "id@1", &badNames[0], &values[0], 1));
+    badNames[0] = "ok";
+    check("... an id with ] or a quote or a blank, an empty id, a long id", !syslog.buildSd(&sd[0], 300, &sl, "i]d", &badNames[0], &values[0], 1) && !syslog.buildSd(&sd[0], 300, &sl, "i\"d", &badNames[0], &values[0], 1) && !syslog.buildSd(&sd[0], 300, &sl, "i d", &badNames[0], &values[0], 1)
+          && !syslog.buildSd(&sd[0], 300, &sl, "", &badNames[0], &values[0], 1) && !syslog.buildSd(&sd[0], 300, &sl, "123456789012345678901234567890123", &badNames[0], &values[0], 1));
+    check("... or a buffer that is too small", !syslog.buildSd(&sd[0], 10, &sl, "meta@32473", &names[0], &values[0], 3));
+
+    // ---- RFC 5424: malformed ----------------------------------------------------------------------------------------------------------------------------------
+    errorCase("an empty message", "", syslog.E_EMPTY);
+    errorCase("a priority without a number", "<>1 - - - - - -", syslog.E_PRI);
+    errorCase("a priority over 191", "<192>1 - - - - - -", syslog.E_PRI);
+    errorCase("a priority of four digits", "<1234>1 - - - - - -", syslog.E_PRI);
+    errorCase("a priority that is not a number", "<abc>1 - - - - - -", syslog.E_PRI);
+    errorCase("a priority with a leading zero", "<034>1 - - - - - -", syslog.E_PRI);
+    errorCase("a negative priority", "<-1>1 - - - - - -", syslog.E_PRI);
+    errorCase("a priority that is not closed", "<34", syslog.E_PRI);
+    errorCase("a priority that is not closed (with text)", "<34 text", syslog.E_PRI);
+    errorCase("version 2", "<34>2 - - - - - -", syslog.E_VERSION);
+    errorCase("an invalid timestamp", "<34>1 2003-13-11T22:14:15Z h a p m -", syslog.E_TIMESTAMP);
+    errorCase("a timestamp without a time zone", "<34>1 2003-10-11T22:14:15 h a p m -", syslog.E_TIMESTAMP);
+    errorCase("the header ends after the timestamp", "<34>1 2003-10-11T22:14:15Z", syslog.E_TRUNCATED);
+    errorCase("the header ends after the host", "<34>1 - host", syslog.E_TRUNCATED);
+    errorCase("the header ends after the msgid", "<34>1 - h a p m", syslog.E_TRUNCATED);
+    errorCase("an empty header field (two blanks)", "<34>1 -  a p m -", syslog.E_FIELD);
+    errorCase("a control character in a header field", "<34>1 - h\x01 a p m -", syslog.E_FIELD);
+    errorCase("a byte over 126 in a header field", "<34>1 - h\xC3\xA9 a p m -", syslog.E_FIELD);
+    errorCase("structured data that is not closed", "<34>1 - h a p m [id k=\"v\"", syslog.E_SD);
+    errorCase("structured data without an end of element", "<34>1 - h a p m [id k=\"v\" x", syslog.E_SD);
+    errorCase("a parameter without a value", "<34>1 - h a p m [id k]", syslog.E_SD);
+    errorCase("a parameter value without quotes", "<34>1 - h a p m [id k=v]", syslog.E_SD);
+    errorCase("an unterminated parameter value", "<34>1 - h a p m [id k=\"v]", syslog.E_SD);
+    errorCase("an unescaped ] in a value", "<34>1 - h a p m [id k=\"a]b\"]", syslog.E_SD);
+    errorCase("an empty SD-ID", "<34>1 - h a p m [ k=\"v\"]", syslog.E_SD);
+    errorCase("an SD-ID with =", "<34>1 - h a p m [i=d k=\"v\"]", syslog.E_SD);
+    errorCase("an SD-ID of 33 characters", "<34>1 - h a p m [123456789012345678901234567890123]", syslog.E_SD);
+    errorCase("an SD-ID with a control character", "<34>1 - h a p m [i\x02 k=\"v\"]", syslog.E_SD);
+    errorCase("text right behind structured data (no blank)", "<34>1 - h a p m [id k=\"v\"]text", syslog.E_SD);
+    errorCase("a dash that goes on", "<34>1 - h a p m -text", syslog.E_SD);
+    e = parseText("<34>1 - h a p m [id k=\"a\\\"b\\\\c\\]d\"] msg");
+    check("escaped \" \\ and ] in a value are fine", e == 0 && syslog.sdParam(m.sd, m.sdLen, "id", "k", &val[0], 64) == 7 && streq(&val[0], "a\"b\\c]d"));
+    e = parseText("<34>1 - h a p m [id]");
+    check("an element without parameters is fine", e == 0 && m.sdLen == 4);
+    e = parseText("<34>1 - h a p m -");
+    check("no message at all is fine", e == 0 && m.msgLen == 0 && m.sd == null);
+    e = parseText("<34>1 - h a p m - ");
+    check("a blank and then nothing: an empty message", e == 0 && m.msgLen == 0);
+    char longHdr[700];
+    memset(&longHdr[0], 'x', 400);
+    longHdr[400] = 0;
+    char big[1000];
+    format(&big[0], 1000, "<34>1 - %s a p m - text", &longHdr[0], 0, 0);
+    e = parseText(&big[0]);
+    check("a host of 400 characters is cut to 255", e == 0 && strlen(&m.host[0]) == 255 && msgIs("text"));
+
+    // ---- RFC 3164 -------------------------------------------------------------------------------------------------------------------------------------------------
+    e = parseText("<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8");
+    check("3164 example 1 parses", e == 0 && m.version == 0 && m.facility == 4 && m.severity == 2 && m.timestamp == 1065910455 && streq(&m.host[0], "mymachine") && streq(&m.app[0], "su") && streq(&m.procid[0], "") && msgIs("'su root' failed for lonvick on /dev/pts/8"));
+    e = parseText("<13>Feb  5 17:32:18 10.0.0.99 Use the BFG!");
+    check("3164 example 2 (no tag: the whole text is the message) parses", e == 0 && m.facility == 1 && m.severity == 5 && streq(&m.host[0], "10.0.0.99") && streq(&m.app[0], "") && msgIs("Use the BFG!"));
+    e = parseText("<165>Aug 24 05:34:00 CST 1987 mymachine myproc[10]: %% It's time to make the do-nuts.  %%  Ingredients: Mix=OK, Jelly=Delicious");
+    check("3164 example 3 (a time zone and a year after the time) parses without a crash", e == 0 && m.facility == 20 && m.severity == 5 && m.timestamp > 0 && m.msgLen > 0);
+    e = parseText("<38>Oct 11 22:14:15 srv sshd[1234]: Failed password for root");
+    check("tag and pid", e == 0 && streq(&m.host[0], "srv") && streq(&m.app[0], "sshd") && streq(&m.procid[0], "1234") && msgIs("Failed password for root"));
+    e = parseText("<38>Oct 11 22:14:15 sshd[1234]: no host here");
+    check("without a host the first word is the tag", e == 0 && streq(&m.host[0], "") && streq(&m.app[0], "sshd") && streq(&m.procid[0], "1234") && msgIs("no host here"));
+    e = parseText("<78>Oct 11 22:14:15 srv CRON[99]: (root) CMD (run-parts /etc/cron.hourly)");
+    check("a message that itself contains colons and brackets", e == 0 && streq(&m.app[0], "CRON") && streq(&m.procid[0], "99") && msgIs("(root) CMD (run-parts /etc/cron.hourly)"));
+    e = parseText("<38>Oct 11 22:14:15 srv app:no blank after the colon");
+    check("no blank after the colon", e == 0 && streq(&m.app[0], "app") && msgIs("no blank after the colon"));
+    e = parseText("<38>Oct 11 22:14:15 srv a-very.long/tag_name123456789012345678901234567890: x");
+    check("a tag of more than 32 characters is not a tag", e == 0 && streq(&m.app[0], "") && msgIs("a-very.long/tag_name123456789012345678901234567890: x"));
+    e = parseText("<38>Oct 11 22:14:15 srv tag[abc]: not a pid");
+    check("a pid that is not a number is not a pid", e == 0 && streq(&m.app[0], "") && streq(&m.procid[0], ""));
+    e = parseText("<38>tag: no timestamp, no host");
+    check("a message without a timestamp (the receiver dates it)", e == 0 && m.timestamp == -1 && streq(&m.app[0], "tag") && msgIs("no timestamp, no host"));
+    e = parseText("<13>");
+    check("a priority and nothing else", e == 0 && m.msgLen == 0 && m.facility == 1 && m.severity == 5);
+    e = parseText("just some text from a device");
+    check("a text without <PRI>: facility user, severity notice", e == 0 && !m.hasPri && m.facility == 1 && m.severity == 5 && msgIs("just some text from a device"));
+    e = parseText("<38>Xyz 11 22:14:15 srv app: bad month");
+    check("an invalid month: it is no timestamp, the text is the message", e == 0 && m.timestamp == -1 && m.msgLen > 20);
+    e = parseText("<38>Feb 30 22:14:15 srv app: no such day");
+    check("February 30 is no timestamp", e == 0 && m.timestamp == -1);
+    e = parseText("<38>Dec 31 23:59:50 srv app: new year", 1767225605);       // received 2026-01-01 00:00:05
+    check("a December message received in January is from the year before", e == 0 && m.timestamp == 1767225590);
+    e = parseText("<38>Oct  1 09:05:07 srv app: padded day", 1790845600);
+    check("a day padded with a blank", e == 0 && m.timestamp == 1790845507 && streq(&m.host[0], "srv"));
+    n = syslog.build3164(&buf[0], 4096, syslog.FAC_AUTH, syslog.SEV_WARNING, 1065910455, "mymachine", "su", 99, "'su root' failed", 16);
+    check("build3164: <36>Oct 11 22:14:15 mymachine su[99]: 'su root' failed", n == strlen("<36>Oct 11 22:14:15 mymachine su[99]: 'su root' failed") && memcmp(&buf[0], "<36>Oct 11 22:14:15 mymachine su[99]: 'su root' failed", n) == 0);
+    n = syslog.build3164(&buf[0], 4096, 1, 6, 1065910455, "h", "tag", -1, "msg", 3);
+    check("... without a pid", memcmp(&buf[0], "<14>Oct 11 22:14:15 h tag: msg", n) == 0 && n == 30);
+    n = syslog.build3164(&buf[0], 4096, 1, 6, -1, "h", "tag", -1, "msg", 3);
+    check("... without a time: no timestamp and no host", n == strlen("<14>tag: msg") && memcmp(&buf[0], "<14>tag: msg", n) == 0);
+    n = syslog.build3164(&buf[0], 4096, 1, 6, 1065910455, "ho st", "ta g", -1, "msg", 3);
+    check("... blanks in the host and the tag become _", memcmp(&buf[0], "<14>Oct 11 22:14:15 ho_st ta_g: msg", n) == 0);
+
+    // ---- a round trip with random fields ----------------------------------------------------------------------------------------------------------------------------
+    int mismatches = 0;
+    for (int round = 0; round < 300; round++) {
+        char host[300];
+        char app[60];
+        char pid[140];
+        char mid[40];
+        int hl = rnd() % 256;
+        int al = rnd() % 49;
+        int pl = rnd() % 129;
+        int ml = rnd() % 33;
+        for (int i = 0; i < hl; i++) host[i] = 33 + rnd() % 94;
+        for (int i = 0; i < al; i++) app[i] = 33 + rnd() % 94;
+        for (int i = 0; i < pl; i++) pid[i] = 33 + rnd() % 94;
+        for (int i = 0; i < ml; i++) mid[i] = 33 + rnd() % 94;
+        host[hl] = 0; app[al] = 0; pid[pl] = 0; mid[ml] = 0;
+        // a field of exactly "-" means NIL
+        if (hl == 1 && host[0] == '-') host[0] = 'x';
+        if (al == 1 && app[0] == '-') app[0] = 'x';
+        if (pl == 1 && pid[0] == '-') pid[0] = 'x';
+        if (ml == 1 && mid[0] == '-') mid[0] = 'x';
+        char text[200];
+        int tl = rnd() % 150;
+        for (int i = 0; i < tl; i++) text[i] = rnd();
+        int fac = rnd() % 24;
+        int sev = rnd() % 8;
+        int ts = rnd() % 2000000000;
+        int us = rnd() % 1000000;
+        n = syslog.build5424(&buf[0], 4096, fac, sev, ts, us, &host[0], &app[0], &pid[0], &mid[0], null, &text[0], tl, false, 6);
+        e = syslog.parse(&buf[0], n, &m, 0);
+        bool same = e == 0 && m.facility == fac && m.severity == sev && m.timestamp == ts && m.usec == us && streq(&m.host[0], &host[0]) && streq(&m.app[0], &app[0]) && streq(&m.procid[0], &pid[0]) && streq(&m.msgid[0], &mid[0]) && m.msgLen == tl && memcmp(m.msg, &text[0], tl) == 0;
+        if (tl > 0 && (text[0] & 255) == 0xEF) same = true;           // a text that starts like a BOM is read as one: not a mismatch of the module
+        if (!same) mismatches++;
+    }
+    check("300 messages with random fields and random message bytes survive build + parse", mismatches == 0);
+
+    // ---- a fuzz run -------------------------------------------------------------------------------------------------------------------------------------------------
+    int errors = 0;
+    int okCount = 0;
+    char junk[400];
+    for (int round = 0; round < 3000; round++) {
+        int len = rnd() % 120;
+        for (int i = 0; i < len; i++) {
+            int k = rnd() % 10;
+            junk[i] = k == 0 ? '<' : (k == 1 ? '>' : (k == 2 ? ' ' : (k == 3 ? '[' : (k == 4 ? ']' : (k == 5 ? '"' : (k == 6 ? '0' + rnd() % 10 : rnd()))))));
+        }
+        if (round % 3 == 0 && len > 6) { junk[0] = '<'; junk[1] = '1'; junk[2] = '3'; junk[3] = '>'; }
+        if (round % 5 == 0 && len > 12) { junk[0] = '<'; junk[1] = '3'; junk[2] = '4'; junk[3] = '>'; junk[4] = '1'; junk[5] = ' '; }
+        e = syslog.parse(&junk[0], len, &m, 1065910455);
+        if (e == 0) {
+            okCount++;
+            // the pointers stay inside the text
+            if (m.msgLen < 0 || m.msgLen > len || m.sdLen < 0 || m.sdLen > len) errors++;
+            if (m.msgLen > 0 && (m.msg < &junk[0] || m.msg + m.msgLen > &junk[0] + len)) errors++;
+            if (m.sdLen > 0 && (m.sd < &junk[0] || m.sd + m.sdLen > &junk[0] + len)) errors++;
+        }
+    }
+    check("fuzz: 3000 random texts: no crash, the pointers of a parsed message stay inside the text", errors == 0 && okCount > 100);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

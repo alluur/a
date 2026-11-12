@@ -1,0 +1,975 @@
+// =============================================================================
+//  syslog - RFC 5424 and RFC 3164 messages, and a sender over UDP, TCP and TLS                                  import syslog;
+//
+//    char buf[2048];
+//    int n = syslog.build5424(&buf[0], 2048, syslog.FAC_AUTH, syslog.SEV_WARNING, datetime.now(), 0, "myhost", "sshd", "4711", "AUTHFAIL", "-", "login failed", 12);
+//    //  <36>1 2026-10-11T22:14:15Z myhost sshd 4711 AUTHFAIL - login failed
+//    syslog.Message m;   if (syslog.parse(&buf[0], n, &m, datetime.now()) == 0) { println(m.app); println(m.msg); }   // both formats, detected
+//
+//    syslog.Sender* s = syslog.newSender("tls://logs.example.org:6514");      // udp://host[:514]  tcp://host[:514]  tls://host[:6514]
+//    s->appName = "myapp";  s->facility = syslog.FAC_LOCAL0;
+//    s->info("service started");  s->error("disk almost full");  s->send(syslog.SEV_NOTICE, "text");
+//    s->flush(2000);  s->dispose();
+//
+//  Messages. The priority is facility * 8 + severity (FAC_ and SEV_ constants, facilityName / severityName and the parsers of the names). build5424 and
+//  build3164 write one message into a buffer (returning its length, -1 if it does not fit): header fields with spaces or control characters get '_', empty
+//  ones become the NILVALUE "-", and over-long ones are cut to the limits of the RFC (host 255, app 48, procid 128, msgid 32). parse() reads either format: <PRI>1 ... is RFC 5424
+//  (timestamp with fractions and offset, structured data checked element by element, the BOM of a UTF-8 message), <PRI>Mmm dd hh:mm:ss host tag[pid]: text is RFC 3164, and
+//  a text without <PRI> is taken as facility user, severity notice. The year of a 3164 timestamp is guessed from the clock you pass. It never reads beyond the
+//  length you give, every field is checked, and a malformed message is an error code, not a crash. Structured data helpers: buildSd (with the escaping of "
+//  \ and ]) and sdParam (finds a parameter and unescapes it).
+//
+//  The sender: UDP sends one datagram per message (cut at maxDatagram, default 2048). TCP and TLS keep a connection, frame messages with octet counting (RFC 6587,
+//  default, the only framing for TLS in RFC 5425) or newline (control characters in the text are then replaced by spaces), connect lazily and without blocking the caller for longer than
+//  connectTimeoutMs (default 1000) once per retryIntervalMs (default 2000), queue what cannot be sent yet (at most maxQueueBytes / maxQueueMessages: more is dropped and counted),
+//  send a message completely again after a reconnect (a frame cut off by a lost connection is never continued) and notice a collector that closed the connection.
+// =============================================================================
+import net;
+import netio;
+import datetime;
+import cstdlib;
+module syslog;
+
+// ---- priorities ------------------------------------------------------------------------------------------------------------------
+public const FAC_KERN = 0;
+public const FAC_USER = 1;
+public const FAC_MAIL = 2;
+public const FAC_DAEMON = 3;
+public const FAC_AUTH = 4;
+public const FAC_SYSLOG = 5;
+public const FAC_LPR = 6;
+public const FAC_NEWS = 7;
+public const FAC_UUCP = 8;
+public const FAC_CRON = 9;
+public const FAC_AUTHPRIV = 10;
+public const FAC_FTP = 11;
+public const FAC_NTP = 12;
+public const FAC_SECURITY = 13;
+public const FAC_CONSOLE = 14;
+public const FAC_CLOCK = 15;
+public const FAC_LOCAL0 = 16;
+public const FAC_LOCAL1 = 17;
+public const FAC_LOCAL2 = 18;
+public const FAC_LOCAL3 = 19;
+public const FAC_LOCAL4 = 20;
+public const FAC_LOCAL5 = 21;
+public const FAC_LOCAL6 = 22;
+public const FAC_LOCAL7 = 23;
+
+public const SEV_EMERG = 0;
+public const SEV_ALERT = 1;
+public const SEV_CRIT = 2;
+public const SEV_ERR = 3;
+public const SEV_WARNING = 4;
+public const SEV_NOTICE = 5;
+public const SEV_INFO = 6;
+public const SEV_DEBUG = 7;
+
+public const FORMAT_5424 = 1;
+public const FORMAT_3164 = 2;
+public const FRAMING_OCTET = 1;
+public const FRAMING_NEWLINE = 2;
+
+public const TRANSPORT_UDP = 1;
+public const TRANSPORT_TCP = 2;
+public const TRANSPORT_TLS = 3;
+
+// parse errors
+public const E_NONE = 0;
+public const E_PRI = 1;                 // a <PRI> that is not a number up to 191
+public const E_VERSION = 2;             // <PRI>2 ... : a version that is not 1
+public const E_TIMESTAMP = 3;
+public const E_FIELD = 4;               // a header field with a character that is not printable ASCII, or an empty field
+public const E_SD = 5;                  // structured data that is not well formed
+public const E_EMPTY = 6;
+public const E_TRUNCATED = 7;           // the header ends too early
+
+public char* errorText(int e) {
+    if (e == E_NONE) return "no error";
+    if (e == E_PRI) return "invalid priority";
+    if (e == E_VERSION) return "unsupported version";
+    if (e == E_TIMESTAMP) return "invalid timestamp";
+    if (e == E_FIELD) return "invalid header field";
+    if (e == E_SD) return "invalid structured data";
+    if (e == E_EMPTY) return "empty message";
+    if (e == E_TRUNCATED) return "message ends inside the header";
+    return "unknown error";
+}
+
+private char* facNames[24];
+private char* sevNames[8];
+private bool namesMade;
+private void makeNames() {
+    if (namesMade) return;
+    namesMade = true;
+    facNames[0] = "kern"; facNames[1] = "user"; facNames[2] = "mail"; facNames[3] = "daemon"; facNames[4] = "auth"; facNames[5] = "syslog";
+    facNames[6] = "lpr"; facNames[7] = "news"; facNames[8] = "uucp"; facNames[9] = "cron"; facNames[10] = "authpriv"; facNames[11] = "ftp";
+    facNames[12] = "ntp"; facNames[13] = "security"; facNames[14] = "console"; facNames[15] = "clock";
+    facNames[16] = "local0"; facNames[17] = "local1"; facNames[18] = "local2"; facNames[19] = "local3";
+    facNames[20] = "local4"; facNames[21] = "local5"; facNames[22] = "local6"; facNames[23] = "local7";
+    sevNames[0] = "emerg"; sevNames[1] = "alert"; sevNames[2] = "crit"; sevNames[3] = "err"; sevNames[4] = "warning"; sevNames[5] = "notice";
+    sevNames[6] = "info"; sevNames[7] = "debug";
+}
+
+public char* facilityName(int f) { makeNames(); return (f >= 0 && f < 24) ? facNames[f] : "?"; }
+public char* severityName(int s) { makeNames(); return (s >= 0 && s < 8) ? sevNames[s] : "?"; }
+
+// the number of a facility name ("auth", "local3", also "security", "authpriv"), -1 if unknown
+public int parseFacility(char* name) {
+    makeNames();
+    for (int i = 0; i < 24; i++) { if (streqi(name, facNames[i])) return i; }
+    if (streqi(name, "mark")) return 1;
+    return -1;
+}
+
+// the number of a severity name (also the old names "panic", "error", "warn"), -1 if unknown
+public int parseSeverity(char* name) {
+    makeNames();
+    for (int i = 0; i < 8; i++) { if (streqi(name, sevNames[i])) return i; }
+    if (streqi(name, "panic")) return 0;
+    if (streqi(name, "error")) return 3;
+    if (streqi(name, "warn")) return 4;
+    return -1;
+}
+
+// ---- time ------------------------------------------------------------------------------------------------------------------------
+private int floorDiv(int a, int b) {
+    int q = a / b;
+    if (a % b != 0 && ((a < 0) != (b < 0))) q--;
+    return q;
+}
+
+// the calendar date of a Unix time (UTC): year, month, day, hour, minute, second
+public void civil(int unix, int* y, int* mo, int* d, int* h, int* mi, int* s) {
+    int days = floorDiv(unix, 86400);
+    int rem = unix - days * 86400;
+    *h = rem / 3600;
+    *mi = rem % 3600 / 60;
+    *s = rem % 60;
+    int z = days + 719468;
+    int era = floorDiv(z, 146097);
+    int doe = z - era * 146097;
+    int yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int yy = yoe + era * 400;
+    int doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int mp = (5 * doy + 2) / 153;
+    *d = doy - (153 * mp + 2) / 5 + 1;
+    *mo = mp < 10 ? mp + 3 : mp - 9;
+    if (*mo <= 2) yy++;
+    *y = yy;
+}
+
+private char* monthNames[12];
+private bool monthsMade;
+private void makeMonths() {
+    if (monthsMade) return;
+    monthsMade = true;
+    monthNames[0] = "Jan"; monthNames[1] = "Feb"; monthNames[2] = "Mar"; monthNames[3] = "Apr"; monthNames[4] = "May"; monthNames[5] = "Jun";
+    monthNames[6] = "Jul"; monthNames[7] = "Aug"; monthNames[8] = "Sep"; monthNames[9] = "Oct"; monthNames[10] = "Nov"; monthNames[11] = "Dec";
+}
+
+// "2003-10-11T22:14:15.003Z" for the time (UTC); fracDigits 0, 3 or 6 (usec is the fraction in microseconds). Returns the length.
+public int formatTime5424(char* out, int unix, int usec, int fracDigits) {
+    int y = 0; int mo = 0; int d = 0; int h = 0; int mi = 0; int s = 0;
+    civil(unix, &y, &mo, &d, &h, &mi, &s);
+    int n = format(out, 40, "%04d-%02d-%02dT%02d:", y, mo, d, h);
+    n = n + format(&out[n], 40 - n, "%02d:%02d", mi, s, 0, 0);
+    if (fracDigits >= 6) n = n + format(&out[n], 40 - n, ".%06d", usec % 1000000, 0, 0, 0);
+    else if (fracDigits >= 3) n = n + format(&out[n], 40 - n, ".%03d", (usec / 1000) % 1000, 0, 0, 0);
+    out[n] = 'Z';
+    out[n + 1] = 0;
+    return n + 1;
+}
+
+// "Oct 11 22:14:15" (the day is padded with a blank: "Oct  1 22:14:15"), UTC. Returns 15.
+public int formatTime3164(char* out, int unix) {
+    makeMonths();
+    int y = 0; int mo = 0; int d = 0; int h = 0; int mi = 0; int s = 0;
+    civil(unix, &y, &mo, &d, &h, &mi, &s);
+    format(out, 24, "%s %2d %02d:%02d:", monthNames[mo - 1], d, h, mi);
+    format(&out[13], 8, "%02d", s, 0, 0, 0);
+    out[15] = 0;
+    return 15;
+}
+
+private int dig2(char* s, int at) {
+    if (s[at] < '0' || s[at] > '9' || s[at + 1] < '0' || s[at + 1] > '9') return -1;
+    return (s[at] - '0') * 10 + (s[at + 1] - '0');
+}
+
+// An RFC 3339 timestamp (as RFC 5424 restricts it): 2003-10-11T22:14:15[.123456](Z|+hh:mm|-hh:mm). n is its length.
+// On success *unix is the time in UTC, *usec the fraction, *tz the offset in minutes. false if it is not valid (month 13, February 30, hour 24, offset 24:00 ...).
+public bool parseTime5424(char* s, int n, int* unix, int* usec, int* tz) {
+    if (n < 20) return false;
+    if (s[4] != '-' || s[7] != '-' || (s[10] != 'T' && s[10] != 't') || s[13] != ':' || s[16] != ':') return false;
+    int y1 = dig2(s, 0);
+    int y2 = dig2(s, 2);
+    int mo = dig2(s, 5);
+    int d = dig2(s, 8);
+    int h = dig2(s, 11);
+    int mi = dig2(s, 14);
+    int sec = dig2(s, 17);
+    if (y1 < 0 || y2 < 0 || mo < 1 || mo > 12 || d < 1 || h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 60) return false;
+    int y = y1 * 100 + y2;
+    if (y < 1) return false;
+    if (d > datetime.daysInMonth(y, mo)) return false;
+    int at = 19;
+    int frac = 0;
+    if (at < n && s[at] == '.') {
+        at++;
+        int digits = 0;
+        while (at < n && s[at] >= '0' && s[at] <= '9') {
+            if (digits < 6) frac = frac * 10 + (s[at] - '0');
+            digits++;
+            at++;
+        }
+        if (digits < 1 || digits > 6) return false;
+        for (int i = digits; i < 6; i++) frac = frac * 10;
+    }
+    int off = 0;
+    if (at < n && (s[at] == 'Z' || s[at] == 'z')) {
+        at++;
+    } else if (at + 6 == n && (s[at] == '+' || s[at] == '-') && s[at + 3] == ':') {
+        int oh = dig2(s, at + 1);
+        int om = dig2(s, at + 4);
+        if (oh < 0 || om < 0 || oh > 23 || om > 59) return false;
+        off = oh * 60 + om;
+        if (s[at] == '-') off = -off;
+        at = at + 6;
+    } else {
+        return false;
+    }
+    if (at != n) return false;
+    *unix = datetime.toUnix(y, mo, d, h, mi, sec) - off * 60;
+    *usec = frac;
+    *tz = off;
+    return true;
+}
+
+// "Oct 11 22:14:15" (15 characters) in the year of refUnix (or the year before when that would be more than a day in the future)
+private bool parseTime3164(char* s, int n, int refUnix, int* unix) {
+    makeMonths();
+    if (n < 15) return false;
+    int mo = 0;
+    for (int i = 0; i < 12; i++) {
+        if (s[0] == monthNames[i][0] && s[1] == monthNames[i][1] && s[2] == monthNames[i][2]) { mo = i + 1; break; }
+    }
+    if (mo == 0 || s[3] != ' ') return false;
+    int d = 0;
+    if (s[4] == ' ') {
+        if (s[5] < '0' || s[5] > '9') return false;
+        d = s[5] - '0';
+    } else {
+        d = dig2(s, 4);
+    }
+    if (d < 1 || s[6] != ' ' || s[9] != ':' || s[12] != ':') return false;
+    int h = dig2(s, 7);
+    int mi = dig2(s, 10);
+    int sec = dig2(s, 13);
+    if (h < 0 || h > 23 || mi < 0 || mi > 59 || sec < 0 || sec > 60) return false;
+    int y = 0; int m2 = 0; int d2 = 0; int hh = 0; int mm = 0; int ss = 0;
+    civil(refUnix, &y, &m2, &d2, &hh, &mm, &ss);
+    if (d > datetime.daysInMonth(y, mo)) return false;
+    int t = datetime.toUnix(y, mo, d, h, mi, sec);
+    if (t > refUnix + 86400) {
+        y--;
+        if (d > datetime.daysInMonth(y, mo)) return false;
+        t = datetime.toUnix(y, mo, d, h, mi, sec);
+    }
+    *unix = t;
+    return true;
+}
+
+// ---- a parsed message -------------------------------------------------------------------------------------------------------------
+// The fields host, app, procid and msgid are copies (cut to the limits of the RFC); sd and msg point into the text that was parsed (valid as long as it is).
+public class Message {
+    public int facility;
+    public int severity;
+    public int version;                 // 1 for RFC 5424, 0 for RFC 3164 (and for a text without <PRI>)
+    public bool hasPri;                 // false: the text had no <PRI> (facility user, severity notice are assumed)
+    public int timestamp;               // Unix time in UTC, -1 if the message has none
+    public int usec;
+    public int tzOffsetMin;             // the offset the sender wrote (the timestamp is UTC already)
+    public char host[256];
+    public char app[49];                // RFC 5424 APP-NAME, RFC 3164 TAG
+    public char procid[129];            // RFC 5424 PROCID, RFC 3164 [pid]
+    public char msgid[33];
+    public char* sd;                    // the structured data text "[id k=\"v\"]..." (not 0 terminated: sdLen), null if none
+    public int sdLen;
+    public char* msg;                   // the message text (not 0 terminated: msgLen)
+    public int msgLen;
+    public bool bom;                    // the message started with the UTF-8 byte order mark (it is not part of msg)
+
+    public void reset() { memset((char*) this, 0, sizeof(Message)); timestamp = -1; }
+    public int priority() { return facility * 8 + severity; }
+}
+
+private bool printable(int c) { return c >= 33 && c <= 126; }
+
+// one header field: from at to the next blank. Copies it into out (at most max - 1 characters, the rest is cut), "-" becomes "". Returns false if a character is not printable or the field is empty.
+private bool field(char* d, int n, int* at, char* out, int max) {
+    int p = *at;
+    int start = p;
+    while (p < n && d[p] != ' ') {
+        if (!printable(d[p] & 255)) return false;
+        p++;
+    }
+    int len = p - start;
+    if (len == 0) return false;
+    if (len == 1 && d[start] == '-') {
+        out[0] = 0;
+    } else {
+        int k = len < max - 1 ? len : max - 1;
+        memcpy(out, &d[start], k);
+        out[k] = 0;
+    }
+    *at = p;
+    return true;
+}
+
+// structured data: "-" or one or more [ID PARAM...]. Returns its length (>= 1) or -1 if it is not well formed.
+private int sdLength(char* d, int n, int start) {
+    if (start >= n) return -1;
+    if (d[start] == '-') return 1;
+    int p = start;
+    while (p < n && d[p] == '[') {
+        p++;
+        int idStart = p;
+        while (p < n && d[p] != ' ' && d[p] != ']' && d[p] != '=' && d[p] != '"') {
+            if (!printable(d[p] & 255)) return -1;
+            p++;
+        }
+        if (p - idStart < 1 || p - idStart > 32) return -1;
+        while (p < n && d[p] == ' ') {
+            p++;
+            int nameStart = p;
+            while (p < n && d[p] != '=' && d[p] != ' ' && d[p] != ']' && d[p] != '"') {
+                if (!printable(d[p] & 255)) return -1;
+                p++;
+            }
+            if (p - nameStart < 1 || p - nameStart > 32) return -1;
+            if (p >= n || d[p] != '=') return -1;
+            p++;
+            if (p >= n || d[p] != '"') return -1;
+            p++;
+            for (;;) {
+                if (p >= n) return -1;
+                if (d[p] == '\\') {
+                    if (p + 1 >= n) return -1;
+                    p = p + 2;
+                } else if (d[p] == '"') {
+                    p++;
+                    break;
+                } else if (d[p] == ']') {
+                    return -1;                  // an unescaped ] inside a value
+                } else {
+                    p++;
+                }
+            }
+        }
+        if (p >= n || d[p] != ']') return -1;
+        p++;
+    }
+    if (p == start) return -1;
+    return p - start;
+}
+
+// Parses a syslog message (RFC 5424 or RFC 3164, or a text without <PRI>). 0 on success, else an error code (errorText). refUnix is the time of reception:
+// it dates RFC 3164 timestamps (which have no year). Nothing is read beyond n bytes.
+public int parse(char* d, int n, Message* m, int refUnix) {
+    m->reset();
+    if (n <= 0) return E_EMPTY;
+    int p = 0;
+    m->facility = FAC_USER;
+    m->severity = SEV_NOTICE;
+    if (d[0] == '<') {
+        int v = 0;
+        int digits = 0;
+        p = 1;
+        while (p < n && d[p] >= '0' && d[p] <= '9' && digits < 4) { v = v * 10 + (d[p] - '0'); p++; digits++; }
+        if (digits < 1 || digits > 3 || p >= n || d[p] != '>' || v > 191) return E_PRI;
+        if (digits > 1 && d[1] == '0') return E_PRI;                // no leading zeros
+        p++;
+        m->hasPri = true;
+        m->facility = v / 8;
+        m->severity = v % 8;
+        if (p < n && d[p] == '1' && p + 1 < n && d[p + 1] == ' ') {
+            m->version = 1;
+            p = p + 2;
+            return parse5424(d, n, p, m);
+        }
+        if (p < n && d[p] >= '0' && d[p] <= '9' && p + 1 < n && d[p + 1] == ' ') return E_VERSION;
+    }
+    return parse3164(d, n, p, m, refUnix);
+}
+
+private int parse5424(char* d, int n, int p, Message* m) {
+    // TIMESTAMP
+    int start = p;
+    while (p < n && d[p] != ' ') p++;
+    if (p >= n) return E_TRUNCATED;
+    if (p - start == 1 && d[start] == '-') {
+        m->timestamp = -1;
+    } else {
+        if (!parseTime5424(&d[start], p - start, &m->timestamp, &m->usec, &m->tzOffsetMin)) { m->timestamp = -1; return E_TIMESTAMP; }
+    }
+    p++;
+    if (!field(d, n, &p, &m->host[0], 256)) return p >= n ? E_TRUNCATED : E_FIELD;
+    if (p >= n) return E_TRUNCATED;
+    p++;
+    if (!field(d, n, &p, &m->app[0], 49)) return p >= n ? E_TRUNCATED : E_FIELD;
+    if (p >= n) return E_TRUNCATED;
+    p++;
+    if (!field(d, n, &p, &m->procid[0], 129)) return p >= n ? E_TRUNCATED : E_FIELD;
+    if (p >= n) return E_TRUNCATED;
+    p++;
+    if (!field(d, n, &p, &m->msgid[0], 33)) return p >= n ? E_TRUNCATED : E_FIELD;
+    if (p >= n) return E_TRUNCATED;
+    p++;
+    int sl = sdLength(d, n, p);
+    if (sl < 0) return E_SD;
+    if (!(sl == 1 && d[p] == '-')) { m->sd = &d[p]; m->sdLen = sl; }
+    p = p + sl;
+    if (p < n) {
+        if (d[p] != ' ') return E_SD;
+        p++;
+        if (p + 2 < n + 0 && (d[p] & 255) == 0xEF && (d[p + 1] & 255) == 0xBB && (d[p + 2] & 255) == 0xBF) {
+            m->bom = true;
+            p = p + 3;
+        }
+        m->msg = &d[p];
+        m->msgLen = n - p;
+    } else {
+        m->msg = &d[n];
+        m->msgLen = 0;
+    }
+    return 0;
+}
+
+private bool tagChar(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '/' || c == '-' || c == '@';
+}
+
+private int parse3164(char* d, int n, int p, Message* m, int refUnix) {
+    m->version = 0;
+    // TIMESTAMP and HOSTNAME
+    if (n - p >= 15 && parseTime3164(&d[p], n - p, refUnix, &m->timestamp)) {
+        p = p + 15;
+        if (p < n && d[p] == ' ') p++;
+        // a hostname, unless the next word is the tag ("su:" or "sshd[123]:")
+        int q = p;
+        while (q < n && d[q] != ' ' && printable(d[q] & 255)) q++;
+        int wl = q - p;
+        bool looksLikeTag = false;
+        for (int i = p; i < q; i++) {
+            if (d[i] == ':' || d[i] == '[') { looksLikeTag = true; break; }
+        }
+        if (wl > 0 && !looksLikeTag && q < n && d[q] == ' ') {
+            int k = wl < 255 ? wl : 255;
+            memcpy(&m->host[0], &d[p], k);
+            m->host[k] = 0;
+            p = q + 1;
+        }
+    }
+    // TAG[pid]: content
+    int t = p;
+    while (t < n && t - p < 33 && tagChar(d[t] & 255)) t++;
+    int tagEnd = t;
+    bool tagged = false;
+    if (t > p && t - p <= 32) {
+        if (t < n && d[t] == ':') {
+            tagged = true;
+            t++;
+        } else if (t < n && d[t] == '[') {
+            int u = t + 1;
+            while (u < n && d[u] >= '0' && d[u] <= '9' && u - t <= 10) u++;
+            if (u > t + 1 && u + 1 < n && d[u] == ']' && d[u + 1] == ':') {
+                int k = u - t - 1;
+                memcpy(&m->procid[0], &d[t + 1], k);
+                m->procid[k] = 0;
+                tagged = true;
+                t = u + 2;
+            }
+        }
+    }
+    if (tagged) {
+        int k = tagEnd - p < 48 ? tagEnd - p : 48;
+        memcpy(&m->app[0], &d[p], k);
+        m->app[k] = 0;
+        p = t;
+        if (p < n && d[p] == ' ') p++;
+    }
+    m->msg = &d[p];
+    m->msgLen = n - p;
+    return 0;
+}
+
+// ---- structured data -------------------------------------------------------------------------------------------------------------
+// Looks for the parameter `name` of the element `id` in structured data text. Copies its value, unescaped (\" \\ \]), into out (0 terminated, cut at max - 1).
+// Returns the length of the value, or -1 if there is no such parameter. The text must be well formed (parse() checked it).
+public int sdParam(char* sd, int sdLen, char* id, char* name, char* out, int max) {
+    int idl = strlen(id);
+    int nl = strlen(name);
+    int p = 0;
+    while (p < sdLen && sd[p] == '[') {
+        p++;
+        int is = p;
+        while (p < sdLen && sd[p] != ' ' && sd[p] != ']') p++;
+        bool mine = (p - is == idl) && memcmp(&sd[is], id, idl) == 0;
+        while (p < sdLen && sd[p] == ' ') {
+            p++;
+            int ns = p;
+            while (p < sdLen && sd[p] != '=') p++;
+            bool want = mine && (p - ns == nl) && memcmp(&sd[ns], name, nl) == 0;
+            p = p + 2;                                      // ="
+            int len = 0;
+            while (p < sdLen && sd[p] != '"') {
+                int c = sd[p];
+                if (c == '\\' && p + 1 < sdLen && (sd[p + 1] == '"' || sd[p + 1] == '\\' || sd[p + 1] == ']')) { p++; c = sd[p]; }
+                if (want && len < max - 1) out[len] = c;
+                if (want) len++;
+                p++;
+            }
+            p++;
+            if (want) {
+                out[len < max - 1 ? len : max - 1] = 0;
+                return len;
+            }
+        }
+        while (p < sdLen && sd[p] != ']') p++;
+        p++;
+    }
+    return -1;
+}
+
+// Builds one element: [id name="value" ...]. Values are escaped, names and the id are checked (printable, none of = blank ] "). Appends to out at *len
+// (max is the size of out); returns false if something is invalid or does not fit.
+public bool buildSd(char* out, int max, int* len, char* id, char** names, char** values, int count) {
+    int n = *len;
+    int idl = strlen(id);
+    if (idl < 1 || idl > 32) return false;
+    if (n + 2 + idl >= max) return false;
+    for (int i = 0; i < idl; i++) { if (!printable(id[i] & 255) || id[i] == '=' || id[i] == ']' || id[i] == '"') return false; }
+    out[n] = '[';
+    n++;
+    memcpy(&out[n], id, idl);
+    n = n + idl;
+    for (int i = 0; i < count; i++) {
+        int nl = strlen(names[i]);
+        if (nl < 1 || nl > 32) return false;
+        for (int k = 0; k < nl; k++) { if (!printable(names[i][k] & 255) || names[i][k] == '=' || names[i][k] == ']' || names[i][k] == '"') return false; }
+        if (n + nl + 4 >= max) return false;
+        out[n] = ' ';
+        n++;
+        memcpy(&out[n], names[i], nl);
+        n = n + nl;
+        out[n] = '=';
+        out[n + 1] = '"';
+        n = n + 2;
+        char* v = values[i];
+        for (int k = 0; v[k] != 0; k++) {
+            if (n + 3 >= max) return false;
+            if (v[k] == '"' || v[k] == '\\' || v[k] == ']') { out[n] = '\\'; n++; }
+            out[n] = v[k];
+            n++;
+        }
+        out[n] = '"';
+        n++;
+    }
+    if (n + 2 >= max) return false;
+    out[n] = ']';
+    n++;
+    out[n] = 0;
+    *len = n;
+    return true;
+}
+
+// ---- building messages -----------------------------------------------------------------------------------------------------------
+// writes a header field: printable characters only (others become '_'), cut at max, "-" when empty. Returns the new position.
+private int putField(char* out, int at, char* s, int max) {
+    int n = s == null ? 0 : strlen(s);
+    if (n == 0) { out[at] = '-'; return at + 1; }
+    if (n > max) n = max;
+    for (int i = 0; i < n; i++) {
+        int c = s[i] & 255;
+        out[at + i] = printable(c) ? c : '_';
+    }
+    return at + n;
+}
+
+// An RFC 5424 message: <PRI>1 TIMESTAMP HOST APP PROCID MSGID SD [MSG]. timestamp < 0: the NILVALUE. sd: structured data text or null / "" for "-".
+// bom: put the UTF-8 byte order mark in front of the text. Returns the length (the buffer also gets a 0 byte if it has room), -1 if it does not fit.
+public int build5424(char* out, int max, int facility, int severity, int timestamp, int usec, char* host, char* app, char* procid, char* msgid, char* sd, char* msg, int msgLen, bool bom = false, int fracDigits = 3) {
+    if (facility < 0 || facility > 23 || severity < 0 || severity > 7 || msgLen < 0) return -1;
+    if (max < 160 + (sd == null ? 0 : strlen(sd)) + msgLen) return -1;
+    int n = format(out, 16, "<%d>1 ", facility * 8 + severity, 0, 0, 0);
+    if (timestamp < 0) { out[n] = '-'; n++; }
+    else n = n + formatTime5424(&out[n], timestamp, usec, fracDigits);
+    out[n] = ' '; n++;
+    n = putField(out, n, host, 255);
+    out[n] = ' '; n++;
+    n = putField(out, n, app, 48);
+    out[n] = ' '; n++;
+    n = putField(out, n, procid, 128);
+    out[n] = ' '; n++;
+    n = putField(out, n, msgid, 32);
+    out[n] = ' '; n++;
+    if (sd == null || sd[0] == 0) {
+        out[n] = '-';
+        n++;
+    } else {
+        int sl = strlen(sd);
+        if (sdLength(sd, sl, 0) != sl) return -1;           // structured data that is not well formed is refused
+        memcpy(&out[n], sd, sl);
+        n = n + sl;
+    }
+    if (msgLen > 0) {
+        out[n] = ' ';
+        n++;
+        if (bom) { out[n] = 0xEF; out[n + 1] = 0xBB; out[n + 2] = 0xBF; n = n + 3; }
+        memcpy(&out[n], msg, msgLen);
+        n = n + msgLen;
+    }
+    if (n < max) out[n] = 0;
+    return n;
+}
+
+// An RFC 3164 message: <PRI>Mmm dd hh:mm:ss HOST TAG[pid]: text. pid < 0: none. timestamp < 0: no timestamp and no host are written (a device that does not know the time).
+public int build3164(char* out, int max, int facility, int severity, int timestamp, char* host, char* tag, int pid, char* msg, int msgLen) {
+    if (facility < 0 || facility > 23 || severity < 0 || severity > 7 || msgLen < 0) return -1;
+    if (max < 120 + msgLen) return -1;
+    int n = format(out, 16, "<%d>", facility * 8 + severity, 0, 0, 0);
+    if (timestamp >= 0) {
+        n = n + formatTime3164(&out[n], timestamp);
+        out[n] = ' ';
+        n++;
+        n = putField(out, n, host, 255);
+        out[n] = ' ';
+        n++;
+    }
+    if (tag != null && tag[0] != 0) {
+        int tl = strlen(tag);
+        if (tl > 32) tl = 32;
+        for (int i = 0; i < tl; i++) out[n + i] = tagChar(tag[i] & 255) ? tag[i] : '_';
+        n = n + tl;
+        if (pid >= 0) n = n + format(&out[n], 16, "[%d]", pid, 0, 0, 0);
+        out[n] = ':';
+        out[n + 1] = ' ';
+        n = n + 2;
+    }
+    if (msgLen > 0) {
+        memcpy(&out[n], msg, msgLen);
+        n = n + msgLen;
+    }
+    if (n < max) out[n] = 0;
+    return n;
+}
+
+// ---- the sender ------------------------------------------------------------------------------------------------------------------
+private char hostCache[256];
+private bool hostCached;
+// the name of this computer (asked once)
+public char* localHostName() {
+    if (!hostCached) {
+        hostCached = true;
+        char* h = net.hostName();
+        int n = strlen(h);
+        if (n > 255) n = 255;
+        memcpy(&hostCache[0], h, n);
+        hostCache[n] = 0;
+        if (n == 0) { hostCache[0] = '-'; hostCache[1] = 0; }
+    }
+    return &hostCache[0];
+}
+
+private char* copyOf(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+public class Sender {
+    public int transport;
+    public int facility;                // default FAC_USER
+    public char* hostName;              // default: the name of this computer
+    public char* appName;               // default "-"
+    public char* procId;                // default: "-"
+    public int format;                  // FORMAT_5424 (default) or FORMAT_3164
+    public int framing;                 // FRAMING_OCTET (default) or FRAMING_NEWLINE (TCP and TLS)
+    public int fracDigits;              // fractions of a second in RFC 5424 timestamps: 0, 3 (default) or 6
+    public int maxMessage;              // longer messages are cut (default 8192; 2048 for UDP)
+    public int maxQueueBytes;           // TCP / TLS: bytes waiting for the connection (default 256 KiB), more is dropped
+    public int maxQueueMessages;        // ... and messages (default 1000)
+    public int connectTimeoutMs;        // default 1000
+    public int retryIntervalMs;         // a failed connection is tried again after this long (default 2000)
+    public bool verify;                 // TLS: check the collector's certificate (default true)
+    public int sent;                    // messages handed to the network (UDP: sent as datagrams; TCP / TLS: completely written)
+    public int dropped;                 // messages that were not queued or sent
+    public int reconnects;              // connections made after the first
+    public int errors;                  // failed sends and failed connection attempts
+    public int now;                     // the clock in seconds for timestamps; 0: datetime.now()
+    public bool heap;
+    public bool ownHost;
+    public bool ownApp;
+    public bool ownProc;
+
+    private char* host;
+    private int port;
+    private int udp;                    // the UDP socket, -1 none
+    private netio.Link* link;
+    private netio.Queue q;
+    private int qlens[1024];            // the length of each queued frame (a ring)
+    private int qhead;
+    private int qcount;
+    private int sentOff;                // bytes of the first frame that have been written to this connection
+    private int lastAttempt;
+    private bool everConnected;
+    private int ip;
+    private char* scratch;
+
+    public Sender() { init(); }
+
+    public void init() {
+        facility = FAC_USER;
+        format = FORMAT_5424;
+        framing = FRAMING_OCTET;
+        fracDigits = 3;
+        maxMessage = 8192;
+        maxQueueBytes = 262144;
+        maxQueueMessages = 1000;
+        connectTimeoutMs = 1000;
+        retryIntervalMs = 2000;
+        verify = true;
+        udp = -1;
+    }
+
+    // a message with the sender's facility, host and application name
+    public bool send(int severity, char* text) { return sendFull(facility, severity, null, null, text, strlen(text)); }
+    public bool debug(char* text) { return send(SEV_DEBUG, text); }
+    public bool info(char* text) { return send(SEV_INFO, text); }
+    public bool notice(char* text) { return send(SEV_NOTICE, text); }
+    public bool warning(char* text) { return send(SEV_WARNING, text); }
+    public bool error(char* text) { return send(SEV_ERR, text); }
+    public bool critical(char* text) { return send(SEV_CRIT, text); }
+
+    // msgid and sd are used by RFC 5424 only (null for "-"); text may contain any bytes (UDP and octet counting) - control characters are replaced by spaces with newline framing
+    public bool sendFull(int fac, int severity, char* msgid, char* sd, char* text, int textLen) {
+        int cap = transport == TRANSPORT_UDP ? (maxMessage > 2048 ? 2048 : maxMessage) : maxMessage;
+        if (scratch == null) scratch = malloc(65536 + 512);
+        if (cap > 65536) cap = 65536;
+        int t = now != 0 ? now : datetime.now();
+        int usec = 0;
+        if (fracDigits > 0) usec = (asysMs() % 1000) * 1000;
+        char* h = hostName != null ? hostName : localHostName();
+        int n = 0;
+        int body = textLen;
+        if (format == FORMAT_5424) {
+            int room = cap - 300 - (sd == null ? 0 : strlen(sd));
+            if (room < 0) room = 0;
+            if (body > room) body = room;
+            n = build5424(scratch, 65536 + 512, fac, severity, t, usec, h, appName, procId, msgid, sd, text, body, false, fracDigits);
+        } else {
+            int room = cap - 300;
+            if (room < 0) room = 0;
+            if (body > room) body = room;
+            n = build3164(scratch, 65536 + 512, fac, severity, t, h, appName, -1, text, body);
+            if (procId != null && procId[0] != 0 && procId[0] != '-') {
+                int pid = 0;
+                bool num = true;
+                for (int i = 0; procId[i] != 0; i++) { if (procId[i] < '0' || procId[i] > '9') num = false; else pid = pid * 10 + (procId[i] - '0'); }
+                if (num) n = build3164(scratch, 65536 + 512, fac, severity, t, h, appName, pid, text, body);
+            }
+        }
+        if (n < 0) { dropped++; return false; }
+        if (n > cap) n = cap;
+        return deliver(scratch, n);
+    }
+
+    private int asysMs() { return datetime.nowMillis(); }
+
+    // sends one finished message (without framing): the transport frames it
+    public bool deliver(char* msg, int n) {
+        if (transport == TRANSPORT_UDP) return deliverUdp(msg, n);
+        // framing
+        int extra = framing == FRAMING_OCTET ? 8 : 1;
+        if (qcount >= maxQueueMessages || qcount >= 1024 || q.pending() + n + extra > maxQueueBytes) { dropped++; return false; }
+        int start = q.pending();
+        if (framing == FRAMING_OCTET) {
+            char hdr[16];
+            int hn = format_(&hdr[0], n);
+            q.add(&hdr[0], hn);
+            q.add(msg, n);
+        } else {
+            for (int i = 0; i < n; i++) {
+                int c = msg[i] & 255;
+                q.addByte(c < 32 || c == 127 ? ' ' : c);
+            }
+            q.addByte(10);
+        }
+        qlens[(qhead + qcount) & 1023] = q.pending() - start;
+        qcount++;
+        pump();
+        return true;
+    }
+
+    private int format_(char* hdr, int n) {
+        int k = syslog_format("%d ", hdr, n);
+        return k;
+    }
+
+    private bool deliverUdp(char* msg, int n) {
+        if (udp < 0) {
+            if (host == null) { dropped++; return false; }
+            ip = net.resolve(host);
+            if (ip < 0) { errors++; dropped++; return false; }
+            udp = net.udpSocket();
+            if (udp < 0) { errors++; dropped++; return false; }
+        }
+        if (net.sendTo(udp, ip, port, msg, n) == n) { sent++; return true; }
+        errors++;
+        dropped++;
+        return false;
+    }
+
+    // connects when it is time to
+    private bool ensureLink() {
+        if (link != null && link->isOpen()) return true;
+        int t = millis();
+        if (lastAttempt != 0 && t - lastAttempt < retryIntervalMs) return false;
+        lastAttempt = t;
+        if (link == null) { link = netio.newLink(); if (link == null) return false; }
+        if (!link->open(host, port, connectTimeoutMs, transport == TRANSPORT_TLS, verify)) { errors++; return false; }
+        if (everConnected) reconnects++;
+        everConnected = true;
+        sentOff = 0;
+        return true;
+    }
+
+    // writes what the connection takes; a frame is only taken out of the queue when all of it is written
+    public void pump() {
+        if (transport == TRANSPORT_UDP || qcount == 0) return;
+        if (!ensureLink()) return;
+        // a collector that closed the connection is noticed here (reading never blocks)
+        char junk[64];
+        int r = link->recv(&junk[0], 64);
+        if (r == 0 || r == -1) { link->close(); sentOff = 0; lastAttempt = 0; errors++; if (!ensureLink()) return; }
+        while (qcount > 0) {
+            int flen = qlens[qhead];
+            int w = link->send(&q.data()[sentOff], flen - sentOff);
+            if (w < 0) { link->close(); sentOff = 0; errors++; return; }
+            if (w == 0) break;
+            sentOff = sentOff + w;
+            if (sentOff >= flen) {
+                q.consume(flen);
+                qhead = (qhead + 1) & 1023;
+                qcount--;
+                sentOff = 0;
+                sent++;
+            }
+        }
+        link->flush();
+    }
+
+    // messages that wait for the connection
+    public int queued() { return qcount; }
+
+    // Waits until everything is written (TCP / TLS). false on a time out.
+    public bool flush(int timeoutMs) {
+        int t0 = millis();
+        for (;;) {
+            pump();
+            if (qcount == 0 && (link == null || !link->hasBacklog())) return true;
+            if (millis() - t0 >= timeoutMs) return false;
+            if (link != null && link->isOpen()) link->waitReadable(5); else sleepMs(5);
+        }
+        return false;
+    }
+
+    public void close() {
+        if (link != null) link->close();
+        if (udp >= 0) { net.close(udp); udp = -1; }
+    }
+
+    public void dispose() {
+        close();
+        if (link != null) { link->dispose(); link = null; }
+        q.release();
+        if (scratch != null) { free(scratch); scratch = null; }
+        if (host != null) { free(host); host = null; }
+        if (hostName != null && ownHost) { free(hostName); }
+        if (appName != null && ownApp) { free(appName); }
+        if (procId != null && ownProc) { free(procId); }
+        hostName = null; appName = null; procId = null;
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
+    }
+
+    // copies that the sender owns (the plain fields only borrow the text you give them)
+    public void setApp(char* app, char* proc) {
+        if (appName != null && ownApp) free(appName);
+        if (procId != null && ownProc) free(procId);
+        appName = app == null ? null : copyOf(app);
+        procId = proc == null ? null : copyOf(proc);
+        ownApp = appName != null;
+        ownProc = procId != null;
+    }
+    public void setHostName(char* h) {
+        if (hostName != null && ownHost) free(hostName);
+        hostName = h == null ? null : copyOf(h);
+        ownHost = hostName != null;
+    }
+
+    public void setTarget(char* h, int p) {
+        if (host != null) free(host);
+        host = copyOf(h);
+        port = p;
+    }
+}
+
+// the text "%d " for a number into hdr: the octet count of a frame
+private int syslog_format(char* fmt, char* hdr, int n) {
+    return format(hdr, 16, fmt, n, 0, 0, 0);
+}
+
+// A Sender for a URL: udp://host[:514], tcp://host[:514] or tls://host[:6514]. null if the URL is not valid. Nothing is connected yet.
+public Sender* newSender(char* url) {
+    int transport = 0;
+    int i = 0;
+    int port = 514;
+    if (startsWith(url, "udp://")) { transport = TRANSPORT_UDP; i = 6; }
+    else if (startsWith(url, "tcp://")) { transport = TRANSPORT_TCP; i = 6; }
+    else if (startsWith(url, "tls://")) { transport = TRANSPORT_TLS; i = 6; port = 6514; }
+    else return null;
+    char hostBuf[256];
+    int hl = 0;
+    while (url[i] != 0 && url[i] != ':' && url[i] != '/') {
+        if (hl >= 255) return null;
+        hostBuf[hl] = url[i];
+        hl++;
+        i++;
+    }
+    hostBuf[hl] = 0;
+    if (hl == 0) return null;
+    if (url[i] == ':') {
+        i++;
+        port = 0;
+        while (isDigit(url[i])) {
+            port = port * 10 + (url[i] - '0');
+            if (port > 65535) return null;
+            i++;
+        }
+        if (port == 0) return null;
+    }
+    if (url[i] != 0 && url[i] != '/') return null;
+    Sender* s = (Sender*) malloc(sizeof(Sender));
+    if (s == null) return null;
+    s->init();
+    s->heap = true;
+    s->transport = transport;
+    s->setTarget(&hostBuf[0], port);
+    if (transport == TRANSPORT_UDP) s->maxMessage = 2048;
+    return s;
+}
