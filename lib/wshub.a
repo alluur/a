@@ -183,6 +183,9 @@ public class Hub {
     public httpx.Response* res;
     public char* rbuf;
     public char* fbuf;
+    public int rejFd[16];           // refused connections (503) that are given a moment to read the answer: closing a socket with unread data resets it,
+    public int rejAt[16];           // and the reset can destroy the answer before the client has read it
+    public int nrej;
 
     public Hub() {
         maxClients = 1000;
@@ -675,6 +678,43 @@ public class Hub {
     }
 
     // ---- accepting -----------------------------------------------------------------------------------------------------------------------------
+    // the answer to a refused connection is on its way: tell the peer that nothing more comes (FIN), read away what it sent, and close when it has hung up or
+    // after a second. (An immediate close() with the request still unread makes the system send a reset, and on some systems, Windows among them, the reset
+    // arrives before the answer has been read.) Sixteen such connections at a time; beyond that the socket is simply closed.
+    private void refuse(int fd) {
+        net.shutdown(fd, 1);
+        if (nrej >= 16) {
+            net.rawClose(fd);
+            return;
+        }
+        rejFd[nrej] = fd;
+        rejAt[nrej] = now;
+        nrej++;
+        drainRefused();
+    }
+
+    // reads away what refused peers sent; closes the ones that hung up or waited too long
+    private void drainRefused() {
+        int i = 0;
+        while (i < nrej) {
+            bool done = false;
+            for (int round = 0; round < 4 && !done; round++) {
+                int n = net.recvSome(rejFd[i], rbuf, 16384);
+                if (n == -2) break;
+                if (n <= 0) done = true;
+            }
+            if (!done && now - rejAt[i] > 1000) done = true;
+            if (done) {
+                net.rawClose(rejFd[i]);
+                nrej--;
+                rejFd[i] = rejFd[nrej];
+                rejAt[i] = rejAt[nrej];
+            } else {
+                i++;
+            }
+        }
+    }
+
     private void acceptNew() {
         for (int k = 0; k < 32; k++) {
             int fd = net.acceptSome(listenFd);
@@ -687,7 +727,7 @@ public class Hub {
                 // full: a short answer, then goodbye (the socket is non-blocking: best effort)
                 char* msg = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
                 if (tlsConfig == null) net.sendSome(fd, msg, strlen(msg));
-                net.rawClose(fd);
+                refuse(fd);
                 stats->rejected++;
                 continue;
             }
@@ -1016,6 +1056,7 @@ public class Hub {
 
     // ---- timers -----------------------------------------------------------------------------------------------------------------------------------
     private void timers() {
+        if (nrej > 0) drainRefused();
         for (int i = 0; i < nclients; i++) {
             Client* c = clients[i];
             if (c->dead) continue;
@@ -1178,7 +1219,8 @@ public class Hub {
             int tn = tls.outLength(c->tlsSession);
             if (tn > 0) net.sendSome(c->fd, tls.outData(c->tlsSession), tn);
         }
-        net.rawClose(c->fd);
+        if (c->kind == KIND_LINGER) net.rawClose(c->fd);        // (a closing WebSocket has been shut down and read to its end already)
+        else refuse(c->fd);                                     // the last answer (an error, "Connection: close") must not be destroyed by a reset
         c->fd = -1;
         if (c->tlsSession != null) {
             tls.release(c->tlsSession);                          // its buffers serve the next TLS client
@@ -1253,6 +1295,10 @@ public class Hub {
             if (clients[i]->deadCode == 0) clients[i]->deadCode = 1001;
         }
         reap();
+        while (nrej > 0) {
+            nrej--;
+            net.rawClose(rejFd[nrej]);
+        }
         stopping = false;
     }
 }
