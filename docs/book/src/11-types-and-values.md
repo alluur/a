@@ -43,7 +43,7 @@ What to notice:
 
 ## char and byte
 
-`char` is one **unsigned** byte, with values 0 to 255. It holds characters of text and raw data. `byte` is another name for it. A character literal such as `'a'` is a `char` and is also an integer, so you can calculate with it.
+`char` is one **unsigned** byte, with values 0 to 255. It holds characters of text and raw data. `byte` is another name for it. A character literal such as `'a'` is just a number, the character code (97), so you can calculate with it. It has the type of an `int`: `sizeof('a')` is 8, while a `char` variable takes 1 byte.
 
 {{sample lang/char_byte}}
 
@@ -148,7 +148,7 @@ What to notice:
 | decimal | `42`, `1_000_000` |
 | hexadecimal | `0xFF`, `0xDEADBEEF` |
 | binary | `0b1010` |
-| character | `'a'`, `'\n'`, `'\0'`, `'\x41'` (type `char`) |
+| character | `'a'`, `'\n'`, `'\0'`, `'\x41'` (an integer: the character code) |
 | boolean | `true`, `false` |
 | null pointer | `null` |
 
@@ -190,7 +190,7 @@ What to notice:
 
 ### Literals, conversions and operators
 
-A floating point literal has a decimal point or an exponent: `1.5`, `2e-3`, `1_000.25`. It is rounded exactly (to nearest, ties to even), like a C compiler does. An `int` in a mixed expression is converted to `double`. Assigning a `double` to an `int` needs a **cast**, which truncates toward zero. The operators `+ - * /`, unary `-`, the six comparisons, `+= -= *= /=`, `++`, `--`, `?:` and the truth test (`if (d)` is true when `d != 0`) all work.
+A floating point literal has a decimal point or an exponent: `1.5`, `2e-3`, `1_000.25`. It is rounded exactly (to nearest, ties to even), like a C compiler does. An `int` in a mixed expression is converted to `double`. Converting a `double` to an `int` truncates toward zero. Write the **cast** `(int) d` to show that you mean it: the compiler also accepts `int i = d;` and passing a `double` to an `int` parameter without any warning, and gives the same truncated value. The operators `+ - * /`, unary `-`, the six comparisons, `+= -= *= /=`, `++`, `--`, `?:` and the truth test (`if (d)` is true when `d != 0`) all work.
 
 {{sample lang/double_values}}
 

@@ -22,7 +22,7 @@ What to notice:
 - `compute()` is called before the line where it is defined. Functions may appear in any order, and you never need to write a prototype.
 - A comment is either `// to the end of the line` or `/* a block */`. Block comments do not nest.
 - Statements end with `;`. Whitespace is not significant.
-- Declare types, constants and enums before the declarations that use them: a function signature, a field, an array size or another constant. A function body may refer to a type or constant that comes later, but putting them first always works. A class that extends another one must come after its base class.
+- Declare types, constants and enums before the declarations that use them: a function signature, a field, the size of a global array or another constant. A function body may refer to a type or constant that comes later, but putting them first always works. A class that extends another one must come after its base class.
 
 ::: note
 

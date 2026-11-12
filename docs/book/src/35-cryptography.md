@@ -78,7 +78,7 @@ An HMAC mixes a secret key into the hash. Whoever knows the key can compute the 
 * The receiver computes the tag again and compares it with the one that came with the message. **Compare with `hash.equalConstantTime`**. A normal comparison stops at the first different byte, and the time it takes tells an attacker how many bytes were right, one byte at a time.
 * `hash.hmac(bits, ...)` returns the length of the tag, like `digest`.
 
-For speed, here is what was measured on a 2.1 GHz Intel Xeon virtual machine (x86-64 Linux, one core in use, the best of five runs): SHA-256 hashed about 200 MB per second and SHA-512 about 300 MB per second (16 MB of data), ChaCha20-Poly1305 sealed about 14 MB per second and AES-128-GCM about 3 MB per second (1 MB of data). Your numbers will differ with the machine, but the order should not: hashes are fast, ChaCha20-Poly1305 is slower, and AES-GCM is the slowest. All of them are plain A code with no processor instructions for cryptography, so they are fine for small messages and short connections, and slow for bulk data.
+For speed, here is what was measured on a 2.1 GHz Intel Xeon virtual machine (x86-64 Linux, one core in use, the best of five runs): SHA-256 hashed about 200 MB per second and SHA-512 about 300 MB per second (16 MB of data), ChaCha20-Poly1305 sealed about 14 MB per second and AES-128-GCM about 3 MB per second (1 MB of data). Your numbers will differ with the machine (on a busy, shared machine a run can take twice as long), but the order should not: hashes are fast, ChaCha20-Poly1305 is slower, and AES-GCM is the slowest. None of them uses the special processor instructions for cryptography (AES-NI, SHA extensions). The ciphers and the signature code are plain A code, and so is SHA-2 on the other targets; on x86-64 the compression step of SHA-256 and SHA-512 is a block of hand written machine code (ordinary integer instructions), which is why those two are so much faster than the ciphers. So the ciphers are fine for small messages and short connections, and slow for bulk data.
 
 ## Authenticated encryption
 
@@ -319,7 +319,7 @@ A session is a state machine that does no input or output itself. It has a buffe
 **What to notice.**
 
 * `tls.clientOnly(host, verify, 0x1303)` offers one cipher suite only (0x1301 AES-128-GCM, 0x1302 AES-256-GCM, 0x1303 ChaCha20-Poly1305). `tls.client(host, verify)` offers all three and lets the server choose.
-* The key exchange is X25519, the certificate signature is checked with `rsa` or `ec`, the certificate chain with `x509`, and the records are sealed with `aes` or `chacha`. Nothing else is involved.
+* The key exchange is X25519, the certificate signature is checked with `rsa` or `ec`, the certificate chain with `x509`, and the records are sealed with `aes` or `chacha`. The other two helpers are `hash` (the transcript hash, HMAC and the key schedule) and `secure` (random numbers). Nothing else is involved.
 * `tls.shutdown` sends a `close_notify`, so that the other side knows the end of the data was not cut by an attacker.
 * The certificate and the key in the helper module `pki.a` are test material. The private key is public.
 
