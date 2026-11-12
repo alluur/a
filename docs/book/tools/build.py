@@ -191,6 +191,88 @@ def expand_directives(text, chapter_name):
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------------------------------------------- sample index
+def all_samples():
+    """[(name, main file)] of every sample under samples/."""
+    out = []
+    for root, dirs, files in os.walk(SAMPLES):
+        dirs.sort()
+        rel = os.path.relpath(root, SAMPLES)
+        if rel != "." and os.path.exists(os.path.join(root, "main.a")):
+            out.append((rel, os.path.join(root, "main.a")))
+            dirs[:] = []
+            continue
+        for f in sorted(files):
+            if f.endswith(".a"):
+                out.append((os.path.join(rel, f[:-2]) if rel != "." else f[:-2], os.path.join(root, f)))
+    return out
+
+
+def gen_samples_index(chapters_all, gen_dir):
+    """Appendix: every sample, the chapter that shows it, and for every library module the samples that import it (a coverage report)."""
+    used = {}                                        # sample name -> chapter
+    for c in chapters_all:
+        src = os.path.join(BOOK, c.path) if not c.path.startswith("gen:") else None
+        if not src or not os.path.exists(src):
+            continue
+        for line in open(src, encoding="utf-8"):
+            m = DIRECTIVE.match(line.strip())
+            if m and m.group(1) == "sample":
+                used.setdefault(m.group(2), c)
+    libdir = os.path.join(REPO, "lib")
+    modules = sorted(f[:-2] for f in os.listdir(libdir) if f.endswith(".a"))
+    clib_members = set(re.findall(r"^\s*import\s+(\w+)\s*;", open(os.path.join(libdir, "clib.a"), encoding="utf-8").read(), re.M)) if os.path.exists(os.path.join(libdir, "clib.a")) else set()
+    by_module = {m: [] for m in modules}
+    rows = []
+    for name, main in all_samples():
+        meta, title = sample_meta(main)
+        text = open(main, encoding="utf-8", errors="replace").read()
+        imports = set(re.findall(r"^\s*import\s+([A-Za-z0-9_]+)\s*;", text, re.M))
+        if "clib" in imports:
+            imports |= clib_members
+        for d in os.path.dirname(main), :
+            for f in os.listdir(d) if os.path.isfile(os.path.join(d, "main.a")) and d != SAMPLES else []:
+                if f.endswith(".a") and f != "main.a":
+                    imports |= set(re.findall(r"^\s*import\s+([A-Za-z0-9_]+)\s*;", open(os.path.join(d, f), encoding="utf-8", errors="replace").read(), re.M))
+        kind = "window" if meta.get("gui") else ("terminal" if meta.get("tui") else ("compiled" if meta.get("compile-only") else "run"))
+        ch = used.get(name)
+        rows.append((name, title or name, kind, ch))
+        for m in imports:
+            if m in by_module:
+                by_module[m].append((name, ch))
+    nsamples = len(rows)
+    lines = ["# Code sample index {#chap-samples}", "",
+             "The book contains **%d code samples**. Each one was compiled for all targets and (except the programs that need a window, a terminal or a network) run when the book was built; "
+             "the output shown under a listing is what it printed. *run* means compiled and executed, *window* a graphical program that was photographed, "
+             "*terminal* a program that was run in a pseudo terminal, *compiled* a program that was built and checked for every target but not run." % nsamples, "",
+             "## Which samples use which module", "", "| Module | Samples |", "|---|---|"]
+    missing = []
+    for m in modules:
+        lst = by_module[m]
+        if not lst and m == "std":
+            lines.insert(lines.index("| Module | Samples |"), "(`std`, the prelude with `print`, `strlen`, `rand` ..., is imported by every program, so it is not listed.)\n")
+            continue
+        if not lst:
+            missing.append(m)
+            continue
+        names = []
+        for n, ch in sorted(lst)[:8]:
+            names.append("[`%s`](#chap-%s)" % (n, ch.slug) if ch else "`%s`" % n)
+        more = " and %d more" % (len(lst) - 8) if len(lst) > 8 else ""
+        lines.append("| [`%s`](#api-%s) | %s%s |" % (m, m, ", ".join(names), more))
+    if missing:
+        lines += ["", "Modules without a sample of their own in this book (they are used through the modules above, or are internal parts of bigger ones): " + ", ".join("`%s`" % m for m in missing) + ".", ""]
+    lines += ["", "## All samples", "", "| Sample | What it shows | Kind | Where |", "|---|---|---|---|"]
+    for name, title, kind, ch in rows:
+        lines.append("| `%s` | %s | %s | %s |" % (name, title.replace("|", "\\|"), kind, "[%s](#chap-%s)" % (ch.title.replace("|", "\\|"), ch.slug) if ch else "(not in a chapter)"))
+    lines.append("")
+    orphans = [n for n, t, k, c in rows if c is None]
+    sys.stderr.write("samples: %d, modules without a sample: %d, samples not in any chapter: %d\n" % (nsamples, len(missing), len(orphans)))
+    if missing:
+        sys.stderr.write("  no sample for: %s\n" % " ".join(missing))
+    open(os.path.join(gen_dir, "samples.md"), "w", encoding="utf-8").write("\n".join(lines))
+
+
 # ---------------------------------------------------------------------------------------------------------------- pandoc / AST
 def pandoc_json(markdown_text, name):
     r = subprocess.run(["pandoc", "-f", READER, "-t", "json"], input=markdown_text.encode("utf-8"), capture_output=True)
@@ -614,7 +696,8 @@ def main():
     ap.add_argument("--code")
     ap.add_argument("--release", default="release")
     ap.add_argument("--lint", action="store_true", help="read everything and report problems, write nothing")
-    ap.add_argument("--downloads", nargs="*", default=[], help="LABEL=FILE pairs offered on the title page (copied into the site)")
+    ap.add_argument("--downloads", nargs="*", default=[], help="LABEL=FILE pairs offered on the title page (the files are copied into the site)")
+    ap.add_argument("--link", nargs="*", default=[], help="LABEL=HREF pairs offered on the title page (a relative link, nothing is copied)")
     a = ap.parse_args()
     ver, code = version_info()
     code = a.code or code
@@ -631,6 +714,7 @@ def main():
         err("api.py failed: " + r.stderr[-500:])
 
     chapters, parts = read_chapters()
+    gen_samples_index(chapters, gen)
     ok_chapters = []
     for c in chapters:
         src = chapter_source(c, gen)
@@ -698,6 +782,9 @@ def main():
                 os.makedirs(os.path.join(site, "downloads"), exist_ok=True)
                 shutil.copy(f, os.path.join(site, "downloads", os.path.basename(f)))
                 downloads.append((label, "downloads/" + os.path.basename(f), ""))
+        for item in a.link:
+            label, _, href = item.partition("=")
+            downloads.append((label, href, ""))
         # screenshots: rewrite the absolute image paths of the html tree
         shotnames = set()
         for i, c in enumerate(chapters):

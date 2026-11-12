@@ -6,7 +6,7 @@
 #    make test-all   test every target (needs wine64 and qemu-user, see docs/TARGETS.md)
 #    make examples   compile every example for every target
 #    make dist       release binary               -> dist/ac-<code>-<release>.elf
-#    make book       the book (HTML + EPUB)       -> build/book/html, dist/a-book-<code>-<release>.epub
+#    make book       the book (HTML + EPUB)       -> dist/a-docs-<code>-<release>.zip, dist/a-book-<code>-<release>.epub
 #    make deb        Debian package               -> dist/a-<code>-<release>.deb
 #    make install    install to $(PREFIX) (default /usr/local)
 #
@@ -60,11 +60,19 @@ deb: build/ac
 	@ls -l dist/a-$(STEM).deb
 
 # the book "The A Programming Language": HTML site and EPUB (docs/book/, needs python3 and pandoc)
+#   build/book/html   the site that goes into the Debian package (links to the EPUB next to it)
+#   dist/a-docs-<code>-<release>.zip   the same site as one file, with the EPUB as a download
+#   dist/a-book-<code>-<release>.epub  the e-book
 book: build/ac
-	python3 docs/book/tools/build.py --out build/book --code $(VERSION_CODE) --release $(RELEASE)
+	python3 docs/book/tools/build.py --out build/book --code $(VERSION_CODE) --release $(RELEASE) \
+	    --link "E-book (EPUB)=../a-book-$(STEM).epub"
+	python3 docs/book/tools/build.py --only html --out build/book --html build/book/site --code $(VERSION_CODE) --release $(RELEASE) \
+	    --downloads "E-book (EPUB)=build/book/a-book-$(STEM).epub"
 	@mkdir -p dist
 	cp build/book/a-book-$(STEM).epub dist/a-book-$(STEM).epub
-	@ls -l dist/a-book-$(STEM).epub
+	rm -f dist/a-docs-$(STEM).zip
+	cd build/book/site && zip -qr ../../../dist/a-docs-$(STEM).zip .
+	@ls -l dist/a-book-$(STEM).epub dist/a-docs-$(STEM).zip
 
 # compile and run every code sample of the book and compare the output with the recorded one
 book-samples: build/ac
