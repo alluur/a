@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes tests/t304_switch_big.a and .out: switch statements with 1000 text labels (many of them with the same hash) and 1000
+"""Writes tests/t304_switch_big.a and .out (and the error test t304_err_switch_toomany): switch statements with 1000 text labels (many of them with the same hash) and 1000
 integer labels (numbers beyond 32 bits, negative numbers, ranges), checked against the table they were made from.
 Run:  python3 tests/gen/gen_switch_big.py     (Python is only needed to regenerate the test, not to run it)"""
 import random, os
@@ -146,4 +146,8 @@ int main() {{
 open(os.path.join(tests, "t304_switch_big.a"), "w").write(src)
 out = "words: 0 wrong, sum %d\nmisses that matched: 0, null: 0\nnumbers: %d hits, sum %d\n" % (sum(range(1, 1001)), exp_hits, exp_sum)
 open(os.path.join(tests, "t304_switch_big.out"), "w").write(out)
+# a switch with more labels than the compiler takes (4096): the error test
+many = "".join("        case %d: return %d;\n" % (i, i) for i in range(4097))
+open(os.path.join(tests, "t304_err_switch_toomany.a"), "w").write("int f(int n) {\n    switch (n) {\n" + many + "    }\n    return 0;\n}\nint main() { return f(1); }\n")
+open(os.path.join(tests, "t304_err_switch_toomany.err"), "w").write("too many case labels")
 print("wrote t304_switch_big:", len(words), "words,", len(ent), "numbers,", len(misses), "misses,", len(probes), "probes")
