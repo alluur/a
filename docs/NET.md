@@ -30,7 +30,7 @@ ws->dispose();                                                              // f
 Options (`websocket.Options`, pass to `connectWith(url, options)`): `verify` (check the server certificate; `websocket.setVerify(false)` changes
 the default, like `http.setVerify`), `origin`, `protocols` ("chat, superchat"), `cookie`, `authorization`, `headers` (more request lines),
 `deflate`, `maxMessage`, `maxFrame`, `connectTimeoutMs`, `handshakeTimeoutMs`. Values with CR, LF or other control characters are refused
-before a connection is made (no header injection); the Sec-WebSocket-Key and every mask come from the secure random generator.
+before a connection is made (no header injection); the Sec-WebSocket-Key and every mask come from the operating system's random generator.
 After the handshake `ws->protocol` is the subprotocol the server chose (`""` if none) and `ws->deflate` says whether compression is on.
 
 A blocking server, one connection per call:
@@ -212,7 +212,7 @@ c->notify("log", params);   jsonrpc.Batch* b = c->batch();  int i = b->add("add"
 The dispatcher follows the specification: requests, notifications, batches (answers only for requests, nothing for a batch of notifications, an empty batch is an Invalid Request),
 ids that are strings, numbers or null (anything else is an Invalid Request), `params` that are arrays or objects, the codes -32700 -32600 -32601 -32602 -32603, reserved `rpc.` names.
 Limits: 100 requests per batch, 1 MiB per message, 200 levels of nesting (the JSON parser's limit). Results, error data and the whole request tree are freed by the module: a server runs in constant memory.
-Params that you pass to a client call stay yours. Not supported: calls from the server to the client over one connection (server notifications are delivered to `onNotification`).
+A handler returns a new value (never `params` or a part of it: the module frees the request tree and the result separately). Params that you pass to a client call stay yours. Not supported: calls from the server to the client over one connection (server notifications are delivered to `onNotification`).
 
 ## Waiting without threads: `net.setIdleHook`
 
