@@ -661,7 +661,7 @@ is_type_start_impl:
     cmp ecx, S_ENUM
     je .maybe_dot
     cmp ecx, S_TYPEDEF
-    je .yes
+    je .maybe_dot
     cmp ecx, S_MODULE
     jne .no
     ; module.Type ?  look ahead
@@ -684,7 +684,7 @@ is_type_start_impl:
     jz .la_done
     mov ecx, [rax+SYM_KIND]
     cmp ecx, S_TYPEDEF
-    je .la_yes
+    je .la_cls
     cmp ecx, S_STRUCT
     je .la_cls
     cmp ecx, S_ENUM
@@ -2115,6 +2115,18 @@ parse_primary:
     je .enumname
     cmp eax, S_STRUCT
     je .structname
+    cmp eax, S_TYPEDEF
+    jne .notalias
+    cmp qword [tk], '.'                 ; typedef Cls Alias;  Alias.member  is the same as  Cls.member
+    jne .notalias
+    mov rcx, [r12+SYM_TYPE]
+    movzx edx, cx
+    cmp edx, TY_STRUCT                  ; a plain class or struct, no pointer, no array
+    jne .notalias
+    shr rcx, 16
+    movzx ebx, cx
+    jmp .sn1
+.notalias:
     ERR "a type name cannot be used as a value"
 
 .local:
