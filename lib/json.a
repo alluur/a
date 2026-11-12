@@ -15,10 +15,15 @@
 //  Numbers: whole numbers are exact ints. Numbers with a fraction or exponent keep their
 //  original text (stringify writes it back unchanged) and asInt() truncates them.
 //  Strings are UTF-8; \uXXXX escapes (also surrogate pairs) are decoded.
+//
+//  Memory: values (and the texts that stringify and pretty return) live on the malloc heap, so a long running program can give them back:
+//    doc->dispose();           frees the value and everything below it (a value must belong to one parent only; do not assign string literals to .text)
+//    free(text);               for the result of stringify / pretty / the strings of asString (cstdlib)
+//  A program that never frees them behaves as before.
 // =============================================================================
 module json;
-import strings;
 import utf8;
+import cstdlib;
 
 const NULL_KIND = 0;
 const BOOL_KIND = 1;
@@ -35,6 +40,32 @@ public class Json {
     private char** keys;           // objects only
     private int count;
     private int cap;
+
+    // removes a member of an object WITHOUT freeing it and returns it (null if there is none): the caller owns the value now
+    public Json* detach(char* key) {
+        int i = indexOfKey(key);
+        if (i < 0) return null;
+        Json* v = items[i];
+        free(keys[i]);
+        for (int k = i; k + 1 < count; k++) {
+            items[k] = items[k + 1];
+            keys[k] = keys[k + 1];
+        }
+        count--;
+        return v;
+    }
+
+    // frees this value, its members, their names and texts (and the value itself)
+    public void dispose() {
+        for (int i = 0; i < count; i++) {
+            items[i]->dispose();
+            if (keys != null && keys[i] != null) free(keys[i]);
+        }
+        if (items != null) free(items);
+        if (keys != null) free(keys);
+        if (text != null) free(text);
+        free(this);
+    }
 
     public bool isNull() { return kind == NULL_KIND; }
     public bool isBool() { return kind == BOOL_KIND; }
@@ -136,12 +167,14 @@ public class Json {
         if (cap > 0) {
             ncap = cap * 2;
         }
-        Json** ni = (Json**) alloc(ncap * 8);
-        char** nk = (char**) alloc(ncap * 8);
+        Json** ni = (Json**) malloc(ncap * 8);
+        char** nk = (char**) malloc(ncap * 8);
         for (int i = 0; i < count; i++) {
             ni[i] = items[i];
             nk[i] = keys[i];
         }
+        if (items != null) free(items);
+        if (keys != null) free(keys);
         items = ni;
         keys = nk;
         cap = ncap;
@@ -166,6 +199,7 @@ public class Json {
         }
         int i = indexOfKey(key);
         if (i >= 0) {
+            if (items[i] != v) items[i]->dispose();
             items[i] = v;
             return;
         }
@@ -173,19 +207,31 @@ public class Json {
             grow();
         }
         items[count] = v;
-        keys[count] = strdup(key);
+        keys[count] = dupText(key);
         count++;
     }
 }
 
+private char* dupText(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    memcpy(r, s, n);
+    r[n] = 0;
+    return r;
+}
+
+private Json* mk(int kind) {
+    Json* j = (Json*) malloc(sizeof(Json));
+    j->kind = kind;
+    return j;
+}
+
 public Json* newNull() {
-    return new Json;
+    return mk(NULL_KIND);
 }
 
 public Json* newBool(bool b) {
-    Json* j = new Json;
-    j->kind = BOOL_KIND;
-    j->num = 0;
+    Json* j = mk(BOOL_KIND);
     if (b) {
         j->num = 1;
     }
@@ -193,30 +239,67 @@ public Json* newBool(bool b) {
 }
 
 public Json* newInt(int n) {
-    Json* j = new Json;
-    j->kind = NUMBER_KIND;
+    Json* j = mk(NUMBER_KIND);
     j->num = n;
     return j;
 }
 
 // the text is copied
 public Json* newString(char* s) {
-    Json* j = new Json;
-    j->kind = STRING_KIND;
-    j->text = strdup(s);
+    Json* j = mk(STRING_KIND);
+    j->text = dupText(s);
     return j;
 }
 
 public Json* newArray() {
-    Json* j = new Json;
-    j->kind = ARRAY_KIND;
-    return j;
+    return mk(ARRAY_KIND);
 }
 
 public Json* newObject() {
-    Json* j = new Json;
-    j->kind = OBJECT_KIND;
-    return j;
+    return mk(OBJECT_KIND);
+}
+
+// a growing text buffer (malloc heap)
+private class Out {
+    public char* buf;
+    public int len;
+    public int cap;
+
+    public void reserve(int extra) {
+        if (len + extra + 1 <= cap) return;
+        int nc = cap * 2;
+        if (nc < 64) nc = 64;
+        while (nc < len + extra + 1) nc = nc * 2;
+        char* nb = realloc(buf, nc);
+        buf = nb;
+        cap = nc;
+    }
+    public void append(char* s) {
+        int n = strlen(s);
+        reserve(n);
+        memcpy(&buf[len], s, n);
+        len = len + n;
+        buf[len] = 0;
+    }
+    public void appendChar(int c) {
+        reserve(1);
+        buf[len] = c;
+        len++;
+        buf[len] = 0;
+    }
+    public void appendInt(int n) {
+        char tmp[24];
+        intToStr(n, &tmp[0]);
+        append(&tmp[0]);
+    }
+    // the text (a malloc'ed string; "" if nothing was added)
+    public char* toString() {
+        if (buf == null) {
+            reserve(1);
+            buf[0] = 0;
+        }
+        return buf;
+    }
 }
 
 // ---- parser ---------------------------------------------------------------------------------
@@ -262,11 +345,12 @@ private int hex4() {
 // parses a string literal (current char is the opening quote) into a new heap string, null on error
 private char* parseStringText() {
     pos++;
-    strings.StringBuilder sb;
+    Out sb;
     for (;;) {
         int c = src[pos];
         if (c == 0) {
             fail("unterminated string");
+            if (sb.buf != null) free(sb.buf);
             return null;
         }
         if (c == '"') {
@@ -275,6 +359,7 @@ private char* parseStringText() {
         }
         if (c < 32) {
             fail("control character in string");
+            if (sb.buf != null) free(sb.buf);
             return null;
         }
         if (c != 92) {
@@ -298,6 +383,7 @@ private char* parseStringText() {
                 int cp = hex4();
                 if (cp < 0) {
                     fail("bad \\u escape");
+                    if (sb.buf != null) free(sb.buf);
                     return null;
                 }
                 if (cp >= 0xD800 && cp < 0xDC00 && src[pos] == 92 && src[pos + 1] == 'u') {
@@ -305,6 +391,7 @@ private char* parseStringText() {
                     int lo = hex4();
                     if (lo < 0xDC00 || lo > 0xDFFF) {
                         fail("bad surrogate pair");
+                        if (sb.buf != null) free(sb.buf);
                         return null;
                     }
                     cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
@@ -317,6 +404,7 @@ private char* parseStringText() {
             }
             default:
                 fail("bad escape in string");
+                if (sb.buf != null) free(sb.buf);
                 return null;
         }
     }
@@ -373,15 +461,16 @@ private Json* parseNumber() {
             pos++;
         }
     }
-    Json* j = new Json;
-    j->kind = NUMBER_KIND;
+    Json* j = mk(NUMBER_KIND);
     if (neg) {
         v = -v;
     }
     j->num = v;
-    j->text = substr(src, start, pos - start);
-    if (simple) {
-        j->text = null;
+    if (!simple) {
+        int tl = pos - start;
+        j->text = malloc(tl + 1);
+        memcpy(j->text, &src[start], tl);
+        j->text[tl] = 0;
     }
     return j;
 }
@@ -403,22 +492,29 @@ private Json* parseValue(int depth) {
         for (;;) {
             skipSpace();
             if (src[pos] != '"') {
+                o->dispose();
                 return fail("expected a string key");
             }
             char* key = parseStringText();
             if (key == null) {
+                o->dispose();
                 return null;
             }
             skipSpace();
             if (src[pos] != ':') {
+                free(key);
+                o->dispose();
                 return fail("expected ':'");
             }
             pos++;
             Json* v = parseValue(depth + 1);
             if (v == null) {
+                free(key);
+                o->dispose();
                 return null;
             }
             o->set(key, v);
+            free(key);
             skipSpace();
             if (src[pos] == ',') {
                 pos++;
@@ -428,6 +524,7 @@ private Json* parseValue(int depth) {
                 pos++;
                 return o;
             }
+            o->dispose();
             return fail("expected ',' or '}'");
         }
     }
@@ -442,6 +539,7 @@ private Json* parseValue(int depth) {
         for (;;) {
             Json* v = parseValue(depth + 1);
             if (v == null) {
+                a->dispose();
                 return null;
             }
             a->push(v);
@@ -454,6 +552,7 @@ private Json* parseValue(int depth) {
                 pos++;
                 return a;
             }
+            a->dispose();
             return fail("expected ',' or ']'");
         }
     }
@@ -462,8 +561,7 @@ private Json* parseValue(int depth) {
         if (s == null) {
             return null;
         }
-        Json* j = new Json;
-        j->kind = STRING_KIND;
+        Json* j = mk(STRING_KIND);
         j->text = s;
         return j;
     }
@@ -496,13 +594,14 @@ public Json* parse(char* text) {
     }
     skipSpace();
     if (src[pos] != 0) {
+        v->dispose();
         return fail("unexpected text after the value");
     }
     return v;
 }
 
 // ---- writer -----------------------------------------------------------------------------------
-private void writeString(strings.StringBuilder* sb, char* s) {
+private void writeString(Out* sb, char* s) {
     sb->appendChar('"');
     for (int i = 0; s[i] != 0; i++) {
         int c = s[i];
@@ -531,7 +630,7 @@ private void writeString(strings.StringBuilder* sb, char* s) {
     sb->appendChar('"');
 }
 
-private void newline(strings.StringBuilder* sb, int indent, int level) {
+private void newline(Out* sb, int indent, int level) {
     if (indent <= 0) {
         return;
     }
@@ -541,7 +640,7 @@ private void newline(strings.StringBuilder* sb, int indent, int level) {
     }
 }
 
-private void write(strings.StringBuilder* sb, Json* v, int indent, int level) {
+private void write(Out* sb, Json* v, int indent, int level) {
     switch (v->kind) {
         case 0: sb->append("null"); break;
         case 1:
@@ -587,14 +686,14 @@ private void write(strings.StringBuilder* sb, Json* v, int indent, int level) {
 
 // compact JSON text: {"a":1,"b":[true,null]}
 public char* stringify(Json* v) {
-    strings.StringBuilder sb;
+    Out sb;
     write(&sb, v, 0, 0);
     return sb.toString();
 }
 
 // indented JSON text (two spaces per level)
 public char* pretty(Json* v) {
-    strings.StringBuilder sb;
+    Out sb;
     write(&sb, v, 2, 0);
     return sb.toString();
 }
