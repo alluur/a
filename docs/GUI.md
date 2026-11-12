@@ -434,7 +434,10 @@ runs a command and closes when it ends. Ctrl+Shift+N opens another window, Ctrl+
   (a double click selects a word); a selection is copied to the clipboard when it is made, the middle button and
   Ctrl+Shift+V paste, Ctrl+Shift+C copies. The size of the pseudo terminal follows the widget (the program gets `SIGWINCH`).
 * **Without a program**: `t->feed("text\r\n")` writes to the screen as if a program had printed it, and what the user types
-  is collected for `t->takeSent()`; `lineText(row)`, `cursorRow`, `cursorCol`, `selectedText()` read the screen back.
+  is collected for `t->takeSent()`; `lineText(row)`, `cursorRow`, `cursorCol`, `selectedText()` read the screen back, and
+  `historyCount()` / `historyText(i)` the history (0 = the oldest line). When the history is full, the line that leaves it is used
+  again as the new bottom line, so a program that prints 100 MB needs no more memory than one that prints 2000 lines (before, every
+  line that left the history was lost: about 4 KB each). `gterm.linesMade` counts the line objects ever made (a statistic for tests).
 * **Limits**: Linux and Android only (Windows has no pseudo terminals here: `start` returns false); no wide (CJK) characters
   (they take one cell), no italics, no clipboard sequence (`OSC 52`), one font size.
 
