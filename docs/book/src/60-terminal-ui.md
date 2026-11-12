@@ -296,10 +296,10 @@ can be dragged. There are two ways to run one: `showDialog(d)` returns at once a
 **What to notice**
 
 * `addButton("&Reload", 1, true)`: the label, the result code and whether it is the default button.
-* `messageBox`, `askYesNo`, `askYesNoCancel` and `prompt` are ready-made dialogs that block until the user answered. `prompt` returns a copy of the text, or `null` when cancelled.
+* `messageBox`, `askYesNo`, `askYesNoCancel` and `prompt` are ready-made dialogs that block until the user answered. `messageBox` returns the number of the button (1 to 3), or 0 for Esc; `askYesNo` returns `true` for Yes; `askYesNoCancel` returns 1 (Yes), 2 (No) or 0 (Cancel or Esc); `prompt` returns a copy of the text, or `null` when cancelled.
 * A headless `App` cannot wait for a person, so the sample queues the keys first with `inject()`. A real program just calls the function. In a headless app `runDialog` returns (as cancelled) when no input is left,
   so a test can never hang.
-* Dialogs are never freed (A's `new` does not free): create a dialog once and show it again if the program opens it often.
+* Dialogs are never freed (A's `new` does not free), and the ready-made forms make a new dialog on every call. If the program opens a dialog often, make it once and show it again with `runDialog(d)` or `showDialog(d)`; that works.
 
 ### The file picker
 
@@ -311,7 +311,7 @@ can be dragged. There are two ways to run one: `showDialog(d)` returns at once a
 
 **What to notice**
 
-* The program made a few files first, so the dialog has something to list. The start directory must be an **absolute path** (a relative one is taken from `/`): the sample joins `currentDir()` and `docs`.
+* The program made a few files first, so the dialog has something to list. The start directory must be an **absolute path** (a relative one is taken from `/`): the sample joins `currentDir()` and `docs`. The fourth argument is a filter: `"*.a"` lists only the files whose names end in `.a` (the directories are always listed), and `""` lists everything.
 * The list is a `ListView`: typing filters it, Enter opens a directory or picks a file, Alt+. shows hidden files. A save dialog has a name field and asks before replacing a file.
 * The dialog is built on `DirList`, which you can use yourself:
 
@@ -319,9 +319,9 @@ can be dragged. There are two ways to run one: `showDialog(d)` returns at once a
 
 **What to notice**
 
-* `load(dir, hidden, withSizes)` reads a directory with `getdents`, without a `stat` per entry (sizes are only asked for when you want them). `sort()` puts directories first, then names without regard to case.
+* `load(dir, hidden, withSizes)` reads a directory with `getdents`. Normally it needs no `stat` per entry (sizes are only asked for when you want them). It lists at most 8192 entries; `truncated` says that there were more. `sort()` puts directories first, then names without regard to case.
 * `joinPath`, `parentPath` and `cleanPath` work on text only and never touch the disk.
-* A link to a directory counts as a directory; `isLink(i)` tells that it is a link. Nothing is ever opened, so a FIFO cannot make the dialog wait. (Windows has no `DirList`: `load` returns `false`.)
+* A link to a directory counts as a directory; `isLink(i)` tells that it is a link. The entries are only examined, never opened, so a FIFO cannot make the dialog wait. (The source makes `load` return `false` when the program is built for Windows; that was not tried.)
 
 ### The command palette
 
@@ -335,7 +335,7 @@ can be dragged. There are two ways to run one: `showDialog(d)` returns at once a
 * The palette is a dialog (`newCommandPalette` + `showDialog`, or the blocking `commandPalette(app)`). Typing `sb` found "Toggle **s**idebar" only, Enter ran it.
 * Pressing `Ctrl+O` ran the second command: a command's key works everywhere, not only in the palette.
 
-There is also a colour dialog, `colorDialog(app, initial)`, with the 256 colour palette, red / green / blue sliders and a hex field; it returns `idx(n)` for a palette colour, `rgb(...)` for any other, and -1 when cancelled.
+There is also a colour dialog, `colorDialog(app, initial)`, with the 256 colour palette, red / green / blue sliders, a hex field and a Default button; it returns `idx(n)` for a palette colour, `rgb(...)` for any other, 0 (the default colour) for the Default button and -1 when cancelled.
 
 ## Timers and the application loop
 
@@ -347,7 +347,7 @@ There is also a colour dialog, `colorDialog(app, initial)`, with the 256 colour 
 **What to notice**
 
 * `addTimer(ms, function, data, repeat)` returns an id for `cancelTimer`; up to 64 timers. A repeating timer that is late runs once, not once for every missed interval.
-* A headless `App` has a **fake clock** (`advanceClock(ms)`): the timers above ran exactly when the program said, and the output does not depend on how fast the machine is.
+* A headless `App` has a **fake clock** (`advanceClock(ms)`): time only passes when the program says so, and the output does not depend on how fast the machine is. A timer runs in the first `pump` after the clock has passed its time: the one-shot timer (250 ms) fired in the 300 ms step.
 * A real program uses the same calls. A progress bar updated by a timer is a few lines, as the widget gallery of the toolkit shows (`examples/tui/gallery.a`).
 
 ### Following the size of the window
@@ -358,9 +358,9 @@ There is also a colour dialog, `colorDialog(app, initial)`, with the 256 colour 
 
 **What to notice**
 
-* A resize arrives as `EV_RESIZE` (from `SIGWINCH`, or by polling the size every 200 ms on AOS). The toolkit makes a new screen, lays the widgets out again and calls `onResizeHook`.
+* A resize arrives as `EV_RESIZE` (from `SIGWINCH`; with `Terminal.pollSize` set, which the toolkit does on AOS, the size is checked every 200 ms instead). The toolkit resizes the screen buffer, lays the widgets out again before the next frame and calls `onResizeHook`.
 * The window of this sample was resized to 60 x 10 by the key file (`resize:60,10`); the screen above is the result.
-* The size comes from the system. A serial console that reports nothing is asked with `CSI 18 t` and a cursor position report; the limit is `term.MAX_COLS` x `term.MAX_ROWS` (1000 x 500).
+* The size comes from the system (`ioctl`). When the system does not know it, `start()` asks the terminal (`CSI 18 t`, then a cursor position report); the environment variables `LINES` and `COLUMNS` and finally 80 x 24 are the last resorts. Sizes are cut to `term.MAX_COLS` x `term.MAX_ROWS` (1000 x 500).
 
 ### The mouse
 
@@ -370,7 +370,7 @@ There is also a colour dialog, `colorDialog(app, initial)`, with the 256 colour 
 
 **What to notice**
 
-* The key file pressed on the divider (column 39), dragged to column 30 and 20 and released: the divider is now at column 20. Only drags are reported by default, which keeps the link quiet; `TUI_MOTION=1` asks for all motion.
+* The key file pressed on the divider (column 39), dragged to column 30 and 20 and released: the divider is now at column 20. Only drags (moving with a button held) are reported by default; `TUI_MOTION=1` asks the terminal for all mouse motion.
 * `app->clicks` is 1, 2 or 3 for double and triple clicks. A widget that sets `app->capture = this` on a press gets all mouse events until the release (that is how drags work).
 
 ### Child programs and descriptors
@@ -384,7 +384,7 @@ calls your function when the pipe has data.
 
 **What to notice**
 
-* `startShell` runs a command line through `/bin/sh`; the child gets its own process group, so `kill` stops the whole job. `read` returns 0 at the end; `finish()` waits and gives the exit status.
+* `startShell` runs a command line through `/bin/sh`; `start(argv)` runs a program directly. The child reads nothing (its input is `/dev/null`) and gets its own process group, so `kill(signal)` reaches the whole job. `read` returns 0 at the end; `finish()` waits and gives the exit status. `Process` needs no terminal.
 * The pane shows the output while the child runs, and `\033[31m` in the output is a colour in the pane: `TextPane` understands ANSI sequences. Colour codes you add yourself work the same.
 * `runShell` / `runProgram` of the `App` instead leave full screen mode, run a program in the foreground with the normal terminal, wait for it and come back, redrawing the screen.
 
@@ -402,7 +402,7 @@ calls your function when the pipe has data.
 
 ## Writing your own widget
 
-Derive from `tui.Widget`, start the constructor with `super();`, and override `prefW`, `prefH`, `paint`, `onKeyPress` and `onMouse`.
+Derive from `tui.Widget`, start the constructor with `super();` (see the warning at the top), and override `prefW`, `prefH`, `paint`, `onKeyPress` and `onMouse`. These methods are `virtual`; the sample repeats the word.
 
 {{sample tui/widget}}
 
