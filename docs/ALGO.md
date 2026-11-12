@@ -100,7 +100,7 @@ Details that matter:
 | `indexOf(text, pattern, from)`, `countOf`, `findAll` | one-shot search with no setup: Horspool with a stack table that falls back to KMP when the text is nasty (worst case stays linear) |
 | `AhoCorasick` | many patterns in one pass: `add(pattern) -> id`, `findAll(text, n, ids, ends, max)`, `count`, `first`, `each(text, n, callback, ctx)`, a state cursor `step / match / nextMatch / patternAt`, `ignoreCase` option |
 
-An empty pattern matches at every position `0 .. n`. Horspool is usually sub-linear but O(n * m) in the worst case; Rabin-Karp uses two moduli below 2^31 with seeded bases and verifies every hit,
+An empty pattern matches at every position `0 .. n`. (`algo.kmpFind` and `algo.countOccurrences` rebuild their table for every call and restart after every match, so they are quadratic on texts like `aaaa...`; the classes above and `strx.countOf` are linear.) Horspool is usually sub-linear but O(n * m) in the worst case; Rabin-Karp uses two moduli below 2^31 with seeded bases and verifies every hit,
 so the answer is always right. Aho-Corasick keeps children in sibling lists (compact for any alphabet) with a direct table for the root; a node limit (default 4 million) refuses further patterns.
 
 ```c
