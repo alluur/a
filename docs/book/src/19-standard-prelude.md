@@ -337,7 +337,7 @@ A looks like C, and most C knowledge carries over. This table lists what is diff
 | arrays | variable length arrays, multi-dimensional | constant sizes only, one dimension |
 | bit-fields | yes | none |
 | strings | read-only literals | string literals are writable |
-| classes | none | `class`, methods, constructors, `public` / `private` / `protected`, inheritance, `virtual`, operator overloading |
+| classes | none | `class`, methods, constructors, `public` / `private` / `protected`, inheritance, `virtual`, `abstract`, `override`, `final`, static members, `is` / `as`, operator overloading |
 | constructors | none | run for `Class c(args);` and `new`, **not** for `Class c;` |
 | memory | `malloc` / `free` | `new` and `alloc` never free; `malloc` / `free` from `cstdlib`; `memcpy` returns nothing |
 | modules | headers only | `module` / `import`, `a_module` / `a_import`, and `#include` |
@@ -347,8 +347,8 @@ A looks like C, and most C knowledge carries over. This table lists what is diff
 | variable arguments | `va_list` | `...`, `va_arg(i)`, `va_count()` |
 | `printf` | any number of arguments, `%f` | up to 8 values, `%b` for binary, no `%f` (it is printed as the two characters `%f`; see `printfd`) |
 | floating point | `float`, `double` in hardware | `double` (and `float` as an alias) in software, same result everywhere |
-| `switch` | constant labels | constant labels that fit in 32 bits |
-| extras | | `defer`, `static if`, `??`, `<=>`, `xor` / `^^`, `and` / `or` / `not`, designated initializers, compound literals |
+| `switch` | integer constant labels | constant labels of any size, lists (`case 1, 2:`), ranges (`case 1..9:`), and text labels when the value is a `char*` |
+| extras | | `foreach`, labeled `break` / `continue`, `defer`, `static if`, `static_assert`, `??`, `??=`, `||=`, `&&=`, `<=>`, `xor` / `^^`, `and` / `or` / `not`, designated initializers, compound literals |
 | preprocessor | yes | yes, a C-style one, plus `static if` and `const` for most uses |
 | separate compilation | object files and a linker | `ac -c` and linking of `.ao` files |
 

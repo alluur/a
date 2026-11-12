@@ -6,9 +6,9 @@ One page of facts to keep open while you write A. Everything here is explained i
 
 | Group | Words |
 |---|---|
-| Control flow | `if` `else` `switch` `case` `default` `while` `do` `for` `break` `continue` `return` `goto` `defer` |
-| Declarations | `const` `static` `extern` `typedef` `struct` `class` `union` `enum` |
-| Classes | `public` `private` `protected` `virtual` `super` `this` `new` |
+| Control flow | `if` `else` `switch` `case` `default` `while` `do` `for` `foreach` `in` `rev` `break` `continue` `return` `goto` `defer` |
+| Declarations | `const` `static` `static_assert` `extern` `typedef` `struct` `class` `union` `enum` |
+| Classes | `public` `private` `protected` `virtual` `abstract` `override` `final` `super` `this` `new` `is` `as` |
 | Modules | `module` `import` `a_module` `a_import` |
 | Types | `int` `long` `char` `byte` `bool` `double` `float` `void` `func` `int8` `int16` `int32` `int64` `uint8` `uint16` `uint32` `uint64` `size_t` `uintptr_t` `ssize_t` `intptr_t` `ptrdiff_t` |
 | Values | `true` `false` `null` |
@@ -47,7 +47,7 @@ Escape sequences: `\n` `\t` `\r` `\0` `\e` (escape, 27) `\\` `\"` `\'` `\xHH`.
 
 | Level | Operators | Notes |
 |---|---|---|
-| 1 | `a[i]` `a.b` `a->b` `f(x)` `x++` `x--` | `.` and `->` are interchangeable on pointers |
+| 1 | `a[i]` `a.b` `a->b` `f(x)` `x++` `x--` `x is C` `x as C` | `.` and `->` are interchangeable on pointers; `is` / `as` ask for the class of an object |
 | 2 | `-x` `+x` `!x` `~x` `*p` `&x` `++x` `--x` `(type)x` | right to left |
 | 3 | `*` `/` `%` | signed, truncating like C |
 | 4 | `+` `-` | pointer plus integer scales by the element size |
@@ -62,6 +62,7 @@ Escape sequences: `\n` `\t` `\r` `\0` `\e` (escape, 27) `\\` `\"` `\'` `\xHH`.
 | 12a | `^^` `xor` | logical exclusive or, both sides run |
 | 13 | `c ? a : b` `a ?? b` | right to left; `a ?? b` is `a` unless it is 0 / `null` |
 | 14 | `=` `+=` `-=` `*=` `/=` `%=` `&=` <code>&#124;=</code> `^=` `<<=` `>>=` | right to left |
+| 14a | <code>&#124;&#124;=</code> `&&=` `??=` | assign only when the target is 0 / `null` (`||=`, `??=`) or true (`&&=`); the right side runs only then |
 
 The words `and`, `or`, `not` and `xor` mean `&&`, <code>&#124;&#124;</code>, `!` and `^^`.
 

@@ -133,7 +133,7 @@ What to notice:
 
 - `describe()` is written once in `Animal` and calls `speak()`. Each object answered with its own `speak`: 1000 + 0 legs, 2000 + 4, and 12000 + 4 for `Puppy`, whose `speak` calls `super.speak()` and adds 10. The local `Dog local();` works the same way: `local.speak()` is 2.
 - `Puppy` has no constructor, so `new Puppy()` used `Dog`'s, which called `Animal(4)`.
-- The object gets its vtable pointer when it is created with `new`, declared as a local, or declared as a global. A class-typed field of another class and the elements of an array of objects are only zeroed, so calling a virtual method on them crashes. Copying an object copies the pointer too: there is no protection against slicing, no destructor, no multiple inheritance and no abstract class.
+- The object gets its vtable pointer when it is created with `new`, declared as a local, or declared as a global. A class-typed field of another class and the elements of an array of objects are only zeroed, so calling a virtual method on them crashes. Copying an object copies the pointer too: there is no protection against slicing, no destructor and no multiple inheritance. Abstract classes, `override`, `final`, static members and `is` / `as` are in [More language features](#chap-more-language-features).
 - A virtual method must have a body; otherwise the program does not link (`undefined function`).
 
 ## A class that points to itself

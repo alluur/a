@@ -74,7 +74,7 @@ What to notice:
 
 ## switch
 
-`switch (value)` jumps to the `case` whose label equals the value, or to `default` when there is none. Labels are **constant expressions** (numbers, characters, `const` names, enum members) and must fit in a signed 32-bit integer (`case 5000000000:` and `case 2147483648:` are the error `case value does not fit in 32 bits`). Using a variable as a label gives `name is not a constant`.
+`switch (value)` jumps to the `case` whose label equals the value, or to `default` when there is none. Labels are **constant expressions** (numbers, characters, `const` names, enum members) of any size. Using a variable as a label gives `name is not a constant`. A label can also be a list (`case 1, 2:`), a range (`case 'a'..'z':`) or a text; those are in [More language features](#chap-more-language-features).
 
 Execution **falls through**: after the matching case runs, it continues into the next one unless a `break` (or `return`) stops it. Two labels in a row share the same code.
 
@@ -85,7 +85,7 @@ What to notice:
 - `case 1:` and `case 2:` share one result because `case 1:` has no code of its own.
 - The `level` switch shows the fall-through: it started at `case 3` and ran through `case 2` and `case 1` until the `break`. `case 0` was never reached.
 - Inside a `switch` that is inside a loop, `continue` belongs to the loop: `case 1: continue;` skipped the rest of that round, including `[after 1]`. `break` leaves only the `switch`, so `[after 3]` was still printed.
-- `switch` compares integers (including `char` and enum values). It does not compare the text of strings: a string label is accepted by the compiler but compares addresses, so it does not do what you want. To choose between strings, use `if` with `streq`.
+- `switch` compares integers (including `char` and enum values). When the value is a `char*`, the labels are compared as **text** (the compiler used to compare addresses, which is why older programs use `if` with `streq`); see [More language features](#chap-more-language-features).
 
 ## goto
 
@@ -128,13 +128,14 @@ What to notice:
 - `if`, `else if` and `else` test integers and pointers; zero and `null` are false.
 - `while` tests before each round, `do ... while` after it, `for` has init, condition and step, each of them optional.
 - `break` leaves the innermost loop or `switch`; `continue` starts the next round of the innermost loop.
-- `switch` labels are constant expressions that fit in a signed 32-bit integer; without `break` execution falls through.
-- `goto` and labels work within one function; leaving nested loops is the good use.
+- `switch` labels are constant expressions; without `break` execution falls through. A switch on a `char*` compares text.
+- `goto` and labels work within one function. To leave nested loops, a labeled `break` is the cleaner way ([More language features](#chap-more-language-features)).
 - `defer` runs an expression at function exit, last in first out, at most 16 per function and only at the top level of the body.
 - `static if` selects code at compile time using constants such as `__ARCH` and `__OS`. It works at file level and in function bodies, not inside a class body.
 
 ## Where next
 
+- [More language features](#chap-more-language-features) adds `foreach`, the text `switch`, labeled `break` and `continue`.
 - [Functions](#chap-functions) covers parameters, results, recursion and function pointers.
 - [Preprocessor and assembly](#chap-preprocessor-and-assembly) has the C-style `#if` for text-level decisions.
 - [Memory and pointers](#chap-memory-and-pointers) shows `defer` together with `malloc` and `free`.
