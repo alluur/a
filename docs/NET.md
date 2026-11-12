@@ -237,7 +237,9 @@ A handler returns a new value (never `params` or a part of it: the module frees 
 
 ## Waiting without threads: `net.setIdleHook`
 
-`net.setIdleHook(fn)` makes every blocking wait of `net` (receive, accept, wait for readability, the TLS handshake) call `fn()` about every 2 ms while it waits. A program that is both
+`net.setIdleHook(fn)` makes every blocking wait of `net` (receive, accept, wait for readability or for room to write, a send into a full socket buffer, `connectTimeout`, the TLS handshake) call `fn()` about every 2 ms while it waits.
+(`waitWritable(h, ms)` with `ms != 0` runs the hook like `waitReadable` does; before, a `netio.Link` that had to wait for a full socket, and so the mqtt and redis clients and the TCP / TLS syslog `Sender`, did not run it: the in-process peer could not drain the socket
+and the send stalled until its time out. This showed on AOS, whose loopback sockets hold only 64 KiB; `t390` checks it by filling the socket first, so it does not depend on the buffer sizes of the machine.) A program that is both
 client and server of a connection can serve the other end from the hook (`hub->poll(0)`); a GUI program can run its event loop. The tests of these modules use it to run a client
 and a server in one thread, which works the same on every target including Windows (where threads do not exist). It is not for production servers: use `hub->run()`.
 
@@ -291,10 +293,12 @@ verified certificate, 160 KB and 300 KB messages), raw frames with every RFC 645
 
 # MQTT, Redis and syslog
 
-Three protocol families, each with a client and a server module (and a small server program each in `examples/`: `mqttd_demo.a`, `redisd_demo.a`, `syslogd_demo.a`). The servers are built so that they can run for months: every queue has a limit, every limit is a setting, memory is
-freed (a strict test per family compares the heap position before and after many operations), malformed input gets an error and a closed connection. The tests run on all five
-targets (Linux x86-64, ARM64, RISC-V, LoongArch, Windows). The modules use only layers that AOS also has (`net`, `netio`, `tls`, `asys`, `datetime`, `os`), but **they have not been run on AOS in QEMU yet**: UDP
-sockets that are non-blocking (`syslogd`) and `poll` on UDP sockets are the parts that depend on the AOS kernel.
+Three protocol families, each with a client and a server module (and a small server program each in `examples/`: `mqttd_demo.a`, `redisd_demo.a`, `syslogd_demo.a`). The servers are built to run for a long time: every queue has a limit, every limit is a setting, memory is
+freed (a strict test per family compares the heap position before and after many operations), malformed input gets an error and a closed connection. **One thing grows with every TLS handshake: about 20 KB of never-freed heap each** (the cryptography of the earlier `tls` / `bn` modules, see Memory above;
+measured +1.9 MB per 100 handshakes). A server with a TLS listener that anyone can reach can be made to grow by connecting and handshaking again and again (100,000 handshakes are about 2 GB), so such a server has to be restarted now and then or sit behind something that limits
+connections (`maxPerIp`, a firewall, a TLS terminating proxy); plain listeners do not have the problem. The tests run on all five
+targets (Linux x86-64, ARM64, RISC-V, LoongArch, Windows) and, since the review of this stage, inside AOS in QEMU (see Tests). The modules use only layers that AOS also has (`net`, `netio`, `tls`, `asys`, `datetime`, `os`); AOS queues only 16 unaccepted connections per listener and its sockets hold 64 KiB,
+which the tests no longer assume anything about.
 
 ## The layers underneath: netio and netsrv
 
@@ -309,7 +313,7 @@ netio.Queue q;  q.max = 65536;  q.add(bytes, n);  /* net.sendSome(fd, q.data(), 
 ```
 
 `netio.Queue` is a first-in first-out byte buffer with an optional limit (`add` fails and sets `overflow` instead of growing). `netio.Link` drives the TLS session of the `tls` module as a state
-machine, so a TLS connection is non-blocking too (`tls.wrap` is not: it installs blocking hooks). `net.setIdleHook` works with it.
+machine, so a TLS connection is non-blocking too (`tls.wrap` is not: it installs blocking hooks). `net.setIdleHook` works with it: the waits of a link (connect, the TLS handshake, `sendAll` into a full socket, `waitReadable`) run the hook.
 
 `netsrv.Server` is the core of the three servers (and of anything you write): one thread, `net.poll`, no blocking call in the loop, TLS handshakes included.
 
@@ -327,6 +331,12 @@ s->listen(7777);  s->listenTls(7778, cfg);  s->addUdp(7779);  s->onDatagram = ..
 | `maxPerIp` | 0 (off) | connections from one address |
 | `maxOut` | 1 MiB | bytes queued for one connection (`c->out.max`): a client that does not read is cut off (`R_EVICTED`) instead of growing the queue |
 | `handshakeTimeoutMs`, `idleTimeoutMs`, `lingerMs` | 5000, 0 (off), 1000 | TLS handshake time, silence (nothing received), the time a closing connection reads away what the peer still sends |
+| `stallTimeoutMs` | 30000 (0: off) | a connection that has output waiting and has not been able to send one byte for this long is cut off (`R_EVICTED`): a peer that does not read, or a wedged TCP connection |
+
+**Backpressure.** `s->pause(c, resumeBelow)` (call it from `onData`) stops reading from a connection (and delivering what TLS has decrypted already) until its output queue is down to `resumeBelow` bytes; then `s->onResume(server, conn)` runs, and it may pause again. `redisd` uses it so that a client
+that pipelines commands with big replies is served as fast as it reads, instead of being cut off.
+**Descriptors.** `maxConns` is not tied to the limit of file descriptors (`ulimit -n`): keep it below that limit minus what the program has open. When `accept()` fails for lack of descriptors or memory the listener rests for 50 ms and then tries again (`stats->acceptFailures`): before, it spun at 100% processor time as
+long as the descriptors were gone. The server recovers when connections close (`tests/net2.sh` checks both with `ulimit -n 30`).
 
 `close(c)` sends what is queued, says goodbye (TLS close_notify, FIN) and reads away the peer's remaining bytes for `lingerMs` (so the last bytes are not lost to a reset); `kill(c)` drops it at once. `onClose` runs
 exactly once for every connection that `onOpen` saw. Conn objects, buffers and TLS sessions are reused. `killAll()` drops every connection, `shutdown()` everything.
@@ -374,8 +384,15 @@ s->run();                                                                       
 **Broker.** One loop for all clients (`netsrv`). CONNACK codes 1 (protocol level other than 4: MQTT 3.1 and 5 are refused), 2 (empty client id with a persistent session), 3 (too many clients), 4, 5 (credentials); session present; a second connection with the same client id takes over
 (its will is sent); persistent sessions keep subscriptions and the QoS 1 / 2 messages for an offline client (QoS 0 is not kept) and resend what is in flight with DUP; a topic tree with wildcards, one copy per client for overlapping subscriptions
 (the highest QoS); QoS downgrade to the subscription's QoS; retained messages (an empty payload removes one; the retain flag is off for live deliveries and on for the ones sent at SUBSCRIBE); will messages (when the connection ends without DISCONNECT, on keep-alive time out
-(1.5 times the interval), on a protocol violation, on takeover); `$SYS/broker/clients/connected`, `clients/total`, `clients/disconnected` (published at once when they change), and every `sysIntervalMs` (10 s) messages received / sent / dropped, subscriptions, retained messages, uptime and version (all
-retained; `sysIntervalMs = 0` turns `$SYS` off); clients cannot publish to `$` topics.
+(1.5 times the interval), on a protocol violation, on takeover). **A will is held to the rules of a PUBLISH, checked at CONNECT**: a will topic that the ACL refuses (`aclHook` with op 1), that starts with `$`, is longer than `maxTopicLength` or deeper than `maxLevels` gets CONNACK 5
+(and the connection that holds the client id is left alone); before, a will was a way round the ACL, round the ban on `$` topics (a client could overwrite the retained `$SYS/broker/version`) and round the topic limits (retained wills of 60,000 bytes). `$SYS/broker/clients/connected`, `clients/total`, `clients/disconnected` (published at once when they change), and every `sysIntervalMs` (10 s) messages received / sent / dropped, subscriptions, retained messages, uptime and version (all
+retained; `sysIntervalMs = 0` turns `$SYS` off); clients cannot publish to `$` topics, neither with PUBLISH nor with a will.
+**Retained messages at SUBSCRIBE** are all delivered, however many there are: they wait on a list (topics only, the message is looked up when it is sent, so a message that was replaced is sent in its new form and one that was removed is not sent) and go out as the client's window and output queue have room; this list is not
+subject to `maxQueue` / `maxQueueBytes` (it was: a QoS 1 subscriber got 1020 of 3000 retained messages). It is bounded by `maxRetained` entries per client and by `maxQueuedTotal` for all clients together (what does not fit is dropped and counted). A client that disconnects loses what had not been sent yet (it subscribes again).
+**Sessions belong to their user.** A stored session (online or offline) can only be resumed or taken over by a connection with the same user name (`bindSessions`, default on; both without a user name count as the same): another user gets CONNACK 5 and the session is left as it is. (Without this, a second user with valid credentials who knew a client id received
+the first user's subscriptions and queued messages.) With `bindSessions = false` the MQTT 3.1.1 behaviour is back: whoever authenticates takes the session. A client that changes its user name needs a new client id. This is also a way to squat on a client id: with `allowAnonymous = true` an anonymous client can keep a
+persistent session id from its owner: turn anonymous access off when it matters. When `maxSessions` is reached the offline session of the **same user** that has been gone longest is dropped first, and only if that user has none the one that has been gone longest of all: a user (or the anonymous ones together) cannot push out the sessions of the others by making many new ones, as long as it has sessions of its own; anonymous clients all
+count as one user.
 
 | Limit (setting of `broker`) | Default | What happens over it |
 |---|---|---|
@@ -385,7 +402,8 @@ retained; `sysIntervalMs = 0` turns `$SYS` off); clients cannot publish to `$` t
 | `maxQueue`, `maxQueueBytes` | 1000, 1 MiB | a message for a client (offline or slow) is dropped and counted (`stats->dropped`); `maxQueuedTotal` (32 MiB) for all clients together |
 | `maxOut` | 4 MiB | bytes waiting for one socket: QoS 0 messages are dropped above half of it; a client that cannot take its acknowledgements is cut off |
 | `maxSubsPerClient`, `maxSubscriptions` | 200, 20000 | SUBACK 128 |
-| `maxRetained`, `maxSessions` | 10000, 1000 | a retained message is not stored; the offline persistent session that has been gone longest is dropped (also `sessionExpirySec`) |
+| `maxRetained`, `maxRetainedBytes` | 10000, 16 MiB | a retained message is not stored (it is still delivered to the live subscribers; `stats->retainedRefused`); a retained value that would be replaced by a message that does not fit is **removed** (no retained message is better than an out of date one). The bytes count payload, topic and tree nodes (pessimistically); the broker's own `$` topics are exempt. Before this limit existed 300 retained messages of 1 MiB made 300 MB, and the count limit alone allowed 10 GB. |
+| `maxSessions` | 1000 | the offline persistent session that has been gone longest (of the same user first, see above) is dropped (also `sessionExpirySec`) |
 | `maxLevels`, `maxTopicLength`, `maxClientIdLength` | 64, 1024, 256 | refused subscription, dropped publish, CONNACK 2 |
 | `connectTimeoutMs` | 10000 | a connection that sends no CONNECT is closed |
 
@@ -420,7 +438,7 @@ import redisd;
 redisd.Server* s = redisd.newServer();  s->store->requirepass = "secret";  s->listen(6379);  s->run();
 ```
 
-**Server.** `PING ECHO QUIT AUTH SELECT` (16 databases), `GET SET` (`EX PX NX XX KEEPTTL`) `SETNX SETEX PSETEX GETSET DEL EXISTS EXPIRE PEXPIRE TTL PTTL PERSIST INCR DECR INCRBY DECRBY APPEND STRLEN MGET MSET KEYS` (glob with `* ? [a-z] [^a] \x`, no exponential backtracking) `TYPE RENAME`,
+**Server.** `PING ECHO QUIT AUTH SELECT` (16 databases), `GET SET` (`EX PX NX XX KEEPTTL GET`) `SETNX SETEX PSETEX GETSET DEL EXISTS EXPIRE PEXPIRE` (`NX XX GT LT`) `TTL PTTL PERSIST INCR DECR INCRBY DECRBY APPEND STRLEN MGET MSET KEYS` (glob with `* ? [a-z] [^a] \x`, no exponential backtracking) `TYPE RENAME`,
 `LPUSH RPUSH LPOP RPOP` (with a count) `LRANGE LLEN LINDEX`, `HSET HGET HGETALL HDEL HLEN HEXISTS HKEYS HVALS`, `SADD SREM SMEMBERS SISMEMBER SCARD`, `ZADD` (`NX XX CH`) `ZRANGE` (`WITHSCORES`) `ZSCORE ZREM ZCARD ZRANK` (scores are doubles: `-inf`, `1e+22`, `0.1`),
 `PUBLISH SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE` (subscribe mode as in Redis: only those, `PING` and `QUIT` are allowed), `MULTI EXEC DISCARD` (errors while queueing make `EXEC` answer `-EXECABORT`, errors inside `EXEC` are elements of the result),
 `FLUSHALL FLUSHDB DBSIZE INFO COMMAND CLIENT`. Errors read like Redis' (`-WRONGTYPE ...`, `-ERR wrong number of arguments for 'get' command`, `-NOAUTH`, `-OOM`, ...). Keys expire lazily and by a sweep in the loop; a key that expired is still counted by `DBSIZE` until it is removed, as in Redis.
@@ -430,12 +448,28 @@ redisd.Server* s = redisd.newServer();  s->store->requirepass = "secret";  s->li
 | `maxBulk`, `maxArgs`, `maxCommand`, `maxInline` (of `store`) | 16 MiB, 1024, 32 MiB, 64 KiB | `-ERR Protocol error: ...` and the connection is closed (a bulk length is judged at its header: nothing is buffered) |
 | `maxQueued` (commands after MULTI) | 1000 | `-ERR too many commands in the transaction`, then `EXEC` aborts |
 | `maxSubs` (channels and patterns of a client) | 1000 | `-ERR too many subscriptions` |
-| `maxMemory` | 64 MiB of data (approximate: keys, values, entries) | write commands answer `-OOM`; reads and deletes still work |
+| `maxMemory` | 64 MiB of data (see below) | write commands answer `-OOM`; reads and deletes still work |
 | `net->maxConns`, `net->maxPerIp`, `net->idleTimeoutMs` | 1000, 0, 0 | closed at once / closed |
-| `net->maxOut` | 16 MiB | a client that does not read its replies (or a subscriber that does not read its messages) is cut off |
+| `store->outHigh` | 1 MiB | **backpressure**: while this many bytes of replies are unsent, the client's next command (and the bytes behind it) wait; nothing more is read from the connection until half of it is sent (`0`: off) |
+| `net->stallTimeoutMs` | 30 s | a client that has replies waiting and takes not one byte for this long is cut off |
+| `net->maxOut` | 16 MiB | bytes waiting for a client because messages are **pushed** to it (pub/sub): a subscriber that does not read its messages is cut off. It does not limit replies |
+| `store->maxReply` | 0 = automatic (`outHigh + maxMemory + maxBulk + 64 KiB`) | the most one command may put into a client's output queue: a command that goes beyond what the data could ever fill (`MGET` of the same 16 MiB key a thousand times) cuts the client off |
 
-The worst case of memory is `maxConns` times `maxCommand` for requests and `maxConns` times `net->maxOut` for replies: lower them for a small machine (AOS needs 128 MB of RAM at least). Not supported: persistence, replication, scripting, streams, `WATCH`, RESP3, blocking commands, cluster, `OBJECT`/`SCAN` and most of the rarer commands (`-ERR unknown command`).
-The core (`store->open()`, `c->feed(bytes, n)`, `c->out`, `store->setClock(ms)`) has no sockets: the tests check the bytes of the replies.
+**Replies and clients that read slowly.** A reply is built whole, so one command can queue as many bytes as its reply has (a `GET` of a 16 MiB value, an `LRANGE` of a big list: up to `maxMemory`). A client that pipelines commands (4 `GET`s of a 10 MB value in one write) is not cut off: after each command the server looks at
+`outHigh`, and while that much is unsent the commands wait in the server (at most one read of 16 KB) and the socket is not read. Before, the 16 MiB limit was applied to the replies of one burst, so clients that read normally were cut off (and a value of exactly `maxBulk` could be stored but not read). The worst case of memory
+is `maxConns` times `maxCommand` for requests (a command is judged at its header, but a client can still send 32 MiB of arguments), and for replies `maxConns` times (`outHigh` plus the biggest reply a client can ask for, up to `maxReply`): 1000 clients that each `GET` a 16 MiB value and then do not read hold 16 GB until
+`stallTimeoutMs` has passed. Lower `maxConns`, `maxBulk` and `maxMemory` for a small machine (AOS needs 128 MB of RAM at least).
+
+**`maxMemory` counts heap blocks.** The allocator rounds every block up to a power of two (16 bytes at least) and adds 16 bytes, and the accounting does the same (a key, its value, an entry of a list, hash or set, the blocks of a sorted set, queued `MULTI` commands, plus a share of the hash tables). Measured with 64 MiB: the resident size of the process grows to between 64 and 80 MB
+(the free lists keep the old, smaller blocks when a list or a table doubles); before, it reached 207 MB with the same limit because only the bytes of the data were counted. The output queues of the clients, the parser buffers and the connection objects are not counted (see above for the first). The limit is checked before a write command: one command can pass it (up to `maxCommand` bytes).
+**Speed.** `APPEND` writes in place into the block of the string (it copies when the block is full, and then the next one is twice as big: n appends cost O(n); copying the whole value each time made 20,000 appends of 100 bytes take 8 s). Sorted sets keep their members in blocks of 256: an insert or a removal moves at most one block
+(100,000 random `ZADD`s took 6.8 s with a plain sorted array and take well under a second now); `ZRANK` and `ZRANGE` add up the sizes of the blocks before the member (O(n / 256)).
+
+**Where it differs from Redis 7.0.15** (checked with a real `redis-server` on the development machine: `tests/net2.sh` runs the redis client module against both and compares the output, and about 80,000 random commands (four runs of 20,000, differences that come from the two servers expiring a key at slightly different moments aside) and several hundred targeted cases were compared reply by reply). Scores are written as the shortest text that reads back (`1.5e-07`; Redis 7.0 writes 17 digits, `1.4999999999999999e-07`; Redis 7.2 and later write the short form, too).
+The order of `KEYS`, `SMEMBERS`, `HKEYS`, `HGETALL` is the order of the hash table (unspecified in Redis as well). The expiry sweep looks at 20 keys per database every 100 ms (Redis: more, adaptive), so a key that has expired can be counted by `DBSIZE` a little longer. `INFO` has a few fields only. `COMMAND` and `CLIENT` answer an empty array / `OK`.
+`SET ... GET` and `EXPIRE ... NX|XX|GT|LT` are supported as in Redis 7; `EXPIREAT`, `GETDEL`, `GETEX`, `SETRANGE`, `GETRANGE`, `SCAN`, `OBJECT` and the other commands that are not listed are not (`-ERR unknown command`). Numbers must be written canonically (`07`, `-0` and `+5` are not integers, as in Redis).
+Not supported: persistence, replication, scripting, streams, `WATCH`, RESP3, blocking commands, cluster.
+The core (`store->open()`, `c->feed(bytes, n)`, `c->out`, `store->setClock(ms)`) has no sockets: the tests check the bytes of the replies. A client with `c->paused` set has replies that nobody took: empty `c->out` (send it) and call `store->resume(c)`; `netsrv` does that through `onResume`.
 
 ## syslog: `syslog` and `syslogd`
 
@@ -481,7 +515,7 @@ Not supported: reading `/dev/log` or the journal, RELP, TLS client certificates,
 
 ## Tests (MQTT, Redis, syslog)
 
-`tests/t371` to `t389` run in the normal suite on every target (client and server in one thread from `net.setIdleHook`, ephemeral ports, nothing depends on time except small time outs):
+`tests/t371` to `t392` run in the normal suite on every target (client and server in one thread from `net.setIdleHook`, ephemeral ports, nothing depends on time except small time outs; the tests wait for conditions and for quiet instead of counting polls and assume nothing about the size of socket buffers or how many connections a listener queues, because AOS has 64 KiB and 16). They are started from the root of the repository (`tests/run.sh` does that: `t388` and `t389` write files below `build/tests/`):
 
 | Test | What |
 |---|---|
@@ -493,9 +527,14 @@ Not supported: reading `/dev/log` or the journal, RELP, TLS client certificates,
 | `t382` `t383` `t384` `t385` | client against server (all helpers, binary values of 1 MB, pipelines, transactions, pub/sub, AUTH, SELECT, reconnect, time outs, garbage replies), the server against hostile peers, TLS, strict memory test |
 | `t386` `t387` | syslog formats (the RFC examples byte for byte, timestamps, structured data, every malformed message, a round trip with random fields, a fuzz run); sender against collector over UDP, TCP (both framings), TLS, reconnect, a frame cut in the middle, raw TCP framing cases |
 | `t388` `t389` | filters, ring, files and rotation, forwarding, floods; strict memory test |
+| `t390` | `net.waitWritable` and `netio.Link` run the idle hook while a socket is full (plain and TLS), the time limit of `sendAll`, `waitWritable(h, 0)` does not run the hook |
+| `t391` | mqttd against the review findings: wills (ACL, `$`, topic limits), `maxRetainedBytes`, all retained messages of a SUBSCRIBE (3000 messages, 3 MB of them, a removed or replaced one), stored sessions and their owners, eviction order |
+| `t392` | redisd against the review findings: the replies of the corrected and new commands (the bytes were taken from Redis 7.0.15), `HKEYS` / `HVALS`, memory accounting, `APPEND` and `ZADD` speed (compared with the time of plain `SET`s: no fixed time limits), sorted set blocks against a model, backpressure in the core, over a plain and a TLS socket |
 
+**On AOS** the networking tests run in the boot test `net` of the AOS repository (the same programs, compiled by `/bin/ac` inside the system, output compared with the `.out` files). That test selects the tests by a regular expression on the file names that stopped at `t370`: to include these (`t371` to `t392`) it has to be `r"^t3(4[0-9]|5[0-9]|6[0-9]|7[0-9]|8[0-9]|9[0-9])_.*\.a$"`.
+Before the fixes of the review, 5 of the 19 tests failed there (`t376`, `t382`, `t383`, `t384`, `t387`: the idle hook, a connection backlog of 16 and a 64 KiB socket buffer); all of them pass now (see the end of this section for the run).
 What the strict memory tests do: they compare `__heap_pos` (what `new`, `alloc` and `strdup` use up and never give back) before and after 10 operations that followed a warm-up, and demand that it did not move at all. They found real leaks while the modules were written
-(for example the score text of a sorted set came from `dtostr`, which takes 40 bytes of never-freed heap per call). What is **not** freed: the cryptography inside a TLS handshake (about 20 KB per handshake, see Memory above), objects made with `new` (the settings objects `Filter`, `Ring`, `FileSink`, `Options`, which are meant to live as long as the program).
+(for example the score text of a sorted set came from `dtostr`, which takes 40 bytes of never-freed heap per call). What is **not** freed: the cryptography inside a TLS handshake (about 20 KB per handshake, see Memory above, and the warning at the top of this part: it applies to every TLS listener, `mqttd`, `redisd` and `syslogd` alike, and to a TLS client that connects again and again), objects made with `new` (the settings objects `Filter`, `Ring`, `FileSink`, `Options`, which are meant to live as long as the program).
 
 ## Limits: what these modules do not do
 
@@ -505,4 +544,4 @@ What the strict memory tests do: they compare `__heap_pos` (what `new`, `alloc` 
 * **Connecting blocks.** `mqtt.connect`, a reconnect inside `poll`, `redis` commands on a closed connection and the first send of a TCP `syslog.Sender` block up to the connect time out (the TLS handshake counts again): a program with its own loop should connect where blocking is fine.
 * **One thread.** The clients are not thread safe; one `netsrv.Server` serves all its sockets from the thread that calls `poll`.
 * **Memory worst cases are products of limits** (clients times queue size): the defaults suit a normal machine; lower them for AOS (128 MB) as the tables above say.
-* **Interoperability** was checked by hand during development, with independent programs where the machine had them: `redis-cli` against `redisd` (commands of every type, `--pipe`, `SUBSCRIBE` / `PUBLISH`, `--raw`, error replies), util-linux `logger` against `syslogd` (UDP and TCP, RFC 3164 and RFC 5424 with structured data), `nc` as the receiver of the `syslog` sender (the bytes of datagrams and of both TCP framings) and a hand written Python raw-socket MQTT client against `mqttd` (connect, subscribe, QoS 0 / 1 / 2, retained, will, ping, a malformed packet). `tests/net2.sh` repeats these checks (Linux; needs python3; `redis-cli` and `logger` are used when they are installed; it is not part of `make test`; the raw MQTT client is `tests/net2_mqtt.py`). There is no MQTT client or broker from another vendor on the development machine, so MQTT was not checked against mosquitto or paho; the tests of the modules use them against each other and byte-exact examples from the specifications.
+* **Interoperability** was checked by hand during development, with independent programs where the machine had them: `redis-cli` against `redisd` (commands of every type, `--pipe`, `SUBSCRIBE` / `PUBLISH`, `--raw`, error replies), util-linux `logger` against `syslogd` (UDP and TCP, RFC 3164 and RFC 5424 with structured data), `nc` as the receiver of the `syslog` sender (the bytes of datagrams and of both TCP framings) and a hand written Python raw-socket MQTT client against `mqttd` (connect, subscribe, QoS 0 / 1 / 2, retained, will, ping, a malformed packet). `tests/net2.sh` repeats these checks (Linux; needs python3; `redis-cli`, `redis-server` and `logger` are used when they are installed; it is not part of `make test`; the raw MQTT client is `tests/net2_mqtt.py`) and adds: the `redis` client module run against a real `redis-server` and against `redisd` (the program `tests/net2_redis_client.a`; the two outputs must be identical; checked with Redis 7.0.15), the descriptor limit (`tests/net2_fdlimit.py`: with `ulimit -n 30` a server must not spin and must serve again afterwards) and the UDP sender with a name that does not resolve (`tests/net2_udpretry.a`). `redisd` was also compared with Redis 7.0.15 reply by reply with random commands over strings, lists, hashes, sets, sorted sets, expiry, `MULTI`, pub/sub (the reviewers' script is not part of the repository; the differences that remain are the ones listed under "Where it differs"). There is no MQTT client or broker from another vendor on the development machine, so MQTT was not checked against mosquitto or paho; the tests of the modules use them against each other and byte-exact examples from the specifications.
