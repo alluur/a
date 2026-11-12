@@ -58,7 +58,8 @@ section .text
 %define FE_SYM          176     ; symbol count to restore
 %define FE_NULLCHK      184     ; the base pointer may be null: an empty loop
 %define FE_TEXTREV      192     ; rev text: the length is computed first
-%define FE_BYTES        200
+%define FE_INCL         200     ; 1: a..=b
+%define FE_BYTES        208
 
 ; fe_slot: a fresh 8 byte hidden local -> rax = its frame offset (negative)
 fe_slot:
@@ -203,6 +204,8 @@ parse_foreach:
     call parse_ternary
     cmp qword [tk], T_DOTDOT
     je .range
+    cmp qword [tk], T_DOTDOTEQ
+    je .range
     cmp qword [tk], ','
     je .ptrcount
     mov rax, [e_type]
@@ -233,10 +236,19 @@ parse_foreach:
     mov rdi, [rbx+FE_HN]
 .rng2:
     CG store_local_a                    ; rev: the lower bound goes to the limit slot, the counter starts at the upper bound
-    call next_token                     ; ..
+    xor eax, eax
+    cmp qword [tk], T_DOTDOTEQ
+    sete al
+    mov [rbx+FE_INCL], rax              ; a..=b includes b
+    call next_token                     ; .. or ..=
     call parse_ternary
     call to_rvalue
     call fe_int_check
+    cmp qword [rbx+FE_INCL], 0
+    je .rng_ex
+    mov edi, 1
+    CG add_imm_a
+.rng_ex:
     mov rdi, [rbx+FE_HN]
     cmp qword [rbx+FE_REV], 0
     je .rng3

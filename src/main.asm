@@ -2301,8 +2301,16 @@ candbuf:        resb 2048
 maindirbuf:     resb 1024
 outnamebuf:     resb 1024
 loop_stack:     resb MAXLOOP * 32
-case_val:       resq 1024
-case_pos:       resq 1024
+case_val:       resq CASE_MAX            ; per label: the value (the low end of a range) or the data offset of a text
+case_hi:        resq CASE_MAX            ; the high end of a range (or of a single value)
+case_pos:       resq CASE_MAX            ; code position of the statements that follow the label
+case_key:       resq CASE_MAX            ; sort key: the value / the FNV-1a hash of the text
+case_ord:       resd CASE_MAX            ; labels in key order (while the dispatch code is made)
+sw_def:         resq 1
+sw_rec:         resq 1
+sw_text:        resd 1
+sw_vslot:       resd 1
+sw_sval:        resd 1
 ptmp_type:      resq MAXPARAM
 ptmp_def:       resq MAXPARAM
 ptmp_name:      resq MAXPARAM

@@ -65,6 +65,7 @@ ops3:
     db "<<=", T_SHLEQ
     db ">>=", T_SHREQ
     db "...", T_ELLIPSIS
+    db "..=", T_DOTDOTEQ
     db "||=", T_OROREQ
     db "&&=", T_ANDANDEQ
     db "??=", T_QQEQ

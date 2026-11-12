@@ -31,6 +31,7 @@
 %define NAMEPOOL_MAX    (1024*1024)
 %define FILE_MAX        256
 %define MAXLOOP         64
+%define CASE_MAX        4096    ; case labels of the switch statements being compiled (nested ones together)
 %define MAXPARAM        64
 %define EDGE_MAX        262144
 
@@ -76,6 +77,7 @@
 %define T_OROREQ        155     ; ||=
 %define T_ANDANDEQ      156     ; &&=
 %define T_QQEQ          157     ; ??=
+%define T_DOTDOTEQ      158     ; ..=  inclusive range: foreach (int i in 1..=10)
 ; keywords
 %define K_INT           160
 %define K_CHAR          161

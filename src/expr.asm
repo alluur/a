@@ -3280,6 +3280,11 @@ parse_assign:
     mov eax, [tk]
     cmp eax, '='
     je .plain
+    cmp eax, T_OROREQ
+    jb .nolog
+    cmp eax, T_QQEQ
+    jbe .logassign
+.nolog:
     cmp eax, T_ADDEQ
     jb .ret
     cmp eax, T_SHREQ
@@ -3337,6 +3342,63 @@ parse_assign:
     mov [e_type], rbx
     mov qword [e_lval], 0
     jmp .ret
+; a ||= b   a &&= b   a ??= b  : the target is only assigned when the test says so, and b is only evaluated then.
+;   ||= and ??=  assign when the target is 0 / null / false;   &&=  assigns when it is not 0.   The address of the target is
+;   evaluated once and kept on the stack; the value of the expression is the target's value afterwards.
+.logassign:
+    mov r12d, eax
+    cmp qword [e_lval], 0
+    jne .la1
+    ERR "left side of assignment is not assignable"
+.la1:
+    mov rbx, [e_type]
+    bt rbx, TF_ARRAY_BIT
+    jnc .la2
+    ERR "cannot assign to an array"
+.la2:
+    cmp rbx, TY_DOUBLE
+    je .labad
+    mov rdi, rbx
+    call type_ls
+    test eax, eax
+    jnz .la3
+.labad:
+    ERR "||=, &&= and ??= need an integer, bool, enum or pointer variable"
+.la3:
+    CG push_a                           ; the address of the target
+    mov rdi, rbx
+    call emit_load_type
+    push 0                              ; chain: the target says "leave it alone"
+    mov rdi, rsp
+    cmp r12d, T_ANDANDEQ
+    je .la_and
+    CG jnz_chain
+    jmp .la_rhs
+.la_and:
+    CG jz_chain
+.la_rhs:
+    call next_token
+    call parse_assign
+    call to_rvalue
+    mov rdi, rbx
+    call coerce_to
+    CG pop_b
+    mov rdi, rbx
+    call emit_store_type                ; A keeps the stored value
+    push 0
+    mov rdi, rsp
+    CG jmp_chain
+    mov rdi, [rsp+8]
+    call patch_here                     ; left alone: drop the address, A is the value of the target
+    mov edi, 1
+    CG drop
+    pop rdi
+    call patch_here
+    add rsp, 8
+    mov [e_type], rbx
+    mov qword [e_lval], 0
+    jmp .ret
+
 .compound:
     mov r12d, eax
     cmp qword [e_lval], 0
