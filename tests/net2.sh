@@ -1,6 +1,6 @@
 #!/bin/bash
 # Interoperability of mqttd, redisd and syslogd with independent programs (Linux; needs python3; uses redis-cli and logger when they are installed).
-# Not part of `make test`: it needs tools that not every machine has. Usage: tests/net2.sh
+# Not part of `make test`: it needs tools that not every machine has. Usage: tests/net2.sh, from the root of the repository (the paths are relative to it).
 cd "$(dirname "$0")/.."
 AC=./build/ac
 mkdir -p build/net2
@@ -34,6 +34,17 @@ else
   echo "skip redis-cli is not installed"
 fi
 
+# ---- Redis: the client module against a real Redis server and against redisd (the same program, the outputs must be identical)
+if command -v redis-server > /dev/null; then
+  $AC tests/net2_redis_client.a -o build/net2/rcli || { echo "cannot build the redis client program"; exit 1; }
+  RP=$(port); redis-server --port $RP --bind 127.0.0.1 --save '' --appendonly no > build/net2/redis-real.log 2>&1 & pids="$pids $!"; sleep 0.7
+  DP=$(port); build/net2/redisd_demo $DP > build/net2/redisd2.out 2>&1 & pids="$pids $!"; sleep 0.5
+  build/net2/rcli $RP > build/net2/rcli_real.txt 2>&1; build/net2/rcli $DP > build/net2/rcli_mine.txt 2>&1
+  if diff -u build/net2/rcli_real.txt build/net2/rcli_mine.txt > build/net2/rcli.diff && [ -s build/net2/rcli_real.txt ]; then ok "redis client: identical output against redis-server ($(redis-server --version | sed 's/.*v=\([0-9.]*\).*/\1/')) and against redisd"; else bad "redis client: output differs between redis-server and redisd"; cat build/net2/rcli.diff; fi
+else
+  echo "skip redis-server is not installed"
+fi
+
 # ---- syslog: util-linux logger
 if command -v logger > /dev/null; then
   P=$(port); rm -f build/net2/sd.log*; build/net2/syslogd_demo $P build/net2/sd.log > build/net2/syslogd.out 2>&1 & pids="$pids $!"; sleep 0.5
@@ -48,5 +59,15 @@ if command -v logger > /dev/null; then
 else
   echo "skip logger is not installed"
 fi
+# ---- syslog: a UDP sender with a host name that does not resolve looks it up once per retry interval
+if $AC tests/net2_udpretry.a -o build/net2/udpretry && build/net2/udpretry > build/net2/udpretry.out 2>&1; then ok "syslog UDP sender: an unresolvable host is looked up once per retryIntervalMs"; else bad "syslog UDP sender retry"; cat build/net2/udpretry.out; fi
+
+# ---- a server at its descriptor limit does not spin on accept() (netsrv: the listener rests, then tries again)
+for e in redisd_demo mqttd_demo; do
+  P=$(port); case $e in redisd_demo) proto=redis;; *) proto=mqtt;; esac
+  (ulimit -n 30; exec build/net2/$e $P > build/net2/fd_$e.out 2>&1) & fdpid=$!; pids="$pids $fdpid"; sleep 0.5
+  if python3 tests/net2_fdlimit.py $P $fdpid $proto > build/net2/fd.out 2>&1; then ok "$e at its descriptor limit: no busy loop, serves again afterwards ($(head -1 build/net2/fd.out))"; else bad "$e at its descriptor limit"; cat build/net2/fd.out; fi
+  kill $fdpid 2>/dev/null
+done
 echo "passed: $pass, failed: $fail"
 [ $fail -eq 0 ]
