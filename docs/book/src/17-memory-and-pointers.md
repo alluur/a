@@ -14,11 +14,11 @@ In this chapter:
 
 | Place | What lives there | Lifetime |
 |---|---|---|
-| **Stack** | locals and parameters, 8 MiB | until the function returns |
+| **Stack** | locals and parameters | until the function returns |
 | **Globals** | `data` (initialised) and zero-filled `bss` | the whole program |
-| **Heap** | `new`, `alloc`, `malloc`, `calloc`, `realloc` | until the program ends, or until `free` |
+| **Heap** | `new`, `alloc`, and `malloc`, `calloc`, `realloc` from `cstdlib` | until the program ends, or until `free` (only for `malloc` and friends) |
 
-Pointers are plain addresses: 8 bytes, with no information about what they point to or how much memory is there. A does not check array bounds, and it does not stop you from using memory after it was freed. The compiler checks types and access, not memory.
+Pointers are plain addresses: 8 bytes, with no information about what they point to or how much memory is there. A does not check array bounds, and it does not stop you from using memory after it was freed. The compiler checks types, not memory.
 
 ## Pointers
 
@@ -59,42 +59,42 @@ What to notice:
 
 ## The stack
 
-Every function call gets a **frame** on the stack for its parameters and local variables. The frame disappears when the function returns, so a pointer to a local must not be used after that. The stack is 8 MiB on Linux and Android and is set to the same size in Windows executables. Deep recursion and big local arrays use it up; when it is full the program crashes (a segmentation fault).
+Every function call gets a **frame** on the stack for its parameters and local variables. The frame disappears when the function returns, so a pointer to a local must not be used after that. The stack is 8 MiB: that is the usual default on Linux and Android (the operating system decides there), and Windows executables reserve 8 MiB. Deep recursion and big local arrays use it up; when it is full the program crashes (a segmentation fault).
 
 {{sample lang/stack_locals}}
 
 What to notice:
 
-- `sumTo(100)` used 100 frames of 32 KiB each, about 3 MB of stack, and that worked. The same recursion with 255 levels (8 MiB / 32 KiB is about 256) overflowed the stack and crashed in a test.
+- `sumTo(100)` used 101 frames (the calls for 100 down to 0) of a little over 32 KiB each, about 3.3 MB of stack, and that worked. 8 MiB / 32 KiB is about 256, and that is where it ends: with the default 8 MiB stack on Linux, `sumTo(254)` still worked and `sumTo(255)` crashed with a segmentation fault.
 - `local` was a stack array and is gone after `greeting` returns. The function copied the text into heap memory from `alloc` and returned **that** pointer.
 - Returning the address of a local (`return local;`) is a bug that the compiler does not catch.
 
 ## The heap: new and alloc
 
-`new Type` and `alloc(n)` take memory from the heap. The heap is a 64 MiB region inside the program and, when that is used up, further blocks that the operating system provides. All of it is **zeroed**, and **`new` and `alloc` never free**: the memory lives until the program ends. The allocator is a plain bump pointer, so it is very fast and never fragments, which suits compilers, tools and short-lived programs.
+`new Type` and `alloc(n)` take memory from the heap. The heap is a 64 MiB region inside the program and, when that is used up, further blocks that the operating system provides. All of it is **zeroed**, and **`new` and `alloc` never free**: the memory lives until the program ends. The allocator is a plain bump pointer, so it is very fast and never fragments, which suits compilers, tools and short-lived programs. If even the operating system has no more memory, the program prints `fatal: out of memory` and exits with code 1; `alloc` never returns `null`.
 
 {{sample lang/heap_new_alloc}}
 
 What to notice:
 
 - `new Point` and `alloc(n)` returned zeroed memory: the first line shows four zeros. `alloc` returns a `char*`; cast it for other types: `(int*) alloc(5 * sizeof(int))`.
-- Blocks follow each other, rounded up to a multiple of 16 bytes: 10 bytes took 16, 17 bytes took 32. A hundred thousand 16 byte blocks used 1,600,000 bytes. This is an implementation detail, shown here so that you can see what a bump allocator does.
-- Allocating is as cheap as incrementing a pointer. Reading a whole file with `readFile` or all input with `readAll` also takes its memory from the heap.
+- Blocks follow each other, rounded up to a multiple of 16 bytes: 10 bytes took 16, 17 bytes took 32. The last of a hundred thousand 16 byte blocks started 1,600,000 bytes after the first. This is an implementation detail, shown here so that you can see what a bump allocator does.
+- Allocating is as cheap as incrementing a pointer. Reading a whole file with `readFile` or all input with `readAll` also takes its memory from the heap (from the built-in 64 MiB region only: more than that is cut off).
 - A program that runs for hours and keeps allocating will eventually run out of memory. For those programs use `malloc` and `free`.
 
 ## malloc and free
 
-The `cstdlib` module (part of the C library, see [chapter 19](#chap-standard-prelude)) has a **real allocator**: `malloc(n)` returns memory that you hand back with `free(p)`, `calloc(count, size)` returns zeroed memory, and `realloc(p, n)` changes the size of a block and keeps its contents. Freed blocks are reused.
+The `cstdlib` module (part of the C library, see [the C library tour](#chap-c-library-tour)) has a **real allocator**: `malloc(n)` returns memory that you hand back with `free(p)`, `calloc(count, size)` is `malloc(count * size)`, and `realloc(p, n)` changes the size of a block and keeps its contents. Blocks are rounded up to a power of two (16 bytes or more) and a freed block goes on a list for its size, so the next `malloc` of that size reuses it. `free(null)` does nothing. All of it sits on top of `alloc`.
 
 {{sample lang/malloc_free}}
 
 What to notice:
 
-- `malloc` does not zero the memory; `calloc` does. Neither is checked against your use: write only inside the `n` bytes you asked for.
-- `realloc` may move the block, so always assign its result back to the pointer.
+- Unlike C, the A library's `malloc` returns **zeroed** memory, also when it reuses a freed block, so `calloc` gives you nothing extra but the multiplication. Neither call checks your use: write only inside the `n` bytes you asked for.
+- `realloc` may move the block, so always assign its result back to the pointer. It returns the same block when the new size still fits.
 - `defer free(values);` releases the memory on every way out of the function. Declare the `defer` right after the allocation (see [chapter 13](#chap-control-flow)).
 - After `free(p)` the pointer is invalid but not `null`. Using it is a bug the language does not detect. Set it to `null` yourself if it stays in scope.
-- The loop of 100000 allocations and frees reuses the same block over and over, so the memory does not grow. Only blocks from `malloc`, `calloc` and `realloc` may be passed to `free`; memory from `new` and `alloc` cannot be given back.
+- The loop of 100000 allocations and frees reuses the same block over and over, so the memory does not grow. Only blocks from `malloc`, `calloc` and `realloc` may be passed to `free`; memory from `new` and `alloc` cannot be given back, and passing it to `free` is a bug (the library reads a header that is not there).
 
 ## Raw bytes
 
@@ -104,9 +104,9 @@ What to notice:
 
 What to notice:
 
-- `memcpy((char*) &q, (char*) &p, sizeof(Pair))` copied a whole struct; the cast changes the pointer type only. For a struct, `q = p;` does the same job.
+- `memcpy((char*) &q, (char*) &p, sizeof(Pair))` copied a whole struct; the cast changes the pointer type only (and makes the intent clear). For a struct, `q = p;` does the same job.
 - The bytes of `0x04030201` are 1, 2, 3, 4: x86-64 is **little endian**, the least significant byte comes first.
-- `memcpy` copies forward. Do not use it for overlapping ranges.
+- `memcpy` copies forward and returns nothing. Do not use it for overlapping ranges: `memmove` from the `cstring` module handles them.
 
 ## setjmp and longjmp
 
@@ -119,14 +119,14 @@ What to notice:
 - `setjmp` returned 0 first. `deep(0)` recursed until `fail(7)` called `longjmp(env, 7)`; control returned to the `setjmp` line, now with the value 7, and `deep` never finished (`not reached` was not printed).
 - A `longjmp` with the value 0 returns 1 from `setjmp`: that is how the second block ended up with `last value 1`.
 - Nothing is cleaned up on the way: deferred expressions of the skipped frames do not run, and memory that the skipped functions allocated with `malloc` is not freed. Use it for error recovery at a few well-chosen places, not as a general control structure.
-- Several `jmp_buf`-style arrays can be active at once, which makes nested handlers possible.
+- Several buffers (`int env1[4]; int env2[4];`) can be active at once, which makes nested handlers possible. A negative value works too.
 
 ## Summary
 
-- Stack: locals, 8 MiB, gone when the function returns. Globals: the whole program. Heap: `new`, `alloc`, `malloc`.
+- Stack: locals, 8 MiB, gone when the function returns. Globals: the whole program. Heap: `new`, `alloc`, `malloc` (from `cstdlib`).
 - `&x` takes an address, `*p` follows it, `T*` is the type; pointer arithmetic is scaled by the element size and not range checked.
 - An array decays to a pointer to its first element; pass the length separately.
-- `new` and `alloc` give zeroed memory from a fast bump allocator and never free it; `malloc`, `calloc`, `realloc` and `free` (from `cstdlib`) can reuse memory.
+- `new` and `alloc` give zeroed memory from a fast bump allocator and never free it; `malloc`, `calloc`, `realloc` and `free` (from `cstdlib`) can reuse memory. All of them return zeroed memory.
 - `defer free(p);` is the safe way to pair an allocation with its release.
 - `memcpy` and `memset` work on raw bytes; casts to `char*` or `uint8*` show the bytes of a value.
 - `setjmp` and `longjmp` jump out of nested calls and skip all cleanup.

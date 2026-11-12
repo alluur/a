@@ -33,6 +33,7 @@ What to notice:
 - `LOG(...)` forwards all its arguments with `__VA_ARGS__`.
 - `REPEAT` uses a backslash at the end of each line to spread the macro over several lines.
 - Names inside string literals are not replaced, and a macro is not expanded inside its own body (`#define A A + 1` is fine).
+- `#undef N` removes the macro, so the next `#define N 10` may give it a new value: the last line of the output shows 10.
 - The preprocessor keeps the number of lines unchanged, so error messages show the right line.
 
 ::: tip
@@ -43,7 +44,7 @@ For constants, the compile-time features of A itself, `const` and `static if`, a
 
 ## Conditional compilation
 
-`#ifdef X` and `#ifndef X` test whether a macro is defined; `#if expr` tests a number. In `expr` you can use `defined(X)`, integers, character constants and the operators `+ - * / % << >> & | ^ ~ ! && || == != < > <= >=`. A name that is not a macro counts as 0. The lines that are not selected are skipped completely: they need not be valid A code.
+`#ifdef X` and `#ifndef X` test whether a macro is defined; `#if expr` tests a number. In `expr` you can use `defined(X)`, integers, character constants, parentheses and the operators `+ - * / % << >> & | ^ ~ ! && || == != < > <= >=`. The conditional operator `? :` is not supported. A name that is not a macro counts as 0. The lines that are not selected are skipped completely: they need not be valid A code.
 
 {{sample lang/pp_conditional}}
 
@@ -62,7 +63,7 @@ pperror.a:2: error: #error
 
 ## Including files
 
-`#include "file"` inserts the file at that place. The compiler looks next to the including file first, then at the path as given, then in the library directories. `#include <file>` uses the library directories. The same file can be included many times; guard it so that its content appears only once, either with `#pragma once` at the top, or with the classic `#ifndef` guard.
+`#include "file"` inserts the file at that place. The compiler looks next to the including file first, then at the path as given, then in the library directories (`lib/`, `/usr/lib/a/` and `/usr/local/lib/a/`). `#include <file>` is looked up in exactly the same way: the compiler does not tell the two forms apart. Includes may be nested 12 levels deep. The same file can be included many times; guard it so that its content appears only once, either with `#pragma once` at the top, or with the classic `#ifndef` guard.
 
 {{sample lang/pp_include}}
 
@@ -70,7 +71,7 @@ The directory of this sample holds `main.a`, `defs.h` (which starts with `#pragm
 
 What to notice:
 
-- `defs.h` was included twice and `guarded.h` twice, yet `helper` and `guarded` are defined once. Without a guard the second include would be a `redefinition` error.
+- `defs.h` was included twice and `guarded.h` twice, yet `helper` and `guarded` are defined once. Without a guard the second include would be a `redefinition of 'helper'` error.
 - Header files are plain text: the `.h` extension is only a convention. Headers hold macros, constants, type definitions and prototypes; the next section uses them to share declarations between compiled units.
 - For A code that you want to reuse, modules (see [chapter 16](#chap-enums-and-modules)) are usually the better tool than `#include`.
 

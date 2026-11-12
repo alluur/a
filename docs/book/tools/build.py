@@ -138,6 +138,11 @@ def sample_meta(path):
     return meta, title
 
 
+def strip_directives(code):
+    """The "// book: ..." lines steer the tools (checker, screenshots); the reader does not need to see them."""
+    return "\n".join(l for l in code.split("\n") if not re.match(r"\s*//\s*book:", l))
+
+
 def listing(title, relname, code, lang="a"):
     f = fence_for(code)
     cap = html.escape(title) if title else ""
@@ -161,9 +166,10 @@ def expand_directives(text, chapter_name):
                 continue
             meta, title = sample_meta(main)
             code = open(main, encoding="utf-8", errors="replace").read()
+            code = strip_directives(code)
             out += [""] + listing(title, name + (".a" if not os.path.isdir(os.path.join(SAMPLES, name)) else "/main.a"), code)
             for o in others:
-                out += listing("", os.path.relpath(o, SAMPLES), open(o, encoding="utf-8", errors="replace").read())
+                out += listing("", os.path.relpath(o, SAMPLES), strip_directives(open(o, encoding="utf-8", errors="replace").read()), "c" if o.endswith(".h") else "a")
             if flag != "src" and not meta.get("compile-only") and not meta.get("gui"):
                 if os.path.exists(outp):
                     got = open(outp, encoding="utf-8", errors="replace", newline="").read().replace("\r\n", "\n").replace("\r", "")
@@ -439,6 +445,7 @@ def doc_slug_map(chapters):
 
 def resolve_links(c, chapters, docmap, mode, id_owner):
     cur = {orig: final for orig, final in c.ids.items()}
+    by_slug = {x.slug: x for x in chapters}
 
     def target_page(other):
         return "" if (mode == "epub" or other is c) else other.fname
@@ -478,6 +485,12 @@ def resolve_links(c, chapters, docmap, mode, id_owner):
                 new = ""      # a file of the repository: keep the words, drop the link
         if new == "":
             return {"t": "Span", "c": [["", ["repo"], []], inl]}
+        # a link written as "chapter 17" shows the number the chapter really has in the book (the file numbers are not the book numbers)
+        mnum = re.match(r"^([Cc])hapter \d+$", plain(inl).strip())
+        if mnum and "#chap-" in new:
+            target = by_slug.get(new.rsplit("#chap-", 1)[-1])
+            if target is not None and target.kind == "chapter":
+                inl = [{"t": "Str", "c": "%shapter" % mnum.group(1)}, {"t": "Space"}, {"t": "Str", "c": target.number}]
         node = dict(node)
         node["c"] = [attr, inl, [new, title]]
         return node

@@ -114,7 +114,7 @@ A `guix.SpinBox(min, max)` is a number field with two small arrows. Type digits,
 
 {{shot gui/splitter}}
 
-Every widget has a `tooltip` field. When the pointer rests on the widget for half a second, a small yellow card with the text appears next to it, and goes away when the pointer moves or a button is pressed.
+Every widget has a `tooltip` field. When the pointer rests on the widget for half a second, a small yellow card with the text appears next to it, and goes away when the pointer leaves the widget or a button is pressed.
 
 {{sample gui/tooltips src}}
 
@@ -336,4 +336,5 @@ A gauge draws its caption **below** its preferred height, so a gauge that gets e
 
 * [Four small applications built step by step](#chap-gui-programs) put widgets, dialogs and drawing together.
 * [Drawing and images](#chap-graphics) for the functions behind `Canvas` and your own widgets.
+* [The code editor widgets](#chap-code-editor-widgets): the themed editor, file tree, tabs, find bar and terminal pane of the AIDE editor.
 * API references: [`guix`](#api-guix), [`gchart`](#api-gchart), [`gui`](#api-gui).

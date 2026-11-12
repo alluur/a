@@ -169,4 +169,5 @@ and a command line argument: `clock 10:08:35` shows that time and does not tick,
 
 * [Windows and widgets](#chap-gui-basics) and [more widgets, dialogs and charts](#chap-gui-more-widgets) for everything the applications could still use.
 * [Drawing and images](#chap-graphics) for the functions behind the canvas and the clock.
+* [Networking and the web inside a GUI](#chap-gui-net-and-web): fetch pages and talk to other programs without freezing a window.
 * API references: [`gui`](#api-gui), [`guix`](#api-guix), [`gfx`](#api-gfx), [`gimg`](#api-gimg), [`datetime`](#api-datetime).

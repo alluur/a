@@ -1,17 +1,17 @@
 # Enums and modules
 
-Two features help you organise a program as it grows. **Enums** give names to a fixed set of values, so that code says `Color.Green` instead of `1`. **Modules** put related code in its own file and its own namespace, so that two files can use the same name without a clash. A offers two ways to write a module: the plain `module` / `import` pair, and module files with `a_module` and `a_import`.
+Two features help you organise a program as it grows. **Enums** give names to a fixed set of values, so that code says `Color.Green` instead of `1`. **Modules** put related code in its own file and its own **namespace** (a separate set of names), so that two files can use the same name without a clash. A offers two ways to write a module: the plain `module` / `import` pair, and module files with `a_module` and `a_import`.
 
 In this chapter:
 
-- enums: members, reflection (`count`, `name`, `parse`, `has`) and base types
+- enums: members, the functions an enum has to describe itself (`count`, `name`, `parse`, `has`) and base types
 - `module` and `import`, `public` and `private`
 - module files with `a_module` and `a_import`
 - importing the library modules that are built into the compiler
 
 ## Enums
 
-`enum Name { A, B, C }` declares a set of named integer constants. Values count up from 0; `= value` sets one explicitly and the next member continues from there. A trailing comma is allowed. Members can be written qualified (`Color.Blue`) or, when the name is unique, bare (`Blue`).
+`enum Name { A, B, C }` declares a set of named integer constants. Values count up from 0; `= value` sets one explicitly and the next member continues from there. A trailing comma is allowed. Members can be written qualified (`Color.Blue`) or bare (`Blue`). If two enums have a member with the same name, a bare name silently means the one declared last, and a local variable of that name hides it, so write `Color.Red` when in doubt.
 
 {{sample lang/enum_basic}}
 
@@ -50,13 +50,13 @@ An enum can be stored in fewer bytes by giving it a base type: `enum Kind : uint
 
 What to notice:
 
-- `sizeof(Kind)` is 1. In `Frame`, the fields are aligned like any other: a `Kind`, a `uint16` and another `Kind` take 8 bytes with padding.
+- `sizeof(Kind)` is 1. In `Frame`, the fields are aligned like any other: the `Kind` is at offset 0, the `uint16` at offset 2 and the second `Kind` at offset 4. That is 5 bytes of data, and the size of a structure is rounded up to a multiple of 8, so `sizeof(Frame)` is 8.
 - The value is cut to the base type when stored: `Kind k = 300;` holds 44.
 - `Kind.name(Kind.Image)` and the other reflection functions work the same way.
 
 ## Modules in files
 
-A source file can declare the module it belongs to with `module name;` as its first statement. Other files then `import name;` and use its names with the module as a prefix: `geometry.area(3, 4)`. Types are qualified in the same way (`geometry.Box*`).
+A source file declares the module it belongs to with `module name;` at the top. The names declared after that line belong to the module. Other files then `import name;` and use its names with the module as a prefix: `geometry.area(3, 4)`. Types are qualified in the same way (`geometry.Box*`).
 
 The smallest example is a directory with two files: `main.a` imports `greeter`, and `greeter.a` starts with `module greeter;`.
 
@@ -75,10 +75,10 @@ What to notice:
 
 - `import geometry;` found `geometry.a` in the directory of the importing file.
 - Inside the module, names are used without the prefix: `describe` calls `secret()` and `area(...)`.
-- `private` makes a top-level declaration (function, global, constant, class, enum) visible only inside its own file. Everything else is public; `public` may be written explicitly. A private name used from outside is the error `access to private declaration 'secret'`.
+- `private` makes a top-level declaration (function, global, constant, class, enum) visible only inside its own file. Everything else is public; `public` may be written explicitly. A private name used from outside is the error `access to private declaration 'secret'`. Fields of a class marked `private` (the `w` and `h` of `Box`) are checked too: `b->w` in `main.a` is the error `member is private to its class 'w'`.
 - Different modules can use the same names. `main.a` defines its own `area` and `geometry.area` is a different function.
 - A file is compiled **once**, however many files import it, and several files may contribute to the same module name.
-- The `module` line and the `import` line are the older and simpler form; the library itself is written with them.
+- The `module` line and the `import` line are the older and simpler form; most library modules are written with them.
 
 ### Where imports are found
 
@@ -131,7 +131,7 @@ What to notice:
 - Names are qualified: `collections.IntList`, `sort.sortInts`, `strings.padLeft`.
 - Classes can be created with `new` (`list`), or live on the stack (`ages`).
 - Every library module has its own page in the API reference, for example [collections](#api-collections), [sort](#api-sort) and [strings](#api-strings).
-- Large programs made of several files can be built in two ways: with `import`, which compiles everything together, or by compiling the files separately and linking them (see [chapter 18](#chap-preprocessor-and-assembly)).
+- Large programs made of several files can be built in two ways: with `import`, which compiles everything together, or by compiling the files separately and linking them (see [Preprocessor, linking and assembly](#chap-preprocessor-and-assembly)).
 
 ## Summary
 

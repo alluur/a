@@ -64,7 +64,7 @@ An honest list helps you decide whether A fits your project.
 | **Targets and internals** | [Every target in detail](#chap-targets) and [how the compiler works](#chap-internals). |
 | **Appendices** | A [quick reference card](#chap-quick-reference) and the generated [library reference](#chap-api): every public function of every module. |
 
-You do not have to read in order. If you know C, skim the first language chapters and go to the part you need. If you are new to programming, read chapters 4 to 10 in order and type in the examples.
+You do not have to read in order. If you know C, skim the first language chapters and go to the part you need. If you are new to programming, read the language guide in order, from [your first programs](#chap-first-programs) to [memory and pointers](#chap-memory-and-pointers), and type in the examples.
 
 ## How to read the listings
 

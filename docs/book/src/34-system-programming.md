@@ -25,7 +25,7 @@ The standard library, which every program has without an import, can read and wr
 | Function | What it does |
 |---|---|
 | `os.getCwd()` | the working directory as a new heap string, `null` on error |
-| `os.fileSize(path)` | the size in bytes; `-1` if the file cannot be opened or is a directory |
+| `os.fileSize(path)` | the size in bytes; `-1` if the file cannot be opened, and (on ordinary file systems) for a directory |
 | `os.rename(from, to)` | renames or moves a file or directory; `true` on success |
 | `os.listDir(path, names, max)` | stores the names of the entries (without `.` and `..`) in `names`; returns how many, `-1` on error |
 
@@ -46,7 +46,7 @@ The standard library, which every program has without an import, can read and wr
 
 **What to notice.**
 
-* `os.fileSize` has no way to say "this is a directory", so it returns `-1` for one, just like for a file that does not exist.
+* `os.fileSize` has no way to say "this is a directory", so on ordinary file systems it returns `-1` for one, just like for a file that does not exist. Special directories can behave differently: on Linux `os.fileSize("/proc")` is `0`. When you must tell the two apart, use `stat` and `S_ISDIR` from `cunistd` (see [the C library tour](#chap-c-library-tour)).
 * On Linux, `os.rename` replaces an existing destination. On Windows it refuses. If your program must run on both, delete the destination first.
 * `fileDelete` returns `false` for a file that is already gone, so deleting twice is safe.
 
@@ -62,7 +62,7 @@ The standard library, which every program has without an import, can read and wr
 
 ### Walking a tree
 
-Combine `listDir` and `fileSize` and you have a recursive walk: an entry with a size of `-1` is a directory.
+Combine `listDir` and `fileSize` and you have a recursive walk: an entry with a size of `-1` is treated as a directory. (A file that you are not allowed to open also gives `-1`; the walk then tries to list it, `listDir` fails with `-1`, and nothing is printed below it.)
 
 {{sample sys/os_walk}}
 
@@ -76,7 +76,7 @@ Combine `listDir` and `fileSize` and you have a recursive walk: an entry with a 
 
 * The three modes are `FILE_READ`, `FILE_WRITE` (creates or truncates) and `FILE_APPEND`.
 * `fileRead` returns `0` at the end of the file. A negative handle means the open failed.
-* Output is not buffered by A: each `fileWrite` is a system call. If you write many small pieces, collect them in a buffer first, or use `FILE*` from the C library, which buffers (see [the C library tour](#chap-c-library-tour)).
+* A does not buffer the handle functions: each `fileWrite` is a system call, and the data is in the file as soon as it returns. If you write many small pieces, collect them in a buffer first, or use `FILE*` from the C library, which buffers (see [the C library tour](#chap-c-library-tour)).
 
 ## The environment
 
@@ -86,9 +86,10 @@ Every program receives a set of `NAME=value` strings from the program that start
 
 **What to notice.**
 
-* `getenv` returns `null` for a variable that is not set, and a pointer to the value otherwise. Copy it (`strdup`) if you need it after the next `setenv`.
+* `getenv` returns `null` for a variable that is not set, and a pointer to the value otherwise. The text belongs to the library: do not change or free it, and copy it (`strdup`) if you need your own version.
 * `setenv(name, value, false)` keeps an existing value. The default `true` replaces it.
-* `getEnv(argc, argv, name)` is the older function of the standard library. It needs `argc` and `argv` to find the environment of the process, and it does not see changes made by `setenv`. Prefer `getenv`.
+* `getEnv(argc, argv, name)` is the older function of the standard library. It needs `argc` and `argv` to find the environment of the process, returns a new copy of the value, and does not see changes made by `setenv`. Prefer `getenv`.
+* Your program can set at most 64 different names with `setenv`; after that `setenv` returns `-1`.
 * A change affects your own process and the children you start afterwards. It never changes the parent's environment, or the shell you started from.
 
 ## Child processes
@@ -105,11 +106,11 @@ On Linux and Android a program can start other programs. The classic way has thr
 
 * The child ends with `_exit`, which leaves at once. `exit` also runs the exit handlers that the program registered with `atexit` and flushes buffered files, which you rarely want in a copy.
 * `waitpid` stores a status word. The exit code is in bits 8 to 15. The low 7 bits are the number of the signal that killed the process, or 0.
-* A parent that never waits leaves a zombie process behind until it ends itself.
+* A parent that never waits leaves a zombie behind: a finished child whose exit status nobody has collected. It stays in the process table until the parent ends.
 
 ### Talking through a pipe
 
-A pipe is a one-way channel in the kernel: `pipe` gives you two descriptors, one to read and one to write. After a `fork`, both processes have both ends. Each side closes the end it does not use.
+A pipe is a one-way channel in the kernel: `pipe` gives you two descriptors (a descriptor is the small number that the system uses for an open file or pipe), one to read and one to write. After a `fork`, both processes have both ends. Each side closes the end it does not use.
 
 {{sample sys/proc_pipe}}
 
@@ -125,9 +126,9 @@ A pipe is a one-way channel in the kernel: `pipe` gives you two descriptors, one
 
 **What to notice.**
 
-* `execvp` searches the directories of `PATH`. `execv` wants a full path. Both take a list of strings that ends with `null`, and the first entry is the program name.
+* `execvp` searches the directories of `PATH`. `execv` wants a path with a `/` in it (`execv("echo", ...)` fails, `execv("/bin/echo", ...)` works). Both take a list of strings that ends with `null`, and the first entry is the program name.
 * They only return when they fail. The code after `execvp` is the error path; `127` is the exit code that shells use for "command not found".
-* The output of the child goes to the same standard output as yours. A did not buffer it, so the order of lines is the order of events.
+* The output of the child goes to the same standard output as yours. `print` and `println` do not buffer, so the order of lines is the order of events.
 
 ### The easy way: system and popen
 
@@ -143,7 +144,7 @@ When you want to run a shell command and do not care about the details, use `sys
 
 ::: warning
 
-On this branch a stream opened with `popen(command, "w")` has a problem: the command also inherits the write end of its own input pipe (the pipe is not marked close-on-exec), so a command that reads until the end of its input (`sort`, `cat`, `tr`) never sees the end, and `pclose` waits forever. The sample uses a shell `read`, which stops after one line. When you need to feed a program that reads to the end, use `pipe`, `fork` and `exec` as in the earlier samples and close the write end in the child.
+On this branch a stream opened with `popen(command, "w")` has a problem: the command also inherits the write end of its own input pipe (the pipe is not marked close-on-exec, which would make the system close it when the new program starts). A command that reads until the end of its input (`sort`, `cat`, `tr`) therefore never sees the end, and `pclose` waits forever; `popen("tr a-z A-Z", "w")` is an example. A command that stops reading by itself is fine: the sample uses a shell `read`, and `head -n 1` also works. When you need to feed a program that reads to the end, use `pipe`, `fork`, `dup2` and `execvp` as in the earlier samples: in the child, `dup2` the read end onto descriptor 0, close both pipe ends, and in the parent close the write end after you have written.
 
 :::
 
@@ -170,7 +171,7 @@ A signal is a small message that the kernel delivers to a process: "the user pre
 **What to notice.**
 
 * The sample checks `elapsed >= 50` rather than printing the time. A program that prints how long it took has a different output every run. For examples and tests, check a bound instead.
-* `cpu.cycles()` reads the processor's own counter. It is finer than `millis()` but its unit is not seconds: on x86-64 it counts CPU cycles, on other processors it counts ticks of a fixed rate timer.
+* `cpu.cycles()` reads the processor's own counter. It is finer than `millis()` but its unit is not seconds: on x86-64 it reads the time stamp counter (the `rdtsc` instruction), on other processors a counter that ticks at a fixed rate. Compare two readings; do not turn one into seconds without knowing the rate of your machine.
 * Calendar time (dates, time zones, `strftime`) is in `ctime`: see [the C library tour](#chap-c-library-tour). The `datetime` module has a date and time class: see its [API reference](#api-datetime).
 
 ## Threads
@@ -184,7 +185,7 @@ The `thread` module starts real operating system threads on Linux and Android. A
 | `thread.spawn(fn, arg)` | starts `fn(arg)` in a new thread; returns a `Thread*`, `null` if it could not be started |
 | `thread.join(t)` | waits for the end and returns the function's result (joining twice is fine) |
 | `thread.finished(t)` | `true` if the thread has ended |
-| `thread.parallelFor(n, body, workers)` | calls `body(i)` for `i` from 0 to `n - 1` on `workers` threads (0 = one per processor) |
+| `thread.parallelFor(n, body, workers)` | calls `body(i)` for `i` from 0 to `n - 1` on `workers` threads (0 = one per processor; at most 64, and never more than `n`) |
 | `thread.cpuCount()` | the number of processors the program may use |
 | `thread.currentId()`, `thread.yield()` | the id of the calling thread; give the processor away |
 | `thread.supported()` | `true` where threads are real |
@@ -202,12 +203,12 @@ The runtime of A is not thread safe. Do not call `alloc`, `new`, `print`, `print
 **What to notice.**
 
 * The function is passed as a value: `thread.spawn(sumTo, 100)`. To pass more than one number, put them in a struct and pass its address as the `int`.
-* Each thread has its own stack of 1 MiB (the main thread has 8 MiB). Keep large arrays out of the local variables of thread functions.
+* Each thread has its own stack of 1 MiB (1,048,576 bytes). The main thread has the stack that the system gives every program, 8 MiB with the usual settings (`ulimit -s`). A thread that uses more than its 1 MiB, by recursing deeply or by having big local arrays, crashes the program: a test with a function that has a 1,000 byte local array stopped at about 1,000 calls in a thread, and at about 8,000 in the main thread. Keep large arrays out of the local variables of thread functions.
 * On Windows `thread.supported()` is `false` and `spawn` runs the function to its end before it returns. Programs that only compute and join give the same result there.
 
 ### Atomic operations
 
-If four threads each do `hits = hits + 1`, updates get lost: two threads read the same old value, and both write the same new one. An atomic operation reads, changes and writes in one indivisible step.
+If four threads each do `hits = hits + 1`, updates get lost: two threads read the same old value, and both write the same new one. An atomic operation reads, changes and writes in one indivisible step. The `cpu` functions work on an `int` (64 bits wide in A).
 
 {{sample sys/thread_atomic}}
 
@@ -226,7 +227,7 @@ When several fields must change together, one atomic number is not enough. A loc
 **What to notice.**
 
 * `cpu.lock(&flag)` waits (spins) until it gets the lock. `cpu.tryLock(&flag)` returns `false` at once if the lock is taken. `cpu.unlock(&flag)` releases it.
-* A spin lock wastes processor time while it waits, so hold it for a few instructions only. There is no mutex that puts a thread to sleep and no condition variable in this module.
+* A spin lock wastes processor time while it waits, so hold it for a few instructions only. The library has no mutex that puts a thread to sleep and no condition variable: for waiting you have the spin lock, `cpu.pause()` and `thread.join`.
 * Nothing connects the lock to the data. The rule that every access to `account` takes `guard` first is a rule of your program.
 
 ### Splitting a loop
@@ -250,7 +251,7 @@ A queue between two threads is a classic. This one is a ring of four slots prote
 * Both sides wait by calling `cpu.pause()` in a loop. It tells the processor that this is a spin loop.
 * `pop()` returns `-1` for "empty", so `0` can be the "no more items" marker.
 * Only the main thread calls `printf`, as the warning above demands.
-* Because of the single producer and single consumer, the order of the output is always the same. This sample needs real threads: on Windows, where `spawn` runs the function first, the producer would wait for ever for a consumer that does not run yet.
+* Because of the single producer and single consumer, the order of the output is always the same. This sample needs real threads: on Windows, where `spawn` runs the function first, the producer would wait forever for a consumer that does not run yet.
 
 ### Output from several threads
 
@@ -310,7 +311,7 @@ Compilers and processors may reorder memory accesses. When one thread hands data
 
 ## Command lines
 
-A command line program gets its arguments in `main(int argc, char** argv)`. For a single flag, the standard library has `hasArg(argc, argv, "-v")` and `argValue(argc, argv, "-o", fallback)`. For anything bigger, use `cli.ArgParser`, which understands
+A command line program gets its arguments in `main(int argc, char** argv)`: `argc` is the number of words, and `argv[0]` is the program name. For a single flag, the standard library has `hasArg(argc, argv, "-v")` and `argValue(argc, argv, "-o", fallback)`. For anything bigger, use `cli.ArgParser`, which understands
 
 * flags and options with several names: `-v,--verbose`;
 * combined short flags: `-ac` means `-a -c`;
@@ -326,8 +327,8 @@ You declare what is allowed with `addFlag(names, help)` and `addOption(names, he
 
 * The `args=` line in the sample tells the build how to run it. The same flags work on a terminal.
 * `parse` returns `false` after an error or after `--help`. Return from `main` right away then; the parser has printed what is needed.
-* The options may come in any order and may be mixed with the arguments: `-v` came first, `--output=report.txt` and `-n 5` in the middle, then the two file names.
-* `optionInt` turns the text into a number. When the text is not a number, you get your fallback.
+* The sample gives three options (`-v`, `--output=report.txt`, `-n 5`) and then two file names. The parser also accepts options after the file names or between them: only `--` stops it.
+* `optionInt` turns the text of the option into a number. When the option was not given, the text is the default you declared ("10" for `-n`). Only when the text is not a number do you get your fallback.
 
 ### Short flags and the end of options
 
@@ -347,7 +348,8 @@ You declare what is allowed with `addFlag(names, help)` and `addOption(names, he
 
 * `--help` prints the usage to standard output and `parse` returns `false`, so the program exits with the code you choose; here it is 1 (`exit=1` in the sample tells the checker).
 * The text is built from your declarations: the names, the help strings and the defaults. An empty default is not shown.
-* The parser holds at most 32 flags and options and 64 arguments.
+* The last line, `-h,--help`, is added by the parser.
+* The parser has room for 32 declarations (each `addFlag` or `addOption` counts once, however many names it has) and 64 arguments. It does not tell you when you go over: further declarations are ignored, so using such an option later gives `unknown option`, and further arguments are dropped without a message.
 
 ### Mistakes
 
@@ -385,7 +387,7 @@ The `log` module writes lines with a level to standard error (so that your real 
 | `log.debugf(fmt, a, b, c, d)`, `infof`, `warnf`, `errorf` | the same with `printf` formatting; exactly four values (pass `0` for the unused ones) |
 | `log.setLevel(level)` | hide everything below `level` |
 | `log.setFd(fd)` | write to another descriptor or file handle |
-| `log.setTimestamps(on)`, `log.setColors(on)` | switch the time stamp and the colours (only used on a terminal) off or on |
+| `log.setTimestamps(on)`, `log.setColors(on)` | switch the time stamp and the colours off or on (colours are only used when the output is a terminal) |
 
 ### Levels
 
@@ -396,6 +398,7 @@ The `log` module writes lines with a level to standard error (so that your real 
 * The sample sends the log to standard output with `setFd(1)` and removes the time stamp, so that its output can be recorded. In a real program you would leave both alone.
 * The tag has a fixed width (`[INFO ]`, `[WARN ]`), so messages line up.
 * `log.setLevel(log.OFF)` silences the log completely.
+* Keep messages short. A message of about 2,000 characters is the limit for the plain functions (a longer one is cut and loses its line break), and the `f` functions cut the formatted text at 1,023 characters.
 
 ### Formatted messages
 
@@ -406,6 +409,12 @@ The `log` module writes lines with a level to standard error (so that your real 
 * The `f` functions take a format and exactly four values. Text is passed as `(int) text`, like all values of `printf`.
 * A message that is not shown costs very little: the formatting is skipped when the level is too low.
 * For a message that you build yourself, with more than four values, use `format` and the plain functions.
+
+::: note
+
+A program cannot import both `log` and the C library modules `cstdio` or `cmath`: the C function `log` (the logarithm) has the same name as the module, and the compiler reports `name is already declared as something else: 'log'`. Use the standard library's `printf` and `fileOpen` in programs that use the `log` module.
+
+:::
 
 ### A log file and the time stamp
 
@@ -423,7 +432,7 @@ The `log` module writes lines with a level to standard error (so that your real 
 | Function | What it does |
 |---|---|
 | `testing.assertEq(expected, actual, name)` | two numbers are equal |
-| `testing.assertStrEq(expected, actual, name)` | two strings are equal (`null` counts as different) |
+| `testing.assertStrEq(expected, actual, name)` | two strings are equal (an `actual` of `null` counts as a failure) |
 | `testing.check(condition, name)` | any condition |
 | `testing.passedCount()`, `testing.failedCount()` | the counters so far |
 | `testing.summary()` | prints `N passed, M failed` and returns M |
@@ -446,7 +455,7 @@ The `log` module writes lines with a level to standard error (so that your real 
 **What to notice.**
 
 * Each failure is one line that starts with `FAIL`, then the name you gave, then the two values. `check` has no values to show, so its line has only the name.
-* A string that is `null` is shown as `(null)`.
+* A string that is `null` is shown as `(null)`. The sample also prints its own line with `passedCount()` and `failedCount()` before `summary()`.
 * The run goes on after a failure; you see every broken test at once. The summary then says `2 passed, 4 failed` and the exit code is 4 (`exit=4` in the sample).
 * Give every assertion a name that says what is *true*: "last in, first out", not "test 3". It is what you will read when it fails.
 
@@ -460,7 +469,7 @@ A small tool that uses three of the modules: `cli` for the options, `os` for the
 
 * The log level follows the `-v` flag: with `-v` the skipped files are mentioned as `DEBUG` lines, without it they are silent.
 * The `-m` option is read as a number with a default, `optionInt("--min", 0)`.
-* A usage error is reported on standard error and returns 2, a failure to read the directory is a log line and returns 1: three different outcomes with three different exit codes. This is the convention that other programs expect: `0` for success, `1` for a failure, `2` for wrong use.
+* Not giving exactly one directory is reported on standard error and returns 2, a failure to read the directory is a log line and returns 1, success returns 0: three different outcomes with three different exit codes. This is the convention that other programs expect: `0` for success, `1` for a failure, `2` for wrong use. (The sample is not perfect: a mistake that `parse` reports, such as an unknown option, returns 1.)
 
 ## Summary
 

@@ -65,7 +65,8 @@ What to notice:
 
 What to notice:
 
-* `\n`, `\t`, `\"`, `\\`, `\/` and `\uXXXX` are decoded, including surrogate pairs such as `\ud83d\ude00` for a character outside the first 65536. The result is ordinary UTF-8.
+* `\n`, `\t`, `\r`, `\b`, `\f`, `\"`, `\\`, `\/` and `\uXXXX` are decoded, including surrogate pairs such as `\ud83d\ude00` for a character outside the first 65536. The result is ordinary UTF-8.
+* Two escapes do not survive the trip into a C string. `\u0000` is dropped, because text in A ends at the first zero byte. A single surrogate without its partner (`\ud83d` alone) is not an error, but it becomes three bytes that are not valid UTF-8; a high surrogate followed by an escape that is not a low surrogate is the error `bad surrogate pair`.
 * The writer escapes only what JSON requires (quote, backslash, control characters) and leaves UTF-8 as it is.
 * A raw control character, such as a real tab inside a string, is an error when parsing (`control character in string`). Write it as `\t`.
 
@@ -110,13 +111,13 @@ What to notice:
 
 * The first line is a header, so the loop starts at 1.
 * The price `2.90` is converted to cents with `atoi` on both sides of the dot, to stay in integers. This only works when every price has exactly two digits after the dot (`2.5` would read as 205 cents). For real money code use [`decimal`](#chap-numbers).
-* Fields that contain line breaks are not supported, because `parseLine` sees one line. Read the file line by line.
+* Fields that contain line breaks are not supported, because `parseLine` sees one line. Read the file line by line. `parseLine` does not remove a carriage return, so with a file that has Windows line endings (CRLF) the last field of each line ends in `\r` unless you strip it first.
 
 See the [API reference of `csv`](#api-csv).
 
 ## INI files: `ini`
 
-INI files are settings in `[sections]` with `key = value` lines. Lines that start with `;` or `#` are comments, and so is the rest of a value line after ` ;` or ` #`. Values may be put in double quotes to keep `;` and `#` (and blanks between words; blanks at the very start or end of the value are trimmed even inside the quotes). Keys before the first section belong to the section `""`.
+INI files are settings in `[sections]` with `key = value` lines. Lines that start with `;` or `#` are comments, and so is the rest of a value line after ` ;` or ` #`. Values may be put in double quotes to keep ` ;` and ` #` (a `;` or `#` that follows a non-blank character is part of the value anyway). Blanks inside a value are always kept, and blanks at the very start or end are trimmed, even inside the quotes. Keys before the first section belong to the section `""`.
 
 {{sample data/ini_parse}}
 
@@ -187,7 +188,7 @@ What to notice:
 What to notice:
 
 * Repetitive data collapses (10000 bytes to 85) and random data grows by a few bytes (10000 to 10011). Compressing twice, or compressing encrypted data, does not help.
-* The compressor looks for repeats in the last 32 KB and writes them with the fixed Huffman code (a ready-made table of short codes for common bytes), or as stored blocks when that is smaller. Real text shrinks to between a quarter and a half (the source of `lib/json.a` to 26%, the file `docs/LANGUAGE.md` to 49%). A full gzip, which also uses dynamic Huffman codes, does better: `gzip -9` needs 1480 bytes for the word soup of this sample (`zlib.gzip` writes 1852 bytes for it). Every program can read what `zlib` writes.
+* The compressor looks for repeats in the last 32 KB and writes them with the fixed Huffman code (one ready-made table of bit codes that is the same for every input, so the savings come from the repeats, not from the codes), or as stored blocks when that is smaller. Real text shrinks to between a quarter and a half (the source of `lib/json.a` to 26%, the file `docs/LANGUAGE.md` to 49%). A full gzip, which also uses dynamic Huffman codes, does better: `gzip -9` needs 1489 bytes for the word soup of this sample (`zlib.gzip` writes 1852 bytes for it). Every program can read what `zlib` writes.
 * A higher level searches longer: here 2652 bytes at level 1 and 1812 at level 9 for the same data.
 
 {{sample data/zlib_damage}}
@@ -282,7 +283,7 @@ What to notice:
 
 What to notice:
 
-* The C library reads the zone from the `TZ` variable. A POSIX rule gives the standard name, the offset (**positive west of Greenwich**, so Helsinki is `-2`), the daylight name and the rules for the switch: `M3.5.0/3` means "month 3, last (5th) week, Sunday, at 03:00".
+* The C library reads the zone from the `TZ` variable. A POSIX rule gives the standard name, the offset (**positive west of Greenwich**, so Helsinki is `-2`), the daylight name and the rules for the switch: `M3.5.0/3` means "month 3, last (5th) week, Sunday, at 03:00". The library does not look up region names: `TZ=Europe/Helsinki` is read as a zone called `Europe` with no offset, so you get UTC times. When `TZ` is not set, Linux programs use the rule at the end of `/etc/localtime`.
 * `localtime` and `strftime` then show winter time (`EET`, UTC+2) and summer time (`EEST`, UTC+3) correctly. `mktime` converts a local date back to a timestamp.
 * Only today's rule is known: the rule is applied to every year, even where history differed.
 * The program sets `TZ` itself, so the output does not depend on the computer. The [C library tour](#chap-c-library-tour) has more on `ctime`.
@@ -308,7 +309,7 @@ The checksums return an `int`. The digests return lowercase hex text (`md5`, `sh
 
 What to notice:
 
-* The CRC-32 of `"123456789"` is `CBF43926`, the standard check value, and the Adler-32 of `"Wikipedia"` is `11E60398`, the value in the specification.
+* The CRC-32 of `"123456789"` is `CBF43926`, the standard check value, and the Adler-32 of `"Wikipedia"` is `11E60398`, the example value that is quoted everywhere for Adler-32.
 * The checksum of an empty text is not always 0: it is 0 for CRC-32, but Adler-32 starts at 1, FNV-1a at its offset basis (`811C9DC5`) and djb2 at 5381 (`1505` in hex).
 * `crc32Update(crc, data, n)` continues a checksum, so a large file can be read in chunks. Start with 0.
 * Changing one letter changes the whole checksum.
@@ -367,7 +368,7 @@ A perceptron draws a straight line through the input space. It can learn every p
 What to notice:
 
 * `fit(x, targets, count, epochs, rate)` runs whole passes over the examples (one pass is an **epoch**) and returns the number of epochs used; it stops early when a pass has no mistake. The targets and the answers of `predict` are plain 0 and 1.
-* AND and OR are learned in a few epochs. XOR is not: no straight line separates `(0,1)` and `(1,0)` from `(0,0)` and `(1,1)`, so the 100 epochs run out and the answers stay wrong.
+* AND and OR are learned in a few epochs. XOR is not: no straight line separates `(0,1)` and `(1,0)` from `(0,0)` and `(1,1)`, so the 100 epochs run out and at least one answer stays wrong (here two of the four).
 * The inputs and the learning rate are fixed-point numbers (`fixed.fromInt(1)`, `fixed.fromText("0.25")`).
 
 ### A network that learns XOR
@@ -395,7 +396,7 @@ What to notice:
 
 * The patterns are arrays of +1 and -1 (`#` and `.` in the picture). `store` adds a pattern with the Hebb rule (cells that have the same value in a pattern get a stronger link).
 * `energy` measures how stable a state is; lower is more stable. Damaging five of the 25 cells raises the energy from -312 to -128, and `recall` brings it back to -312.
-* `recall(state, maxSweeps)` changes the state in place and returns the number of sweeps it needed. A sweep visits every cell once; the last sweep is the one in which nothing changed, so 2 sweeps here means one that repaired the pattern and one that confirmed it.
+* `recall(state, maxSweeps)` changes the state in place and returns the number of sweeps it needed (`maxSweeps` when it has not settled by then). A sweep visits every cell once; the last sweep is the one in which nothing changed, so 2 sweeps here means one that repaired the pattern and one that confirmed it.
 * A Hopfield network of `n` neurons holds only a few patterns (about 0.14 n). Similar patterns interfere with each other.
 
 The `codec` module (see [text and strings](#chap-text-and-strings)) turns text and pictures into the vectors these networks want, and the example program `examples/ocr.a` combines them into a character recogniser. See the [API reference of `nn`](#api-nn).

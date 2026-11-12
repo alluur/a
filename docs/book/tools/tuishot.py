@@ -24,6 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BOOK = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(BOOK))
 SAMPLES = os.path.join(BOOK, "samples")
+sys.dont_write_bytecode = True      # do not leave a __pycache__ in tests/tui
 sys.path.insert(0, os.path.join(ROOT, "tests", "tui"))
 import ptyterm  # noqa: E402  (the terminal emulator of the tui tests)
 

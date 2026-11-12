@@ -346,4 +346,5 @@ When you have work of your own, write the loop yourself: one step of work, then 
 
 * [More widgets: menus, tabs, tables, dialogs, charts](#chap-gui-more-widgets)
 * [Four small applications, built step by step](#chap-gui-programs)
+* [The display server](#chap-display-server): windows, layers, input and the protocol behind everything in this chapter
 * API references: [`gui`](#api-gui), [`adp`](#api-adp), [`gfx`](#api-gfx)

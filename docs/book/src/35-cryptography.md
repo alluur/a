@@ -2,7 +2,7 @@
 
 A has a small set of cryptographic building blocks written in A itself: hashes and HMAC, two authenticated ciphers (AES-GCM and ChaCha20-Poly1305), X25519 key agreement, RSA and ECDSA signatures, X.509 certificates, TLS 1.3, and the password hashes of `/etc/shadow`. They are what `http` and `gnet` use for `https://`, and you can use them directly.
 
-This chapter shows each module with a sample that uses a published test vector where one exists, and explains which tool is for which job. The second half of the work, choosing the right tool and using it in the right order, matters more than any single call.
+This chapter shows each module with a sample that uses a published test vector where one exists, and explains which tool is for which job. Choosing the right tool, and using it in the right order, matters more than any single call.
 
 In this chapter:
 
@@ -14,7 +14,7 @@ In this chapter:
 
 ::: warning
 
-**This is a from-scratch implementation that has not had an independent security audit.** It was written for A, in A, and its tests compare its answers with published test vectors and with other implementations (OpenSSL through Python's `cryptography` package), so it computes the right results. That is not the same as being safe against an attacker. In particular the code is **not constant time**: table lookups and branches that depend on secret data can leak the secret to someone who can measure timings, for example from another process on the same machine. Use it to learn, to talk to servers and to protect data where a loss is acceptable. For anything whose loss would hurt (money, health, other people's data), use a library that has been audited and has years of use, and treat what is in this chapter as a way to understand how that library works.
+**This is a from-scratch implementation that has not had an independent security audit.** It was written for A, in A, and its tests compare its answers with published test vectors and with other implementations (Python's `cryptography` package, which uses OpenSSL, and `openssl`, `curl` and Python's `ssl` module for TLS), so it computes the right results. That is not the same as being safe against an attacker. In particular the code is **not constant time**: table lookups and branches that depend on secret data can leak the secret to someone who can measure timings, for example from another process on the same machine. Use it to learn, to talk to servers and to protect data where a loss is acceptable. For anything whose loss would hurt (money, health, other people's data), use a library that has been audited and has years of use, and treat what is in this chapter as a way to understand how that library works.
 
 :::
 
@@ -24,7 +24,7 @@ Start from what you want to achieve, not from the algorithm.
 
 | You want to | Use | Module and call |
 |---|---|---|
-| get a fingerprint of data, to detect accidents | a hash: SHA-256, SHA-384, SHA-512 | `hash.sha256`, `hash.digest(bits, ...)` |
+| get a fingerprint of data, to detect accidents | a hash: SHA-256, SHA-384, SHA-512 | `hash.sha256Raw`, `hash.digest(bits, ...)` |
 | prove that a message came from someone who knows a shared secret, and was not changed | HMAC | `hash.hmacSha256`, `hash.hmac(bits, ...)` |
 | keep data secret **and** detect changes | an AEAD cipher: AES-GCM or ChaCha20-Poly1305 | `aes.seal` / `aes.open`, `chacha.seal` / `chacha.open` |
 | agree on a key with someone over a channel that others can read | X25519 | `x25519.base`, `x25519.scalarmult` |
@@ -41,31 +41,31 @@ Three facts that the table cannot show:
 * **Encryption alone does not protect against changes.** `chacha.xorStream` encrypts and nothing else; a changed byte decrypts to a changed byte, silently. Use the AEAD functions, which check a tag before they give you any plain text.
 * **Key agreement alone does not tell you who you agreed with.** X25519 gives two parties a shared secret; it does not tell either of them whom they share it with. Combine it with a signature, a certificate, or a secret that you shared in advance, or an attacker in the middle can run two agreements and read everything.
 
-What is **not** there: encryption with RSA or key exchange with ECDH on the NIST curves (`rsa` and `ec` only sign and verify); the classic block cipher modes ECB, CBC and CTR for AES (only GCM is public); Ed25519; SHA-3; and key derivation functions such as PBKDF2, HKDF, scrypt or argon2. `hash.sha1` and `hash.md5` exist for old formats; do not use them where an attacker can choose the data.
+What is **not** there (checked in the sources of `lib/`): encryption with RSA or key exchange with ECDH on the NIST curves (`rsa` and `ec` only sign and verify; `rsa` cannot make PKCS#1 v1.5 signatures, only check them); the classic block cipher modes ECB, CBC and CTR for AES (the only public AES calls are the GCM ones); Ed25519; SHA-3; and key derivation functions such as PBKDF2, HKDF, scrypt or argon2. (The `tls` module has an HKDF inside, but it is private to it.) `hash.sha1` and `hash.md5` exist for old formats (`hash.digest` also takes 160 for SHA-1 and 128 for MD5); do not use them where an attacker can choose the data.
 
 ## Random bytes and hex text
 
-Keys and nonces must be unpredictable. `secure.bytes(buf, n)` fills a buffer from the operating system's generator (`getrandom` or `/dev/urandom` on Linux, `RtlGenRandom` on Windows) and returns `false` if the system has none. `secure.unique(out)` gives 16 bytes that do not repeat.
+Keys and nonces must be unpredictable. `secure.bytes(buf, n)` fills a buffer from the operating system's generator (`getrandom` or `/dev/urandom` on Linux, `RtlGenRandom` on Windows) and returns `false` if the system has none. `secure.unique(out)` gives 16 bytes that do not repeat: normally random bytes from the same source, but when there is no secure generator it falls back to a hash of a counter, the clock and an address. Such a value does not repeat, but it can be guessed, so use `secure.bytes` for keys.
 
 {{sample crypto/secure_random}}
 
 **What to notice.**
 
-* Always look at the result of `secure.bytes` when the bytes are a key. The modules never fall back to a weaker source, and your program should not either.
-* `rand()` of the standard library is a fast generator for games and tests. After `srand(1)` it gives the same numbers every time, and its state can be worked out from a few outputs. Never use it for a key, a nonce or a password salt.
+* Always look at the result of `secure.bytes` when the bytes are a key. The signing and TLS code of the library stops with an error when `secure.bytes` fails instead of using a weaker source, and your program should do the same.
+* `rand()` of the standard library is a simple xorshift generator for games and tests. After `srand(1)` it gives the same numbers every time, and its state can be worked out from a few outputs. Never use it for a key, a nonce or a password salt.
 
-Test vectors and keys are easier to read as hex text. `secure.toHex(data, n)` makes lower case hex, and `secure.fromHex(text, out, max)` decodes it. The decoder returns the number of bytes, `-1` for an odd number of digits, for a character that is not a hex digit, and for a result that would not fit in `max` bytes. It accepts upper and lower case, and ignores a trailing newline. Every sample below uses these two functions to write keys and results.
+Test vectors and keys are easier to read as hex text. `secure.toHex(data, n)` makes lower case hex, and `secure.fromHex(text, out, max)` decodes it. The decoder returns the number of bytes, and `-1` for an odd number of digits, for a character that is not a hex digit, and for a result that would not fit in `max` bytes. It accepts upper and lower case, and ignores trailing spaces, carriage returns and newlines. Every sample below uses these two functions to write keys and results.
 
 ## Hashes and HMAC
 
-A hash turns any amount of data into a fixed size fingerprint. A good hash makes two things impossible in practice: finding other data with the same fingerprint, and working backwards from a fingerprint to the data. `hash.sha256(data, n)` returns the fingerprint as 64 hex characters; `hash.sha256Raw` writes the 32 bytes. `hash.digest(bits, data, n, out)` chooses 256, 384 or 512 at run time and returns the size of the digest.
+A hash turns any amount of data into a fixed size fingerprint. A good hash makes two things impossible in practice: finding other data with the same fingerprint, and working backwards from a fingerprint to the data. `hash.sha256(data, n)` returns the fingerprint as 64 hex characters; `hash.sha256Raw` writes the 32 bytes. `hash.digest(bits, data, n, out)` chooses 256, 384 or 512 at run time, writes the raw digest and returns its size in bytes (32, 48 or 64; it returns 0 for a size it does not know).
 
 {{sample crypto/hash_sha2}}
 
 **What to notice.**
 
 * Every function takes a pointer and a byte count: `hash.sha256(abc, 3)`. A string is passed with `strlen(s)`.
-* The three digests of `abc` are the published values from FIPS 180. One different letter changes the whole digest.
+* The SHA-256 and SHA-512 digests of `abc` are the published values from FIPS 180, and so is the start of the SHA-384 digest. One different letter (`abd`) changes the whole digest.
 * The empty input has a hash, too (`e3b0c442...`).
 
 An HMAC mixes a secret key into the hash. Whoever knows the key can compute the tag; whoever does not know it cannot. It is the simplest way to protect messages between two programs that share a secret.
@@ -78,7 +78,7 @@ An HMAC mixes a secret key into the hash. Whoever knows the key can compute the 
 * The receiver computes the tag again and compares it with the one that came with the message. **Compare with `hash.equalConstantTime`**. A normal comparison stops at the first different byte, and the time it takes tells an attacker how many bytes were right, one byte at a time.
 * `hash.hmac(bits, ...)` returns the length of the tag, like `digest`.
 
-For speed: on the machine this chapter was written on, SHA-256 hashed about 200 MB per second, ChaCha20-Poly1305 about 12 MB per second and AES-GCM about 2 MB per second (one run of 1 MB each; your numbers will differ, but the order will not). All three are implemented in plain A with no processor instructions for cryptography.
+For speed, here is what was measured on a 2.1 GHz Intel Xeon virtual machine (x86-64 Linux, one core in use, the best of five runs): SHA-256 hashed about 200 MB per second and SHA-512 about 300 MB per second (16 MB of data), ChaCha20-Poly1305 sealed about 14 MB per second and AES-128-GCM about 3 MB per second (1 MB of data). Your numbers will differ with the machine, but the order should not: hashes are fast, ChaCha20-Poly1305 is slower, and AES-GCM is the slowest. All of them are plain A code with no processor instructions for cryptography, so they are fine for small messages and short connections, and slow for bulk data.
 
 ## Authenticated encryption
 
@@ -100,10 +100,10 @@ bool ok = chacha.open(key32, nonce12, aad, aadLen, in, n + 16, out);
 | key | 16 or 32 bytes | 32 bytes |
 | nonce | 12 bytes | 12 bytes |
 | tag | 16 bytes | 16 bytes |
-| speed here | slower (about 2 MB/s) | faster (about 12 MB/s) |
+| speed here | slower (about 3 MB/s) | faster (about 14 MB/s) |
 | standard | NIST SP 800-38D | RFC 8439 |
 
-Pick either. Use ChaCha20-Poly1305 when speed matters in this implementation, and AES-GCM when something else in the system insists on it. TLS uses both.
+Pick either. Use ChaCha20-Poly1305 when speed matters in this implementation, and AES-GCM when something else in the system insists on it. TLS in A offers both (and AES-256-GCM).
 
 ### AES-GCM against a published vector
 
@@ -111,7 +111,7 @@ Pick either. Use ChaCha20-Poly1305 when speed matters in this implementation, an
 
 **What to notice.**
 
-* This is test case 4 of the GCM specification (McGrew and Viega). The same cipher text and tag were computed with OpenSSL through Python to be sure.
+* This is test case 4 of the GCM specification (McGrew and Viega). The tag was recomputed with OpenSSL through Python's `cryptography` package, and it is the same.
 * `out` holds the cipher text (as long as the plain text) and then the 16 byte tag. You need `n + 16` bytes.
 * `aes.gcm(key, 16)` does the key schedule once. Keep the `Gcm*` and use it for many messages.
 
@@ -119,8 +119,8 @@ Pick either. Use ChaCha20-Poly1305 when speed matters in this implementation, an
 
 **What to notice.**
 
-* Only the key length changes. A 32 byte key gives AES-256.
-* `aes.open` decrypts into a buffer of your own. It writes nothing when the tag is wrong.
+* Only the key length changes. A 32 byte key gives AES-256. The sample is test case 16 of the GCM specification.
+* `aes.open` decrypts into a buffer of your own. It writes nothing when the tag is wrong, and it returns `false` for an input shorter than the 16 byte tag.
 
 ### Changes are noticed
 
@@ -140,7 +140,7 @@ A *nonce* ("number used once") makes every message encrypt differently. The rule
 
 **What to notice.**
 
-* Both modes are stream ciphers inside: the plain text is combined with a key stream that depends only on the key and the nonce. Two messages with the same nonce use the same stream.
+* Both ciphers (the sample shows AES-GCM) are stream ciphers inside: the plain text is combined with a key stream that depends only on the key and the nonce. Two messages with the same nonce use the same stream.
 * Then `cipher1 XOR cipher2` equals `plain1 XOR plain2`. The key has dropped out, and anyone who guesses one text gets the other.
 * With GCM, repeating a nonce also leaks material that lets an attacker forge messages.
 
@@ -153,6 +153,7 @@ Two safe ways to choose nonces: a random 12 byte nonce for each message (fine fo
 * The nonce is a message counter. Sender and receiver count in step, so the nonce does not need to be sent.
 * The receiver derives the nonce from *its* counter. A replayed message (number 0 again) and a message that arrives too early (number 2 before 1) do not open, so replay and reordering are noticed without more code.
 * The counter only moves on after a good message. An attacker who sends garbage cannot push the receiver out of step.
+* This channel goes one way. If both sides send with the same key, give each direction its own key, or its own fixed byte in the nonce, or the two counters will produce the same nonce.
 
 ### ChaCha20-Poly1305
 
@@ -161,7 +162,7 @@ Two safe ways to choose nonces: a random 12 byte nonce for each message (fine fo
 **What to notice.**
 
 * The vector is section 2.8.2 of RFC 8439. The tag `1ae10b59...` is the one printed in the RFC.
-* The key is the bytes `0x80` to `0x9f`, written with a loop, because a published vector often has a pattern.
+* The key is the bytes `0x80` to `0x9f`, written with a loop because it is a counting pattern. The sample prints the first 32 bytes of the cipher text and the tag.
 
 The module also exposes the plain ChaCha20 stream cipher, `chacha.xorStream`, without any authentication. Protocols can be built on it, and on its own it is dangerous.
 
@@ -194,7 +195,7 @@ Two people who have never met can compute the same secret by sending each other 
 * The numbers are the Alice and Bob of RFC 7748 section 6.1.
 * Both sides get the same 32 bytes, and only the public keys crossed the network.
 
-The shared secret is a good random-looking value, but it is not a key yet. Hash it first, and put anything else that both sides know (the two public keys, a protocol name) into the hash.
+The shared secret is a good random-looking value, but it is not a key yet. Hash it first, and in a real protocol put anything else that both sides know (the two public keys, a protocol name) into the hash. The sample below keeps it short and hashes only the secret.
 
 {{sample crypto/x25519_hybrid}}
 
@@ -226,13 +227,13 @@ rsa.verifyPss(modulus, modLen, exponent, expLen, hashBits, digest, signature, si
 rsa.signPss(modulus, modLen, privateExponent, dLen, hashBits, digest, out)
 ```
 
-`hashBits` is 256, 384 or 512 (and 160 for the SHA-1 signatures of old certificates, for verification only). The modulus has 512 to 8192 bits.
+`hashBits` is 256, 384 or 512 (and 160 for the SHA-1 signatures of old certificates, for verification only). The modulus has 512 to 8192 bits for verification. PSS here uses MGF1 with the same hash and a salt as long as the hash, which is what TLS 1.3 uses.
 
 {{sample crypto/rsa_verify}}
 
 **What to notice.**
 
-* The signatures were made by OpenSSL (through Python's `cryptography` package) with a throw-away 2048 bit key; `PKCS#1 v1.5` and `PSS` are the two RSA signature schemes.
+* The signatures were made by OpenSSL (through Python's `cryptography` package) with a throw-away 2048 bit key. `PKCS#1 v1.5` and `PSS` are the two RSA signature schemes; the message is the text `The A Programming Language`, hashed with SHA-256 (`256` in the calls).
 * A PSS signature does not verify as PKCS#1, and a different message does not verify at all.
 * New designs should use PSS. PKCS#1 v1.5 is here because many certificates still use it.
 
@@ -247,7 +248,7 @@ rsa.signPss(modulus, modLen, privateExponent, dLen, hashBits, digest, out)
 
 ### ECDSA
 
-ECDSA signatures are much shorter than RSA ones and checking them is cheap. `ec.verify(bits, pub, publen, digest, dlen, r, rlen, s, slen)` takes the curve (256 or 384), the public key as an uncompressed point `04 || X || Y`, the digest, and the two numbers of the signature as big-endian bytes.
+ECDSA signatures are much shorter than RSA ones (two 32 byte numbers for P-256, against 256 bytes for RSA-2048). Checking one is not faster in this library, though: on the machine described above a P-256 check took about 5 ms and an RSA-2048 check about 3.5 ms. `ec.verify(bits, pub, publen, digest, dlen, r, rlen, s, slen)` takes the curve (256 or 384), the public key as an uncompressed point `04 || X || Y`, the digest, and the two numbers of the signature as big-endian bytes.
 
 {{sample crypto/ecdsa_verify}}
 
@@ -292,9 +293,9 @@ A client has to check that the certificate is for the host it wanted to talk to.
 
 **What to notice.**
 
-* A wildcard `*.cdn.example.test` covers exactly one label: `static.cdn.example.test`, but not `a.b.cdn.example.test` and not `cdn.example.test`.
+* A wildcard `*.cdn.example.test` covers exactly one label: `static.cdn.example.test`, but not `a.b.cdn.example.test` and not `cdn.example.test`. A wildcard needs at least two labels after the star, so `*.test` never matches.
 * Names are compared without regard to case.
-* An IP address is only accepted when the certificate lists it as an IP address. A certificate with a list of alternative names is never matched against its common name; the common name is only used for old certificates that have no list.
+* An IP address (four dotted numbers, so IPv4 only) is only accepted when the certificate lists it as an IP address. A certificate with a list of alternative names is never matched against its common name; the common name is only used for old certificates that have no list.
 
 `x509.verifyChain(chain, count, host, now)` does the whole check and returns `null` when the chain is trusted, or a sentence that says what is wrong. The caller supplies `now`: the clock is a parameter, which is also what makes the sample repeatable.
 
@@ -302,7 +303,7 @@ A client has to check that the certificate is for the host it wanted to talk to.
 
 **What to notice.**
 
-* The trust store is a list of root certificates. `x509.addRootPem(text)` trusts more. The first verification loads the system's roots (the files `/etc/ssl/certs/ca-certificates.crt` and a few other places on Linux), unless you call `x509.clearRoots()` first, which empties the store and stops that. The sample does so, so that the result is the same on every machine.
+* The trust store is a list of root certificates. `x509.addRootPem(text)` trusts more. The first verification loads the system's roots (the file named by the environment variable `SSL_CERT_FILE`, else `/etc/ssl/certs/ca-certificates.crt` or one of four other usual places on Linux; Windows uses its root store), unless you call `x509.clearRoots()` first, which empties the store and stops that. The sample does so, so that the result is the same on every machine.
 * The answers are plain sentences: wrong host name, unknown authority, not valid yet, expired.
 * What is **not** checked: revocation (no OCSP, no CRL), name constraints, certificate policies and key usage. A certificate that was revoked yesterday is still good here.
 * A valid certificate says that someone with the key for `www.example.test` was known to a root. It says nothing about whether that someone is honest.
@@ -328,7 +329,7 @@ What a client does when something is wrong:
 
 **What to notice.**
 
-* With `verify` set, each of the first three attempts fails during the handshake, with the same messages that `x509.verifyChain` gives. The last attempt has verification off: the connection is encrypted, but you have no idea whom you are talking to. Never switch verification off in a real program.
+* The first attempt has everything right and connects. With `verify` set, each of the next three attempts fails during the handshake, with the same messages that `x509.verifyChain` gives. The last attempt has verification off: the connection is encrypted, but you have no idea whom you are talking to. Never switch verification off in a real program.
 * `client->error` holds the reason. `tls.failed(client)` says whether a session has failed.
 
 The same handshake over a real socket, on the loopback interface. The server is a child process (so that the two sides do not share a heap), the port is chosen by the system and read back with `net.localPort`:
@@ -345,7 +346,7 @@ To talk to a real server, `tls.connect(host, port, true)` does the name lookup, 
 
 {{sample crypto/tls_fetch src}}
 
-What TLS in A does not have: TLS 1.2 and older, session resumption, 0-RTT, client certificates, and the `HelloRetryRequest` message (a server that does not accept X25519 fails with an error). That matches what is in the module list at the top of the chapter.
+What TLS in A does not have: TLS 1.2 and older, session resumption, 0-RTT, client certificates, and the `HelloRetryRequest` message (a server that does not accept X25519 fails with an error). This is the list in the header comment of `lib/tls.a`; the key exchange is X25519 only, and the signatures are RSA-PSS and ECDSA on P-256 and P-384.
 
 ## Passwords
 
@@ -365,9 +366,9 @@ A system that stores passwords must assume that its database will leak. Then the
 
 **What to notice.**
 
-* The default is 5000 rounds. `$6$rounds=N$salt` asks for more (1000 to 999999999). On the machine used for this chapter 5000 rounds took 5 ms and 100000 rounds about 100 ms; a login can afford the second.
-* The rounds are part of the stored text, so you can raise the count for new passwords while old ones keep working.
-* A salt has at most 16 characters; the rest is cut. The `rounds=10000` hash in the sample is the published vector.
+* The default is 5000 rounds. `$6$rounds=N$salt` asks for another count: 1000 to 999999999, and a number outside that range is moved to the nearest limit. On the 2.1 GHz virtual machine described above (best of several runs) 5000 rounds took about 5 ms and 100000 rounds about 100 ms; a login can afford the second.
+* The rounds are part of the stored text, so you can raise the count for new passwords while old ones keep working. A hash made with the default count has no `rounds=` part.
+* A salt has at most 16 characters (the rest is cut) and ends at the next `$`, as the two `$6$ab` lines show. The `rounds=10000` hash in the sample is the published vector.
 * Other formats are not supported. `sha512crypt` returns `null` for `$5$`, and `verify` returns `false` for `$1$` (MD5 crypt), `$y$` and plain text.
 
 A complete small registration and login, with a random salt for each user:
@@ -405,7 +406,7 @@ DES is a block cipher from 1977 with a 56 bit key, which can be found by searchi
 ## Checklist
 
 * Use `secure.bytes` for every key, nonce and salt.
-* Use an AEAD (`aes.seal`, `chacha.seal`) for secrecy, with a new nonce for each message and the same key.
+* Use an AEAD (`aes.seal`, `chacha.seal`) for secrecy, with a nonce that is new for every message under the same key.
 * Authenticate every key exchange, with a signature, a certificate or a shared secret.
 * Compare tags, hashes and password hashes in constant time (`hash.equalConstantTime`, `syscrypt.verify`).
 * Check the result of everything that can fail: `secure.bytes`, `x25519.scalarmult`, `aes.open`, `x509.verifyChain`.
