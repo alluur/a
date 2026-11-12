@@ -918,6 +918,7 @@ parse_aggregate:
     mov [tk_len], eax
     call fatal_error_tok
 .sf2:
+    mov dword [any_static], 1
     mov rdi, [agg_mtype]
     call check_concrete
     mov r12d, [sym_count]               ; the symbols that parse_global_vars creates are the static fields

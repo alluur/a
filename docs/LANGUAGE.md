@@ -128,7 +128,16 @@ const uint8 SMALL = 300;  // a typed constant is cut to its type: 44
   (numbers, constants, enum values, `sizeof`, string literals and operators on them);
   uninitialised globals live in a zero-filled `bss` area and cost no file size.
 * **Constants** are evaluated by the compiler and cannot be assigned to or have their address
-  taken. Constant expressions support all arithmetic, bitwise, comparison and logical operators.
+  taken. Constant expressions support all arithmetic, bitwise, comparison and logical operators, `sizeof`, enum members and `Enum.count`.
+* **`static_assert(condition);`** and **`static_assert(condition, "message");`** check a constant expression while compiling: a
+  false condition stops the compilation with `static assertion failed: message` at that line. They are allowed at top level, in class bodies and
+  in function bodies and generate no code:
+
+      static_assert(sizeof(Header) == 8, "the header is sent over the wire");
+      static_assert(Color.count == 3);
+      static_assert(__ARCH >= 0 && __ARCH <= 3);
+
+  (`static_assert` is a word only where a statement or declaration starts; the message has to be a text in quotes.)
 
 ## 5. Operators
 
@@ -136,7 +145,7 @@ From highest to lowest precedence:
 
 | Level | Operators | Notes |
 |---|---|---|
-| 1 | `a[i]`  `a.b`  `a->b`  `f(x)`  `x++`  `x--` | `.` and `->` are interchangeable on pointers |
+| 1 | `a[i]`  `a.b`  `a->b`  `f(x)`  `x++`  `x--`  `x is C`  `x as C` | `.` and `->` are interchangeable on pointers; `is` / `as` check the class of an object, see [section 8](#is-and-as) |
 | 2 | `-x`  `+x`  `!x`  `~x`  `*p`  `&x`  `++x`  `--x`  `(type)x` | right to left |
 | 3 | `*`  `/`  `%` | signed; truncating division like C |
 | 4 | `+`  `-` | pointer ± integer scales by the element size |
@@ -151,8 +160,33 @@ From highest to lowest precedence:
 | 12a | `^^`  `xor` | logical exclusive or: both sides run, the result is 0 or 1 (between `&&` and `\|\|`) |
 | 13 | `c ? a : b`  `a ?? b` | right to left; `a ?? b` is `a` unless it is 0 / `null`, then `b` (which is only evaluated in that case) |
 | 14 | `=  +=  -=  *=  /=  %=  &=  \|=  ^=  <<=  >>=` | right to left |
+| 14a | `\|\|=  &&=  ??=` | right to left; the right side runs only when the target is changed, see [below](#logical-assignment) |
 
 The words `and`, `or`, `not` and `xor` mean `&&`, `||`, `!` and `^^`, so `if (a > 1 and not done or retry)` works.
+
+### Logical assignment
+
+`a ||= b`, `a &&= b` and `a ??= b` change the target only when it says so, and evaluate `b` only then:
+
+| | assigns `b` when the target is | otherwise |
+|---|---|---|
+| `a \|\|= b` and `a ??= b` | 0, `null` or `false` | `a` stays as it is, `b` is not evaluated |
+| `a &&= b` | not 0 | `a` stays as it is (it is 0), `b` is not evaluated |
+
+```c
+name ??= "unknown";              // a default for a null pointer
+count ||= load();                // load() runs only when count is 0
+ready &&= check();               // check() runs only when ready is true
+arr[next()] ||= 5;               // next() runs exactly once: the address of the target is computed once
+```
+
+The value of the expression is the target after the statement. The target must be an integer, `bool`, enum or pointer variable (a
+local, global, field, array element or `*p`); doubles, structs and arrays are compile errors. `||=` and `??=` do the same for numbers
+and pointers (they differ only in how they read); `x ||= y` is not `x = x || y`: it does not store the 0 / 1 that `||` produces but
+leaves a true target alone and stores `y` itself otherwise. The other ten compound assignments (`+= -= *= /= %= &= |= ^= <<= >>=`) work
+on every integer type (the result is cut to the width of the target, `uint64` divides, takes the remainder and shifts unsigned), on
+doubles (`+= -= *= /=`), on pointers (`+=` and `-=` step by the size of the element), on `bool` and enum variables and, through the
+operator methods, on classes (`a += b` is `a = a.operator+(b)`); the target address is computed once (`a[i++] += 2`).
 
 `!`, `&&`, `||` and the comparison operators always produce 0 or 1. Any integer or pointer can be
 used as a condition: zero / `null` is false, everything else is true.
@@ -168,12 +202,75 @@ while (cond) { ... }
 do { ... } while (cond);
 for (int i = 0; i < n; i++) { ... }       // each of the three parts may be empty
 for (;;) { if (done) break; }             // infinite loop
+foreach (int x in values) { ... }         // over arrays, text, ranges, classes: see below
 break;                                    // leave the innermost loop or switch
 continue;                                 // next iteration of the innermost loop
+outer: for (...) { for (...) { if (done) break outer; if (skip) continue outer; } }     // labeled loops
 return expr;   return;
 ```
 
-The body of `if`, `else`, `while`, `for` may be a single statement or a `{ block }`.
+The body of `if`, `else`, `while`, `for`, `foreach` may be a single statement or a `{ block }`.
+
+A label in front of a loop (`while`, `do`, `for`, `foreach`) or a `switch` names it: `break name;` leaves that statement and
+`continue name;` goes to the next round of that loop (a switch cannot be continued). The name is looked up from the innermost
+statement outwards; no enclosing statement with that label is an error. A label is also a `goto` target, so the name can be used once per
+function.
+
+### foreach
+
+```c
+foreach (int x in values) { ... }              // each element
+foreach (int i, int x in values) { ... }       // the index too
+foreach (x in values) { ... }                  // the type of the variable is the type of the elements
+foreach (int x in rev values) { ... }          // last element first
+```
+
+What can be iterated, and what the variable gets:
+
+| `values` is | the elements are |
+|---|---|
+| an **array** whose length the compiler knows: a local, global or `static` array, an array field (`s.items`, `p->items`, `this.items`, a bare field name in a method), a compound literal `(int[]){1, 2, 3}` | the array elements, in order. A `char buf[32]` has 32 elements; the array is **not** copied, so changes made by the body to elements that come later are seen |
+| **text** (`char*`, also a string literal) | the bytes up to the NUL (not including it). A null pointer is an empty text. `rev` measures the text first |
+| a **range** `a..b`, `a..=b` | the integers `a`, `a+1`, ... up to `b-1` (`..`, half open) or `b` (`..=`, closed). Empty when `b <= a` (`b < a` for `..=`). `rev a..b` counts down from `b-1` to `a`. The bounds are evaluated once, in that order; `b` must be smaller than the largest `int` for `..=` |
+| **`pointer, count`**: `foreach (int x in p, n)` | `n` elements starting at `p` (a `void*` is an error; `n <= 0` runs nothing). This is how an array parameter or `argv` is iterated: `foreach (char* a in argv, argc)` |
+| an object (or a pointer to one) of a **class with the iteration protocol** | `get(0)` ... `get(n-1)`, see below |
+
+* **The expression is evaluated once**, before the loop (a function call runs once). The length, the pointer or the object is kept in hidden
+  local variables.
+* **The variable is a copy** of the element (a struct is copied; changing it does not change the array), and it is a new variable in each
+  round that the body may change without affecting the loop. To change the elements declare the variable as a **pointer to the element
+  type**: `foreach (Point* p in points) p->x++;` gives the address of each element (arrays, text, `pointer, count`; not for ranges and
+  classes). `foreach (char* p in text)` points into the text.
+* Scalars convert as in an assignment (`foreach (int c in "abc")`, `foreach (int v in doubles)` truncates, `foreach (uint8 b in 250..260)`
+  wraps); pointers convert to pointers; a struct needs the same struct. Anything else is the error `the type of the foreach variable does not fit
+  the type of the elements`.
+* The index variable (`foreach (int i, T x in ...)`) is an integer; with `rev` it counts down with the elements (it is the real index).
+  A range has only one variable.
+* `break`, `continue` (also labeled), `return` and `goto` work as in the other loops; `defer` stays tied to the function. Loops nest.
+* A **null** `char*` or a null pointer to a collection runs zero rounds instead of crashing.
+* `rev` is a word only in this place: `foreach (x in rev a)` reverses `a`; if the program has a variable (or field) called `rev`, the word is
+  that variable. `in` is only a word in the foreach header, so it stays usable as a name.
+* A `foreach` over an array whose length is not known (an `extern int t[];`, an array of more than 16 million elements, a parameter) is
+  an error that tells to use the `pointer, count` form.
+
+**The iteration protocol for classes.** A class (struct) can be the subject of a `foreach` when it has
+* a method without parameters that tells the number of elements, called `count()`, `size()`, `len()` or `length()` (looked up in that
+  order), and
+* a method `get(int i)` or an `operator[](int i)` that returns element `i`.
+
+The object is evaluated once and the count is read once, before the first round, so a body that adds elements does not make the loop longer
+(the standard collections `IntList` and `StrList` of `collections` return 0 / null for a bad index). Both methods may be inherited
+and virtual. `foreach (int x in list)` works with `collections.IntList` and `StrList` (`size()` and `get()`) without any change to them.
+The element type is the result type of `get`; a struct result is copied. The methods have to be visible from where the loop is
+(`private` ones are an error).
+
+```c
+foreach (int i, Item* it in s.items) { it->id = i + 1; }        // array of structs inside a struct, with pointers
+foreach (char* name in rev names) { println(name); }
+foreach (int line in 1..=last) { ... }
+foreach (int v in list) { total += v; }                         // collections.IntList
+foreach (char c in "hello") { printChar(c - 32); }
+```
 
 ### switch
 
@@ -182,13 +279,38 @@ switch (value) {
     case 1:  println("one"); break;
     case 2:                                // falls through, like C
     case 3:  println("two or three"); break;
+    case 4, 5, 6: println("four to six"); break;      // several labels for one case
+    case 10..20: println("ten to twenty"); break;     // a range: both ends are included
+    case 'a'..'z': ...
     case Color.Red: ...                    // case labels are constant expressions
     default: println("other");
 }
+
+switch (command) {                         // a switch on text (char*)
+    case "get": ...; break;
+    case "put", "post": ...; break;        // several texts for one case
+    case NAME: ...; break;                 // a text constant is fine too
+    default: println("unknown");
+}
 ```
 
-`break` leaves the switch; without it execution continues into the next case (fall-through).
-`continue` inside a `switch` applies to the enclosing loop.
+`break` leaves the switch; without it execution continues into the next case (fall-through), also from `default`, which may stand
+anywhere. `continue` inside a `switch` applies to the enclosing loop.
+
+* **Integer labels** are constant expressions of any size (the old limit of 32 bits is gone). `lo..hi` includes both ends (this differs from
+  the half open `a..b` of `foreach`: a label is a set of values, so `case 0..9:` is the digits); a range with `lo > hi` is an error.
+* **A switch on text** is chosen when the value has the type `char*`. The labels are compared like `streq` (byte by byte up to the NUL);
+  **a null pointer matches no label** and goes to `default` (or leaves the switch), it never crashes. The value is evaluated once.
+  The labels have to be text literals or text `const`s, escapes included: `case "a\tb":` is compared with the bytes `a`, TAB, `b`. The text
+  switch is **fast for many labels**: up to 4 labels are compared one after the other; with more, the compiler hashes the labels (FNV-1a
+  over the bytes, 32 bits; the same function `__swhash` of `lib/std.a` hashes the value at run time), sorts them and emits a binary search over the hash
+  values, then compares the text with the labels that have that hash (labels with equal hashes are checked one by one, so collisions are
+  harmless). A switch with 1000 text labels needs about 0.09 microseconds per decision instead of the 3 microseconds of a chain of 1000
+  `streq` calls (measured on native x86-64 with a 1000-label switch like `tests/t304_switch_big.a`).
+* **Integer switches** with fewer than 8 plain 32-bit labels keep the compare chain; bigger ones, ranges and big values use a binary search
+  over the sorted ranges.
+* **Duplicate labels are compile errors** (equal numbers, overlapping ranges, equal texts, also across `case a, b:`), reported at the label;
+  so is a text label in a switch on numbers and the other way round. At most 4096 labels are open at one time (nested switches count together).
 
 ## 7. Functions
 
@@ -649,7 +771,7 @@ printlnInt(a->describe());                    // 12004: speak() resolves to Pupp
 * The derived object starts with the fields of the base class, so a `Dog*` can be used wherever an
   `Animal*` is expected (pointer types convert freely in A).
 * `virtual` gives a method a slot in the class's vtable. A method with the same name as a virtual method of
-  a base class overrides it, with or without the keyword. The signature is not compared.
+  a base class overrides it, with or without the keyword. Without the word `override` (below) the signature is not compared.
 * `protected` members can be used by the class itself and by derived classes. `private` members stay
   private to the class that declares them, even from derived classes.
 * `super(args);` calls the base class constructor (put it first in your constructor). A class without a
@@ -657,8 +779,90 @@ printlnInt(a->describe());                    // 12004: speak() resolves to Pupp
   without virtual dispatch.
 * Objects of a class with virtual methods get their vtable pointer when they are created with `new`,
   declared as a local, or declared as a global. Copying an object copies the pointer as well (no
-  slicing protection, no destructors, no multiple inheritance, no abstract classes).
-* A virtual method must have a body, otherwise the program fails to link with `undefined function`.
+  slicing protection, no destructors, no multiple inheritance; abstract classes and `final` are below).
+* A virtual method must have a body, otherwise the program fails to link with `undefined function` (unless it is `abstract`).
+* A constructor of a derived class runs the base class constructor only when it says `super(...)`.
+
+### Abstract classes, `override` and `final`
+
+```c
+abstract class Shape {                         // no object of an abstract class can be created
+public:
+    abstract int area();                       // no body: every concrete subclass has to provide it
+    virtual int sides() = 0;                   // the C++ way to say the same
+    int ratio() { return area() * 100 / sides(); }      // a method of the base class calls the abstract ones
+}
+class Rect : Shape {
+public:
+    int w; int h;
+    override int area() { return w * h; }     // checked: the base class has a virtual method area() of this signature
+    override final int sides() { return 4; }  // nobody may override this one again
+}
+final class Leaf : Rect { }                    // nothing can derive from a final class
+Shape* s = new Rect();                         // pointers to the abstract class are fine; calls dispatch to Rect
+```
+
+* `abstract class X` and `abstract` / `= 0` methods: a class with an abstract method has to be declared `abstract` (the error says so).
+  **No objects of an abstract class**: `new X`, a local, global, `static` local, field or by-value parameter of that type, is
+  a compile error (pointers to it are the way to use it). A class that is **not** abstract has to implement every abstract method it
+  inherits (an abstract class may implement some and leave others): the error names the method that is missing. An abstract
+  method has no body (a body is an error) and a call through the base class pointer dispatches virtually; `super.name()` to an abstract method is an error. An abstract
+  class whose methods are all abstract is what other languages call an interface (there is only single inheritance).
+* `override` before a method says "this replaces a virtual method of a base class" and is checked: a virtual method of that name must
+  exist in a base class (error otherwise), it must not be a non-virtual method, and the **result type and the parameter types must be
+  the same** (`the result or parameter types differ from the method that is overridden`). `override` implies `virtual`. Overriding without the
+  word works as before (the signature is not compared). The modifiers can be written in any order (`public virtual`, `override final`).
+* `final` on a method (together with `override`, or on a method that overrides a virtual one) forbids any further override
+  (`cannot override a final method`); `final` on a method that overrides nothing is an error. `final class X` cannot be a base class
+  (`cannot derive from a final class`); a class cannot be both `abstract` and `final`.
+* `abstract`, `override` and `final` are words only in front of a class or member declaration (a method can still be called `final`).
+
+### Static members
+
+```c
+class Counter {
+public:
+    static int count;                          // one variable for the class, zero at the start
+    static int step = 5;                       // with a constant initializer (also arrays, structs, text; several: static int a, b;)
+    int id;
+    Counter() { count++; id = count; }         // plain use inside the class and its subclasses
+    static int next() { count += step; return count; }     // a static method has no 'this'
+    static int square(int v) { return v * v; }
+}
+Counter.count = 10;  int a = Counter.next();  int b = Counter.square(7);
+Counter.next();                                // a statement may start with a class name
+```
+
+* A static field is an ordinary global variable that belongs to the class: it lives in the data (or bss) section, is found as `Class.name`
+  (also `module.Class.name`), inside the class's methods and the methods of derived classes by its plain name, and **it hides a global
+  variable with the same name** in those places (like instance fields do). `sizeof(Counter.table)` and `foreach (int v in Counter.table)` work
+  (the array length is known).
+* A static method is a function in the class's scope: it can use the class's static members, private ones included, but **not `this`
+  and not instance fields or methods** (the error says that a static method has no object). Call it as `Class.method(args)`, or
+  by its plain name inside the class. A static method is not virtual and cannot be `abstract`, `override` or `final`, and a static
+  method cannot have the name of a virtual method of a base class.
+* Static members follow the access labels (`private` / `protected` / `public`). They are used with the class name, not through an object
+  (`obj.count` and `obj.square(2)` are errors with that advice). Structs can have them too.
+* With separate compilation (`ac -c`) a static field is an exported global of the unit that defines the class: define a class with static
+  fields in one unit only (headers with such classes would define the field in every unit and the link reports the duplicate).
+
+### `is` and `as`
+
+```c
+Animal* a = pick();
+if (a is Dog) { ... }                          // a bool: true when a points to a Dog or to a class derived from Dog
+Dog* d = a as Dog;                             // a, or null when it is not a Dog (the type of the result is Dog*)
+(a as Dog)->bark();   a as Dog->bark();        // no check for null: it is the caller's business
+if (!(a is Cat) && b is Dog) { ... }           // is / as bind like ->: use parentheses with !
+```
+
+* The left side is a pointer to a class **with virtual methods** (the object finds its class through its vtable pointer, so a class
+  without any virtual method has no run time class: the error says so). A null pointer is not a Dog (`is` gives false, `as` gives null).
+  The right side is a class name (`Dog` or `Dog*`) with virtual methods, which has to be related to the class of the pointer (a derived class
+  or a base class; two unrelated classes are an error). Objects created with `new`, as locals and as globals have the information; an object in raw memory (`alloc`, `memset`
+  of a buffer, a cast of bytes) has no vtable pointer and is "not a Dog" for every class.
+* How it works: each vtable begins with one word, the address of the vtable of the base class (0 for a root), and `__isa` of `lib/std.a` walks that
+  chain comparing with the vtable of the wanted class; it costs a call and one step per level of inheritance.
 
 ## 9. Enums
 
@@ -1254,7 +1458,8 @@ prog.a:3: error: expected ';'
       ^
 ```
 
-Typical messages: `undeclared identifier 'x'`, `wrong number of arguments in call`,
+Typical messages: `undeclared identifier 'x'` (with `(did you mean 'y'?)` when a declared name differs by one letter, two swapped
+letters or the case: `undeclared identifier 'cuont' (did you mean 'count'?)`), `wrong number of arguments in call`,
 `member is private to its class 'balance'`, `access to private declaration 'helper'`,
 `undefined function 'f'`, `left side of assignment is not assignable`,
 `functions cannot return a struct by value, return a pointer`.
@@ -1270,4 +1475,5 @@ The process exit code is 1; on success it is 0.
 * Unsigned arithmetic only through `uint64` (and the narrower unsigned types), no bit-fields. Function pointers exist as the type `func`; parameters can have default values.
 * Structs can be passed and returned by value (a hidden copy), `typedef`, `union`, `static` locals, default values (also text) and
   variadic functions (`...` with `va_arg`) exist; bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in, and units can be compiled separately and linked (`ac -c`).
-* `switch` labels must be constant expressions (like C), and `case` values must fit in 32 bits.
+* `switch` labels must be constant expressions (like C); a switch can also be on text, a case can have several labels and `lo..hi` ranges, and duplicate labels are errors.
+* `foreach`, labeled `break` / `continue`, `static_assert`, `||=` `&&=` `??=`, abstract classes, `override`, `final`, static class members and `is` / `as` exist.

@@ -2382,6 +2382,7 @@ agg_virtual:    resd 1
 agg_cmods:      resd 1                  ; SF_ABSTRACT / SF_FINAL written before 'class'
 agg_mflags:     resd 1                  ; modifiers of the member being parsed: 1 static, 2 abstract, 4 override, 8 final
 cur_static:     resd 1                  ; compiling a static method
+any_static:     resd 1                  ; the program has declared a static field
 pend_lbl_ptr:   resq 1                 ; a label that stands directly in front of the next statement
 pend_lbl_len:   resd 1
 stmt_lbl_ptr:   resq 1                  ; the label of the statement being parsed (taken by loop_push)

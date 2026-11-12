@@ -705,18 +705,26 @@ is_type_start_impl:
     ret
 ; a class or enum name followed by '.' starts an expression (Counter.count, Color.Red), not a declaration
 .maybe_dot:
-    sub rsp, 128
-    mov rdi, rsp
-    call lex_save
-    call next_token
-    xor ebx, ebx
-    cmp qword [tk], '.'
-    setne bl
-    mov rsi, rsp
-    call lex_restore
-    add rsp, 128
-    mov eax, ebx
+    mov rsi, [src_ptr]                  ; look at the character after the name (no need to run the lexer)
+.md:
+    movzx eax, byte [rsi]
+    cmp eax, ' '
+    je .mdn
+    cmp eax, 9
+    je .mdn
+    cmp eax, 10
+    je .mdn
+    cmp eax, 13
+    je .mdn
+    cmp eax, '.'
+    jne .yes
+    cmp byte [rsi+1], '.'              ; '..' is a range, not a member access
+    je .yes
+    xor eax, eax
     ret
+.mdn:
+    inc rsi
+    jmp .md
 
 ; parse_type -> rax = type; consumes the type and any '*' suffixes
 parse_type:
@@ -1382,8 +1390,7 @@ parse_primary:
     call sym_find_global
     test rax, rax
     jnz .sc2
-    mov edi, msg_undeclared
-    call fatal_error_tok
+    jmp fatal_undeclared
 .sc2:
     mov r12, rax
     call next_token
@@ -2067,12 +2074,15 @@ parse_primary:
     call struct_find_field
     test rax, rax
     jnz .implicit_field
+    cmp dword [any_static], 0           ; (the scan is only needed when the program has static fields at all)
+    je .nostatic
     mov edi, [cur_class]
     mov rsi, r13
     mov edx, r14d
     call struct_find_static
     test rax, rax
     jnz .implicit_static
+.nostatic:
     mov edi, [cur_class]
     mov rsi, r13
     mov edx, r14d
@@ -2082,8 +2092,7 @@ parse_primary:
 .nocls:
     test r12, r12
     jnz .consume
-    mov edi, msg_undeclared
-    call fatal_error_tok
+    jmp fatal_undeclared
 .consume:
     call next_token
 .dispatch:
@@ -4117,8 +4126,7 @@ const_unary:
     call sym_lookup
     test rax, rax
     jnz .id1
-    mov edi, msg_undeclared
-    call fatal_error_tok
+    jmp fatal_undeclared
 .id1:
     mov r12, rax
     call next_token
@@ -4432,3 +4440,203 @@ obj_localize_string:
     pop rsi
     pop rax
 .r: ret
+
+; ---- "did you mean" for undeclared names --------------------------------------------------------------------------
+; names_near: rdi = name a, esi = length a, rdx = name b, ecx = length b -> eax = 1 when the names differ by one letter (replaced, missing,
+; extra, two swapped) or only by upper / lower case
+names_near:
+    xor eax, eax
+.pre:
+    cmp eax, esi
+    jae .preend
+    cmp eax, ecx
+    jae .preend
+    mov r8b, [rdi+rax]
+    cmp r8b, [rdx+rax]
+    jne .preend
+    inc eax
+    jmp .pre
+.preend:
+    mov r9d, esi
+    mov r10d, ecx
+.suf:
+    cmp r9d, eax
+    jbe .sufend
+    cmp r10d, eax
+    jbe .sufend
+    mov r8d, r9d
+    mov r8b, [rdi+r8-1]
+    mov r11d, r10d
+    cmp r8b, [rdx+r11-1]
+    jne .sufend
+    dec r9d
+    dec r10d
+    jmp .suf
+.sufend:
+    sub r9d, eax
+    sub r10d, eax
+    mov r11d, r9d
+    or r11d, r10d
+    jz .yes
+    cmp r9d, 1
+    ja .two
+    cmp r10d, 1
+    ja .two
+    jmp .yes
+.two:
+    cmp r9d, 2
+    jne .case
+    cmp r10d, 2
+    jne .case
+    mov r8b, [rdi+rax]
+    cmp r8b, [rdx+rax+1]
+    jne .case
+    mov r8b, [rdi+rax+1]
+    cmp r8b, [rdx+rax]
+    jne .case
+    jmp .yes
+.case:
+    cmp esi, ecx
+    jne .no
+    xor eax, eax
+.cl:
+    cmp eax, esi
+    jae .yes
+    mov r8b, [rdi+rax]
+    mov r11b, [rdx+rax]
+    or r8b, 0x20
+    or r11b, 0x20
+    cmp r8b, r11b
+    jne .no
+    inc eax
+    jmp .cl
+.yes:
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+; find_similar: the current token is an identifier -> rax = a declared name (symbol table, then the fields of the current class) that is one
+; letter away from it, edx = its length; rax = 0 when there is none (names shorter than 3 letters are not suggested)
+find_similar:
+    push rbx
+    push r12
+    push r13
+    mov r12, [tk_ptr]
+    mov r13d, [tk_len]
+    cmp r13d, 3
+    jb .none
+    mov ebx, [sym_count]
+.l:
+    test ebx, ebx
+    jz .fields
+    dec ebx
+    mov rax, rbx
+    shl rax, 6
+    add rax, symtab
+    cmp dword [rax+SYM_NLEN], 3
+    jb .l
+    test dword [rax+SYM_FLAGS], F_METHOD | F_BUILTIN
+    jnz .l
+    cmp dword [rax+SYM_KIND], S_LOCAL
+    je .try
+    mov ecx, [rax+SYM_MOD]
+    test ecx, ecx
+    jz .try
+    cmp ecx, [cur_module]
+    jne .l
+.try:
+    mov rdi, [rax+SYM_NAME]
+    mov esi, [rax+SYM_NLEN]
+    mov rdx, r12
+    mov ecx, r13d
+    push rax
+    call names_near
+    mov ecx, eax
+    pop rax
+    test ecx, ecx
+    jz .l
+    mov rcx, [rax+SYM_NAME]
+    mov edx, [rax+SYM_NLEN]
+    mov rax, rcx
+    jmp .out
+.fields:
+    mov edi, [cur_class]
+    cmp edi, -1
+    je .none
+    call struct_ptr
+    mov ebx, [rax+ST_NFIELDS]
+    mov eax, [rax+ST_FIRST]
+    shl rax, 5
+    add rax, field_tab
+.fl:
+    test ebx, ebx
+    jz .none
+    push rax
+    mov rdi, [rax+FD_NAME]
+    mov esi, [rax+FD_NLEN]
+    mov rdx, r12
+    mov ecx, r13d
+    call names_near
+    mov ecx, eax
+    pop rax
+    test ecx, ecx
+    jnz .ffound
+    add rax, FD_SIZEOF
+    dec ebx
+    jmp .fl
+.ffound:
+    mov edx, [rax+FD_NLEN]
+    mov rax, [rax+FD_NAME]
+    jmp .out
+.none:
+    xor eax, eax
+.out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; fatal_undeclared: the identifier in tk_ptr / tk_len is not declared:  undeclared identifier 'x'  (and ", did you mean 'y'?" when a name that is
+; one letter away exists)
+fatal_undeclared:
+    call find_similar
+    test rax, rax
+    jnz .sugg
+    mov edi, msg_undeclared
+    jmp fatal_error_tok
+.sugg:
+    mov r12, rax
+    mov r13d, edx
+    mov rdi, errbuf
+    mov rsi, msg_undeclared
+    call cstr_copy
+    mov byte [rdi], ' '
+    mov byte [rdi+1], 0x27
+    add rdi, 2
+    mov rsi, [tk_ptr]
+    mov ecx, [tk_len]
+    cmp ecx, 100
+    jbe .c1
+    mov ecx, 100
+.c1:
+    rep movsb
+    mov rsi, s_didyoumean
+    call cstr_copy
+    mov rsi, r12
+    mov ecx, r13d
+    cmp ecx, 100
+    jbe .c2
+    mov ecx, 100
+.c2:
+    rep movsb
+    mov byte [rdi], 0x27
+    mov byte [rdi+1], '?'
+    mov byte [rdi+2], ')'
+    mov byte [rdi+3], 0
+    mov edi, errbuf
+    jmp fatal_error
+section .rodata
+s_didyoumean: db "' (did you mean '", 0
+section .text
