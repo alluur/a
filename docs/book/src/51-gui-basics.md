@@ -73,7 +73,7 @@ The program connects, creates a window, puts a **column** (`vbox`) with a label 
 
 * `gui.connect(null)` returns a `gui.Display*`, or `null` when there is no display server (nothing listens, or `ADISPLAY` is wrong). Always check.
 * `d->createWindow(title, w, h, flags)` makes a window whose **client area** (the part you draw in) is `w` x `h`. The title bar and the border are added around it by the server.
-  The server places the first window at 40, 74 on the screen and each next one 28 pixels further down and to the right (the cascade starts again after eight windows).
+  The server places the first window at 40, 74 on the screen and each next one 28 pixels further down and to the right (the cascade starts again after eight windows; the count is the server's, so windows of other programs take their turn too).
 * `w->setRoot(widget)` sets the widget that fills the window. It is nearly always a `Box`.
 * `d->run()` handles events until the last window is closed. A button's `onClick` is a function `int f(int widget)`: the widget arrives as an `int`, and you cast it back.
 * `label->setText(...)` copies the text, so a local buffer is fine. It also asks for a layout and a repaint; you never paint by hand.
@@ -142,7 +142,7 @@ Cast it to the right class to read its fields. Every widget has a `userData` fie
 | Field | Class | When |
 |---|---|---|
 | `onClick` | `Button` | pressed and released over the button, or Enter / Space |
-| `onChange` | `CheckBox`, `TextBox`, `TextArea`, `Slider` | the state or the text changed (typing, a paste, `setChecked`, `setValue`; **not** `setText`) |
+| `onChange` | `CheckBox`, `TextBox`, `TextArea`, `Slider` | the state or the text changed (typing, a paste, `setChecked`, `setValue`; **not** `setText`). A `TextBox` also calls it when Backspace or Delete finds nothing to delete, so do not assume that the text is different |
 | `onEnter` | `TextBox` | Enter was pressed in the field |
 | `onSelect`, `onActivate` | `ListBox` | a row was chosen (click, arrow keys or `select(i)`); double click or Enter |
 | `onMouseEvent` | `Canvas` | a mouse button pressed or released, or the pointer moved over the canvas |
