@@ -1,0 +1,564 @@
+// The Redis server core without sockets: every command with the exact bytes of its reply (the replies are those of Redis 7), errors included
+// (WRONGTYPE, arity, not an integer, NOAUTH, EXECABORT, OOM, ...), expiry with a clock that the test sets, glob patterns, the five data types, databases,
+// AUTH, MULTI / EXEC / DISCARD, publish / subscribe between three clients, and the memory books (used bytes return to zero when everything is gone).
+import redis;
+import redisd;
+import netio;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+redisd.Store* st;
+redisd.Rclient* cl;
+int now = 1000000;
+
+// the text with \r and \n made visible
+void show(char* d, int n) {
+    for (int i = 0; i < n; i++) {
+        int c = d[i] & 255;
+        if (c == 13) print("\\r");
+        else if (c == 10) print("\\n");
+        else if (c < 32 || c > 126) printf("\\x%02x", c, 0, 0, 0);
+        else printChar(c);
+    }
+}
+
+bool same(netio.Queue* q, char* want) {
+    int n = strlen(want);
+    return q->pending() == n && memcmp(q->data(), want, n) == 0;
+}
+
+// runs a command given as an inline line on a client and compares the whole reply
+bool exOn(redisd.Rclient* c, char* line, char* want) {
+    c->out->clear();
+    char buf[2048];
+    int n = format(&buf[0], 2048, "%s\r\n", line, 0, 0, 0);
+    st->feedAt(c, &buf[0], n);
+    bool ok = same(c->out, want);
+    if (!ok) {
+        print("     got:    ");
+        show(c->out->data(), c->out->pending());
+        print("\n     wanted: ");
+        show(want, strlen(want));
+        print("\n");
+    }
+    c->out->clear();
+    return ok;
+}
+
+void ex(char* line, char* want) {
+    check(line, exOn(cl, line, want));
+}
+
+// the reply is an array of this many elements (the first line only)
+void exCount(char* line, int count) {
+    char want[24];
+    format(&want[0], 24, "*%d\r\n", count, 0, 0, 0);
+    cl->out->clear();
+    char buf[2048];
+    int n = format(&buf[0], 2048, "%s\r\n", line, 0, 0, 0);
+    st->feedAt(cl, &buf[0], n);
+    bool ok = cl->out->pending() >= 4 && memcmp(cl->out->data(), &want[0], strlen(&want[0])) == 0;
+    check(line, ok);
+    cl->out->clear();
+}
+
+void tick(int ms) {
+    now = now + ms;
+    st->setClock(now);
+}
+
+void globCase(char* pat, char* s, bool want) {
+    char name[200];
+    format(&name[0], 200, "glob %s  %s  -> %s", pat, s, want ? "yes" : "no");
+    check(&name[0], st->glob(pat, strlen(pat), s, strlen(s)) == want);
+}
+
+int main() {
+    st = new redisd.Store();
+    st->setClock(now);
+    cl = st->open();
+
+    // ---- connection ------------------------------------------------------------------------------------------------------------------------------
+    ex("PING", "+PONG\r\n");
+    ex("PING hello", "$5\r\nhello\r\n");
+    ex("ping", "+PONG\r\n");
+    ex("PiNg", "+PONG\r\n");
+    ex("ECHO \"two words\"", "$9\r\ntwo words\r\n");
+    ex("ECHO", "-ERR wrong number of arguments for 'echo' command\r\n");
+    ex("FOOBAR 1 2", "-ERR unknown command 'FOOBAR', with args beginning with: \r\n");
+    ex("GET", "-ERR wrong number of arguments for 'get' command\r\n");
+    ex("GET a b", "-ERR wrong number of arguments for 'get' command\r\n");
+    ex("SET a", "-ERR wrong number of arguments for 'set' command\r\n");
+
+    // ---- strings ---------------------------------------------------------------------------------------------------------------------------------
+    ex("GET nokey", "$-1\r\n");
+    ex("SET k1 v1", "+OK\r\n");
+    ex("GET k1", "$2\r\nv1\r\n");
+    ex("SET k1 \"new value\"", "+OK\r\n");
+    ex("GET k1", "$9\r\nnew value\r\n");
+    ex("SET empty \"\"", "+OK\r\n");
+    ex("GET empty", "$0\r\n\r\n");
+    ex("STRLEN empty", ":0\r\n");
+    ex("SET nx1 a NX", "+OK\r\n");
+    ex("SET nx1 b NX", "$-1\r\n");
+    ex("GET nx1", "$1\r\na\r\n");
+    ex("SET xx1 a XX", "$-1\r\n");
+    ex("SET nx1 c XX", "+OK\r\n");
+    ex("GET nx1", "$1\r\nc\r\n");
+    ex("SET both a NX XX", "-ERR syntax error\r\n");
+    ex("SET k2 v EX 10", "+OK\r\n");
+    ex("TTL k2", ":10\r\n");
+    ex("PTTL k2", ":10000\r\n");
+    tick(4000);
+    ex("TTL k2", ":6\r\n");
+    ex("SET k2 v2 KEEPTTL", "+OK\r\n");
+    ex("PTTL k2", ":6000\r\n");
+    ex("SET k2 v3", "+OK\r\n");
+    ex("TTL k2", ":-1\r\n");
+    ex("SET k3 v PX 1500", "+OK\r\n");
+    ex("PTTL k3", ":1500\r\n");
+    tick(1499);
+    ex("GET k3", "$1\r\nv\r\n");
+    tick(1);
+    ex("GET k3", "$-1\r\n");
+    ex("EXISTS k3", ":0\r\n");
+    ex("SET bad v EX 0", "-ERR invalid expire time in 'set' command\r\n");
+    ex("SET bad v EX x", "-ERR value is not an integer or out of range\r\n");
+    ex("SET bad v EX", "-ERR syntax error\r\n");
+    ex("SET bad v FOO", "-ERR syntax error\r\n");
+    ex("SETNX sn 1", ":1\r\n");
+    ex("SETNX sn 2", ":0\r\n");
+    ex("GET sn", "$1\r\n1\r\n");
+    ex("SETEX se 100 v", "+OK\r\n");
+    ex("TTL se", ":100\r\n");
+    ex("SETEX se 0 v", "-ERR invalid expire time in 'setex' command\r\n");
+    ex("PSETEX pse 2500 v", "+OK\r\n");
+    ex("PTTL pse", ":2500\r\n");
+    ex("GETSET gs 1", "$-1\r\n");
+    ex("GETSET gs 2", "$1\r\n1\r\n");
+    ex("GET gs", "$1\r\n2\r\n");
+    ex("INCR cnt", ":1\r\n");
+    ex("INCR cnt", ":2\r\n");
+    ex("INCRBY cnt 10", ":12\r\n");
+    ex("DECR cnt", ":11\r\n");
+    ex("DECRBY cnt 20", ":-9\r\n");
+    ex("GET cnt", "$2\r\n-9\r\n");
+    ex("SET text abc", "+OK\r\n");
+    ex("INCR text", "-ERR value is not an integer or out of range\r\n");
+    ex("INCRBY cnt x", "-ERR value is not an integer or out of range\r\n");
+    ex("SET max 9223372036854775807", "+OK\r\n");
+    ex("INCR max", "-ERR increment or decrement would overflow\r\n");
+    ex("GET max", "$19\r\n9223372036854775807\r\n");
+    ex("SET min -9223372036854775808", "+OK\r\n");
+    ex("DECR min", "-ERR increment or decrement would overflow\r\n");
+    ex("SET big 12345678901234567890", "+OK\r\n");
+    ex("INCR big", "-ERR value is not an integer or out of range\r\n");
+    ex("SET sp \" 5\"", "+OK\r\n");
+    ex("INCR sp", "-ERR value is not an integer or out of range\r\n");
+    ex("APPEND ap abc", ":3\r\n");
+    ex("APPEND ap def", ":6\r\n");
+    ex("GET ap", "$6\r\nabcdef\r\n");
+    ex("STRLEN ap", ":6\r\n");
+    ex("STRLEN nokey", ":0\r\n");
+    ex("MSET m1 a m2 b m3 c", "+OK\r\n");
+    ex("MGET m1 nokey m3", "*3\r\n$1\r\na\r\n$-1\r\n$1\r\nc\r\n");
+    ex("MSET m1 a m2", "-ERR wrong number of arguments for 'mset' command\r\n");
+    ex("LPUSH alist x", ":1\r\n");
+    ex("MGET m1 alist", "*2\r\n$1\r\na\r\n$-1\r\n");
+    ex("GET alist", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("INCR alist", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("APPEND alist x", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("SET alist replaced", "+OK\r\n");
+    ex("TYPE alist", "+string\r\n");
+    ex("SET bin \"a\\x00b\\r\\nc\"", "+OK\r\n");
+    cl->out->clear();
+    st->feedAt(cl, "GET bin\r\n", 9);
+    check("GET bin: a 0 byte, CR and LF inside a value", cl->out->pending() == 4 + 6 + 2 && memcmp(cl->out->data(), "$6\r\na", 5) == 0 && cl->out->data()[5] == 0 && memcmp(&cl->out->data()[6], "b\r\nc\r\n", 6) == 0);
+    cl->out->clear();
+    ex("STRLEN bin", ":6\r\n");
+
+    // ---- keys ------------------------------------------------------------------------------------------------------------------------------------
+    ex("DEL k1 nokey empty", ":2\r\n");
+    ex("EXISTS k1", ":0\r\n");
+    ex("EXISTS sn sn nokey", ":2\r\n");
+    ex("DEL", "-ERR wrong number of arguments for 'del' command\r\n");
+    ex("TYPE sn", "+string\r\n");
+    ex("TYPE nokey", "+none\r\n");
+    ex("RENAME sn sn2", "+OK\r\n");
+    ex("GET sn2", "$1\r\n1\r\n");
+    ex("GET sn", "$-1\r\n");
+    ex("RENAME nokey x", "-ERR no such key\r\n");
+    ex("RENAME sn2 sn2", "+OK\r\n");
+    ex("EXPIRE sn2 100", ":1\r\n");
+    ex("RENAME sn2 sn3", "+OK\r\n");
+    ex("TTL sn3", ":100\r\n");
+    ex("EXPIRE nokey 10", ":0\r\n");
+    ex("PEXPIRE sn3 5000", ":1\r\n");
+    ex("PTTL sn3", ":5000\r\n");
+    ex("PERSIST sn3", ":1\r\n");
+    ex("PERSIST sn3", ":0\r\n");
+    ex("TTL sn3", ":-1\r\n");
+    ex("TTL nokey", ":-2\r\n");
+    ex("EXPIRE sn3 x", "-ERR value is not an integer or out of range\r\n");
+    ex("EXPIRE sn3 0", ":1\r\n");
+    ex("EXISTS sn3", ":0\r\n");
+    ex("EXPIRE sn2 10", ":0\r\n");
+    // expiry without access: the sweep removes the key
+    ex("SET sw1 x PX 100", "+OK\r\n");
+    ex("SET sw2 x PX 100", "+OK\r\n");
+    ex("SET sw3 x", "+OK\r\n");
+    int before = st->keyCount(0);
+    tick(101);
+    st->sweep(1000);
+    check("the sweep removes expired keys that nobody asked for", st->keyCount(0) == before - 2 && st->expiringCount(0) == 0 || st->keyCount(0) == before - 2);
+    // KEYS
+    ex("FLUSHALL", "+OK\r\n");
+    ex("MSET hello 1 hallo 2 hxllo 3 hllo 4 heeeello 5 hillo 6 h/llo 7 other 8", "+OK\r\n");
+    exCount("KEYS *", 8);
+    exCount("KEYS h?llo", 5);
+    exCount("KEYS h*llo", 7);
+    exCount("KEYS h[ae]llo", 2);
+    exCount("KEYS h[^e]llo", 4);
+    exCount("KEYS h[a-b]llo", 1);
+    exCount("KEYS h\\?llo", 0);
+    exCount("KEYS nomatch*", 0);
+    ex("KEYS other", "*1\r\n$5\r\nother\r\n");
+    ex("SET expiring x PX 50", "+OK\r\n");
+    tick(51);
+    exCount("KEYS *", 8);
+    ex("DBSIZE", ":9\r\n");                      // like Redis: a key that expired is counted until it is removed
+    globCase("*", "", true);
+    globCase("", "", true);
+    globCase("", "a", false);
+    globCase("a*", "a", true);
+    globCase("a*b", "ab", true);
+    globCase("a*b", "axxb", true);
+    globCase("a*b", "axxbx", false);
+    globCase("a*b*c", "abxbxc", true);
+    globCase("*a*a*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false);
+    globCase("a?c", "abc", true);
+    globCase("a?c", "ac", false);
+    globCase("[abc]", "b", true);
+    globCase("[abc]", "d", false);
+    globCase("[a-c]x", "bx", true);
+    globCase("[c-a]x", "bx", true);
+    globCase("[^a-c]x", "dx", true);
+    globCase("[^a-c]x", "bx", false);
+    globCase("\\*", "*", true);
+    globCase("\\*", "a", false);
+    globCase("[", "[", false);
+    globCase("a[", "a", false);
+    globCase("*[", "ab", false);
+
+    // ---- lists -----------------------------------------------------------------------------------------------------------------------------------
+    ex("RPUSH l a b c", ":3\r\n");
+    ex("LPUSH l z y", ":5\r\n");
+    ex("LRANGE l 0 -1", "*5\r\n$1\r\ny\r\n$1\r\nz\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    ex("LRANGE l 1 2", "*2\r\n$1\r\nz\r\n$1\r\na\r\n");
+    ex("LRANGE l -2 -1", "*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    ex("LRANGE l 3 100", "*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    ex("LRANGE l 5 10", "*0\r\n");
+    ex("LRANGE l 3 1", "*0\r\n");
+    ex("LRANGE l -100 1", "*2\r\n$1\r\ny\r\n$1\r\nz\r\n");
+    ex("LRANGE nolist 0 -1", "*0\r\n");
+    ex("LRANGE l a 1", "-ERR value is not an integer or out of range\r\n");
+    ex("LLEN l", ":5\r\n");
+    ex("LLEN nolist", ":0\r\n");
+    ex("LINDEX l 0", "$1\r\ny\r\n");
+    ex("LINDEX l -1", "$1\r\nc\r\n");
+    ex("LINDEX l 9", "$-1\r\n");
+    ex("LPOP l", "$1\r\ny\r\n");
+    ex("RPOP l", "$1\r\nc\r\n");
+    ex("LPOP l 2", "*2\r\n$1\r\nz\r\n$1\r\na\r\n");
+    ex("RPOP l 5", "*1\r\n$1\r\nb\r\n");
+    ex("EXISTS l", ":0\r\n");
+    ex("LPOP l", "$-1\r\n");
+    ex("LPOP l 2", "*-1\r\n");
+    ex("LPOP l -1", "-ERR value is out of range, must be positive\r\n");
+    ex("RPUSH l 1", ":1\r\n");
+    ex("SADD l x", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("LRANGE sn2 0 1", "*0\r\n");
+    ex("SET str v", "+OK\r\n");
+    ex("LPUSH str x", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("LLEN str", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("TYPE l", "+list\r\n");
+    for (int i = 0; i < 40; i++) {
+        char line[40];
+        format(&line[0], 40, "RPUSH ring %d", i, 0, 0, 0);
+        cl->out->clear();
+        char buf[60];
+        int n = format(&buf[0], 60, "%s\r\n", &line[0], 0, 0, 0);
+        st->feedAt(cl, &buf[0], n);
+        if (i % 3 == 0) { cl->out->clear(); st->feedAt(cl, "LPOP ring\r\n", 11); }
+    }
+    ex("LLEN ring", ":26\r\n");
+    ex("LINDEX ring 0", "$2\r\n14\r\n");
+    ex("LINDEX ring -1", "$2\r\n39\r\n");
+
+    // ---- hashes ----------------------------------------------------------------------------------------------------------------------------------
+    ex("HSET h f1 v1", ":1\r\n");
+    ex("HSET h f1 v1b f2 v2", ":1\r\n");
+    ex("HSET h f3", "-ERR wrong number of arguments for 'hset' command\r\n");
+    ex("HGET h f1", "$3\r\nv1b\r\n");
+    ex("HGET h nofield", "$-1\r\n");
+    ex("HGET noh f1", "$-1\r\n");
+    ex("HLEN h", ":2\r\n");
+    ex("HEXISTS h f2", ":1\r\n");
+    ex("HEXISTS h f9", ":0\r\n");
+    exCount("HGETALL h", 4);
+    exCount("HKEYS h", 2);
+    exCount("HVALS h", 2);
+    ex("HDEL h f1 nofield", ":1\r\n");
+    ex("HGETALL h", "*2\r\n$2\r\nf2\r\n$2\r\nv2\r\n");
+    ex("HDEL h f2", ":1\r\n");
+    ex("EXISTS h", ":0\r\n");
+    ex("HGETALL h", "*0\r\n");
+    ex("HGET str f", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("HSET str f v", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("HSET h2 \"\" empty", ":1\r\n");
+    ex("HGET h2 \"\"", "$5\r\nempty\r\n");
+
+    // ---- sets ------------------------------------------------------------------------------------------------------------------------------------
+    ex("SADD s a b c a", ":3\r\n");
+    ex("SADD s a", ":0\r\n");
+    ex("SCARD s", ":3\r\n");
+    ex("SISMEMBER s b", ":1\r\n");
+    ex("SISMEMBER s z", ":0\r\n");
+    ex("SISMEMBER nos z", ":0\r\n");
+    exCount("SMEMBERS s", 3);
+    ex("SREM s a z", ":1\r\n");
+    ex("SREM s b c", ":2\r\n");
+    ex("EXISTS s", ":0\r\n");
+    ex("SMEMBERS s", "*0\r\n");
+    ex("SADD one only", ":1\r\n");
+    ex("SMEMBERS one", "*1\r\n$4\r\nonly\r\n");
+    ex("SADD str x", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("TYPE one", "+set\r\n");
+
+    // ---- sorted sets -----------------------------------------------------------------------------------------------------------------------------
+    ex("ZADD z 2 b 1 a 3 c", ":3\r\n");
+    ex("ZRANGE z 0 -1", "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    ex("ZRANGE z 0 -1 WITHSCORES", "*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n");
+    ex("ZRANGE z -2 -1", "*2\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    ex("ZRANGE z 5 9", "*0\r\n");
+    ex("ZRANGE z 0 0 WITHSCORES", "*2\r\n$1\r\na\r\n$1\r\n1\r\n");
+    ex("ZRANGE z 0 1 FOO", "-ERR syntax error\r\n");
+    ex("ZSCORE z b", "$1\r\n2\r\n");
+    ex("ZSCORE z zz", "$-1\r\n");
+    ex("ZCARD z", ":3\r\n");
+    ex("ZRANK z c", ":2\r\n");
+    ex("ZRANK z a", ":0\r\n");
+    ex("ZRANK z zz", "$-1\r\n");
+    ex("ZADD z 1.5 b", ":0\r\n");
+    ex("ZRANGE z 0 -1", "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    ex("ZSCORE z b", "$3\r\n1.5\r\n");
+    ex("ZADD z 0.5 b", ":0\r\n");
+    ex("ZRANGE z 0 -1", "*3\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n");
+    ex("ZADD z CH 9 b 3 c 4 d", ":2\r\n");
+    ex("ZRANGE z 0 -1", "*4\r\n$1\r\na\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\nb\r\n");
+    ex("ZADD z NX 100 a 1 e", ":1\r\n");
+    ex("ZSCORE z a", "$1\r\n1\r\n");
+    ex("ZADD z XX 100 a 1 f", ":0\r\n");
+    ex("ZSCORE z a", "$3\r\n100\r\n");
+    ex("ZSCORE z f", "$-1\r\n");
+    ex("ZADD z NX XX 1 x", "-ERR XX and NX options at the same time are not compatible\r\n");
+    ex("ZADD z abc x", "-ERR value is not a valid float\r\n");
+    ex("ZADD z nan x", "-ERR value is not a valid float\r\n");
+    ex("ZADD z 1 x 2", "-ERR syntax error\r\n");
+    ex("ZADD zi -inf lo inf hi 0 mid", ":3\r\n");
+    ex("ZRANGE zi 0 -1 WITHSCORES", "*6\r\n$2\r\nlo\r\n$4\r\n-inf\r\n$3\r\nmid\r\n$1\r\n0\r\n$2\r\nhi\r\n$3\r\ninf\r\n");
+    ex("ZADD ties 1 b 1 a 1 c 1 aa", ":4\r\n");
+    ex("ZRANGE ties 0 -1", "*4\r\n$1\r\na\r\n$2\r\naa\r\n$1\r\nb\r\n$1\r\nc\r\n");
+    ex("ZADD big 2 x 10 y", ":2\r\n");
+    ex("ZRANGE big 0 -1", "*2\r\n$1\r\nx\r\n$1\r\ny\r\n");
+    ex("ZADD neg -5 n -0.25 m 1e3 k", ":3\r\n");
+    ex("ZRANGE neg 0 -1 WITHSCORES", "*6\r\n$1\r\nn\r\n$2\r\n-5\r\n$1\r\nm\r\n$5\r\n-0.25\r\n$1\r\nk\r\n$4\r\n1000\r\n");
+    ex("ZREM z a b zz", ":2\r\n");
+    ex("ZCARD z", ":3\r\n");
+    ex("ZREM ties a aa b c", ":4\r\n");
+    ex("EXISTS ties", ":0\r\n");
+    ex("ZADD str 1 a", "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+    ex("TYPE z", "+zset\r\n");
+
+    // ---- databases -------------------------------------------------------------------------------------------------------------------------------
+    ex("SET shared in0", "+OK\r\n");
+    ex("SELECT 1", "+OK\r\n");
+    ex("GET shared", "$-1\r\n");
+    ex("SET shared in1", "+OK\r\n");
+    ex("DBSIZE", ":1\r\n");
+    ex("SELECT 0", "+OK\r\n");
+    ex("GET shared", "$3\r\nin0\r\n");
+    ex("SELECT 16", "-ERR DB index is out of range\r\n");
+    ex("SELECT -1", "-ERR DB index is out of range\r\n");
+    ex("SELECT x", "-ERR value is not an integer or out of range\r\n");
+    ex("SELECT 15", "+OK\r\n");
+    ex("SET last in15", "+OK\r\n");
+    ex("FLUSHDB", "+OK\r\n");
+    ex("DBSIZE", ":0\r\n");
+    ex("SELECT 1", "+OK\r\n");
+    ex("DBSIZE", ":1\r\n");
+    ex("SELECT 0", "+OK\r\n");
+    ex("FLUSHALL", "+OK\r\n");
+    ex("DBSIZE", ":0\r\n");
+    ex("SELECT 1", "+OK\r\n");
+    ex("DBSIZE", ":0\r\n");
+    ex("SELECT 0", "+OK\r\n");
+    check("every byte of data is accounted for: after FLUSHALL none is in use", st->used == 0);
+
+    // ---- INFO --------------------------------------------------------------------------------------------------------------------------------------
+    cl->out->clear();
+    st->feedAt(cl, "SET info1 x\r\nINFO\r\n", 19);
+    cl->out->consume(5);
+    bool hasAll = cl->out->pending() > 100;
+    char* text = cl->out->data();
+    int tl = cl->out->pending();
+    bool f1 = false; bool f2 = false; bool f3 = false; bool f4 = false;
+    for (int i = 0; i + 14 < tl; i++) {
+        if (memcmp(&text[i], "redis_version:", 14) == 0) f1 = true;
+        if (memcmp(&text[i], "connected_clients:1", 19 < tl - i ? 19 : 1) == 0 && text[i] == 'c') f2 = true;
+        if (memcmp(&text[i], "used_memory:", 12) == 0) f3 = true;
+        if (memcmp(&text[i], "db0:keys=1,expires=0", 20 < tl - i ? 20 : 1) == 0 && text[i] == 'd') f4 = true;
+    }
+    check("INFO: version, clients, memory and the keyspace", hasAll && f1 && f2 && f3 && f4);
+    cl->out->clear();
+
+    // ---- AUTH ---------------------------------------------------------------------------------------------------------------------------------------
+    ex("AUTH secret", "-ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?\r\n");
+    st->requirepass = "s3cret";
+    redisd.Rclient* a = st->open();
+    check("NOAUTH before AUTH: GET", exOn(a, "GET k", "-NOAUTH Authentication required.\r\n"));
+    check("NOAUTH before AUTH: PING", exOn(a, "PING", "-NOAUTH Authentication required.\r\n"));
+    check("a wrong password", exOn(a, "AUTH wrong", "-WRONGPASS invalid username-password pair or user is disabled.\r\n"));
+    check("a prefix of the password", exOn(a, "AUTH s3cre", "-WRONGPASS invalid username-password pair or user is disabled.\r\n"));
+    check("a password that goes on", exOn(a, "AUTH s3cretX", "-WRONGPASS invalid username-password pair or user is disabled.\r\n"));
+    check("still no access", exOn(a, "SET a b", "-NOAUTH Authentication required.\r\n"));
+    check("AUTH with a user name that is not default", exOn(a, "AUTH bob s3cret", "-WRONGPASS invalid username-password pair or user is disabled.\r\n"));
+    check("AUTH default password", exOn(a, "AUTH default s3cret", "+OK\r\n"));
+    check("then commands work", exOn(a, "SET a b", "+OK\r\n") && exOn(a, "GET a", "$1\r\nb\r\n"));
+    redisd.Rclient* a2 = st->open();
+    check("AUTH password", exOn(a2, "AUTH s3cret", "+OK\r\n") && exOn(a2, "GET a", "$1\r\nb\r\n"));
+    check("a client that already existed is not affected (it was open without a password)", exOn(cl, "GET a", "$1\r\nb\r\n"));
+    st->close(a2);
+    st->close(a);
+    st->requirepass = null;
+
+    // ---- MULTI / EXEC / DISCARD ----------------------------------------------------------------------------------------------------------------------
+    ex("MULTI", "+OK\r\n");
+    ex("SET t1 1", "+QUEUED\r\n");
+    ex("INCR t1", "+QUEUED\r\n");
+    ex("GET t1", "+QUEUED\r\n");
+    ex("MULTI", "-ERR MULTI calls can not be nested\r\n");
+    ex("EXEC", "*3\r\n+OK\r\n:2\r\n$1\r\n2\r\n");
+    ex("EXEC", "-ERR EXEC without MULTI\r\n");
+    ex("DISCARD", "-ERR DISCARD without MULTI\r\n");
+    ex("MULTI", "+OK\r\n");
+    ex("SET t2 1", "+QUEUED\r\n");
+    ex("DISCARD", "+OK\r\n");
+    ex("EXISTS t2", ":0\r\n");
+    ex("MULTI", "+OK\r\n");
+    ex("SET t3 1", "+QUEUED\r\n");
+    ex("FOOBAR", "-ERR unknown command 'FOOBAR', with args beginning with: \r\n");
+    ex("GET", "-ERR wrong number of arguments for 'get' command\r\n");
+    ex("EXEC", "-EXECABORT Transaction discarded because of previous errors.\r\n");
+    ex("EXISTS t3", ":0\r\n");
+    ex("MULTI", "+OK\r\n");
+    ex("SET t4 v", "+QUEUED\r\n");
+    ex("INCR t4", "+QUEUED\r\n");
+    ex("SET t5 v", "+QUEUED\r\n");
+    ex("EXEC", "*3\r\n+OK\r\n-ERR value is not an integer or out of range\r\n+OK\r\n");
+    ex("EXISTS t5", ":1\r\n");
+    ex("MULTI", "+OK\r\n");
+    ex("EXEC", "*0\r\n");
+    st->maxQueued = 3;
+    ex("MULTI", "+OK\r\n");
+    ex("PING", "+QUEUED\r\n");
+    ex("PING", "+QUEUED\r\n");
+    ex("PING", "+QUEUED\r\n");
+    ex("PING", "-ERR too many commands in the transaction\r\n");
+    ex("EXEC", "-EXECABORT Transaction discarded because of previous errors.\r\n");
+    st->maxQueued = 1000;
+
+    // ---- publish / subscribe --------------------------------------------------------------------------------------------------------------------------------
+    redisd.Rclient* s1 = st->open();
+    redisd.Rclient* s2 = st->open();
+    redisd.Rclient* pb = st->open();
+    check("SUBSCRIBE news", exOn(s1, "SUBSCRIBE news", "*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"));
+    check("SUBSCRIBE two channels at once", exOn(s1, "SUBSCRIBE a b", "*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:2\r\n*3\r\n$9\r\nsubscribe\r\n$1\r\nb\r\n:3\r\n"));
+    check("a repeated SUBSCRIBE does not count twice", exOn(s1, "SUBSCRIBE a", "*3\r\n$9\r\nsubscribe\r\n$1\r\na\r\n:3\r\n"));
+    check("PSUBSCRIBE n*", exOn(s2, "PSUBSCRIBE n*", "*3\r\n$10\r\npsubscribe\r\n$2\r\nn*\r\n:1\r\n"));
+    check("PUBLISH reaches the channel and the pattern", exOn(pb, "PUBLISH news hello", ":2\r\n"));
+    check("the channel subscriber got a message", same(s1->out, "*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n"));
+    check("the pattern subscriber got a pmessage", same(s2->out, "*4\r\n$8\r\npmessage\r\n$2\r\nn*\r\n$4\r\nnews\r\n$5\r\nhello\r\n"));
+    s1->out->clear();
+    s2->out->clear();
+    check("PUBLISH to a channel nobody listens to", exOn(pb, "PUBLISH void x", ":0\r\n"));
+    check("a message with a binary body", exOn(pb, "PUBLISH a \"x\\x00y\"", ":1\r\n") && s1->out->pending() == 4 + 13 + 7 + 9 && s1->out->data()[s1->out->pending() - 5] == 'x' && s1->out->data()[s1->out->pending() - 4] == 0 && s1->out->data()[s1->out->pending() - 3] == 'y');
+    s1->out->clear();
+    check("in subscribe mode other commands are refused", exOn(s1, "GET x", "-ERR Can't execute 'get': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n"));
+    check("PING in subscribe mode answers with an array", exOn(s1, "PING", "*2\r\n$4\r\npong\r\n$0\r\n\r\n"));
+    check("PING with an argument in subscribe mode", exOn(s1, "PING hi", "*2\r\n$4\r\npong\r\n$2\r\nhi\r\n"));
+    check("UNSUBSCRIBE one", exOn(s1, "UNSUBSCRIBE a", "*3\r\n$11\r\nunsubscribe\r\n$1\r\na\r\n:2\r\n"));
+    check("UNSUBSCRIBE a channel that was not subscribed", exOn(s1, "UNSUBSCRIBE zz", "*3\r\n$11\r\nunsubscribe\r\n$2\r\nzz\r\n:2\r\n"));
+    check("UNSUBSCRIBE without arguments leaves all", exOn(s1, "UNSUBSCRIBE", "*3\r\n$11\r\nunsubscribe\r\n$1\r\nb\r\n:1\r\n*3\r\n$11\r\nunsubscribe\r\n$4\r\nnews\r\n:0\r\n"));
+    check("after the last UNSUBSCRIBE the client is a normal client again", exOn(s1, "PING", "+PONG\r\n"));
+    check("UNSUBSCRIBE with nothing subscribed", exOn(s1, "UNSUBSCRIBE", "*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n"));
+    check("PUNSUBSCRIBE", exOn(s2, "PUNSUBSCRIBE n*", "*3\r\n$12\r\npunsubscribe\r\n$2\r\nn*\r\n:0\r\n"));
+    check("nobody listens now", exOn(pb, "PUBLISH news x", ":0\r\n"));
+    check("pattern subscriptions with a glob", exOn(s2, "PSUBSCRIBE log.[ab]*", "*3\r\n$10\r\npsubscribe\r\n$9\r\nlog.[ab]*\r\n:1\r\n") && exOn(pb, "PUBLISH log.alpha x", ":1\r\n") && exOn(pb, "PUBLISH log.zeta x", ":0\r\n"));
+    st->maxSubs = 2;
+    check("maxSubs: the third subscription is refused", exOn(s1, "SUBSCRIBE c1 c2", "*3\r\n$9\r\nsubscribe\r\n$2\r\nc1\r\n:1\r\n*3\r\n$9\r\nsubscribe\r\n$2\r\nc2\r\n:2\r\n") && exOn(s1, "SUBSCRIBE c3", "-ERR too many subscriptions\r\n"));
+    st->maxSubs = 1000;
+    st->close(s1);
+    st->close(s2);
+    st->close(pb);
+
+    // ---- memory ---------------------------------------------------------------------------------------------------------------------------------------
+    ex("FLUSHALL", "+OK\r\n");
+    st->maxMemory = 1000;
+    ex("SET m1 \"0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\"", "+OK\r\n");
+    char big[1200];
+    memset(&big[0], 'x', 1100);
+    big[1100] = 0;
+    char line[1300];
+    format(&line[0], 1300, "SET m2 %s", &big[0], 0, 0, 0);
+    check("SET with a value of 1100 bytes (this one passes the limit)", exOn(cl, &line[0], "+OK\r\n"));
+    ex("SET m3 x", "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    ex("LPUSH m4 x", "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    ex("GET m1", "$100\r\n0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789\r\n");
+    ex("DEL m2", ":1\r\n");
+    ex("SET m3 x", "+OK\r\n");
+    check("refused writes are counted", st->stats->rejected == 2);
+    st->maxMemory = 67108864;
+
+    // ---- protocol errors close the connection ------------------------------------------------------------------------------------------------------------
+    redisd.Rclient* pe = st->open();
+    st->feedAt(pe, "*1\r\n$-5\r\n", 9);
+    check("a protocol error is answered, then the connection is to be closed", same(pe->out, "-ERR Protocol error: invalid number\r\n") && pe->closing);
+    check("nothing more is read from it", st->feedAt(pe, "PING\r\n", 6) < 0);
+    st->close(pe);
+    pe = st->open();
+    st->feedAt(pe, "QUIT\r\nPING\r\n", 12);
+    check("QUIT: +OK, then closed, the PING behind it is not run", same(pe->out, "+OK\r\n") && pe->closing);
+    st->close(pe);
+    pe = st->open();
+    st->feedAt(pe, "PING\r\nPING\r\nPING\r\n", 18);
+    check("pipelined commands are answered in order", same(pe->out, "+PONG\r\n+PONG\r\n+PONG\r\n"));
+    st->close(pe);
+
+    ex("FLUSHALL", "+OK\r\n");
+    check("at the end: every client closed but one, nothing in use", st->clients == 1 && st->used == 0);
+    printf("%d checks, %d failed\n", checks, fails);
+    st->dispose();
+    return fails == 0 ? 0 : 1;
+}
