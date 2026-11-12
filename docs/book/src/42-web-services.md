@@ -115,7 +115,7 @@ side answers with its own close frame, and then the TCP connection is closed. Co
 | 1005 | `CLOSE_NO_STATUS` | **never sent**: what `closeCode` says when a close frame had no code |
 | 1006 | `CLOSE_ABNORMAL` | **never sent**: what `closeCode` says when the connection ended without a close frame |
 | 1007 | `CLOSE_BAD_DATA` | text that is not UTF-8 |
-| 1008 | `CLOSE_POLICY` | a hub uses it for a client that was cut off because its send queue was full |
+| 1008 | `CLOSE_POLICY` | what a hub reports in `onClose` for a client that it cut off because its send queue was full |
 | 1009 | `CLOSE_TOO_BIG` | a message or frame over the limit |
 | 1010 to 1014 | | extension missing, internal error (1011: a keepalive ping was not answered), service restart, try later, bad gateway |
 | 3000 to 3999 | | for libraries and frameworks |
@@ -152,7 +152,7 @@ a hostile client had sent them:
   frames that are fragmented or longer than 125 bytes, a length that is not in its shortest form, a continuation with nothing to
   continue, bad close frames.
 * **1007** is invalid text. The check runs **while the bytes arrive**, so a bad byte ends the connection before the message is
-  complete. Overlong forms (`c1 61` is an overlong "a"), surrogates and values over U+10FFFF are refused too, also when the text is split
+  complete. Overlong forms (`c1 a1` is "a" written with two bytes), surrogates and values over U+10FFFF are refused too, also when the text is split
   over several frames.
 * **1009** is a size limit. A frame that announces a gigantic length (the last line announces 1 TiB) is refused from its header:
   nothing is allocated for it.
@@ -367,9 +367,9 @@ In the sample the server sends two events per connection and then "restarts". Th
 * The client waits `retryMs` (the server's `retry:` field replaces it; the default is 3000, the sample uses 20), doubles the pause after
   each failure up to `maxRetryMs`, and gives up after `maxRetries` failures in a row (default 5).
 * `c->reconnects` counts every time the stream was opened, the first time included: 3 here.
-* **A trap:** `hub->close(c, ...)` on an event stream ends it at once and drops what is still queued for it. If you call it in the same
-  callback that queued the events (for example in `onOpen`), the client gets no answer at all, not even the response head. The sample
-  closes the streams from the main loop, after the client has read the events.
+* **A trap:** `hub->close(c, ...)` on an event stream ends it at once; bytes that are still waiting in its queue are not sent. If you
+  call it in the same callback that queued the events (for example in `onOpen`), the client gets nothing at all, not even the
+  response head, and tries again. The sample ends the streams from the main loop, after the client has read the events.
 * On the plain `http` server, a handler can write a stream with `sse.begin(client)`, `sse.send(client, name, data, id)` and
   `sse.comment(client, text)`; `sse.lastEventId(request)` reads the header. That is one blocking handler per stream, so use a hub
   for more than a few clients. `tests/t367_sse_http.a` is a verified program that does it.
@@ -507,6 +507,8 @@ side is `getRange`, conditional headers, `downloadTo` and `decompress`.
 
 **What to notice.**
 
+* `head` sends a `HEAD` request: the answer has the headers of the file (its length is `1000`) and no body, and the client does not wait
+  for one. (The older `http` module of the previous chapter does not know about `HEAD` and waits for the body that never comes.)
 * `Range: bytes=995-` gave **206** with `Content-Range: bytes 995-999/1000`. A start past the end gave **416**.
 * `If-None-Match` with the `ETag` of the first answer gave **304 and no body**: "you already have it".
 * `downloadTo(url, path, resume, &written)` writes to a file and never holds the body in memory. With `resume` it continues at the
@@ -563,8 +565,8 @@ The same dispatcher serves three transports:
   (`timeoutMs`, default 10000), an answer that is not valid.
 * A batch: `b->add(method, params)` returns an index, `b->notify` adds a notification, `send()` sends the lot, and `b->result(i)`,
   `b->errorCode(i)`, `b->answered(i)` read the answers by index.
-* Params you pass to the client stay yours: dispose them yourself. `c->dispose()` closes the connection and frees the client (a connection
-  you gave to `connectStream` stays yours).
+* Params you pass to the client stay yours: dispose them yourself. `c->close()` and `c->dispose()` close the connection (also one that you
+  gave to `connectStream`); `dispose()` frees the client too. The `conn.Connection` object you made is not freed: that is yours.
 * **Not supported:** the server cannot call the client over the connection the request came in on. Messages that the server sends on
   its own arrive in the client's `onNotification`.
 
@@ -654,6 +656,9 @@ A list of the places where these modules can surprise you. Most of them are in t
 * **`net.accept` with an idle hook waits** (see above); `net.acceptSome` does not.
 * **Request targets.** `httpx` refuses a request target over 2048 bytes and a path of 1099 bytes or more with 414. The older `http.Request`
   has fixed buffers: `query` holds 1024 bytes, so copying a longer form body into it overflows (the previous chapter guards for it).
+* **512 secure sockets at a time.** Sockets that `tls.wrap` or `tls.wrapServer` made secure (so also `https://` and `wss://` clients and
+  `websocket.acceptTls`) live in a table of 512 entries in `net`; the 513th fails with "too many secure sockets at the same time". The
+  TLS clients of a hub are not in that table. (From the source of `net.secureAttach`; not tried with 513 connections.)
 * **IPv4 only.** Like the rest of `net`.
 * **Bare LF.** The request parser and the client accept a bare LF as a line end, as RFC 9112 allows for recipients. If a proxy in front
   of your server treats a bare LF differently, configure it to reject bare LF.
@@ -675,10 +680,9 @@ From `docs/NET.md` and from the limits found while writing this chapter:
 * **No limit per address and none for the hub as a whole.** A firewall or a reverse proxy has to provide it. A closing WebSocket lingers
   for one second and counts towards `maxClients` meanwhile.
 * **No IPv6.**
-* **Not run for this chapter:** Windows and AOS, a real browser (the interoperability tests in `tests/net.sh` use python `websockets`,
-  curl and openssl: I did not run them), `Cors`, `Client.stream`, `requestChunked`, a `Last-Event-ID` against a browser, the speed of
-  TLS, and hubs with hundreds of clients. The samples compile for all nine targets; they were run on x86-64 and, under `qemu-user`, on
-  ARM64.
+* **Not exercised by the samples of this chapter:** Windows and AOS, a real browser, the interoperability tests of `tests/net.sh`
+  (python `websockets`, curl and openssl), `Cors`, `Client.stream`, `requestChunked`, the speed of TLS, and hubs with hundreds of
+  clients. The samples compile for all nine targets; they were run on x86-64 and, under `qemu-user`, on ARM64.
 
 ## Summary
 
