@@ -1,2 +1,2815 @@
-// placeholder
+// =============================================================================
+//  strx - string algorithms beyond algo                                                                         import strx;
+//
+//  Strings are char* plus a length: every function takes  (char* s, int n)  and n = -1 means "up to the terminating 0" (so
+//  strx.levenshtein("kitten", -1, "sitting", -1)  works, and so does binary data with an explicit length). A null pointer is an empty string.
+//  Texts that are not 0 terminated are never read past n. Functions that allocate return null / -1 when memory ran out.
+//
+//  Searching one pattern (a class compiles the pattern once and searches many texts; the three have the same methods)
+//    strx.Kmp p("abab");  p.find(text, n, from) -> index or -1;  p.count(text, n, overlap);  p.findAll(text, n, out, max, overlap) -> how many
+//    strx.Horspool        Boyer-Moore-Horspool: usually sub-linear, worst case O(n*m)       strx.RabinKarp   rolling hash (two moduli), verified
+//    strx.prefixFunction(s, n, pi)   KMP failure function          strx.zFunction(s, n, z)   Z array (z[0] = n)         strx.period(s, n)  smallest period
+//    strx.indexOf(text, pattern, from)  strx.countOf(text, pattern, overlap)  strx.findAll(...)    one-shot search, no setup (Horspool, falls back to KMP)
+//    An empty pattern matches at every position from 0 to n.
+//  Many patterns at once
+//    strx.AhoCorasick ac;  ac.add("he"); ac.add("she"); ac.build();  ac.findAll(text, n, ids, ends, max)  ac.count(text, n)  ac.first(text, n, &id, &end)
+//    ac.each(text, n, callback, ctx)   (callback(id, end, ctx) returns 0 to go on, non-zero to stop)       linear in the text plus the number of matches
+//  Distances and similarities  (bytes; the Utf8 variants compare code points, bad bytes count as one symbol each)
+//    strx.levenshtein(a, na, b, nb)                 edit distance, O(min(na,nb)) memory      strx.levenshteinMax(a, na, b, nb, k)  stops at k (banded: O(k*n))
+//    strx.osa(a, na, b, nb)                         optimal string alignment (adjacent swaps, memory linear)    strx.damerau(...)  true Damerau-Levenshtein
+//    strx.hamming(a, b, n)  strx.hammingBits(a, b, n)    differing bytes / bits (-1 when the lengths differ)
+//    strx.jaro(a, na, b, nb)  strx.jaroWinkler(a, na, b, nb)   0.0 .. 1.0        strx.diceBigrams  strx.jaccardQgrams  strx.levenshteinSimilarity
+//    strx.lcsLength(a, na, b, nb)  strx.lcs(a, na, b, nb)   longest common subsequence (Hirschberg, linear memory)
+//    strx.longestCommonSubstring(a, na, b, nb, &startA, &startB)         strx.commonPrefix(a, b)  strx.commonSuffix(a, b)
+//  Diff of two line arrays (Myers, linear memory, O((N+M) D))
+//    strx.LineDiff d;  d.run(linesA, na, linesB, nb);  char* patch = d.unified("a.txt", "b.txt", 3);  strx.freeText(patch);   strx.splitLines(text, &count)
+//  Suffix array:  strx.SuffixArray sa(text, n);  sa.at(i) sa.rank(i) sa.lcp(i) sa.find(p) sa.count(p) sa.findAll(p, out, max) sa.lcpOf(i, j) sa.longestRepeat(&pos)
+//  Palindromes (Manacher):  strx.longestPalindrome(s, n, &start)  strx.countPalindromes(s, n)  strx.isPalindrome(s, n)
+//  Matching names:  strx.fuzzyScore(pattern, candidate, positions)  strx.FuzzyMatcher (rank a list like a quick-open box)
+//    strx.globMatch("src/**/*.a", path, strx.GLOB_PATHNAME)     strx.soundex("Robert", out) -> "R163"     strx.naturalCompare("img2", "img10")
+//
+//  Example
+//    strx.AhoCorasick ac;  ac.add("he"); ac.add("she"); ac.add("hers");  ac.build();
+//    int ids[16]; int ends[16];  int k = ac.findAll("ushers", -1, ids, ends, 16);        // k = 3: "she" ends at 4, "he" ends at 4, "hers" ends at 6
+//    ac.dispose();
+//
+//  Rules: classes work as zeroed objects (no constructor needed for the ones that take no arguments); dispose() frees every block and leaves
+//  an empty object that can be used again. Nothing here is thread safe. See docs/ALGO.md for the complexities and measured speeds.
+// =============================================================================
+import asys;
+import bits;
+import ds;
+import algo;
+import dmath;
 module strx;
+
+// ---- helpers ---------------------------------------------------------------------------------------------------------------------------
+private const MAXN = 0x10000000000;                // 2^40 symbols: far more than memory allows, keeps n * 8 from overflowing
+
+private int lenOf(char* s, int n) {
+    if (n >= 0) { return n; }
+    if (s == null) { return 0; }
+    return strlen(s);
+}
+
+private int* newInts(int n) {
+    if (n < 0 || n > 0x1000000000) { return null; }
+    return (int*) asys.alloc(n * 8);
+}
+
+private char* newBytes(int n) {
+    if (n < 0 || n > MAXN) { return null; }
+    return asys.alloc(n);
+}
+
+private void freeMem(void* p) {
+    if (p != null) { asys.free((char*) p); }
+}
+
+private int imin(int a, int b) { return (a < b) ? a : b; }
+private int imax(int a, int b) { return (a > b) ? a : b; }
+
+private char* dupBytes(char* s, int n) {
+    char* c = newBytes(n + 1);
+    if (c == null) { return null; }
+    if (n > 0) { memcpy(c, s, n); }
+    c[n] = 0;
+    return c;
+}
+
+// frees a text that strx handed out (lcs, unified, splitLines parts ...)
+public void freeText(char* s) {
+    freeMem(s);
+}
+
+// ASCII lower case
+private int foldChar(int c) {
+    if (c >= 'A' && c <= 'Z') { return c + 32; }
+    return c;
+}
+
+// ---- prefix function and Z function ---------------------------------------------------------------------------------------------------
+// pi[i] = length of the longest proper prefix of s[0..i] that is also a suffix of it (the KMP failure function); pi has room for n ints
+public void prefixFunction(char* s, int n, int* pi) {
+    n = lenOf(s, n);
+    if (n <= 0) { return; }
+    pi[0] = 0;
+    int k = 0;
+    for (int i = 1; i < n; i++) {
+        while (k > 0 && s[i] != s[k]) { k = pi[k - 1]; }
+        if (s[i] == s[k]) { k++; }
+        pi[i] = k;
+    }
+}
+
+// z[i] = length of the longest common prefix of s and s[i..]; z[0] = n. z has room for n ints.
+public void zFunction(char* s, int n, int* z) {
+    n = lenOf(s, n);
+    if (n <= 0) { return; }
+    z[0] = n;
+    int l = 0;
+    int r = 0;
+    for (int i = 1; i < n; i++) {
+        int k = 0;
+        if (i < r) { k = imin(r - i, z[i - l]); }
+        while (i + k < n && s[k] == s[i + k]) { k++; }
+        z[i] = k;
+        if (i + k > r) { l = i; r = i + k; }
+    }
+}
+
+// the smallest p > 0 such that s[i] == s[i + p] for every valid i (n for a string without a shorter period); 0 for the empty string
+public int period(char* s, int n) {
+    n = lenOf(s, n);
+    if (n <= 0) { return 0; }
+    int* pi = newInts(n);
+    if (pi == null) { return -1; }
+    prefixFunction(s, n, pi);
+    int p = n - pi[n - 1];
+    freeMem(pi);
+    return p;
+}
+
+// ---- Knuth-Morris-Pratt -----------------------------------------------------------------------------------------------------------------
+public class Kmp {
+    private char* pat;                      // a private copy of the pattern
+    private int* fail;
+    private int m;
+    private bool bad;
+
+    public Kmp(char* p, int len = -1) {
+        m = lenOf(p, len);
+        pat = dupBytes(p, m);
+        if (pat == null) { bad = true; m = 0; return; }
+        if (m > 0) {
+            fail = newInts(m);
+            if (fail == null) { bad = true; m = 0; freeMem(pat); pat = null; return; }
+            prefixFunction(pat, m, fail);
+        }
+    }
+
+    public int length() { return m; }
+    public bool ok() { return !bad; }
+
+    // index of the first occurrence at or after from, or -1
+    public int find(char* text, int n = -1, int from = 0) {
+        n = lenOf(text, n);
+        if (bad || from < 0 || from > n) { return -1; }
+        if (m == 0) { return from; }
+        int k = 0;
+        for (int i = from; i < n; i++) {
+            while (k > 0 && text[i] != pat[k]) { k = fail[k - 1]; }
+            if (text[i] == pat[k]) { k++; }
+            if (k == m) { return i - m + 1; }
+        }
+        return -1;
+    }
+
+    // stores up to max start positions in out (out may be null: only count); returns the total number of matches. One pass over the text.
+    public int findAll(char* text, int n, int* out, int max, bool overlap = true) {
+        n = lenOf(text, n);
+        if (bad) { return 0; }
+        int total = 0;
+        if (m == 0) {
+            for (int i = 0; i <= n; i++) {
+                if (out != null && total < max) { out[total] = i; }
+                total++;
+            }
+            return total;
+        }
+        int k = 0;
+        for (int i = 0; i < n; i++) {
+            while (k > 0 && text[i] != pat[k]) { k = fail[k - 1]; }
+            if (text[i] == pat[k]) { k++; }
+            if (k == m) {
+                if (out != null && total < max) { out[total] = i - m + 1; }
+                total++;
+                k = overlap ? fail[m - 1] : 0;
+            }
+        }
+        return total;
+    }
+
+    public int count(char* text, int n = -1, bool overlap = true) {
+        return findAll(text, n, null, 0, overlap);
+    }
+
+    public void dispose() {
+        freeMem(pat);
+        freeMem(fail);
+        pat = null;
+        fail = null;
+        m = 0;
+        bad = false;
+    }
+}
+
+// ---- Boyer-Moore-Horspool ---------------------------------------------------------------------------------------------------------------
+public class Horspool {
+    private char* pat;
+    private int* shift;                     // 256 ints
+    private int m;
+    private bool bad;
+
+    public Horspool(char* p, int len = -1) {
+        m = lenOf(p, len);
+        pat = dupBytes(p, m);
+        shift = newInts(256);
+        if (pat == null || shift == null) {
+            bad = true; m = 0;
+            freeMem(pat); freeMem(shift); pat = null; shift = null;
+            return;
+        }
+        for (int c = 0; c < 256; c++) { shift[c] = (m > 0) ? m : 1; }
+        for (int i = 0; i + 1 < m; i++) { shift[pat[i]] = m - 1 - i; }
+    }
+
+    public int length() { return m; }
+    public bool ok() { return !bad; }
+
+    public int find(char* text, int n = -1, int from = 0) {
+        n = lenOf(text, n);
+        if (bad || from < 0 || from > n) { return -1; }
+        if (m == 0) { return from; }
+        int i = from;
+        while (i + m <= n) {
+            int j = m - 1;
+            while (j >= 0 && text[i + j] == pat[j]) { j--; }
+            if (j < 0) { return i; }
+            i = i + shift[text[i + m - 1]];
+        }
+        return -1;
+    }
+
+    public int findAll(char* text, int n, int* out, int max, bool overlap = true) {
+        n = lenOf(text, n);
+        if (bad) { return 0; }
+        int total = 0;
+        if (m == 0) {
+            for (int i = 0; i <= n; i++) {
+                if (out != null && total < max) { out[total] = i; }
+                total++;
+            }
+            return total;
+        }
+        int i = 0;
+        while (i + m <= n) {
+            int j = m - 1;
+            while (j >= 0 && text[i + j] == pat[j]) { j--; }
+            if (j < 0) {
+                if (out != null && total < max) { out[total] = i; }
+                total++;
+                i = i + (overlap ? shift[text[i + m - 1]] : m);
+            } else {
+                i = i + shift[text[i + m - 1]];
+            }
+        }
+        return total;
+    }
+
+    public int count(char* text, int n = -1, bool overlap = true) {
+        return findAll(text, n, null, 0, overlap);
+    }
+
+    public void dispose() {
+        freeMem(pat);
+        freeMem(shift);
+        pat = null;
+        shift = null;
+        m = 0;
+        bad = false;
+    }
+}
+
+// ---- Rabin-Karp -------------------------------------------------------------------------------------------------------------------------
+// A rolling polynomial hash modulo two primes below 2^31 with bases taken from the seed; every hash hit is verified byte by byte, so the answer
+// is always right (a crafted text could only make it slower).
+private const RK_P1 = 2147483647;
+private const RK_P2 = 2147483629;
+
+public class RabinKarp {
+    private char* pat;
+    private int m;
+    private int b1;
+    private int b2;
+    private int top1;                       // base^(m-1) modulo each prime
+    private int top2;
+    private int h1;                         // hash of the whole pattern
+    private int h2;
+    private bool bad;
+
+    public RabinKarp(char* p, int len = -1, int seed = 0) {
+        m = lenOf(p, len);
+        pat = dupBytes(p, m);
+        if (pat == null) { bad = true; m = 0; return; }
+        int s = ds.mix64(seed + 0x2545F4914F6CDD1D);
+        b1 = 257 + ((s >> 8) & 0xFFFFFF) % 1000003;
+        b2 = 263 + ((s >> 32) & 0xFFFFFF) % 1000033;
+        top1 = 1;
+        top2 = 1;
+        for (int i = 0; i + 1 < m; i++) {
+            top1 = (top1 * b1) % RK_P1;
+            top2 = (top2 * b2) % RK_P2;
+        }
+        for (int i = 0; i < m; i++) {
+            h1 = (h1 * b1 + pat[i] + 1) % RK_P1;
+            h2 = (h2 * b2 + pat[i] + 1) % RK_P2;
+        }
+    }
+
+    public int length() { return m; }
+    public bool ok() { return !bad; }
+
+    public int find(char* text, int n = -1, int from = 0) {
+        n = lenOf(text, n);
+        if (bad || from < 0 || from > n) { return -1; }
+        if (m == 0) { return from; }
+        if (n - from < m) { return -1; }
+        int t1 = 0;
+        int t2 = 0;
+        for (int i = 0; i < m; i++) {
+            t1 = (t1 * b1 + text[from + i] + 1) % RK_P1;
+            t2 = (t2 * b2 + text[from + i] + 1) % RK_P2;
+        }
+        int i = from;
+        for (;;) {
+            if (t1 == h1 && t2 == h2 && memcmp(&text[i], pat, m) == 0) { return i; }
+            if (i + m >= n) { return -1; }
+            int out = text[i] + 1;
+            t1 = ((t1 + RK_P1 - (out * top1) % RK_P1) * b1 + text[i + m] + 1) % RK_P1;
+            t2 = ((t2 + RK_P2 - (out * top2) % RK_P2) * b2 + text[i + m] + 1) % RK_P2;
+            i++;
+        }
+        return -1;
+    }
+
+    public int findAll(char* text, int n, int* out, int max, bool overlap = true) {
+        n = lenOf(text, n);
+        if (bad) { return 0; }
+        int total = 0;
+        int from = 0;
+        for (;;) {
+            int p = find(text, n, from);
+            if (p < 0) { break; }
+            if (out != null && total < max) { out[total] = p; }
+            total++;
+            from = p + (overlap ? 1 : imax(m, 1));
+            if (from > n) { break; }
+        }
+        return total;
+    }
+
+    public int count(char* text, int n = -1, bool overlap = true) {
+        return findAll(text, n, null, 0, overlap);
+    }
+
+    public void dispose() {
+        freeMem(pat);
+        pat = null;
+        m = 0;
+        bad = false;
+    }
+}
+
+// ---- one-shot searching -----------------------------------------------------------------------------------------------------------------
+// index of the first occurrence of pattern in text at or after from, or -1. Horspool with a shift table on the stack; when the text is
+// nasty (more than 4 comparisons per byte) it switches to KMP, so the worst case stays linear.
+public int indexOf(char* text, char* pattern, int from = 0, int n = -1, int m = -1) {
+    n = lenOf(text, n);
+    m = lenOf(pattern, m);
+    if (from < 0 || from > n) { return -1; }
+    if (m == 0) { return from; }
+    if (n - from < m) { return -1; }
+    if (m == 1) {
+        int c = pattern[0];
+        for (int i = from; i < n; i++) { if (text[i] == c) { return i; } }
+        return -1;
+    }
+    int shift[256];
+    for (int c = 0; c < 256; c++) { shift[c] = m; }
+    for (int i = 0; i + 1 < m; i++) { shift[pattern[i]] = m - 1 - i; }
+    int i = from;
+    int work = 0;
+    int budget = 4 * (n - from) + 64;
+    while (i + m <= n) {
+        int j = m - 1;
+        while (j >= 0 && text[i + j] == pattern[j]) { j--; }
+        work = work + (m - j);
+        if (j < 0) { return i; }
+        i = i + shift[text[i + m - 1]];
+        if (work > budget) {
+            Kmp k(pattern, m);
+            int r = k.find(text, n, i);
+            k.dispose();
+            return r;
+        }
+    }
+    return -1;
+}
+
+// number of occurrences (overlapping ones count unless overlap is false)
+public int countOf(char* text, char* pattern, bool overlap = true, int n = -1, int m = -1) {
+    Kmp k(pattern, m);
+    int r = k.count(text, n, overlap);
+    k.dispose();
+    return r;
+}
+
+// start positions of all occurrences (up to max stored); returns the total number
+public int findAll(char* text, char* pattern, int* out, int max, bool overlap = true, int n = -1, int m = -1) {
+    Kmp k(pattern, m);
+    int r = k.findAll(text, n, out, max, overlap);
+    k.dispose();
+    return r;
+}
+
+// ---- Aho-Corasick ------------------------------------------------------------------------------------------------------------------------
+// Many patterns in one pass. The trie keeps its children in sibling lists (compact for any alphabet), the root has a 256 entry table.
+// Node layout: 6 ints  [first child, next sibling, fail link, dictionary link (nearest terminal on the fail chain), pattern id + 1, byte]
+private const AC_STRIDE = 6;
+private const AC_CHILD = 0;
+private const AC_SIB = 1;
+private const AC_FAIL = 2;
+private const AC_LINK = 3;
+private const AC_TERM = 4;
+private const AC_BYTE = 5;
+
+public class AhoCorasick {
+    private int* nodes;                     // AC_STRIDE ints per node, node 0 is the root
+    private int nodeCount;
+    private int nodeCap;
+    private int* lens;                      // length of every pattern, by id
+    private int patCount;
+    private int patCap;
+    private int* rootNext;                  // 256 ints, valid after build()
+    private bool dirty;                     // patterns were added since the last build()
+    private bool fold;                      // ASCII case folding
+    private int maxNodes;
+
+    // ignoreCase: A-Z and a-z match each other (bytes >= 128 are compared as they are)
+    public AhoCorasick(bool ignoreCase = false, int maxNodeCount = 4000000) {
+        fold = ignoreCase;
+        maxNodes = maxNodeCount;
+        dirty = true;
+    }
+
+    private bool ensureRoot() {
+        if (nodes != null) { return true; }
+        nodeCap = 64;
+        nodes = newInts(nodeCap * AC_STRIDE);
+        if (nodes == null) { nodeCap = 0; return false; }
+        nodeCount = 1;
+        return true;
+    }
+
+    private bool growNodes() {
+        if (nodeCount < nodeCap) { return true; }
+        int ncap = nodeCap * 2;
+        if (ncap > 0x100000000) { return false; }
+        int* nn = (int*) asys.realloc((char*) nodes, ncap * AC_STRIDE * 8);
+        if (nn == null) { return false; }
+        nodes = nn;
+        nodeCap = ncap;
+        return true;
+    }
+
+    private int childOf(int node, int c) {
+        int e = nodes[node * AC_STRIDE + AC_CHILD];
+        while (e > 0) {
+            if (nodes[e * AC_STRIDE + AC_BYTE] == c) { return e; }
+            e = nodes[e * AC_STRIDE + AC_SIB];
+        }
+        return 0;
+    }
+
+    public int patternCount() { return patCount; }
+    public int nodeTotal() { return nodeCount; }
+
+    // length of pattern id (0 for a bad id)
+    public int patternLength(int id) {
+        if (id < 0 || id >= patCount) { return 0; }
+        return lens[id];
+    }
+
+    // adds a pattern and returns its id (0, 1, 2 ... in the order of first appearance; a pattern that was added before returns its old id).
+    // -1 for an empty pattern, when the node limit is reached or when memory ran out (nothing is changed then)
+    public int add(char* p, int len = -1) {
+        len = lenOf(p, len);
+        if (len <= 0) { return -1; }
+        if (!ensureRoot()) { return -1; }
+        // walk the existing part first, so that a failure leaves no half added pattern behind: count what is missing
+        int node = 0;
+        int i = 0;
+        while (i < len) {
+            int c = fold ? foldChar(p[i]) : p[i];
+            int nx = childOf(node, c);
+            if (nx == 0) { break; }
+            node = nx;
+            i++;
+        }
+        if (i == len) {                       // the whole pattern is already there
+            int t = nodes[node * AC_STRIDE + AC_TERM];
+            if (t > 0) { return t - 1; }
+        }
+        if (nodeCount + (len - i) > ((maxNodes > 0) ? maxNodes : 4000000)) { return -1; }
+        if (patCount == patCap) {
+            int ncap = (patCap == 0) ? 16 : patCap * 2;
+            int* nl = (int*) asys.realloc((char*) lens, ncap * 8);
+            if (nl == null) { return -1; }
+            lens = nl;
+            patCap = ncap;
+        }
+        int firstNew = nodeCount;
+        int branch = node;
+        while (i < len) {
+            if (!growNodes()) {                // roll back the nodes of this pattern
+                rollback(branch, firstNew);
+                return -1;
+            }
+            int c = fold ? foldChar(p[i]) : p[i];
+            int nx = nodeCount;
+            nodeCount++;
+            int* nd = &nodes[nx * AC_STRIDE];
+            nd[AC_CHILD] = 0;
+            nd[AC_SIB] = nodes[node * AC_STRIDE + AC_CHILD];
+            nd[AC_FAIL] = 0;
+            nd[AC_LINK] = 0;
+            nd[AC_TERM] = 0;
+            nd[AC_BYTE] = c;
+            nodes[node * AC_STRIDE + AC_CHILD] = nx;
+            node = nx;
+            i++;
+        }
+        nodes[node * AC_STRIDE + AC_TERM] = patCount + 1;
+        lens[patCount] = len;
+        patCount++;
+        dirty = true;
+        return patCount - 1;
+    }
+
+    // undo for a failed add: the new nodes form one chain below the branching node; cut it
+    private void rollback(int branch, int firstNew) {
+        // the first new node is a child of 'branch' (the head of its list, as new children are pushed in front)
+        if (firstNew < nodeCount) {
+            nodes[branch * AC_STRIDE + AC_CHILD] = nodes[firstNew * AC_STRIDE + AC_SIB];
+        }
+        nodeCount = firstNew;
+    }
+
+    // computes the fail and dictionary links; called by the search functions when needed
+    public bool build() {
+        if (!ensureRoot()) { return false; }
+        if (!dirty && rootNext != null) { return true; }
+        int* rn = rootNext;
+        if (rn == null) { rn = newInts(256); if (rn == null) { return false; } }
+        int* queue = newInts(nodeCount);
+        if (queue == null) { if (rootNext == null) { freeMem(rn); } return false; }
+        rootNext = rn;
+        for (int c = 0; c < 256; c++) { rootNext[c] = 0; }
+        int head = 0;
+        int tail = 0;
+        nodes[AC_FAIL] = 0;
+        nodes[AC_LINK] = 0;
+        int e = nodes[AC_CHILD];
+        while (e > 0) {
+            rootNext[nodes[e * AC_STRIDE + AC_BYTE]] = e;
+            nodes[e * AC_STRIDE + AC_FAIL] = 0;
+            nodes[e * AC_STRIDE + AC_LINK] = 0;
+            queue[tail] = e;
+            tail++;
+            e = nodes[e * AC_STRIDE + AC_SIB];
+        }
+        while (head < tail) {
+            int u = queue[head];
+            head++;
+            int ch = nodes[u * AC_STRIDE + AC_CHILD];
+            while (ch > 0) {
+                int c = nodes[ch * AC_STRIDE + AC_BYTE];
+                int f = nodes[u * AC_STRIDE + AC_FAIL];
+                int target = 0;
+                for (;;) {
+                    int nx = (f == 0) ? rootNext[c] : childOf(f, c);
+                    if (nx > 0 && nx != ch) { target = nx; break; }
+                    if (f == 0) { break; }
+                    f = nodes[f * AC_STRIDE + AC_FAIL];
+                }
+                nodes[ch * AC_STRIDE + AC_FAIL] = target;
+                if (nodes[target * AC_STRIDE + AC_TERM] > 0) {
+                    nodes[ch * AC_STRIDE + AC_LINK] = target;
+                } else {
+                    nodes[ch * AC_STRIDE + AC_LINK] = nodes[target * AC_STRIDE + AC_LINK];
+                }
+                queue[tail] = ch;
+                tail++;
+                ch = nodes[ch * AC_STRIDE + AC_SIB];
+            }
+        }
+        freeMem(queue);
+        dirty = false;
+        return true;
+    }
+
+    // one step of the automaton: the state after reading byte c in state s (0 = start). Needs build().
+    public int step(int s, int c) {
+        if ((dirty || rootNext == null) && !build()) { return 0; }
+        if (fold) { c = foldChar(c); }
+        for (;;) {
+            if (s == 0) { return rootNext[c & 255]; }
+            int nx = childOf(s, c & 255);
+            if (nx > 0) { return nx; }
+            s = nodes[s * AC_STRIDE + AC_FAIL];
+        }
+        return 0;
+    }
+
+    // The patterns that end in state s are listed with:  for (int t = ac.match(s); t > 0; t = ac.nextMatch(t)) { int id = ac.patternAt(t); ... }
+    // (longest pattern first). match(s) is the state of the longest pattern that ends at s, 0 when there is none.
+    public int match(int s) {
+        if (s <= 0 || s >= nodeCount) { return 0; }
+        if (nodes[s * AC_STRIDE + AC_TERM] > 0) { return s; }
+        return nodes[s * AC_STRIDE + AC_LINK];
+    }
+
+    // the state of the next shorter pattern that ends in the same place as the pattern of state t, 0 when there is none
+    public int nextMatch(int t) {
+        if (t <= 0 || t >= nodeCount) { return 0; }
+        return nodes[t * AC_STRIDE + AC_LINK];
+    }
+
+    // the pattern id of the state t returned by match() / nextMatch() (-1 for other states)
+    public int patternAt(int t) {
+        if (t <= 0 || t >= nodeCount) { return -1; }
+        return nodes[t * AC_STRIDE + AC_TERM] - 1;
+    }
+
+    // calls cb(id, end, ctx) for every occurrence (end = index after the last byte); a non-zero result stops. Returns the number of calls.
+    public int each(char* text, int n, func cb, int ctx = 0) {
+        n = lenOf(text, n);
+        if (patCount == 0 || !build()) { return 0; }
+        int s = 0;
+        int calls = 0;
+        for (int i = 0; i < n; i++) {
+            int c = text[i];
+            if (fold) { c = foldChar(c); }
+            for (;;) {
+                if (s == 0) { s = rootNext[c]; break; }
+                int nx = childOf(s, c);
+                if (nx > 0) { s = nx; break; }
+                s = nodes[s * AC_STRIDE + AC_FAIL];
+            }
+            int t = s;
+            if (nodes[t * AC_STRIDE + AC_TERM] == 0) { t = nodes[t * AC_STRIDE + AC_LINK]; }
+            while (t > 0) {
+                calls++;
+                if (cb(nodes[t * AC_STRIDE + AC_TERM] - 1, i + 1, ctx) != 0) { return calls; }
+                t = nodes[t * AC_STRIDE + AC_LINK];
+            }
+        }
+        return calls;
+    }
+
+    // stores up to max matches (pattern id and end position) in text order, at one end position the longest pattern first; returns the TOTAL
+    // number of matches (which may be larger than max). ids / ends may be null.
+    public int findAll(char* text, int n, int* ids, int* ends, int max) {
+        n = lenOf(text, n);
+        if (patCount == 0 || !build()) { return 0; }
+        int s = 0;
+        int total = 0;
+        for (int i = 0; i < n; i++) {
+            int c = text[i];
+            if (fold) { c = foldChar(c); }
+            for (;;) {
+                if (s == 0) { s = rootNext[c]; break; }
+                int nx = childOf(s, c);
+                if (nx > 0) { s = nx; break; }
+                s = nodes[s * AC_STRIDE + AC_FAIL];
+            }
+            int t = s;
+            if (nodes[t * AC_STRIDE + AC_TERM] == 0) { t = nodes[t * AC_STRIDE + AC_LINK]; }
+            while (t > 0) {
+                if (total < max) {
+                    if (ids != null) { ids[total] = nodes[t * AC_STRIDE + AC_TERM] - 1; }
+                    if (ends != null) { ends[total] = i + 1; }
+                }
+                total++;
+                t = nodes[t * AC_STRIDE + AC_LINK];
+            }
+        }
+        return total;
+    }
+
+    public int count(char* text, int n = -1) {
+        return findAll(text, n, null, null, 0);
+    }
+
+    // the first match (the one that ends first): returns its end position or -1; *id gets the pattern (the longest one that ends there)
+    public int first(char* text, int n, int* id, int* end) {
+        n = lenOf(text, n);
+        if (patCount == 0 || !build()) { return -1; }
+        int s = 0;
+        for (int i = 0; i < n; i++) {
+            int c = text[i];
+            if (fold) { c = foldChar(c); }
+            for (;;) {
+                if (s == 0) { s = rootNext[c]; break; }
+                int nx = childOf(s, c);
+                if (nx > 0) { s = nx; break; }
+                s = nodes[s * AC_STRIDE + AC_FAIL];
+            }
+            int t = s;
+            if (nodes[t * AC_STRIDE + AC_TERM] == 0) { t = nodes[t * AC_STRIDE + AC_LINK]; }
+            if (t > 0) {
+                if (id != null) { *id = nodes[t * AC_STRIDE + AC_TERM] - 1; }
+                if (end != null) { *end = i + 1; }
+                return i + 1;
+            }
+        }
+        return -1;
+    }
+
+    public void dispose() {
+        freeMem(nodes);
+        freeMem(lens);
+        freeMem(rootNext);
+        nodes = null;
+        lens = null;
+        rootNext = null;
+        nodeCount = 0;
+        nodeCap = 0;
+        patCount = 0;
+        patCap = 0;
+        dirty = true;
+    }
+}
+
+// ---- symbols: bytes or UTF-8 code points -------------------------------------------------------------------------------------------------
+// The distance and similarity functions work on arrays of symbols (ints). A byte is one symbol; with utf8 = true a valid UTF-8 sequence is one
+// symbol (its code point) and every byte that is not part of a valid sequence is one symbol of its own (0x110000 + the byte).
+private bool isCont(int c) { return (c & 0xC0) == 0x80; }
+
+// decodes the symbol at s[i] (i < n): *len gets the bytes it uses
+private int symAt(char* s, int n, int i, int* len) {
+    int b = s[i];
+    *len = 1;
+    if (b < 0x80) { return b; }
+    if (b >= 0xC2 && b < 0xE0) {
+        if (i + 1 < n && isCont(s[i + 1])) { *len = 2; return ((b & 0x1F) << 6) | (s[i + 1] & 0x3F); }
+    } else if (b >= 0xE0 && b < 0xF0) {
+        if (i + 2 < n && isCont(s[i + 1]) && isCont(s[i + 2])) {
+            int cp = ((b & 0x0F) << 12) | ((s[i + 1] & 0x3F) << 6) | (s[i + 2] & 0x3F);
+            if (cp >= 0x800 && (cp < 0xD800 || cp > 0xDFFF)) { *len = 3; return cp; }
+        }
+    } else if (b >= 0xF0 && b < 0xF5) {
+        if (i + 3 < n && isCont(s[i + 1]) && isCont(s[i + 2]) && isCont(s[i + 3])) {
+            int cp = ((b & 0x07) << 18) | ((s[i + 1] & 0x3F) << 12) | ((s[i + 2] & 0x3F) << 6) | (s[i + 3] & 0x3F);
+            if (cp >= 0x10000 && cp <= 0x10FFFF) { *len = 4; return cp; }
+        }
+    }
+    return 0x110000 + b;
+}
+
+// fills out (room for n ints) with the symbols of s[0..n); offs (n + 1 ints, may be null) gets the byte offset of every symbol and n at the end.
+// Returns the number of symbols.
+private int symbols(char* s, int n, int* out, int* offs, bool u8) {
+    if (!u8) {
+        for (int i = 0; i < n; i++) {
+            out[i] = s[i];
+            if (offs != null) { offs[i] = i; }
+        }
+        if (offs != null) { offs[n] = n; }
+        return n;
+    }
+    int k = 0;
+    int i = 0;
+    while (i < n) {
+        int len = 1;
+        out[k] = symAt(s, n, i, &len);
+        if (offs != null) { offs[k] = i; }
+        k++;
+        i = i + len;
+    }
+    if (offs != null) { offs[k] = n; }
+    return k;
+}
+
+// ---- Levenshtein ---------------------------------------------------------------------------------------------------------------------------
+// the core: x, y symbol arrays, k >= 0 caps the result (k + 1 means "more than k"), rows has room for 2 * (min(nx, ny) + 2) ints
+private int levCore(int* x, int nx, int* y, int ny, int k, int* rows) {
+    while (nx > 0 && ny > 0 && x[0] == y[0]) { x = x + 1; y = y + 1; nx--; ny--; }
+    while (nx > 0 && ny > 0 && x[nx - 1] == y[ny - 1]) { nx--; ny--; }
+    if (nx < ny) { int* t = x; x = y; y = t; int tn = nx; nx = ny; ny = tn; }     // y is the shorter one: the rows have its length
+    if (ny == 0) { return (k >= 0 && nx > k) ? k + 1 : nx; }
+    if (k < 0 || k > nx) { k = nx; }
+    if (nx - ny > k) { return k + 1; }
+    int* prev = rows;
+    int* cur = &rows[ny + 2];
+    int inf = k + 1;
+    for (int j = 0; j <= ny; j++) { prev[j] = (j <= k) ? j : inf; }
+    for (int i = 1; i <= nx; i++) {
+        int lo = imax(1, i - k);
+        int hi = imin(ny, i + k);
+        if (lo > hi) { return inf; }
+        cur[lo - 1] = (lo == 1) ? imin(i, inf) : inf;
+        int rowMin = cur[lo - 1];
+        int xi = x[i - 1];
+        for (int j = lo; j <= hi; j++) {
+            int v = prev[j - 1] + ((xi != y[j - 1]) ? 1 : 0);
+            int del = prev[j] + 1;
+            if (del < v) { v = del; }
+            int ins = cur[j - 1] + 1;
+            if (ins < v) { v = ins; }
+            if (v > inf) { v = inf; }
+            cur[j] = v;
+            if (v < rowMin) { rowMin = v; }
+        }
+        if (hi + 1 <= ny) { cur[hi + 1] = inf; }
+        if (rowMin > k) { return inf; }
+        int* t = prev; prev = cur; cur = t;
+    }
+    int r = prev[ny];
+    return (r > k) ? inf : r;
+}
+
+// decodes both strings and runs core(x, nx, y, ny, k, rows); extra = number of rows of workspace (each min + 2 ints long)
+private int* symPair(char* a, int na, char* b, int nb, bool u8, int rowsNeeded, int** px, int** py, int** prows, int* sx, int* sy) {
+    int* mem = newInts(na + nb + rowsNeeded * (imin(na, nb) + 2) + 2);
+    if (mem == null) { return null; }
+    *px = mem;
+    *py = &mem[na];
+    *prows = &mem[na + nb];
+    *sx = symbols(a, na, *px, null, u8);
+    *sy = symbols(b, nb, *py, null, u8);
+    return mem;
+}
+
+// Levenshtein distance (insert, delete, replace; each costs 1) in O(na * nb) time and O(min(na, nb)) memory. -1 when memory ran out.
+public int levenshtein(char* a, int na, char* b, int nb, bool utf8 = false) {
+    return levenshteinMax(a, na, b, nb, -1, utf8);
+}
+
+// the distance when it is at most k, otherwise k + 1; O(k * max(na, nb)) time (Ukkonen's band). k < 0 means no limit.
+public int levenshteinMax(char* a, int na, char* b, int nb, int k, bool utf8 = false) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int* x; int* y; int* rows; int sx; int sy;
+    int* mem = symPair(a, na, b, nb, utf8, 2, &x, &y, &rows, &sx, &sy);
+    if (mem == null) { return -1; }
+    int r = levCore(x, sx, y, sy, k, rows);
+    freeMem(mem);
+    return r;
+}
+
+// 1.0 for equal strings, 0.0 for nothing in common:  1 - distance / longer length
+public double levenshteinSimilarity(char* a, int na, char* b, int nb, bool utf8 = false) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int* x; int* y; int* rows; int sx; int sy;
+    int* mem = symPair(a, na, b, nb, utf8, 2, &x, &y, &rows, &sx, &sy);
+    if (mem == null) { return -1.0; }
+    int d = levCore(x, sx, y, sy, -1, rows);
+    int longer = imax(sx, sy);
+    freeMem(mem);
+    if (longer == 0) { return 1.0; }
+    return 1.0 - (double) d / longer;
+}
+
+// ---- optimal string alignment and Damerau-Levenshtein ---------------------------------------------------------------------------------
+// OSA: like Levenshtein, plus the swap of two adjacent symbols for 1, but no symbol takes part in two edits ("ca" -> "abc" costs 3).
+// Memory O(min(na, nb)).
+private int osaCore(int* x, int nx, int* y, int ny, int* rows) {
+    if (nx < ny) { int* t = x; x = y; y = t; int tn = nx; nx = ny; ny = tn; }
+    if (ny == 0) { return nx; }
+    int w = ny + 2;
+    int* p2 = rows;                       // row i - 2
+    int* p1 = &rows[w];                   // row i - 1
+    int* cur = &rows[2 * w];
+    for (int j = 0; j <= ny; j++) { p1[j] = j; p2[j] = j; }
+    for (int i = 1; i <= nx; i++) {
+        cur[0] = i;
+        for (int j = 1; j <= ny; j++) {
+            int cost = (x[i - 1] == y[j - 1]) ? 0 : 1;
+            int v = p1[j - 1] + cost;
+            if (p1[j] + 1 < v) { v = p1[j] + 1; }
+            if (cur[j - 1] + 1 < v) { v = cur[j - 1] + 1; }
+            if (i > 1 && j > 1 && x[i - 1] == y[j - 2] && x[i - 2] == y[j - 1]) {
+                if (p2[j - 2] + 1 < v) { v = p2[j - 2] + 1; }
+            }
+            cur[j] = v;
+        }
+        int* t = p2; p2 = p1; p1 = cur; cur = t;
+    }
+    return p1[ny];
+}
+
+public int osa(char* a, int na, char* b, int nb, bool utf8 = false) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int* x; int* y; int* rows; int sx; int sy;
+    int* mem = symPair(a, na, b, nb, utf8, 3, &x, &y, &rows, &sx, &sy);
+    if (mem == null) { return -1; }
+    int r = osaCore(x, sx, y, sy, rows);
+    freeMem(mem);
+    return r;
+}
+
+// The true Damerau-Levenshtein distance (Lowrance-Wagner): a substring may be edited after it was swapped ("ca" -> "abc" costs 2). It needs the
+// whole table, (na + 2) * (nb + 2) ints: -1 when that would be more than 2^23 cells (64 MiB) or memory ran out.
+public int damerau(char* a, int na, char* b, int nb, bool utf8 = false) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    if (na > 0x1000000 || nb > 0x1000000) { return -1; }
+    int* x; int* y; int* rows; int sx; int sy;
+    int* mem = symPair(a, na, b, nb, utf8, 0, &x, &y, &rows, &sx, &sy);
+    if (mem == null) { return -1; }
+    int w = sy + 2;
+    if ((sx + 2) * w > 0x800000) { freeMem(mem); return -1; }
+    int* d = newInts((sx + 2) * w);
+    // the last row in which a symbol occurred in x: a small table by sorted distinct symbols of both strings
+    int* syms = newInts(sx + sy + 1);
+    int* lastRow = newInts(sx + sy + 1);
+    if (d == null || syms == null || lastRow == null) {
+        freeMem(mem); freeMem(d); freeMem(syms); freeMem(lastRow);
+        return -1;
+    }
+    int ns = 0;
+    for (int i = 0; i < sx; i++) { syms[ns] = x[i]; ns++; }
+    for (int j = 0; j < sy; j++) { syms[ns] = y[j]; ns++; }
+    algo.sortBy(syms, ns, ds.cmpAsc);
+    ns = algo.unique(syms, ns);
+    int maxDist = sx + sy;
+    // d[(i + 1) * w + (j + 1)] is the distance of the first i and j symbols; row / column 0 hold the sentinel maxDist
+    d[0] = maxDist;
+    for (int i = 0; i <= sx; i++) { d[(i + 1) * w] = maxDist; d[(i + 1) * w + 1] = i; }
+    for (int j = 0; j <= sy; j++) { d[j + 1] = maxDist; d[w + j + 1] = j; }
+    for (int i = 1; i <= sx; i++) {
+        int db = 0;
+        for (int j = 1; j <= sy; j++) {
+            int k = lastRow[algo.lowerBound(syms, ns, y[j - 1])];
+            int l = db;
+            int cost = 1;
+            if (x[i - 1] == y[j - 1]) { cost = 0; db = j; }
+            int v = d[i * w + j] + cost;                                  // substitution
+            int ins = d[(i + 1) * w + j] + 1;
+            int del = d[i * w + j + 1] + 1;
+            int tr = d[k * w + l] + (i - k - 1) + 1 + (j - l - 1);        // transposition
+            if (ins < v) { v = ins; }
+            if (del < v) { v = del; }
+            if (tr < v) { v = tr; }
+            d[(i + 1) * w + j + 1] = v;
+        }
+        lastRow[algo.lowerBound(syms, ns, x[i - 1])] = i;
+    }
+    int r = d[(sx + 1) * w + sy + 1];
+    freeMem(mem); freeMem(d); freeMem(syms); freeMem(lastRow);
+    return r;
+}
+
+// ---- Hamming ------------------------------------------------------------------------------------------------------------------------------
+// number of positions with different symbols; -1 when the strings do not have the same length (in symbols)
+public int hamming(char* a, int na, char* b, int nb, bool utf8 = false) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    if (!utf8) {
+        if (na != nb) { return -1; }
+        int d = 0;
+        for (int i = 0; i < na; i++) { if (a[i] != b[i]) { d++; } }
+        return d;
+    }
+    int* x; int* y; int* rows; int sx; int sy;
+    int* mem = symPair(a, na, b, nb, true, 0, &x, &y, &rows, &sx, &sy);
+    if (mem == null) { return -1; }
+    int d = -1;
+    if (sx == sy) {
+        d = 0;
+        for (int i = 0; i < sx; i++) { if (x[i] != y[i]) { d++; } }
+    }
+    freeMem(mem);
+    return d;
+}
+
+// number of differing BITS of two byte strings of the same length (-1 when the lengths differ)
+public int hammingBits(char* a, int na, char* b, int nb) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    if (na != nb) { return -1; }
+    int d = 0;
+    for (int i = 0; i < na; i++) { d = d + bits.popcount((a[i] ^ b[i]) & 255); }
+    return d;
+}
+
+// length of the common prefix / suffix in bytes
+public int commonPrefix(char* a, int na, char* b, int nb) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int i = 0;
+    while (i < na && i < nb && a[i] == b[i]) { i++; }
+    return i;
+}
+
+public int commonSuffix(char* a, int na, char* b, int nb) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int i = 0;
+    while (i < na && i < nb && a[na - 1 - i] == b[nb - 1 - i]) { i++; }
+    return i;
+}
+
+// ---- Jaro and Jaro-Winkler -----------------------------------------------------------------------------------------------------------------
+private double jaroCore(int* x, int nx, int* y, int ny, char* flags) {
+    if (nx == 0 && ny == 0) { return 1.0; }
+    if (nx == 0 || ny == 0) { return 0.0; }
+    int window = imax(nx, ny) / 2 - 1;
+    if (window < 0) { window = 0; }
+    char* fx = flags;
+    char* fy = &flags[nx];
+    for (int i = 0; i < nx + ny; i++) { flags[i] = 0; }
+    int m = 0;
+    for (int i = 0; i < nx; i++) {
+        int lo = imax(0, i - window);
+        int hi = imin(ny - 1, i + window);
+        for (int j = lo; j <= hi; j++) {
+            if (fy[j] == 0 && x[i] == y[j]) { fx[i] = 1; fy[j] = 1; m++; break; }
+        }
+    }
+    if (m == 0) { return 0.0; }
+    int t = 0;
+    int k = 0;
+    for (int i = 0; i < nx; i++) {
+        if (fx[i] != 0) {
+            while (fy[k] == 0) { k++; }
+            if (x[i] != y[k]) { t++; }
+            k++;
+        }
+    }
+    t = t / 2;
+    return ((double) m / nx + (double) m / ny + (double) (m - t) / m) / 3.0;
+}
+
+private double jaroWrap(char* a, int na, char* b, int nb, bool u8, bool winkler, double scale, int maxPrefix, double threshold) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int* x; int* y; int* rows; int sx; int sy;
+    int* mem = symPair(a, na, b, nb, u8, 0, &x, &y, &rows, &sx, &sy);
+    char* flags = newBytes(sx + sy + 1);
+    if (mem == null || flags == null) { freeMem(mem); freeMem(flags); return -1.0; }
+    double j = jaroCore(x, sx, y, sy, flags);
+    if (winkler && j > threshold) {
+        int l = 0;
+        while (l < sx && l < sy && l < maxPrefix && x[l] == y[l]) { l++; }
+        j = j + (double) l * scale * (1.0 - j);
+    }
+    freeMem(mem);
+    freeMem(flags);
+    return j;
+}
+
+// similarity 0.0 .. 1.0 (1.0 = equal; two empty strings are equal). Transpositions are counted as half the number of matches out of order,
+// rounded down (as in the original definition and in common libraries). -1.0 when memory ran out.
+public double jaro(char* a, int na, char* b, int nb, bool utf8 = false) {
+    return jaroWrap(a, na, b, nb, utf8, false, 0.0, 0, 0.0);
+}
+
+// Jaro-Winkler: Jaro plus a bonus for a common prefix of up to 4 symbols (scale 0.1), given only when jaro > 0.7; the usual definition
+public double jaroWinkler(char* a, int na, char* b, int nb, bool utf8 = false) {
+    return jaroWrap(a, na, b, nb, utf8, true, 0.1, 4, 0.7);
+}
+
+// the same with your own parameters (scale <= 0.25 keeps the result <= 1; the bonus is given only when jaro > threshold)
+public double jaroWinklerEx(char* a, int na, char* b, int nb, bool utf8, double scale, int maxPrefix, double threshold) {
+    return jaroWrap(a, na, b, nb, utf8, true, scale, maxPrefix, threshold);
+}
+
+// ---- q-gram similarities ---------------------------------------------------------------------------------------------------------------------
+// the hash of every run of q symbols, sorted; returns the count (0 when the string is shorter than q)
+private int qgrams(int* x, int nx, int q, int* out) {
+    if (nx < q || q < 1) { return 0; }
+    int c = nx - q + 1;
+    for (int i = 0; i < c; i++) {
+        int g = 0;
+        for (int t = 0; t < q; t++) { g = ds.mix64(g + x[i + t] + 1); }
+        out[i] = g;
+    }
+    algo.sortBy(out, c, ds.cmpAsc);
+    return c;
+}
+
+// 0 = Dice (multiset), 1 = Jaccard (sets), 2 = cosine (counts)
+private double qgramWrap(char* a, int na, char* b, int nb, int q, bool u8, int kind) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int* x; int* y; int* rows; int sx; int sy;
+    int* mem = symPair(a, na, b, nb, u8, 0, &x, &y, &rows, &sx, &sy);
+    int* ga = newInts(sx + 1);
+    int* gb = newInts(sy + 1);
+    if (mem == null || ga == null || gb == null) { freeMem(mem); freeMem(ga); freeMem(gb); return -1.0; }
+    int ca = qgrams(x, sx, q, ga);
+    int cb = qgrams(y, sy, q, gb);
+    double r = 0.0;
+    if (ca == 0 && cb == 0) {
+        r = (na == nb && (na == 0 || memcmp(a, b, na) == 0)) ? 1.0 : 0.0;      // both too short for a q-gram: equal or not
+    } else if (ca == 0 || cb == 0) {
+        r = 0.0;
+    } else if (kind == 0) {
+        int i = 0; int j = 0; int inter = 0;
+        while (i < ca && j < cb) {
+            if (ga[i] == gb[j]) { inter++; i++; j++; }
+            else if (ga[i] < gb[j]) { i++; }
+            else { j++; }
+        }
+        r = 2.0 * (double) inter / (double) (ca + cb);
+    } else if (kind == 1) {
+        ca = algo.unique(ga, ca);
+        cb = algo.unique(gb, cb);
+        int i = 0; int j = 0; int inter = 0;
+        while (i < ca && j < cb) {
+            if (ga[i] == gb[j]) { inter++; i++; j++; }
+            else if (ga[i] < gb[j]) { i++; }
+            else { j++; }
+        }
+        r = (double) inter / (double) (ca + cb - inter);
+    } else {
+        // cosine of the count vectors
+        int i = 0; int j = 0;
+        int dot = 0; int na2 = 0; int nb2 = 0;
+        while (i < ca || j < cb) {
+            int v = 0;
+            if (i >= ca) { v = gb[j]; }
+            else if (j >= cb) { v = ga[i]; }
+            else { v = (ga[i] < gb[j]) ? ga[i] : gb[j]; }
+            int cA = 0; int cB = 0;
+            while (i < ca && ga[i] == v) { cA++; i++; }
+            while (j < cb && gb[j] == v) { cB++; j++; }
+            dot = dot + cA * cB;
+            na2 = na2 + cA * cA;
+            nb2 = nb2 + cB * cB;
+        }
+        r = (double) dot / (dmath.sqrt((double) na2) * dmath.sqrt((double) nb2));
+    }
+    freeMem(mem); freeMem(ga); freeMem(gb);
+    return r;
+}
+
+// Sorensen-Dice coefficient of the q-gram multisets (q = 2: bigrams): 2 * shared / (grams of a + grams of b). Strings shorter than q are
+// 1.0 when equal and 0.0 otherwise.
+public double diceQgrams(char* a, int na, char* b, int nb, int q = 2, bool utf8 = false) {
+    return qgramWrap(a, na, b, nb, q, utf8, 0);
+}
+
+public double diceBigrams(char* a, int na, char* b, int nb, bool utf8 = false) {
+    return qgramWrap(a, na, b, nb, 2, utf8, 0);
+}
+
+// Jaccard index of the q-gram SETS: shared / (distinct grams of both)
+public double jaccardQgrams(char* a, int na, char* b, int nb, int q = 2, bool utf8 = false) {
+    return qgramWrap(a, na, b, nb, q, utf8, 1);
+}
+
+// cosine similarity of the q-gram count vectors
+public double cosineQgrams(char* a, int na, char* b, int nb, int q = 2, bool utf8 = false) {
+    return qgramWrap(a, na, b, nb, q, utf8, 2);
+}
+
+// ---- longest common subsequence -----------------------------------------------------------------------------------------------------------
+// the last row of the LCS length table of x[x0..x1) against y[y0..y1) (forward), or of the reversed strings (rev): out[j] for j = 0..ny; tmp is a second row
+private void lcsRow(int* x, int x0, int x1, int* y, int y0, int y1, bool rev, int* out, int* tmp) {
+    int ny = y1 - y0;
+    int* prev = out;
+    int* cur = tmp;
+    for (int j = 0; j <= ny; j++) { prev[j] = 0; cur[j] = 0; }
+    int nx = x1 - x0;
+    for (int i = 0; i < nx; i++) {
+        int xi = rev ? x[x1 - 1 - i] : x[x0 + i];
+        cur[0] = 0;
+        for (int j = 1; j <= ny; j++) {
+            int yj = rev ? y[y1 - j] : y[y0 + j - 1];
+            if (xi == yj) { cur[j] = prev[j - 1] + 1; }
+            else { cur[j] = (prev[j] > cur[j - 1]) ? prev[j] : cur[j - 1]; }
+        }
+        int* t = prev; prev = cur; cur = t;
+    }
+    if (prev != out) { for (int j = 0; j <= ny; j++) { out[j] = prev[j]; } }
+}
+
+// Hirschberg: marks keep[i] = 1 for the symbols of x[x0..x1) that belong to a longest common subsequence with y[y0..y1)
+private void hirschberg(int* x, int x0, int x1, int* y, int y0, int y1, char* keep, int* w) {
+    int nx = x1 - x0;
+    int ny = y1 - y0;
+    if (nx <= 0 || ny <= 0) { return; }
+    if (nx == 1) {
+        for (int j = y0; j < y1; j++) { if (y[j] == x[x0]) { keep[x0] = 1; return; } }
+        return;
+    }
+    int mid = x0 + nx / 2;
+    int* f = w;
+    int* g = &w[ny + 2];
+    int* t1 = &w[2 * (ny + 2)];
+    lcsRow(x, x0, mid, y, y0, y1, false, f, t1);
+    lcsRow(x, mid, x1, y, y0, y1, true, g, t1);
+    int best = -1;
+    int split = 0;
+    for (int k = 0; k <= ny; k++) {
+        int v = f[k] + g[ny - k];
+        if (v > best) { best = v; split = k; }
+    }
+    hirschberg(x, x0, mid, y, y0, y0 + split, keep, w);
+    hirschberg(x, mid, x1, y, y0 + split, y1, keep, w);
+}
+
+// length of the longest common subsequence in O(na * nb) time and O(min(na, nb)) memory (-1: out of memory)
+public int lcsLength(char* a, int na, char* b, int nb, bool utf8 = false) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int* x; int* y; int* rows; int sx; int sy;
+    int* mem = symPair(a, na, b, nb, utf8, 2, &x, &y, &rows, &sx, &sy);
+    if (mem == null) { return -1; }
+    int r = 0;
+    int* p = x; int* q = y; int np = sx; int nq = sy;
+    if (np < nq) { p = y; q = x; np = sy; nq = sx; }      // rows over the shorter one
+    // trim the common ends (they belong to every longest common subsequence)
+    int lo = 0;
+    while (lo < np && lo < nq && p[lo] == q[lo]) { lo++; }
+    int hiP = np; int hiQ = nq;
+    while (hiP > lo && hiQ > lo && p[hiP - 1] == q[hiQ - 1]) { hiP--; hiQ--; }
+    r = lo + (np - hiP);
+    if (hiP > lo && hiQ > lo) {
+        lcsRow(p, lo, hiP, q, lo, hiQ, false, rows, &rows[nq + 2]);
+        r = r + rows[hiQ - lo];
+    }
+    freeMem(mem);
+    return r;
+}
+
+// A longest common subsequence as a new text (free it with freeText); *outLen gets its length in bytes (may be null). Hirschberg's divide
+// and conquer: O(na * nb) time, O(na + nb) memory. null when memory ran out. With utf8 the symbols are code points, so no sequence is cut.
+public char* lcs(char* a, int na, char* b, int nb, int* outLen = null, bool utf8 = false) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    int* x = newInts(na + 1);
+    int* y = newInts(nb + 1);
+    int* offs = newInts(na + 2);
+    char* keep = newBytes(na + 1);
+    int* w = newInts(3 * (nb + 2) + 4);
+    char* res = null;
+    if (x != null && y != null && offs != null && keep != null && w != null) {
+        int sx = symbols(a, na, x, offs, utf8);
+        int sy = symbols(b, nb, y, null, utf8);
+        // common ends first
+        int lo = 0;
+        while (lo < sx && lo < sy && x[lo] == y[lo]) { keep[lo] = 1; lo++; }
+        int hx = sx; int hy = sy;
+        while (hx > lo && hy > lo && x[hx - 1] == y[hy - 1]) { hx--; hy--; keep[hx] = 1; }
+        hirschberg(x, lo, hx, y, lo, hy, keep, w);
+        int total = 0;
+        for (int i = 0; i < sx; i++) { if (keep[i] != 0) { total = total + offs[i + 1] - offs[i]; } }
+        res = newBytes(total + 1);
+        if (res != null) {
+            int at = 0;
+            for (int i = 0; i < sx; i++) {
+                if (keep[i] != 0) {
+                    int len = offs[i + 1] - offs[i];
+                    memcpy(&res[at], &a[offs[i]], len);
+                    at = at + len;
+                }
+            }
+            res[total] = 0;
+            if (outLen != null) { *outLen = total; }
+        }
+    }
+    freeMem(x); freeMem(y); freeMem(offs); freeMem(keep); freeMem(w);
+    return res;
+}
+
+// ---- suffix array (SA-IS, linear time) ---------------------------------------------------------------------------------------------------
+private void saNaive(int* s, int n, int* sa) {
+    for (int i = 0; i < n; i++) { sa[i] = i; }
+    for (int i = 1; i < n; i++) {
+        int v = sa[i];
+        int j = i - 1;
+        while (j >= 0) {
+            // compare suffix sa[j] with suffix v
+            int a = sa[j];
+            int b = v;
+            bool greater = false;
+            for (;;) {
+                if (a >= n) { greater = false; break; }
+                if (b >= n) { greater = true; break; }
+                if (s[a] != s[b]) { greater = s[a] > s[b]; break; }
+                a++; b++;
+            }
+            if (!greater) { break; }
+            sa[j + 1] = sa[j];
+            j--;
+        }
+        sa[j + 1] = v;
+    }
+}
+
+private void saInduce(int* s, int n, int* sa, char* ls, int* sumL, int* sumS, int* buf, int upper, int* lms, int m) {
+    for (int i = 0; i < n; i++) { sa[i] = -1; }
+    for (int c = 0; c <= upper; c++) { buf[c] = sumS[c]; }
+    for (int i = 0; i < m; i++) {
+        int d = lms[i];
+        if (d == n) { continue; }
+        sa[buf[s[d]]] = d;
+        buf[s[d]]++;
+    }
+    for (int c = 0; c <= upper; c++) { buf[c] = sumL[c]; }
+    sa[buf[s[n - 1]]] = n - 1;
+    buf[s[n - 1]]++;
+    for (int i = 0; i < n; i++) {
+        int v = sa[i];
+        if (v >= 1 && ls[v - 1] == 0) {
+            sa[buf[s[v - 1]]] = v - 1;
+            buf[s[v - 1]]++;
+        }
+    }
+    for (int c = 0; c <= upper; c++) { buf[c] = sumL[c]; }
+    for (int i = n - 1; i >= 0; i--) {
+        int v = sa[i];
+        if (v >= 1 && ls[v - 1] != 0) {
+            buf[s[v - 1] + 1]--;
+            sa[buf[s[v - 1] + 1]] = v - 1;
+        }
+    }
+}
+
+// s: n symbols in 0..upper; fills sa with the suffix array; false when memory ran out
+private bool saIs(int* s, int n, int upper, int* sa) {
+    if (n == 0) { return true; }
+    if (n == 1) { sa[0] = 0; return true; }
+    if (n == 2) {
+        if (s[0] < s[1]) { sa[0] = 0; sa[1] = 1; } else { sa[0] = 1; sa[1] = 0; }
+        return true;
+    }
+    if (n < 10) { saNaive(s, n, sa); return true; }
+    char* ls = newBytes(n);
+    int* sumL = newInts(upper + 2);
+    int* sumS = newInts(upper + 2);
+    int* buf = newInts(upper + 2);
+    int* lmsMap = newInts(n + 1);
+    if (ls == null || sumL == null || sumS == null || buf == null || lmsMap == null) {
+        freeMem(ls); freeMem(sumL); freeMem(sumS); freeMem(buf); freeMem(lmsMap);
+        return false;
+    }
+    for (int i = n - 2; i >= 0; i--) {
+        if (s[i] == s[i + 1]) { ls[i] = ls[i + 1]; }
+        else { ls[i] = (s[i] < s[i + 1]) ? 1 : 0; }
+    }
+    for (int i = 0; i < n; i++) {
+        if (ls[i] == 0) { sumS[s[i]]++; } else { sumL[s[i] + 1]++; }
+    }
+    for (int i = 0; i <= upper; i++) {
+        sumS[i] = sumS[i] + sumL[i];
+        if (i < upper) { sumL[i + 1] = sumL[i + 1] + sumS[i]; }
+    }
+    int m = 0;
+    for (int i = 0; i <= n; i++) { lmsMap[i] = -1; }
+    for (int i = 1; i < n; i++) {
+        if (ls[i - 1] == 0 && ls[i] != 0) { lmsMap[i] = m; m++; }
+    }
+    int* lms = newInts(m + 1);
+    int* sorted = newInts(m + 1);
+    int* recS = newInts(m + 1);
+    int* recSa = newInts(m + 1);
+    bool ok = (lms != null && sorted != null && recS != null && recSa != null);
+    if (ok) {
+        int k = 0;
+        for (int i = 1; i < n; i++) {
+            if (ls[i - 1] == 0 && ls[i] != 0) { lms[k] = i; k++; }
+        }
+        saInduce(s, n, sa, ls, sumL, sumS, buf, upper, lms, m);
+        if (m > 0) {
+            int cnt = 0;
+            for (int i = 0; i < n; i++) {
+                int v = sa[i];
+                if (v >= 0 && lmsMap[v] != -1) { sorted[cnt] = v; cnt++; }
+            }
+            int recUpper = 0;
+            recS[lmsMap[sorted[0]]] = 0;
+            for (int i = 1; i < m; i++) {
+                int l = sorted[i - 1];
+                int r = sorted[i];
+                int endL = (lmsMap[l] + 1 < m) ? lms[lmsMap[l] + 1] : n;
+                int endR = (lmsMap[r] + 1 < m) ? lms[lmsMap[r] + 1] : n;
+                bool same = true;
+                if (endL - l != endR - r) {
+                    same = false;
+                } else {
+                    while (l < endL) {
+                        if (s[l] != s[r]) { break; }
+                        l++;
+                        r++;
+                    }
+                    if (l == n || s[l] != s[r]) { same = false; }
+                }
+                if (!same) { recUpper++; }
+                recS[lmsMap[sorted[i]]] = recUpper;
+            }
+            ok = saIs(recS, m, recUpper, recSa);
+            if (ok) {
+                for (int i = 0; i < m; i++) { sorted[i] = lms[recSa[i]]; }
+                saInduce(s, n, sa, ls, sumL, sumS, buf, upper, sorted, m);
+            }
+        }
+    }
+    freeMem(ls); freeMem(sumL); freeMem(sumS); freeMem(buf); freeMem(lmsMap);
+    freeMem(lms); freeMem(sorted); freeMem(recS); freeMem(recSa);
+    return ok;
+}
+
+// builds the suffix array of the symbols s[0..n) (values 0..upper) into a new int array of n entries (null when memory ran out)
+private int* suffixArrayOf(int* s, int n, int upper) {
+    int* sa = newInts(n + 1);
+    if (sa == null) { return null; }
+    if (!saIs(s, n, upper, sa)) { freeMem(sa); return null; }
+    return sa;
+}
+
+// Kasai: lcp[i] = length of the common prefix of the suffixes sa[i - 1] and sa[i] (lcp[0] = 0); rnk is filled as a by-product
+private void lcpOfArray(int* s, int n, int* sa, int* rnk, int* lcpOut) {
+    for (int i = 0; i < n; i++) { rnk[sa[i]] = i; }
+    int h = 0;
+    for (int i = 0; i < n; i++) {
+        if (h > 0) { h--; }
+        int r = rnk[i];
+        if (r == 0) { lcpOut[0] = 0; h = 0; continue; }
+        int j = sa[r - 1];
+        while (j + h < n && i + h < n) {
+            if (s[j + h] != s[i + h]) { break; }
+            h++;
+        }
+        lcpOut[r] = h;
+    }
+}
+
+public class SuffixArray {
+    private char* txt;                      // a copy of the text
+    private int n;
+    private int* sa;
+    private int* rnk;
+    private int* lcpa;
+    private int* rmq;                       // segment tree over lcpa, built on the first lcpOf()
+    private bool bad;
+
+    // builds the suffix array and the LCP array of s[0..n) in O(n) time (SA-IS + Kasai) and about 24 bytes per input byte
+    public SuffixArray(char* s, int len = -1) {
+        n = lenOf(s, len);
+        txt = dupBytes(s, n);
+        int* sym = newInts(n + 1);
+        sa = null;
+        if (txt == null || sym == null) { bad = true; freeMem(txt); freeMem(sym); txt = null; n = 0; return; }
+        for (int i = 0; i < n; i++) { sym[i] = txt[i]; }
+        sa = suffixArrayOf(sym, n, 255);
+        rnk = newInts(n + 1);
+        lcpa = newInts(n + 1);
+        if (sa == null || rnk == null || lcpa == null) {
+            bad = true;
+            freeMem(sa); freeMem(rnk); freeMem(lcpa); freeMem(txt);
+            sa = null; rnk = null; lcpa = null; txt = null; n = 0;
+            freeMem(sym);
+            return;
+        }
+        lcpOfArray(sym, n, sa, rnk, lcpa);
+        freeMem(sym);
+    }
+
+    public int size() { return n; }
+    public bool ok() { return !bad; }
+
+    // the start of the suffix that is number i in sorted order (-1 for a bad index)
+    public int at(int i) { return (i < 0 || i >= n) ? -1 : sa[i]; }
+    // the sorted position of the suffix that starts at i
+    public int rank(int i) { return (i < 0 || i >= n) ? -1 : rnk[i]; }
+    // common prefix of the sorted neighbours i - 1 and i (0 for i = 0)
+    public int lcp(int i) { return (i < 0 || i >= n) ? -1 : lcpa[i]; }
+
+    // compares the first m bytes of suffix p with pat: <0, 0, >0 (a suffix that ends early and matches so far is smaller)
+    private int cmpSuffix(int p, char* pat, int m) {
+        int avail = n - p;
+        int c = memcmp(&txt[p], pat, imin(avail, m));
+        if (c != 0) { return c; }
+        if (avail < m) { return -1; }
+        return 0;
+    }
+
+    // the range [lo, hi) of sorted positions whose suffixes start with pat
+    private void range(char* pat, int m, int* lo, int* hi) {
+        int a = 0;
+        int b = n;
+        while (a < b) {
+            int mid = a + (b - a) / 2;
+            if (cmpSuffix(sa[mid], pat, m) < 0) { a = mid + 1; } else { b = mid; }
+        }
+        *lo = a;
+        b = n;
+        while (a < b) {
+            int mid = a + (b - a) / 2;
+            if (cmpSuffix(sa[mid], pat, m) <= 0) { a = mid + 1; } else { b = mid; }
+        }
+        *hi = a;
+    }
+
+    // how many times pat occurs (overlapping ones count); O(m log n)
+    public int count(char* pat, int m = -1) {
+        m = lenOf(pat, m);
+        if (bad) { return 0; }
+        if (m == 0) { return n + 1; }
+        int lo; int hi;
+        range(pat, m, &lo, &hi);
+        return hi - lo;
+    }
+
+    // some position where pat occurs, or -1
+    public int find(char* pat, int m = -1) {
+        m = lenOf(pat, m);
+        if (bad) { return -1; }
+        if (m == 0) { return 0; }
+        int lo; int hi;
+        range(pat, m, &lo, &hi);
+        return (hi > lo) ? sa[lo] : -1;
+    }
+
+    // the start of the smallest-position occurrence... of every occurrence: stores up to max positions (in suffix order, not text order); returns the total
+    public int findAll(char* pat, int m, int* out, int max) {
+        m = lenOf(pat, m);
+        if (bad) { return 0; }
+        if (m == 0) { return 0; }
+        int lo; int hi;
+        range(pat, m, &lo, &hi);
+        for (int i = lo; i < hi && i - lo < max; i++) { out[i - lo] = sa[i]; }
+        return hi - lo;
+    }
+
+    // length of the longest common prefix of the suffixes starting at i and j (O(log n) per query after a one-time O(n) setup); -1 for bad indexes
+    public int lcpOf(int i, int j) {
+        if (bad || i < 0 || j < 0 || i > n || j > n) { return -1; }
+        if (i == n || j == n) { return 0; }
+        if (i == j) { return n - i; }
+        if (rmq == null) {
+            rmq = newInts(2 * n + 2);
+            if (rmq == null) { return -1; }
+            for (int k = 0; k < n; k++) { rmq[n + k] = lcpa[k]; }
+            for (int k = n - 1; k >= 1; k--) { rmq[k] = imin(rmq[2 * k], rmq[2 * k + 1]); }
+        }
+        int a = rnk[i];
+        int b = rnk[j];
+        if (a > b) { int t = a; a = b; b = t; }
+        // minimum of lcpa[a + 1 .. b]
+        int l = a + 1 + n;
+        int r = b + 1 + n;
+        int best = 0x7FFFFFFFFFFFFFFF;
+        while (l < r) {
+            if ((l & 1) != 0) { best = imin(best, rmq[l]); l++; }
+            if ((r & 1) != 0) { r--; best = imin(best, rmq[r]); }
+            l = l / 2;
+            r = r / 2;
+        }
+        return best;
+    }
+
+    // the longest substring that occurs at least twice (overlapping allowed): returns its length, *pos gets one start (may be null)
+    public int longestRepeat(int* pos) {
+        int best = 0;
+        int at = 0;
+        for (int i = 1; i < n; i++) {
+            if (lcpa[i] > best) { best = lcpa[i]; at = sa[i]; }
+        }
+        if (pos != null) { *pos = (best > 0) ? at : -1; }
+        return best;
+    }
+
+    // number of different non-empty substrings: n (n + 1) / 2 - sum of the lcp values
+    public int distinctSubstrings() {
+        int total = n * (n + 1) / 2;
+        for (int i = 1; i < n; i++) { total = total - lcpa[i]; }
+        return total;
+    }
+
+    public void dispose() {
+        freeMem(txt); freeMem(sa); freeMem(rnk); freeMem(lcpa); freeMem(rmq);
+        txt = null; sa = null; rnk = null; lcpa = null; rmq = null;
+        n = 0;
+        bad = false;
+    }
+}
+
+// The longest substring that both texts contain, in O(na + nb) time: returns its length and the start in a and in b (-1 and -1 when 0).
+// With utf8 the match is a whole number of code points (the lengths and starts are still in bytes).
+public int longestCommonSubstring(char* a, int na, char* b, int nb, int* startA = null, int* startB = null, bool utf8 = false) {
+    na = lenOf(a, na);
+    nb = lenOf(b, nb);
+    if (startA != null) { *startA = -1; }
+    if (startB != null) { *startB = -1; }
+    if (na == 0 || nb == 0) { return 0; }
+    int* sym = newInts(na + nb + 2);
+    int* offs = newInts(na + nb + 4);
+    if (sym == null || offs == null) { freeMem(sym); freeMem(offs); return -1; }
+    int sa1 = symbols(a, na, sym, offs, utf8);                       // symbol k starts at byte offs[k]
+    int* symB = &sym[sa1 + 1];
+    int* offB = &offs[sa1 + 1];
+    int sb1 = symbols(b, nb, symB, offB, utf8);
+    int total = sa1 + 1 + sb1;
+    int upper = 256;
+    if (utf8) {
+        // compress the alphabet: the separator becomes 0, the others their rank among the distinct symbols + 1
+        int* sorted = newInts(total + 1);
+        if (sorted == null) { freeMem(sym); freeMem(offs); return -1; }
+        int cnt = 0;
+        for (int i = 0; i < sa1; i++) { sorted[cnt] = sym[i]; cnt++; }
+        for (int i = 0; i < sb1; i++) { sorted[cnt] = symB[i]; cnt++; }
+        algo.sortBy(sorted, cnt, ds.cmpAsc);
+        cnt = algo.unique(sorted, cnt);
+        for (int i = 0; i < sa1; i++) { sym[i] = algo.lowerBound(sorted, cnt, sym[i]) + 1; }
+        for (int i = 0; i < sb1; i++) { symB[i] = algo.lowerBound(sorted, cnt, symB[i]) + 1; }
+        upper = cnt + 1;
+        freeMem(sorted);
+    } else {
+        for (int i = 0; i < sa1; i++) { sym[i] = sym[i] + 1; }
+        for (int i = 0; i < sb1; i++) { symB[i] = symB[i] + 1; }
+    }
+    sym[sa1] = 0;                                                    // the separator: smaller than everything, occurs once
+    int* sarr = suffixArrayOf(sym, total, upper);
+    int* rnk = newInts(total + 1);
+    int* lcpa = newInts(total + 1);
+    if (sarr == null || rnk == null || lcpa == null) {
+        freeMem(sym); freeMem(offs); freeMem(sarr); freeMem(rnk); freeMem(lcpa);
+        return -1;
+    }
+    lcpOfArray(sym, total, sarr, rnk, lcpa);
+    int bestLen = 0;      // in symbols
+    int bestA = -1;
+    int bestB = -1;
+    for (int i = 1; i < total; i++) {
+        int p = sarr[i - 1];
+        int q = sarr[i];
+        bool pa = p < sa1;
+        bool qa = q < sa1;
+        if (pa == qa || p == sa1 || q == sa1) { continue; }       // both in the same text, or one is the separator
+        if (lcpa[i] > bestLen) {
+            bestLen = lcpa[i];
+            if (pa) { bestA = p; bestB = q - sa1 - 1; } else { bestA = q; bestB = p - sa1 - 1; }
+        }
+    }
+    int byteLen = 0;
+    if (bestLen > 0) {
+        byteLen = offs[bestA + bestLen] - offs[bestA];
+        if (startA != null) { *startA = offs[bestA]; }
+        if (startB != null) { *startB = offB[bestB]; }
+    }
+    freeMem(sym); freeMem(offs); freeMem(sarr); freeMem(rnk); freeMem(lcpa);
+    return byteLen;
+}
+
+// ---- palindromes (Manacher) ----------------------------------------------------------------------------------------------------------------
+// d1[i] = number of odd palindromes centred at i (the longest has length 2 * d1[i] - 1); d2[i] = number of even palindromes centred between i - 1 and i
+// (the longest has length 2 * d2[i]). Both arrays have room for n ints. O(n).
+private void manacherCore(int* s, int n, int* d1, int* d2) {
+    int l = 0;
+    int r = -1;
+    for (int i = 0; i < n; i++) {
+        int k = (i > r) ? 1 : imin(d1[l + r - i], r - i + 1);
+        while (i - k >= 0 && i + k < n && s[i - k] == s[i + k]) { k++; }
+        d1[i] = k;
+        if (i + k - 1 > r) { l = i - k + 1; r = i + k - 1; }
+    }
+    l = 0;
+    r = -1;
+    for (int i = 0; i < n; i++) {
+        int k = (i > r) ? 0 : imin(d2[l + r - i + 1], r - i + 1);
+        while (i - k - 1 >= 0 && i + k < n && s[i - k - 1] == s[i + k]) { k++; }
+        d2[i] = k;
+        if (i + k - 1 > r) { l = i - k; r = i + k - 1; }
+    }
+}
+
+// the palindrome radii of s (see above), false when memory ran out
+public bool manacher(char* s, int n, int* d1, int* d2) {
+    n = lenOf(s, n);
+    int* sym = newInts(n + 1);
+    if (sym == null) { return false; }
+    for (int i = 0; i < n; i++) { sym[i] = s[i]; }
+    manacherCore(sym, n, d1, d2);
+    freeMem(sym);
+    return true;
+}
+
+// the longest palindromic substring (the leftmost one when there are several): returns its length in bytes, *start gets where it begins; with utf8
+// it is a palindrome of code points. -1 when memory ran out.
+public int longestPalindrome(char* s, int n, int* start = null, bool utf8 = false) {
+    n = lenOf(s, n);
+    int* sym = newInts(n + 1);
+    int* offs = newInts(n + 2);
+    int* d1 = newInts(n + 1);
+    int* d2 = newInts(n + 1);
+    if (sym == null || offs == null || d1 == null || d2 == null) {
+        freeMem(sym); freeMem(offs); freeMem(d1); freeMem(d2);
+        return -1;
+    }
+    int k = symbols(s, n, sym, offs, utf8);
+    manacherCore(sym, k, d1, d2);
+    int bestLen = 0;
+    int bestStart = 0;
+    for (int i = 0; i < k; i++) {
+        int len = 2 * d1[i] - 1;
+        int st = i - d1[i] + 1;
+        if (len > bestLen) { bestLen = len; bestStart = st; }
+        int len2 = 2 * d2[i];
+        int st2 = i - d2[i];
+        if (len2 > bestLen) { bestLen = len2; bestStart = st2; }
+    }
+    int byteLen = 0;
+    if (bestLen > 0) {
+        byteLen = offs[bestStart + bestLen] - offs[bestStart];
+        if (start != null) { *start = offs[bestStart]; }
+    } else if (start != null) {
+        *start = 0;
+    }
+    freeMem(sym); freeMem(offs); freeMem(d1); freeMem(d2);
+    return byteLen;
+}
+
+// how many palindromic substrings (different positions count separately; every single symbol is one)
+public int countPalindromes(char* s, int n, bool utf8 = false) {
+    n = lenOf(s, n);
+    int* sym = newInts(n + 1);
+    int* d1 = newInts(n + 1);
+    int* d2 = newInts(n + 1);
+    if (sym == null || d1 == null || d2 == null) { freeMem(sym); freeMem(d1); freeMem(d2); return -1; }
+    int k = symbols(s, n, sym, null, utf8);
+    manacherCore(sym, k, d1, d2);
+    int total = 0;
+    for (int i = 0; i < k; i++) { total = total + d1[i] + d2[i]; }
+    freeMem(sym); freeMem(d1); freeMem(d2);
+    return total;
+}
+
+public bool isPalindrome(char* s, int n, bool utf8 = false) {
+    n = lenOf(s, n);
+    if (!utf8) {
+        for (int i = 0; i < n / 2; i++) { if (s[i] != s[n - 1 - i]) { return false; } }
+        return true;
+    }
+    int* sym = newInts(n + 1);
+    if (sym == null) { return false; }
+    int k = symbols(s, n, sym, null, true);
+    bool r = true;
+    for (int i = 0; i < k / 2; i++) { if (sym[i] != sym[k - 1 - i]) { r = false; break; } }
+    freeMem(sym);
+    return r;
+}
+
+// ---- lines of a text ---------------------------------------------------------------------------------------------------------------------
+// Splits text[0..n) at '\n' into lines. Returns an array of *count line pointers (each line is a 0 terminated string without its '\n'; with stripCr
+// a '\r' in front of the '\n' is removed too). *noEol becomes true when the last line had no newline at the end (may be null). The array and
+// the copy of the text are ONE block: free it with freeText((char*) lines). Returns null when memory ran out.
+public char** splitLines(char* text, int n, int* count, bool* noEol = null, bool stripCr = false) {
+    n = lenOf(text, n);
+    int lines = 0;
+    for (int i = 0; i < n; i++) { if (text[i] == '\n') { lines++; } }
+    bool partial = (n > 0 && text[n - 1] != '\n');
+    if (partial) { lines++; }
+    if (n > MAXN) { return null; }
+    char* block = newBytes((lines + 1) * 8 + n + 1);
+    if (block == null) { return null; }
+    char** ptrs = (char**) block;
+    char* copy = &block[(lines + 1) * 8];
+    if (n > 0) { memcpy(copy, text, n); }
+    int k = 0;
+    int start = 0;
+    for (int i = 0; i < n; i++) {
+        if (copy[i] == '\n') {
+            ptrs[k] = &copy[start];
+            if (stripCr && i > start && copy[i - 1] == '\r') { copy[i - 1] = 0; }
+            copy[i] = 0;
+            k++;
+            start = i + 1;
+        }
+    }
+    if (partial) {
+        ptrs[k] = &copy[start];
+        if (stripCr && n > start && copy[n - 1] == '\r') { copy[n - 1] = 0; }
+        k++;
+    }
+    ptrs[k] = null;
+    *count = k;
+    if (noEol != null) { *noEol = partial; }
+    return ptrs;
+}
+
+// ---- a growing text buffer ---------------------------------------------------------------------------------------------------------------
+private class Out {
+    public char* p;
+    public int len;
+    public int cap;
+    public bool bad;
+
+    public void add(char* s, int n) {
+        if (bad || n <= 0) { return; }
+        if (len + n + 1 > cap) {
+            int ncap = (cap == 0) ? 256 : cap;
+            while (ncap < len + n + 1) { ncap = ncap * 2; }
+            char* np = asys.realloc(p, ncap);
+            if (np == null) { bad = true; return; }
+            p = np;
+            cap = ncap;
+        }
+        memcpy(&p[len], s, n);
+        len = len + n;
+        p[len] = 0;
+    }
+
+    public void str(char* s) { add(s, strlen(s)); }
+
+    public void ch(int c) {
+        char b[2];
+        b[0] = c;
+        add(&b[0], 1);
+    }
+
+    public void num(int v) {
+        char b[24];
+        int k = 23;
+        b[k] = 0;
+        bool neg = v < 0;
+        uint64 u = neg ? (uint64) (0 - v) : (uint64) v;
+        if (u == 0) { k--; b[k] = '0'; }
+        while (u > 0) { k--; b[k] = '0' + (u % 10); u = u / 10; }
+        if (neg) { k--; b[k] = '-'; }
+        add(&b[k], 23 - k);
+    }
+
+    // the finished text (never null for success: an empty text is ""); the buffer is handed over
+    public char* take() {
+        if (bad) { freeMem(p); p = null; len = 0; cap = 0; bad = false; return null; }
+        if (p == null) { p = newBytes(1); }
+        char* r = p;
+        p = null; len = 0; cap = 0;
+        return r;
+    }
+}
+
+// ---- diff of two line arrays (Myers) -------------------------------------------------------------------------------------------------
+// Lines are first replaced by small integers (equal lines get equal numbers), so the comparisons inside are integer compares. Then the common
+// beginning and end are cut off and Myers' O(ND) algorithm runs in its linear space form (middle snake + divide and conquer).
+// The result is flagged lines: delA[i] = 1 for lines of a that are deleted, insB[j] = 1 for lines of b that are inserted.
+private const DIFF_EQ = 0;
+private const DIFF_DEL = 1;
+private const DIFF_INS = 2;
+
+// the middle snake of A[a0 .. a0 + N) against B[b0 .. b0 + M); vf / vb are arrays of 2 * limit + 4 ints. Returns the length D of a shortest edit script
+// and fills snake[0..3] = x, y, u, v (relative to a0, b0). When D is larger than 2 * limit it returns -1 and snake[0..1] is the furthest point that
+// was reached (a good place to cut the problem in two, but not on a shortest script); snake[4] always counts the steps that were made.
+private int midSnake(int* A, int a0, int N, int* B, int b0, int M, int* vf, int* vb, int limit, int* snake) {
+    int delta = N - M;
+    bool odd = (delta & 1) != 0;
+    int maxD = (N + M + 1) / 2;
+    if (maxD > limit) { maxD = limit; }
+    int* f = &vf[limit + 1];                      // f[k] / r[k] for k = -limit - 1 .. limit + 1
+    int* r = &vb[limit + 1];
+    int* pa = &A[a0];
+    int* pb = &B[b0];
+    int steps = 0;
+    int bestProgress = -1;
+    int bestX = 0;
+    int bestY = 0;
+    f[1] = 0;
+    r[1] = 0;
+    for (int d = 0; d <= maxD; d++) {
+        for (int k = -d; k <= d; k = k + 2) {
+            int x;
+            if (k == -d || (k != d && f[k - 1] < f[k + 1])) { x = f[k + 1]; }
+            else { x = f[k - 1] + 1; }
+            int y = x - k;
+            int xs = x;
+            int ys = y;
+            while (x < N && y < M && pa[x] == pb[y]) { x++; y++; }
+            steps = steps + 1 + x - xs;
+            f[k] = x;
+            if (odd) {
+                int kb = delta - k;
+                if (kb >= 1 - d && kb <= d - 1 && x + r[kb] >= N) {
+                    snake[0] = xs; snake[1] = ys; snake[2] = x; snake[3] = y; snake[4] = steps;
+                    return 2 * d - 1;
+                }
+            }
+            if (x <= N && y <= M && x + y > bestProgress) { bestProgress = x + y; bestX = x; bestY = y; }
+        }
+        for (int k = -d; k <= d; k = k + 2) {
+            int x;
+            if (k == -d || (k != d && r[k - 1] < r[k + 1])) { x = r[k + 1]; }
+            else { x = r[k - 1] + 1; }
+            int y = x - k;
+            int xs = x;
+            int ys = y;
+            while (x < N && y < M && pa[N - 1 - x] == pb[M - 1 - y]) { x++; y++; }
+            steps = steps + 1 + x - xs;
+            r[k] = x;
+            if (!odd) {
+                int kf = delta - k;
+                if (kf >= -d && kf <= d && x + f[kf] >= N) {
+                    snake[0] = N - x; snake[1] = M - y; snake[2] = N - xs; snake[3] = M - ys; snake[4] = steps;
+                    return 2 * d;
+                }
+            }
+            if (x <= N && y <= M && x + y > bestProgress) { bestProgress = x + y; bestX = N - x; bestY = M - y; }
+        }
+    }
+    snake[0] = bestX; snake[1] = bestY; snake[4] = steps;
+    return -1;
+}
+
+// state shared by the recursion
+private struct DiffState {
+    int* A;
+    int* B;
+    char* delA;
+    char* insB;
+    int* vf;
+    int* vb;
+    int limit;
+    int work;                                    // steps still allowed
+    bool exact;
+}
+
+private void diffRec(DiffState* st, int a0, int N, int b0, int M) {
+    int* A = st->A;
+    int* B = st->B;
+    while (N > 0 && M > 0 && A[a0] == B[b0]) { a0++; b0++; N--; M--; }
+    while (N > 0 && M > 0 && A[a0 + N - 1] == B[b0 + M - 1]) { N--; M--; }
+    if (N == 0) { for (int j = 0; j < M; j++) { st->insB[b0 + j] = 1; } return; }
+    if (M == 0) { for (int i = 0; i < N; i++) { st->delA[a0 + i] = 1; } return; }
+    int snake[5];
+    int d = -1;
+    if (st->work > 0) {
+        d = midSnake(A, a0, N, B, b0, M, st->vf, st->vb, st->limit, &snake[0]);
+        st->work = st->work - snake[4];
+    }
+    if (d < 0) {                                  // too expensive: cut at the furthest point that was reached, or give up on this part
+        st->exact = false;
+        if (st->work > 0 && snake[0] + snake[1] > 0 && snake[0] + snake[1] < N + M) {
+            int px = snake[0];
+            int py = snake[1];
+            diffRec(st, a0, px, b0, py);
+            diffRec(st, a0 + px, N - px, b0 + py, M - py);
+            return;
+        }
+        for (int i = 0; i < N; i++) { st->delA[a0 + i] = 1; }
+        for (int j = 0; j < M; j++) { st->insB[b0 + j] = 1; }
+        return;
+    }
+    diffRec(st, a0, snake[0], b0, snake[1]);
+    diffRec(st, a0 + snake[2], N - snake[2], b0 + snake[3], M - snake[3]);
+}
+
+public class LineDiff {
+    private char** a;                       // the line arrays of the last run (not copied: they must stay valid for unified())
+    private char** b;
+    private int na;
+    private int nb;
+    private bool noEolA;
+    private bool noEolB;
+    private int* ops;                       // 4 ints per run: kind, start in a, start in b, length
+    private int nops;
+    private int dist;
+    private bool isExact;
+    private char* ownA;                     // blocks of runText
+    private char* ownB;
+
+    // number of runs of the edit script (equal, deleted and inserted runs alternate; deletions come before insertions)
+    public int opCount() { return nops; }
+    // DIFF kind of run i: LineDiff.EQUAL (0), DELETE (1) or INSERT (2)
+    public int opKind(int i) { return (i < 0 || i >= nops) ? -1 : ops[4 * i]; }
+    public int opA(int i) { return (i < 0 || i >= nops) ? -1 : ops[4 * i + 1]; }
+    public int opB(int i) { return (i < 0 || i >= nops) ? -1 : ops[4 * i + 2]; }
+    public int opLen(int i) { return (i < 0 || i >= nops) ? -1 : ops[4 * i + 3]; }
+    // number of deleted plus inserted lines
+    public int distance() { return dist; }
+    // false when the cost limit was hit somewhere: the script is correct but not shortest
+    public bool exact() { return isExact; }
+
+    private bool addOp(int kind, int sa, int sb, int len, int* cap) {
+        if (nops == *cap) {
+            int ncap = (*cap == 0) ? 64 : *cap * 2;
+            int* nn = (int*) asys.realloc((char*) ops, ncap * 4 * 8);
+            if (nn == null) { return false; }
+            ops = nn;
+            *cap = ncap;
+        }
+        ops[4 * nops] = kind;
+        ops[4 * nops + 1] = sa;
+        ops[4 * nops + 2] = sb;
+        ops[4 * nops + 3] = len;
+        nops++;
+        return true;
+    }
+
+    // Compares line arrays la[0..lna) and lb[0..lnb) (0 terminated strings; they must stay valid while this object is used). maxCost limits the
+    // work: a sub-problem whose edit distance is above about maxCost is replaced by "delete everything, insert everything" and exact() becomes
+    // false; -1 = no limit, the default 8000 keeps the time bounded to about a second for completely different files. eolMissingA / eolMissingB: the last line of
+    // that array had no newline (splitLines tells), so that diff output can show it as diff -u does.
+    // Returns false when memory ran out (the object is empty then).
+    public bool run(char** la, int lna, char** lb, int lnb, int maxCost = 8000, bool eolMissingA = false, bool eolMissingB = false) {
+        clear();
+        a = la; b = lb; na = lna; nb = lnb;
+        noEolA = eolMissingA;
+        noEolB = eolMissingB;
+        isExact = true;
+        if (na < 0 || nb < 0 || na > 0x10000000 || nb > 0x10000000) { return false; }
+        int total = na + nb;
+        // 1. integer ids for the lines
+        int* ids = newInts(total + 1);
+        int* hashes = newInts(total + 1);
+        int slots = 16;
+        while (slots < 2 * total) { slots = slots * 2; }
+        int* table = newInts(slots);
+        char* flags = newBytes(total + 2);
+        if (ids == null || hashes == null || table == null || flags == null) {
+            freeMem(ids); freeMem(hashes); freeMem(table); freeMem(flags);
+            return false;
+        }
+        for (int c = 0; c < total; c++) {
+            char* line = (c < na) ? a[c] : b[c - na];
+            int h = ds.hashText(line);
+            hashes[c] = h;
+            int s = h & (slots - 1);
+            for (;;) {
+                int e = table[s];
+                if (e == 0) { table[s] = c + 1; ids[c] = c; break; }
+                int o = e - 1;
+                char* other = (o < na) ? a[o] : b[o - na];
+                if (hashes[o] == h && strcmp(other, line) == 0) { ids[c] = ids[o]; break; }
+                s = (s + 1) & (slots - 1);
+            }
+        }
+        freeMem(table);
+        freeMem(hashes);
+        int* A = ids;
+        int* B = &ids[na];
+        // a last line without newline differs from the same line with one (it can only equal the last line of the other file when that has no newline either)
+        if (noEolA && na > 0) { A[na - 1] = total + 7; }
+        if (noEolB && nb > 0) {
+            if (noEolA && na > 0 && ids[na - 1] == total + 7 && strcmp(a[na - 1], b[nb - 1]) == 0) { B[nb - 1] = total + 7; }
+            else { B[nb - 1] = total + 8; }
+        }
+        char* delA = flags;
+        char* insB = &flags[na + 1];
+        // 2. the shortest edit script
+        int N = na;
+        int M = nb;
+        int lo = 0;
+        while (lo < N && lo < M && A[lo] == B[lo]) { lo++; }
+        int hiA = N;
+        int hiB = M;
+        while (hiA > lo && hiB > lo && A[hiA - 1] == B[hiB - 1]) { hiA--; hiB--; }
+        int mn = hiA - lo;
+        int mm = hiB - lo;
+        if (mn > 0 && mm > 0) {
+            // lines that occur in only one of the two arrays cannot be part of a common subsequence: they are changed for sure, and
+            // leaving them out of the search makes it much cheaper (the result stays a shortest script)
+            char* seenA = newBytes(total + 16);                  // ids go up to total + 8 (the two special last lines)
+            char* seenB = newBytes(total + 16);
+            int* ra = newInts(mn + 1);
+            int* rb = newInts(mm + 1);
+            int* mapA = newInts(mn + 1);
+            int* mapB = newInts(mm + 1);
+            char* rflags = newBytes(mn + mm + 2);
+            if (seenA == null || seenB == null || ra == null || rb == null || mapA == null || mapB == null || rflags == null) {
+                freeMem(seenA); freeMem(seenB); freeMem(ra); freeMem(rb); freeMem(mapA); freeMem(mapB); freeMem(rflags);
+                freeMem(ids); freeMem(flags);
+                return false;
+            }
+            for (int i = lo; i < hiA; i++) { seenA[A[i]] = 1; }
+            for (int j = lo; j < hiB; j++) { seenB[B[j]] = 1; }
+            int cntA = 0;
+            int cntB = 0;
+            for (int i = lo; i < hiA; i++) {
+                if (seenB[A[i]] != 0) { ra[cntA] = A[i]; mapA[cntA] = i; cntA++; } else { delA[i] = 1; }
+            }
+            for (int j = lo; j < hiB; j++) {
+                if (seenA[B[j]] != 0) { rb[cntB] = B[j]; mapB[cntB] = j; cntB++; } else { insB[j] = 1; }
+            }
+            freeMem(seenA);
+            freeMem(seenB);
+            bool memOk = true;
+            if (cntA > 0 && cntB > 0) {
+                int limit = (cntA + cntB + 1) / 2;
+                if (maxCost >= 0 && (maxCost + 1) / 2 < limit) { limit = (maxCost + 1) / 2; }
+                int* vf = newInts(2 * limit + 4);
+                int* vb = newInts(2 * limit + 4);
+                if (vf == null || vb == null) {
+                    freeMem(vf); freeMem(vb);
+                    memOk = false;
+                } else {
+                    DiffState st;
+                    st.A = ra; st.B = rb; st.delA = rflags; st.insB = &rflags[cntA + 1]; st.vf = vf; st.vb = vb; st.limit = limit; st.exact = true;
+                    st.work = (maxCost >= 0) ? 8 * (limit + 1) * (limit + 1) + 1000000 : 0x7FFFFFFFFFFFFF;
+                    diffRec(&st, 0, cntA, 0, cntB);
+                    isExact = st.exact;
+                    for (int i = 0; i < cntA; i++) { if (rflags[i] != 0) { delA[mapA[i]] = 1; } }
+                    for (int j = 0; j < cntB; j++) { if (rflags[cntA + 1 + j] != 0) { insB[mapB[j]] = 1; } }
+                    freeMem(vf);
+                    freeMem(vb);
+                }
+            } else {
+                for (int i = 0; i < cntA; i++) { delA[mapA[i]] = 1; }
+                for (int j = 0; j < cntB; j++) { insB[mapB[j]] = 1; }
+            }
+            freeMem(ra); freeMem(rb); freeMem(mapA); freeMem(mapB); freeMem(rflags);
+            if (!memOk) { freeMem(ids); freeMem(flags); return false; }
+        } else {
+            for (int i = lo; i < hiA; i++) { delA[i] = 1; }
+            for (int j = lo; j < hiB; j++) { insB[j] = 1; }
+        }
+        // 3. the runs
+        int cap = 0;
+        int i = 0;
+        int j = 0;
+        bool ok = true;
+        while (ok && (i < na || j < nb)) {
+            if (i < na && delA[i] != 0) {
+                int s = i;
+                while (i < na && delA[i] != 0) { i++; }
+                dist = dist + (i - s);
+                ok = addOp(DIFF_DEL, s, j, i - s, &cap);
+            } else if (j < nb && insB[j] != 0) {
+                int s = j;
+                while (j < nb && insB[j] != 0) { j++; }
+                dist = dist + (j - s);
+                ok = addOp(DIFF_INS, i, s, j - s, &cap);
+            } else {
+                int s = i;
+                while (i < na && j < nb && delA[i] == 0 && insB[j] == 0) { i++; j++; }
+                if (i == s) { ok = false; break; }              // cannot happen for a consistent script
+                ok = addOp(DIFF_EQ, s, j - (i - s), i - s, &cap);
+            }
+        }
+        freeMem(ids);
+        freeMem(flags);
+        if (!ok) { clear(); return false; }
+        return true;
+    }
+
+    // Compares two texts (split into lines for you; the copies live until dispose()). Returns false when memory ran out.
+    public bool runText(char* ta, char* tb, int maxCost = 8000, bool stripCr = false) {
+        int ca = 0; int cb = 0;
+        bool ea = false; bool eb = false;
+        char** la = splitLines(ta, -1, &ca, &ea, stripCr);
+        char** lb = splitLines(tb, -1, &cb, &eb, stripCr);
+        if (la == null || lb == null) { freeMem(la); freeMem(lb); return false; }
+        bool ok = run(la, ca, lb, cb, maxCost, ea, eb);
+        // run() cleared the old own blocks: keep the new ones
+        ownA = (char*) la;
+        ownB = (char*) lb;
+        if (!ok) { freeMem(ownA); freeMem(ownB); ownA = null; ownB = null; }
+        return ok;
+    }
+
+    // the number of lines of b / a that the last run saw
+    public int linesA() { return na; }
+    public int linesB() { return nb; }
+
+    // Unified diff text ("--- nameA", "+++ nameB", then hunks "@@ -a,b +c,d @@" with context lines around every change), like diff -u without timestamps.
+    // "" when the files are equal. Free the result with freeText. null when memory ran out. With noEol the marker "\ No newline at end of file" is written as diff does.
+    public char* unified(char* nameA, char* nameB, int context = 3) {
+        Out o;
+        if (context < 0) { context = 0; }
+        bool header = false;
+        int r = 0;
+        while (r < nops) {
+            // a change block: the runs from r up to the next equal run
+            if (ops[4 * r] == DIFF_EQ) { r++; continue; }
+            // collect the hunk: blocks whose gaps are at most 2 * context
+            int firstBlock = r;
+            int lastBlock = r;
+            int q = r;
+            for (;;) {
+                // end of this block
+                while (q < nops && ops[4 * q] != DIFF_EQ) { q++; }
+                lastBlock = q;                                // exclusive end of the block
+                if (q >= nops) { break; }
+                int gap = ops[4 * q + 3];
+                if (q + 1 < nops && gap <= 2 * context) { q++; continue; }
+                break;
+            }
+            // lines of the hunk
+            int aFirst = ops[4 * firstBlock + 1];
+            int bFirst = ops[4 * firstBlock + 2];
+            int lead = (firstBlock > 0) ? imin(context, ops[4 * (firstBlock - 1) + 3]) : 0;
+            int aStart = aFirst - lead;
+            int bStart = bFirst - lead;
+            int aEnd = aFirst;
+            int bEnd = bFirst;
+            for (int t = firstBlock; t < lastBlock; t++) {
+                int kind = ops[4 * t];
+                int len = ops[4 * t + 3];
+                if (kind == DIFF_EQ) { aEnd = aEnd + len; bEnd = bEnd + len; }
+                else if (kind == DIFF_DEL) { aEnd = aEnd + len; }
+                else { bEnd = bEnd + len; }
+            }
+            int trail = 0;
+            if (lastBlock < nops) { trail = imin(context, ops[4 * lastBlock + 3]); }
+            aEnd = aEnd + trail;
+            bEnd = bEnd + trail;
+            if (!header) {
+                o.str("--- "); o.str(nameA); o.ch('\n');
+                o.str("+++ "); o.str(nameB); o.ch('\n');
+                header = true;
+            }
+            o.str("@@ -"); range(&o, aStart, aEnd - aStart);
+            o.str(" +"); range(&o, bStart, bEnd - bStart);
+            o.str(" @@\n");
+            int pa = aStart;
+            int pb = bStart;
+            for (int z = 0; z < lead; z++) { emit(&o, ' ', a[pa], pa, na, noEolA); pa++; pb++; }
+            for (int t = firstBlock; t < lastBlock; t++) {
+                int kind = ops[4 * t];
+                int len = ops[4 * t + 3];
+                if (kind == DIFF_EQ) {
+                    for (int z = 0; z < len; z++) { emit(&o, ' ', a[pa], pa, na, noEolA); pa++; pb++; }
+                } else if (kind == DIFF_DEL) {
+                    for (int z = 0; z < len; z++) { emit(&o, '-', a[pa], pa, na, noEolA); pa++; }
+                } else {
+                    for (int z = 0; z < len; z++) { emit(&o, '+', b[pb], pb, nb, noEolB); pb++; }
+                }
+            }
+            for (int z = 0; z < trail; z++) { emit(&o, ' ', a[pa], pa, na, noEolA); pa++; pb++; }
+            r = lastBlock;
+        }
+        return o.take();
+    }
+
+    private void range(Out* o, int start, int len) {
+        // "start,len" with start 1-based; a single line is just "start"; an empty range names the line before
+        if (len == 1) { o->num(start + 1); return; }
+        if (len == 0) { o->num(start); o->str(",0"); return; }
+        o->num(start + 1); o->ch(','); o->num(len);
+    }
+
+    private void emit(Out* o, int mark, char* line, int idx, int count, bool noEol) {
+        o->ch(mark);
+        o->str(line);
+        o->ch('\n');
+        if (noEol && idx == count - 1) { o->str("\\ No newline at end of file\n"); }
+    }
+
+    private void clear() {
+        freeMem(ops);
+        freeMem(ownA);
+        freeMem(ownB);
+        ops = null; ownA = null; ownB = null;
+        nops = 0; dist = 0; na = 0; nb = 0; a = null; b = null;
+        isExact = true;
+    }
+
+    public void dispose() {
+        clear();
+    }
+}
+
+// ---- fuzzy matching (quick open) ------------------------------------------------------------------------------------------------------
+public const FUZZY_SMART = 0;                  // case sensitive only when the pattern has an upper case letter
+public const FUZZY_IGNORE_CASE = 1;
+public const FUZZY_CASE = 2;                   // always case sensitive
+public const FUZZY_UTF8 = 4;                   // symbols are UTF-8 code points (positions are still byte offsets)
+
+private const FZ_MATCH = 16;
+private const FZ_GAP_START = -3;
+private const FZ_GAP_EXT = -1;
+private const FZ_BOUNDARY = 8;
+private const FZ_WHITE = 10;
+private const FZ_DELIM = 9;
+private const FZ_CAMEL = 7;
+private const FZ_CONSEC = 4;
+private const FZ_NEG = -0x100000000000;
+private const FZ_MAXCAND = 1024;               // longer candidates are scored greedily
+private const FZ_MAXPAT = 64;
+
+private bool isUpperSym(int c) {
+    if (c >= 'A' && c <= 'Z') { return true; }
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) { return true; }
+    if (c >= 0x391 && c <= 0x3A9) { return true; }
+    if (c >= 0x400 && c <= 0x42F) { return true; }
+    return false;
+}
+
+private bool isLowerSym(int c) {
+    if (c >= 'a' && c <= 'z') { return true; }
+    if (c >= 0xDF && c <= 0xFF && c != 0xF7) { return true; }
+    if (c >= 0x3B1 && c <= 0x3C9) { return true; }
+    if (c >= 0x430 && c <= 0x45F) { return true; }
+    return false;
+}
+
+private bool isDigitSym(int c) { return c >= '0' && c <= '9'; }
+
+// a symbol that is part of a word: letters, digits, "_" is NOT (it separates words) and everything outside ASCII except the Latin-1 punctuation
+private bool isWordSym(int c) {
+    if (c >= 0x80) { return !(c >= 0x80 && c < 0xC0) && c < 0x110000; }
+    return isDigitSym(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+// simple case folding: ASCII, Latin-1, Greek and Cyrillic capitals
+private int foldSym(int c) {
+    if (c < 0x80) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+    if (c >= 0xC0 && c <= 0xDE && c != 0xD7) { return c + 32; }
+    if (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) { return c + 32; }
+    if (c >= 0x410 && c <= 0x42F) { return c + 32; }
+    if (c >= 0x400 && c <= 0x40F) { return c + 80; }
+    return c;
+}
+
+// the bonus for a match at position j of the candidate symbols
+private int bonusAt(int* cand, int j) {
+    if (j == 0) { return FZ_BOUNDARY; }
+    int p = cand[j - 1];
+    int c = cand[j];
+    if (!isWordSym(p)) {
+        if (p == ' ' || p == '\t') { return FZ_WHITE; }
+        if (p == '/' || p == '\\') { return FZ_DELIM; }
+        return FZ_BOUNDARY;
+    }
+    if (isLowerSym(p) && isUpperSym(c)) { return FZ_CAMEL; }
+    if (!isDigitSym(p) && isDigitSym(c)) { return FZ_CAMEL; }
+    return 0;
+}
+
+public class FuzzyMatcher {
+    private int* pat;                       // the pattern symbols (folded unless case sensitive)
+    private int m;
+    private bool cs;                        // case sensitive
+    private bool u8;
+    private int* cand;                      // scratch: candidate symbols (raw), folded copy, byte offsets
+    private int* candF;
+    private int* offs;
+    private int* dTab;                      // m * n scores and previous positions
+    private int* pTab;
+    private int* cTab;                      // the bonus of the first symbol of the run of consecutive matches that ends in the cell
+    private int* gRow;
+    private int* gSrc;
+    private int scratchN;                   // the candidate length the scratch holds
+    private int scratchM;
+    private bool bad;
+
+    public FuzzyMatcher(char* pattern, int flags = 0) {
+        int len = (pattern == null) ? 0 : strlen(pattern);
+        u8 = (flags & FUZZY_UTF8) != 0;
+        int* tmp = newInts(len + 1);
+        if (tmp == null) { bad = true; return; }
+        m = symbols(pattern, len, tmp, null, u8);
+        bool upper = false;
+        for (int i = 0; i < m; i++) { if (isUpperSym(tmp[i])) { upper = true; } }
+        if ((flags & 3) == FUZZY_CASE) { cs = true; }
+        else if ((flags & 3) == FUZZY_IGNORE_CASE) { cs = false; }
+        else { cs = upper; }
+        if (!cs) { for (int i = 0; i < m; i++) { tmp[i] = foldSym(tmp[i]); } }
+        pat = tmp;
+    }
+
+    public int length() { return m; }
+    public bool ok() { return !bad; }
+
+    // makes room for a candidate of n symbols; false when memory ran out
+    private bool prepare(int n) {
+        if (cand != null && n <= scratchN) { return true; }
+        int cap = imax(imax(n, 64), 2 * scratchN);
+        freeMem(cand); freeMem(candF); freeMem(offs);
+        cand = newInts(cap + 1);
+        candF = newInts(cap + 1);
+        offs = newInts(cap + 2);
+        if (cand == null || candF == null || offs == null) {
+            freeMem(cand); freeMem(candF); freeMem(offs);
+            cand = null; candF = null; offs = null; scratchN = 0;
+            return false;
+        }
+        scratchN = cap;
+        return true;
+    }
+
+    private bool prepareTables(int n) {
+        int nn = imin(n, FZ_MAXCAND);
+        if (dTab != null && nn <= scratchM) { return true; }
+        int cap = 64;
+        while (cap < nn) { cap = cap * 2; }
+        freeMem(dTab); freeMem(pTab); freeMem(cTab); freeMem(gRow); freeMem(gSrc);
+        dTab = newInts(imin(m, FZ_MAXPAT) * cap);
+        pTab = newInts(imin(m, FZ_MAXPAT) * cap);
+        cTab = newInts(imin(m, FZ_MAXPAT) * cap);
+        gRow = newInts(cap + 1);
+        gSrc = newInts(cap + 1);
+        if (dTab == null || pTab == null || cTab == null || gRow == null || gSrc == null) {
+            freeMem(dTab); freeMem(pTab); freeMem(cTab); freeMem(gRow); freeMem(gSrc);
+            dTab = null; pTab = null; cTab = null; gRow = null; gSrc = null; scratchM = 0;
+            return false;
+        }
+        scratchM = cap;
+        return true;
+    }
+
+    // the score of a candidate: -1 when the pattern is not a subsequence of it, else a positive number (bigger is better). positions (m ints, may be
+    // null) gets the byte offset of the match of every pattern symbol. Matches at word starts, after separators, in camelCase humps and
+    // consecutive matches score higher, gaps cost. An empty pattern matches everything with score 0.
+    public int score(char* text, int n = -1, int* positions = null) {
+        n = lenOf(text, n);
+        if (bad) { return -1; }
+        if (m == 0) { return 0; }
+        if (!prepare(n)) { return -1; }
+        int sn = symbols(text, n, cand, offs, u8);
+        for (int i = 0; i < sn; i++) { candF[i] = cs ? cand[i] : foldSym(cand[i]); }
+        // quick subsequence test (also gives the greedy fallback)
+        int gp[64];
+        int k = 0;
+        for (int i = 0; i < sn && k < m; i++) {
+            if (candF[i] == pat[k]) { if (k < FZ_MAXPAT) { gp[k] = i; } k++; }
+        }
+        if (k < m) { return -1; }
+        if (m > FZ_MAXPAT || sn > FZ_MAXCAND) { return greedy(sn, positions, &gp[0]); }
+        if (!prepareTables(sn)) { return greedy(sn, positions, &gp[0]); }
+        int W = sn;
+        // fill the tables: dTab[i * W + j] = best score with pattern symbol i matched at candidate position j
+        for (int i = 0; i < m; i++) {
+            // the gap row for transitions from row i - 1: gRow[j] = best D(i-1, j') + gap penalty over j' <= j - 2
+            if (i > 0) {
+                for (int j = 0; j < sn; j++) {
+                    if (j < 2) { gRow[j] = FZ_NEG; gSrc[j] = -1; continue; }
+                    int fromD = dTab[(i - 1) * W + j - 2];
+                    int best = FZ_NEG;
+                    int src = -1;
+                    if (fromD > FZ_NEG) { best = fromD + FZ_GAP_START; src = j - 2; }
+                    if (gRow[j - 1] > FZ_NEG && gRow[j - 1] + FZ_GAP_EXT > best) { best = gRow[j - 1] + FZ_GAP_EXT; src = gSrc[j - 1]; }
+                    gRow[j] = best;
+                    gSrc[j] = src;
+                }
+            }
+            for (int j = 0; j < sn; j++) {
+                int v = FZ_NEG;
+                int from = -1;
+                int chunk = 0;
+                if (candF[j] == pat[i]) {
+                    int bonus = bonusAt(cand, j);
+                    if (i == 0) {
+                        v = FZ_MATCH + bonus * 2;
+                        chunk = bonus;
+                    } else {
+                        if (j >= 1 && dTab[(i - 1) * W + j - 1] > FZ_NEG) {
+                            // a run of consecutive matches keeps the bonus of its first symbol when that was a word boundary
+                            int cb = cTab[(i - 1) * W + j - 1];
+                            int eff = (bonus > FZ_CONSEC) ? bonus : FZ_CONSEC;
+                            if (cb >= FZ_BOUNDARY && cb > eff) { eff = cb; }
+                            v = dTab[(i - 1) * W + j - 1] + FZ_MATCH + eff;
+                            from = j - 1;
+                            chunk = (cb >= FZ_BOUNDARY) ? cb : bonus;
+                        }
+                        if (gRow[j] > FZ_NEG) {
+                            int g = gRow[j] + FZ_MATCH + bonus;
+                            if (g > v) { v = g; from = gSrc[j]; chunk = bonus; }
+                        }
+                    }
+                }
+                dTab[i * W + j] = v;
+                pTab[i * W + j] = from;
+                cTab[i * W + j] = chunk;
+            }
+        }
+        int best = FZ_NEG;
+        int bj = -1;
+        for (int j = 0; j < sn; j++) {
+            if (dTab[(m - 1) * W + j] > best) { best = dTab[(m - 1) * W + j]; bj = j; }
+        }
+        if (bj < 0) { return greedy(sn, positions, &gp[0]); }
+        if (positions != null) {
+            int j = bj;
+            for (int i = m - 1; i >= 0; i--) {
+                positions[i] = offs[j];
+                j = pTab[i * W + j];
+            }
+        }
+        return (best > 0) ? best : 1;
+    }
+
+    // cheap score for very long candidates: the first-match positions and the bonuses/penalties of those
+    private int greedy(int sn, int* positions, int* gp) {
+        int total = 0;
+        int prev = -2;
+        int lim = imin(m, FZ_MAXPAT);
+        for (int i = 0; i < lim; i++) {
+            int j = gp[i];
+            total = total + FZ_MATCH + bonusAt(cand, j);
+            if (j == prev + 1) { total = total + FZ_CONSEC; }
+            else if (prev >= 0) { total = total + FZ_GAP_START + (j - prev - 2) * FZ_GAP_EXT; }
+            prev = j;
+            if (positions != null) { positions[i] = offs[j]; }
+        }
+        if (m > FZ_MAXPAT) {                      // the rest of a huge pattern: matched in order, positions repeated from the greedy walk
+            int k = lim;
+            int j = prev + 1;
+            while (k < m && j < sn) {
+                if (candF[j] == pat[k]) { if (positions != null) { positions[k] = offs[j]; } total = total + FZ_MATCH; k++; }
+                j++;
+            }
+        }
+        return (total > 0) ? total : 1;
+    }
+
+    // Ranks items[0..count) against the pattern: writes the indexes of the best max matches, best first, into outIdx (and their scores into outScore,
+    // which may be null). Ties go to the shorter item, then to the earlier one. Returns how many matched (at most max). count may be up to 2^24 - 1.
+    public int rank(char** items, int count, int* outIdx, int max, int* outScore = null) {
+        if (bad || count < 0 || count > 0xFFFFFF || max <= 0) { return 0; }
+        int* keys = newInts(count + 1);
+        if (keys == null) { return 0; }
+        int k = 0;
+        for (int i = 0; i < count; i++) {
+            if (items[i] == null) { continue; }
+            int len = strlen(items[i]);
+            int s = score(items[i], len, null);
+            if (s < 0) { continue; }
+            // sort key: score (high), shorter first, earlier first; the sort is ascending on the negated score
+            int lenPart = (len > 0xFFFFF) ? 0xFFFFF : len;
+            keys[k] = ((0x7FFFF - imin(s, 0x7FFFF)) << 44) | (lenPart << 24) | i;
+            k++;
+        }
+        algo.sortBy(keys, k, ds.cmpAsc);
+        int n = imin(k, max);
+        for (int i = 0; i < n; i++) {
+            int idx = keys[i] & 0xFFFFFF;
+            outIdx[i] = idx;
+            if (outScore != null) { outScore[i] = 0x7FFFF - ((keys[i] >> 44) & 0x7FFFF); }
+        }
+        freeMem(keys);
+        return n;
+    }
+
+    public void dispose() {
+        freeMem(pat); freeMem(cand); freeMem(candF); freeMem(offs);
+        freeMem(dTab); freeMem(pTab); freeMem(cTab); freeMem(gRow); freeMem(gSrc);
+        pat = null; cand = null; candF = null; offs = null; dTab = null; pTab = null; cTab = null; gRow = null; gSrc = null;
+        m = 0; scratchN = 0; scratchM = 0; bad = false;
+    }
+}
+
+// one-shot form of FuzzyMatcher.score: -1 when pattern is not a subsequence of candidate. positions (strlen(pattern) ints) may be null.
+public int fuzzyScore(char* pattern, char* candidate, int* positions = null, int flags = 0) {
+    FuzzyMatcher f(pattern, flags);
+    int s = f.score(candidate, -1, positions);
+    f.dispose();
+    return s;
+}
+
+// ---- glob matching ---------------------------------------------------------------------------------------------------------------------
+public const GLOB_PATHNAME = 1;      // * ? and [..] never match '/'; "**" matches across '/'
+public const GLOB_ICASE = 2;         // ASCII case insensitive
+public const GLOB_PERIOD = 4;        // a leading '.' (of the text, or after '/' with GLOB_PATHNAME) must be matched by a literal '.'
+public const GLOB_NOESCAPE = 8;      // '\' is an ordinary character
+
+// Does the character c match the set that starts at pat[p] (just after the '[') and must end before pend? *next gets the index after the ']'.
+// Returns 1 / 0 for a match / no match and -1 when the set is not closed (the caller then treats '[' as a literal).
+private int matchSet(char* pat, int p, int pend, int c, int flags, int* next) {
+    bool neg = false;
+    if (p < pend && (pat[p] == '!' || pat[p] == '^')) { neg = true; p++; }
+    bool hit = false;
+    bool first = true;
+    bool esc = (flags & GLOB_NOESCAPE) == 0;
+    int cl = c;
+    int cu = c;
+    if (flags & GLOB_ICASE) {
+        cl = foldChar(c);
+        cu = (c >= 'a' && c <= 'z') ? c - 32 : c;
+    }
+    for (;;) {
+        if (p >= pend) { return -1; }
+        int pc = pat[p];
+        if (pc == ']' && !first) { p++; break; }
+        first = false;
+        int lo = pc;
+        if (pc == '\\' && esc && p + 1 < pend) { p++; lo = pat[p]; }
+        p++;
+        int hi = lo;
+        if (p + 1 < pend && pat[p] == '-' && pat[p + 1] != ']') {
+            p++;
+            hi = pat[p];
+            if (hi == '\\' && esc && p + 1 < pend) { p++; hi = pat[p]; }
+            p++;
+        }
+        if ((c >= lo && c <= hi) || (cl >= lo && cl <= hi) || (cu >= lo && cu <= hi)) { hit = true; }
+    }
+    *next = p;
+    return (hit != neg) ? 1 : 0;
+}
+
+// does the pattern segment pat[p0..p1) match the whole text segment txt[t0..t1)? (* ? [..] and \ only; no '/' handling)
+private bool segMatch(char* pat, int p0, int p1, char* txt, int t0, int t1, int flags) {
+    bool icase = (flags & GLOB_ICASE) != 0;
+    bool esc = (flags & GLOB_NOESCAPE) == 0;
+    if ((flags & GLOB_PERIOD) != 0 && t0 < t1 && txt[t0] == '.') {
+        // a leading dot is matched only by a literal dot
+        bool lit = p0 < p1 && (pat[p0] == '.' || (esc && pat[p0] == '\\' && p0 + 1 < p1 && pat[p0 + 1] == '.'));
+        if (!lit) { return false; }
+    }
+    int p = p0;
+    int t = t0;
+    int sp = -1;
+    int st = 0;
+    for (;;) {
+        bool failed = false;
+        if (p < p1) {
+            int pc = pat[p];
+            if (pc == '*') {
+                while (p < p1 && pat[p] == '*') { p++; }
+                sp = p;
+                st = t;
+                continue;
+            }
+            if (t < t1) {
+                int tc = txt[t];
+                if (pc == '?') { p++; t++; continue; }
+                if (pc == '[') {
+                    int next = 0;
+                    int r = matchSet(pat, p + 1, p1, tc, flags, &next);
+                    if (r < 0) {
+                        if (tc == '[') { p++; t++; continue; }
+                        failed = true;
+                    } else if (r == 1) {
+                        p = next; t++; continue;
+                    } else {
+                        failed = true;
+                    }
+                } else {
+                    int lit = pc;
+                    int adv = 1;
+                    if (pc == '\\' && esc && p + 1 < p1) { lit = pat[p + 1]; adv = 2; }
+                    bool same = icase ? (foldChar(lit) == foldChar(tc)) : (lit == tc);
+                    if (same) { p = p + adv; t++; continue; }
+                    failed = true;
+                }
+            } else {
+                failed = true;
+            }
+        } else if (t >= t1) {
+            return true;
+        } else {
+            failed = true;
+        }
+        if (failed && sp >= 0 && st < t1) {
+            st++;
+            p = sp;
+            t = st;
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+// end of the '/' separated segment that starts at i (index of the '/' or n)
+private int segEnd(char* s, int i, int n) {
+    while (i < n && s[i] != '/') { i++; }
+    return i;
+}
+
+// Does the glob pattern match the whole text?  Wildcards: * (any run, also empty), ? (one byte), [abc] [a-z] [!abc] sets, \ escapes the next character
+// (GLOB_NOESCAPE: it is an ordinary character). With GLOB_PATHNAME the text and the pattern are split at '/': * ? and sets never match a '/', and a
+// segment of the pattern that is exactly "**" matches any number (also none) of whole text segments, so "src/**/*.a" matches "src/x.a" and
+// "src/a/b/x.a", and "a/**" matches "a", "a/b" and "a/b/c". A '/' inside [..] is not supported in that mode. No brace expansion.
+// Time is O(pattern * text) at worst, never exponential. plen / tlen: lengths, -1 = 0 terminated.
+public bool globMatch(char* pattern, char* text, int flags = 0, int plen = -1, int tlen = -1) {
+    plen = lenOf(pattern, plen);
+    tlen = lenOf(text, tlen);
+    if ((flags & GLOB_PATHNAME) == 0) {
+        return segMatch(pattern, 0, plen, text, 0, tlen, flags);
+    }
+    bool period = (flags & GLOB_PERIOD) != 0;
+    int pi = 0;                      // start of the current pattern segment (plen + 1: none left)
+    int ti = 0;                      // start of the current text segment (tlen + 1: none left)
+    int spp = -1;                    // after the last "**" segment: where to continue in the pattern
+    int stt = 0;                     // the text segment that "**" has reached
+    bool starSeen = false;
+    for (;;) {
+        bool failed = false;
+        if (pi <= plen) {
+            int pe = segEnd(pattern, pi, plen);
+            if (pe - pi == 2 && pattern[pi] == '*' && pattern[pi + 1] == '*') {
+                pi = pe + 1;
+                spp = pi;
+                stt = ti;
+                starSeen = true;
+                continue;
+            }
+            if (ti <= tlen) {
+                int te = segEnd(text, ti, tlen);
+                if (segMatch(pattern, pi, pe, text, ti, te, flags)) {
+                    pi = pe + 1;
+                    ti = te + 1;
+                    continue;
+                }
+            }
+            failed = true;
+        } else if (ti > tlen) {
+            return true;
+        } else {
+            failed = true;
+        }
+        // failed: let the last "**" swallow one more text segment
+        if (starSeen && stt <= tlen) {
+            int te = segEnd(text, stt, tlen);
+            if (period && te > stt && text[stt] == '.') { return false; }
+            stt = te + 1;
+            ti = stt;
+            pi = spp;
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+// ---- Soundex -------------------------------------------------------------------------------------------------------------------------------
+// American Soundex: the first letter and three digits ("Robert" and "Rupert" -> "R163"). out needs 5 bytes. Non-letters are ignored; returns
+// false (and writes "0000") when s has no letter. ASCII letters only.
+public bool soundex(char* s, char* out, int n = -1) {
+    n = lenOf(s, n);
+    // 0 = skipped letter (vowels and Y separate equal codes, H and W do not)
+    char* codes = "01230120022455012623010202";             // A..Z
+    int len = 0;
+    int last = -1;
+    for (int i = 0; i < n && len < 4; i++) {
+        int c = s[i];
+        if (c >= 'a' && c <= 'z') { c = c - 32; }
+        if (c < 'A' || c > 'Z') { continue; }
+        int code = codes[c - 'A'] - '0';
+        if (len == 0) {
+            out[0] = c;
+            len = 1;
+            last = code;
+            continue;
+        }
+        if (c == 'H' || c == 'W') { continue; }                 // do not reset the previous code
+        if (code != 0 && code != last) {
+            out[len] = '0' + code;
+            len++;
+        }
+        last = code;
+    }
+    if (len == 0) {
+        out[0] = '0'; out[1] = '0'; out[2] = '0'; out[3] = '0'; out[4] = 0;
+        return false;
+    }
+    while (len < 4) { out[len] = '0'; len++; }
+    out[4] = 0;
+    return true;
+}
+
+// true when both texts have the same Soundex code
+public bool soundexEqual(char* a, char* b) {
+    char x[8];
+    char y[8];
+    bool ha = soundex(a, &x[0]);
+    bool hb = soundex(b, &y[0]);
+    return ha && hb && strcmp(&x[0], &y[0]) == 0;
+}
+
+// ---- natural order -------------------------------------------------------------------------------------------------------------------------
+// Compares like strcmp, but runs of digits count by their numeric value, however long ("img2" < "img10", "a9" < "a10").
+// Equal values with different numbers of leading zeros: fewer zeros first ("a1" < "a01"). ignoreCase folds ASCII letters. Returns <0, 0, >0.
+public int naturalCompare(char* a, char* b, bool ignoreCase = false) {
+    int i = 0;
+    int j = 0;
+    int tie = 0;
+    for (;;) {
+        int ca = a[i];
+        int cb = b[j];
+        if (ca >= '0' && ca <= '9' && cb >= '0' && cb <= '9') {
+            int za = 0;
+            while (a[i + za] == '0') { za++; }
+            int zb = 0;
+            while (b[j + zb] == '0') { zb++; }
+            int la = 0;
+            while (a[i + za + la] >= '0' && a[i + za + la] <= '9') { la++; }
+            int lb = 0;
+            while (b[j + zb + lb] >= '0' && b[j + zb + lb] <= '9') { lb++; }
+            if (la != lb) { return (la < lb) ? -1 : 1; }
+            for (int k = 0; k < la; k++) {
+                int x = a[i + za + k];
+                int y = b[j + zb + k];
+                if (x != y) { return (x < y) ? -1 : 1; }
+            }
+            if (za != zb && tie == 0) { tie = (za < zb) ? -1 : 1; }
+            i = i + za + la;
+            j = j + zb + lb;
+            continue;
+        }
+        if (ignoreCase) { ca = foldChar(ca); cb = foldChar(cb); }
+        if (ca != cb) { return (ca < cb) ? -1 : 1; }
+        if (ca == 0) { return tie; }
+        i++;
+        j++;
+    }
+    return 0;
+}
+
+private int naturalCmpPtr(int a, int b) { return naturalCompare((char*) a, (char*) b, false); }
+private int naturalCmpPtrI(int a, int b) { return naturalCompare((char*) a, (char*) b, true); }
+
+// sorts an array of strings in natural order (stable)
+public void naturalSort(char** items, int n, bool ignoreCase = false) {
+    if (ignoreCase) { algo.sortBy((int*) items, n, naturalCmpPtrI); }
+    else { algo.sortBy((int*) items, n, naturalCmpPtr); }
+}
