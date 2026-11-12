@@ -144,7 +144,7 @@ What to notice:
 
 ## Separate compilation and linking
 
-Besides compiling a whole program from one file, `ac` can compile files **separately** and link them, like a C toolchain. `ac -c util.a -o util.ao` compiles one **unit** to an object file; `ac main.ao util.ao -o prog` links objects into a program. Units share declarations the C way, through a header that both `#include`: function prototypes, `extern` variables, and the definitions of structs, classes and constants.
+Besides compiling a whole program from one file, `ac` can compile files **separately** and link them, like a C toolchain. `ac -c shapes.a -o shapes.ao` compiles one **unit** to an object file; `ac main.ao shapes.ao -o prog` links objects into a program. Units share declarations the C way, through a header that both `#include`: function prototypes, `extern` variables, and the definitions of structs, classes and constants.
 
 {{sample lang/link_units}}
 
@@ -196,7 +196,7 @@ Use separate compilation for big programs that you rebuild often, or when you wa
 | free to clobber | rsi, rdi, r8-r11 | x3-x5, x9-x17 | t0-t6, a3-a7 | $t0-$t8, $a3-$a7 |
 | keep intact | rsp, rbp, rbx, r12-r15 | sp, x29, x30 | sp, s0, ra | $sp, $fp, $ra |
 
-The code is given as numbers: bytes on x64, and 32-bit instruction words on the other CPUs. There is no assembler in the compiler: get the numbers from an assembler (`llvm-mc -show-encoding`, `as`) or from a manual.
+The register table comes from the language reference. Its last two rows are rules for the code you write; the compiler does not check them. The code is given as numbers: bytes on x64, and 32-bit instruction words on the other CPUs. There is no assembler in the compiler: get the numbers from an assembler (`llvm-mc -show-encoding`, `as`) or from a manual.
 
 {{sample lang/asm_add}}
 
@@ -205,7 +205,7 @@ What to notice:
 - `a` went into register A and `b` into B; `add rax, rcx` (the bytes `0x48, 0x01, 0xC8`) added them, and the result stayed in A, which is the value of the expression.
 - The `asm()` statement with no operands is a no-operation on every CPU. The program continued after it.
 - The section names are `x64` (also `x86_64`, `amd64`), `arm64` (`aarch64`), `riscv64` (`rv64`) and `loongarch64` (`la64`). An unknown name is an error (`unknown CPU name in the asm block`).
-- The sample was compiled for every target, but only **run** on x86-64 here: the arm64, riscv64 and loongarch64 words come from the language reference and were not executed.
+- The sample was compiled for all nine targets, but only **run** on x86-64 here: the arm64, riscv64 and loongarch64 words were not executed.
 - The code must not change the stack pointer permanently, must keep the registers listed under "keep intact", and must not jump out of the block (jumps inside it are fine; offsets are relative). The standard prelude uses `asm` for fast `strlen`, `memcpy` and `memset` on x86-64, and the `cpu` and `thread` modules are written with it.
 
 A block must have a section for the CPU being compiled, otherwise the compiler stops with `this asm block has no code for the CPU being compiled`. When you only have code for one processor, combine `asm` with `static if` and give the other targets a version written in A:
@@ -215,7 +215,7 @@ A block must have a section for the CPU being compiled, otherwise the compiler s
 What to notice:
 
 - On x86-64 the first definition is compiled (`shl rax, 3`); on every other CPU the `else` branch is, and the `asm` block inside the first branch is never looked at.
-- Inline assembly makes a program non-portable and bypasses every check the compiler makes. Reach for it only for operations that A cannot express, such as special instructions; the standard modules `cpu`, `bits` and `thread` already wrap many of them.
+- Inline assembly makes a program non-portable and bypasses every check the compiler makes. Reach for it only for operations that A cannot express, such as special instructions; the standard modules `cpu` (timer, memory barriers, atomic operations) and `thread` already wrap many of them, and `bits` offers bit tricks written in plain A.
 
 ## Summary
 
