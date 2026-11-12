@@ -593,7 +593,7 @@ parse_foreach:
     CG load_local_a
     cmp qword [rbx+FE_REV], 0
     jne .c_rev
-    cmp rax, FK_ARRAY
+    cmp qword [rbx+FE_KIND], FK_ARRAY           ; (rax does not survive the backend primitives on every CPU)
     jne .c_a1
     mov rdi, [rbx+FE_LEN]
     CG imm_b
@@ -607,7 +607,7 @@ parse_foreach:
     CG jcmp_chain
     jmp .c_done
 .c_rev:
-    cmp rax, FK_RANGE
+    cmp qword [rbx+FE_KIND], FK_RANGE
     je .c_r1
     xor edi, edi
     CG imm_b
