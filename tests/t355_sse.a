@@ -1,0 +1,250 @@
+// Server-Sent Events: the wire format, the parser (every line ending, BOM, comments, fields, limits), a stream from a wshub with
+// Last-Event-ID, the client with reconnects, and rooms of event stream clients
+import sse;
+import wshub;
+import httpx;
+import net;
+import conn;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// feeds the text and returns the events as "name|data|id;" text
+char* events(sse.Parser* p, char* text) {
+    int n = strlen(text);
+    int off = 0;
+    char* out = alloc(2000);
+    while (off < n) {
+        int r = p->feed(&text[off], n - off);
+        off = off + r;
+        sse.Event* e = p->take();
+        while (e != null) {
+            strcat(out, e->event);
+            strcat(out, "|");
+            strcat(out, e->data);
+            strcat(out, "|");
+            strcat(out, e->id);
+            strcat(out, ";");
+            e->dispose();
+            e = p->take();
+        }
+        if (r == 0) break;
+    }
+    return out;
+}
+
+char* oneShot(char* text) {
+    sse.Parser* p = sse.newParser();
+    char* r = events(p, text);
+    p->dispose();
+    return r;
+}
+
+// ---- the application of the hub
+wshub.Hub* hub;
+int opened = 0;
+int closedStreams = 0;
+char* lastIdSeen = null;
+
+int onHttp(wshub.Hub* h, wshub.Client* c, httpx.Request* req, httpx.Response* res) {
+    if (streq(&req->path[0], "/events")) {
+        char* last = req->header("Last-Event-ID");
+        lastIdSeen = last == null ? null : strdup(last);
+        sse.startResponse(res);
+        return 1;
+    }
+    if (streq(&req->path[0], "/plain")) {
+        res->text(200, "not a stream");
+        return 1;
+    }
+    if (streq(&req->path[0], "/gone")) {
+        res->status = 204;
+        res->setBody("", 0);
+        return 1;
+    }
+    if (streq(&req->path[0], "/moved")) {
+        res->redirect(302, "/events");
+        return 1;
+    }
+    return 0;
+}
+
+int onOpen(wshub.Hub* h, wshub.Client* c) {
+    opened++;
+    if (c->isEventStream()) {
+        h->join(c, "news");
+        h->sendEvent(c, "hello", "welcome", "1");
+    }
+    return 0;
+}
+
+int onClose(wshub.Hub* h, wshub.Client* c, int code) {
+    closedStreams++;
+    return 0;
+}
+
+int hook() {
+    hub->poll(0);
+    return 0;
+}
+
+int main() {
+    // --- the wire format
+    check("one event", streq(sse.eventText("tick", "hello", "7", 0), "event: tick\nid: 7\ndata: hello\n\n"));
+    check("data only", streq(sse.eventText(null, "x", null, 0), "data: x\n\n"));
+    check("data with newlines: one line each", streq(sse.eventText(null, "a\nb\r\nc", null, 0), "data: a\ndata: b\ndata: c\n\n"));
+    check("a trailing newline gives an empty last line", streq(sse.eventText(null, "a\n", null, 0), "data: a\ndata: \n\n"));
+    check("empty data", streq(sse.eventText("e", "", null, 0), "event: e\ndata: \n\n"));
+    check("retry", streq(sse.eventText(null, "x", null, 3000), "retry: 3000\ndata: x\n\n"));
+    check("CR or LF in the event name or id is refused", sse.eventText("a\nb", "x", null, 0) == null && sse.eventText(null, "x", "1\r2", 0) == null && sse.eventText("a\rb", "x", null, 0) == null);
+    check("a comment", streq(sse.commentText("keep alive"), ": keep alive\n\n") && streq(sse.commentText("a\nb"), ": a b\n\n"));
+    // round trip: what we write, the parser reads
+    char* wire = sse.eventText("note", "line 1\nline 2\n\nline 4", "id-9", 0);
+    check("write then parse", streq(oneShot(wire), "note|line 1\nline 2\n\nline 4|id-9;"));
+
+    // --- the parser
+    check("a simple event", streq(oneShot("data: hi\n\n"), "message|hi|;"));
+    check("event name and id", streq(oneShot("event: a\nid: 5\ndata: x\n\n"), "a|x|5;"));
+    check("two data lines", streq(oneShot("data: a\ndata: b\n\n"), "message|a\nb|;"));
+    check("CRLF line ends", streq(oneShot("event: a\r\ndata: x\r\n\r\n"), "a|x|;"));
+    check("CR line ends", streq(oneShot("data: x\r\rdata: y\r\r"), "message|x|;message|y|;"));
+    check("mixed line ends", streq(oneShot("data: x\n\r\ndata: y\r\n\n"), "message|x|;message|y|;"));
+    check("a colon followed by a space: only the first space is dropped", streq(oneShot("data:  two spaces\n\n"), "message| two spaces|;"));
+    check("no space after the colon", streq(oneShot("data:x\n\n"), "message|x|;"));
+    check("a field without a colon has an empty value", streq(oneShot("data\n\n"), "message||;"));
+    check("comments are ignored", streq(oneShot(": comment\ndata: x\n: another\n\n"), "message|x|;"));
+    check("an event without data is not dispatched", streq(oneShot("event: a\n\n"), ""));
+    check("the name resets after an event", streq(oneShot("event: a\ndata: 1\n\ndata: 2\n\n"), "a|1|;message|2|;"));
+    check("the last event id persists", streq(oneShot("id: 5\ndata: 1\n\ndata: 2\n\nid: 6\ndata: 3\n\n"), "message|1|5;message|2|5;message|3|6;"));
+    check("an id with a NUL is ignored", streq(oneShot("id: a\ndata: 1\n\n"), "message|1|a;"));
+    check("unknown fields are ignored", streq(oneShot("foo: bar\ndata: x\n\n"), "message|x|;"));
+    check("a stream that ends inside an event gives no event", streq(oneShot("data: partial"), ""));
+    check("the byte order mark is skipped", streq(oneShot("\xEF\xBB\xBFdata: x\n\n"), "message|x|;"));
+    check("a partial BOM is text", streq(oneShot("\xEF\xBBdata: x\n\n"), ""));
+    sse.Parser* p = sse.newParser();
+    check("retry sets the reconnect time", streq(events(p, "retry: 1500\ndata: x\n\n"), "message|x|;") && p->retryMs == 1500);
+    events(p, "retry: abc\ndata: y\n\n");
+    check("retry takes digits only", p->retryMs == 1500);
+    p->dispose();
+    // byte by byte
+    p = sse.newParser();
+    char* text = "retry: 20\r\nevent: tick\r\nid: 3\r\ndata: one\r\ndata: two\r\n\r\n: hb\r\ndata: three\r\n\r\n";
+    char* got = alloc(500);
+    for (int i = 0; i < strlen(text); i++) {
+        p->feed(&text[i], 1);
+        sse.Event* e = p->take();
+        while (e != null) { strcat(got, e->event); strcat(got, "="); strcat(got, e->data); strcat(got, ";"); e->dispose(); e = p->take(); }
+    }
+    check("the same stream one byte at a time", streq(got, "tick=one\ntwo;message=three;") && p->retryMs == 20 && streq(p->lastId, "3"));
+    p->dispose();
+    // limits
+    p = sse.newParser();
+    p->maxLine = 100;
+    char* longLine = alloc(300);
+    strcpy(longLine, "data: ");
+    for (int i = 0; i < 150; i++) strcat(longLine, "a");
+    p->feed(longLine, strlen(longLine));
+    check("a line over maxLine fails the stream", p->failed && p->feed("\n\n", 2) == 0);
+    p->dispose();
+    p = sse.newParser();
+    p->maxEvent = 50;
+    for (int i = 0; i < 10 && !p->failed; i++) p->feed("data: 0123456789\n", 17);
+    check("an event over maxEvent fails the stream", p->failed);
+    p->dispose();
+    p = sse.newParser();
+    p->qLimit = 2;
+    char* three = "data: 1\n\ndata: 2\n\ndata: 3\n\n";
+    int took = p->feed(three, strlen(three));
+    check("feed stops when qLimit events are waiting", took < strlen(three) && p->qCount == 2);
+    p->take()->dispose();
+    p->take()->dispose();
+    check("... and goes on after they are taken", p->feed(&three[took], strlen(three) - took) > 0 && p->take() != null);
+    p->dispose();
+
+    // --- a stream from the hub
+    hub = new wshub.Hub();
+    hub->onHttp = onHttp;
+    hub->onOpen = onOpen;
+    hub->onClose = onClose;
+    hub->sseKeepAliveMs = 40;
+    hub->listen(0);
+    net.setIdleHook(hook);
+    char* url = alloc(100);
+    format(url, 100, "http://127.0.0.1:%d/events", hub->port);
+    sse.Client* c = new sse.Client(url);
+    c->maxRetries = 3;
+    c->retryMs = 30;
+    sse.Event* e = c->next(1000);
+    check("the client gets the first event", e != null && streq(e->event, "hello") && streq(e->data, "welcome") && streq(e->id, "1"));
+    e->dispose();
+    check("the hub counts it as an event stream client in a room", hub->count() == 1 && hub->roomSize("news") == 1 && hub->find(1)->isEventStream());
+    check("it sent no Last-Event-ID the first time", lastIdSeen == null);
+    hub->publishText("news", "breaking", 0);
+    e = c->next(1000);
+    check("publish to the room reaches the stream", e != null && streq(e->event, "message") && streq(e->data, "breaking"));
+    e->dispose();
+    int ids[5];
+    hub->clientIds(&ids[0], 5);
+    hub->sendEvent(hub->find(ids[0]), "update", "multi\nline", "42");
+    e = c->next(1000);
+    check("sendEvent with a name, multi line data and an id", e != null && streq(e->event, "update") && streq(e->data, "multi\nline") && streq(e->id, "42"));
+    e->dispose();
+    check("the client remembers the last event id", streq(c->lastEventId, "42"));
+    check("binary messages are not sent to event streams", !hub->sendBinary(hub->find(ids[0]), "x", 1));
+    e = c->next(150);
+    check("keep-alive comments do not appear as events", e == null && !c->closed);
+    check("the answer was text/event-stream (status 200)", c->status == 200);
+
+    // --- reconnect: the hub drops the stream, the client comes back with Last-Event-ID
+    hub->close(hub->find(ids[0]), 1000, null);
+    for (int i = 0; i < 5; i++) hub->poll(0);
+    check("the hub ended the stream", hub->count() == 0 && closedStreams == 1);
+    e = c->next(2000);
+    check("the client reconnects by itself and gets the greeting again", e != null && streq(e->event, "hello") && c->reconnects == 2);
+    e->dispose();
+    check("it sent Last-Event-ID: 42", streq(lastIdSeen, "42"));
+    c->close();
+    check("a closed client returns null", c->next(10) == null && c->closed);
+
+    // --- what is not a stream
+    format(url, 100, "http://127.0.0.1:%d/plain", hub->port);
+    sse.Client* c2 = new sse.Client(url);
+    check("an answer that is not text/event-stream ends the client", c2->next(500) == null && c2->closed && contains(sse.error(), "event-stream"));
+    format(url, 100, "http://127.0.0.1:%d/gone", hub->port);
+    c2 = new sse.Client(url);
+    check("204 means: do not reconnect", c2->next(500) == null && c2->closed);
+    format(url, 100, "http://127.0.0.1:%d/missing", hub->port);
+    c2 = new sse.Client(url);
+    check("a 404 ends the client", c2->next(500) == null && c2->closed && c2->status == 404);
+    format(url, 100, "http://127.0.0.1:%d/moved", hub->port);
+    c2 = new sse.Client(url);
+    e = c2->next(1000);
+    check("a redirect is followed", e != null && streq(e->event, "hello"));
+    e->dispose();
+    c2->close();
+    for (int i = 0; i < 5; i++) hub->poll(0);
+
+    // --- the server goes away: the client keeps trying, backs off and gives up
+    int port = hub->port;
+    net.setIdleHook(null);
+    hub->shutdown(100);
+    format(url, 100, "http://127.0.0.1:%d/events", port);
+    sse.Client* c3 = new sse.Client(url);
+    c3->retryMs = 20;
+    c3->maxRetries = 2;
+    c3->maxRetryMs = 60;
+    int t0 = millis();
+    e = c3->next(5000);
+    check("a dead server: the client gives up after maxRetries", e == null && c3->closed && c3->failures == 3);
+    check("... after waiting between the tries", millis() - t0 >= 40);
+    printf("failures: %d\n", fails);
+    return fails;
+}
