@@ -15,6 +15,7 @@ The [collections chapter](#chap-collections-and-algorithms) has the everyday con
 * **`dispose()` gives the memory back.** `A` has no `delete`, so call `dispose()` on a container when you are done; it frees every block, also the copies of text keys, and leaves an empty object that can be used again. Objects made with `new` are never freed, so prefer objects on the stack.
 * **No crashes on bad numbers.** A bad index, an empty container or a failed allocation gives `0`, `-1`, `false` or `null` (documented per method) and leaves the container as it was. Use `size()` or `isEmpty()` when 0 is a valid element.
 * **`ds` does not check pointers.** A text key, a byte buffer or an output array must be a real pointer: `Trie.put(null, 1)` crashes. Pass `""` for an empty text. `strx` and `rng` take a `null` text as an empty text.
+* **Pass containers by pointer** (`void show(ds.Deque* d)`), never by value and never by assignment (`ds.Deque b = a;`). The copy shares the buffers of the original; when the copy grows it frees the buffer that the original still points to. (Checked: after `void grow(ds.Deque d)` pushed 20 numbers into its copy, the next `a.pushBack(7)` wrote into a block that the allocator had already handed to something else.)
 * **Not thread safe.** Give every thread its own objects.
 
 ::: note
@@ -172,7 +173,7 @@ What to notice:
 * `BitSet(count)` starts with all bits 0. `set(i)`, `unset(i)`, `flip(i)`, `get(i)`, `setAll()`, `count()` (the number of 1 bits). A bit outside `0 .. size - 1` is ignored: `set` does nothing there and `get` returns `false`.
 * **`setRange(lo, hi)` and `countRange(lo, hi)` are half open**: they use the bits `lo .. hi - 1`. `Fenwick`, `SegTree` and `IntervalSet` (below) include both ends.
 * `nextSet(i)` and `nextClear(i)` find the next 1 or 0 bit at or after `i` (-1 for none), `prevSet(i)` the last 1 bit at or before `i`. A loop over `nextSet` walks all members in order.
-* `orWith`, `andWith`, `xorWith` and `andNotWith` change this set; `isSubsetOf`, `intersects` and `equals` only ask. `copyFrom(&other)` copies and resizes. `resize(n)` changes the size and sets new bits to 0.
+* `orWith`, `andWith`, `xorWith` and `andNotWith` change this set; `isSubsetOf`, `intersects` and `equals` only ask. `copyFrom(&other)` copies and resizes. `resize(n)` changes the size and sets new bits to 0. The set operations keep the size of this set: bits of the other set beyond it are ignored, and bits it lacks count as 0.
 
 ### Running sums: `Fenwick` and `RangeFenwick`
 
@@ -262,7 +263,7 @@ The module documentation, `docs/ALGO.md` in the source tree, lists measured spee
 
 ## String algorithms: `strx`
 
-`strx` works on **texts as a pointer and a length**: every function takes `(char* s, int n)`, and `n = -1` means "up to the terminating 0". A `null` pointer is an empty text. Texts that are not 0 terminated are never read past `n`. Functions that return a text or an array allocate it; the sections say how to free it (`strx.freeText`). The distance, similarity and palindrome functions compare code points instead of bytes when you pass `utf8 = true`.
+`strx` works on **texts as a pointer and a length**: most functions take `(char* s, int n)`, and `n = -1` means "up to the terminating 0" (a few take plain 0 terminated texts: `naturalCompare`, `soundexEqual`, `fuzzyScore`). A `null` pointer is an empty text. Texts that are not 0 terminated are never read past `n`. Functions that return a text or an array allocate it; the sections say how to free it (`strx.freeText`). The distance, similarity and palindrome functions compare code points instead of bytes when you pass `utf8 = true`.
 
 ### Searching for one pattern: `Kmp`, `Horspool`, `RabinKarp`
 
@@ -529,7 +530,7 @@ A checklist of what the three modules do **not** do, or do differently from what
 * The `strx` classes that are made from a pattern or a text (`Kmp`, `Horspool`, `RabinKarp`, `SuffixArray`, `FuzzyMatcher`) must be declared with their arguments as well, but a zeroed one is **not** "finds nothing": a zeroed `Kmp`, `Horspool` or `RabinKarp` is an empty pattern, which matches everywhere (`find` returns 0, `count("abc")` returns 4), and a zeroed `FuzzyMatcher` matches every text with score 0. A zeroed `SuffixArray` is an empty text. Nothing crashes, but the answers are not the ones you meant.
 * The module documentation lists `BitSet` among the zeroed classes that "grow on first use", but a zeroed `BitSet` has size 0 and **ignores `set(5)`**. Call `resize(n)` first, or declare `BitSet(n)`. (A zeroed `DisjointSet` does grow: `add()` creates elements.)
 * `strx.LineDiff d();` is a compile error because the class has no constructor. Declare it as `strx.LineDiff d;`.
-* `dispose()` is the only way to free. `new` objects are never freed.
+* `dispose()` is the only way to free. `new` objects are never freed. Do not copy a container by value (see the rules at the top): two objects that own one buffer end in a use after free.
 
 **Pointers**
 

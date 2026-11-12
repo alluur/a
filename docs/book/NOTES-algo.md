@@ -147,3 +147,46 @@ Measured here, native x86-64, one run (also in the chapter):
   `bitset_sieve.a`, the sums of `fenwick_trees.a` and `segment_tree.a`, the word counts of `word_index.a` were recomputed by hand or in
   Python. The Bloom filter and count-min figures (5056 bits, 67 false alarms, estimates) come from the module itself; their exact values
   depend on its hash functions, which are integer code and therefore identical everywhere (the same on four targets).
+
+## Second pass by an independent reviewer (fresh eyes)
+
+Everything below was run with `build/ac` of this worktree. **No library function that returns a wrong result was found.** Differential checks that agree:
+`Kmp`, `Horspool`, `RabinKarp` and `strx.countOf` against a naive search on 20,000 random small cases (overlap on and off), `SegTree` (sum, min,
+max, add and assign mixed), `IntervalSet` and `OrderedMap` (`rank`, `floorKey`, `verify`) against plain arrays, the twelve rows of `distributions.a`
+(first three draws and the mean of 2000) against NumPy 2.5.3 with the PCG64 state copied from `Pcg64(2024, 7).getState(0..3)`, and
+`Mt19937.seedPython(12345)` against Python's `random.random()`. All 32 samples give the recorded output on x86-64 and under `qemu-user` on
+linux-arm64, linux-riscv64 and linux-loongarch64, and compile for all nine targets.
+
+Where the reference text was wrong, and the chapter was corrected:
+
+| Where | Claim | What really happens |
+|---|---|---|
+| `lib/strx.a` (comments of `levenshtein`, `lcsLength`), `docs/ALGO.md` (table of costs) | `levenshtein` needs O(min(na, nb)) memory | the DP rows are O(min), but `symPair` first decodes **both** texts into arrays of ints: 8 bytes per input byte. Two 1 MB texts: `levenshteinMax(a, n, b, n, 5)` peaked at 33 MB resident (`resource.getrusage` of the child), 130 ms |
+| `docs/ALGO.md` (search section) | `strx.countOf` / `indexOf` "fall back to KMP" | only `indexOf` is Horspool with a fallback; `countOf` and `findAll` (the one-shot ones) run `Kmp` from the start |
+| `docs/ALGO.md` "Conventions" | the classes made from a size or capacity store nothing when zeroed | true for `ds`; a zeroed `strx.Kmp`, `Horspool`, `RabinKarp` is an **empty pattern**, which matches everywhere (`find("abc")` is 0, `count("abc")` is 4) and a zeroed `FuzzyMatcher` scores every text 0 (the ALGO.md sentence "is an empty pattern" is right; the chapter had said "finds nothing") |
+| `Trie` header ("O(length of the prefix)") | `countPrefix` costs the length of the prefix | each step scans a sorted sibling list (up to 255 entries), so O(length x fan-out); fine for text, but not a flat O(length) |
+
+Other traps that were not in the notes above and are now in the chapter: `Mt19937` and `ChaCha20Rng` are the only generators that allocate and have
+`dispose()`; `ChaCha20Rng.seedUint64` has only 64 bits of entropy; `rng.Pcg64(42)` is not NumPy's `default_rng(42)` (NumPy seeds PCG64 through a
+`SeedSequence`, so only a copied state gives the same numbers); `OrderedMap.nextNode` is an O(log n) search, so a walk with `firstNode` / `nextNode`
+costs O(n log n); the set operations of `BitSet` keep the size of the receiver.
+
+### A trap found by the reviewer: a `ds` container passed or assigned **by value** shares its buffers
+
+The compiler accepts `void f(ds.Deque d)` and `ds.Deque b = a;` and copies the fields, which are pointers. When the copy grows, `grow()` frees the buffer that the original still points to:
+
+```c
+import ds; import asys;
+void grow(ds.Deque d) { for (int i = 0; i < 20; i++) d.pushBack(i); }     // by value: a copy of the object
+int main() {
+    ds.Deque a(4);
+    grow(a);                                      // the copy outgrew the buffer of a and freed it
+    int* other = (int*) asys.alloc(64);           // the allocator hands out the freed block again
+    for (int i = 0; i < 8; i++) other[i] = 1000 + i;
+    a.pushBack(7);                                // a still writes into that block
+    printf("other[0] = %d\n", other[0]);          // 7, not 1000
+    return 0;
+}
+```
+
+This is the usual rule for classes with owned memory (pass a pointer), not a compiler bug, but nothing in `docs/ALGO.md` says it. The chapter's rules and traps now say so; its samples pass `ds.Deque* d`.

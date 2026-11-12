@@ -38,8 +38,8 @@ The older `http` module of [the previous chapter](#chap-http-websocket-tls) stil
 
 ::: note
 
-**How the samples run.** Every sample in this chapter is one program with one thread: the client and its server live in the same
-process, so that a sample is self-contained and needs no second terminal. The trick is `net.setIdleHook`: while a blocking call of the
+**How the samples run.** Every sample in this chapter is one program with one thread. Where a sample has a client and a server, both live in the same
+process, so that a sample is self-contained and needs no second terminal (some samples have no network at all and only feed bytes from one object to another). The trick is `net.setIdleHook`: while a blocking call of the
 client waits for the network, `net` calls a function of yours every few milliseconds, and that function serves the other end. The
 section [Waiting without threads](#waiting-without-threads) explains it; `ws_echo` below is the first example. In a real program the
 server is a separate program and you simply run it (`hub->run()`). All servers here listen on `127.0.0.1` with port `0`, so the system
@@ -598,7 +598,7 @@ loop you write yourself:
 
 `net.setIdleHook(fn)` makes every blocking wait of `net` (receive, accept, wait for readability, the TLS handshake) call `fn()` about every
 2 ms while it waits. If a program is **both** the client and the server of a connection, the server can live in `fn`. It is how every
-sample in this chapter works, how the tests of these modules run on every target, and the way it stays portable on Windows, where
+sample in this chapter that has a client and a server works, how the tests of these modules run on every target, and the way it stays portable on Windows, where
 `thread` runs a function at once in the calling thread instead of starting one.
 
 {{sample web/idle_hook}}
@@ -672,6 +672,12 @@ A list of the places where these modules can surprise you. Most of them are in t
   `websocket.acceptTls`) live in a table of 512 entries in `net`; the 513th fails with "too many secure sockets at the same time". The
   TLS clients of a hub are not in that table. (From the source of `net.secureAttach`; not tried with 513 connections.)
 * **IPv4 only.** Like the rest of `net`.
+* **Fixed table sizes.** An `httpx.Router` holds 128 routes and 16 middleware functions (a pattern may have 16 segments and 8 parameters), a `jsonrpc.Dispatcher` 64
+  methods, a `conn.Poller` 128 sockets, a `CookieJar` 256 cookies (50 per host). `add`, `use` and `Poller.add` return `false` when the table is full, and `CookieJar.store`
+  silently keeps only the newest 50 of a host: check the results.
+* **Route parameters are short.** A `:name` part (and the `*` rest of a pattern) holds at most 127 bytes after percent decoding. With a longer value the route
+  **still runs**, but `x->req->param("id")` returns `null` (checked: 126 and 127 bytes arrive, 128 gives `null`). Always test it for `null`; the samples leave
+  that out to stay short.
 * **Bare LF.** The request parser and the client accept a bare LF as a line end, as RFC 9112 allows for recipients. If a proxy in front
   of your server treats a bare LF differently, configure it to reject bare LF.
 
@@ -694,7 +700,7 @@ From `docs/NET.md` and from the limits found while writing this chapter:
 * **No IPv6.**
 * **Not exercised by the samples of this chapter:** Windows and AOS, a real browser, the interoperability tests of `tests/net.sh`
   (python `websockets`, curl and openssl), `Cors`, `Client.stream`, `requestChunked`, the speed of TLS, and hubs with hundreds of
-  clients. The samples compile for all nine targets; they were run on x86-64 and, under `qemu-user`, on ARM64.
+  clients. The samples compile for all nine targets; they were run on x86-64 and, under `qemu-user`, on ARM64, RISC-V and LoongArch (all 25 give the recorded output).
 
 ## Summary
 

@@ -218,3 +218,77 @@ HEAD, `query[1024]`) are still true: `lib/http.a` did not change, and the 27 sam
 * The group `web` has 25 samples, none compile-only, all with recorded output. Total run time of the group on this machine: about 1.5 s with three jobs.
 * `samples/web/wss_loopback/testcert.a` is a copy of the throw-away certificate module of `samples/http/*/testcert.a`; the book listing of the sample
   shows it after `main.a` (about 2 KB of PEM text).
+
+## Second pass by an independent reviewer (fresh eyes)
+
+All 25 samples of the group give the recorded output on x86-64 and under `qemu-user` on linux-arm64, linux-riscv64 and linux-loongarch64 (run three
+times in a row on x86-64 with four jobs: stable), and compile for all nine targets. Checked again by running: the `hub->close` on an event stream
+(bug 1 above), the hang of `net.accept` inside the hook (bug 2), `pingIntervalMs` / `pongTimeoutMs` of a hub (a client that never reads is closed with
+1011 after interval + timeout; one that waits in `waitMessage` stays), the 100 request batch limit, the 200 levels of JSON nesting, `NUL` and bad UTF-8
+in JSON-RPC (Parse error), the control character checks of `websocket.Options`, an Origin of 299 bytes (accepted) and of 300 (403), a gzip bomb and a
+broken gzip body in the client (`the answer body is too big`, `the answer body is damaged (it does not unpack)`).
+
+### New findings
+
+#### 6. `httpx.Router`: a route parameter of 128 bytes or more is silently dropped, and the handler runs anyway
+
+`Request.pvals` holds 8 values of 128 bytes. `Router.matches` decodes into it, and `dispatch` ignores the answer of the second call
+(`matches(r, req, true);`), so with a longer value the route is **still dispatched**, but with `nparams == 0`: `param("id")` is `null`. The same happens to the `*` rest of a
+pattern such as `/files/*` (a file path of 128 bytes is not unusual). A handler that does `strlen(x->req->param("id"))` or `strcpy(buf, param)` crashes on a URL
+that anybody can send; `printf("%s", null)` prints `(null)` and hides it. Expected: 404 (or 414), or the full value.
+
+```c
+import httpx;
+int h(httpx.Context* x) { char* id = x->req->param("id"); printf("%s\n", id == null ? "(null)" : id); x->res->text(200, "ok"); return 0; }
+int main() {
+    httpx.Router* r = new httpx.Router();  r->get("/u/:id", h);
+    for (int n = 127; n <= 128; n++) {
+        char* raw = alloc(400);  char* path = alloc(300);  strcpy(path, "/u/");
+        for (int i = 0; i < n; i++) strcat(path, "a");
+        format(raw, 400, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+        httpx.RequestParser* p = httpx.newParser();  httpx.Request* q = httpx.newRequest();  httpx.Response* res = httpx.newResponse();
+        p->reset(q);  p->feed(raw, strlen(raw));  r->handle(q, res);
+        printf("length %d -> status %d\n", n, res->status);        // 127: the value, 200.  128: (null), still 200
+    }
+    return 0;
+}
+```
+
+The chapter now says so under "Limits and traps" (checked with 126, 127, 128, 129 bytes and with a 150 byte `*`).
+
+#### 7. `wshub.Hub`: raising `maxClients` after `listen` is ignored
+
+`listenOn` clamps `maxClients` to 1 .. 1000 and sizes the poll tables with it (`capClients`); the accept check is `nclients >= maxClients || nclients >= capClients`. Lowering it
+later works (the chapter's sample sets it before `listenOn`), raising it does nothing. Neither the header comment nor `docs/NET.md` says "set it before you listen".
+
+```c
+wshub.Hub* hub = new wshub.Hub();  hub->maxClients = 1;  hub->listenOn("127.0.0.1", 0, null);
+hub->maxClients = 5;                                   // too late
+// two websocket.connect calls (with net.setIdleHook(serve) running hub->poll(0)): the second gets HTTP 503, not a connection
+```
+
+#### 8. `websocket.Options o;` (no parentheses) is a client that does not verify certificates
+
+The constructor sets `verify = verifyTls` (true), the timeouts and the limits. A zeroed object has `verify` false and every timeout and limit 0: a `wss://` connection would
+not check the server certificate, and `connectWith` on a plain `ws://` fails with `the handshake took too long` (handshakeTimeoutMs 0). It is the general rule of chapter 15
+(only a declaration with parentheses, or `new`, runs the constructor), but for `verify` the zero is the unsafe value. The chapter now has a sentence.
+
+```c
+websocket.Options o;                                   // zeroed: o.verify 0, o.maxMessage 0, o.connectTimeoutMs 0
+websocket.WebSocket* ws = websocket.connectWith("ws://127.0.0.1:PORT/", &o);   // null: "the handshake took too long"
+```
+
+#### 9. Smaller things
+
+* **`setStreamHandler` flags.** `docs/NET.md` and the header say "flags: 1 first, 2 last". What happens: the data pieces come with 1 for the first and 0 after it, and the **end is always one more
+  empty piece with flag 2**; an empty message and a compressed one (it is inflated in memory first) arrive as one piece with the flags 3. (Run with `feed` on two `create(null, ...)` objects.)
+* **`CookieJar.store` returns `true` while it throws away the oldest cookie** of a host once there are 50 (300 cookies stored: 300 times `true`, `n == 50`, `c0` gone, `c299` there).
+* **`closeWith(0, ...)` and `closeWith(1005, ...)`** are accepted and send a close frame without a code (`docs/NET.md`: "accepts the codes 1000-1003, 1007-1014 and 3000-4999").
+* **Table sizes that only the source comments mention** (not `docs/NET.md`): 128 routes and 16 middleware per `httpx.Router`, 64 methods per `jsonrpc.Dispatcher` (`add` returns `false`), 128 sockets per `conn.Poller`,
+  256 cookies in a jar. All return `false` when full; nothing says so in the chapters' samples.
+* **`lib/httpx.a` header comment** shows `c->downloadTo(url, "file.bin", &got)`; the real signature is `downloadTo(url, path, resume, &written)`.
+* **`websocket` key and mask fall back to `rand()`** (unseeded) when `secure.bytes` fails (lines 902 and 1886). Only if the operating system's generator is unusable; then masks and the handshake key
+  are predictable. The chapter says they come from the operating system's generator, which is true as long as that works.
+* **Sample `hub_rooms`** copied the path of every client with `strcpy` into a 40 byte block (a path of 40 bytes or more overflows it: `Client.path` holds up to 255) and `strdup`ed every message
+  (`alloc` never gives memory back, so a hub that runs for days grows). Fixed in the sample (`c->user = &c->path[1]`, a bounded `format` into a local buffer); the output did not change.
+* `sse.eventText` and `commentText` return heap strings (`malloc`): `free` them. The header comments say "heap string"; the chapter did not say what to do with it, and the sample `sse_wire` does not free them.

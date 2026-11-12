@@ -80,6 +80,8 @@ Nothing here was fixed by the book work: `lib/` and `src/` were left alone on pu
 | `ds.BitSet`: a zeroed `BitSet` ignores `set()` out of range although `docs/ALGO.md` says it grows; `strx.LineDiff d();` says "this class has no constructor"; `LruCache.dispose()` also calls the eviction handler | NOTES-algo |
 | `static_assert(sizeof(ThisClass) ...)` placed before the class's last field gives contradictory answers (both `==` 16 and `!= 16` fail for a 16-byte class); put it after the last field | NOTES-lang2 |
 | A function (not only a variable or field) named `rev` turns `foreach (x in rev a)` into the error `foreach needs an array, a range ...`; "does not implement the abstract method" points at the token after the class and does not name the class | NOTES-lang2 |
+| `httpx.Router`: a `:param` or `*` value of 128 bytes or more is silently dropped but the route still runs with `param()` null (a handler that does `strlen` or `strcpy` on it crashes on a long URL); `wshub`: raising `maxClients` after `listen()` is ignored; a zeroed `websocket.Options o;` means `verify` false and all time-outs 0 | NOTES-web 6 to 8 |
+| `ds` containers passed or assigned **by value** share their buffers, and when the copy grows it frees the original's buffer; `strx.levenshtein` and `lcsLength` are documented as O(min) memory but decode both texts first (about 8 bytes per input byte) | NOTES-algo |
 | `docs/ALGO.md`: the `splitLines` + `run` example drops the no-newline flags (its patch differs from `diff -u`); `lib/strx.a` mentions `LineDiff.EQUAL` constants that do not exist; the "five targets" claim is stale; no callback signatures are given | NOTES-algo |
 
 ## What the book work verified and found *correct*
