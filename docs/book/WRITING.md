@@ -177,3 +177,42 @@ Work out the coordinates from the layout (window at 40,74 + padding + spacing + 
 it and read the pixels off. **Look at every picture** (the Read tool shows images): empty windows, clipped text and a window that is too
 small are all possible, and the tool cannot tell. Tell the build nothing else: `build.py` takes `shots/GROUP-NAME.png` where a chapter says
 `{{shot group/name}}`.
+
+## 7. Terminal samples
+
+A full screen program (the terminal UI toolkit, `import tui;` / `import term;`) cannot run in the plain checker: it needs a terminal. Mark it
+`// book: tui` (add `compile-only` on the same line, `// book: tui compile-only`, so that every version of `samples.py` only compiles it) and
+write two files next to it:
+
+* `NAME.keys` - what the "user" does, one token per line (the vocabulary below);
+* `NAME.screen` - the result, written by `tools/tuishot.py`: the final screen of an **80 x 24** terminal as plain text (trailing blanks
+  trimmed, no escape sequences, so colours and the cursor are not part of it). A chapter shows it with the line `{{screen tui/name}}`
+  after the listing.
+
+```sh
+python3 docs/book/tools/tuishot.py --update tui/hello      # build, run in a pseudo terminal, feed NAME.keys, record NAME.screen (twice: both runs must agree)
+python3 docs/book/tools/tuishot.py tui                     # compare with the recorded screens (exit status 1 when one differs)
+```
+
+`tuishot.py` compiles the sample, starts it in a pseudo terminal of 80 x 24 (the terminal emulator of `tests/tui/ptyterm.py`, `TERM=xterm-256color`,
+`LANG=C.UTF-8`, `HOME` and the working directory = the empty directory `/tmp/tuishot/run`, so a file dialog shows the same path everywhere),
+waits until the program has been quiet for 250 ms after every token, and records the screen at the end. Look at the `.screen` file after you
+recorded it, like a `.out` file. Things that change from run to run (a clock, a progress bar driven by a timer) must not be on the screen.
+A program that is not a terminal program of the toolkit but still wants a plain screen can use `App.initHeadless` instead: it runs in the
+normal checker and prints `app->text()` (no `tui` directive).
+
+Tokens of a `.keys` file (`#` starts a comment line, blank lines are ignored; everything after the first colon is the argument, blanks included):
+
+| Token | Meaning |
+|---|---|
+| `text:hello world` | type the text (UTF-8 is fine) |
+| `key:enter` | one key: `enter tab esc backspace space delete insert home end pgup pgdn up down left right f1`..`f12`, `minus`, or one character |
+| `key:ctrl-x`, `key:alt-f`, `key:shift-tab`, `key:ctrl-alt-up` | a key with modifiers (`ctrl`, `alt`, `shift`, joined with `-`; `ctrl` works with letters, `[ \ ] ^ _ / space`) |
+| `wait:200` | wait this many milliseconds (then the usual quiet wait follows) |
+| `click:10,5` / `rclick:10,5` | click with the left / right button at column 10, row 5 (cells counted from 0, SGR mouse reports) |
+| `press:X,Y`, `drag:X,Y`, `release:X,Y` | the three parts of a drag with the left button |
+| `wheel-up:X,Y` / `wheel-down:X,Y` | one wheel step |
+| `paste:text` | a bracketed paste (the program must have switched bracketed paste on, which `App.start()` does) |
+| `resize:100,30` | change the window size (`TIOCSWINSZ` + `SIGWINCH`); the recorded screen has the new size |
+| `expect:text` / `gone:text` | wait (at most 6 s) until the text is on the screen / no longer there; an error otherwise. Use it where a program needs real time (a child process that ends) |
+| `env:NAME=value` | set an environment variable for the program (before it starts), for example `env:TERM=linux`, `env:TUI_ASCII=1`, `env:NO_COLOR=1` |

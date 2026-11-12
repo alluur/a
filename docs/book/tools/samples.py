@@ -14,6 +14,8 @@ The first lines of a sample may carry directives in comments:
     // book: args=one two        command line arguments
     // book: sorted              compare the lines of the output in sorted order (threads)
     // book: linux-only          the program needs Linux (fork, signals, /proc ...): --targets builds only the Linux targets
+    // book: link                (directory samples) separate compilation: every .a file of the directory is compiled with -c to an
+                                 object, then main.a's object and the others are linked (headers next to them are #included as usual)
 Next to the program:  NAME.in is read as standard input, NAME.out is the expected standard output.
 The program runs in a scratch copy of its directory, so it may create files.
 
@@ -102,14 +104,29 @@ def run_one(path, ac, update, targets, verbose):
                     shutil.copy(path[:-2] + ext, work)
         prog = os.path.join(work, "main.a" if multi else os.path.basename(path))
         exe = os.path.join(work, "prog.elf")
-        r = subprocess.run([ac, prog, "-o", exe], cwd=work, capture_output=True, text=True, timeout=120)
+
+        def build(target, out):
+            targ = ["-t", target] if target else []
+            if d.get("link") and multi:
+                units = [prog] + sorted(os.path.join(work, f) for f in os.listdir(work) if f.endswith(".a") and f != "main.a")
+                objs = []
+                for i, u in enumerate(units):
+                    o = os.path.join(work, "u%d-%s.ao" % (i, target or "linux"))
+                    r = subprocess.run([ac] + targ + ["-c", u, "-o", o], cwd=work, capture_output=True, text=True, timeout=120)
+                    if r.returncode != 0:
+                        return r
+                    objs.append(o)
+                return subprocess.run([ac] + targ + objs + ["-o", out], cwd=work, capture_output=True, text=True, timeout=120)
+            return subprocess.run([ac] + targ + [prog, "-o", out], cwd=work, capture_output=True, text=True, timeout=120)
+
+        r = build(None, exe)
         if r.returncode != 0:
             return name, False, "compile error:\n" + (r.stderr or r.stdout)[:1500]
         if targets:
             for t in TARGETS[1:]:
                 if d.get("linux-only") and not t.startswith("linux"):
                     continue
-                r = subprocess.run([ac, "-t", t, prog, "-o", os.path.join(work, "x-" + t)], cwd=work, capture_output=True, text=True, timeout=120)
+                r = build(t, os.path.join(work, "x-" + t))
                 if r.returncode != 0:
                     return name, False, "compile error for target %s:\n%s" % (t, (r.stderr or r.stdout)[:1500])
         if d.get("compile-only") or d.get("gui"):

@@ -365,4 +365,5 @@ A looks like C, and most C knowledge carries over. This table lists what is diff
 
 - [First programs](#chap-first-programs) covers the output, input and file functions in detail.
 - [Types and values](#chap-types-and-values) and [Memory and pointers](#chap-memory-and-pointers) explain the types behind these functions.
+- [Text and strings](#chap-text-and-strings), [collections and algorithms](#chap-collections-and-algorithms) and [numbers](#chap-numbers) continue with the library modules.
 - The API reference of the library modules starts with [strings](#api-strings), [collections](#api-collections) and [math](#api-math).

@@ -27,7 +27,7 @@ All collections live in the module `collections`. Objects can be created on the 
 
 Three rules hold for all of them:
 
-* **No errors, only defaults.** Reading outside a list or from an empty queue does not crash: it returns 0 (or `null` for strings) and changes nothing. Use `size()` and `isEmpty()` when 0 is a valid value.
+* **No errors, only defaults.** Reading outside a list or from an empty queue does not crash: it returns 0 (or `null` for strings) and changes nothing. Use `size()` (or `isEmpty()`, which the lists of ints, the queue, the heap and the priority queue have) when 0 is a valid value.
 * **Memory is never freed** (see [memory and pointers](#chap-memory-and-pointers)). When a collection grows it leaves the old storage behind, which is fine for programs that finish and worth knowing for programs that run for days.
 * **They store `int` and `char*` only.** To keep a struct, store a pointer to it as an `int`, or keep the structs in an array and store the index.
 
@@ -38,7 +38,7 @@ Three rules hold for all of them:
 What to notice:
 
 * `push` and `pop` work at the end, so an `IntList` is also a stack. `insert(i, v)` and `removeAt(i)` shift the elements after `i`, which costs time proportional to the length.
-* `get(100)` on a list of five elements returns 0, and `set` with a bad index does nothing.
+* `get(100)` on a short list returns 0, and `set` with a bad index does nothing. `insert` and `removeAt` with a bad index do nothing either (`removeAt` returns 0).
 * `items()` returns the raw array. That is how you hand a list to `sort.sortInts`. The pointer is only valid until the next `push`, because the storage may move.
 
 {{sample collections/strlist}}
@@ -47,6 +47,7 @@ What to notice:
 
 * A `StrList` keeps the **pointers** you give it. It does not copy the text, so the strings must stay alive and unchanged while they are in the list.
 * `get` and `pop` return `null` for a bad index or an empty list.
+* A `StrList` can do less than an `IntList`: `push`, `pop`, `get`, `size`, `indexOf`, `clear` and `items`. There is no `set`, `insert` or `removeAt`.
 * `items()` is a `char**`, which is exactly what `sort.sortStrings` wants.
 
 ### Maps: `StrMap` and `IntMap`
@@ -75,7 +76,7 @@ What to notice:
 
 What to notice:
 
-* `add` twice keeps one element. `has` and `remove` work like the map functions.
+* `add` twice keeps one element. `has` and `remove` work like the map functions, and `remove` returns true when the element was there.
 * A `StrSet` copies the text; the sample reuses one buffer for all five words.
 * To walk a set use `capacity()` and the slot functions: `usedAt(s)` and `valueAt(s)` for an `IntSet`, `valueAt(s) != null` for a `StrSet`.
 
@@ -107,7 +108,7 @@ See the [API reference of `collections`](#api-collections).
 |---|---|
 | `sortInts(a, n)` | ascending, in place (a quicksort that finishes small ranges with insertion sort) |
 | `reverseInts(a, n)` | reverses the array |
-| `isSorted(a, n)` | true when the array is ascending |
+| `isSorted(a, n)` | true when the array is in ascending order (equal neighbours are fine) |
 | `binarySearch(a, n, key)` | the index of `key` in a sorted array, or -1 |
 | `sortStrings(a, n)` | alphabetical by byte value, in place; the strings are not copied |
 
@@ -124,7 +125,7 @@ What to notice:
 
 * The order is by byte value, so all capital letters come before all lower case letters.
 * `sortStrings` is an insertion sort: fine for hundreds of strings, slow for tens of thousands.
-* For a case-blind order, sort lower-case copies, as the sample does, or sort an array of indexes with `algo.sortBy` and your own comparison.
+* For a case-blind order, sort lower-case copies, as the sample does, or sort an array of indexes with `algo.sortBy` and a comparator that looks the strings up by index.
 
 See the [API reference of `sort`](#api-sort).
 
@@ -139,9 +140,10 @@ See the [API reference of `sort`](#api-sort).
 What to notice:
 
 * `sortBy(a, n, cmp)` is a **stable** merge sort: elements that compare equal keep their order (31 before 91, 12 before 22). The comparator is passed as a function name.
-* `lowerBound(a, n, key)` is the first index whose element is `>= key` and `upperBound` the first that is `> key`; the difference is the number of equal elements (`countEqual`). Both need a sorted array and return `n` when nothing is larger.
+* `lowerBound(a, n, key)` is the first index whose element is `>= key` and `upperBound` the first that is `> key`; the difference is the number of equal elements (`countEqual`). Both need a sorted array and return `n` when there is no such element.
 * `unique` removes repeated neighbours of a sorted array and returns the new length.
-* `rotate`, `kthSmallest` (a quickselect: it does not sort everything), `partition` (the elements below a pivot first, no other order promised) and `nextPermutation` change the array in place. `nextPermutation` returns false after the last arrangement and leaves the array sorted again, so a `do ... while` loop visits all permutations once.
+* `sortDesc(a, n)` is the same stable sort in descending order.
+* `rotate(a, n, k)` moves every element `k` places to the left. `kthSmallest(a, n, k)` returns the element that would be at index `k` (counting from 0) after sorting; it is a quickselect, so it does not sort everything. `partition` (the elements below a pivot first, no other order promised) and `nextPermutation` change the array in place (`kthSmallest` rearranges it). `nextPermutation` returns false after the last arrangement and leaves the array sorted again, so a `do ... while` loop visits all permutations once.
 
 ### Sequences and strings
 
@@ -149,10 +151,10 @@ What to notice:
 
 What to notice:
 
-* `maxSubarray` (the best run of neighbours), `lis` (longest increasing subsequence), `knapsack` and `lcsLength` are the classic dynamic programming problems.
+* `maxSubarray` (the largest sum of consecutive elements), `lis` (the length of the longest strictly increasing subsequence), `knapsack` (the 0/1 version: every item is taken once or not at all) and `lcsLength` (the longest common subsequence) are the classic dynamic programming problems.
 * `editDistance` is the Levenshtein distance: the fewest insertions, deletions and replacements that turn one text into the other.
-* `kmpFind` searches in linear time and returns the index or -1.
-* `sieve(limit, flags)` fills `flags[0..limit]` with 1 for primes and returns how many there are.
+* `kmpFind(text, pattern)` searches in linear time and returns the index of the first match or -1. `countOccurrences` counts matches that overlap, and `isSubsequence(small, big)` asks whether the letters of `small` appear in `big` in order, with gaps allowed.
+* `sieve(limit, flags)` fills `flags[0..limit]` with 1 for primes and returns how many there are. `flags` is a `char` array of `limit + 1` bytes.
 
 ### Union-find
 
@@ -172,14 +174,14 @@ What to notice:
 What to notice:
 
 * `edge(from, to, weight)` adds a directed edge, `undirected(a, b, w)` adds two. Nodes are numbered from 0.
-* `bfs` and `dfs` fill an array with the visiting order and return how many nodes they reached. Neighbours are visited in the order in which the edges were added.
+* `bfs` and `dfs` fill an array (it needs room for all the nodes) with the visiting order and return how many nodes they reached. Neighbours are visited in the order in which the edges were added.
 * `dijkstra(start, dist)` fills `dist` with the shortest distances (-1 for unreachable nodes). The weights must not be negative.
 * `topological(order)` returns false when the graph has a cycle: a build order does not exist then.
 * `components()` counts the connected components and follows every edge in both directions. `hasPath(a, b)` follows the edges in their own direction.
 
 ## Bits: `bits`
 
-The `bits` module is for code that cares about single bits: flags, hashes, protocols, bitboards. Every function works on exactly the width in its name and ignores the bits above.
+The `bits` module is for code that cares about single bits: flags, hashes, protocols, bitboards. The functions with a number in their name (`clz32`, `rotl32`, `bswap16`, ...) work on exactly that many bits and ignore the bits above. The others work on a whole 64 bit `int`.
 
 ### Counting
 
@@ -190,7 +192,7 @@ What to notice:
 * `popcount` counts the 1 bits, `parity` tells whether that number is odd, `clz` and `ctz` count leading and trailing zeros. `clz(0)` and `ctz(0)` are 64 (the full width), `log2(0)` is -1.
 * `log2(x)` is the position of the highest 1 bit, the integer part of the binary logarithm: `log2(1000)` is 9.
 * `isPow2`, `nextPow2` (the smallest power of two that is not smaller than `x`) and `mask(n)` (the `n` lowest bits set) are the usual helpers for buffer sizes and masks.
-* The `32`-suffixed versions (`clz32`, `ctz32`) work on 32 bits.
+* The `32`-suffixed versions (`clz32`, `ctz32`) work on 32 bits, so `clz32(0)` and `ctz32(0)` are 32.
 
 ### Rotating, swapping and reversing
 
@@ -208,7 +210,7 @@ What to notice:
 
 What to notice:
 
-* `set`, `clear`, `flip` and `get` work on bit number `i` (0 is the lowest) of an `int`. They return the new value; they do not change a variable.
+* `set`, `clear`, `flip` and `get` work on bit number `i` (0 is the lowest) of an `int`. `set`, `clear` and `flip` return the new value; they do not change a variable. `get` returns 0 or 1.
 * `field(x, lo, n)` extracts `n` bits starting at bit `lo`, `insert(x, lo, n, v)` replaces them. The RGB565 colour in the sample shows why: 5 + 6 + 5 bits in one 16 bit number.
 * `signExtend(x, n)` reads the low `n` bits as a signed number: the sensor value `0xFF6` is -10 in 12 bits. `fitsSigned` and `fitsUnsigned` tell whether a value fits into `n` bits.
 * `udiv`, `umod` and `ucmp` treat plain `int` values as unsigned 64 bit numbers. (A `uint64` variable does this by itself.)
@@ -248,8 +250,8 @@ What to notice:
 What to notice:
 
 * `humanSize` uses powers of 1024 (`KiB`, `MiB`), `humanSizeSI` powers of 1000 (`kB`, `MB`).
-* `parseSize` understands what people type: `10MB` is 10,000,000, `10M` and `10MiB` are 10,485,760, a blank and a decimal point are fine (`1.5G`), and -1 means "not a size".
-* `hex` and `fromHex` convert bytes to hexadecimal text and back; `fromHex` gives the byte count through a pointer. `hexdump` produces the classic listing with offsets, bytes and printable characters, which is what you want in a debugging session.
+* `parseSize` understands what people type: `10MB` is 10,000,000, `10M` and `10MiB` are 10,485,760, a blank and a decimal point are fine (`1.5G`), a plain number is a number of bytes, and -1 means "not a size".
+* `hex` and `fromHex` convert bytes to hexadecimal text and back; `fromHex` gives the byte count through a pointer, skips blanks, and returns `null` for a bad digit or an odd number of digits. `hexdump` produces the classic listing with offsets, bytes and printable characters, which is what you want in a debugging session.
 
 See the [API reference of `bytebuf`](#api-bytebuf).
 
@@ -259,12 +261,12 @@ See the [API reference of `bytebuf`](#api-bytebuf).
 * Maps and sets are walked slot by slot (`capacity`, `keyAt`, `usedAt`) in hash order. Sort the keys when you need a stable listing.
 * `sort` sorts ints and strings in place; `algo.sortBy` takes a comparator and is stable.
 * `algo` has binary search helpers, permutations, dynamic programming, string distance, a prime sieve, union-find and a graph class with BFS, DFS, Dijkstra and topological order.
-* `bits` counts, rotates, swaps and extracts bits on exactly the width in each function's name.
+* `bits` counts, rotates, swaps and extracts bits; a number in a function's name is the exact width it works on.
 * `bytebuf` reads and writes integers in big or little endian, builds messages with `Buf` and parses them with the range-checked `Reader`.
 
 ## Where next
 
 * [Numbers](#chap-numbers): the number types beyond `int`.
-* [Data formats](#chap-data-formats): JSON, CSV, tar and zlib build on `bytebuf` and `collections`.
+* [Data formats](#chap-data-formats): JSON, CSV, tar archives and zlib, which work with the same kind of byte data.
 * [Text and strings](#chap-text-and-strings): splitting and searching the text that goes into these collections.
 * API references: [`collections`](#api-collections), [`sort`](#api-sort), [`algo`](#api-algo), [`bits`](#api-bits), [`bytebuf`](#api-bytebuf).

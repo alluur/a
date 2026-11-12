@@ -116,7 +116,7 @@ def sample_files(name):
     d = os.path.join(SAMPLES, name)
     if os.path.isdir(d):
         main = os.path.join(d, "main.a")
-        others = sorted(f for f in os.listdir(d) if f.endswith(".a") and f != "main.a")
+        others = sorted(f for f in os.listdir(d) if f.endswith((".a", ".h", ".am")) and f != "main.a")
         return main, [os.path.join(d, f) for f in others], os.path.join(d, "main.out")
     p = os.path.join(SAMPLES, name + ".a")
     return p, [], os.path.join(SAMPLES, name + ".out")
