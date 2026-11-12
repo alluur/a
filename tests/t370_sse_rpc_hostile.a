@@ -1,0 +1,246 @@
+// Regression tests for review findings on sse and jsonrpc: an event stream that starts with an empty line used to crash the parser (null line buffer), an
+// empty "event:" field must give the type "message", header names are not case sensitive and a very long Content-Type must not hurt the client, a
+// redirect may be relative; JSON-RPC refuses NUL (a \u0000 escape cut a method name short: "ad\u0000d" ran "add") and bad UTF-8
+import sse;
+import jsonrpc;
+import json;
+import conn;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// feeds the text in pieces of the given size and returns the events as "name|data|id;" text
+char* events(char* text, int n, int piece) {
+    sse.Parser* p = sse.newParser();
+    char* out = malloc(3000);
+    out[0] = 0;
+    int off = 0;
+    while (off < n) {
+        int take = n - off;
+        if (take > piece) take = piece;
+        int r = p->feed(&text[off], take);
+        off = off + (r > 0 ? r : take);
+        sse.Event* e = p->take();
+        while (e != null) {
+            strcat(out, e->event);
+            strcat(out, "|");
+            strcat(out, e->data);
+            strcat(out, "|");
+            strcat(out, e->id);
+            strcat(out, ";");
+            e->dispose();
+            e = p->take();
+        }
+    }
+    p->dispose();
+    return out;
+}
+
+// the same text in pieces of 1, 3 and 1000 bytes must give the same events
+bool same(char* text, char* want) {
+    int n = strlen(text);
+    char* a = events(text, n, 1);
+    char* b = events(text, n, 3);
+    char* c = events(text, n, 1000);
+    bool ok = streq(a, want) && streq(b, want) && streq(c, want);
+    if (!ok) printf("   \"%s\" gave \"%s\" / \"%s\" / \"%s\", wanted \"%s\"\n", text, a, b, c, want);
+    return ok;
+}
+
+// ---- a scripted server: the n-th connection gets the n-th canned answer, then it hangs up
+conn.Listener* script;
+conn.Connection* scriptConn = null;
+char* replies[4];
+int nextReply = 0;
+int served = 0;
+
+int step() {
+    if (scriptConn == null) scriptConn = script->accept(0);
+    if (scriptConn != null && scriptConn->readable(0)) {
+        char line[300];
+        while (scriptConn->buffered() > 0 || scriptConn->readable(0)) {
+            int n = scriptConn->readLine(&line[0], 300);
+            if (n < 0) { scriptConn->close(); scriptConn = null; break; }
+            if (n == 0) {
+                char* r = replies[nextReply < 3 ? nextReply : 3];
+                nextReply++;
+                scriptConn->write(r, strlen(r));
+                scriptConn->flush();
+                served++;
+                scriptConn->close();
+                scriptConn = null;
+                break;
+            }
+        }
+    }
+    return 0;
+}
+
+char* aaa(int n) {
+    char* s = malloc(n + 1);
+    for (int i = 0; i < n; i++) s[i] = 'a';
+    s[n] = 0;
+    return s;
+}
+
+// a client for the n-th scripted answer
+sse.Client* clientFor(int port) {
+    char url[100];
+    format(&url[0], 100, "http://127.0.0.1:%d/events", port);
+    sse.Client* c = new sse.Client(&url[0]);
+    c->maxRetries = 0;
+    c->retryMs = 20;
+    return c;
+}
+
+// ---- JSON-RPC
+int called = 0;
+json.Json* add(jsonrpc.Call* c) {
+    called++;
+    json.Json* a = c->param(0, "a");
+    json.Json* b = c->param(1, "b");
+    if (a == null || b == null) { c->fail(jsonrpc.INVALID_PARAMS, "need a and b", null); return null; }
+    return json.newInt(a->asInt() + b->asInt());
+}
+json.Json* echo(jsonrpc.Call* c) {
+    called++;
+    json.Json* a = c->param(0, "text");
+    if (a == null) return json.newNull();
+    return json.newString(a->asString());
+}
+
+char* run(jsonrpc.Dispatcher* d, char* text, int n) {
+    int outLen;
+    char* r = d->handleText(text, n, &outLen);
+    if (r == null) return "(none)";
+    char* copy = strdup(r);
+    free(r);
+    return copy;
+}
+
+int main() {
+    // ===== 1. the parser
+    check("a stream that starts with LF (this used to crash)", same("\ndata: x\n\n", "message|x|;"));
+    check("... with CRLF", same("\r\ndata: x\r\n\r\n", "message|x|;"));
+    check("... with CR", same("\rdata: x\r\r", "message|x|;"));
+    check("several empty lines first", same("\n\n\r\n\ndata: a\n\n", "message|a|;"));
+    check("a comment, then an empty line", same(":hi\n\ndata: a\n\n", "message|a|;"));
+    check("a BOM and then an empty line", same("\xEF\xBB\xBF\ndata: a\n\n", "message|a|;"));
+    check("nothing but empty lines gives no event", same("\n\n\n", ""));
+    check("an empty event name means message", same("event: \ndata: a\n\n", "message|a|;"));
+    check("an event line without a colon: the name is empty, so message", same("event\ndata: a\n\n", "message|a|;"));
+    check("event: ping", same("event: ping\ndata: a\n\n", "ping|a|;"));
+    check("the name is for one event only", same("event: a\ndata: 1\n\ndata: 2\n\nevent: \ndata: 3\n\n", "a|1|;message|2|;message|3|;"));
+    check("an id and data", same("id: 7\ndata: a\n\n", "message|a|7;"));
+    sse.Parser* p = sse.newParser();
+    p->feed("data: one\n\n", 11);
+    p->restart();
+    p->feed("\ndata: two\n\n", 12);
+    sse.Event* e = p->take();
+    sse.Event* e2 = p->take();
+    check("after restart() (a reconnect) an empty line first is fine too", e != null && streq(e->data, "one") && e2 != null && streq(e2->data, "two"));
+    if (e != null) e->dispose();
+    if (e2 != null) e2->dispose();
+    p->dispose();
+
+    // ===== 2. the client against a scripted server
+    script = new conn.Listener(0);
+    int port = script->port();
+    net.setIdleHook(step);
+    replies[0] = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\ndata: first\n\ndata: second\n\n";
+    sse.Client* c = clientFor(port);
+    e = c->next(2000);
+    check("a stream that starts with an empty line: the client gets the event (it used to crash)", e != null && streq(e->data, "first") && streq(e->event, "message"));
+    if (e != null) e->dispose();
+    e = c->next(2000);
+    check("... and the next", e != null && streq(e->data, "second"));
+    if (e != null) e->dispose();
+    c->close();
+    c->dispose();
+
+    nextReply = 0;
+    replies[0] = "HTTP/1.1 200 OK\r\nCONTENT-TYPE: text/event-stream\r\nTRANSFER-ENCODING: chunked\r\nConnection: close\r\n\r\n12\r\nevent: x\ndata: y\n\n\r\n0\r\n\r\n";
+    c = clientFor(port);
+    e = c->next(2000);
+    check("header names in capitals: the content type and the chunked framing are understood", e != null && streq(e->event, "x") && streq(e->data, "y"));
+    if (e != null) e->dispose();
+    c->close();
+    c->dispose();
+
+    nextReply = 0;
+    char* long1 = aaa(1000);                       // (a header line may be 1023 bytes: more is an error of its own)
+    char* long2 = aaa(900);
+    char* r1 = malloc(2500);
+    format(r1, 2500, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; x=%s\r\nLocation: %s\r\nConnection: close\r\n\r\ndata: ok\n\n", long2, long1);
+    replies[0] = r1;
+    c = clientFor(port);
+    e = c->next(2000);
+    check("a Content-Type of 900 bytes and a Location of 1000 bytes do not overflow anything", e != null && streq(e->data, "ok"));
+    if (e != null) e->dispose();
+    c->close();
+    c->dispose();
+
+    nextReply = 0;
+    replies[0] = "HTTP/1.1 302 Found\r\nLocation: next\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    replies[1] = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: after redirect\n\n";
+    c = clientFor(port);
+    e = c->next(2000);
+    check("a relative Location is followed", e != null && streq(e->data, "after redirect") && served >= 5);
+    if (e != null) e->dispose();
+    c->close();
+    c->dispose();
+
+    nextReply = 0;
+    replies[0] = "HTTP/1.1 302 Found\r\nLocation: ftp://example.org/stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    c = clientFor(port);
+    e = c->next(2000);
+    check("a redirect to another scheme is refused", e == null && c->closed);
+    c->dispose();
+    net.setIdleHook(null);
+
+    // ===== 3. JSON-RPC: NUL and bad UTF-8
+    jsonrpc.Dispatcher* d = new jsonrpc.Dispatcher();
+    d->add("add", add);
+    d->add("echo", echo);
+    char* ok = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":1}", -1);
+    check("add works", streq(ok, "{\"jsonrpc\":\"2.0\",\"result\":3,\"id\":1}") && called == 1);
+    char* nul = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"ad\\u0000d\",\"params\":[1,2],\"id\":2}", -1);
+    check("a method name with \\u0000 does not run 'add': Parse error", contains(nul, "-32700") && called == 1);
+    char* nul2 = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"add\\u0000\",\"params\":[1,2],\"id\":3}", -1);
+    check("... a \\u0000 at the end neither", contains(nul2, "-32700") && called == 1);
+    char* nul3 = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[\"x\\u0000y\",2],\"id\":4}", -1);
+    check("... in a parameter: Parse error as well (a C string cannot hold it)", contains(nul3, "-32700") && called == 1);
+    char* esc = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"add\\\\u0000\",\"params\":[1,2],\"id\":5}", -1);
+    check("an escaped backslash followed by u0000 is not a NUL: the method is just unknown", contains(esc, "-32601") && called == 1);
+    char* esc2 = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":\"a\\\\u0000\"}", -1);
+    check("... in an id too", contains(esc2, "\"result\":3") && called == 2);
+    char* raw = malloc(100);
+    strcpy(raw, "{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":6}");
+    int rl = strlen(raw);
+    raw[10] = 0;
+    char* rawResult = run(d, raw, rl);
+    check("a NUL byte inside the text: Parse error", contains(rawResult, "-32700") && called == 2);
+    char* bad1 = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":[\"\xff\"],\"id\":7}", -1);
+    check("a byte that is no UTF-8: Parse error", contains(bad1, "-32700") && called == 2);
+    char* bad2 = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":[\"\xc0\x80\"],\"id\":8}", -1);
+    check("an overlong NUL (C0 80): Parse error", contains(bad2, "-32700") && called == 2);
+    char* bad3 = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":[\"\xed\xa0\x80\"],\"id\":9}", -1);
+    check("a UTF-16 surrogate encoded in UTF-8 (ED A0 80): Parse error", contains(bad3, "-32700") && called == 2);
+    char* good = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":[\"h\xc3\xa9llo \xe2\x82\xac \xf0\x9f\x98\x80\"],\"id\":10}", -1);
+    check("real UTF-8 (2, 3 and 4 byte characters) goes through", contains(good, "h\xc3\xa9llo \xe2\x82\xac \xf0\x9f\x98\x80") && called == 3);
+    char* unicodeEsc = run(d, "{\"jsonrpc\":\"2.0\",\"method\":\"echo\",\"params\":[\"\\u00e9\"],\"id\":11}", -1);
+    check("a \\u escape of an ordinary character is fine", contains(unicodeEsc, "\"result\"") && called == 4);
+    char* batch = run(d, "[{\"jsonrpc\":\"2.0\",\"method\":\"ad\\u0000d\",\"params\":[1,2],\"id\":1},{\"jsonrpc\":\"2.0\",\"method\":\"add\",\"params\":[1,2],\"id\":2}]", -1);
+    check("a batch with a NUL in one request: the whole text is a Parse error, nothing runs", contains(batch, "-32700") && called == 4);
+    printf("failures: %d\n", fails);
+    return fails;
+}

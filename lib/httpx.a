@@ -1579,10 +1579,11 @@ public void serveFile(Request* req, Response* res, char* root, StaticOptions* o)
         int ad = 0;
         int bd = 0;
         int i = 0;
-        while (isDigit(r[i]) && ad < 18) { a = a * 10 + (r[i] - '0'); i++; ad++; }
+        // the numbers stop growing at 10^18 (far beyond any file): a long run of digits is a huge number, not an invalid range
+        while (isDigit(r[i])) { a = a < 100000000000000000 ? a * 10 + (r[i] - '0') : 1000000000000000000; i++; ad++; }
         bool dash = r[i] == '-';
         if (dash) i++;
-        while (isDigit(r[i]) && bd < 18) { b = b * 10 + (r[i] - '0'); i++; bd++; }
+        while (isDigit(r[i])) { b = b < 100000000000000000 ? b * 10 + (r[i] - '0') : 1000000000000000000; i++; bd++; }
         if (!dash || r[i] != 0 || (ad == 0 && bd == 0)) {
             useRange = false;                           // not a valid range: ignored
         } else if (ad == 0) {
@@ -1705,6 +1706,22 @@ public bool parseUrl(char* s, Url* u) {
 // resolves a Location (absolute URL, //host/path, /path, relative path, ?query) against the URL of the request. A heap string, null if it cannot be done
 public char* resolveUrl(char* base, char* ref) {
     if (startsWith(ref, "http://") || startsWith(ref, "https://")) return dupStr(ref);
+    // a scheme (letters, digits, + - . and a colon before any / ? #): http and https in any letter case are followed, every other one (ftp:, file:,
+    // javascript:, data: ...) is refused and not taken for a relative path
+    int sc = 0;
+    while (isAlpha(ref[sc]) || (sc > 0 && (isDigit(ref[sc]) || ref[sc] == '+' || ref[sc] == '-' || ref[sc] == '.'))) sc++;
+    if (sc > 0 && ref[sc] == ':') {
+        char low[8];
+        if (sc >= 6) return null;
+        for (int k = 0; k < sc; k++) low[k] = toLower(ref[k]);
+        low[sc] = 0;
+        if (!(streq(&low[0], "http") || streq(&low[0], "https")) || ref[sc + 1] != '/' || ref[sc + 2] != '/') return null;
+        char* fixed = malloc(strlen(ref) + 1);
+        if (fixed == null) return null;
+        strcpy(fixed, ref);
+        for (int k = 0; k < sc; k++) fixed[k] = low[k];
+        return fixed;
+    }
     Url u;
     if (!parseUrl(base, &u)) return null;
     int cap = strlen(ref) + strlen(base) + 40;
@@ -1733,21 +1750,29 @@ public char* resolveUrl(char* base, char* ref) {
         format(out, cap, "%s%s%s", &hostPort[0], &dir[0], ref);
         return out;
     }
-    char merged[4200];
+    // the buffers live on the heap and are sized from what goes in: a Location line may be 8000 bytes, a stack array of a fixed size is not safe
+    int mcap = pq + strlen(ref) + 8;
+    char* merged = malloc(mcap);
+    char* result = malloc(mcap + 8);
+    if (merged == null || result == null) {
+        if (merged != null) free(merged);
+        if (result != null) free(result);
+        free(out);
+        return null;
+    }
     if (ref[0] == '/') {
-        strcpy(&merged[0], ref);
+        strcpy(merged, ref);
     } else {
         int slash = pq;
         while (slash > 0 && dir[slash - 1] != '/') slash--;
-        memcpy(&merged[0], &dir[0], slash);
+        memcpy(merged, &dir[0], slash);
         merged[slash] = 0;
-        strcat(&merged[0], ref);
+        strcat(merged, ref);
     }
-    // remove . and .. segments (RFC 3986 5.2.4)
-    char result[4200];
+    // remove . and .. segments (RFC 3986 5.2.4); the result is never longer than merged plus the closing slash
     int ro = 0;
     int i = 0;
-    int ml = strlen(&merged[0]);
+    int ml = strlen(merged);
     while (i < ml && merged[i] != '?') {
         // a segment starts at i (merged[i] == '/')
         int s = i + 1;
@@ -1770,8 +1795,10 @@ public char* resolveUrl(char* base, char* ref) {
     }
     if (ro == 0) { result[0] = '/'; ro = 1; }
     result[ro] = 0;
-    strcat(&result[0], &merged[i]);
-    format(out, cap, "%s%s", &hostPort[0], &result[0]);
+    strcat(result, &merged[i]);
+    format(out, cap, "%s%s", &hostPort[0], result);
+    free(merged);
+    free(result);
     return out;
 }
 
@@ -2648,10 +2675,11 @@ public class Client {
         Headers* hdr = copyHeaders(extra);
         int redirects = 0;
         bool crossSite = false;
+        bool dropCreds = false;                  // set at the first hop to another origin and kept: the client's default Authorization and Cookie stay home
         Url first;
         parseUrl(url, &first);
         for (;;) {
-            Reply* r = attempt(&m[0], cur, hdr, curBody, curLen, crossSite, started);
+            Reply* r = attempt(&m[0], cur, hdr, curBody, curLen, crossSite, dropCreds, started);
             if (r == null) { free(cur); hdr->dispose(); free(hdr); return null; }
             int st = r->status;
             char* loc = r->header("Location");
@@ -2693,6 +2721,7 @@ public class Client {
                 hdr->remove("Authorization");
                 hdr->remove("Cookie");
                 hdr->remove("Proxy-Authorization");
+                dropCreds = true;
             }
             if (!streq(&nu.host[0], &first.host[0])) crossSite = true;
             free(cur);
@@ -2711,12 +2740,12 @@ public class Client {
     }
 
     // one request with retries
-    private Reply* attempt(char* method, char* url, Headers* hdr, char* body, int bodyLen, bool crossSite, int started) {
+    private Reply* attempt(char* method, char* url, Headers* hdr, char* body, int bodyLen, bool crossSite, bool dropCreds, int started) {
         bool idempotent = streq(method, "GET") || streq(method, "HEAD") || streq(method, "PUT") || streq(method, "DELETE") || streq(method, "OPTIONS");
         bool canRetry = (idempotent || retryAll);
         int pause = retryBackoffMs;
         for (int tries = 0; ; tries++) {
-            Reply* r = once(method, url, hdr, body, bodyLen, crossSite, started);
+            Reply* r = once(method, url, hdr, body, bodyLen, crossSite, dropCreds, started);
             bool failedTry = r == null;
             bool badStatus = r != null && (r->status == 502 || r->status == 503 || r->status == 504 || r->status == 429);
             if (!(failedTry || badStatus) || !canRetry || tries >= retries || sinkAborted) return r;
@@ -2802,7 +2831,7 @@ public class Client {
     }
 
     // one try: connect (or reuse), send, read the answer
-    private Reply* once(char* method, char* url, Headers* hdr, char* body, int bodyLen, bool crossSite, int started) {
+    private Reply* once(char* method, char* url, Headers* hdr, char* body, int bodyLen, bool crossSite, bool dropCreds, int started) {
         Url u;
         if (!parseUrl(url, &u)) { fail("not an http:// or https:// URL"); return null; }
         if (!cleanValue(method) || indexOf(method, ' ') >= 0) { fail("bad method"); return null; }
@@ -2835,6 +2864,12 @@ public class Client {
             else format(req, cap, "%s %s HTTP/1.1\r\nHost: %s:%d\r\n", method, &u.path[0], &u.host[0], u.port);
             hl = strlen(req);
             Headers* all = copyHeaders(headers);
+            if (dropCreds) {
+                // after a redirect to another origin (host, port or scheme) the credentials in the client's default headers are not sent either
+                all->remove("Authorization");
+                all->remove("Cookie");
+                all->remove("Proxy-Authorization");
+            }
             for (int i = 0; i < hdr->count(); i++) all->set(hdr->nameAt(i), hdr->valueAt(i));
             if (!all->has("User-Agent") && userAgent != null) all->set("User-Agent", userAgent);
             if (!all->has("Accept")) all->set("Accept", "*/*");
@@ -2982,19 +3017,28 @@ public class Client {
         // a gzip or deflate body is unpacked
         char* ce = r->headers->get("Content-Encoding");
         if (decompress && ce != null && r->body != null && r->bodyLen > 0 && !toSink) {
+            // the unpacked body is held to maxBody like any other (a few KB of gzip can stand for gigabytes)
             int pn = 0;
             char* plain = null;
+            bool known = false;
             if (hasToken(ce, "gzip")) {
-                plain = zlib.gunzip(r->body, r->bodyLen, &pn);
+                known = true;
+                plain = zlib.gunzipEx(r->body, r->bodyLen, maxBody, &pn);
             } else if (hasToken(ce, "deflate")) {
-                plain = zlib.decompress(r->body, r->bodyLen, &pn);
-                if (plain == null) plain = zlib.inflateEx(r->body, r->bodyLen, null, 0, maxBody, false, &pn);
+                known = true;
+                plain = zlib.decompressEx(r->body, r->bodyLen, maxBody, &pn);
+                if (plain == null && !zlib.inflateTooBig()) plain = zlib.inflateEx(r->body, r->bodyLen, null, 0, maxBody, false, &pn);
             }
             if (plain != null) {
                 free(r->body);
                 r->body = plain;
                 r->bodyLen = pn;
                 r->headers->remove("Content-Encoding");
+            } else if (known) {
+                // not the raw bytes with a status 200 (the caller would take them for the content): the answer failed
+                fail(zlib.inflateTooBig() ? "the answer body is too big" : "the answer body is damaged (it does not unpack)");
+                r->dispose();
+                return null;                                    // the caller closes the connection
             }
         }
         if (keep && !sinkAborted) {
@@ -3054,12 +3098,17 @@ public class Client {
                 if (digits == 0) { fail("a bad chunk size"); return false; }
                 if (size == 0) {
                     // trailers up to an empty line
+                    // (at most 100 lines, and no longer than a body part may take: a server must not keep us here with a trickle of trailers)
                     char t[300];
                     int tn = 0;
-                    while (tn < 100) {
+                    int tstart = millis();
+                    for (;;) {
                         int x = l->readLine(&t[0], 300);
-                        if (x <= 0) break;
+                        if (x < 0) { fail(l->timedOut ? "timed out reading the trailers" : "the chunked body ended early"); return false; }
+                        if (x == 0) break;
                         tn++;
+                        if (tn > 100) { fail("the answer has too many trailer lines"); return false; }
+                        if (bodyTimeoutMs > 0 && millis() - tstart > bodyTimeoutMs) { fail("timed out reading the trailers"); return false; }
                     }
                     break;
                 }

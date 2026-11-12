@@ -61,8 +61,17 @@ Every violation sends a close frame with the right code and ends the connection 
 | keepalive ping not answered | 1011 |
 
 Text is checked as it arrives, so an invalid byte ends the connection before the message is complete. Pings are answered with pongs by the
-module. `closeWith(code, reason)` accepts the codes 1000-1003, 1007-1014 and 3000-4999 and a reason of at most 123 bytes of UTF-8. Text that you send is
+module, but a pong is queued like any other frame: when the send queue is at `maxOutBuffer` the pong is skipped (RFC 6455 5.5.3 allows that) and `overflowed` is set, so a peer that pings
+and never reads cannot make the queue grow (a `wshub` cuts such a client off). `closeWith(code, reason)` accepts the codes 1000-1003, 1007-1014 and 3000-4999 and a reason of at most 123 bytes of UTF-8. Text that you send is
 checked too: `sendText` with invalid UTF-8 sends nothing and returns false.
+
+### The server side of the handshake
+
+`serverHandshake` judges the upgrade request as RFC 6455 4.2.1 says: method GET, HTTP/1.1, `Host`, `Upgrade`, `Connection`, a 16 byte base64 `Sec-WebSocket-Key`, and `Sec-WebSocket-Version` exactly `13` (otherwise 426 with the
+supported version). **Origin:** with `ServerOptions.origins` set (a comma separated allow-list, `*` for any) an Origin that is not on the list is refused with 403, and so is a request without Origin if `requireOrigin` is on.
+An `Origin` header that is *there* but empty, or 300 bytes or longer (a real origin is at most about 267: scheme, a 253 character host name, a port), is refused with 403 with or without a policy: it must not count as "no Origin"
+(that let a browser past the allow-list in an earlier version) and it is never cut short (a prefix could match). Two Origin headers never match. The Origin that `onUpgrade` and `Client.origin` see is the whole header value.
+Subprotocols and extensions that the client offers and the server does not know are ignored, as the RFC allows.
 
 ### Fragments, streaming, limits
 
@@ -119,7 +128,7 @@ is a complete server (WebSocket, rooms, HTTP routes, uploads, SSE, JSON-RPC, sta
 |---|---|---|
 | `maxClients` | 1000 (at most) | all connections; more get `503 Service Unavailable` |
 | `maxMessage` | 1 MiB | largest WebSocket message, else 1009 |
-| `maxQueued` | 1 MiB | bytes waiting to be sent to one client; over it the client is cut off (close code 1008 in `onClose`, `stats->evicted`) |
+| `maxQueued` | 1 MiB | bytes waiting to be sent to one client (messages and the pongs for its pings); over it the client is cut off (close code 1008 in `onClose`, `stats->evicted`) |
 | `maxBody`, `maxHead` | 1 MiB, 16 KiB | HTTP request limits (413, 431) |
 | `handshakeTimeoutMs` | 5000 | from accept to a complete request, TLS handshake included (slowloris) |
 | `idleTimeoutMs` | 0 (off) | a WebSocket silent this long is closed with 1001 |
@@ -159,8 +168,8 @@ println(e->event); println(e->data); println(e->id);  e->dispose();
 ```
 
 `eventText` returns null when the event name or id contains CR or LF (stream injection). The parser (`sse.Parser`, usable alone) follows the specification: LF, CR and CRLF line ends, comments, one optional space after
-the colon, data lines joined with LF, `id` with a NUL ignored, `retry` with digits only, a leading byte order mark skipped, an event is dispatched only if it has data. Limits: 64 KB per line, 1 MB per event, 1024
-events waiting. The client sends `Last-Event-ID`, follows up to 3 redirects, understands chunked streams, honours the server's `retry` value, doubles its pause after each failure up to `maxRetryMs`, and gives up after
+the colon, data lines joined with LF, `id` with a NUL ignored, `retry` with digits only, a leading byte order mark skipped, an empty line at the start of the stream is fine, an event without an `event` field or with an empty one has the type `message`, an event is dispatched only if it has data. Limits: 64 KB per line, 1 MB per event, 1024
+events waiting. The client sends `Last-Event-ID`, follows up to 3 redirects (also relative ones; other schemes are refused), reads header names in any letter case, understands chunked streams, honours the server's `retry` value, doubles its pause after each failure up to `maxRetryMs`, and gives up after
 `maxRetries` failures in a row (default 5, -1 for never). A status other than 200, a content type other than `text/event-stream` and 204 end the client for good, as the specification says.
 
 ## httpx
@@ -169,7 +178,7 @@ events waiting. The client sends `Last-Event-ID`, follows up to 3 redirects, und
 
 | Feature | How |
 |---|---|
-| redirects 301 302 303 307 308 | `maxRedirects` (default 10). 303 becomes GET (HEAD stays); 301 and 302 turn POST into GET; 307, 308 and 301/302 of other methods keep method and body; `Authorization` and `Cookie` are dropped on a redirect to another host; relative, absolute and `//host` locations, dot segments |
+| redirects 301 302 303 307 308 | `maxRedirects` (default 10). 303 becomes GET (HEAD stays); 301 and 302 turn POST into GET; 307, 308 and 301/302 of other methods keep method and body; `Authorization`, `Cookie` and `Proxy-Authorization` are dropped on a redirect to another origin (host, port or scheme: a downgrade from https to http counts) and stay dropped for the rest of that request, whether they came from the request's headers or from the client's default headers `client->headers`; relative, absolute and `//host` locations, dot segments. A Location with another scheme (`ftp:`, `file:`, `javascript:` ...) or a path over 2047 bytes fails the request ("a redirect to a URL that cannot be followed") |
 | cookies | `client->cookies = httpx.newCookieJar()`: Set-Cookie after RFC 6265 (Domain, Path, Expires, Max-Age, Secure, HttpOnly, SameSite, `__Secure-` and `__Host-`), 50 per host and 256 in all |
 | keep-alive | `keepAlive = true` reuses the connection; a kept connection that went stale is replaced without the caller noticing |
 | retries | `retries`, `retryBackoffMs` (doubling, at most 5 s): connection errors and 502, 503, 504, 429 (`Retry-After` up to 5 s); only idempotent methods unless `retryAll` |
@@ -177,7 +186,7 @@ events waiting. The client sends `Last-Event-ID`, follows up to 3 redirects, und
 | streaming | `stream(url, cb, user)` hands the body of a 2xx answer to `cb(user, data, n)` in pieces; `downloadTo(url, path, resume, &written)` writes a file without holding it in memory, with `Range` resume |
 | Range | `getRange(url, from, to)` |
 | bodies | `post put patch postForm postJson`, `postMultipart(url, multipart)`, `requestChunked(method, url, headers, reader, user)` for uploads of unknown length |
-| answers | `Reply`: `status`, `header(name)`, `body` (+ 0 byte), `bodyLen`, `url`, `redirects`, `reused`; chunked, Content-Length and until-close bodies; 1xx skipped; gzip / deflate unpacked with `decompress = true`; `maxBody` (default 64 MiB) |
+| answers | `Reply`: `status`, `header(name)`, `body` (+ 0 byte), `bodyLen`, `url`, `redirects`, `reused`; chunked, Content-Length and until-close bodies; 1xx skipped; gzip / deflate unpacked with `decompress = true`; `maxBody` (default 64 MiB) holds for the unpacked size too (a compressed bomb fails with "the answer body is too big") and a body that does not unpack is an error, not the raw bytes; at most 100 trailer lines, read within `bodyTimeoutMs` |
 
 **Server pieces** (they work on bytes, so any transport can use them):
 
@@ -211,7 +220,7 @@ c->notify("log", params);   jsonrpc.Batch* b = c->batch();  int i = b->add("add"
 
 The dispatcher follows the specification: requests, notifications, batches (answers only for requests, nothing for a batch of notifications, an empty batch is an Invalid Request),
 ids that are strings, numbers or null (anything else is an Invalid Request), `params` that are arrays or objects, the codes -32700 -32600 -32601 -32602 -32603, reserved `rpc.` names.
-Limits: 100 requests per batch, 1 MiB per message, 200 levels of nesting (the JSON parser's limit). Results, error data and the whole request tree are freed by the module: a server runs in constant memory.
+Limits: 100 requests per batch, 1 MiB per message, 200 levels of nesting (the JSON parser's limit). A text that is not UTF-8, or that has a NUL byte or a `\u0000` escape (a C string cannot hold it, and "ad\u0000d" would have run `ad`), is a Parse error. Results, error data and the whole request tree are freed by the module: a server runs in constant memory.
 A handler returns a new value (never `params` or a part of it: the module frees the request tree and the result separately). Params that you pass to a client call stay yours. Not supported: calls from the server to the client over one connection (server notifications are delivered to `onNotification`).
 
 ## Waiting without threads: `net.setIdleHook`
@@ -254,10 +263,16 @@ behind a TLS terminating proxy. On AOS blocks over 128 KiB are never reused addr
 * **JSON-RPC.** The server cannot call the client over the connection it came in on; messages that the server sends on its own arrive in `onNotification` of the client.
 * **One thread.** All blocking calls of the client side block; the way to wait for several things is `conn.Poller`, `ws->setNonBlocking`, or a `wshub`. `net.setIdleHook` is for tests and GUI programs.
 * **IPv4 only**, like the rest of `net`.
+* **Defaults that are made for a trusted network.** For a server on the internet, set these yourself. `idleTimeoutMs` and `pingIntervalMs` are 0 (off): an upgraded socket that stays silent is kept for ever, so 1000 idle
+  connections (`maxClients`, default 1000) lock every other client out with 503 until they go; set `idleTimeoutMs` (and `pingIntervalMs` so that dead peers are noticed). `maxQueued` is per client (1 MiB) and there is no
+  limit for the hub as a whole: 1000 slow readers can hold 1000 MiB (AOS needs 128 MB of RAM at least): lower `maxQueued` and `maxMessage`, or `maxClients`, to what the machine has. A closing WebSocket lingers for one
+  second and counts towards `maxClients` meanwhile. There is no limit per address; a firewall or a reverse proxy has to provide it. A TLS handshake blocks the thread for about 150 ms (see above), so a flood of `wss://`
+  connection attempts is a flood of 150 ms stalls: with TLS, a terminating proxy in front is the safe setup. `handshakeTimeoutMs` (5 s) bounds how long a half open connection holds a slot.
+* **Bare LF.** The request parser and the client accept a bare LF as a line end (RFC 9112 allows it for recipients). If a proxy of yours treats a bare LF differently, put it in front only with a configuration that rejects bare LF.
 * **Memory.** Objects made with `new` (instead of the factory functions) keep their own few bytes after `dispose()`; TLS handshakes keep about 20 KB each (see Memory).
 
 ## Tests
 
-`tests/t340` to `t367` run in the normal suite on every target (client and server in one thread, ephemeral ports): frames and strictness (`t340`-`t344`), permessage-deflate (`t345`), sockets, options, non-blocking and keepalive (`t346`-`t349`), the hub (`t350`-`t354`), SSE (`t355`, and from the plain `http` server `t367`), httpx (`t356`, `t357`), JSON-RPC (`t358`, `t359`), and the layers underneath: conn and net (`t360`), zlib (`t361`), json (`t362`), TLS session reuse (`t363`), memory (`t364` zlib and permessage-deflate, `t365` the hub, `t366` clients and toolkits). `tests/net.sh` (Linux x86-64; needs python3, curl, openssl; uses the python packages
+`tests/t340` to `t370` run in the normal suite on every target (client and server in one thread, ephemeral ports): frames and strictness (`t340`-`t344`), permessage-deflate (`t345`), sockets, options, non-blocking and keepalive (`t346`-`t349`), the hub (`t350`-`t354`), SSE (`t355`, and from the plain `http` server `t367`), httpx (`t356`, `t357`), JSON-RPC (`t358`, `t359`), and the layers underneath: conn and net (`t360`), zlib (`t361`), json (`t362`), TLS session reuse (`t363`), memory (`t364` zlib and permessage-deflate, `t365` the hub, `t366` clients and toolkits), and regression tests for what independent reviewers found: `t368` (a recycled WebSocket object after a half message, pongs against `maxQueued`, the Origin policy, a finished `Connection: close` answer), `t369` (Locations of 8000 bytes and other schemes, default credentials across origins, compressed bombs, trailers, huge Range numbers), `t370` (an event stream that starts with an empty line, header names and long headers of the SSE client, NUL and bad UTF-8 in JSON-RPC). `tests/net.sh` (Linux x86-64; needs python3, curl, openssl; uses the python packages
 `websockets` and `requests` when they are installed) checks the modules against independent implementations: python websockets as client and server (permessage-deflate, subprotocols, Origin, wss with a
 verified certificate, 160 KB and 300 KB messages), raw frames with every RFC 6455 violation, curl (Range, ETag, chunked uploads, `Expect: 100-continue`, multipart, JSON-RPC, https) and a python SSE client.

@@ -46,6 +46,7 @@ import secure;
 import cstdlib;
 module websocket;
 
+public const ORIGIN_MAX = 300;       // room for an Origin header value (with its end byte); a longer one is refused
 public const OP_CONT = 0;
 public const OP_TEXT = 1;
 public const OP_BINARY = 2;
@@ -474,7 +475,7 @@ public class Options {
 public class ServerOptions {
     public char* protocols;         // subprotocols this server speaks, comma separated, in order of preference (null: none)
     public bool requireProtocol;    // refuse (400) a client that offers none of them
-    public char* origins;           // allowed Origin values, comma separated ("*" = any); null: no check
+    public char* origins;           // allowed Origin values, comma separated ("*" = any); null: no check. An Origin header that is empty or 300+ bytes is refused (403) in any case
     public bool requireOrigin;      // with origins: a request without an Origin header is refused (403) too
     public bool deflate;            // accept permessage-deflate offers (default off)
     public bool allowTakeover;      // with deflate: accept clients that keep their compression context (default false: always asks for client_no_context_takeover)
@@ -495,7 +496,7 @@ public class ServerOptions {
 public class HandshakeInfo {
     public char path[1024];         // the request target ("/chat?room=1")
     public char* headers;           // the raw header lines (use header(name))
-    public char origin[256];        // the Origin header ("" if none)
+    public char origin[ORIGIN_MAX];  // the Origin header ("" if none; a header that is empty or longer than 299 bytes is refused with 403)
     public char protocol[64];       // the subprotocol that was chosen ("" if none)
     public char* response;          // the complete HTTP answer to send (101, or an error)
     public int responseLen;
@@ -821,7 +822,22 @@ public class WebSocket {
         ctrlLen = 0;
         mOp = 0;
         mLen = 0;
+        mTotal = 0;                   // a recycled object must not remember the half message of the connection before it
+        mComp = false;
+        mU8 = 0;
+        mFirst = false;
+        fFin = false;
+        fRsv1 = false;
+        fMasked = false;
+        fRemain = 0;
+        fMask = 0;
+        fMaskOff = 0;
+        fOp = 0;
+        pingCounter = 0;
         txOpen = false;
+        txOp = 0;
+        txFirst = false;
+        txU8 = 0;
         txLen = 0;
         winLen = 0;
         lastRx = clockNow;
@@ -1326,13 +1342,13 @@ public class WebSocket {
                 return failWith(1002, "new message inside a fragmented one");
             }
             if (len > maxFrame) return failWith(1009, "frame too big");
+            if (op != OP_CONT) mTotal = 0;                     // a new message starts from nothing, whatever the last one left behind
             if (mTotal + len > maxMessage) return failWith(1009, "message too big");
             if (op != OP_CONT) {
                 mOp = op;
                 mComp = fRsv1;
                 mLen = 0;
                 mU8 = 0;
-                mTotal = 0;
                 mFirst = true;
             }
         }
@@ -1415,7 +1431,9 @@ public class WebSocket {
     private bool control(int op, char* p, int n) {
         lastRx = nowMs();
         if (op == OP_PING) {
-            if (!closeSent) queueFrame(OP_PONG, true, false, p, n, true);
+            // the pong is not forced past maxOutBuffer: a peer that pings and never reads must not be able to grow the queue without bound (RFC 6455
+            // 5.5.3 lets an endpoint skip pongs); the failed attempt sets overflowed, which a server (wshub) takes as a reason to cut the peer off
+            if (!closeSent) queueFrame(OP_PONG, true, false, p, n, false);
             if (handler != null && !closeSent) handler(this, EV_PING, OP_PING, p, n);
             return true;
         }
@@ -2151,15 +2169,17 @@ public int serverHandshake(char* head, ServerOptions* o, HandshakeInfo* info) {
     if (!hv(hd, "Host", &v[0], 1024) || v[0] == 0) { rejectInfo(info, 400, null); return 400; }
     if (!hv(hd, "Upgrade", &v[0], 1024) || !hasToken(&v[0], "websocket")) { rejectInfo(info, 400, null); return 400; }
     if (!hv(hd, "Connection", &v[0], 1024) || !hasToken(&v[0], "upgrade")) { rejectInfo(info, 400, null); return 400; }
-    if (!hv(hd, "Sec-WebSocket-Version", &v[0], 1024) || !hasToken(&v[0], "13")) { rejectInfo(info, 426, "Sec-WebSocket-Version: 13\r\n"); return 426; }
+    if (!hv(hd, "Sec-WebSocket-Version", &v[0], 1024) || !streq(&v[0], "13")) { rejectInfo(info, 426, "Sec-WebSocket-Version: 13\r\n"); return 426; }
     char key[128];
     if (!hv(hd, "Sec-WebSocket-Key", &key[0], 128) || strlen(&key[0]) != 24) { rejectInfo(info, 400, null); return 400; }
     char decoded[32];
     if (encoding.base64Decode(&key[0], &decoded[0]) != 16) { rejectInfo(info, 400, null); return 400; }
-    // Origin
+    // Origin. A header that is there but empty or longer than a real origin can be (scheme, a 253 character host name, a port: at most 267 bytes) is
+    // refused: it must neither count as "no Origin header" (that would let a browser past the allow-list) nor be cut short (a prefix could match)
     if (hv(hd, "Origin", &v[0], 1024)) {
         int ol = strlen(&v[0]);
-        if (ol < 256) strcpy(&info->origin[0], &v[0]);
+        if (ol == 0 || ol >= ORIGIN_MAX) { rejectInfo(info, 403, null); return 403; }
+        strcpy(&info->origin[0], &v[0]);
     }
     if (o != null && o->origins != null) {
         bool allowed = hasToken(o->origins, "*");

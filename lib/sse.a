@@ -338,6 +338,12 @@ public class Parser {
 
     // a line is complete
     private void endLine() {
+        if (line == null) {
+            // an empty first line: nothing was added yet, so there is no buffer
+            line = malloc(256);
+            if (line == null) { failed = true; return; }
+            lineCap = 256;
+        }
         line[lineLen] = 0;
         int n = lineLen;
         lineLen = 0;
@@ -347,7 +353,8 @@ public class Parser {
                 Event* e = (Event*) malloc(sizeof(Event));
                 if (e == null) { failed = true; return; }
                 e->heap = true;
-                e->event = dupN(name == null ? "message" : name, name == null ? 7 : strlen(name));
+                bool plain = name == null || name[0] == 0;            // no event field, or an empty one: the type is "message"
+                e->event = dupN(plain ? "message" : name, plain ? 7 : strlen(name));
                 e->dataLen = dataLen - 1;                  // the last LF is not part of the data
                 e->data = dupN(data, e->dataLen);
                 e->id = dupN(lastId, strlen(lastId));
@@ -429,6 +436,29 @@ public Parser* newParser() {
     return p;
 }
 
+// true if the header line starts with the lower case name (a name with its colon, "content-type:"), whatever the letter case
+private bool headerIs(char* line, char* name) {
+    for (int i = 0; name[i] != 0; i++) {
+        int c = line[i] & 255;
+        if (c >= 'A' && c <= 'Z') c = c + 32;
+        if (c != (name[i] & 255)) return false;
+    }
+    return true;
+}
+
+// copies the value of a header line (after the name of nameLen bytes and the spaces) into out of max bytes, cut if it is longer
+private void copyValue(char* out, int max, char* line, int nameLen) {
+    int s = nameLen;
+    while (line[s] == ' ' || line[s] == 9) s++;
+    int k = 0;
+    while (line[s] != 0 && k < max - 1) {
+        out[k] = line[s];
+        k++;
+        s++;
+    }
+    out[k] = 0;
+}
+
 // ---- the client ---------------------------------------------------------------------------------------------------------------------------------------------
 // A connection to an event stream that comes back after it drops. It sends Last-Event-ID, honours the server's retry value and doubles the
 // pause after every failed attempt (up to maxRetryMs). Calls block.
@@ -456,6 +486,7 @@ public class Client {
     public int chunkLineLen;
     public bool headDone;
     public bool heap;
+    private char* hopUrl;           // the target of a redirect that is being followed (a heap string)
 
     public Client(char* streamUrl) {
         init(streamUrl);
@@ -476,6 +507,7 @@ public class Client {
     }
 
     private bool open() {
+        if (hopUrl != null) { free(hopUrl); hopUrl = null; }
         http.Url* u = (http.Url*) malloc(sizeof(http.Url));
         char* target = url;
         bool ok = false;
@@ -525,28 +557,23 @@ public class Client {
                 int n = net.recvLine(h, &line[0], 1024);
                 if (n < 0) { net.close(h); fail("the answer ended in the headers"); free(u); return false; }
                 if (n == 0) break;
-                if (startsWith(&line[0], "Location:") || startsWith(&line[0], "location:")) {
-                    int s = 9;
-                    while (line[s] == ' ') s++;
-                    strcpy(&loc[0], &line[s]);
-                } else if (startsWith(&line[0], "Content-Type:") || startsWith(&line[0], "content-type:")) {
-                    int s = 13;
-                    while (line[s] == ' ') s++;
-                    strcpy(&ctype[0], &line[s]);
-                } else if (startsWith(&line[0], "Transfer-Encoding:") || startsWith(&line[0], "transfer-encoding:")) {
+                // header names are not case sensitive; a value that is too long for its buffer is cut (the Content-Type check only needs the start)
+                if (headerIs(&line[0], "location:")) {
+                    copyValue(&loc[0], 1024, &line[0], 9);
+                } else if (headerIs(&line[0], "content-type:")) {
+                    copyValue(&ctype[0], 200, &line[0], 13);
+                } else if (headerIs(&line[0], "transfer-encoding:")) {
                     if (contains(&line[0], "chunked")) isChunked = true;
                 }
             }
             if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
                 net.close(h);
                 if (loc[0] == 0) { fail("a redirect without a Location"); free(u); return false; }
-                if (loc[0] == '/') {
-                    char* nt = malloc(strlen(&u->host[0]) + strlen(&loc[0]) + 40);
-                    format(nt, strlen(&u->host[0]) + strlen(&loc[0]) + 40, "%s://%s:%d%s", &u->scheme[0], &u->host[0], u->port, &loc[0]);
-                    target = nt;
-                } else {
-                    target = strdup(&loc[0]);
-                }
+                char* nt = httpx.resolveUrl(target, &loc[0]);              // absolute, //host, /path and relative forms; other schemes are refused
+                if (nt == null) { fail("a redirect to a URL that cannot be followed"); free(u); return false; }
+                if (hopUrl != null) free(hopUrl);
+                hopUrl = nt;
+                target = nt;
                 continue;
             }
             if (status == 204) {
@@ -717,6 +744,8 @@ public class Client {
         parser = null;
         if (url != null) free(url);
         url = null;
+        if (hopUrl != null) free(hopUrl);
+        hopUrl = null;
         if (lastEventId != null) free(lastEventId);
         lastEventId = null;
         if (heap) {
