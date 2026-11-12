@@ -192,7 +192,7 @@ same programs compiled by GCC, on every target (see [`docs/INTERNALS.md`](docs/I
 
 `tests/tui.sh` runs the terminal toolkit's programs in a pseudo terminal and checks the screen with a terminal emulator written in
 Python (typing, menus, mouse, resize, paste, suspend to a shell, signals, `TERM` variants); `tests/gui.sh` tests the graphical stack,
-`tests/https.sh` the TLS code, `tests/net.sh` the WebSocket, HTTP, SSE and JSON-RPC modules against python websockets, curl and raw frames
+`tests/https.sh` the TLS code, `tests/net.sh` the WebSocket, HTTP, SSE and JSON-RPC modules against python websockets, curl and raw frames, `tests/net2.sh` the MQTT, Redis and syslog servers against a raw MQTT client, `redis-cli` and `logger`
 (the normal suite runs them client against server in one thread, `t340` ... `t370`). The gcode widgets (`t240` ... `t267`) are tested in-process: the display server runs inside the test program on
 its Headless backend, the test types, clicks and drags through it and compares pixels, so the same checks run on all five targets.
 
