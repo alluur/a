@@ -1510,11 +1510,13 @@ public matrix.Matrix correlationMatrix(matrix.Matrix* data) {
 // ============================================================================================================================================
 //  Streaming accumulators
 // ============================================================================================================================================
-// Welford's online algorithm extended to the third and fourth moments (Pebay's update formulas): O(1) memory, numerically stable, mergeable
+// Welford's online algorithm extended to the third and fourth moments (Pebay's update formulas): O(1) memory, numerically stable, mergeable. The sums are kept
+// relative to the first value (`shift`), so data with a huge offset (a million plus a spread of one) keeps all its digits; use mean(), not the fields.
 public class Welford {
     public int count;
-    public double avg;                     // the running mean
-    public double m2;                      // sums of powers of the deviations from the mean
+    public double shift;                   // the first value seen
+    public double dev;                     // the running mean of (value - shift)
+    public double m2;                      // sums of powers of the deviations from that mean
     public double m3;
     public double m4;
     public double lo;                      // smallest and largest value seen
@@ -1522,7 +1524,7 @@ public class Welford {
 
     public void add(double x) {
         if (x != x) {
-            avg = x;                       // NaN poisons everything, as it does in the batch functions
+            dev = x;                       // NaN poisons everything, as it does in the batch functions
             m2 = x;
             m3 = x;
             m4 = x;
@@ -1531,14 +1533,15 @@ public class Welford {
             count++;
             return;
         }
+        if (count == 0) { shift = x; }
         int n1 = count;
         count++;
         double n = (double) count;
-        double delta = x - avg;
+        double delta = (x - shift) - dev;
         double dn = delta / n;
         double dn2 = dn * dn;
         double term1 = delta * dn * (double) n1;
-        avg += dn;
+        dev += dn;
         m4 += term1 * dn2 * (n * n - 3.0 * n + 3.0) + 6.0 * dn2 * m2 - 4.0 * dn * m3;
         m3 += term1 * dn * (n - 2.0) - 3.0 * dn * m2;
         m2 += term1;
@@ -1555,7 +1558,8 @@ public class Welford {
         if (o == null || o->count == 0) { return; }
         if (count == 0) {
             count = o->count;
-            avg = o->avg;
+            shift = o->shift;
+            dev = o->dev;
             m2 = o->m2;
             m3 = o->m3;
             m4 = o->m4;
@@ -1566,13 +1570,13 @@ public class Welford {
         double na = (double) count;
         double nb = (double) o->count;
         double n = na + nb;
-        double delta = o->avg - avg;
+        double delta = (o->shift - shift) + (o->dev - dev);        // the difference of the two means
         double d2 = delta * delta;
         double nm4 = m4 + o->m4 + d2 * d2 * na * nb * (na * na - na * nb + nb * nb) / (n * n * n)
                      + 6.0 * d2 * (na * na * o->m2 + nb * nb * m2) / (n * n) + 4.0 * delta * (na * o->m3 - nb * m3) / n;
         double nm3 = m3 + o->m3 + d2 * delta * na * nb * (na - nb) / (n * n) + 3.0 * delta * (na * o->m2 - nb * m2) / n;
         double nm2 = m2 + o->m2 + d2 * na * nb / n;
-        avg = avg + delta * nb / n;
+        dev = dev + delta * nb / n;
         m2 = nm2;
         m3 = nm3;
         m4 = nm4;
@@ -1582,7 +1586,7 @@ public class Welford {
     }
 
     public int size() { return count; }
-    public double mean() { return count > 0 ? avg : nanValue(); }
+    public double mean() { return count > 0 ? shift + dev : nanValue(); }
     public double variance(int ddof = 1) { return (count - ddof >= 1) ? m2 / (double) (count - ddof) : nanValue(); }
     public double stddev(int ddof = 1) { return (count - ddof >= 1) ? dmath.sqrt(m2 / (double) (count - ddof)) : nanValue(); }
     public double sem() { return (count >= 2) ? dmath.sqrt(m2 / (double) (count - 1) / (double) count) : nanValue(); }
@@ -1598,7 +1602,8 @@ public class Welford {
     }
     public void reset() {
         count = 0;
-        avg = 0.0;
+        shift = 0.0;
+        dev = 0.0;
         m2 = 0.0;
         m3 = 0.0;
         m4 = 0.0;
@@ -1663,6 +1668,7 @@ public class RollingStats {
     private int cap;
     private int total;                     // how many values were added in all
     private int len;                       // how many are in the window
+    private int slen;                      // how many of them are in the sorted copy (NaN is not)
     private int mqh;
     private int mqt;
     private int nqh;
@@ -1696,13 +1702,17 @@ public class RollingStats {
     // adds a value; the oldest one leaves when the window is full
     public void add(double x) {
         if (cap == 0) { return; }
+        bool dirty = false;
         if (len == cap) {
             double old = ring[total % cap];
             // remove old from the sorted copy and from the Welford state
             if (old == old) {
                 int p = findSorted(old);
-                for (int i = p; i < len - 1; i++) { sorted[i] = sorted[i + 1]; }
-                sorted[len - 1] = 0.0;
+                for (int i = p; i < slen - 1; i++) { sorted[i] = sorted[i + 1]; }
+                slen--;
+                sorted[slen] = 0.0;
+            } else {
+                dirty = true;                      // a NaN leaves the window: the running mean and variance are NaN and have to be recomputed
             }
             int nn = len - 1;
             if (nn == 0) {
@@ -1723,16 +1733,15 @@ public class RollingStats {
         ring[total % cap] = x;
         // sorted insert (NaN is not sorted: poisoned instead)
         if (x == x) {
-            int p = 0;
             int lo = 0;
-            int hi = len;
+            int hi = slen;
             while (lo < hi) {
                 int mid = (lo + hi) / 2;
                 if (sorted[mid] <= x) { lo = mid + 1; } else { hi = mid; }
             }
-            p = lo;
-            for (int i = len; i > p; i--) { sorted[i] = sorted[i - 1]; }
-            sorted[p] = x;
+            for (int i = slen; i > lo; i--) { sorted[i] = sorted[i - 1]; }
+            sorted[lo] = x;
+            slen++;
         }
         len++;
         double d1 = x - mu;
@@ -1747,12 +1756,12 @@ public class RollingStats {
         nqt++;
         total++;
         sinceFresh++;
-        if (sinceFresh >= cap) { refresh(); }
+        if (dirty || sinceFresh >= cap) { refresh(); }
     }
 
     private int findSorted(double v) {
         int lo = 0;
-        int hi = len - 1;
+        int hi = slen - 1;
         while (lo < hi) {
             int mid = (lo + hi) / 2;
             if (sorted[mid] < v) { lo = mid + 1; } else { hi = mid; }
@@ -1845,6 +1854,7 @@ public class RollingStats {
         minq = null;
         cap = 0;
         len = 0;
+        slen = 0;
         total = 0;
     }
 }
