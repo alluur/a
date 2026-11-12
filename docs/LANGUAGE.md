@@ -844,6 +844,8 @@ Counter.next();                                // a statement may start with a c
   method cannot have the name of a virtual method of a base class.
 * A static field and an instance field of one class cannot have the same name (`redefinition of 'x'`, in either order; a static field
   cannot take the name of an inherited instance field either). A static field may have the name of a static field or a global of another class.
+* A `typedef` of a class can stand in front of the dot like the class name (`typedef Counter Count;  Count.next();`, also `module.Alias.member`);
+  a typedef of a pointer or of a non-class type has no members (the error says that a type name is no value).
 * A class in a module is used as `module.Class.name` in every place where an expression can stand (as a statement, after `(`, in arguments
   and conditions: `cfg.Cfg.bump();  int y = (cfg.Cfg.counter + 1);`), and so is a module enum value `module.Enum.Value`.
 * Static members follow the access labels (`private` / `protected` / `public`). They are used with the class name, not through an object
