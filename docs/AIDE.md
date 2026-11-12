@@ -4,12 +4,13 @@ AIDE is the integrated development environment of the A language. It will run as
 program (`aide-gui`), both on Linux and on AOS, and both are built on the same libraries. This document describes those
 libraries (they are part of the A standard library, in `lib/`) and how the two front ends are meant to use them.
 
-**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`). The terminal front end exists: `user/aide.a` in the
-AOS repository (`aide`, about 6000 lines, one file; manual `docs/AIDE.md` there) runs on the AOS terminals (serial console, `aterm`, `telnetd`) and on
+**State of the work.** The libraries described here are finished and tested (tests `t200` ... `t219`, `t280`). Both front ends exist. The GUI front end is `user/gui/aide-gui.a` in the AOS
+repository (a window with menus, a tool bar, two editor panes, a real terminal, run / problems / search panels, themes that reach the menus and dialogs, project templates, run configurations,
+the documentation, recovery; manual: `docs/AIDE.md` there); it uses the widgets of `gcode` (section 13) and the module `aidecore` (section 14). The terminal front end: `user/aide.a` in the AOS repository (`aide`, about 6000 lines, one file; manual `docs/AIDE.md` there) runs on the AOS terminals (serial console, `aterm`, `telnetd`) and on
 Linux terminals, and uses everything below: `asys`, `acode`, `asyntax`, `atheme`, `aproject`, `afind` and the toolkit of [TUI.md](TUI.md). It has its own tests
 (`tests/aide_tui_test.py` in the AOS repository: 90 tests in pseudo terminals, among them a random session of 500 keys, mouse events and resizes; and
-the QEMU tests `aide` and `aide-gui`). The GUI front end (`user/gui/aide-gui.a`) does not exist yet. The libraries contain no user interface code: everything
-that draws or reads the keyboard is the front end's job. The widgets of the GUI front end are the module `gcode` (section 13; tests `t240` ... `t267`),
+the QEMU tests `aide` and `aide-aterm`); `tests/aide_gui_test.py` (display server with VNC, real key presses and clicks) and the QEMU test `aide-gui` test the GUI front end. The libraries
+contain no user interface code: everything that draws or reads the keyboard is the front end's job. The widgets of the GUI front end are the module `gcode` (section 13; tests `t240` ... `t267`),
 and `examples/gui/codedemo.a` assembles them into a small working editor.
 
 Contents
@@ -27,6 +28,7 @@ Contents
 11. [Tests and measurements](#11-tests-and-measurements)
 12. [Known limitations](#12-known-limitations)
 13. [The GUI widgets: gcode](#13-the-gui-widgets-gcode)
+14. [aidecore - the logic of a front end](#14-aidecore---the-logic-of-a-front-end)
 
 ---
 
@@ -477,4 +479,23 @@ Known limitations of the GUI widgets (in addition to section 12): no code foldin
 `Doc` share cursors; the font is the 13 pixel DejaVu (or the configured font file) and characters above Latin-1 are drawn as `?`; the menu bar
 and the standard dialogs of `guix` are not themed; the completion candidates come from `asyntax.Completer` (words, symbols, keywords: no type
 information); `FileTree` deletes files and empty folders only; the terminal pane needs a pseudo terminal (Linux and Android).
+
+## 14. aidecore - the logic of a front end
+
+`import aidecore;` holds what an IDE front end needs besides the editor libraries and has no user interface, so that the GUI and terminal front ends (and tests) can share it. The tests are `t280_aidecore` and `t283_aidecore_limits` (snippets at deep indentation, build plans with many flags, quote-heavy run lines, line breaks in project values, run configuration names; both run on all five targets).
+
+| Part | What it does |
+|---|---|
+| `Words` | splits a command line into words (quotes group, no escapes, any number of words): `Words w("-x 'a b'"); w.argv[1]`; `shellQuote`, `commandLineText` (the `$ ac main.a ...` line of the output panel) |
+| `Project`, `RunConfig` | the file `.aide`: `load(folder)`, `save()` (atomic; **keeps every section it does not know**; line breaks in values become blanks, so a value cannot add entries or sections), `runNameProblem(name)` (why a name cannot be a run configuration name: empty, over 60 characters, brackets, control characters, blanks at the ends; null when it is fine), `mainPath()`, `defaultOutputName(source)` (`NAME-VERSION-RELEASE.elf`, `.exe` for a windows target), `makeIgnore()` (built-in rules, `.gitignore`, the project's patterns), and any number of `[run NAME]` sections (program, args, cwd, env; `findRun`, `addRun`, `removeRun`, `reloadRuns`) |
+| `makeBuildPlan` | the compiler command line (or the shell command of a custom build) for a project: `BuildPlan.argv`, `display`, `outPath`, `source`; a syntax check goes to a throw-away output; the project's flags are split like a command line (no flag is ever dropped: the plan grows as needed). `makeCheckDir` makes the private folder for that output (an unpredictable name, mode 0700) |
+| `runShellLine` | `cd 'DIR' && NAME='value' 'PROGRAM' args` for running a program in a shell (run in the terminal) |
+| `SnippetSet` | the built-in snippets (`main`, `for`, `class` ...) plus `snippets.ini` of the user; `insert(buffer, editor, index, from)` (keeps the indentation of the line, the document's indent unit, the caret goes to `$0`; the output is sized exactly, so any indentation works, and a snippet that would expand to more than 8 MB is refused with `false`), `expandWord` (Tab after a snippet name) |
+| `newProject` | a folder with `main.a`, `README.md` and `.aide` from a template (`TPL_HELLO`, `TPL_CONSOLE`, `TPL_GUI`, `TPL_SERVER`; `templateName`, `templateInfo`, `templateSource`; the sources compile and run, checked by hand and by the AOS integration tests); `validProjectName` |
+| `Recovery` | copies of unsaved documents (`CONFIG/recovery/PID-ID.rec`, a three line header and the text), the liveness mark of an instance (in `/tmp` on AOS), `scan()` finds the records of instances that are gone; the same format as the terminal AIDE |
+| `Session` | the open files and carets of a project (`CONFIG/sessions/HASH.ini`, the same file as the terminal AIDE) plus key / value extras in `HASH.gui.ini` (split, panes, panel sizes, run configuration) |
+| small things | `baseName`, `dirName`, `relativeTo`, `selfPid`, `processAlive`, `scaleAt` (the interface sizes 85 ... 150 percent) |
+
+The GUI front end also needs three additions that are not in `aidecore`: `gfx.scaleFont` / `setFontScales` / `setUiFont` (fonts at another size and the choice of the interface font, section "Drawing" of [GUI.md](GUI.md)),
+the colours that a program with a dark scheme sets for menus, tables and tool tips (`guix.cPanel` ..., `gui.cTipBack` ...), and the panels `SearchPane`, `RunPane` and `DocView` of `gcode` (tests `t281`, `t282`).
 

@@ -166,6 +166,34 @@ public class Font {
         return true;
     }
 
+    // Takes over another font (the glyph data is shared, not copied). The object stays the same, so everything that holds a pointer to
+    // this font (the widgets of a program hold gfx.sans()) shows the new font after its next layout.
+    public bool assign(Font* o) {
+        if (o == null || !o->valid) {
+            return false;
+        }
+        data = o->data;
+        offs = o->offs;
+        ascent = o->ascent;
+        height = o->height;
+        valid = true;
+        return true;
+    }
+
+    // a number that is the same for fonts that share their glyph data (after assign), and different for fonts that do not
+    public int identity() {
+        return (int) data;
+    }
+
+    // frees the glyph data. Only for a font that made its own data (scaleFont) and that no other font shares through assign.
+    public void release() {
+        if (data != null) { free(data); }
+        if (offs != null) { free((char*) offs); }
+        data = null;
+        offs = null;
+        valid = false;
+    }
+
     // offset of the glyph of a code (codes outside Latin-1 are shown as '?')
     public int slot(int code) {
         if (code < 32 || code > 255) {
@@ -316,6 +344,282 @@ Font* configured(char* role) {
         }
     }
     return null;
+}
+
+// a division that rounds to the nearest whole number (also for negative values; d > 0)
+private int roundDiv(int a, int d) {
+    if (a >= 0) {
+        return (a + d / 2) / d;
+    }
+    return -((-a + d / 2) / d);
+}
+
+private int floorDiv(int a, int d) {
+    if (a >= 0) {
+        return a / d;
+    }
+    return -((-a + d - 1) / d);
+}
+
+// the coverage (0..15) of one glyph pixel, 0 outside the glyph
+private int glyphCover(Font* f, int q, int gw, int gh, int col, int row) {
+    if (col < 0 || row < 0 || col >= gw || row >= gh) {
+        return 0;
+    }
+    int i = row * gw + col;
+    int bv = f->byteAt(q + (i >> 1));
+    return (i & 1) != 0 ? (bv & 15) : (bv >> 4);
+}
+
+// A copy of a font at another size (percent of the original, 20..400): every glyph is sampled again with an area average, so text stays
+// readable at 85 percent and at 150 percent. Returns null for a font that is not valid. Integer arithmetic only (the same pixels on every target).
+public Font* scaleFont(Font* f, int percent) {
+    if (f == null || !f->valid || percent < 20 || percent > 400) {
+        return null;
+    }
+    // the size of every glyph first, to know how much room the data needs
+    int total = 2;
+    for (int code = 32; code < 256; code++) {
+        int p = f->slot(code);
+        int gw = f->byteAt(p + 3);
+        int gh = f->byteAt(p + 4);
+        int nw = 0;
+        int nh = 0;
+        if (gw > 0 && gh > 0) {
+            int lb = f->byteAt(p + 1);
+            if (lb > 127) { lb = lb - 256; }
+            int top = f->byteAt(p + 2);
+            if (top > 127) { top = top - 256; }
+            nw = floorDiv((lb + gw) * percent + 99, 100) - floorDiv(lb * percent, 100);
+            nh = floorDiv(top * percent + 99, 100) - floorDiv((top - gh) * percent, 100);
+            if (nw < 1) { nw = 1; }
+            if (nh < 1) { nh = 1; }
+            if (nw > 255) { nw = 255; }
+            if (nh > 255) { nh = 255; }
+        }
+        total = total + 5 + (nw * nh + 1) / 2;
+    }
+    char* bin = malloc(total + 16);
+    int o = 0;
+    int ascent = roundDiv(f->ascent * percent, 100);
+    int height = roundDiv(f->height * percent, 100);
+    if (height < 1) { height = 1; }
+    if (ascent < 1) { ascent = 1; }
+    bin[o] = ascent; o++;
+    bin[o] = height; o++;
+    for (int code = 32; code < 256; code++) {
+        int p = f->slot(code);
+        int adv = f->byteAt(p);
+        int lb = f->byteAt(p + 1);
+        if (lb > 127) { lb = lb - 256; }
+        int top = f->byteAt(p + 2);
+        if (top > 127) { top = top - 256; }
+        int gw = f->byteAt(p + 3);
+        int gh = f->byteAt(p + 4);
+        int nadv = roundDiv(adv * percent, 100);
+        if (nadv < 1 && adv > 0) { nadv = 1; }
+        int nlb = floorDiv(lb * percent, 100);
+        int ntop = 0;
+        int nw = 0;
+        int nh = 0;
+        if (gw > 0 && gh > 0) {
+            ntop = floorDiv(top * percent + 99, 100);
+            nw = floorDiv((lb + gw) * percent + 99, 100) - nlb;
+            nh = ntop - floorDiv((top - gh) * percent, 100);
+            if (nw < 1) { nw = 1; }
+            if (nh < 1) { nh = 1; }
+            if (nw > 255) { nw = 255; }
+            if (nh > 255) { nh = 255; }
+        }
+        bin[o] = nadv;
+        bin[o + 1] = nlb;
+        bin[o + 2] = ntop;
+        bin[o + 3] = nw;
+        bin[o + 4] = nh;
+        o = o + 5;
+        int count = nw * nh;
+        for (int k = 0; k < (count + 1) / 2; k++) { bin[o + k] = 0; }
+        for (int row = 0; row < nh; row++) {
+            // the source rows (in 1/256 pixels; glyph row 0 is at height `top`) that this row covers
+            int y0 = top * 256 - ((ntop - row) * 25600) / percent;
+            int y1 = top * 256 - ((ntop - row - 1) * 25600) / percent;
+            for (int col = 0; col < nw; col++) {
+                int x0 = ((nlb + col) * 25600) / percent - lb * 256;
+                int x1 = ((nlb + col + 1) * 25600) / percent - lb * 256;
+                int sum = 0;
+                int area = 0;
+                int ry = floorDiv(y0, 256);
+                while (ry * 256 < y1) {
+                    int oy0 = (ry * 256 > y0) ? ry * 256 : y0;
+                    int oy1 = ((ry + 1) * 256 < y1) ? (ry + 1) * 256 : y1;
+                    int cx = floorDiv(x0, 256);
+                    while (cx * 256 < x1) {
+                        int ox0 = (cx * 256 > x0) ? cx * 256 : x0;
+                        int ox1 = ((cx + 1) * 256 < x1) ? (cx + 1) * 256 : x1;
+                        int wgt = (ox1 - ox0) * (oy1 - oy0);
+                        sum = sum + wgt * glyphCover(f, p + 5, gw, gh, cx, ry);
+                        area = area + wgt;
+                        cx++;
+                    }
+                    ry++;
+                }
+                int cov = (area > 0) ? (sum + area / 2) / area : 0;
+                if (percent > 100) {
+                    cov = (cov * (100 + (percent - 100) / 4)) / 100;        // a larger glyph spreads the same ink thinner: bring it back
+                }
+                if (cov > 15) { cov = 15; }
+                int idx = row * nw + col;
+                if ((idx & 1) != 0) {
+                    bin[o + (idx >> 1)] = bin[o + (idx >> 1)] | cov;
+                } else {
+                    bin[o + (idx >> 1)] = cov << 4;
+                }
+            }
+        }
+        o = o + (count + 1) / 2;
+    }
+    Font* nf = new Font("");
+    if (!nf->setup(bin, o)) {
+        free(bin);
+        return null;
+    }
+    return nf;
+}
+
+Font* baseSans;
+Font* baseBold;
+Font* baseMono;
+Font* firstSans;                // the configured fonts, before setUiFont replaced them
+Font* firstBold;
+int curUiScale = 100;
+int curMonoScale = 100;
+
+private Font* copyOf(Font* f) {
+    Font* c = new Font("");
+    c->assign(f);
+    return c;
+}
+
+private void captureBases() {
+    if (baseSans != null) {
+        return;
+    }
+    baseSans = copyOf(sans());
+    baseBold = copyOf(sansBold());
+    baseMono = copyOf(mono());
+    firstSans = copyOf(baseSans);
+    firstBold = copyOf(baseBold);
+}
+
+// The scaled glyph sets that setFontScales made: every zoom step used to compute a new glyph set (about 21 KB for each of the three fonts)
+// and keep it for good, which a program that zooms for hours (or an OS whose allocator never frees) cannot afford. A size that was used
+// before is taken from this cache; when it is full the set that was used least recently is freed. The sets in use by sans(), sansBold() and
+// mono() are the three most recently used, so they are never the ones that go.
+const SCALE_CACHE_SIZE = 48;
+Font** scaleFonts;
+Font** scaleBases;
+int* scaleIdents;
+int* scalePcts;
+int* scaleUsed;
+int scaleTick;
+int scaleBuilt;
+
+// how many glyph sets setFontScales has had to compute so far (the others came from the cache)
+public int fontScaleBuilds() { return scaleBuilt; }
+
+private Font* scaledFor(Font* base, int percent) {
+    if (scaleFonts == null) {
+        scaleFonts = (Font**) calloc(SCALE_CACHE_SIZE, 8);
+        scaleBases = (Font**) calloc(SCALE_CACHE_SIZE, 8);
+        scaleIdents = (int*) calloc(SCALE_CACHE_SIZE, 8);
+        scalePcts = (int*) calloc(SCALE_CACHE_SIZE, 8);
+        scaleUsed = (int*) calloc(SCALE_CACHE_SIZE, 8);
+    }
+    scaleTick++;
+    int spare = -1;
+    int oldest = -1;
+    for (int i = 0; i < SCALE_CACHE_SIZE; i++) {
+        if (scaleFonts[i] == null) {
+            if (spare < 0) { spare = i; }
+            continue;
+        }
+        if (scaleBases[i] == base && scaleIdents[i] == base->identity() && scalePcts[i] == percent) {
+            scaleUsed[i] = scaleTick;
+            return scaleFonts[i];
+        }
+        if (oldest < 0 || scaleUsed[i] < scaleUsed[oldest]) { oldest = i; }
+    }
+    Font* sc = scaleFont(base, percent);
+    if (sc == null) {
+        return null;
+    }
+    scaleBuilt++;
+    int slot = spare;
+    if (slot < 0) {
+        slot = oldest;
+        scaleFonts[slot]->release();
+    }
+    scaleFonts[slot] = sc;
+    scaleBases[slot] = base;
+    scaleIdents[slot] = base->identity();
+    scalePcts[slot] = percent;
+    scaleUsed[slot] = scaleTick;
+    return sc;
+}
+
+private void applyFont(Font* target, Font* base, int percent) {
+    if (percent == 100) {
+        target->assign(base);
+        return;
+    }
+    Font* sc = scaledFor(base, percent);
+    if (sc != null) {
+        target->assign(sc);
+    }
+}
+
+private void applyAll() {
+    applyFont(sans(), baseSans, curUiScale);
+    applyFont(sansBold(), baseBold, curUiScale);
+    applyFont(mono(), baseMono, curMonoScale);
+}
+
+// Scales the shared fonts in place: sans() and sansBold() (the text of every widget) by uiPercent, mono() (editors, terminals) by monoPercent;
+// 100 is the size that the font configuration gives. The objects that sans(), sansBold() and mono() return stay the same: a program that
+// calls this and then lays out its windows again shows the new sizes. Percent values are limited to 50..300.
+public void setFontScales(int uiPercent, int monoPercent) {
+    captureBases();
+    curUiScale = (uiPercent < 50) ? 50 : ((uiPercent > 300) ? 300 : uiPercent);
+    curMonoScale = (monoPercent < 50) ? 50 : ((monoPercent > 300) ? 300 : monoPercent);
+    applyAll();
+}
+
+public int uiFontScale() { return curUiScale; }
+public int monoFontScale() { return curMonoScale; }
+
+// Chooses the font of the interface (what sans() and sansBold() return): "sans" or "" (the configured sans fonts), "mono" (the mono font for
+// all text), or the path of a font file. Returns false (and changes nothing) when the file cannot be used. The scales stay.
+public bool setUiFont(char* name) {
+    captureBases();
+    Font* pick = null;
+    Font* pickBold = null;
+    if (name == null || name[0] == 0 || streq(name, "sans")) {
+        pick = firstSans;
+        pickBold = firstBold;
+    } else if (streq(name, "mono")) {
+        pick = baseMono;
+        pickBold = baseMono;
+    } else {
+        pick = loadFont(name);
+        pickBold = pick;
+    }
+    if (pick == null) {
+        return false;
+    }
+    baseSans->assign(pick);
+    baseBold->assign(pickBold);
+    applyAll();
+    return true;
 }
 
 public Font* sans() {

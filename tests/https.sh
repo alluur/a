@@ -31,11 +31,13 @@ mkcert() { # name type
 }
 mkcert rsa rsa; mkcert p256 prime256v1; mkcert p384 secp384r1
 
+# a port nobody listens on (a server left behind by an earlier run must not be mistaken for the one that was just started)
+free_port() { local p; while :; do p=$(($1 + RANDOM % 400)); (echo > /dev/tcp/127.0.0.1/$p) 2>/dev/null || { echo $p; return; }; done; }
 wait_port() { for i in $(seq 1 50); do (echo > /dev/tcp/127.0.0.1/$1) 2>/dev/null && return 0; sleep 0.1; done; return 1; }
 
 # ---- the A server ------------------------------------------------------------------------------------------------------------------
 for k in rsa p256 p384; do
-    port=$((18440 + RANDOM % 400))
+    port=$(free_port 18440)
     $W/httpsd $W/$k/cert.pem $W/$k/key.pem $port $W/www > $W/httpsd.log 2>&1 &
     pid=$!
     if ! wait_port $port; then bad "httpsd ($k) did not start"; kill $pid 2>/dev/null; continue; fi
@@ -72,8 +74,8 @@ done
 # ---- the A client ------------------------------------------------------------------------------------------------------------------
 for k in rsa p256 p384; do
     for suite in TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256; do
-        port=$((18840 + RANDOM % 400))
-        (cd $W/www && openssl s_server -accept $port -cert ../$k/cert.pem -key ../$k/key.pem -tls1_3 -ciphersuites $suite -WWW > ../s_server.log 2>&1) &
+        port=$(free_port 18840)
+        (cd $W/www && exec openssl s_server -accept $port -cert ../$k/cert.pem -key ../$k/key.pem -tls1_3 -ciphersuites $suite -WWW > ../s_server.log 2>&1) &
         pid=$!
         wait_port $port || { bad "s_server ($k) did not start"; kill $pid; continue; }
         got=$(SSL_CERT_FILE=$W/$k/cert.pem $W/http_get https://localhost:$port/index.html 2>&1 | tail -2 | head -1)
@@ -81,8 +83,8 @@ for k in rsa p256 p384; do
         kill $pid 2>/dev/null; wait $pid 2>/dev/null
     done
 done
-port=$((19300 + RANDOM % 400))
-(cd $W/www && openssl s_server -accept $port -cert ../rsa/cert.pem -key ../rsa/key.pem -tls1_3 -WWW > ../s_server.log 2>&1) &
+port=$(free_port 19300)
+(cd $W/www && exec openssl s_server -accept $port -cert ../rsa/cert.pem -key ../rsa/key.pem -tls1_3 -WWW > ../s_server.log 2>&1) &
 pid=$!
 wait_port $port
 got=$(SSL_CERT_FILE=$W/p256/cert.pem $W/http_get https://localhost:$port/index.html 2>&1 | head -1)
