@@ -316,6 +316,8 @@ def crop_box(base, img):
     diff = ImageChops.difference(base, img)
     r, g, b = diff.split()
     mask = ImageChops.lighter(ImageChops.lighter(r, g), b).point(lambda v: 255 if v > THRESHOLD else 0)
+    # the pointer waits in the bottom right corner of the empty desktop: when a sample moved it away, that is a difference too
+    mask.paste(0, (img.width - 40, img.height - 40, img.width, img.height))
     return mask.getbbox()
 
 
