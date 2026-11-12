@@ -277,8 +277,9 @@ the list in the picture also holds the sample's own source file, because the pro
 
 ### Notifications
 
-`guix.notify(d, title, text, kind, ms)` shows a card in the top right corner of the screen: `kind` 0 is information, 1 a warning, 2 an error. It disappears after `ms` milliseconds or on a click, and up to six cards are shown at a time.
-It is for events that arrive while the user does something else: a download that finished, a message from a friend.
+`guix.notify(d, title, text, kind, ms)` shows a card in the top right corner of the screen: `kind` 0 is information (blue stripe), 1 a warning (orange), 2 an error (red). The card shows the title and at most two lines of the text.
+It disappears after `ms` milliseconds or on a click. Up to six cards are shown at a time, one below the other; a seventh call shows nothing and returns `null` (otherwise `notify` returns the window of the card).
+It is for events that arrive while the user does something else: a download that finished, a message from a friend. The card never takes the keyboard focus.
 
 {{sample gui/notifications src}}
 
@@ -292,7 +293,7 @@ The standard look is light. All widgets read a handful of **global variables** w
 |---|---|
 | `gui` | `cBack` (windows), `cText`, `cTextDim`, `cAccent`, `cAccentText`, `cField` (text fields, lists), `cBorder`, `cButton`, `cButtonHot`, `cButtonDown`, `cSelect`; tool tips: `cTipBack`, `cTipBorder`, `cTipText` |
 | `guix` | `cPanel` (menu popups, notification cards), `cTabIdle`, `cTrack`, `cThumbOff` (scroll bars), `cHeadTop`, `cHeadBottom`, `cStripe` (tables) |
-| per widget | `MenuBar.background`, `Toolbar.background`; the text boxes have `colBack`, `colText`, `colSel`, `colBorder`, `colAccent`, `colDim` |
+| per widget | `MenuBar.background`, `Toolbar.background`; `gui.TextBox` has `colBack`, `colText`, `colSel`, `colBorder`, `colAccent`, `colDim` (0 means "use the scheme") |
 
 {{sample gui/dark_theme src}}
 
@@ -307,10 +308,11 @@ In a program you would put them in a box and let the layout size them (the last 
 
 ### Chart
 
-`gchart.Chart(kind)` with `gchart.BAR`, `LINE`, `AREA` or `PIE`. `addSeries(name, colour)` adds a data series and returns its number (up to 8; colour 0 takes the next colour of a built-in palette).
-Give it data with `setValues(series, array, n)` or one point at a time with `push(series, value)`: the chart keeps the last `maxPoints` points (60 by default) and the oldest drop out, so a live chart scrolls by itself.
-`setLabels(names, n)` gives names to the bars or slices, `setRange(lo, hi)` fixes the vertical axis (otherwise it is chosen from the data, in steps of 1, 2 or 5 times a power of ten), `title`, `legend`, `grid` and `stacked` change the look.
-`seriesCount()`, `pointCount(s)`, `valueAt(s, i)` and `clearData()` read and reset the data.
+`gchart.Chart(kind)` with `gchart.BAR`, `LINE`, `AREA` or `PIE`. `addSeries(name, colour)` adds a data series and returns its number (up to 8; the ninth call returns -1). Colour 0 takes the palette colour of that series number from a built-in palette of eight.
+The values are `int`s. Give the chart data with `setValues(series, array, n)` (it copies the numbers) or one point at a time with `push(series, value)`: the chart keeps the last `maxPoints` points (60 by default) and the oldest drop out, so a live chart scrolls by itself.
+`setLabels(names, n)` gives names to the bars, to the points of a line or area chart on the x axis, or to the slices of a pie; it keeps your array instead of copying it, so the array must stay alive as long as the chart.
+`setRange(lo, hi)` fixes the vertical axis (it is ignored unless `hi` is larger than `lo`). Without it the axis starts at 0 (or at the smallest value when that is negative) and ends at the largest value rounded up to 1, 2, 5 or 10 times a power of ten.
+`title`, `legend`, `grid` and `stacked` change the look. `seriesCount()`, `pointCount(s)`, `valueAt(s, i)` (0 for a number that is out of range) and `clearData()` read and reset the data.
 
 {{sample gfx/chart_bar}}
 
@@ -326,20 +328,24 @@ Give it data with `setValues(series, array, n)` or one point at a time with `pus
 
 **What to notice**
 
-* In the bar chart with `stacked = true` the series are piled up instead of drawn side by side, and the axis grows to the sum.
-* The line chart shows two series with different colours from the palette and a legend; `setRange(0, 100)` keeps the axis from moving.
-* `maxPoints = 30` made the area chart keep 30 of the 100 values pushed; `valueAt(load, 0)` is the oldest one that is left.
+* In the bar chart with `stacked = true` the series are piled up instead of drawn side by side, and the axis is sized for the sum of the series (95 for Q4 here). Both charts end up with a top of 100: the largest single value, 60, is rounded up to 100, too. `stacked` only changes bar charts.
+* The output line says `value at 3: 60`: `valueAt(a, 3)` is the fourth sales number.
+* The line chart shows two series with different colours from the palette and a legend; `setRange(0, 100)` keeps the axis from moving. Each series got 40 points, one per call of `push`. A line chart draws a dot on every point only while a series has 30 points or fewer.
+* `maxPoints = 30` made the area chart keep 30 of the 100 values pushed; `valueAt(load, 0)` is the oldest one that is left (66 here, the 71st value pushed).
 
 {{sample gfx/chart_pie}}
 
 {{shot gfx/chart_pie}}
 
-A pie chart draws **one slice per value** of the first series and takes the slice names from `setLabels`.
+A pie chart draws **one slice per value** of the first series and takes the slice names from `setLabels` (without labels the legend shows the numbers). The slice colours come from the built-in palette, not from the colour of the series; values that are zero or negative get no slice.
+In the sample, the output line says that the four values add up to 1700 and that rent, 900, is 52 percent of it; the picture shows that slice as a little more than half of the circle.
 
 ### Gauge, switch and rating
 
-A `gchart.Gauge(min, max)` is a dial with coloured zones: green, then yellow from `warn` percent of the range (60 by default) and red from `critical` (85); set both to 100 for one colour. `setValue(v)` clamps to the range, `caption` is a text below the value.
-A `gchart.Switch(initial)` is an on/off toggle (`on`, `set(b)`, `onChange`; click or Space). A `gchart.Rating(stars, initial)` is a row of stars to click (`value`, `max`, `set(n)`, `onChange`).
+A `gchart.Gauge(min, max)` is a dial with coloured zones: green, then amber from `warn` percent of the range (60 by default) and red from `critical` (85); set both to 100 for one colour. `setValue(v)` clamps to the range, `caption` is a text below the value.
+A `gchart.Switch(initial)` is an on/off toggle (`on`, `set(b)`, `onChange`; click it, or press Space while it has the focus). A `gchart.Rating(stars, initial)` is a row of stars to click (`value`, `max`, `set(n)`, `onChange`);
+`set` cuts the number to 0 .. `max`, and a click on the star that is already the value sets it back to 0. `onChange` of both runs only when the value really changes, and is a function `int f(int widget)`.
+In the first picture the CPU gauge (35) is all green, the memory gauge (72) has passed the amber mark at 60, and the disk gauge (94) reaches into the red zone that starts at 85. In the second, the first switch is off, the second is on, and the ratings show 3 of 5 stars and 5 of 5.
 
 {{sample gfx/gauges}}
 
