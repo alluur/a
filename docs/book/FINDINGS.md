@@ -78,6 +78,8 @@ Nothing here was fixed by the book work: `lib/` and `src/` were left alone on pu
 | `hub->listen` and `conn.Listener` bind 0.0.0.0 (`conn.Listener` has no host parameter); `net.secureAttach` has 512 slots (a new, undocumented limit) | NOTES-web |
 | `lib/httpx.a` header names `httpx.cors` and `checkBearer`, which do not exist; `char* long = ...` says "expected a variable name" with no hint that `long` is reserved | NOTES-web |
 | `ds.BitSet`: a zeroed `BitSet` ignores `set()` out of range although `docs/ALGO.md` says it grows; `strx.LineDiff d();` says "this class has no constructor"; `LruCache.dispose()` also calls the eviction handler | NOTES-algo |
+| `static_assert(sizeof(ThisClass) ...)` placed before the class's last field gives contradictory answers (both `==` 16 and `!= 16` fail for a 16-byte class); put it after the last field | NOTES-lang2 |
+| A function (not only a variable or field) named `rev` turns `foreach (x in rev a)` into the error `foreach needs an array, a range ...`; "does not implement the abstract method" points at the token after the class and does not name the class | NOTES-lang2 |
 | `docs/ALGO.md`: the `splitLines` + `run` example drops the no-newline flags (its patch differs from `diff -u`); `lib/strx.a` mentions `LineDiff.EQUAL` constants that do not exist; the "five targets" claim is stale; no callback signatures are given | NOTES-algo |
 
 ## What the book work verified and found *correct*

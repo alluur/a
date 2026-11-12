@@ -96,7 +96,7 @@ What to notice:
 What to notice:
 
 - The first function uses `goto again` as a loop and `goto found` / `goto missing` as exits. The same function is easy to write with `for` and `return`, which is clearer; use `goto` when it removes complexity.
-- The nested loops are the classic good use: `goto done` leaves **both** loops at once, where a `break` would leave only one.
+- The nested loops are the classic good use: `goto done` leaves **both** loops at once, where a plain `break` would leave only one.
 
 ## defer
 

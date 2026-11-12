@@ -125,7 +125,7 @@ What to notice:
 
 ### Virtual methods
 
-To let the real class of an object decide, mark the base method `virtual`. A method with the same name in a derived class then overrides it (with or without the keyword; the signature is not compared).
+To let the real class of an object decide, mark the base method `virtual`. A method with the same name in a derived class then overrides it (with or without the word `virtual`; the signature is not compared, unless you write `override`, see [More language features](#chap-more-language-features)).
 
 {{sample lang/virtual_methods}}
 

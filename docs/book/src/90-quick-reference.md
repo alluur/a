@@ -15,6 +15,8 @@ One page of facts to keep open while you write A. Everything here is explained i
 | Operators as words | `and` `or` `not` `xor` `sizeof` |
 | Low level | `asm` |
 
+Of the newer words only `foreach` is reserved. `in`, `rev`, `abstract`, `override`, `final`, `is`, `as` and `static_assert` mean something only in the place where they are used, and can still be names; `rev` stops working in `foreach (x in rev a)` while a variable, field or function called `rev` is visible (see [More language features](#chap-more-language-features)).
+
 ## Types
 
 | Type | Size | Notes |

@@ -103,7 +103,7 @@ What to notice:
 
 ## static and private
 
-Two meanings of `static`:
+Two meanings of `static` here (a third one, inside a class, is in [More language features](#chap-more-language-features): a `static` field or method belongs to the class, not to an object):
 
 - **At the top level**, `static` is the same as `private`: the function or global can only be used inside its own file.
 - **Inside a function**, a `static` local keeps its value between calls. It is zero at the start, or set once from its constant initializer before the program starts. It is visible only in its block, and it may be an array.
