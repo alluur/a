@@ -8,7 +8,7 @@ In this chapter:
 
 * the layers, and what each module is for;
 * the engine: `asys`, `acode`, `asyntax`, `atheme`, `aproject`, `afind` and `aidecore`, each with a program you can run;
-* the widgets of `gcode` and its eight parts, each shown in a picture;
+* the widgets of `gcode` and its eight parts, most of them shown in a picture;
 * **building your own IDE** from these parts.
 
 The widgets use windows, boxes and menus from [GUI basics](#chap-gui-basics) and [more widgets](#chap-gui-more-widgets). Pictures here are taken the way [the display server chapter](#chap-display-server)
@@ -18,12 +18,13 @@ describes: a server and a client in one program. The documents behind this chapt
 
 ```text
    aide (terminal)            aide-gui (GUI)               front ends: they draw and read the keyboard
+   with the tui toolkit       with the gcode widgets  <-- Look (theme, font, preferences)
         |                          |
-        |                    gcode widgets  <-- Look (theme, font, preferences)
-        |                          |
-        +---- aidecore: project file, build plans, snippets, templates, recovery, session
-        |
-   atheme  asyntax  afind  aproject  acode  ----  regex
+        +------------+-------------+
+                     |
+   aidecore: project file, build plans, snippets, templates, recovery, session   (aide-gui uses most of it)
+                     |
+   atheme  asyntax  afind  aproject  acode  ----  regex                          (both front ends use these)
                          |
                        asys: memory, files, processes
 ```
