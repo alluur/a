@@ -116,7 +116,7 @@ See the [API reference of `csv`](#api-csv).
 
 ## INI files: `ini`
 
-INI files are settings in `[sections]` with `key = value` lines. Lines that start with `;` or `#` are comments, and so is the rest of a value line after ` ;` or ` #`. Values may be put in double quotes to keep blanks, `;` and `#`. Keys before the first section belong to the section `""`.
+INI files are settings in `[sections]` with `key = value` lines. Lines that start with `;` or `#` are comments, and so is the rest of a value line after ` ;` or ` #`. Values may be put in double quotes to keep `;` and `#` (and blanks between words; blanks at the very start or end of the value are trimmed even inside the quotes). Keys before the first section belong to the section `""`.
 
 {{sample data/ini_parse}}
 
@@ -187,7 +187,7 @@ What to notice:
 What to notice:
 
 * Repetitive data collapses (10000 bytes to 85) and random data grows by a few bytes (10000 to 10011). Compressing twice, or compressing encrypted data, does not help.
-* The compressor looks for repeats in the last 32 KB and writes them with the fixed Huffman code (a ready-made table of short codes for common bytes), or as stored blocks when that is smaller. Real text shrinks to between a quarter and a half (the source of `lib/json.a` to 26%, the file `docs/LANGUAGE.md` to 49%). A full gzip, which also uses dynamic Huffman codes, does better: `gzip -9` needs 1489 bytes for the word soup of this sample (`zlib.gzip` writes 1852 bytes for it). Every program can read what `zlib` writes.
+* The compressor looks for repeats in the last 32 KB and writes them with the fixed Huffman code (a ready-made table of short codes for common bytes), or as stored blocks when that is smaller. Real text shrinks to between a quarter and a half (the source of `lib/json.a` to 26%, the file `docs/LANGUAGE.md` to 49%). A full gzip, which also uses dynamic Huffman codes, does better: `gzip -9` needs 1480 bytes for the word soup of this sample (`zlib.gzip` writes 1852 bytes for it). Every program can read what `zlib` writes.
 * A higher level searches longer: here 2652 bytes at level 1 and 1812 at level 9 for the same data.
 
 {{sample data/zlib_damage}}

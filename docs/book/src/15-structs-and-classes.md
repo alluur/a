@@ -1,6 +1,6 @@
 # Structs and classes
 
-A struct groups several values under one name. A class is a struct that also owns functions (methods), hides its data, and can be extended by other classes. In A the two are the same construct with different defaults, so everything you learn about one applies to the other.
+A struct groups several values under one name. A class adds the tools for larger programs: functions that belong to it (called **methods**), data that other code cannot touch, and the ability to be extended by other classes. In A the two are the same construct with different defaults, so everything you learn about one applies to the other.
 
 In this chapter:
 
@@ -21,9 +21,9 @@ What to notice:
 - `Point q = p;` copied the struct: changing `q.x` did not change `p`.
 - `r.bottomRight = (Point){6, 5};` assigns a whole struct from a compound literal. `strcpy(r.name, "window")` fills the `char` array field.
 - Pointers use either spelling: `pp->x`, `(*pp).y` and `pp.x` mean the same.
-- Fields are laid out in order, each at a multiple of its own size: `Point` is 16 bytes, `Rect` is 16 + 16 + 12 = 44 bytes, rounded up to 48. The size of every struct is a multiple of 8.
+- Fields are laid out in the order you wrote them. An `int` is 8 bytes in A, so `Point` is 8 + 8 = 16 bytes. `char`, `bool` and `char` arrays can start at any byte; every other field (integers, pointers, nested structs) starts at a multiple of 8. `Rect` is 16 + 16 + 12 = 44 bytes, which is rounded up to 48. The size of every struct is a multiple of 8, so a one-byte struct still takes 8.
 - `new Point` allocates a zeroed struct on the heap and returns a pointer; see [chapter 17](#chap-memory-and-pointers) for what that means.
-- There is no automatic comparison: `a == b` on two struct values does not compare their fields. Write a function, or define `operator==` (see below).
+- There is no automatic comparison. `a == b` on two struct values compiles, but it does not compare the fields: it compares where the two variables are stored, so it is true only when both names are the same variable. Write a function that compares the fields, or define `operator==` (see below).
 
 ## Classes
 
@@ -41,7 +41,7 @@ What to notice:
 
 ### Access labels
 
-Instead of a modifier on every member you can use C++ style labels. After `public:` or `private:` all following members have that access until the next label. A `struct` is public by default, a `class` is private by default.
+Instead of a modifier on every member you can use C++ style labels. After `public:`, `protected:` or `private:` all following members have that access until the next label. A `struct` is public by default, a `class` is private by default.
 
 {{sample lang/class_labels}}
 
@@ -60,8 +60,20 @@ How you declare an object decides whether the constructor runs:
 | `Counter c();` | constructor runs with its default arguments |
 | `Counter* p = new Counter(100);` | constructor runs, on the heap |
 | `Counter c;` | object is **zeroed**, the constructor does **not** run |
+| `new Counter;` | compile error when the class has a constructor |
 
-A class without a constructor is always just zeroed. Constructors may have default parameter values, like any function.
+Only a declaration with parentheses, or `new`, runs the constructor. `Counter c;` does not run it, wherever it appears: a local variable, a global, a field of another class, or an element of an array are all just zeroed. (If the class has virtual methods, the object still gets its vtable pointer; see below.) The sample below prints a line from inside the constructor, so you can see when it runs.
+
+{{sample lang/class_ctor_runs}}
+
+What to notice:
+
+- `Noisy a;` printed no "constructor ran" line, and `a.id` is 0, not 100. The same is true for the global, for the field `h.inner` and for the elements of `arr`.
+- `Noisy b();`, `Noisy c(5);` and `new Noisy(7)` each ran the constructor once. `b` used the default `n = 0`, so its `id` is 100.
+- A class that has a constructor cannot be created with a bare `new Noisy;`: that is the compile error `constructor call needs parentheses`. Write `new Noisy()` or `new Noisy(args)`.
+- A class without a constructor is always just zeroed. `Plain p;` and `new Plain` both work, and so does `new Plain()`. Parentheses on a stack object (`Plain p();`) are an error (`this class has no constructor`).
+
+Constructors may have default parameter values, like any function. The next sample uses them.
 
 {{sample lang/class_objects}}
 
@@ -69,7 +81,7 @@ What to notice:
 
 - `Counter c();` ran the constructor with `start = 1` and `step = 1`, so `tick()` made 2.
 - `Counter zero;` has `step = 0`, so `tick()` left `value` at 0: the constructor never ran. When a class needs initialisation, declare it with parentheses or with `new`.
-- `Plain` has no constructor, so all its fields start as 0 and `null`, with or without parentheses.
+- `Plain` has no constructor, so all its fields start as 0 and `null`. `Plain p;` and `new Plain()` are both fine.
 
 ### Methods and global functions
 
@@ -84,7 +96,7 @@ What to notice:
 
 ## Operator overloading
 
-A class (or struct) can define what the operators do by declaring methods named `operator` followed by the operator. The operators are `+ - * / % & | ^ << >> == != < > <= >= []` and the unary `-`. The left operand must be a class **value** (not a pointer); the right operand is whatever the method takes. `a != b` uses `operator==` when there is no `operator!=`, and `a += b` calls `operator+` and stores the result.
+A class (or struct) can define what the operators do by declaring methods named `operator` followed by the operator. The operators are `+ - * / % & | ^ << >> == != < > <= >= []` and the unary `-`. The left operand must be a class **value** (not a pointer); the right operand is whatever the method takes. `a != b` uses `operator==` when there is no `operator!=`, and `a += b` calls `operator+` and stores the result (`-=`, `*=` and the other compound forms work the same way).
 
 {{sample lang/operator_overload}}
 
@@ -92,7 +104,8 @@ What to notice:
 
 - `operator-()` with no parameter is the unary minus; `operator-(Vec o)` would be the binary one.
 - `operator*(int k)` multiplies by an `int`, not by a `Vec`: the right operand may have any type.
-- A class has one method per operator: no overloading by parameter type. `&&`, `||`, `!`, `++`, `--` and `=` cannot be overloaded (`this operator cannot be overloaded`).
+- A class has one method per operator: a second `operator+` with another parameter type is the error `redefinition of 'operator+'`. `&&`, `||`, `!`, `~`, `++`, `--`, `=` and `()` cannot be overloaded (`this operator cannot be overloaded`).
+- Be careful with operators you did **not** define. The compiler does not report them: it treats the two struct values as addresses. For example `a > b` without an `operator>` compares where `a` and `b` are stored, and `a + b` without an `operator+` adds two addresses. Define every operator you use.
 - Results that are classes are returned by value (see [functions](#chap-functions)).
 
 ## Inheritance
@@ -105,7 +118,7 @@ There are three levels of access: `public` (everyone), `protected` (the class an
 
 What to notice:
 
-- `super(name, 2)` runs the base class constructor. Put it first in the constructor. A class without any constructor uses the base class constructor.
+- `super(name, 2)` runs the base class constructor. Put it first in the constructor. If a derived class has a constructor but does not call `super(...)`, the base class constructor does not run. A class without any constructor uses the base class constructor.
 - `Bird.wings()` reads `legs`, which is `protected`. Reading `secret` (private to `Animal`) would be the error `member is private to its class 'secret'`.
 - `Dog.kind()` has the same name as `Animal.kind()` and replaces it for calls on a `Dog`. `super.kind()` calls the base version.
 - Through an `Animal*`, `a->kind()` still printed `animal`. The method `kind` is **not virtual**, so the type of the pointer decides which one runs.
@@ -118,7 +131,7 @@ To let the real class of an object decide, mark the base method `virtual`. A met
 
 What to notice:
 
-- `describe()` is written once in `Animal` and calls `speak()`. Each object answered with its own `speak`: 1000 + 0 legs, 2000 + 4, and 12000 + 4 for `Puppy`, whose `speak` calls `super.speak()` and adds 10.
+- `describe()` is written once in `Animal` and calls `speak()`. Each object answered with its own `speak`: 1000 + 0 legs, 2000 + 4, and 12000 + 4 for `Puppy`, whose `speak` calls `super.speak()` and adds 10. The local `Dog local();` works the same way: `local.speak()` is 2.
 - `Puppy` has no constructor, so `new Puppy()` used `Dog`'s, which called `Animal(4)`.
 - The object gets its vtable pointer when it is created with `new`, declared as a local, or declared as a global. Copying an object copies the pointer too: there is no protection against slicing, no destructor, no multiple inheritance and no abstract class.
 - A virtual method must have a body; otherwise the program does not link (`undefined function`).
@@ -133,16 +146,16 @@ What to notice:
 
 - `Stack` has private fields `top` and `size`. As a `new` object they start as `null` and 0, so no constructor is needed.
 - `new Node(v)` runs the constructor; the new node's `next` is set to the old top, and `top` becomes the new node: a push onto the front of a singly linked list.
-- Nodes are never freed (that is what `new` means in A); a long-running program that pushes and pops millions of times should use `malloc` and `free` instead (see [chapter 17](#chap-memory-and-pointers)).
+- `pop` does not free the node. Memory from `new` is never given back in A, so a long-running program that pushes and pops millions of times would use `malloc` and `free` for the nodes instead (see [chapter 17](#chap-memory-and-pointers)). `malloc` does not run a constructor, so you set the fields yourself.
 
 ## Summary
 
 - `struct` and `class` are one construct: members are public in a struct and private in a class.
 - Fields are laid out in order, naturally aligned, and the struct size is a multiple of 8; objects are zeroed.
-- A constructor has the name of the class; `Class c(args);` and `new Class(args)` run it, `Class c;` does not.
+- A constructor has the name of the class; `Class c();`, `Class c(args);` and `new Class(args)` run it. `Class c;` (a local, a global, a field or an array element) does not: the object is only zeroed.
 - `this` is the pointer to the object; methods can use fields and other methods without a prefix, and they hide global functions of the same name (`::name` reaches the global one).
 - `public`, `private` and `protected` are checked at compile time.
-- Operator methods (`operator+`, `operator==`, `operator[]`, ...) give classes the usual operators.
+- Operator methods (`operator+`, `operator==`, `operator[]`, ...) give classes the usual operators. An operator you did not define is not an error: it works on addresses.
 - `class Dog : Animal` inherits; `super(...)` and `super.name(...)` reach the base class; `virtual` makes a method dispatch on the real class.
 
 ## Where next

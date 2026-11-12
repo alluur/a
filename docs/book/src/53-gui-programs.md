@@ -28,7 +28,7 @@ The smallest application with state: a number, and buttons that change it.
 The state is the global `count`. `show()` is the **one** function that turns the state into what you see; the two callbacks only change the state and call it. The picture was taken after three clicks on "+".
 
 * The two buttons have `flex = 1` in a row, so they share the width equally.
-* `shown->font = gfx.sansBold()` and `align = 1` make the number bold and centred. (`gfx` comes in with `import gui;`.)
+* `shown->font = gfx.sansBold()` and `align = 1` make the number bold and centred.
 * The label is created with the text "0" and `show()` is not called at the start: the initial state and the initial text agree. Calling `show()` once at the start is safer in a larger program, as the next version does.
 
 ### The finished version
@@ -43,7 +43,7 @@ The finished counter has a step (a `SpinBox`), limits that disable the buttons, 
 
 * `show()` does more now: it also sets the title with `win->setTitle`, and enables or disables the two buttons with `setEnabled` at the limits. Everything that depends on `count` is in that one function, so no path can forget one of them.
 * `add(delta)` is the only place that changes `count`; it clamps the value to -20 .. 20. Buttons, keys and Reset all go through it.
-* `win->onKey` gets the keys that no widget used. The spin box and the buttons are focusable and take their own keys, but `+`, `-` and `0` fall through to the window. The picture shows the result of three clicks of step 2 and then the `+` key: 8.
+* `win->onKey` gets the keys that no widget used. The focused widget gets a key first; a button has no use for `+`, so it falls through to the window. (A focused spin box would take the digit `0` for itself.) The picture shows the result of three clicks of step 2 and then the `+` key: 8.
 * The callbacks use globals (`win`, `shown`, `less`, `more`, `step`). A graphical program has one window with one set of widgets, and a global is the simplest way for a callback to reach them; for several windows use `userData` of the widget or the window.
 
 ## A to-do list
@@ -111,7 +111,7 @@ Moving the mouse quickly makes events that are far apart, so a thick brush must 
 * The slider sets the radius of the brush. `dab` draws a filled circle in the selected colour. `mouse` calls it once for every pixel between the old and the new position (`steps` is the larger of the two distances), so strokes are solid at any speed.
 * **Clear** fills the canvas surface with white, **Save** writes it with `gimg.savePng(canvas->surf, "painting.png")` and reports it in a label. The canvas *is* the document: there is nothing else to save.
 * The window is made with `fit()`, so the width follows the toolbar row; the canvas is 528 pixels wide to match it.
-* The picture was made with a click on the red cell and a drag, a click on blue and a drag, and so on: five strokes in four colours.
+* The picture was made with a click on the red cell and a drag, a click on blue and a drag, and so on: four strokes in four colours.
 
 ## An analog clock
 

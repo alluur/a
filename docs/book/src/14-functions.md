@@ -12,7 +12,7 @@ In this chapter:
 
 ## Defining and calling functions
 
-A function has a result type, a name, a parameter list and a body: `int add(int a, int b) { return a + b; }`. The result type `void` means that nothing is returned. Parameters and results are passed **by value**: the callee gets copies. Allowed types are integers, `char`, `bool`, enums, pointers, `func`, and structs and classes.
+A function has a result type, a name, a parameter list and a body: `int add(int a, int b) { return a + b; }`. The result type `void` means that nothing is returned. Parameters and results are passed **by value**: the callee gets copies. Allowed types are integers, `char`, `bool`, `double`, enums, pointers, `func`, and structs and classes.
 
 {{sample lang/functions_basic}}
 
@@ -27,7 +27,7 @@ What to notice:
 
 ## Default parameter values
 
-A parameter can have a default value: a constant expression (a number, a character, `true`, `false`, `null`, a `const` name, an enum member, or arithmetic on them) after `=`. Parameters with defaults must come last, and a call may leave out trailing arguments that have defaults. The same works for methods and constructors, and it is how `printf` takes one to eight values.
+A parameter can have a default value: a constant expression (a number, a character, `true`, `false`, `null`, a `const` name, an enum member, or arithmetic on them) after `=`. Parameters with defaults must come last, and a call may leave out trailing arguments that have defaults. The same works for methods and constructors, and it is how `printf` takes up to eight values.
 
 {{sample lang/default_params}}
 
@@ -48,7 +48,7 @@ What to notice:
 - `shift(p)` changed only its copy: `p.x` stayed 9. `shiftInPlace(&p)` took a **pointer** and changed the original.
 - Calls nest: the result of `make` is a temporary that `add` receives as an argument.
 - Copying a big struct on every call costs time. For large structs that a function only reads or changes, pass a pointer.
-- Calling a struct-returning function through a `func` pointer is not supported.
+- Calling a struct-returning function through a `func` pointer is not supported. The compiler does not stop you, but the program crashes.
 
 ## Variable argument lists
 
@@ -60,7 +60,7 @@ What to notice:
 
 - All extra arguments are 64-bit values: numbers, characters, pointers (strings included), doubles as bit patterns.
 - There is **no check** that `i` is below `va_count()`; the loop must stay within the count.
-- `logf` shows how to make your own `printf`: copy the extras into an array and hand it to `vformat` (see [chapter 10](#chap-first-programs)).
+- `logf` shows how to make your own `printf`: copy the extras into an array and hand it to `vformat` (see [first programs](#chap-first-programs)).
 - A function with `...` cannot be a method, cannot have default values, and cannot be called through a `func` pointer or used as a value (`a function with ... cannot be used as a value`).
 
 ## Function pointers
@@ -74,7 +74,7 @@ What to notice:
 - `apply(&square, 9)` and `apply(square, 9)` are the same.
 - A `func` can be a variable, an array element (`table[1](7)`) or a field of a struct (`cmds[i].run(5)`); this is how you build tables of commands or callbacks.
 - Function pointers can be compared with `==`.
-- Only ordinary functions have an address: not methods, not functions with `...`, and not the built-in `__...` runtime functions. The library functions `qsort`, `bsearch`, `atexit` and `signal` of the C library take `func` arguments.
+- Only ordinary functions have an address: not methods, not functions with `...`, and not the built-in `__...` runtime functions. The C library functions `qsort`, `bsearch` and `atexit` (module `cstdlib`) and `signal` (module `cunistd`) take `func` arguments.
 
 ## Recursion
 
@@ -85,7 +85,7 @@ A function may call itself. Each call has its own parameters and locals on the *
 What to notice:
 
 - `20!` is the largest factorial that fits in a 64-bit `int`: `21!` would wrap around.
-- `fib(20)` makes thousands of calls, and the program ran instantly: calls are cheap.
+- `fib(20)` makes 21,891 calls, and the program ran instantly: calls are cheap.
 - `depth(100000)` recursed a hundred thousand levels without trouble. A recursion without an end (or with a huge local array in each frame) runs out of stack, and the program crashes with a segmentation fault; the shell then reports exit code 139.
 - Recursion is the natural fit for trees and divide-and-conquer; for a plain counting loop, use `for`.
 
@@ -124,7 +124,7 @@ A `union` is like a `struct` whose members all share the same memory. Its size i
 
 What to notice:
 
-- `Value` is 8 bytes: the `int`, the 8-byte array and the pointer overlap.
+- `Value` is 8 bytes: the `int`, the 8-byte array and the pointer overlap. `Tagged` is 16 bytes: `kind` plus the 8-byte union.
 - Writing `v.number = 0x0102030405060708` and reading `v.bytes` shows the byte order of the processor: x86-64 stores the **least** significant byte first.
 - `Tagged` is the standard pattern for a "variant": `kind` says which member is valid. The language does not check that you read the member you wrote.
 
@@ -174,8 +174,8 @@ A accepts several C forms so that existing code ports easily. They all behave as
 What to notice:
 
 - `a = 1, b = 2` evaluates both and has the value of the last one. It works in statements, `for` heads and parentheses, but not between function arguments, where the comma separates arguments.
-- `sizeof(x)`, `sizeof x` and `sizeof(expr)` all work; the expression is not evaluated and must not contain a call (`sizeof cannot contain a function call`).
-- `short`, `long`, `signed`, `unsigned`, `long long`, `unsigned long int` and `long double` are accepted and mean the ordinary A types: all integers are the 64-bit signed `int`, `unsigned char` is `char`, and `long double` is `double`. `sizeof(short)` is 8! Use `int16` when you need 16 bits.
+- `sizeof(x)`, `sizeof x` and `sizeof(expr)` all work (the 7-element `int` array has size 56); the expression is not evaluated and must not contain a call (`sizeof cannot contain a function call`).
+- `short`, `long`, `signed`, `unsigned`, `long long`, `unsigned long int` and `long double` are accepted and mean the ordinary A types: all integers are the 64-bit signed `int`, `unsigned char` is `char`, and `long double` is `double`. `sizeof(short)` is 8, and `unsigned u = -1;` stays -1. Use `int16` or `uint16` (and the other `int8` ... `uint64` types) when you need a width or unsigned arithmetic.
 - Adjacent string literals are joined, also across lines.
 
 **`typedef enum`, `typedef struct`, the `struct` keyword and `extern`:**

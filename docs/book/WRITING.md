@@ -129,7 +129,7 @@ with `{{shot group/name}}` (after the `{{sample group/name}}` that shows the cod
 | `// book: gui` | **a program with windows** (`import gui;`): the sample checker only compiles it; `shots.py` starts a headless display server, runs the program as a client, drives it, takes a screenshot and cuts the window out. It has no `.out`. |
 
 ```sh
-python3 docs/book/tools/shots.py                      # every graphical sample
+python3 docs/book/tools/shots.py                      # every graphical sample of every group (also the ones of the other contributors: pass your GROUP instead)
 python3 docs/book/tools/shots.py gui/hello_window     # one sample (GROUP or GROUP/NAME, like samples.py)
 python3 docs/book/tools/shots.py --list               # which samples are graphical
 nice -n 10 python3 docs/book/tools/shots.py -v --keep gui   # keep the scratch directories (with the program's output in client.log)

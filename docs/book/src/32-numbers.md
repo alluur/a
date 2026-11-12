@@ -37,6 +37,7 @@ What to notice:
 
 * `%` and `/` truncate towards zero, like in C: `-7 % 3` is -1 and `-7 / 2` is -3. `mod(a, m)` returns 0 to `m - 1` when `m` is positive, and `floorDiv` rounds towards minus infinity.
 * `isqrt` is the integer square root, rounded down. `isPrime`, `nextPrime`, `powMod`, `factorial`, `fibonacci` and `binomial` are what you expect; `factorial(21)` or `fibonacci(93)` no longer fit in an `int`.
+* Two limits to know: `math.powMod(base, exp, m)` is only correct for a modulus `m` below 2^31 (with a larger one the intermediate product overflows and the result is wrong, even negative), and `math.isPrime` tries divisors one by one, which is slow for numbers near 2^63. `arith` has versions without these limits (below).
 * The statistics functions take an array and a length: `sum`, `minOf`, `maxOf`.
 
 The global random generator of the standard library is a seeded one. With the same `srand` you get the same numbers on every run and every target, which is what you want in tests and simulations.
@@ -79,7 +80,7 @@ What to notice:
 
 What to notice:
 
-* `factorize(n, primes, max)` stores the prime factors, with repeats, and returns how many. It handles numbers like 600851475143 instantly.
+* `factorize(n, primes, max)` stores the prime factors, with repeats, and returns how many; it stores at most `max` of them, but the number it returns is the full count. It divides by 2, 3, 5, 7, 9 ... up to the square root of what is left, so it is instant for numbers like 600851475143 and slow (seconds or more) for a number whose smallest prime factor is around a billion or larger. `totient` and `divisorCount` work the same way.
 * `isPrime` is exact for every 64-bit number, including 2^61 - 1.
 * `mulMod`, `powMod` and `modInverse` work without overflow for any positive modulus: `mulMod` multiplies two `int` values modulo `m` correctly, even when the product needs more than 64 bits. `modInverse` returns -1 when no inverse exists.
 * `totient(n)` is Euler's totient (how many numbers up to `n` have no common factor with it), `divisorCount(n)` counts the divisors and `nextPrime(n)` is the first prime above `n`.
@@ -91,7 +92,7 @@ What to notice:
 
 What to notice:
 
-* The limits are in the names of the functions: `fibonacci(92)` is the largest that fits, `factorial` goes up to 20, `catalan` up to 33.
+* Watch the limits, because there is no overflow check: `fibonacci(92)` is the largest that fits in an `int`, `factorial` goes up to 20, `catalan` up to 33 (the module's documented limits; larger arguments silently give wrong numbers).
 * `digitCount`, `digitSum`, `reverseDigits` and `isPalindrome` work on the decimal digits of a number.
 
 ### Exact fractions: `Rational`
@@ -155,7 +156,7 @@ See the [API reference of `bigint`](#api-bigint).
 
 ## Big numbers for cryptography: `bn`
 
-`bn` is a different tool for a different job. A `bn.Num` has a **fixed number of limbs** (30 bits each) that you choose, and the module is built around modular arithmetic with an odd modulus using Montgomery multiplication. RSA, elliptic curves and X25519 in the standard library are built on it. All numbers that meet in one operation have the same limb count.
+`bn` is a different tool for a different job. A `bn.Num` has a **fixed number of limbs** (30 bits each) that you choose, and the module is built around modular arithmetic with an odd modulus using Montgomery multiplication. RSA, elliptic curves and X25519 in the standard library are built on it. All numbers that meet in one operation have the same limb count (only the exponent of `powMod` may have a different one).
 
 {{sample numbers/bn_modpow}}
 
@@ -239,7 +240,7 @@ What to notice:
 
 What to notice:
 
-* `sqrt` is exact. `exp`, `log`, `sin`, `pow` and the others are computed with about 100 bits and rounded once, so they are almost always the correctly rounded result and the same on every CPU: `log10(1000)` is exactly 3.0 and `sin(PI / 2)` exactly 1.0.
+* `sqrt` and the basic operations are correctly rounded (error 0). `exp`, `log`, `sin`, `pow` and the others are computed with about 100 bits and rounded once, so they are almost always the correctly rounded result and the same on every CPU: `log10(1000)` is exactly 3.0 and `sin(PI / 2)` exactly 1.0.
 * Trigonometry works in **radians**. `asin(0.5) * 180 / PI` converts to degrees.
 * `round` rounds halves away from zero (`round(-2.5)` is -3.0), `floor` goes down, `ceil` up, `trunc` towards zero.
 * `sqrt(-1)` is NaN.

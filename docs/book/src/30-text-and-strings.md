@@ -8,7 +8,7 @@ Text in A is a plain `char*`: a pointer to bytes that end with a zero byte, and 
 * `utf8`: characters (code points) instead of bytes;
 * `encoding`: Base64, hexadecimal and URL escapes;
 * `codec`: text, binary digits and small pictures converted into each other;
-* `regex`: a full regular expression engine with groups, look-ahead, lazy quantifiers and a step limit.
+* `regex`: a backtracking regular expression engine with groups, look-ahead, lazy quantifiers and a step limit.
 
 ## Text in A on one page
 
@@ -16,7 +16,7 @@ Four facts explain almost everything in this chapter.
 
 * A string is a pointer to bytes and ends at the first zero byte. `strlen(s)` counts **bytes**, not characters.
 * String literals are stored in writable memory, so functions such as `trim` and `strUpper` can change them in place. Work on a copy (`strdup`) when you need the original.
-* Functions that **return** text (`strings.concat`, `utf8.reverse`, `encoding.hexEncode` ...) make a new string on the heap. The heap is never freed (see [memory and pointers](#chap-memory-and-pointers)), which is fine for programs that finish, and something to keep in mind in a loop that runs a million times.
+* Functions that **return** text (`strings.concat`, `utf8.reverse`, `encoding.hexEncode` ...) make a new string on the heap. The heap is never freed (see [memory and pointers](#chap-memory-and-pointers)), which is fine for programs that finish, and something to keep in mind in a loop that runs a million times. The results of `regex.replaceGroups`, `regex.replaceAll` and `regex.quote` are an exception: they come from another allocator and can be freed (see "Replacing" in the regex section).
 * Binary data can contain zero bytes, so functions that handle it (`encoding`, `hash`, `zlib`) take a pointer **and a length**. Do not use `strlen` on such data.
 
 ## Building and changing strings: `strings`
@@ -46,7 +46,7 @@ What to notice:
 | `lastIndexOf(s, c)` | the index of the last character `c`, or -1 |
 | `replace(s, from, to)` | every occurrence of `from` replaced by `to` (an empty `from` changes nothing) |
 | `padLeft(s, width, fill)`, `padRight(...)` | fill up to `width` bytes with the character `fill` (on the left or on the right) |
-| `capitalize(s)`, `upper(s)`, `lower(s)` | letter case (ASCII letters only) |
+| `capitalize(s)`, `upper(s)`, `lower(s)` | `capitalize` turns the first letter into a capital and leaves the rest alone; `upper` and `lower` change every letter (ASCII letters only) |
 | `isBlank(s)` | true when the text is empty or has only spaces, tabs and line breaks |
 
 {{sample text/strings_functions}}
@@ -162,7 +162,7 @@ What to notice:
 
 ### Pictures
 
-A `codec.Image` has a width `w`, a height `h` and one byte per pixel in `px`: 0 is black and 255 is white. `binaryToImage` reads rows of `0` and `1` where **1 is a dark pixel**.
+A `codec.Image` has a width `w`, a height `h` and one byte per pixel in `px`: 0 is black and 255 is white. `binaryToImage` reads rows of `0` and `1` where **1 is a dark pixel** (`#` is dark too, every other character is white).
 
 {{sample text/codec_image}}
 
@@ -266,7 +266,7 @@ What to notice:
 * An empty match is replaced as well: `x*` on `abc` puts a dash before and after every letter, like Python 3.7 and newer.
 * A group that did not take part in the match contributes nothing.
 * `replaceAll` uses the replacement literally and the *simple dialect* described at the end of this section.
-* The result of `replaceGroups` and `replaceAll` (and of `quote`, below) is memory from the `asys` allocator, so you can give it back with `asys.free` if you need to.
+* The result of `replaceGroups` and `replaceAll` (and of `quote`, below) is memory from the `asys` allocator, so you can give it back with `asys.free` (after `import asys;`) if you need to.
 
 ### Anchors and boundaries
 
@@ -305,7 +305,7 @@ What to notice:
 
 What to notice:
 
-* `(?i)` can stand at the start of the pattern or in front of a part of it, `(?i:...)` limits it to the parentheses. The `flags` argument of `compile` (`regex.F_ICASE`, `F_DOTALL`, `F_MULTILINE`) has the same effect on the whole pattern.
+* `(?i)` can stand at the start of the pattern or in front of a part of it; it then works up to the end of the enclosing group (or of the pattern). `(?i:...)` limits it to the parentheses. The `flags` argument of `compile` (`regex.F_ICASE`, `F_DOTALL`, `F_MULTILINE`) has the same effect on the whole pattern.
 * `(?=px)` looks ahead without using up the text. The match for `\d+(?=px)` is `24`, not `24px`.
 * The negative look-ahead has to exclude digits too (`(?!\d|px)`), otherwise `\d+` can simply stop one digit earlier.
 
@@ -316,7 +316,7 @@ What to notice:
 What to notice:
 
 * `.` and `[^...]` use up one whole UTF-8 character, so `Gr.{3}` matches `Grüße` (5 characters, 7 bytes).
-* `\w` matches every non-ASCII character, so words in any script are found.
+* `\w` matches every non-ASCII character, so words in any script are found. The price is that non-ASCII punctuation, symbols and spaces (a no-break space, `€`) count as word characters too.
 * A class can contain a range of code points, here `[ぁ-ヶ]` for hiragana and katakana.
 * `(?i)` ignores the case of ASCII letters only: `ü` does not match `Ü`.
 
@@ -336,7 +336,7 @@ Nested quantifiers such as `(a+)+b` can take exponential time on text that does 
 
 ### The simple functions
 
-For a quick test in a tool, four functions compile the pattern for you: `matches` (the whole text), `test` (anywhere), `search` (the position, and the length through a pointer) and `replaceAll` (replace every match, see above). A fifth helper, `quote`, escapes a text so that it matches itself. The compiled patterns of the last eight different patterns are kept, so calling these functions in a loop does not compile each time.
+For a quick test in a tool, four functions compile the pattern for you: `matches` (the whole text), `test` (anywhere), `search` (the position, and the length through a pointer) and `replaceAll` (replace every match, see above). A fifth helper, `quote`, escapes a text so that it matches itself. The compiled patterns of the last eight different patterns are kept (`replaceGroups` shares this cache), so calling these functions in a loop does not compile each time.
 
 {{sample text/regex_simple}}
 
