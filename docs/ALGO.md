@@ -18,12 +18,20 @@ Contents: [conventions](#conventions) · [ds](#ds---data-structures) · [strx](#
 
 ## Conventions
 
-* **Declare objects with parentheses** (`ds.Deque d(16);`) when the class has constructor arguments. A class that is only zeroed (`ds.Trie t;`) is an empty container that
-  grows on first use, so both forms work for the classes that take no required argument.
+* **Declare objects with parentheses** (`ds.Deque d(16);`) when the class has constructor arguments; a constructor never runs for a plain `ds.Deque d;`.
+  *Zeroed objects* (declared without parentheses) are valid in two ways. The classes **without a size or capacity** (`Deque`, `OrderedMap`, `OrderedSet`, `OrderedTextMap`, `OrderedTextSet`, `HashMap`, `HashSet`,
+  `TextHashMap`, `TextHashSet`, `Trie`, `IntervalSet`, `BinaryHeap`, `PriorityQueue`, `DisjointSet`, `BitSet`, and in `strx` `AhoCorasick` and `LineDiff`) are empty containers that grow on first use.
+  The classes **made with a size or capacity** (`RingBuffer`, `ByteRing`, `Fenwick`, `RangeFenwick`, `SegTree`, `LruCache`, `TextLruCache`, `BloomFilter`, `CountMinSketch`) must be declared with parentheses:
+  zeroed, they have size 0 or capacity 0 and store nothing (`push`, `put` and `add` return `false`, queries find nothing), but they never crash. **A default argument is not applied to a zeroed object**:
+  a zeroed `LruCache` has capacity 0, not 16, and a zeroed `BloomFilter` has no bits (`add` returns `false`, `mightContain` says no, `bitCount()` is 0). A zeroed `strx.Kmp`, `Horspool` or `RabinKarp` is an empty pattern.
 * **`dispose()` frees every block** (also copies of text keys) and leaves an empty object that can be used again. `A` has no `delete`: an object made with `new` is never freed,
   so prefer objects on the stack. Collections of the standard library never free memory; these do. The tests check `asys.memInUse()` before and after.
 * **Memory failures** do not crash: an operation that has to allocate returns `false`, `-1` or `null` and leaves the container as it was.
-* **Bad indexes and empty containers** give `0`, `-1`, `false` or `null` (documented per method), never a crash. Counts and sums wrap around on overflow.
+* **Bad indexes and empty containers** give `0`, `-1`, `false` or `null` (documented per method), never a crash (this includes `size 0`, never-sized, zeroed and disposed containers; t429 and t437 test it). Counts and sums wrap around on overflow.
+* **Null pointers**: `strx` takes a `null` text as an empty text and `rng` takes a `null` array when the count is 0 (t429). **`ds` does not check its pointer arguments for `null`**: a text key, a byte buffer or an output
+  array must be a real pointer. Measured crashes: `Trie.put`, `TextHashMap.put`, `TextHashSet.add`, `OrderedTextMap.put`, `OrderedTextSet.add`, `BloomFilter.addText / mightContainText / addBytes`, `CountMinSketch.addText / estimateText`,
+  `TextLruCache.put`, `ByteRing.write / peek / read` with a length above 0, `Deque.copyTo(null)`, `Trie.collect` with a `null` array. A lookup in an empty container (`Trie.has(null)`, `TextHashMap.get(null)`) may happen to answer
+  `false`; do not rely on it. Pass `""` for an empty text.
 * **Texts** in `strx` are `char*` plus a length `(s, n)`; `n = -1` means "up to the terminating 0", and a `null` pointer is an empty text. Texts that are not 0 terminated are never read past `n`.
   A flag `utf8 = true` on the distance and similarity functions compares code points instead of bytes (invalid bytes count as one symbol each).
 * **Not thread safe.**
@@ -49,8 +57,8 @@ All containers hold ints (texts and pointers fit in an int, and there are text v
 | `SegTree` | sum, minimum or maximum over ranges, **lazy** range add and range assign | `SegTree t(n, ds.SEG_MAX); t.add(l, r, v); t.assign(l, r, v); t.query(l, r)` |
 | `IntervalSet` | merged integer intervals | `add(lo, hi) remove(lo, hi) contains covers overlaps nextFree nextMember indexOf lowAt highAt length` |
 | `LruCache`, `TextLruCache` | hash map + doubly linked list, eviction callback, counters `hits misses evictions` | `get put peek remove setCapacity setEvictHandler` |
-| `BloomFilter` | "maybe in the set", integer arithmetic only | `BloomFilter f(expected, oneIn); add mightContain addText mightContainText merge falsePositivePpm` |
-| `CountMinSketch` | approximate frequencies, optional conservative update | `add(key, n) estimate(key) merge` |
+| `BloomFilter` | "maybe in the set", integer arithmetic only | `BloomFilter f(expected, oneIn); add mightContain addText mightContainText merge falsePositivePpm` (`add` returns `false` when the filter has no bits: zeroed, out of memory, disposed) |
+| `CountMinSketch` | approximate frequencies, optional conservative update | `add(key, n) estimate(key) merge` (`add` returns `false` when nothing was stored: no table, or `n <= 0`) |
 
 Functions: `cmpAsc cmpDesc cmpText` (comparators for `BinaryHeap`, `OrderedMap`, `algo.sortBy`), `mix64 hashInt hashText hashBytes` (seeded), `randomSeed()` (a seed
 from the system: pass it to the hash maps when the keys come from an attacker), `freeTexts(array, n)` (frees the texts `Trie.collect` hands out).
@@ -101,7 +109,8 @@ Details that matter:
 | `AhoCorasick` | many patterns in one pass: `add(pattern) -> id`, `findAll(text, n, ids, ends, max)`, `count`, `first`, `each(text, n, callback, ctx)`, a state cursor `step / match / nextMatch / patternAt`, `ignoreCase` option |
 
 An empty pattern matches at every position `0 .. n`. (`algo.kmpFind` and `algo.countOccurrences` rebuild their table for every call and restart after every match, so they are quadratic on texts like `aaaa...`; the classes above and `strx.countOf` are linear.) Horspool is usually sub-linear but O(n * m) in the worst case; Rabin-Karp uses two moduli below 2^31 with seeded bases and verifies every hit,
-so the answer is always right. Aho-Corasick keeps children in sibling lists (compact for any alphabet) with a direct table for the root; a node limit (default 4 million) refuses further patterns.
+so the answer is always right. **That verification costs O(m) per hit, so Rabin-Karp (like Horspool) is quadratic when almost every window matches**: 2,000,000 times `a` searched for 1000 times `a` takes
+about 15 ms with `Kmp.count` (and `strx.countOf`), 4.5 seconds with `Horspool.count` and 23 seconds with `RabinKarp.count` (measured natively). Use `Kmp` (always linear) or `strx.countOf` / `indexOf` (they fall back to KMP) when the text may be that repetitive, for example attacker supplied text. Aho-Corasick keeps children in sibling lists (compact for any alphabet) with a direct table for the root; a node limit (default 4 million) refuses further patterns.
 
 ```c
 strx.AhoCorasick ac;  ac.add("he");  ac.add("she");  ac.add("hers");
@@ -148,7 +157,9 @@ The unified text is what `diff -u` prints (no timestamps; line breaks in the nam
 ### Suffix array and palindromes
 
 `SuffixArray sa(text, n)` builds the suffix array (**SA-IS, linear time**) and the LCP array (Kasai) in about 24 bytes per input byte:
-`at(i) rank(i) lcp(i) count(p) find(p) findAll(p, out, max) lcpOf(i, j)` (O(log n) after a one-time O(n) setup) `longestRepeat(&pos) distinctSubstrings()`.
+`at(i) rank(i) lcp(i) count(p, m) find(p, m) findAll(p, m, out, max) lcpOf(i, j)` (O(log n) after a one-time O(n) setup) `longestRepeat(&pos) distinctSubstrings()`
+(`m` is the pattern length, -1 for "up to the 0"). `findAll` stores up to `max` positions in suffix order (not text order) and returns the total. An empty pattern occurs at every position `0 .. n`:
+`count("")` and `findAll("", ...)` both return `n + 1` (it stores `n`, then the suffixes in order) and `find("")` returns 0.
 `manacher(s, n, d1, d2)`, `longestPalindrome(s, n, &start)`, `countPalindromes`, `isPalindrome` run in O(n) (with `utf8` for code points).
 
 ### Matching names
@@ -324,7 +335,7 @@ functions much slower than the integer ones (`normal` needs about 1 microsecond,
 
 ## Tests
 
-Tests t410 to t419 (`ds`), t420 to t428 (`strx`), t429 (null pointers, negative and absurd arguments in all three modules) and t430 to t436 (`rng`) in `tests/`; they run on all five targets and, as the `algo` test of `tests/boot_test.py` of the AOS repository, inside AOS.
+Tests t410 to t419 (`ds`), t420 to t428 (`strx`), t429 (null pointers and negative or absurd arguments in `strx` and `rng`, empty / zeroed / disposed containers in `ds`), t430 to t436 (`rng`) and t437 (every class zeroed, with size 0, 1, 2 and after `dispose()`; the examples of the module headers and of this file run as printed; the regression tests of the review findings) in `tests/`; they run on all five targets and, as the `algo` test of `tests/boot_test.py` of the AOS repository, inside AOS.
 
 * **Differential tests** compare every structure with a plain model that is easy to get right (arrays, brute force, a full dynamic programming table) on thousands of random operations.
 * **Expected outputs from independent implementations**: t430 (all generator sequences) was produced by Python implementations that were first checked against NumPy, Python's `random`, `cryptography`
@@ -332,7 +343,7 @@ Tests t410 to t419 (`ds`), t420 to t428 (`strx`), t429 (null pointers, negative 
   erasure refill and `mixIn`) by Python mirrors of the documented algorithms. The `jump` polynomials of xoshiro were verified against 2^128 and 2^192 powers of its transition matrix.
 * The unified diff text of t423 is identical to the output of GNU `diff -u`; 600 random file pairs were additionally applied with the real `patch(1)` and compared with `diff --minimal` for length (not part of the test suite).
 * Statistical tests (t431, t433, t434) use fixed seeds, so their result never varies; thresholds are far in the tails.
-* Big inputs (a million elements, lines or letters) check that nothing is quadratic; memory tests check that `dispose()` returns everything (`asys.memInUse()`), and that no block is freed twice.
+* Big inputs (tens to hundreds of thousands of elements, lines or letters; t419 also 1.6 million bits) check that nothing is quadratic (the sizes are chosen so that the slowest tests take about 20 seconds or less on riscv64 under `qemu-user`, which is about 16 times slower than native for the soft float code; the limit of the test runner is 60 seconds); memory tests check that `dispose()` returns everything (`asys.memInUse()`), and that no block is freed twice.
 
 ---
 
@@ -346,4 +357,5 @@ Tests t410 to t419 (`ds`), t420 to t428 (`strx`), t429 (null pointers, negative 
 * `rng` distributions need `n` up to 2^53 for `binomial`; the large-`n` binomial is exact but not NumPy's BTPE, so its numbers differ from NumPy's there. `Pcg32` / `Mt19937` seed with 32 or 64 bits only.
   Gamma, beta, Poisson and binomial call the slow correctly rounded `log` / `exp` / `pow` and are therefore far slower than integer generators.
 * ChaCha20Rng is as secure as ChaCha20 and the operating system random source; nothing else in `rng` is suitable for secrets. There is no fork detection.
-* On AOS big blocks (above 128 KiB) come from a bump allocator: code that must run there should reuse big buffers (the library does, the tests use smaller inputs on AOS).
+* On AOS big blocks (above 128 KiB) come from a bump allocator that never reuses address space: code that must run there should reuse big buffers (the library does). The tests run on AOS with exactly the same
+  inputs as on Linux (nothing is shrunk for AOS); the `algo` boot test checks that every one of them prints the same bytes there.
