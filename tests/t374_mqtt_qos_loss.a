@@ -1,0 +1,219 @@
+// The QoS 1 and QoS 2 state machines of the client and of the broker with injected packet loss. No sockets: the client engine (feed / outData) and the
+// broker core (open / feed / peer->out) are connected by this test, which loses one chosen packet (and with it the connection, as TCP does when it
+// loses data for good) and lets both sides reconnect with their persistent sessions. For every packet of the PUBLISH handshake, in both directions
+// and for both QoS levels, the message must arrive: QoS 1 at least once (a copy is marked DUP), QoS 2 exactly once, and nothing may stay in flight.
+import mqtt;
+import mqttd;
+import netio;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqttd.Broker* broker;
+int now = 1000;
+
+class Side {
+    public mqtt.Client* c;
+    public mqttd.Peer* p;
+    public char* id;
+    public int dropDir;             // 1: client -> broker, 2: broker -> client
+    public int dropType;            // the packet type to lose (0: none)
+    public int dropNth;             // lose the n-th packet of that type
+    public int seen;
+    public bool dropped;
+    public int reconnects;
+    public int log[40];
+    public int nlog;
+}
+
+Side sides[2];
+char chunk[70000];
+
+// the number of bytes of the first packet in data (a header and its remaining length), -1 if incomplete
+int packetLength(char* d, int n) {
+    if (n < 2) return -1;
+    int rem = 0;
+    int mult = 1;
+    int i = 1;
+    for (;;) {
+        if (i >= n) return -1;
+        int b = d[i] & 255;
+        rem = rem + (b & 127) * mult;
+        i++;
+        if ((b & 128) == 0) break;
+        mult = mult * 128;
+    }
+    return i + rem <= n ? i + rem : -1;
+}
+
+void note(Side* s, int dir, int type) {
+    if (s->nlog < 40) { s->log[s->nlog] = dir * 100 + type; s->nlog++; }
+}
+
+// delivers the bytes of one direction packet by packet; the chosen packet is lost together with everything behind it
+bool transfer(Side* s, int dir, char* data, int n) {
+    int off = 0;
+    while (off < n) {
+        int len = packetLength(&data[off], n - off);
+        if (len < 0) return false;
+        int type = (data[off] >> 4) & 15;
+        note(s, dir, type);
+        if (!s->dropped && s->dropDir == dir && type == s->dropType) {
+            s->seen++;
+            if (s->seen == s->dropNth) {
+                s->dropped = true;                      // this packet and everything behind it is lost
+                return false;
+            }
+        }
+        if (dir == 1) {
+            if (broker->feed(s->p, &data[off], len) < 0) return false;
+        } else {
+            if (!s->c->feed(&data[off], len)) return false;
+        }
+        off = off + len;
+    }
+    return true;
+}
+
+void connectSide(Side* s) {
+    s->p = broker->open(now);
+    s->c->begin(now);
+}
+
+// the connection is gone on both ends
+void breakSide(Side* s) {
+    s->c->lost("the test dropped the connection");
+    broker->closed(s->p);
+    s->p = null;
+}
+
+// moves bytes both ways until nothing moves; a lost packet breaks the connection, then the client connects again
+void run(int rounds) {
+    for (int r = 0; r < rounds; r++) {
+        bool moved = false;
+        for (int k = 0; k < 2; k++) {
+            Side* s = &sides[k];
+            if (s->p == null) continue;
+            bool broken = false;
+            int n = s->c->outPending();
+            if (n > 0) {
+                memcpy(&chunk[0], s->c->outData(), n);
+                s->c->outConsumed(n);
+                moved = true;
+                if (!transfer(s, 1, &chunk[0], n)) broken = true;
+            }
+            if (!broken) {
+                n = s->p->out->pending();
+                if (n > 0) {
+                    memcpy(&chunk[0], s->p->out->data(), n);
+                    s->p->out->consume(n);
+                    moved = true;
+                    if (!transfer(s, 2, &chunk[0], n)) broken = true;
+                }
+            }
+            if (!broken && s->p->wantClose) broken = true;
+            if (broken) {
+                breakSide(s);
+                s->reconnects++;
+                connectSide(s);
+                moved = true;
+            }
+        }
+        if (!moved) return;
+    }
+}
+
+int msgs;
+bool firstDup;                     // was the first copy that the subscriber got marked DUP?
+int onMessage(mqtt.Client* c, char* topic, char* payload, int n, int qos, int retain) { msgs++; return 0; }
+
+// one scenario: a publisher "pub" sends a message with QoS q to a subscriber "sub"; the packet of type `type` that travels in direction `dir` over the link of `lossy` is lost
+void scenario(char* name, int lossy, int dir, int type, int qos) {
+    broker = new mqttd.Broker();
+    broker->sysIntervalMs = 0;
+    for (int k = 0; k < 2; k++) {
+        Side* s = &sides[k];
+        memset((char*) s, 0, sizeof(Side));
+        s->id = k == 0 ? "pub" : "sub";
+        mqtt.Options* o = new mqtt.Options();
+        o->clientId = s->id;
+        o->cleanSession = false;
+        o->keepAliveSec = 0;
+        s->c = mqtt.newClient("localhost", 1, o);
+        s->c->options = o;
+        connectSide(s);
+    }
+    run(50);
+    Side* pub = &sides[0];
+    Side* sub = &sides[1];
+    bool up = pub->c->state == mqtt.ST_ONLINE && sub->c->state == mqtt.ST_ONLINE;
+    sub->c->subscribe("loss/#", 2);
+    run(50);
+    // arm the loss and publish
+    sides[lossy].dropDir = dir;
+    sides[lossy].dropType = type;
+    sides[lossy].dropNth = 1;
+    pub->c->publishText("loss/m", "payload", qos, false);
+    run(200);
+    int count = 0;
+    mqtt.Message* m = sub->c->next();
+    firstDup = m != null && m->dup;
+    while (m != null) {
+        count++;
+        m->dispose();
+        m = sub->c->next();
+    }
+    char line[200];
+    format(&line[0], 200, "%s: the packet was lost and both sides came back", name, 0, 0, 0);
+    check(&line[0], up && sides[lossy].dropped && sides[lossy].reconnects == 1 && pub->c->state == mqtt.ST_ONLINE && sub->c->state == mqtt.ST_ONLINE);
+    format(&line[0], 200, "%s: delivered %s", name, qos == 2 ? "exactly once" : "at least once", 0, 0);
+    if (qos == 2) check(&line[0], count == 1);
+    else check(&line[0], count >= 1 && count <= 2);       // a lost PUBACK makes the publisher send again: the broker forwards a second copy
+    format(&line[0], 200, "%s: nothing is left in flight", name, 0, 0, 0);
+    check(&line[0], pub->c->inflight() == 0 && pub->c->queued() == 0 && sub->c->inflight() == 0
+          && broker->sessionInflight("pub") == 0 && broker->sessionInflight("sub") == 0 && broker->sessionQueued("pub") == 0 && broker->sessionQueued("sub") == 0 && broker->stats->liveItems == 0);
+    // a second message goes through cleanly (the packet identifiers and states are in order again)
+    pub->c->publishText("loss/m2", "again", qos, false);
+    run(50);
+    m = sub->c->next();
+    check("a following message is delivered normally", m != null && streq(m->topic, "loss/m2") && !m->dup && sub->c->next() == null);
+    if (m != null) m->dispose();
+    for (int k = 0; k < 2; k++) {
+        broker->closed(sides[k].p);
+        sides[k].c->dispose();
+    }
+    broker->dispose();
+}
+
+int main() {
+    // PUBLISH QoS 1: PUBLISH, PUBACK
+    scenario("QoS 1 publisher -> broker, PUBLISH lost", 0, 1, mqtt.PUBLISH, 1);
+    check("... the publisher's second try reaches the subscriber as a normal message", !firstDup);
+    scenario("QoS 1 publisher -> broker, PUBACK lost", 0, 2, mqtt.PUBACK, 1);
+    // PUBLISH QoS 2: PUBLISH, PUBREC, PUBREL, PUBCOMP
+    scenario("QoS 2 publisher -> broker, PUBLISH lost", 0, 1, mqtt.PUBLISH, 2);
+    scenario("QoS 2 publisher -> broker, PUBREC lost", 0, 2, mqtt.PUBREC, 2);
+    scenario("QoS 2 publisher -> broker, PUBREL lost", 0, 1, mqtt.PUBREL, 2);
+    scenario("QoS 2 publisher -> broker, PUBCOMP lost", 0, 2, mqtt.PUBCOMP, 2);
+    // the other direction: the broker sends to the subscriber
+    scenario("QoS 1 broker -> subscriber, PUBLISH lost", 1, 2, mqtt.PUBLISH, 1);
+    check("... the broker's second try is marked DUP", firstDup);
+    scenario("QoS 1 broker -> subscriber, PUBACK lost", 1, 1, mqtt.PUBACK, 1);
+    scenario("QoS 2 broker -> subscriber, PUBLISH lost", 1, 2, mqtt.PUBLISH, 2);
+    check("... the broker's second try is marked DUP", firstDup);
+    scenario("QoS 2 broker -> subscriber, PUBREC lost", 1, 1, mqtt.PUBREC, 2);
+    scenario("QoS 2 broker -> subscriber, PUBREL lost", 1, 2, mqtt.PUBREL, 2);
+    scenario("QoS 2 broker -> subscriber, PUBCOMP lost", 1, 1, mqtt.PUBCOMP, 2);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

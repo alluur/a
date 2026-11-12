@@ -1,0 +1,560 @@
+// The broker core without sockets (and with a clock that the test sets): CONNECT / CONNACK answers (session present, refused ids, credentials,
+// unsupported versions, too many clients), persistent sessions (subscriptions, queued QoS 1 messages, re-sending with DUP, QoS 2 state), takeover, will
+// messages (abnormal end, keep-alive time out, protocol violation; none after DISCONNECT; retained wills), keep-alive supervision, the CONNECT time out,
+// queue caps, the window, retained messages and $SYS counters.
+import mqtt;
+import mqttd;
+import netio;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqttd.Broker* b;
+int now = 100000;
+
+// a client as the broker sees it: a peer, what we send (q) and a parser for what the broker answers
+class Cli {
+    public mqttd.Peer* p;
+    public mqtt.Parser* rp;
+    public netio.Queue q;
+    public mqtt.Packet r;
+    public bool sp;                 // session present in the last CONNACK
+    public int code;                // the last CONNACK code
+    public int pid;
+}
+
+void advance(int ms) {
+    now = now + ms;
+    b->tick(now);
+}
+
+void freshBroker() {
+    b = new mqttd.Broker();
+    b->sysIntervalMs = 0;
+    b->setClock(now);
+}
+
+Cli* newCli() {
+    Cli* c = (Cli*) malloc(sizeof(Cli));
+    c->p = b->open(now);
+    c->rp = mqtt.newParser(mqtt.MODE_CLIENT, 1048576);
+    c->pid = 1;
+    return c;
+}
+
+// sends what is in c->q, returns the broker's verdict (< 0: the connection is to be closed)
+int flush(Cli* c) {
+    int rc = b->feed(c->p, c->q.data(), c->q.pending());
+    c->q.clear();
+    return rc;
+}
+
+int sendHex(Cli* c, char* hex) {
+    int n = 0;
+    char* raw = bytebuf.fromHex(hex, &n);
+    int rc = b->feed(c->p, raw, n);
+    free(raw);
+    return rc;
+}
+
+// the next packet the broker sent: its type, 0 if there is none; the packet is in c->r
+int next(Cli* c) {
+    int n = c->p->out->pending();
+    if (n > 0) {
+        c->rp->feed(c->p->out->data(), n);
+        c->p->out->consume(n);
+    }
+    int r = c->rp->next(&c->r);
+    return r == 1 ? c->r.type : 0;
+}
+
+// CONNECT and the CONNACK code (-1: no CONNACK came)
+int connectWith(Cli* c, char* id, bool clean, int ka, char* user, char* pass, char* willTopic, char* willPayload, int willQos, bool willRetain) {
+    mqtt.Packet k;
+    k.reset();
+    k.clientId = id;
+    k.clean = clean;
+    k.keepAlive = ka;
+    if (user != null) { k.hasUser = true; k.username = user; }
+    if (pass != null) { k.hasPass = true; k.password = pass; k.passwordLen = strlen(pass); }
+    if (willTopic != null) { k.hasWill = true; k.willTopic = willTopic; k.willPayload = willPayload; k.willLen = strlen(willPayload); k.willQos = willQos; k.willRetain = willRetain; }
+    mqtt.putConnect(&c->q, &k);
+    flush(c);
+    if (next(c) != mqtt.CONNACK) { c->code = -1; return -1; }
+    c->sp = c->r.sessionPresent;
+    c->code = c->r.returnCode;
+    return c->code;
+}
+
+int connect(Cli* c, char* id, bool clean = true, int ka = 0) {
+    return connectWith(c, id, clean, ka, null, null, null, null, 0, false);
+}
+
+// SUBSCRIBE: the granted QoS or 128, -1 without a SUBACK
+int sub(Cli* c, char* filter, int qos) {
+    char* f[1];
+    int q[1];
+    f[0] = filter;
+    q[0] = qos;
+    mqtt.putSubscribe(&c->q, c->pid, &f[0], &q[0], 1);
+    c->pid++;
+    flush(c);
+    if (next(c) != mqtt.SUBACK) return -1;
+    return c->r.fqos[0];
+}
+
+void pub(Cli* c, char* topic, char* payload, int qos, bool retain = false) {
+    mqtt.putPublish(&c->q, topic, payload, strlen(payload), qos, retain, false, qos > 0 ? c->pid : 0);
+    if (qos > 0) c->pid++;
+    flush(c);
+    if (qos > 0 && c->p != null) next(c);                   // the PUBACK or PUBREC: the publishers of this test do not subscribe
+}
+
+void disconnect(Cli* c) {
+    mqtt.putEmpty(&c->q, mqtt.DISCONNECT);
+    flush(c);
+}
+
+// the connection breaks without DISCONNECT
+void drop(Cli* c) {
+    b->closed(c->p);
+    c->p = null;
+}
+
+void ack(Cli* c, int type, int pid) {
+    mqtt.putAck(&c->q, type, pid);
+    flush(c);
+}
+
+// the next packet is a PUBLISH with these properties (it stays in c->r)
+bool isPub(Cli* c, char* topic, char* payload, int qos, bool retain) {
+    if (next(c) != mqtt.PUBLISH) return false;
+    mqtt.Packet* r = &c->r;
+    return streq(r->topic, topic) && r->payloadLen == strlen(payload) && memcmp(r->payload, payload, r->payloadLen) == 0 && r->qos == qos && r->retain == retain;
+}
+
+bool quiet(Cli* c) { return next(c) == 0; }
+
+int main() {
+    freshBroker();
+
+    // ---- CONNECT and CONNACK -----------------------------------------------------------------------------------------------------------------------
+    Cli* a = newCli();
+    check("a fresh clean session is accepted, no session present", connect(a, "a") == 0 && !a->sp);
+    check("one client is connected, one session exists", b->connected == 1 && b->sessionCount() == 1);
+    Cli* d = newCli();
+    check("a second client", connect(d, "d") == 0);
+    mqtt.Packet k2;
+    k2.reset();
+    k2.clientId = "d-again";
+    k2.clean = true;
+    mqtt.putConnect(&d->q, &k2);
+    check("a second CONNECT on the same connection ends it", flush(d) < 0 && d->p->wantClose);
+    check("... and the session goes with it (clean session)", b->connected == 1 && b->sessionCount() == 1 && !b->hasSession("d"));
+    b->closed(d->p);
+
+    Cli* e = newCli();
+    check("an empty client id is accepted with a clean session", connect(e, "") == 0 && b->sessionCount() == 2);
+    Cli* e2 = newCli();
+    check("an empty client id with a persistent session is refused (code 2)", connect(e2, "", false) == mqtt.CONNACK_ID_REJECTED && e2->p->wantClose);
+    b->closed(e2->p);
+    disconnect(e);
+    b->closed(e->p);
+
+    Cli* v3 = newCli();
+    sendHex(v3, "1010" "0006" "4d5149736470" "03" "02" "003c" "0002" "6162");
+    check("MQTT 3.1 (MQIsdp, level 3) is answered with CONNACK 1 and the connection ends", next(v3) == mqtt.CONNACK && v3->r.returnCode == 1 && v3->p->wantClose);
+    b->closed(v3->p);
+    Cli* v5 = newCli();
+    sendHex(v5, "100e00044d51545405" "02003c00026162");
+    check("MQTT level 5 is answered with CONNACK 1 too", next(v5) == mqtt.CONNACK && v5->r.returnCode == 1 && v5->p->wantClose);
+    b->closed(v5->p);
+    check("refused connections leave nothing behind", b->connected == 1 && b->sessionCount() == 1 && b->peerCount() == 1);
+    Cli* np = newCli();
+    check("a PUBLISH before CONNECT ends the connection", sendHex(np, "300a0003612f6268656c6c6f") < 0 && np->p->wantClose);
+    b->closed(np->p);
+
+    // ---- credentials ----------------------------------------------------------------------------------------------------------------------------------
+    b->addUser("alice", "secret");
+    b->addUser("bob", "pa\xC3\xA9ss");
+    Cli* u = newCli();
+    check("with users configured, anonymous clients are still allowed by default", connect(u, "u1") == 0);
+    disconnect(u);
+    b->closed(u->p);
+    b->allowAnonymous = false;
+    u = newCli();
+    check("anonymous clients are refused when allowAnonymous is off (code 5)", connect(u, "u2") == mqtt.CONNACK_NOT_AUTHORIZED);
+    b->closed(u->p);
+    u = newCli();
+    check("a wrong password (code 4)", connectWith(u, "u3", true, 60, "alice", "wrong", null, null, 0, false) == mqtt.CONNACK_BAD_CREDENTIALS);
+    b->closed(u->p);
+    u = newCli();
+    check("a password that is a prefix of the right one (code 4)", connectWith(u, "u3", true, 60, "alice", "secre", null, null, 0, false) == mqtt.CONNACK_BAD_CREDENTIALS);
+    b->closed(u->p);
+    u = newCli();
+    check("a password that extends the right one (code 4)", connectWith(u, "u3", true, 60, "alice", "secretX", null, null, 0, false) == mqtt.CONNACK_BAD_CREDENTIALS);
+    b->closed(u->p);
+    u = newCli();
+    check("an unknown user (code 4)", connectWith(u, "u3", true, 60, "mallory", "secret", null, null, 0, false) == mqtt.CONNACK_BAD_CREDENTIALS);
+    b->closed(u->p);
+    u = newCli();
+    check("a user name without a password (code 4)", connectWith(u, "u3", true, 60, "alice", null, null, null, 0, false) == mqtt.CONNACK_BAD_CREDENTIALS);
+    b->closed(u->p);
+    u = newCli();
+    check("the right credentials", connectWith(u, "u4", true, 60, "alice", "secret", null, null, 0, false) == 0);
+    disconnect(u);
+    b->closed(u->p);
+    u = newCli();
+    check("a password with UTF-8 characters", connectWith(u, "u5", true, 60, "bob", "pa\xC3\xA9ss", null, null, 0, false) == 0);
+    disconnect(u);
+    b->closed(u->p);
+    check("the refused attempts did not make sessions", b->sessionCount() == 1 && b->stats->rejected >= 7);
+    b->allowAnonymous = true;
+
+    // ---- persistent sessions: subscriptions and queued messages ---------------------------------------------------------------------------------------
+    Cli* x = newCli();
+    connect(x, "x");
+    Cli* p1 = newCli();
+    check("a persistent session is new the first time", connect(p1, "p1", false) == 0 && !p1->sp);
+    check("it subscribes with QoS 1", sub(p1, "s/#", 1) == 1);
+    disconnect(p1);
+    b->closed(p1->p);
+    check("after DISCONNECT the session stays", b->hasSession("p1") && b->connected == 2);
+    pub(x, "s/a", "m1", 1);
+    pub(x, "s/b", "m0", 0);
+    pub(x, "s/c", "m2", 2);
+    check("QoS 1 and 2 messages are queued for it (as QoS 1), QoS 0 is not", b->sessionQueued("p1") == 2 && b->queuedBytes() == 4);
+    p1 = newCli();
+    check("reconnecting with a persistent session: session present", connect(p1, "p1", false) == 0 && p1->sp);
+    check("the first queued message arrives (QoS 1)", isPub(p1, "s/a", "m1", 1, false) && !p1->r.dup);
+    int pid1 = p1->r.pid;
+    check("the second queued message arrives (QoS 2 limited to 1)", isPub(p1, "s/c", "m2", 1, false));
+    int pid2 = p1->r.pid;
+    check("... with its own packet identifier", pid1 != pid2 && pid1 > 0 && pid2 > 0 && b->sessionInflight("p1") == 2 && b->sessionQueued("p1") == 0 && b->queuedBytes() == 0);
+    ack(p1, mqtt.PUBACK, pid1);
+    check("PUBACK frees one", b->sessionInflight("p1") == 1);
+    drop(p1);
+    p1 = newCli();
+    check("the connection broke before the second PUBACK: session present", connect(p1, "p1", false) == 0 && p1->sp);
+    check("the unacknowledged message is sent again, marked DUP, with the same identifier", isPub(p1, "s/c", "m2", 1, false) && p1->r.dup && p1->r.pid == pid2);
+    ack(p1, mqtt.PUBACK, pid2);
+    check("nothing is in flight now", b->sessionInflight("p1") == 0 && quiet(p1));
+    pub(x, "s/live", "live", 1);
+    check("the subscription survived: live messages arrive", isPub(p1, "s/live", "live", 1, false) && !p1->r.dup);
+    ack(p1, mqtt.PUBACK, p1->r.pid);
+    disconnect(p1);
+    b->closed(p1->p);
+    pub(x, "s/more", "m3", 1);
+    p1 = newCli();
+    check("a clean session wipes everything: no session present", connect(p1, "p1", true) == 0 && !p1->sp);
+    check("... the queued message is gone and so is the subscription", quiet(p1) && b->sessionQueued("p1") == 0);
+    pub(x, "s/after", "m4", 1);
+    check("... nothing arrives any more", quiet(p1));
+    disconnect(p1);
+    b->closed(p1->p);
+    check("... and a clean session does not stay after the end of the connection", !b->hasSession("p1"));
+
+    // ---- QoS 2 towards a persistent client -----------------------------------------------------------------------------------------------------------
+    Cli* p2 = newCli();
+    connect(p2, "p2", false);
+    sub(p2, "q/#", 2);
+    pub(x, "q/one", "two-phase", 2);
+    check("a QoS 2 message to a persistent client", isPub(p2, "q/one", "two-phase", 2, false));
+    int qpid = p2->r.pid;
+    drop(p2);
+    p2 = newCli();
+    check("lost before PUBREC: sent again with DUP", connect(p2, "p2", false) == 0 && p2->sp && isPub(p2, "q/one", "two-phase", 2, false) && p2->r.dup && p2->r.pid == qpid);
+    ack(p2, mqtt.PUBREC, qpid);
+    check("the broker answers PUBREC with PUBREL", next(p2) == mqtt.PUBREL && p2->r.pid == qpid);
+    drop(p2);
+    p2 = newCli();
+    check("lost before PUBCOMP: the broker sends PUBREL again, not the message", connect(p2, "p2", false) == 0 && p2->sp && next(p2) == mqtt.PUBREL && p2->r.pid == qpid && quiet(p2));
+    ack(p2, mqtt.PUBCOMP, qpid);
+    check("PUBCOMP completes it", b->sessionInflight("p2") == 0);
+    disconnect(p2);
+    b->closed(p2->p);
+
+    // the other way: a QoS 2 PUBLISH is routed once even if the client sends it twice
+    Cli* sx = newCli();
+    connect(sx, "sx");
+    sub(sx, "dup/#", 2);
+    mqtt.putPublish(&x->q, "dup/a", "once", 4, 2, false, false, 500);
+    flush(x);
+    check("QoS 2 from a client: PUBREC", next(x) == mqtt.PUBREC && x->r.pid == 500);
+    mqtt.putPublish(&x->q, "dup/a", "once", 4, 2, false, true, 500);
+    flush(x);
+    check("the same packet identifier again (DUP): PUBREC again", next(x) == mqtt.PUBREC && x->r.pid == 500);
+    check("... but the subscriber got one message only", isPub(sx, "dup/a", "once", 2, false) && quiet(sx));
+    ack(x, mqtt.PUBREL, 500);
+    check("PUBREL: PUBCOMP", next(x) == mqtt.PUBCOMP && x->r.pid == 500);
+    ack(x, mqtt.PUBREL, 500);
+    check("PUBREL for an identifier that is not known is answered too", next(x) == mqtt.PUBCOMP);
+    mqtt.putPublish(&x->q, "dup/a", "twice", 5, 2, false, false, 500);
+    flush(x);
+    check("after PUBREL the identifier can be used again for a new message", next(x) == mqtt.PUBREC && isPub(sx, "dup/a", "twice", 2, false));
+    ack(x, mqtt.PUBREL, 500);
+    next(x);
+    ack(sx, mqtt.PUBREC, sx->r.pid);
+    ack(sx, mqtt.PUBCOMP, sx->r.pid);
+
+    // ---- takeover ---------------------------------------------------------------------------------------------------------------------------------------
+    Cli* w = newCli();
+    check("a client with a will", connectWith(w, "t1", true, 60, null, null, "will/t1", "t1 died", 1, false) == 0);
+    Cli* mon = newCli();
+    connect(mon, "mon");
+    sub(mon, "will/#", 1);
+    int took = b->stats->takeovers;
+    Cli* w2 = newCli();
+    check("the same client id connects again", connect(w2, "t1") == 0);
+    check("the old connection is closed (takeover)", w->p->wantClose && b->stats->takeovers == took + 1);
+    check("its will is sent", isPub(mon, "will/t1", "t1 died", 1, false));
+    ack(mon, mqtt.PUBACK, mon->r.pid);
+    check("the books are right (the old peer does not count)", b->connected == 5 && b->sessionCount() == 6);
+    b->closed(w->p);
+    check("the closing of the old connection does not disturb the new one", b->hasSession("t1") && w2->p->wantClose == false);
+    disconnect(w2);
+    b->closed(w2->p);
+
+    // ---- will messages ----------------------------------------------------------------------------------------------------------------------------------
+    Cli* w3 = newCli();
+    connectWith(w3, "w3", true, 60, null, null, "will/w3", "gone", 1, true);
+    drop(w3);
+    check("a connection that vanishes sends its will (QoS 1)", isPub(mon, "will/w3", "gone", 1, false));
+    ack(mon, mqtt.PUBACK, mon->r.pid);
+    check("a retained will is stored", b->retainedCount() == 1);
+    Cli* late = newCli();
+    connect(late, "late");
+    sub(late, "will/+", 1);
+    check("a late subscriber gets the retained will", isPub(late, "will/w3", "gone", 1, true));
+    disconnect(late);
+    b->closed(late->p);
+    Cli* w4 = newCli();
+    connectWith(w4, "w4", true, 60, null, null, "will/w4", "never", 0, false);
+    disconnect(w4);
+    b->closed(w4->p);
+    check("DISCONNECT: no will", quiet(mon));
+    Cli* w5 = newCli();
+    connectWith(w5, "w5", true, 10, null, null, "will/w5", "silent", 0, false);
+    advance(14000);
+    check("keep-alive 10 s: still alive after 14 s", !w5->p->wantClose && quiet(mon));
+    advance(1001);
+    check("... and cut off after 15 s of silence (1.5 times)", w5->p->wantClose && b->stats->timeouts >= 1);
+    check("its will is sent", isPub(mon, "will/w5", "silent", 0, false));
+    b->closed(w5->p);
+    Cli* w6 = newCli();
+    connectWith(w6, "w6", true, 60, null, null, "will/w6", "broken", 0, false);
+    check("a protocol violation ends the connection", sendHex(w6, "0000") < 0 && w6->p->wantClose);
+    check("... and sends the will", isPub(mon, "will/w6", "broken", 0, false));
+    b->closed(w6->p);
+    Cli* w7 = newCli();
+    connectWith(w7, "w7", true, 60, null, null, "will/w7", "x", 0, false);
+    check("a malformed packet (bad flags) ends the connection", sendHex(w7, "c100") < 0 && isPub(mon, "will/w7", "x", 0, false));
+    b->closed(w7->p);
+    b->publish("will/w3", "", 0, 0, true);
+    check("the retained will can be cleared", b->retainedCount() == 0);
+    mqtt.putPublish(&mon->q, "will/w3", "", 0, 0, true, false, 0);
+    flush(mon);
+    quiet(mon);
+
+    // ---- keep-alive and time outs -----------------------------------------------------------------------------------------------------------------------
+    Cli* k = newCli();
+    connect(k, "ka", true, 10);
+    advance(14000);
+    mqtt.putEmpty(&k->q, mqtt.PINGREQ);
+    flush(k);
+    check("PINGREQ is answered with PINGRESP", next(k) == mqtt.PINGRESP);
+    advance(14000);
+    check("a ping restarts the clock: alive 28 s after the connect", !k->p->wantClose);
+    advance(1501);
+    check("... 15.5 s after the last packet it is cut off", k->p->wantClose);
+    b->closed(k->p);
+    Cli* k0 = newCli();
+    connect(k0, "ka0", true, 0);
+    advance(3600000);
+    check("keep-alive 0 means no supervision", !k0->p->wantClose);
+    disconnect(k0);
+    b->closed(k0->p);
+    Cli* nc = newCli();
+    advance(9000);
+    check("a connection that sends no CONNECT: alive after 9 s", !nc->p->wantClose);
+    advance(1500);
+    check("... cut off after 10 s", nc->p->wantClose);
+    b->closed(nc->p);
+
+    // ---- limits -----------------------------------------------------------------------------------------------------------------------------------------
+    // the window
+    b->maxInflight = 2;
+    Cli* sl = newCli();
+    connect(sl, "slow");
+    sub(sl, "win/#", 1);
+    for (int i = 0; i < 5; i++) pub(x, "win/n", "p", 1);
+    int got = 0;
+    int pids[8];
+    while (next(sl) == mqtt.PUBLISH) { pids[got] = sl->r.pid; got++; }
+    check("only 2 messages are in flight to a client, 3 wait", got == 2 && b->sessionInflight("slow") == 2 && b->sessionQueued("slow") == 3);
+    ack(sl, mqtt.PUBACK, pids[0]);
+    check("an acknowledgement lets the next one go", next(sl) == mqtt.PUBLISH && b->sessionInflight("slow") == 2 && b->sessionQueued("slow") == 2);
+    b->maxInflight = 20;
+    disconnect(sl);
+    b->closed(sl->p);
+
+    // queue caps of an offline persistent session
+    b->maxQueue = 3;
+    Cli* q1 = newCli();
+    connect(q1, "q1", false);
+    sub(q1, "cap/#", 1);
+    disconnect(q1);
+    b->closed(q1->p);
+    int dropped0 = b->stats->dropped;
+    for (int i = 0; i < 5; i++) pub(x, "cap/n", "x", 1);
+    check("at most maxQueue messages are kept for an offline client, the rest is dropped and counted", b->sessionQueued("q1") == 3 && b->stats->dropped == dropped0 + 2);
+    b->maxQueue = 1000;
+    b->maxQueueBytes = 100;
+    char* sixty = "012345678901234567890123456789012345678901234567890123456789";
+    pub(x, "cap/b", sixty, 1);
+    pub(x, "cap/b", sixty, 1);
+    check("the byte limit of a client's queue holds as well", b->sessionQueued("q1") == 4 && b->stats->dropped == dropped0 + 3);
+    b->maxQueueBytes = 1048576;
+    b->maxQueuedTotal = 10;
+    pub(x, "cap/c", sixty, 1);
+    check("... and the limit for all clients together", b->sessionQueued("q1") == 4 && b->stats->dropped == dropped0 + 4);
+    b->maxQueuedTotal = 33554432;
+    q1 = newCli();
+    connect(q1, "q1", true);
+    check("a clean session frees the queue (and the byte count)", b->queuedBytes() == 0);
+    disconnect(q1);
+    b->closed(q1->p);
+
+    // subscriptions
+    b->maxSubsPerClient = 2;
+    Cli* sc = newCli();
+    connect(sc, "subs");
+    check("subscriptions up to the limit", sub(sc, "l/1", 0) == 0 && sub(sc, "l/2", 0) == 0);
+    check("the next one is refused with 0x80", sub(sc, "l/3", 0) == 128);
+    check("a filter that is already subscribed is just updated", sub(sc, "l/2", 1) == 1);
+    b->maxSubsPerClient = 200;
+    check("with room again it is granted", sub(sc, "l/3", 0) == 0);
+    char deep[400];
+    int dn = 0;
+    for (int i = 0; i < 70; i++) { deep[dn] = 'a'; deep[dn + 1] = '/'; dn = dn + 2; }
+    deep[dn] = 'z';
+    deep[dn + 1] = 0;
+    check("a filter with more than 64 levels is refused", sub(sc, &deep[0], 0) == 128);
+    b->maxLevels = 100;
+    check("... unless maxLevels is raised", sub(sc, &deep[0], 0) == 0);
+    disconnect(sc);
+    b->closed(sc->p);
+
+    // clients, sessions, expiry
+    b->maxClients = b->connected + 2;
+    Cli* c1 = newCli();
+    Cli* c2 = newCli();
+    Cli* c3 = newCli();
+    check("clients up to the limit", connect(c1, "mc1") == 0 && connect(c2, "mc2") == 0);
+    check("one too many gets CONNACK 3 (server unavailable)", connect(c3, "mc3") == mqtt.CONNACK_UNAVAILABLE && c3->p->wantClose);
+    b->maxClients = 1000;
+    b->closed(c3->p);
+    disconnect(c1);
+    b->closed(c1->p);
+    disconnect(c2);
+    b->closed(c2->p);
+    b->maxSessions = 2;
+    Cli* o1 = newCli(); connect(o1, "off1", false); disconnect(o1); b->closed(o1->p);
+    advance(10);
+    Cli* o2 = newCli(); connect(o2, "off2", false); disconnect(o2); b->closed(o2->p);
+    advance(10);
+    Cli* o3 = newCli(); connect(o3, "off3", false); disconnect(o3); b->closed(o3->p);
+    check("maxSessions: the offline session that has been gone longest is dropped", !b->hasSession("off1") && b->hasSession("off2") && b->hasSession("off3"));
+    b->maxSessions = 1000;
+    b->sessionExpirySec = 5;
+    advance(6000);
+    check("sessionExpirySec: offline sessions expire", !b->hasSession("off2") && !b->hasSession("off3"));
+    b->sessionExpirySec = 0;
+
+    // clients do not publish to $-topics
+    Cli* sy = newCli();
+    connect(sy, "dollar");
+    sub(sy, "$SYS/#", 0);
+    pub(x, "$SYS/fake", "x", 0);
+    check("a client cannot publish to a $-topic", quiet(sy));
+    disconnect(sy);
+    b->closed(sy->p);
+
+    // ---- retained messages on subscribe -----------------------------------------------------------------------------------------------------------------
+    pub(x, "ret/a", "ra", 2, true);
+    pub(x, "ret/b/c", "rbc", 1, true);
+    b->publish("$internal/r", "ri", 2, 0, true);
+    Cli* rs = newCli();
+    connect(rs, "rs");
+    check("retained messages: subscribe to ret/# with QoS 1", sub(rs, "ret/#", 1) == 1);
+    int nr = 0;
+    bool flagsOk = true;
+    bool qosOk = true;
+    while (next(rs) == mqtt.PUBLISH) {
+        nr++;
+        if (!rs->r.retain) flagsOk = false;
+        if (rs->r.qos != 1) qosOk = false;
+        ack(rs, mqtt.PUBACK, rs->r.pid);
+    }
+    check("both arrive with the retain flag, QoS limited to 1", nr == 2 && flagsOk && qosOk);
+    check("subscribing again sends them again", sub(rs, "ret/#", 0) == 0 && next(rs) == mqtt.PUBLISH && next(rs) == mqtt.PUBLISH && quiet(rs));
+    sub(rs, "#", 0);
+    int all = 0;
+    while (next(rs) == mqtt.PUBLISH) all++;
+    check("# gets the retained messages, but not those of $-topics", all == 2);
+    check("$internal/+ does", sub(rs, "$internal/+", 0) == 0 && isPub(rs, "$internal/r", "ri", 0, true));
+    check("a filter with + in the middle finds retained messages", sub(rs, "ret/+/c", 0) == 0 && isPub(rs, "ret/b/c", "rbc", 0, true));
+    disconnect(rs);
+    b->closed(rs->p);
+
+    // ---- $SYS -------------------------------------------------------------------------------------------------------------------------------------------
+    b->dispose();
+    freshBroker();
+    b->sysIntervalMs = 10000;
+    Cli* m1 = newCli();
+    connect(m1, "monitor");
+    check("$SYS: subscribe to the connected counter", sub(m1, "$SYS/broker/clients/connected", 0) == 0);
+    check("... the current value is retained", isPub(m1, "$SYS/broker/clients/connected", "1", 0, true));
+    Cli* m2 = newCli();
+    connect(m2, "c2");
+    check("a new client: the counter says 2", isPub(m1, "$SYS/broker/clients/connected", "2", 0, false));
+    Cli* m3 = newCli();
+    connect(m3, "c3");
+    check("... 3", isPub(m1, "$SYS/broker/clients/connected", "3", 0, false));
+    disconnect(m2);
+    b->closed(m2->p);
+    check("a client goes: 2", isPub(m1, "$SYS/broker/clients/connected", "2", 0, false));
+    drop(m3);
+    check("a client vanishes: 1", isPub(m1, "$SYS/broker/clients/connected", "1", 0, false));
+    check("the books agree", b->connected == 1 && b->sessionCount() == 1);
+    sub(m1, "$SYS/broker/clients/total", 0);
+    check("the total of known clients is published too", isPub(m1, "$SYS/broker/clients/total", "1", 0, true));
+    advance(10001);
+    Cli* m4 = newCli();
+    connect(m4, "late");
+    check("$SYS/# gets every statistic (retained)", sub(m4, "$SYS/#", 0) == 0);
+    int stats = 0;
+    bool names = false;
+    while (next(m4) == mqtt.PUBLISH) {
+        stats++;
+        if (streq(m4->r.topic, "$SYS/broker/version")) names = true;
+    }
+    check("... at least ten of them, with the version", stats >= 10 && names);
+    sub(m4, "#", 0);
+    check("# does not", quiet(m4));
+    b->sysIntervalMs = 0;
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
