@@ -1,0 +1,251 @@
+// websocket: handshake options and checks: subprotocols, Origin, Cookie, Authorization, extra headers, Origin policy, refused requests,
+// header injection, oversized or malformed request heads
+import websocket;
+import conn;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+conn.Listener* listener;
+websocket.WebSocket* sws;
+websocket.HandshakeInfo* sinfo;
+websocket.ServerOptions* sopts;
+int accepted = 0;
+
+int serve() {
+    if (sws == null && listener != null) {
+        conn.Connection* sc = listener->accept(0);
+        if (sc != null) {
+            accepted++;
+            if (sinfo != null) sinfo->dispose();
+            sinfo = websocket.newHandshakeInfo();
+            if (websocket.readUpgrade(sc, sopts, sinfo)) {
+                sws = websocket.completeUpgrade(sc, sopts, sinfo);
+                if (sws != null) sws->setNonBlocking(true);
+            }
+        }
+    }
+    if (sws != null) sws->pump();
+    return 0;
+}
+
+char* url() {
+    char* u = alloc(100);
+    format(u, 100, "ws://127.0.0.1:%d/room", listener->port());
+    return u;
+}
+
+void reset() {
+    if (sws != null) { sws->dispose(); sws = null; }
+    accepted = 0;
+}
+
+// the head of a request for the pure checks
+char* req(char* first, char* extra) {
+    char* h = alloc(1500);
+    format(h, 1500, "%s\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s", first, extra);
+    return h;
+}
+
+int judge(char* head, websocket.ServerOptions* o) {
+    websocket.HandshakeInfo* i = new websocket.HandshakeInfo();
+    return websocket.serverHandshake(head, o, i);
+}
+
+int main() {
+    net.setIdleHook(serve);
+    listener = new conn.Listener(0);
+    sopts = new websocket.ServerOptions();
+
+    // --- what the client sends
+    websocket.Options* o = new websocket.Options();
+    o->origin = "https://example.org";
+    o->cookie = "session=abc; theme=dark";
+    o->authorization = "Bearer token123";
+    o->protocols = "v2.chat, v1.chat";
+    o->headers = "X-Custom: one\r\nX-Other: two\r\n";
+    websocket.WebSocket* ws = websocket.connectWith(url(), o);
+    check("connect with options", ws != null && sws != null);
+    check("Origin", streq(sinfo->header("Origin"), "https://example.org") && streq(&sinfo->origin[0], "https://example.org"));
+    check("Cookie", streq(sinfo->header("Cookie"), "session=abc; theme=dark"));
+    check("Authorization", streq(sinfo->header("Authorization"), "Bearer token123"));
+    check("Sec-WebSocket-Protocol", streq(sinfo->header("Sec-WebSocket-Protocol"), "v2.chat, v1.chat"));
+    check("extra headers", streq(sinfo->header("X-Custom"), "one") && streq(sinfo->header("X-Other"), "two"));
+    check("header lookup ignores case, a missing header is null", streq(sinfo->header("x-custom"), "one") && sinfo->header("X-Missing") == null);
+    check("Host has the port", contains(sinfo->header("Host"), "127.0.0.1:"));
+    check("no subprotocols configured on the server: none chosen", streq(ws->protocol, "") && streq(sws->protocol, ""));
+    ws->dispose();
+    reset();
+
+    // --- subprotocol: the server's order wins
+    sopts->protocols = "v1.chat, v2.chat";
+    ws = websocket.connectWith(url(), o);
+    check("the server's first choice among the offered", ws != null && streq(ws->protocol, "v1.chat") && streq(sws->protocol, "v1.chat") && streq(&sinfo->protocol[0], "v1.chat"));
+    ws->dispose();
+    reset();
+    sopts->protocols = "other, v2.chat";
+    ws = websocket.connectWith(url(), o);
+    check("a protocol the client offered second", ws != null && streq(ws->protocol, "v2.chat"));
+    ws->dispose();
+    reset();
+    sopts->protocols = "zzz";
+    ws = websocket.connectWith(url(), o);
+    check("no common protocol: connected without one", ws != null && streq(ws->protocol, ""));
+    ws->dispose();
+    reset();
+    sopts->requireProtocol = true;
+    ws = websocket.connectWith(url(), o);
+    check("requireProtocol refuses with 400", ws == null && websocket.status() == 400);
+    websocket.Options* plain = new websocket.Options();
+    ws = websocket.connectWith(url(), plain);
+    check("... also a client that offers none", ws == null && websocket.status() == 400);
+    sopts->requireProtocol = false;
+    sopts->protocols = null;
+    reset();
+
+    // --- Origin policy
+    sopts->origins = "https://example.org, https://other.org";
+    ws = websocket.connectWith(url(), o);
+    check("an allowed origin", ws != null);
+    ws->dispose();
+    reset();
+    websocket.Options* bad = new websocket.Options();
+    bad->origin = "https://evil.example";
+    ws = websocket.connectWith(url(), bad);
+    check("another origin is refused with 403", ws == null && websocket.status() == 403);
+    reset();
+    ws = websocket.connectWith(url(), plain);
+    check("no Origin header (not a browser): allowed unless required", ws != null);
+    ws->dispose();
+    reset();
+    sopts->requireOrigin = true;
+    ws = websocket.connectWith(url(), plain);
+    check("requireOrigin: no Origin -> 403", ws == null && websocket.status() == 403);
+    reset();
+    sopts->origins = "*";
+    ws = websocket.connectWith(url(), bad);
+    check("* allows every origin", ws != null);
+    ws->dispose();
+    reset();
+    sopts->origins = null;
+    sopts->requireOrigin = false;
+
+    // --- injection: nothing is sent when a value has CR or LF
+    int before = accepted;
+    websocket.Options* inj = new websocket.Options();
+    inj->origin = "https://a.example\r\nX-Evil: 1";
+    check("CRLF in Origin", websocket.connectWith(url(), inj) == null && contains(websocket.error(), "control"));
+    inj = new websocket.Options();
+    inj->cookie = "a=b\nX-Evil: 1";
+    check("LF in Cookie", websocket.connectWith(url(), inj) == null);
+    inj = new websocket.Options();
+    inj->authorization = "Bearer x\r\n";
+    check("CRLF in Authorization", websocket.connectWith(url(), inj) == null);
+    inj = new websocket.Options();
+    inj->headers = "X-One: 1\r\nX-Two 2\r\n";
+    check("an extra header line without a colon", websocket.connectWith(url(), inj) == null);
+    inj = new websocket.Options();
+    inj->headers = "X-One: 1";
+    check("an extra header line without CRLF", websocket.connectWith(url(), inj) == null);
+    inj = new websocket.Options();
+    inj->headers = "X-One: 1\r\n\r\nGET /evil HTTP/1.1\r\n";
+    check("an empty line in the extra headers", websocket.connectWith(url(), inj) == null);
+    inj = new websocket.Options();
+    inj->protocols = "chat, bad proto";
+    check("a subprotocol with a space", websocket.connectWith(url(), inj) == null);
+    inj = new websocket.Options();
+    inj->protocols = "chat\r\nX: y";
+    check("CRLF in the subprotocols", websocket.connectWith(url(), inj) == null);
+    char* evilUrl = alloc(200);
+    format(evilUrl, 200, "ws://127.0.0.1:%d/a b", listener->port());
+    check("a space in the path", websocket.connectWith(evilUrl, null) == null);
+    format(evilUrl, 200, "ws://127.0.0.1:%d/a\r\nX-Evil: 1", listener->port());
+    check("CRLF in the path", websocket.connectWith(evilUrl, null) == null);
+    for (int i = 0; i < 3; i++) serve();
+    check("no connection was even made for any of them", accepted == before);
+
+    // --- the pure checks of the server
+    check("a good request", judge(req("GET /chat HTTP/1.1", ""), null) == 101);
+    check("POST is 405", judge(req("POST /chat HTTP/1.1", ""), null) == 405);
+    check("HTTP/1.0 is 400", judge(req("GET /chat HTTP/1.0", ""), null) == 400);
+    check("a request line with two parts", judge(req("GET /chat", ""), null) == 400);
+    check("a target that is not a path", judge(req("GET chat HTTP/1.1", ""), null) == 400);
+    check("a target with a control character", judge(req("GET /a\x01b HTTP/1.1", ""), null) == 400);
+    char* longTarget = alloc(1400);
+    strcpy(longTarget, "GET /");
+    for (int i = 0; i < 1200; i++) strcat(longTarget, "a");
+    strcat(longTarget, " HTTP/1.1");
+    check("a target of 1200 bytes is 414", judge(req(longTarget, ""), null) == 414);
+    websocket.HandshakeInfo* hi = new websocket.HandshakeInfo();
+    check("version 12 is 426 with the supported version", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 12\r\n", null, hi) == 426
+        && contains(hi->response, "Sec-WebSocket-Version: 13"));
+    check("no Host", websocket.serverHandshake("GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("no Upgrade", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("Upgrade: h2c", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: h2c\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("no Connection: Upgrade", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("Connection: keep-alive, Upgrade", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 101);
+    check("no key", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("a key of the wrong length", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("a key that is not base64", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: !!!hIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("two keys", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("a folded header line", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\n  folded\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("a header line without a colon", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nnonsense\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 400);
+    check("the answer carries the right accept key", websocket.serverHandshake("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: WebSocket\r\nConnection: upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n", null, hi) == 101
+        && contains(hi->response, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n") && startsWith(hi->response, "HTTP/1.1 101 Switching Protocols\r\n"));
+    // an error answer is a complete HTTP response without a body
+    judge(req("POST /chat HTTP/1.1", ""), null);
+    websocket.serverHandshake("POST / HTTP/1.1\r\nHost: x\r\n", null, hi);
+    check("an error answer", startsWith(hi->response, "HTTP/1.1 405 Method Not Allowed\r\n") && contains(hi->response, "Content-Length: 0\r\n") && contains(hi->response, "Allow: GET") && hi->responseLen == strlen(hi->response));
+
+    // --- limits on the request head that arrives over a socket
+    conn.Connection* raw = conn.open("127.0.0.1", listener->port(), 1000);
+    char* flood = alloc(40000);
+    strcpy(flood, "GET / HTTP/1.1\r\nHost: x\r\n");
+    for (int i = 0; i < 150; i++) strcat(flood, "X-Header: value\r\n");
+    strcat(flood, "\r\n");
+    raw->writeText(flood);
+    raw->flush();
+    serve();
+    serve();
+    char line[100];
+    check("150 header lines: the connection is dropped", raw->readLine(&line[0], 100) < 0 || !startsWith(&line[0], "HTTP/1.1 101"));
+    raw->close();
+    reset();
+    raw = conn.open("127.0.0.1", listener->port(), 1000);
+    char* longLine = alloc(20000);
+    strcpy(longLine, "GET / HTTP/1.1\r\nHost: x\r\nX-Long: ");
+    for (int i = 0; i < 9000; i++) strcat(longLine, "a");
+    strcat(longLine, "\r\n\r\n");
+    raw->writeText(longLine);
+    raw->flush();
+    serve();
+    serve();
+    check("a header line of 9000 bytes: the connection is dropped", raw->readLine(&line[0], 100) < 0 || !startsWith(&line[0], "HTTP/1.1 101"));
+    raw->close();
+    reset();
+    raw = conn.open("127.0.0.1", listener->port(), 1000);
+    raw->writeText("GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n");
+    raw->flush();
+    sopts->handshakeTimeoutMs = 150;
+    int t0 = millis();
+    serve();
+    int took = millis() - t0;
+    check("an incomplete request head is given up after the handshake timeout", sws == null && took >= 100 && took < 3000);
+    raw->close();
+    reset();
+    sopts->handshakeTimeoutMs = 10000;
+
+    net.setIdleHook(null);
+    listener->close();
+    printf("failures: %d\n", fails);
+    return fails;
+}

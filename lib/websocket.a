@@ -328,6 +328,23 @@ private bool hasToken(char* list, char* token) {
     return false;
 }
 
+// the next item of a comma separated list (trimmed) into out; false at the end of the list
+private bool nextItem(char* list, int* pos, char* out, int max) {
+    int i = *pos;
+    while (list[i] == ' ' || list[i] == 9 || list[i] == ',') i++;
+    if (list[i] == 0) { *pos = i; return false; }
+    int s = i;
+    while (list[i] != 0 && list[i] != ',') i++;
+    int e = i;
+    while (e > s && (list[e - 1] == ' ' || list[e - 1] == 9)) e--;
+    int n = e - s;
+    if (n >= max) n = max - 1;
+    memcpy(out, &list[s], n);
+    out[n] = 0;
+    *pos = i;
+    return true;
+}
+
 // a token as RFC 7230 defines it (what a subprotocol name may be made of)
 private bool isToken(char* s, int n) {
     if (n <= 0) return false;
@@ -1228,6 +1245,7 @@ public class WebSocket {
             }
         }
         if (closed) return -1;
+        if (kaInterval > 0) pingSentAt = 0;           // anything that arrives shows the peer is alive
         return n;
     }
 
@@ -1429,13 +1447,13 @@ public class WebSocket {
 
     // the final frame of a message arrived
     private bool completeMessage() {
-        if (mBuf == null) {
-            mBuf = malloc(256);
+        if (mBuf == null && mComp) {
+            mBuf = malloc(256);                       // an empty compressed message still needs room for the 4 byte tail
             mCap = 256;
             if (mBuf == null) return failWith(1011, "out of memory");
         }
         int op = mOp;
-        char* data = mBuf;
+        char* data = mBuf == null ? "" : mBuf;
         int n = mLen;
         char* z = null;
         mOp = 0;
@@ -1581,7 +1599,11 @@ public class WebSocket {
                 return null;
             }
             int slice = -1;
-            if (kaInterval > 0) slice = 100;
+            if (kaInterval > 0) {
+                slice = kaInterval / 4;
+                if (slice < 10) slice = 10;
+                if (slice > 100) slice = 100;
+            }
             if (ms >= 0) {
                 int left = ms - (millis() - t0);
                 if (left < 0) left = 0;
@@ -1606,6 +1628,7 @@ public class WebSocket {
                 endBlocking();
                 return null;
             }
+            if (kaInterval > 0) clockNow = millis();
             feedAll(&buf[0], n);
             tick(millis());
             flushAll();
@@ -1815,13 +1838,11 @@ private char* buildClientRequest(char* host, int port, bool secureConn, char* pa
         return null;
     }
     if (o->protocols != null && o->protocols[0] != 0) {
-        // a list of tokens
-        int i = 0;
-        while (o->protocols[i] != 0) {
-            while (o->protocols[i] == ' ' || o->protocols[i] == ',') i++;
-            int s = i;
-            while (o->protocols[i] != 0 && o->protocols[i] != ',' && o->protocols[i] != ' ') i++;
-            if (i > s && !isToken(&o->protocols[s], i - s)) { fail1("bad subprotocol name"); return null; }
+        // a list of tokens separated by commas
+        int pos = 0;
+        char item[100];
+        while (nextItem(o->protocols, &pos, &item[0], 100)) {
+            if (!isToken(&item[0], strlen(&item[0]))) { fail1("bad subprotocol name"); return null; }
         }
     }
     char raw[16];
@@ -1886,8 +1907,9 @@ public bool clientSendWith(conn.Connection* c, char* host, int port, bool secure
     return ok;
 }
 
-// Checks the server's answer (head: the status line and headers) against the key and the options; on success configures ws.
-private bool applyClientResponse(char* head, char* key, Options* o, WebSocket* ws) {
+// Client side: checks the server's answer (head: the status line and the header lines, each ending in CRLF) against the key and the options
+// (subprotocol and extensions must be ones that were offered); on success configures ws (protocol, permessage-deflate). error() says what is wrong.
+public bool checkServerResponse(char* head, char* key, Options* o, WebSocket* ws) {
     lastStatus = 0;
     if (!startsWith(head, "HTTP/1.")) { fail1("the answer is not an HTTP response"); return false; }
     int sp = indexOf(head, ' ');
@@ -1953,7 +1975,7 @@ public WebSocket* clientFinishWith(conn.Connection* c, char* key, Options* o) {
     ws->maxMessage = o->maxMessage;
     ws->maxFrame = o->maxFrame;
     ws->minCompress = o->minCompress;
-    bool ok = applyClientResponse(head, key, o, ws);
+    bool ok = checkServerResponse(head, key, o, ws);
     free(head);
     if (!ok) {
         ws->dispose();
@@ -2007,8 +2029,12 @@ public WebSocket* connectWith(char* url, Options* o) {
         fail1("not a ws:// or wss:// URL");
         return null;
     }
+    char key[40];
+    char* req = buildClientRequest(&host[0], port, secureConn, &path[0], &key[0], o);     // before any connection is made: a bad value sends nothing
+    if (req == null) return null;
     int h = net.connectTimeout(&host[0], port, o->connectTimeoutMs);
     if (h < 0) {
+        free(req);
         fail1("cannot connect");
         return null;
     }
@@ -2018,12 +2044,15 @@ public WebSocket* connectWith(char* url, Options* o) {
             char* why = tls.lastError();
             fail1(why == null ? "the TLS handshake failed" : why);
             net.rawClose(h);
+            free(req);
             return null;
         }
     }
     conn.Connection* c = new conn.Connection(h);
-    char key[40];
-    if (!clientSendWith(c, &host[0], port, secureConn, &path[0], &key[0], o)) {
+    bool sent = c->writeText(req) && c->flush();
+    free(req);
+    if (!sent) {
+        fail1("sending the request failed");
         c->close();
         return null;
     }
@@ -2110,17 +2139,12 @@ public int serverHandshake(char* head, ServerOptions* o, HandshakeInfo* info) {
     char offered[400];
     bool clientOffered = hv(hd, "Sec-WebSocket-Protocol", &offered[0], 400) && offered[0] != 0;
     if (o != null && o->protocols != null && o->protocols[0] != 0 && clientOffered) {
-        int i = 0;
-        while (o->protocols[i] != 0) {
-            while (o->protocols[i] == ' ' || o->protocols[i] == ',') i++;
-            int s = i;
-            while (o->protocols[i] != 0 && o->protocols[i] != ',' && o->protocols[i] != ' ') i++;
-            int n = i - s;
-            if (n > 0 && n < 64 && isToken(&o->protocols[s], n)) {
-                char tok[64];
-                memcpy(&tok[0], &o->protocols[s], n);
-                tok[n] = 0;
-                if (hasToken(&offered[0], &tok[0])) { strcpy(&info->protocol[0], &tok[0]); break; }
+        int pos = 0;
+        char tok[100];
+        while (nextItem(o->protocols, &pos, &tok[0], 100)) {
+            if (isToken(&tok[0], strlen(&tok[0])) && strlen(&tok[0]) < 64 && hasToken(&offered[0], &tok[0])) {
+                strcpy(&info->protocol[0], &tok[0]);
+                break;
             }
         }
     }

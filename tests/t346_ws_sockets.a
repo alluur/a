@@ -1,0 +1,173 @@
+// websocket over real loopback sockets in ONE thread: the blocking client calls wait for data, and the idle hook of net lets the
+// server side (accept, echo, close) run from the same thread while they wait
+import websocket;
+import conn;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+conn.Listener* listener;
+websocket.WebSocket* sws;
+websocket.HandshakeInfo* sinfo;
+websocket.ServerOptions* sopts;
+int rejectWith = 0;
+int accepted = 0;
+char* seenText = null;
+bool closeOnBye = false;
+
+// the server: accepts one connection when the client has sent its request, then echoes
+int serve() {
+    if (sws == null && listener != null) {
+        conn.Connection* sc = listener->accept(0);
+        if (sc != null) {
+            accepted++;
+            if (sinfo != null) sinfo->dispose();
+            sinfo = websocket.newHandshakeInfo();
+            if (websocket.readUpgrade(sc, sopts, sinfo)) {
+                if (rejectWith != 0) {
+                    websocket.rejectUpgrade(sc, sinfo, rejectWith);
+                } else {
+                    sws = websocket.completeUpgrade(sc, sopts, sinfo);
+                    if (sws != null) sws->setNonBlocking(true);       // the server must never wait: the client is in the same thread
+                }
+            }
+        }
+    }
+    if (sws != null) {
+        sws->pump();
+        websocket.Message* m = sws->takeMessage();
+        while (m != null) {
+            if (m->opcode == websocket.OP_TEXT && streq(m->data, "bye") && closeOnBye) {
+                sws->closeWith(1001, "server says bye");
+            } else if (m->opcode == websocket.OP_TEXT) {
+                char* t = alloc(m->length + 20);
+                format(t, m->length + 20, "echo: %s", m->data);
+                sws->sendText(t);
+            } else {
+                sws->sendBinary(m->data, m->length);
+            }
+            m->dispose();
+            m = sws->takeMessage();
+        }
+    }
+    return 0;
+}
+
+void startServer() {
+    listener = new conn.Listener(0);
+    sws = null;
+    sopts = new websocket.ServerOptions();
+}
+
+void stopServer() {
+    if (sws != null) { sws->dispose(); sws = null; }
+    listener->close();
+    listener = null;
+}
+
+char* url(char* path) {
+    char* u = alloc(100);
+    format(u, 100, "ws://127.0.0.1:%d%s", listener->port(), path);
+    return u;
+}
+
+int main() {
+    net.setIdleHook(serve);
+    startServer();
+    websocket.WebSocket* ws = websocket.connect(url("/chat?room=7"));
+    check("connect", ws != null && sws != null);
+    check("the server saw the path", streq(&sinfo->path[0], "/chat?room=7"));
+    check("status 101", websocket.status() == 101);
+    ws->sendText("hello");
+    websocket.Message* m = ws->receiveMessage();
+    check("text echo", m != null && streq(m->data, "echo: hello") && m->opcode == websocket.OP_TEXT);
+    m->dispose();
+    // 70000 bytes in one message
+    char* big = alloc(70000);
+    for (int i = 0; i < 70000; i++) big[i] = i * 7;
+    check("send 70000 bytes", ws->sendBinary(big, 70000));
+    m = ws->receiveMessage();
+    check("binary echo of 70000 bytes", m != null && m->length == 70000 && m->opcode == websocket.OP_BINARY && memcmp(m->data, big, 70000) == 0);
+    m->dispose();
+    // the old API
+    ws->sendText("again");
+    char buf[100];
+    int op;
+    int n = ws->receive(&buf[0], 100, &op);
+    check("the old receive(buf, max, &op)", n == 11 && op == 1 && streq(&buf[0], "echo: again"));
+    // a message that does not fit the buffer is cut
+    ws->sendText("a long message that is cut");
+    n = ws->receive(&buf[0], 10, &op);
+    check("receive cuts a long message", n == 10 && buf[6] == 'a');
+    // ping: the server answers it inside pump(); the pong is seen while the client waits
+    ws->ping();
+    ws->sendText("after ping");
+    m = ws->receiveMessage();
+    check("a ping does not disturb messages", m != null && streq(m->data, "echo: after ping") && ws->rttMs >= 0);
+    m->dispose();
+    // a timeout that is not an error
+    m = ws->waitMessage(30);
+    check("waitMessage times out without closing", m == null && !ws->closed);
+    // the client closes: close handshake
+    check("closeWith", ws->closeWith(1000, "done"));
+    check("... both sides are closed", ws->closed && ws->closeCode == 1000 && sws->closed && sws->closeCode == 1000 && streq(sws->closeReason, "done"));
+    ws->dispose();
+    sws->dispose();
+    sws = null;
+
+    // the server closes
+    closeOnBye = true;
+    ws = websocket.connect(url("/"));
+    check("second connection", ws != null && sws != null);
+    ws->sendText("bye");
+    m = ws->receiveMessage();
+    check("the server's close ends receive", m == null && ws->closed && ws->closeCode == 1001 && streq(ws->closeReason, "server says bye"));
+    for (int i = 0; i < 5; i++) serve();
+    check("the close handshake finishes on the server side too", sws->closed && sws->closeCode == 1001);
+    ws->dispose();
+    sws->dispose();
+    sws = null;
+    closeOnBye = false;
+
+    // the server drops the connection without a close frame
+    ws = websocket.connect(url("/"));
+    sws->abort();
+    m = ws->receiveMessage();
+    check("a dropped connection: receive returns null, code 1006", m == null && ws->closed && ws->closeCode == 1006);
+    ws->dispose();
+    sws->dispose();
+    sws = null;
+
+    // the server refuses the upgrade
+    rejectWith = 403;
+    ws = websocket.connect(url("/secret"));
+    check("403: connect fails and says why", ws == null && websocket.status() == 403 && contains(websocket.error(), "403"));
+    rejectWith = 0;
+    // a server that speaks plain HTTP
+    ws = websocket.connectWith(url("/"), null);
+    check("a good connection after a refused one", ws != null);
+    ws->dispose();
+    if (sws != null) { sws->dispose(); sws = null; }
+
+    // not a websocket URL, a closed port
+    check("http:// is not a websocket URL", websocket.connect("http://127.0.0.1:1/") == null && contains(websocket.error(), "ws://"));
+    check("an empty host", websocket.connect("ws:///x") == null);
+    check("a bad port", websocket.connect("ws://127.0.0.1:99999/") == null);
+    int port = listener->port();
+    stopServer();
+    net.setIdleHook(null);
+    char* dead = alloc(100);
+    format(dead, 100, "ws://127.0.0.1:%d/", port);
+    check("connection refused", websocket.connect(dead) == null && streq(websocket.error(), "cannot connect"));
+    printf("failures: %d\n", fails);
+    return fails;
+}

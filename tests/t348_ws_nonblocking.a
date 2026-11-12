@@ -1,0 +1,223 @@
+// websocket in non-blocking mode: one thread serves several clients with a conn.Poller (fd, pump, takeMessage, flush),
+// a client that reads slowly keeps its data queued, closing and dropping clients
+import websocket;
+import conn;
+import net;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+conn.Listener* listener;
+conn.Poller* poller;
+websocket.WebSocket* peers[8];
+int nameOf[8];
+int accepted = 0;
+int pumped = 0;
+int removed = 0;
+int nextId = 1;
+
+void addPeer(websocket.WebSocket* ws) {
+    for (int i = 0; i < 8; i++) {
+        if (peers[i] == null) {
+            peers[i] = ws;
+            nameOf[i] = nextId;
+            nextId++;
+            poller->add(ws->fd(), i);
+            return;
+        }
+    }
+}
+
+void dropPeer(int i) {
+    poller->remove(peers[i]->fd());
+    peers[i]->dispose();
+    peers[i] = null;
+    removed++;
+}
+
+int broadcast(int from, char* text) {
+    int sent = 0;
+    for (int j = 0; j < 8; j++) {
+        if (peers[j] != null && !peers[j]->closed) {
+            char* t = alloc(strlen(text) + 20);
+            format(t, strlen(text) + 20, "%d says %s", nameOf[from], text);
+            if (peers[j]->sendText(t)) sent++;
+        }
+    }
+    return sent;
+}
+
+// one turn of a single threaded server
+int step() {
+    int n = poller->wait(0);
+    for (int k = 0; k < n; k++) {
+        int tag = poller->readyTag(k);
+        if (tag == 100) {
+            conn.Connection* c = listener->accept(0);
+            if (c != null) {
+                websocket.WebSocket* ws = websocket.accept(c, null, 0);
+                if (ws != null) {
+                    ws->setNonBlocking(true);
+                    addPeer(ws);
+                    accepted++;
+                }
+            }
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        websocket.WebSocket* ws = peers[i];
+        if (ws == null) continue;
+        int r = ws->pump();
+        pumped++;
+        websocket.Message* m = ws->takeMessage();
+        while (m != null) {
+            if (m->opcode == websocket.OP_TEXT) {
+                broadcast(i, m->data);
+            } else if (m->length == 5 && memcmp(m->data, "flood", 5) == 0) {
+                // send big messages until the socket buffer is full: the rest stays queued
+                char* chunk = alloc(100000);
+                for (int q = 0; q < 100000; q++) chunk[q] = q;
+                int count = 0;
+                while (ws->outPending() == 0 && count < 200) {
+                    ws->sendBinary(chunk, 100000);
+                    count++;
+                }
+                char summary[40];
+                format(&summary[0], 40, "flooded %d", count);
+                ws->sendText(&summary[0]);
+            }
+            m->dispose();
+            m = ws->takeMessage();
+        }
+        if (ws->closed && ws->qCount == 0) dropPeer(i);
+    }
+    return 0;
+}
+
+int live() {
+    int n = 0;
+    for (int i = 0; i < 8; i++) if (peers[i] != null) n++;
+    return n;
+}
+
+int main() {
+    listener = new conn.Listener(0);
+    poller = new conn.Poller();
+    poller->add(listener->handle(), 100);
+    net.setIdleHook(step);
+    char* u = alloc(100);
+    format(u, 100, "ws://127.0.0.1:%d/", listener->port());
+    websocket.WebSocket* a = websocket.connect(u);
+    websocket.WebSocket* b = websocket.connect(u);
+    websocket.WebSocket* c = websocket.connect(u);
+    check("three clients connect to one single threaded server", a != null && b != null && c != null && accepted == 3 && live() == 3);
+    check("the server sockets are non-blocking and have descriptors", peers[0]->nonblocking && peers[0]->fd() >= 0 && peers[0]->fd() != peers[1]->fd());
+
+    a->sendText("hello");
+    websocket.Message* m = a->receiveMessage();
+    check("a hears its own broadcast", m != null && streq(m->data, "1 says hello"));
+    m->dispose();
+    m = b->receiveMessage();
+    check("b hears it", m != null && streq(m->data, "1 says hello"));
+    m->dispose();
+    m = c->receiveMessage();
+    check("c hears it", m != null && streq(m->data, "1 says hello"));
+    m->dispose();
+    c->sendText("from c");
+    char* heard[3];
+    websocket.WebSocket* all[3];
+    all[0] = a; all[1] = b; all[2] = c;
+    int okCount = 0;
+    for (int i = 0; i < 3; i++) {
+        m = all[i]->receiveMessage();
+        if (m != null && streq(m->data, "3 says from c")) okCount++;
+        m->dispose();
+    }
+    check("everybody hears c", okCount == 3);
+
+    // queries
+    check("nothing is waiting on a client", !a->messageReady() && a->takeMessage() == null);
+    check("a client without input says so", !a->inputReady());
+    step();
+    check("pump on a connection with nothing to read returns 0", peers[0]->pump() == 0);
+
+    // the poller says when a socket has something
+    a->sendText("ping me");
+    int ready = 0;
+    for (int i = 0; i < 100 && ready == 0; i++) ready = poller->wait(50);
+    check("the poller reports the socket that has data", ready >= 1);
+    check("inputReady agrees", peers[0]->inputReady());
+    check("pump finds one message", peers[0]->pump() == 1 && peers[0]->messageReady());
+    m = peers[0]->takeMessage();
+    check("takeMessage gives it", m != null && streq(m->data, "ping me"));
+    m->dispose();
+
+    // a big message arrives in many reads
+    char* big = alloc(300000);
+    for (int i = 0; i < 300000; i++) big[i] = i * 3;
+    a->sendBinary(big, 300000);
+    step();
+    int steps = 0;
+    while (steps < 400) { step(); steps++; }
+    check("a 300000 byte message passes through the poll loop", pumped > 100);
+
+    // a slow reader: the server cannot send everything at once
+    b->sendBinary("flood", 5);
+    int before = pumped;
+    for (int i = 0; i < 50; i++) step();
+    websocket.WebSocket* srvB = peers[1];
+    check("the flood leaves bytes queued, the server did not block", srvB->outPending() > 0);
+    // now b reads: the server flushes as the socket drains
+    int count = 0;
+    long total = 0;
+    bool intact = true;
+    for (;;) {
+        m = b->receiveMessage();
+        if (m == null) break;
+        if (m->opcode == websocket.OP_TEXT) {
+            check("the server's summary", startsWith(m->data, "flooded "));
+            count = atoi(&m->data[8]);
+            m->dispose();
+            break;
+        }
+        if (m->length != 100000 || m->data[7] != 7 || m->data[99999] != (99999 & 255)) intact = false;
+        total++;
+        m->dispose();
+    }
+    check("every queued message arrives complete and in order", intact && total == count && count > 0);
+    for (int i = 0; i < 5; i++) step();
+    check("the queue drained", srvB->outPending() == 0);
+
+    // a client closes: the handshake completes and the server forgets it
+    int live0 = live();
+    check("c closes", c->closeWith(1000, "bye"));
+    for (int i = 0; i < 10; i++) step();
+    check("the server saw the close and dropped the peer", live() == live0 - 1 && removed == 1);
+    c->dispose();
+
+    // a client vanishes without a close frame
+    b->abort();
+    for (int i = 0; i < 10; i++) step();
+    check("a dropped connection is noticed", live() == 1 && removed == 2);
+    b->dispose();
+    // the server drops a client
+    peers[0]->abort();
+    a->sendText("x");
+    m = a->receiveMessage();
+    check("a client of a dropped connection ends with 1006", m == null && a->closeCode == 1006);
+    for (int i = 0; i < 5; i++) step();
+    check("nobody is left", live() == 0);
+    a->dispose();
+    net.setIdleHook(null);
+    listener->close();
+    printf("failures: %d\n", fails);
+    return fails;
+}

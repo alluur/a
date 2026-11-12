@@ -1,0 +1,349 @@
+// websocket: permessage-deflate (RFC 7692): negotiation on both sides with every parameter, round trips, messages from a zlib compressor with and
+// without context takeover, window bits, decompression bombs, damaged data
+import websocket;
+import zlib;
+import encoding;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+char* upgradeHead(char* extHeader) {
+    char* h = alloc(1000);
+    format(h, 1000, "GET /chat HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s", extHeader);
+    return h;
+}
+
+// negotiates with the offer text (the whole header line, or "") and returns the response; info receives the details
+websocket.HandshakeInfo* negotiate(char* offerLine, bool deflate, bool takeover) {
+    websocket.ServerOptions* o = new websocket.ServerOptions();
+    o->deflate = deflate;
+    o->allowTakeover = takeover;
+    websocket.HandshakeInfo* info = new websocket.HandshakeInfo();
+    int st = websocket.serverHandshake(upgradeHead(offerLine), o, info);
+    if (st != 101) printf("  status %d\n", st);
+    return info;
+}
+
+bool answered(websocket.HandshakeInfo* i, char* ext) {
+    char* want = alloc(300);
+    format(want, 300, "Sec-WebSocket-Extensions: %s\r\n", ext);
+    return i->deflate && contains(i->response, want);
+}
+
+bool noExtension(websocket.HandshakeInfo* i) {
+    return !i->deflate && !contains(i->response, "Sec-WebSocket-Extensions");
+}
+
+char* respHead(char* extras) {
+    char* h = alloc(1000);
+    format(h, 1000, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n%s", extras);
+    return h;
+}
+
+char* KEY = "dGhlIHNhbXBsZSBub25jZQ==";
+
+bool clientAccepts(char* head, websocket.Options* o, websocket.WebSocket* w) {
+    return websocket.checkServerResponse(head, KEY, o, w);
+}
+
+int move(websocket.WebSocket* a, websocket.WebSocket* b) {
+    int n = a->outPending();
+    if (n == 0) return 0;
+    int r = b->feed(a->outData(), n);
+    a->outConsumed(n);
+    return r;
+}
+
+int outCloseCode(websocket.WebSocket* w) {
+    int n = w->outPending();
+    if (n < 4) return 0;
+    char b[200];
+    if (n > 200) n = 200;
+    memcpy(&b[0], w->outData(), n);
+    if ((b[0] & 15) != 8) return 0;
+    int len = b[1] & 127;
+    int off = 2;
+    if ((b[1] & 128) != 0) {
+        websocket.unmask(&b[6], len, ((b[2] & 255) << 24) | ((b[3] & 255) << 16) | ((b[4] & 255) << 8) | (b[5] & 255));
+        off = 6;
+    }
+    return (b[off] & 255) * 256 + (b[off + 1] & 255);
+}
+
+int feedHex(websocket.WebSocket* w, char* hex) {
+    char* buf = alloc(strlen(hex) / 2 + 8);
+    int n = encoding.hexDecode(hex, buf);
+    return w->feed(buf, n);
+}
+
+char* nextText(websocket.WebSocket* w) {
+    websocket.Message* m = w->takeMessage();
+    if (m == null) return "(none)";
+    char* t = strdup(m->data);
+    m->dispose();
+    return t;
+}
+
+int main() {
+    // --- the server answers offers
+    char* base = "permessage-deflate; server_no_context_takeover; client_no_context_takeover";
+    check("plain offer", answered(negotiate("Sec-WebSocket-Extensions: permessage-deflate\r\n", true, false), base));
+    check("client_max_window_bits without a value", answered(negotiate("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n", true, false), base));
+    websocket.HandshakeInfo* i = negotiate("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=10; client_max_window_bits\r\n", true, false);
+    check("server_max_window_bits=10 is answered and obeyed", answered(i, "permessage-deflate; server_no_context_takeover; server_max_window_bits=10; client_no_context_takeover") && i->txDist == 1024);
+    i = negotiate("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits=9\r\n", true, false);
+    check("client_max_window_bits=9", answered(i, base));
+    i = negotiate("Sec-WebSocket-Extensions: permessage-deflate\r\n", true, true);
+    check("a server that allows context takeover does not forbid it", answered(i, "permessage-deflate; server_no_context_takeover") && i->rxTakeover);
+    i = negotiate("Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n", true, true);
+    check("... unless the client says it will not use it", answered(i, base) && !i->rxTakeover);
+    i = negotiate("Sec-WebSocket-Extensions: permessage-deflate\r\n", true, false);
+    check("by default the server forbids it", !i->rxTakeover && i->txDist == 32768);
+    check("an unknown parameter declines the offer", noExtension(negotiate("Sec-WebSocket-Extensions: permessage-deflate; foo\r\n", true, false)));
+    i = negotiate("Sec-WebSocket-Extensions: permessage-deflate; foo, permessage-deflate; server_max_window_bits=9\r\n", true, false);
+    check("... and the next offer is tried", answered(i, "permessage-deflate; server_no_context_takeover; server_max_window_bits=9; client_no_context_takeover") && i->txDist == 512);
+    check("a repeated parameter declines", noExtension(negotiate("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; server_no_context_takeover\r\n", true, false)));
+    check("window bits 7 decline", noExtension(negotiate("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=7\r\n", true, false)));
+    check("window bits 16 decline", noExtension(negotiate("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=16\r\n", true, false)));
+    check("window bits abc decline", noExtension(negotiate("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=abc\r\n", true, false)));
+    check("server_max_window_bits needs a value", noExtension(negotiate("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits\r\n", true, false)));
+    check("a value on a flag declines", noExtension(negotiate("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover=1\r\n", true, false)));
+    i = negotiate("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=\"12\"\r\n", true, false);
+    check("a quoted value", i->deflate && i->txDist == 4096);
+    check("another extension is ignored", noExtension(negotiate("Sec-WebSocket-Extensions: x-webkit-deflate-frame\r\n", true, false)));
+    check("with deflate off nothing is accepted", noExtension(negotiate("Sec-WebSocket-Extensions: permessage-deflate\r\n", false, false)));
+    check("no offer, no extension", noExtension(negotiate("", true, false)));
+    i = negotiate("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Extensions: x-other\r\n", true, false);
+    check("an offer split over two header lines", answered(i, base));
+
+    // --- the client checks the answer
+    websocket.Options* o = new websocket.Options();
+    o->deflate = true;
+    o->protocols = "chat, superchat";
+    websocket.WebSocket* w = websocket.create(null, true);
+    check("a plain 101 is fine", clientAccepts(respHead(""), o, w) && !w->deflate);
+    w->dispose();
+    w = websocket.create(null, true);
+    check("the extension with all parameters", clientAccepts(respHead("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover; client_max_window_bits=9; server_max_window_bits=12\r\n"), o, w)
+        && w->deflate && !w->rxTakeover && w->txDist == 512);
+    w->dispose();
+    w = websocket.create(null, true);
+    check("without server_no_context_takeover the server keeps its context", clientAccepts(respHead("Sec-WebSocket-Extensions: permessage-deflate\r\n"), o, w) && w->deflate && w->rxTakeover && w->txDist == 32768);
+    w->dispose();
+    w = websocket.create(null, true);
+    check("a subprotocol that was offered", clientAccepts(respHead("Sec-WebSocket-Protocol: superchat\r\n"), o, w) && streq(w->protocol, "superchat"));
+    w->dispose();
+    w = websocket.create(null, true);
+    check("a subprotocol that was not offered is refused", !clientAccepts(respHead("Sec-WebSocket-Protocol: other\r\n"), o, w));
+    check("two subprotocols are refused", !clientAccepts(respHead("Sec-WebSocket-Protocol: chat, superchat\r\n"), o, w));
+    check("an unknown extension is refused", !clientAccepts(respHead("Sec-WebSocket-Extensions: x-foo\r\n"), o, w));
+    check("two extensions are refused", !clientAccepts(respHead("Sec-WebSocket-Extensions: permessage-deflate, permessage-deflate\r\n"), o, w));
+    check("an unknown parameter is refused", !clientAccepts(respHead("Sec-WebSocket-Extensions: permessage-deflate; foo\r\n"), o, w));
+    check("client_max_window_bits needs a value in an answer", !clientAccepts(respHead("Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n"), o, w));
+    check("window bits 20 are refused", !clientAccepts(respHead("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=20\r\n"), o, w));
+    check("a repeated parameter is refused", !clientAccepts(respHead("Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; server_no_context_takeover\r\n"), o, w));
+    websocket.Options* plain = new websocket.Options();
+    check("an extension that was not offered is refused", !clientAccepts(respHead("Sec-WebSocket-Extensions: permessage-deflate\r\n"), plain, w));
+    check("a subprotocol when none was offered is refused", !clientAccepts(respHead("Sec-WebSocket-Protocol: chat\r\n"), plain, w));
+    check("a wrong Sec-WebSocket-Accept", !clientAccepts("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n", plain, w));
+    check("no Sec-WebSocket-Accept", !clientAccepts("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n", plain, w));
+    check("status 200", !clientAccepts("HTTP/1.1 200 OK\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n", plain, w) && websocket.status() == 200);
+    check("status 403", !clientAccepts("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n", plain, w) && websocket.status() == 403);
+    check("HTTP/1.0", !clientAccepts("HTTP/1.0 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n", plain, w));
+    check("no Upgrade header", !clientAccepts("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n", plain, w));
+    check("no Connection header", !clientAccepts("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n", plain, w));
+    check("a malformed header line", !clientAccepts("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nnonsense\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n", plain, w));
+    w->dispose();
+    w = websocket.create(null, true);
+    check("lower case names and a token list are fine", clientAccepts("HTTP/1.1 101 Switching Protocols\r\nupgrade: WebSocket\r\nconnection: keep-alive, Upgrade\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n", plain, w));
+    w->dispose();
+
+    // --- round trips
+    websocket.WebSocket* c = websocket.create(null, true);
+    websocket.WebSocket* s = websocket.create(null, false);
+    c->deflate = true;
+    s->deflate = true;
+    char* text = alloc(20016);
+    for (int k = 0; k < 20000; k++) text[k] = "the rain in spain stays mainly in the plain. "[k % 45];
+    check("a compressible text of 20000 bytes", c->sendTextN(text, 20000) && c->outPending() < 3000 && (c->outData()[0] & 255) == 0xC1);
+    check("the server inflates it", move(c, s) > 0 && streq(nextText(s), text));
+    s->sendTextN(text, 20000);
+    check("the server's frame is compressed and not masked", s->outPending() < 3000 && (s->outData()[0] & 255) == 0xC1 && (s->outData()[1] & 128) == 0);
+    move(s, c);
+    check("the client inflates it", streq(nextText(c), text));
+    c->sendText("short");
+    check("a short message is sent as it is (RSV1 clear)", (c->outData()[0] & 255) == 0x81 && c->outPending() == 11);
+    move(c, s);
+    check("... and arrives", streq(nextText(s), "short"));
+    c->sendText("");
+    check("an empty message", move(c, s) > 0 && streq(nextText(s), ""));
+    char* rnd = alloc(5000);
+    int x = 12345;
+    for (int k = 0; k < 5000; k++) { x = (x * 1103515245 + 12345) & 0x7fffffff; rnd[k] = x >> 16; }
+    c->sendBinary(rnd, 5000);
+    check("incompressible data is sent stored", c->outPending() > 5000 && (c->outData()[0] & 255) == 0xC2);
+    move(c, s);
+    websocket.Message* m = s->takeMessage();
+    check("... and arrives intact", m != null && m->length == 5000 && memcmp(m->data, rnd, 5000) == 0);
+    m->dispose();
+    // fragments with deflate: collected and sent as one compressed message
+    c->beginMessage(websocket.OP_TEXT);
+    c->sendFragment(text, 5000);
+    c->sendFragment(&text[5000], 5000);
+    check("nothing goes out before endMessage", c->outPending() == 0);
+    c->endMessage();
+    move(c, s);
+    m = s->takeMessage();
+    check("a message in pieces is one compressed message", m != null && m->length == 10000 && memcmp(m->data, text, 10000) == 0);
+    m->dispose();
+    // split into frames (fragSize), compressed once
+    c->setFragmentSize(100);
+    c->sendTextN(text, 20000);
+    move(c, s);
+    m = s->takeMessage();
+    check("a compressed message split in frames (RSV1 only on the first)", m != null && m->length == 20000 && memcmp(m->data, text, 20000) == 0);
+    m->dispose();
+    c->setFragmentSize(0);
+    c->dispose();
+    s->dispose();
+
+    // --- messages from a real zlib compressor (Python's), with context takeover and without
+    char* t1 = "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.";
+    char* t2 = "The quick brown fox jumps over the lazy cat. The quick brown fox jumps over the lazy dog!";
+    char* tk1 = "0ac94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb298490a01800";
+    char* tk2 = "22566d72620949062b0200";
+    char* in2 = "0ac94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552a242796e8298410a938253f5d1100";
+    s = websocket.create(null, false);
+    s->deflate = true;
+    s->rxTakeover = true;
+    char* f1 = alloc(400);
+    char* f2 = alloc(400);
+    int n1; int n2;
+    {
+        char* p1 = alloc(200);
+        int pl = encoding.hexDecode(tk1, p1);
+        n1 = websocket.buildFrame(websocket.OP_TEXT, true, true, 0, p1, pl, f1);
+        f1[0] = f1[0] | 0x40;
+        char* p2 = alloc(200);
+        pl = encoding.hexDecode(tk2, p2);
+        n2 = websocket.buildFrame(websocket.OP_TEXT, true, true, 0, p2, pl, f2);
+        f2[0] = f2[0] | 0x40;
+    }
+    check("context takeover: the first message", s->feed(f1, n1) == n1 && streq(nextText(s), t1));
+    check("context takeover: the second refers to the first", s->feed(f2, n2) == n2 && streq(nextText(s), t2));
+    s->dispose();
+    s = websocket.create(null, false);
+    s->deflate = true;
+    s->rxTakeover = false;
+    check("without takeover the same first message works", s->feed(f1, n1) == n1 && streq(nextText(s), t1));
+    check("... but the second, which needs the history, is damaged data (1007)", s->feed(f2, n2) == -1 && outCloseCode(s) == 1007);
+    s->dispose();
+    // independent messages
+    s = websocket.create(null, false);
+    s->deflate = true;
+    {
+        char* p2 = alloc(200);
+        int pl = encoding.hexDecode(in2, p2);
+        n2 = websocket.buildFrame(websocket.OP_TEXT, true, true, 0, p2, pl, f2);
+        f2[0] = f2[0] | 0x40;
+    }
+    check("independent messages", s->feed(f1, n1) == n1 && streq(nextText(s), t1) && s->feed(f2, n2) == n2 && streq(nextText(s), t2));
+    s->dispose();
+    // the empty message of Python's compressor: one 00 byte after removing the tail
+    s = websocket.create(null, false);
+    s->deflate = true;
+    check("an empty compressed message", feedHex(s, "c181" "00000000" "00") > 0 && streq(nextText(s), ""));
+    s->dispose();
+    s = websocket.create(null, false);
+    s->deflate = true;
+    check("a compressed message with no payload bytes is not a deflate stream (1007)", feedHex(s, "c180" "00000000") == -1 && outCloseCode(s) == 1007);
+    s->dispose();
+
+    // --- window bits: a smaller window finds fewer far repeats
+    int a; int b;
+    char* far = alloc(2000);
+    for (int k = 0; k < 1000; k++) far[k] = (k * 7 + k / 13) & 255;
+    memcpy(&far[1000], far, 1000);
+    char* z1 = zlib.deflateSync(far, 2000, 6, 32768, &a);
+    char* z2 = zlib.deflateSync(far, 2000, 6, 256, &b);
+    check("a window of 256 bytes does not reach a repeat 1000 bytes back", a < b);
+    int back;
+    char* r1 = zlib.inflateEx(z1, a, null, 0, 0, true, &back);
+    check("both are valid streams", r1 != null && back == 2000 && memcmp(r1, far, 2000) == 0);
+    char* r2 = zlib.inflateEx(z2, b, null, 0, 0, true, &back);
+    check("... of the same data", r2 != null && back == 2000 && memcmp(r2, far, 2000) == 0);
+
+    // --- limits
+    s = websocket.create(null, false);
+    s->deflate = true;
+    s->maxMessage = 65536;
+    char* bombHex = "ecc101010000008220ffaf6e4840010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000af06";
+    char* bomb = alloc(1200);
+    int bl = encoding.hexDecode(bombHex, bomb);
+    char* bf = alloc(1300);
+    n1 = websocket.buildFrame(websocket.OP_BINARY, true, true, 0, bomb, bl, bf);
+    bf[0] = bf[0] | 0x40;
+    check("a decompression bomb (a few hundred bytes, a megabyte inflated) ends with 1009", bl < 1100 && s->feed(bf, n1) == -1 && outCloseCode(s) == 1009 && zlib.inflateTooBig() && streq(&s->failReason[0], "inflated message too big"));
+    s->dispose();
+    s = websocket.create(null, false);
+    s->deflate = true;
+    s->maxMessage = 2000000;
+    check("with a bigger limit it passes", s->feed(bf, n1) == n1);
+    websocket.Message* big = s->takeMessage();
+    check("... and is a million zero bytes", big != null && big->length == 1000000 && big->data[0] == 0 && big->data[999999] == 0);
+    big->dispose();
+    s->dispose();
+    // a bomb split over frames, each small
+    s = websocket.create(null, false);
+    s->deflate = true;
+    s->maxMessage = 65536;
+    s->maxFrame = 600;
+    char* fa = alloc(700);
+    char* fb = alloc(700);
+    int la = websocket.buildFrame(websocket.OP_BINARY, false, true, 0, bomb, 500, fa);
+    fa[0] = fa[0] | 0x40;
+    int lb = websocket.buildFrame(websocket.OP_CONT, true, true, 0, &bomb[500], bl - 500, fb);
+    check("a bomb in two fragments", s->feed(fa, la) == la && s->feed(fb, lb) == -1 && outCloseCode(s) == 1009);
+    s->dispose();
+    // the compressed size counts against maxMessage too
+    s = websocket.create(null, false);
+    s->deflate = true;
+    s->maxMessage = 100;
+    n1 = websocket.buildFrame(websocket.OP_BINARY, true, true, 0, bomb, bl, bf);
+    bf[0] = bf[0] | 0x40;
+    check("a compressed message over maxMessage is refused at its header", s->feed(bf, 8) == -1 && outCloseCode(s) == 1009);
+    s->dispose();
+    // damaged data and invalid text
+    s = websocket.create(null, false);
+    s->deflate = true;
+    check("garbage that is not deflate data -> 1007", feedHex(s, "c183" "00000000" "ffffff") == -1 && outCloseCode(s) == 1007);
+    s->dispose();
+    s = websocket.create(null, false);
+    s->deflate = true;
+    int zn;
+    char* zbad = zlib.deflateSync("abc\xff" "def and some more text to be compressed", 40, 6, 32768, &zn);
+    char* zf = alloc(200);
+    int zl = websocket.buildFrame(websocket.OP_TEXT, true, true, 0, zbad, zn - 4, zf);
+    zf[0] = zf[0] | 0x40;
+    check("invalid UTF-8 inside a compressed text message -> 1007", s->feed(zf, zl) == -1 && outCloseCode(s) == 1007);
+    s->dispose();
+    // RSV1 where it must not be
+    s = websocket.create(null, false);
+    s->deflate = true;
+    check("RSV1 on a continuation frame -> 1002", feedHex(s, "4180" "00000000" "c080" "00000000") == -1 && outCloseCode(s) == 1002);
+    s->dispose();
+    s = websocket.create(null, false);
+    s->deflate = true;
+    check("RSV1 on a ping -> 1002", feedHex(s, "c980" "00000000") == -1 && outCloseCode(s) == 1002);
+    s->dispose();
+    printf("failures: %d\n", fails);
+    return fails;
+}

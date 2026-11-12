@@ -1,0 +1,250 @@
+// websocket: sending in fragments (beginMessage / sendFragment / endMessage, setFragmentSize), pings between fragments, receiving into a handler
+// or a stream handler without collecting the message, the message queue limit (backpressure), the output queue limit
+import websocket;
+import encoding;
+
+int fails = 0;
+char* log = null;
+int logLen = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+void logAdd(char* s) {
+    int n = strlen(s);
+    memcpy(&log[logLen], s, n);
+    logLen = logLen + n;
+    log[logLen] = 0;
+}
+
+char* hexOut(websocket.WebSocket* w) {
+    int n = w->outPending();
+    char* h = encoding.hexEncode(w->outData(), n);
+    w->outConsumed(n);
+    return h;
+}
+
+int move(websocket.WebSocket* a, websocket.WebSocket* b) {
+    int n = a->outPending();
+    if (n == 0) return 0;
+    int r = b->feed(a->outData(), n);
+    a->outConsumed(n);
+    return r;
+}
+
+// handlers
+int onEvent(websocket.WebSocket* w, int event, int op, char* data, int n) {
+    char tmp[100];
+    if (event == websocket.EV_MESSAGE) {
+        char* copy = alloc(n + 1);
+        memcpy(copy, data, n);
+        format(&tmp[0], 100, "[msg %d:%s]", op, copy);
+        logAdd(&tmp[0]);
+    } else if (event == websocket.EV_PING) {
+        char* copy = alloc(n + 1);
+        memcpy(copy, data, n);
+        format(&tmp[0], 100, "[ping:%s]", copy);
+        logAdd(&tmp[0]);
+    } else if (event == websocket.EV_PONG) {
+        logAdd("[pong]");
+    } else if (event == websocket.EV_CLOSE) {
+        format(&tmp[0], 100, "[close %d]", w->closeCode);
+        logAdd(&tmp[0]);
+    }
+    return 0;
+}
+
+bool logging = true;
+int pieceCount = 0;
+
+int onPiece(websocket.WebSocket* w, int op, char* data, int n, int flags) {
+    pieceCount++;
+    if (!logging) return 0;
+    char tmp[100];
+    char* copy = alloc(n + 1);
+    memcpy(copy, data, n);
+    format(&tmp[0], 100, "[%d/%d:%s]", op, flags, copy);
+    logAdd(&tmp[0]);
+    return 0;
+}
+
+int main() {
+    log = alloc(4000);
+    // --- sending in pieces (a server: unmasked frames)
+    websocket.WebSocket* s = websocket.create(null, false);
+    check("begin", s->beginMessage(websocket.OP_BINARY));
+    check("a second begin is refused", !s->beginMessage(websocket.OP_TEXT));
+    check("sendText during a message is refused", !s->sendText("x") && !s->sendBinary("x", 1));
+    check("fragment 1", s->sendFragment("ab", 2));
+    check("a ping may go between the fragments", s->pingWith("p", 1));
+    check("fragment 2", s->sendFragment("cd", 2));
+    check("an empty fragment is fine", s->sendFragment("", 0));
+    check("end", s->endMessage());
+    check("the frames", streq(hexOut(s), "02026162" "890170" "00026364" "0000" "8000"));
+    check("a new message may start", s->beginMessage(websocket.OP_TEXT) && s->endMessage() && streq(hexOut(s), "8100"));
+    check("sendFragment without begin is refused", !s->sendFragment("x", 1) && !s->endMessage());
+    check("only text and binary can begin", !s->beginMessage(websocket.OP_PING) && !s->beginMessage(websocket.OP_CONT) && !s->beginMessage(websocket.OP_CLOSE));
+    // a client receives them
+    websocket.WebSocket* c = websocket.create(null, true);
+    s->beginMessage(websocket.OP_BINARY); s->sendFragment("ab", 2); s->pingWith("p", 1); s->sendFragment("cd", 2); s->endMessage();
+    move(s, c);
+    websocket.Message* m = c->takeMessage();
+    check("the client assembles the pieces", m != null && m->length == 4 && streq(m->data, "abcd") && m->opcode == 2);
+    m->dispose();
+    check("and answered the ping between them", c->outPending() > 0);
+    c->outConsumed(c->outPending());
+
+    // --- automatic fragmentation
+    s->setFragmentSize(4);
+    s->sendBinary("0123456789", 10);
+    check("a message of 10 bytes in fragments of 4", streq(hexOut(s), "0204" "30313233" "0004" "34353637" "8002" "3839"));
+    s->sendBinary("abcd", 4);
+    check("a message that fits is one frame", streq(hexOut(s), "8204" "61626364"));
+    s->sendText("abcdefgh");
+    check("text fragments", streq(hexOut(s), "0104" "61626364" "8004" "65666768"));
+    s->setFragmentSize(0);
+    s->dispose();
+    c->dispose();
+
+    // --- a handler: no queue, data valid during the call
+    c = websocket.create(null, true);
+    s = websocket.create(null, false);
+    c->setHandler(onEvent);
+    s->sendText("one");
+    s->sendBinary("two", 3);
+    s->pingWith("hi", 2);
+    s->beginMessage(websocket.OP_TEXT); s->sendFragment("th", 2); s->sendFragment("ree", 3); s->endMessage();
+    s->pong("x", 1);
+    s->closeWith(1001, "away");
+    move(s, c);
+    check("the handler sees everything in order", streq(log, "[msg 1:one][msg 2:two][ping:hi][msg 1:three][pong][close 1001]"));
+    check("nothing is queued for takeMessage", c->takeMessage() == null);
+    c->dispose();
+    s->dispose();
+
+    // --- the stream handler: pieces arrive as the frames do, nothing is collected
+    logLen = 0; log[0] = 0;
+    c = websocket.create(null, true);
+    s = websocket.create(null, false);
+    c->setStreamHandler(onPiece);
+    s->beginMessage(websocket.OP_TEXT);
+    s->sendFragment("Hel", 3);
+    s->sendFragment("lo ", 3);
+    s->sendFragment("world", 5);
+    s->endMessage();
+    s->sendBinary("", 0);
+    move(s, c);
+    check("pieces with first/last flags", streq(log, "[1/1:Hel][1/0:lo ][1/0:world][1/2:][2/3:]"));
+    check("no buffer was built", c->mBuf == null && c->takeMessage() == null);
+    // a big message is streamed without memory growth
+    logging = false;
+    char* big = alloc(200000);
+    for (int i = 0; i < 200000; i++) big[i] = 'a';
+    char* frame = alloc(200100);
+    int fl = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 200000, frame);
+    int off = 0;
+    int pieces = 0;
+    while (off < fl) {
+        int take = fl - off;
+        if (take > 3000) take = 3000;
+        c->feed(&frame[off], take);
+        off = off + take;
+        pieces++;
+    }
+    check("200000 bytes streamed in 200 pieces, still no buffer", c->mBuf == null && c->mCap == 0 && c->messagesIn == 3 && pieceCount > 190);
+    c->dispose();
+    s->dispose();
+
+    // --- the message queue: feed stops taking bytes when it is full
+    c = websocket.create(null, true);
+    s = websocket.create(null, false);
+    c->maxQueue = 2;
+    for (int i = 0; i < 5; i++) {
+        char t[8];
+        format(&t[0], 8, "m%d", i);
+        s->sendText(&t[0]);
+    }
+    int total = s->outPending();
+    char* all = alloc(total);
+    memcpy(all, s->outData(), total);
+    int pos = 0;
+    int rounds = 0;
+    int got = 0;
+    char order[40];
+    order[0] = 0;
+    while (pos < total && rounds < 20) {
+        int r = c->feed(&all[pos], total - pos);
+        pos = pos + r;
+        check("feed takes some bytes", r >= 0);
+        m = c->takeMessage();
+        while (m != null) {
+            strcat(&order[0], m->data);
+            got++;
+            m->dispose();
+            m = c->takeMessage();
+        }
+        rounds++;
+    }
+    check("five messages, queue of two: all arrive in order", got == 5 && streq(&order[0], "m0m1m2m3m4") && pos == total);
+    check("it took several feed calls", rounds >= 3);
+    c->dispose();
+    s->dispose();
+
+    // --- limits of an assembled message
+    c = websocket.create(null, true);
+    c->maxMessage = 1000;
+    c->maxFrame = 1000;
+    fl = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 1000, frame);
+    check("a message of exactly maxMessage is fine", c->feed(frame, fl) == fl && c->takeMessage() != null);
+    fl = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 1001, frame);
+    check("one byte more ends the connection", c->feed(frame, fl) == -1 && c->localCloseCode == 1009);
+    c->dispose();
+
+    // --- a big message frees its buffer afterwards
+    c = websocket.create(null, true);
+    fl = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big, 200000, frame);
+    c->feed(frame, fl);
+    m = c->takeMessage();
+    check("200000 bytes assembled", m != null && m->length == 200000);
+    m->dispose();
+    check("the assembly buffer is kept for small messages", c->mCap > 0 && c->mCap <= 262144);
+    char* big2 = alloc(300000);
+    char* frame2 = alloc(300100);
+    fl = websocket.buildFrame(websocket.OP_BINARY, true, false, 0, big2, 300000, frame2);
+    c->feed(frame2, fl);
+    m = c->takeMessage();
+    m->dispose();
+    check("but not after a very big one", c->mBuf == null && c->mCap == 0);
+    c->dispose();
+
+    // --- the output queue limit
+    s = websocket.create(null, false);
+    s->maxOutBuffer = 100;
+    check("50 bytes fit", s->sendBinary(big, 50) && s->outPending() == 52);
+    check("another 50 do not (52 + 52 > 100)", !s->sendBinary(big, 50) && s->overflowed && s->outPending() == 52);
+    check("a ping goes anyway", s->pingWith("x", 1));
+    check("a close frame goes anyway", s->closeWith(1000, "full") && s->outPending() > 52);
+    s->dispose();
+    s = websocket.create(null, false);
+    s->maxOutBuffer = 100;
+    check("one message over the limit is refused even when the queue is empty", !s->sendBinary(big, 99) && s->overflowed && s->outPending() == 0);
+    s->overflowed = false;
+    check("after the queue is drained the next send works", s->sendBinary(big, 50) && !s->overflowed);
+    s->outConsumed(s->outPending());
+    check("and again", s->sendBinary(big, 50) && s->outPending() == 52);
+    s->dispose();
+    // an atomic fragmented send: all or nothing
+    s = websocket.create(null, false);
+    s->maxOutBuffer = 100;
+    s->setFragmentSize(10);
+    check("a fragmented message that does not fit is not queued at all", !s->sendBinary(big, 95) && s->outPending() == 0);
+    s->dispose();
+    printf("failures: %d\n", fails);
+    return fails;
+}
