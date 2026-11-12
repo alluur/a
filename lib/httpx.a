@@ -1644,3 +1644,1470 @@ public bool loadFileBody(Response* res) {
     b[got] = 0;
     return got > 0 || true;
 }
+
+// ---- URLs -----------------------------------------------------------------------------------------------------------------------------------------------
+// a URL taken apart
+public class Url {
+    public char scheme[8];          // "http" or "https"
+    public char host[256];
+    public int port;
+    public char path[2048];         // with the query, always starts with /
+    public bool ok;
+
+    public bool isSecure() { return streq(&scheme[0], "https"); }
+}
+
+// splits an absolute http:// or https:// URL; false if it is not one (or something is too long). A fragment (#...) is dropped
+public bool parseUrl(char* s, Url* u) {
+    int i = 0;
+    if (startsWith(s, "http://")) { strcpy(&u->scheme[0], "http"); u->port = 80; i = 7; }
+    else if (startsWith(s, "https://")) { strcpy(&u->scheme[0], "https"); u->port = 443; i = 8; }
+    else return false;
+    // user info is not supported
+    int k = 0;
+    while (s[i] != 0 && s[i] != '/' && s[i] != ':' && s[i] != '?' && s[i] != '#' && k < 255) {
+        int c = s[i] & 255;
+        if (c <= 32 || c == '@') return false;
+        u->host[k] = toLower(c);
+        k++;
+        i++;
+    }
+    u->host[k] = 0;
+    if (k == 0) return false;
+    if (s[i] == ':') {
+        i++;
+        int p = 0;
+        int d = 0;
+        while (isDigit(s[i])) { p = p * 10 + (s[i] - '0'); i++; d++; if (p > 65535) return false; }
+        if (d == 0 || p == 0) return false;
+        u->port = p;
+    }
+    k = 0;
+    if (s[i] != '/') { u->path[0] = '/'; k = 1; }
+    while (s[i] != 0 && s[i] != '#' && k < 2047) {
+        int c = s[i] & 255;
+        if (c <= 32 || c == 127) return false;
+        u->path[k] = c;
+        k++;
+        i++;
+    }
+    if (s[i] != 0 && s[i] != '#') return false;
+    u->path[k] = 0;
+    u->ok = true;
+    return true;
+}
+
+// resolves a Location (absolute URL, //host/path, /path, relative path, ?query) against the URL of the request. A heap string, null if it cannot be done
+public char* resolveUrl(char* base, char* ref) {
+    if (startsWith(ref, "http://") || startsWith(ref, "https://")) return dupStr(ref);
+    Url u;
+    if (!parseUrl(base, &u)) return null;
+    int cap = strlen(ref) + strlen(base) + 40;
+    char* out = malloc(cap);
+    if (out == null) return null;
+    char* path;
+    if (startsWith(ref, "//")) {
+        format(out, cap, "%s:%s", &u.scheme[0], ref);
+        return out;
+    }
+    char hostPort[300];
+    bool defPort = (u.isSecure() && u.port == 443) || (!u.isSecure() && u.port == 80);
+    if (defPort) format(&hostPort[0], 300, "%s://%s", &u.scheme[0], &u.host[0]);
+    else format(&hostPort[0], 300, "%s://%s:%d", &u.scheme[0], &u.host[0], u.port);
+    // the path to resolve against: the directory of the base path
+    char dir[2100];
+    int pq = 0;
+    while (u.path[pq] != 0 && u.path[pq] != '?') pq++;
+    memcpy(&dir[0], &u.path[0], pq);
+    dir[pq] = 0;
+    if (ref[0] == 0) {
+        format(out, cap, "%s%s", &hostPort[0], &u.path[0]);
+        return out;
+    }
+    if (ref[0] == '?') {
+        format(out, cap, "%s%s%s", &hostPort[0], &dir[0], ref);
+        return out;
+    }
+    char merged[4200];
+    if (ref[0] == '/') {
+        strcpy(&merged[0], ref);
+    } else {
+        int slash = pq;
+        while (slash > 0 && dir[slash - 1] != '/') slash--;
+        memcpy(&merged[0], &dir[0], slash);
+        merged[slash] = 0;
+        strcat(&merged[0], ref);
+    }
+    // remove . and .. segments (RFC 3986 5.2.4)
+    char result[4200];
+    int ro = 0;
+    int i = 0;
+    int ml = strlen(&merged[0]);
+    while (i < ml && merged[i] != '?') {
+        // a segment starts at i (merged[i] == '/')
+        int s = i + 1;
+        int e = s;
+        while (e < ml && merged[e] != '/' && merged[e] != '?') e++;
+        int sl = e - s;
+        if (sl == 2 && merged[s] == '.' && merged[s + 1] == '.') {
+            while (ro > 0 && result[ro - 1] != '/') ro--;
+            if (ro > 0) ro--;
+            if (e >= ml || merged[e] == '?') { result[ro] = '/'; ro++; }
+        } else if (sl == 1 && merged[s] == '.') {
+            if (e >= ml || merged[e] == '?') { result[ro] = '/'; ro++; }
+        } else {
+            result[ro] = '/';
+            ro++;
+            memcpy(&result[ro], &merged[s], sl);
+            ro = ro + sl;
+        }
+        i = e;
+    }
+    if (ro == 0) { result[0] = '/'; ro = 1; }
+    result[ro] = 0;
+    strcat(&result[0], &merged[i]);
+    format(out, cap, "%s%s", &hostPort[0], &result[0]);
+    return out;
+}
+
+// ---- cookies ----------------------------------------------------------------------------------------------------------------------------------------------
+public class Cookie {
+    public char* name;
+    public char* value;
+    public char* domain;            // lower case, without a leading dot
+    public char* path;
+    public int expires;             // seconds since 1970, 0: a session cookie
+    public bool secure;
+    public bool httpOnly;
+    public int sameSite;            // 0 none given, 1 Lax, 2 Strict, 3 None
+    public bool hostOnly;           // sent to exactly that host (no Domain attribute)
+    public int created;
+}
+
+// A cookie jar after RFC 6265: Set-Cookie parsing (Domain, Path, Expires, Max-Age, Secure, HttpOnly, SameSite, the __Secure- and __Host- prefixes),
+// domain and path matching, expiry, at most 50 cookies per host and 256 in all (the oldest go first)
+public class CookieJar {
+    public Cookie* items[256];
+    public int n;
+    public int clock;               // a counter that orders the cookies by creation
+
+    // the number of cookies (expired ones are removed first)
+    public int count(int nowSecs) {
+        purge(nowSecs);
+        return n;
+    }
+
+    private void drop(int i) {
+        Cookie* c = items[i];
+        free(c->name); free(c->value); free(c->domain); free(c->path);
+        free(c);
+        items[i] = items[n - 1];
+        n--;
+    }
+
+    // removes the cookies that are expired at nowSecs
+    public void purge(int nowSecs) {
+        int i = 0;
+        while (i < n) {
+            if (items[i]->expires != 0 && items[i]->expires <= nowSecs) drop(i); else i++;
+        }
+    }
+
+    public void clear() {
+        while (n > 0) drop(n - 1);
+    }
+
+    private bool domainMatches(char* host, char* domain) {
+        if (streq(host, domain)) return true;
+        int hl = strlen(host);
+        int dl = strlen(domain);
+        if (hl <= dl) return false;
+        if (host[hl - dl - 1] != '.') return false;
+        if (!streq(&host[hl - dl], domain)) return false;
+        // an IP address only matches itself
+        bool ip = true;
+        for (int i = 0; i < hl; i++) if (!isDigit(host[i]) && host[i] != '.') ip = false;
+        return !ip;
+    }
+
+    private bool pathMatches(char* reqPath, char* cpath) {
+        int cl = strlen(cpath);
+        if (!startsWith(reqPath, cpath)) return false;
+        if (strlen(reqPath) == cl) return true;
+        if (cpath[cl - 1] == '/') return true;
+        return reqPath[cl] == '/';
+    }
+
+    // Stores a cookie from the value of a Set-Cookie header that the server of `host` sent for a request to `path` (secure: the request was https).
+    // Returns false if the cookie was refused (bad syntax, a Domain that does not match the host, a Secure cookie over plain http, a bad prefix) or
+    // deleted by an expiry in the past.
+    public bool store(char* setCookie, char* host, char* path, bool secure, int nowSecs) {
+        int len = strlen(setCookie);
+        if (len > 4096 + 1024) return false;
+        // name=value
+        int i = 0;
+        int semi = 0;
+        while (semi < len && setCookie[semi] != ';') semi++;
+        int eq = 0;
+        while (eq < semi && setCookie[eq] != '=') eq++;
+        if (eq >= semi) return false;
+        int ns = 0;
+        int ne = eq;
+        while (ns < ne && (setCookie[ns] == ' ' || setCookie[ns] == 9)) ns++;
+        while (ne > ns && (setCookie[ne - 1] == ' ' || setCookie[ne - 1] == 9)) ne--;
+        int vs = eq + 1;
+        int ve = semi;
+        while (vs < ve && (setCookie[vs] == ' ' || setCookie[vs] == 9)) vs++;
+        while (ve > vs && (setCookie[ve - 1] == ' ' || setCookie[ve - 1] == 9)) ve--;
+        if (ne <= ns || ne - ns + ve - vs > 4096) return false;
+        for (int k = ns; k < ne; k++) if (!isTokenChar(setCookie[k] & 255)) return false;
+        for (int k = vs; k < ve; k++) { int c = setCookie[k] & 255; if (c < 32 || c == 127 || c == ';') return false; }
+        char* name = dupN(&setCookie[ns], ne - ns);
+        char* value = dupN(&setCookie[vs], ve - vs);
+        char* domain = null;
+        char* cpath = null;
+        int expires = 0;
+        bool hasMaxAge = false;
+        int maxAge = 0;
+        bool cSecure = false;
+        bool httpOnly = false;
+        int sameSite = 0;
+        i = semi;
+        while (i < len) {
+            i++;                                              // the ;
+            while (i < len && (setCookie[i] == ' ' || setCookie[i] == 9)) i++;
+            int as = i;
+            while (i < len && setCookie[i] != ';' && setCookie[i] != '=') i++;
+            int ae = i;
+            while (ae > as && (setCookie[ae - 1] == ' ' || setCookie[ae - 1] == 9)) ae--;
+            char* aval = "";
+            char* avalHeap = null;
+            if (i < len && setCookie[i] == '=') {
+                i++;
+                int s2 = i;
+                while (i < len && setCookie[i] != ';') i++;
+                int e2 = i;
+                while (s2 < e2 && (setCookie[s2] == ' ' || setCookie[s2] == 9)) s2++;
+                while (e2 > s2 && (setCookie[e2 - 1] == ' ' || setCookie[e2 - 1] == 9)) e2--;
+                avalHeap = dupN(&setCookie[s2], e2 - s2);
+                aval = avalHeap;
+            }
+            char* an = dupN(&setCookie[as], ae - as);
+            if (nameIs(an, "Domain")) {
+                char* d = aval;
+                if (d[0] == '.') d = &d[1];
+                if (domain != null) free(domain);
+                domain = dupStr(d);
+                for (int k = 0; domain[k] != 0; k++) domain[k] = toLower(domain[k]);
+            } else if (nameIs(an, "Path")) {
+                if (aval[0] == '/') { if (cpath != null) free(cpath); cpath = dupStr(aval); }
+            } else if (nameIs(an, "Expires")) {
+                int t = parseHttpDate(aval);
+                if (t >= 0) expires = t;
+                else if (t < 0) expires = 0;
+            } else if (nameIs(an, "Max-Age")) {
+                bool neg = aval[0] == '-';
+                int k = neg ? 1 : 0;
+                bool digits = aval[k] != 0;
+                int v = 0;
+                for (; aval[k] != 0; k++) { if (!isDigit(aval[k])) digits = false; else if (v < 1000000000) v = v * 10 + (aval[k] - '0'); }
+                if (digits) { hasMaxAge = true; maxAge = neg ? -v : v; }
+            } else if (nameIs(an, "Secure")) {
+                cSecure = true;
+            } else if (nameIs(an, "HttpOnly")) {
+                httpOnly = true;
+            } else if (nameIs(an, "SameSite")) {
+                if (nameIs(aval, "Lax")) sameSite = 1;
+                else if (nameIs(aval, "Strict")) sameSite = 2;
+                else if (nameIs(aval, "None")) sameSite = 3;
+            }
+            free(an);
+            if (avalHeap != null) free(avalHeap);
+        }
+        if (hasMaxAge) {
+            expires = maxAge <= 0 ? 1 : nowSecs + maxAge;         // a Max-Age of 0 or less expires it at once
+        }
+        // the checks
+        bool refuse = false;
+        char lowHost[256];
+        int hl = strlen(host);
+        if (hl > 255) hl = 255;
+        for (int k = 0; k < hl; k++) lowHost[k] = toLower(host[k]);
+        lowHost[hl] = 0;
+        bool hostOnly = true;
+        if (domain != null && domain[0] != 0) {
+            // must be the host or a parent of it, and not a bare top-level name ("com")
+            if (!domainMatches(&lowHost[0], domain) || indexOf(domain, '.') < 0) refuse = true;
+            hostOnly = false;
+        } else {
+            if (domain != null) free(domain);
+            domain = dupStr(&lowHost[0]);
+        }
+        if (cSecure && !secure) refuse = true;                    // a Secure cookie needs a secure connection
+        if (startsWith(name, "__Secure-") && !cSecure) refuse = true;
+        if (startsWith(name, "__Host-") && (!cSecure || !hostOnly || cpath == null || !streq(cpath, "/"))) refuse = true;
+        if (cpath == null) {
+            // the default path: the directory of the request path
+            int pl = strlen(path);
+            int e = pl;
+            for (int k = 0; k < pl; k++) if (path[k] == '?') { e = k; break; }
+            while (e > 0 && path[e - 1] != '/') e--;
+            if (e <= 1) cpath = dupStr("/"); else cpath = dupN(path, e - 1);
+        }
+        if (refuse) {
+            free(name); free(value); free(domain); free(cpath);
+            return false;
+        }
+        // replace a cookie with the same name, domain and path
+        for (int k = 0; k < n; k++) {
+            Cookie* c = items[k];
+            if (streq(c->name, name) && streq(c->domain, domain) && streq(c->path, cpath)) {
+                drop(k);
+                break;
+            }
+        }
+        if (expires != 0 && expires <= nowSecs) {
+            free(name); free(value); free(domain); free(cpath);
+            return false;                                         // an expired cookie deletes the old one and is not kept
+        }
+        // room: at most 50 per domain, 256 in all: the oldest go
+        int same = 0;
+        int oldest = -1;
+        for (int k = 0; k < n; k++) {
+            if (streq(items[k]->domain, domain)) {
+                same++;
+                if (oldest < 0 || items[k]->created < items[oldest]->created) oldest = k;
+            }
+        }
+        if (same >= 50 && oldest >= 0) drop(oldest);
+        if (n >= 256) {
+            int o2 = 0;
+            for (int k = 1; k < n; k++) if (items[k]->created < items[o2]->created) o2 = k;
+            drop(o2);
+        }
+        Cookie* c = (Cookie*) malloc(sizeof(Cookie));
+        c->name = name; c->value = value; c->domain = domain; c->path = cpath;
+        c->expires = expires; c->secure = cSecure; c->httpOnly = httpOnly; c->sameSite = sameSite;
+        c->hostOnly = hostOnly;
+        clock++;
+        c->created = clock;
+        items[n] = c;
+        n++;
+        return true;
+    }
+
+    // The value of the Cookie header for a request (a heap string), or null when no cookie applies. secure: the request is https; crossSite: the
+    // request follows a redirect to another site (SameSite=Strict cookies stay at home then)
+    public char* header(char* host, char* path, bool secure, bool crossSite, int nowSecs) {
+        purge(nowSecs);
+        char lowHost[256];
+        int hl = strlen(host);
+        if (hl > 255) hl = 255;
+        for (int k = 0; k < hl; k++) lowHost[k] = toLower(host[k]);
+        lowHost[hl] = 0;
+        char rpath[2100];
+        int pl = 0;
+        while (path[pl] != 0 && path[pl] != '?' && pl < 2095) { rpath[pl] = path[pl]; pl++; }
+        rpath[pl] = 0;
+        int pick[256];
+        int np = 0;
+        for (int i = 0; i < n; i++) {
+            Cookie* c = items[i];
+            if (c->hostOnly ? !streq(&lowHost[0], c->domain) : !domainMatches(&lowHost[0], c->domain)) continue;
+            if (!pathMatches(&rpath[0], c->path)) continue;
+            if (c->secure && !secure) continue;
+            if (c->sameSite == 2 && crossSite) continue;
+            pick[np] = i;
+            np++;
+        }
+        if (np == 0) return null;
+        // longer paths first, then the older ones
+        for (int a = 1; a < np; a++) {
+            int v = pick[a];
+            int b = a - 1;
+            while (b >= 0 && (strlen(items[pick[b]]->path) < strlen(items[v]->path)
+                || (strlen(items[pick[b]]->path) == strlen(items[v]->path) && items[pick[b]]->created > items[v]->created))) {
+                pick[b + 1] = pick[b];
+                b--;
+            }
+            pick[b + 1] = v;
+        }
+        int cap = 16;
+        for (int a = 0; a < np; a++) cap = cap + strlen(items[pick[a]]->name) + strlen(items[pick[a]]->value) + 4;
+        char* out = malloc(cap);
+        out[0] = 0;
+        for (int a = 0; a < np; a++) {
+            if (a > 0) strcat(out, "; ");
+            strcat(out, items[pick[a]]->name);
+            strcat(out, "=");
+            strcat(out, items[pick[a]]->value);
+        }
+        return out;
+    }
+
+    // the cookie with that name that would be sent to host + path (a pointer into the jar), or null
+    public Cookie* find(char* name, char* host) {
+        for (int i = 0; i < n; i++) {
+            if (streq(items[i]->name, name) && (items[i]->hostOnly ? streq(items[i]->domain, host) : domainMatches(host, items[i]->domain))) return items[i];
+        }
+        return null;
+    }
+}
+
+// ---- multipart/form-data (RFC 7578) -----------------------------------------------------------------------------------------------------------------------
+// builds the body of a form with fields and files
+public class Multipart {
+    public char boundary[48];
+    public char* buf;
+    public int len;
+    public int cap;
+    public int parts;
+    public bool closed;
+
+    public Multipart() {
+        char r[12];
+        if (!secure.bytes(&r[0], 12)) for (int i = 0; i < 12; i++) r[i] = rand() & 255;
+        strcpy(&boundary[0], "----AFormBoundary");
+        int o = strlen(&boundary[0]);
+        for (int i = 0; i < 12; i++) {
+            boundary[o + i] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[(r[i] & 255) % 62];
+        }
+        boundary[o + 12] = 0;
+    }
+
+    private void add(char* s, int n) {
+        if (len + n + 8 > cap) {
+            int nc = cap * 2;
+            if (nc < 512) nc = 512;
+            while (nc < len + n + 8) nc = nc * 2;
+            buf = realloc(buf, nc);
+            cap = nc;
+        }
+        memcpy(&buf[len], s, n);
+        len = len + n;
+    }
+
+    private void addText(char* s) { add(s, strlen(s)); }
+
+    // a header value in quotes: " becomes %22, CR %0D, LF %0A (as browsers do)
+    private void addQuoted(char* s) {
+        addText("\"");
+        for (int i = 0; s[i] != 0; i++) {
+            int c = s[i] & 255;
+            if (c == '"') addText("%22");
+            else if (c == 13) addText("%0D");
+            else if (c == 10) addText("%0A");
+            else { char ch = c; add(&ch, 1); }
+        }
+        addText("\"");
+    }
+
+    private void startPart(char* name) {
+        addText("--");
+        addText(&boundary[0]);
+        addText("\r\nContent-Disposition: form-data; name=");
+        addQuoted(name);
+        parts++;
+    }
+
+    // a text field
+    public bool addField(char* name, char* value) {
+        if (closed) return false;
+        startPart(name);
+        addText("\r\n\r\n");
+        addText(value);
+        addText("\r\n");
+        return true;
+    }
+
+    // a file from memory; contentType may be null (application/octet-stream)
+    public bool addFile(char* name, char* filename, char* contentType, char* data, int n) {
+        if (closed) return false;
+        if (contentType != null && !cleanValue(contentType)) return false;
+        startPart(name);
+        addText("; filename=");
+        addQuoted(filename);
+        addText("\r\nContent-Type: ");
+        addText(contentType == null ? "application/octet-stream" : contentType);
+        addText("\r\n\r\n");
+        add(data, n);
+        addText("\r\n");
+        return true;
+    }
+
+    // a file from disk (read completely); false if it cannot be read
+    public bool addFilePath(char* name, char* path, char* contentType) {
+        asys.Stat st;
+        if (asys.stat(path, &st) < 0 || !st.isFile()) return false;
+        int fd = asys.fileOpen(path, asys.F_READ);
+        if (fd < 0) return false;
+        char* data = malloc(st.size + 1);
+        int got = 0;
+        while (got < st.size) {
+            int r = asys.fileRead(fd, &data[got], st.size - got);
+            if (r <= 0) break;
+            got = got + r;
+        }
+        asys.fileClose(fd);
+        int slash = strlen(path);
+        while (slash > 0 && path[slash - 1] != '/' && path[slash - 1] != '\\') slash--;
+        bool ok = addFile(name, &path[slash], contentType == null ? http.mimeType(path) : contentType, data, got);
+        free(data);
+        return ok;
+    }
+
+    // the Content-Type header value
+    public char* contentType() {
+        char* r = malloc(80);
+        format(r, 80, "multipart/form-data; boundary=%s", &boundary[0]);
+        return r;
+    }
+
+    // the finished body (the closing boundary is added once); *n gets its length. The memory belongs to the Multipart
+    public char* body(int* n) {
+        if (!closed) {
+            addText("--");
+            addText(&boundary[0]);
+            addText("--\r\n");
+            closed = true;
+        }
+        *n = len;
+        return buf;
+    }
+
+    public void dispose() {
+        if (buf != null) free(buf);
+        buf = null;
+        len = 0;
+        cap = 0;
+    }
+}
+
+// one part of a parsed form
+public class Part {
+    public char* name;
+    public char* filename;          // null for a plain field
+    public char* contentType;       // "" if the part had none
+    public char* data;              // followed by a 0 byte
+    public int length;
+}
+
+private void freePart(Part* p) {
+    if (p->name != null) free(p->name);
+    if (p->filename != null) free(p->filename);
+    if (p->contentType != null) free(p->contentType);
+    if (p->data != null) free(p->data);
+    free(p);
+}
+
+// frees the parts that parseMultipart returned
+public void freeParts(Part** parts, int n) {
+    for (int i = 0; i < n; i++) freePart(parts[i]);
+}
+
+// the value of a parameter in a header like  form-data; name="a"; filename="b.txt"  (copy into out); false if there is none
+private bool paramOf(char* h, char* name, char* out, int max) {
+    int nl = strlen(name);
+    int i = 0;
+    while (h[i] != 0) {
+        // a parameter starts after ';' or at the beginning
+        while (h[i] == ' ' || h[i] == ';' || h[i] == 9) i++;
+        int s = i;
+        while (h[i] != 0 && h[i] != '=' && h[i] != ';') i++;
+        int e = i;
+        while (e > s && h[e - 1] == ' ') e--;
+        bool match = (e - s == nl) && strncasecmpN(&h[s], name, nl);
+        if (h[i] == '=') {
+            i++;
+            int o = 0;
+            if (h[i] == '"') {
+                i++;
+                while (h[i] != 0 && h[i] != '"') {
+                    if (h[i] == '\\' && h[i + 1] != 0) i++;
+                    if (o + 1 < max) { out[o] = h[i]; o++; }
+                    i++;
+                }
+                if (h[i] == '"') i++;
+            } else {
+                while (h[i] != 0 && h[i] != ';' && h[i] != ' ') {
+                    if (o + 1 < max) { out[o] = h[i]; o++; }
+                    i++;
+                }
+            }
+            out[o] = 0;
+            if (match) return true;
+        } else if (match) {
+            out[0] = 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+private bool strncasecmpN(char* a, char* b, int n) {
+    for (int i = 0; i < n; i++) if (toLower(a[i]) != toLower(b[i])) return false;
+    return true;
+}
+
+// Parses a multipart/form-data body. contentType is the Content-Type header value (it carries the boundary). Fills out with up to max parts (free them with
+// freeParts); returns how many parts there are, or -1 if the body is not valid multipart data. Limits: 8 KB of headers per part and `max` parts.
+public int parseMultipart(char* contentType, char* body, int n, Part** out, int max) {
+    char boundary[100];
+    if (!startsWith(contentType, "multipart/") && !startsWith(contentType, "Multipart/")) return -1;
+    if (!paramOf(contentType, "boundary", &boundary[0], 100) || boundary[0] == 0 || strlen(&boundary[0]) > 70) return -1;
+    int bl = strlen(&boundary[0]);
+    // the delimiter is  --boundary ; after the first one every delimiter is preceded by CRLF
+    int pos = 0;
+    int found = -1;
+    // find the first delimiter
+    for (int i = 0; i + 2 + bl <= n; i++) {
+        if (body[i] == '-' && body[i + 1] == '-' && memcmp(&body[i + 2], &boundary[0], bl) == 0 && (i == 0 || body[i - 1] == 10)) { found = i; break; }
+    }
+    if (found < 0) return -1;
+    pos = found + 2 + bl;
+    int count = 0;
+    for (;;) {
+        // after a delimiter: "--" ends the data, otherwise spaces and CRLF
+        if (pos + 1 < n && body[pos] == '-' && body[pos + 1] == '-') return count;
+        while (pos < n && (body[pos] == ' ' || body[pos] == 9)) pos++;
+        if (pos + 1 < n && body[pos] == 13 && body[pos + 1] == 10) pos = pos + 2;
+        else if (pos < n && body[pos] == 10) pos++;
+        else { freeParts(out, count); return -1; }
+        // the part headers up to an empty line
+        int hs = pos;
+        int he = -1;
+        for (int i = pos; i + 3 < n && i - pos < 8192; i++) {
+            if (body[i] == 13 && body[i + 1] == 10 && body[i + 2] == 13 && body[i + 3] == 10) { he = i; break; }
+        }
+        if (he < 0) {
+            // a part without headers: the body starts right at an empty line
+            if (pos + 1 < n && body[pos] == 13 && body[pos + 1] == 10) { he = pos - 2; }
+            else { freeParts(out, count); return -1; }
+        }
+        char* hdrText = dupN(&body[hs], he - hs > 0 ? he - hs : 0);
+        int ds = he + 4;
+        if (he < hs) ds = pos + 2;
+        // the end of the data: CRLF --boundary
+        int de = -1;
+        for (int i = ds; i + 4 + bl <= n + 0 && i + 2 + 2 + bl <= n; i++) {
+            if (body[i] == 13 && body[i + 1] == 10 && body[i + 2] == '-' && body[i + 3] == '-' && memcmp(&body[i + 4], &boundary[0], bl) == 0) { de = i; break; }
+        }
+        if (de < 0) { free(hdrText); freeParts(out, count); return -1; }
+        if (count >= max) { free(hdrText); freeParts(out, count); return -1; }
+        Part* p = (Part*) malloc(sizeof(Part));
+        // the headers
+        char nm[300];
+        char fn[300];
+        nm[0] = 0;
+        fn[0] = 0;
+        p->contentType = dupStr("");
+        int hp = 0;
+        int hl2 = strlen(hdrText);
+        bool hasName = false;
+        bool hasFile = false;
+        while (hp < hl2) {
+            int le = hp;
+            while (le < hl2 && hdrText[le] != 13 && hdrText[le] != 10) le++;
+            char* line = dupN(&hdrText[hp], le - hp);
+            if (startsWith(line, "Content-Disposition:") || startsWith(line, "content-disposition:")) {
+                hasName = paramOf(&line[20], "name", &nm[0], 300);
+                hasFile = paramOf(&line[20], "filename", &fn[0], 300);
+            } else if (startsWith(line, "Content-Type:") || startsWith(line, "content-type:")) {
+                char* v = &line[13];
+                while (*v == ' ') v++;
+                free(p->contentType);
+                p->contentType = dupStr(v);
+            }
+            free(line);
+            hp = le;
+            while (hp < hl2 && (hdrText[hp] == 13 || hdrText[hp] == 10)) hp++;
+        }
+        free(hdrText);
+        if (!hasName) { free(p->contentType); free(p); freeParts(out, count); return -1; }
+        p->name = dupStr(&nm[0]);
+        p->filename = hasFile ? dupStr(&fn[0]) : null;
+        p->length = de - ds > 0 ? de - ds : 0;
+        p->data = dupN(&body[ds], p->length);
+        out[count] = p;
+        count++;
+        pos = de + 2 + 2 + bl;
+    }
+    return count;
+}
+
+// ---- the client ---------------------------------------------------------------------------------------------------------------------------------------------
+// an answer
+public class Reply {
+    public int status;
+    public Headers* headers;
+    public char* body;              // the body followed by a 0 byte (null when it was streamed to a callback or a file)
+    public int bodyLen;
+    public char* url;               // the URL that finally answered (after redirects), a heap string
+    public int redirects;           // how many redirects were followed
+    public bool reused;             // the connection was one that an earlier request had used
+    public int bytes;               // body bytes received (also when streamed)
+    public bool heap;
+
+    // the value of a header (case does not matter) or null; valid until dispose()
+    public char* header(char* name) {
+        if (headers == null) return null;
+        return headers->get(name);
+    }
+
+    public void dispose() {
+        if (headers != null) { headers->dispose(); free(headers); }
+        if (body != null) free(body);
+        if (url != null) free(url);
+        headers = null;
+        body = null;
+        url = null;
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+}
+
+// a buffered connection for the client
+class Link {
+    public int fd;
+    public char* buf;
+    public int pos;
+    public int len;
+    public char host[256];
+    public int port;
+    public bool secure;
+    public int uses;
+
+    private int fill() {
+        if (buf == null) buf = malloc(8192);
+        pos = 0;
+        len = 0;
+        int n = net.recv(fd, buf, 8192);
+        if (n <= 0) return n;
+        len = n;
+        return n;
+    }
+
+    public int readByte() {
+        if (pos >= len) {
+            int n = fill();
+            if (n <= 0) return -1;
+        }
+        int c = buf[pos] & 255;
+        pos++;
+        return c;
+    }
+
+    // a line without CR LF; -1 at the end of the connection, -2 when it is longer than max - 1
+    public int readLine(char* out, int max) {
+        int n = 0;
+        for (;;) {
+            int c = readByte();
+            if (c < 0) return (n == 0) ? -1 : -1;
+            if (c == 10) break;
+            if (c == 13) continue;
+            if (n + 1 >= max) return -2;
+            out[n] = c;
+            n++;
+        }
+        out[n] = 0;
+        return n;
+    }
+
+    // up to max bytes that are there (waits for at least one); 0 at the end
+    public int readSome(char* out, int max) {
+        if (pos >= len) {
+            int n = fill();
+            if (n <= 0) return 0;
+        }
+        int k = len - pos;
+        if (k > max) k = max;
+        memcpy(out, &buf[pos], k);
+        pos = pos + k;
+        return k;
+    }
+
+    // bytes that are buffered or ready on the socket without waiting (a reused connection that has some was closed or confused)
+    public bool hasInput() {
+        return pos < len || net.waitReadable(fd, 0);
+    }
+
+    public void close() {
+        if (fd >= 0) net.close(fd);
+        fd = -1;
+        if (buf != null) free(buf);
+        buf = null;
+        pos = 0;
+        len = 0;
+    }
+}
+
+// the state of downloadTo
+class DownloadState {
+    public char* path;
+    public int fd;
+    public bool append;
+    public bool failed;
+}
+
+// An HTTP client. Settings are plain fields; one request at a time per client. https: TLS 1.3 with certificate checks (see docs/TLS.md).
+public class Client {
+    public CookieJar* cookies;      // set one to remember cookies
+    public int maxRedirects;        // default 10; 0: do not follow
+    public bool keepAlive;          // reuse the connection for the next request to the same server (default false)
+    public int connectTimeoutMs;    // connecting (default 5000)
+    public int sendTimeoutMs;       // sending the request (default 15000)
+    public int headerTimeoutMs;     // waiting for the status line and headers (default 15000)
+    public int bodyTimeoutMs;       // waiting for each part of the body (default 15000)
+    public int totalTimeoutMs;      // the whole request including redirects (0: no limit)
+    public int retries;             // extra tries after a failed connection or a 502, 503, 504 or 429 answer (idempotent methods only unless retryAll; default 0)
+    public int retryBackoffMs;      // the pause before the first retry, doubled each time (default 200, at most 5000)
+    public bool retryAll;           // retry POST and PATCH too
+    public bool verify;             // https: check the certificate (default true)
+    public bool decompress;         // ask for gzip / deflate and unpack it (default false)
+    public int maxBody;             // the largest body held in memory (default 64 MiB)
+    public char* userAgent;
+    public Headers* headers;        // sent with every request (Accept-Language, Authorization ...)
+    public int requests;            // how many requests were sent
+    public int connects;            // how many connections were made
+    public func sink;               // internal: sink(user, data, n) for streamed bodies
+    public char* sinkUser;
+    public bool sinkAborted;
+    public int sinkBytes;           // internal: bytes given to the sink (no retry after that)
+    public Link* pool;
+    public int slept;               // milliseconds slept for backoff (for tests)
+
+    public Client() {
+        maxRedirects = 10;
+        connectTimeoutMs = 5000;
+        sendTimeoutMs = 15000;
+        headerTimeoutMs = 15000;
+        bodyTimeoutMs = 15000;
+        retryBackoffMs = 200;
+        verify = true;
+        maxBody = 67108864;
+        userAgent = "A-httpx/1.0";
+        headers = (Headers*) malloc(sizeof(Headers));
+    }
+
+    // ---- the convenience calls
+    public Reply* get(char* url) { return request("GET", url, null, null, 0); }
+    public Reply* head(char* url) { return request("HEAD", url, null, null, 0); }
+    public Reply* del(char* url) { return request("DELETE", url, null, null, 0); }
+
+    public Reply* post(char* url, char* body, int n, char* contentType) { return withBody("POST", url, body, n, contentType); }
+    public Reply* put(char* url, char* body, int n, char* contentType) { return withBody("PUT", url, body, n, contentType); }
+    public Reply* patch(char* url, char* body, int n, char* contentType) { return withBody("PATCH", url, body, n, contentType); }
+    public Reply* postForm(char* url, char* fields) { return withBody("POST", url, fields, strlen(fields), "application/x-www-form-urlencoded"); }
+    public Reply* postJson(char* url, char* json) { return withBody("POST", url, json, strlen(json), "application/json"); }
+
+    private Reply* withBody(char* method, char* url, char* body, int n, char* contentType) {
+        Headers* h = (Headers*) malloc(sizeof(Headers));
+        h->set("Content-Type", contentType);
+        Reply* r = request(method, url, h, body, n);
+        h->dispose();
+        free(h);
+        return r;
+    }
+
+    // a multipart/form-data upload (files and fields)
+    public Reply* postMultipart(char* url, Multipart* m) {
+        int n;
+        char* body = m->body(&n);
+        char* ct = m->contentType();
+        Reply* r = withBody("POST", url, body, n, ct);
+        free(ct);
+        return r;
+    }
+
+    // GET with a Range header (from .. to, inclusive; to < 0: to the end)
+    public Reply* getRange(char* url, int from, int to) {
+        Headers* h = (Headers*) malloc(sizeof(Headers));
+        char v[60];
+        if (to >= 0) format(&v[0], 60, "bytes=%d-%d", from, to); else format(&v[0], 60, "bytes=%d-", from);
+        h->set("Range", &v[0]);
+        Reply* r = request("GET", url, h, null, 0);
+        h->dispose();
+        free(h);
+        return r;
+    }
+
+    // ---- streaming: the body of a 2xx answer goes to cb(user, data, n) in pieces and is never held in memory; return nonzero from cb to stop
+    // (the connection is dropped). The Reply has status and headers, bytes counts what was delivered.
+    public Reply* stream(char* url, func cb, char* user) {
+        sink = cb;
+        sinkUser = user;
+        sinkAborted = false;
+        sinkBytes = 0;
+        bool saved = decompress;
+        decompress = false;
+        Reply* r = request("GET", url, null, null, 0);
+        decompress = saved;
+        sink = null;
+        return r;
+    }
+
+    // downloads a URL into a file without holding it in memory. Returns the HTTP status (200 or 206 mean the file was written), -1 on a failure
+    // (the partial file stays). With resume the download continues at the end of an existing file (Range: bytes=N-).
+    public int downloadTo(char* url, char* path, bool resume, int* written) {
+        int start = 0;
+        asys.Stat st;
+        if (resume && asys.stat(path, &st) >= 0 && st.isFile()) start = st.size;
+        Headers* h = (Headers*) malloc(sizeof(Headers));
+        if (start > 0) {
+            char v[40];
+            format(&v[0], 40, "bytes=%d-", start);
+            h->set("Range", &v[0]);
+        }
+        DownloadState* d = (DownloadState*) malloc(sizeof(DownloadState));
+        d->path = path;
+        d->fd = -1;
+        d->append = start > 0;
+        sink = writeToFile;
+        sinkUser = (char*) d;
+        sinkAborted = false;
+        sinkBytes = 0;
+        bool saved = decompress;
+        decompress = false;
+        Reply* r = request("GET", url, h, null, 0);
+        decompress = saved;
+        sink = null;
+        h->dispose();
+        free(h);
+        int result = -1;
+        if (r != null) {
+            result = r->status;
+            if (written != null) *written = r->bytes;
+            if (r->status == 200 && start > 0 && d->fd >= 0) { /* the server ignored the range: the file was rewritten from the start */ }
+            r->dispose();
+        }
+        if (d->fd >= 0) asys.fileClose(d->fd);
+        if (d->failed) result = -1;
+        free(d);
+        return result;
+    }
+
+    // ---- the general request
+    // method, URL, extra header lines (may be null), body (may be null). Follows redirects (301 302 303 307 308); null on failure: httpx.error() says why
+    public Reply* request(char* method, char* url, Headers* extra, char* body, int bodyLen) {
+        int started = millis();
+        char* cur = dupStr(url);
+        char m[16];
+        if (strlen(method) > 15) { fail("method too long"); free(cur); return null; }
+        strcpy(&m[0], method);
+        char* curBody = body;
+        int curLen = bodyLen;
+        Headers* hdr = copyHeaders(extra);
+        int redirects = 0;
+        bool crossSite = false;
+        Url first;
+        parseUrl(url, &first);
+        for (;;) {
+            Reply* r = attempt(&m[0], cur, hdr, curBody, curLen, crossSite, started);
+            if (r == null) { free(cur); hdr->dispose(); free(hdr); return null; }
+            int st = r->status;
+            char* loc = r->header("Location");
+            bool isRedirect = st == 301 || st == 302 || st == 303 || st == 307 || st == 308;
+            if (!isRedirect || loc == null || maxRedirects <= 0) {
+                r->url = cur;
+                r->redirects = redirects;
+                hdr->dispose();
+                free(hdr);
+                return r;
+            }
+            if (redirects >= maxRedirects) {
+                fail("too many redirects");
+                r->dispose();
+                free(cur); hdr->dispose(); free(hdr);
+                return null;
+            }
+            char* next = resolveUrl(cur, loc);
+            r->dispose();
+            if (next == null) { fail("a redirect to a URL that cannot be followed"); free(cur); hdr->dispose(); free(hdr); return null; }
+            Url nu;
+            if (!parseUrl(next, &nu)) { fail("a redirect to a URL that cannot be followed"); free(next); free(cur); hdr->dispose(); free(hdr); return null; }
+            Url cu;
+            parseUrl(cur, &cu);
+            // the method and the body (RFC 9110 15.4): 303 becomes GET (not HEAD); 301 and 302 turn POST into GET; 307 and 308 keep everything
+            bool toGet = false;
+            if (st == 303 && !streq(&m[0], "HEAD") && !streq(&m[0], "GET")) toGet = true;
+            if ((st == 301 || st == 302) && streq(&m[0], "POST")) toGet = true;
+            if (toGet) {
+                strcpy(&m[0], "GET");
+                curBody = null;
+                curLen = 0;
+                hdr->remove("Content-Type");
+                hdr->remove("Content-Length");
+                hdr->remove("Transfer-Encoding");
+            }
+            // credentials do not follow a redirect to another origin
+            if (!streq(&nu.host[0], &cu.host[0]) || nu.port != cu.port || !streq(&nu.scheme[0], &cu.scheme[0])) {
+                hdr->remove("Authorization");
+                hdr->remove("Cookie");
+                hdr->remove("Proxy-Authorization");
+            }
+            if (!streq(&nu.host[0], &first.host[0])) crossSite = true;
+            free(cur);
+            cur = next;
+            redirects++;
+        }
+        return null;
+    }
+
+    private Headers* copyHeaders(Headers* h) {
+        Headers* c = (Headers*) malloc(sizeof(Headers));
+        if (h != null) {
+            for (int i = 0; i < h->count(); i++) c->add(h->nameAt(i), h->valueAt(i));
+        }
+        return c;
+    }
+
+    // one request with retries
+    private Reply* attempt(char* method, char* url, Headers* hdr, char* body, int bodyLen, bool crossSite, int started) {
+        bool idempotent = streq(method, "GET") || streq(method, "HEAD") || streq(method, "PUT") || streq(method, "DELETE") || streq(method, "OPTIONS");
+        bool canRetry = (idempotent || retryAll);
+        int pause = retryBackoffMs;
+        for (int tries = 0; ; tries++) {
+            Reply* r = once(method, url, hdr, body, bodyLen, crossSite, started);
+            bool failedTry = r == null;
+            bool badStatus = r != null && (r->status == 502 || r->status == 503 || r->status == 504 || r->status == 429);
+            if (!(failedTry || badStatus) || !canRetry || tries >= retries || sinkAborted) return r;
+            if (failedTry && sink != null && sinkBytes > 0) return r;             // part of the body was already delivered: no replay
+            // pause: the server's Retry-After (seconds) if it gave one, else the backoff
+            int wait = pause;
+            if (r != null) {
+                char* ra = r->header("Retry-After");
+                if (ra != null && isDigit(ra[0])) {
+                    int secs = atoi(ra);
+                    if (secs > 5) secs = 5;
+                    wait = secs * 1000;
+                }
+                r->dispose();
+            }
+            if (totalTimeoutMs > 0 && millis() - started + wait >= totalTimeoutMs) {
+                fail("the total time limit was reached while waiting to retry");
+                return null;
+            }
+            sleepMs(wait);
+            slept = slept + wait;
+            pause = pause * 2;
+            if (pause > 5000) pause = 5000;
+        }
+        return null;
+    }
+
+    // the time left for the phase: min(phase limit, the rest of the total limit); < 0 when the total limit has passed
+    private int phaseMs(int phase, int started) {
+        if (totalTimeoutMs <= 0) return phase;
+        int left = totalTimeoutMs - (millis() - started);
+        if (left <= 0) return -1;
+        return phase < left ? phase : left;
+    }
+
+    private void drop() {
+        if (pool != null) {
+            pool->close();
+            free(pool);
+            pool = null;
+        }
+    }
+
+    // closes a connection that is being kept for the next request
+    public void close() { drop(); }
+
+    private Link* connectTo(Url* u, int started) {
+        int ms = phaseMs(connectTimeoutMs, started);
+        if (ms < 0) { fail("the total time limit was reached"); return null; }
+        int fd = net.connectTimeout(&u->host[0], u->port, ms);
+        if (fd < 0) { fail("cannot connect"); return null; }
+        connects++;
+        if (u->isSecure()) {
+            if (!tls.wrap(fd, &u->host[0], verify)) {
+                char* why = tls.lastError();
+                fail(why == null ? "the TLS handshake failed" : why);
+                net.rawClose(fd);
+                return null;
+            }
+        }
+        net.setNoDelay(fd, true);
+        Link* l = (Link*) malloc(sizeof(Link));
+        l->fd = fd;
+        strcpy(&l->host[0], &u->host[0]);
+        l->port = u->port;
+        l->secure = u->isSecure();
+        return l;
+    }
+
+    // one try: connect (or reuse), send, read the answer
+    private Reply* once(char* method, char* url, Headers* hdr, char* body, int bodyLen, bool crossSite, int started) {
+        Url u;
+        if (!parseUrl(url, &u)) { fail("not an http:// or https:// URL"); return null; }
+        if (!cleanValue(method) || indexOf(method, ' ') >= 0) { fail("bad method"); return null; }
+        bool headReq = streq(method, "HEAD");
+        for (int attemptNo = 0; attemptNo < 2; attemptNo++) {
+            bool reused = false;
+            Link* l = null;
+            if (keepAlive && pool != null && pool->fd >= 0 && streq(&pool->host[0], &u.host[0]) && pool->port == u.port && pool->secure == u.isSecure()) {
+                if (pool->hasInput()) {
+                    drop();                                              // the server closed it (or sent something unasked)
+                } else {
+                    l = pool;
+                    reused = true;
+                }
+            } else if (pool != null) {
+                drop();
+            }
+            if (l == null) {
+                l = connectTo(&u, started);
+                if (l == null) return null;
+            }
+            pool = null;
+            requests++;
+            // ---- the request head
+            int hl = 0;
+            int cap = strlen(&u.path[0]) + strlen(&u.host[0]) + 600 + bodyLen / 1000000 + hdr->len + headers->len;
+            char* req = malloc(cap);
+            bool defPort = (u.isSecure() && u.port == 443) || (!u.isSecure() && u.port == 80);
+            if (defPort) format(req, cap, "%s %s HTTP/1.1\r\nHost: %s\r\n", method, &u.path[0], &u.host[0]);
+            else format(req, cap, "%s %s HTTP/1.1\r\nHost: %s:%d\r\n", method, &u.path[0], &u.host[0], u.port);
+            hl = strlen(req);
+            Headers* all = copyHeaders(headers);
+            for (int i = 0; i < hdr->count(); i++) all->set(hdr->nameAt(i), hdr->valueAt(i));
+            if (!all->has("User-Agent") && userAgent != null) all->set("User-Agent", userAgent);
+            if (!all->has("Accept")) all->set("Accept", "*/*");
+            if (decompress && sink == null && !all->has("Accept-Encoding")) all->set("Accept-Encoding", "gzip, deflate");
+            if (cookies != null && !all->has("Cookie")) {
+                char* ch = cookies->header(&u.host[0], &u.path[0], u.isSecure(), crossSite, nowSecs());
+                if (ch != null) { all->set("Cookie", ch); free(ch); }
+            }
+            all->remove("Host");
+            all->remove("Connection");
+            all->remove("Content-Length");
+            all->remove("Transfer-Encoding");
+            for (int i = 0; i < all->count(); i++) {
+                char* nm = all->nameAt(i);
+                char* vl = all->valueAt(i);
+                int need = strlen(nm) + strlen(vl) + 6;
+                if (hl + need + 100 > cap) {
+                    cap = (hl + need + 100) * 2;
+                    req = realloc(req, cap);
+                }
+                format(&req[hl], cap - hl, "%s: %s\r\n", nm, vl);
+                hl = hl + strlen(&req[hl]);
+            }
+            all->dispose();
+            free(all);
+            if (body != null || streq(method, "POST") || streq(method, "PUT") || streq(method, "PATCH")) {
+                format(&req[hl], cap - hl, "Content-Length: %d\r\n", bodyLen);
+                hl = hl + strlen(&req[hl]);
+            }
+            strcpy(&req[hl], keepAlive ? "Connection: keep-alive\r\n\r\n" : "Connection: close\r\n\r\n");
+            hl = hl + strlen(&req[hl]);
+            int sms = phaseMs(sendTimeoutMs, started);
+            if (sms < 0) { free(req); l->close(); free(l); fail("the total time limit was reached"); return null; }
+            net.setTimeout(l->fd, sms);
+            bool sent = net.send(l->fd, req, hl) == hl;
+            free(req);
+            if (sent && body != null && bodyLen > 0) sent = net.send(l->fd, body, bodyLen) == bodyLen;
+            if (!sent) {
+                l->close();
+                free(l);
+                if (reused && attemptNo == 0) continue;                  // a kept connection that had gone stale: once more on a new one
+                fail("sending the request failed");
+                return null;
+            }
+            // ---- the answer
+            Reply* r = readReply(l, headReq, started, reused, &u);
+            if (r == null) {
+                bool noByte = l->uses == 0;
+                l->close();
+                free(l);
+                if (reused && attemptNo == 0 && noByte) continue;
+                return null;
+            }
+            return r;
+        }
+        return null;
+    }
+
+    private int nowSecs() {
+        return asys.nowMs() / 1000;
+    }
+
+    // status line, headers, body; also decides whether the connection stays
+    private Reply* readReply(Link* l, bool headReq, int started, bool reused, Url* u) {
+        int hms = phaseMs(headerTimeoutMs, started);
+        if (hms < 0) { fail("the total time limit was reached"); return null; }
+        net.setTimeout(l->fd, hms);
+        char line[8200];
+        bool http11 = false;
+        Reply* r = (Reply*) malloc(sizeof(Reply));
+        r->heap = true;
+        r->headers = (Headers*) malloc(sizeof(Headers));
+        r->reused = reused;
+        for (;;) {
+            // a status line; 1xx answers are skipped
+            int n = l->readLine(&line[0], 8200);
+            if (n == -1) { fail(l->uses == 0 ? "the connection closed before an answer" : "the answer ended early"); r->dispose(); return null; }
+            if (n < 0) { fail("the status line is too long"); r->dispose(); return null; }
+            l->uses++;
+            if (!startsWith(&line[0], "HTTP/1.")) { fail("not an HTTP answer"); r->dispose(); return null; }
+            http11 = startsWith(&line[0], "HTTP/1.1");
+            r->status = atoi(&line[9]);
+            if (r->status < 100 || r->status > 599) { fail("bad status code"); r->dispose(); return null; }
+            // headers
+            r->headers->clear();
+            int total = 0;
+            int count = 0;
+            for (;;) {
+                n = l->readLine(&line[0], 8200);
+                if (n < 0) { fail("the answer has a bad or too long header line"); r->dispose(); return null; }
+                if (n == 0) break;
+                total = total + n;
+                count++;
+                if (total > 65536 || count > 200) { fail("the answer has too many headers"); r->dispose(); return null; }
+                int colon = indexOf(&line[0], ':');
+                if (colon <= 0 || line[0] == ' ' || line[0] == 9) { fail("a malformed header in the answer"); r->dispose(); return null; }
+                line[colon] = 0;
+                if (!r->headers->add(&line[0], &line[colon + 1])) { fail("a malformed header in the answer"); r->dispose(); return null; }
+            }
+            if (r->status >= 200 || r->status == 101) break;
+        }
+        // cookies
+        if (cookies != null) {
+            for (int i = 0; i < r->headers->count(); i++) {
+                if (nameIs(r->headers->nameAt(i), "Set-Cookie")) cookies->store(r->headers->valueAt(i), &u->host[0], &u->path[0], u->isSecure(), nowSecs());
+            }
+        }
+        // the body
+        bool noBody = headReq || r->status == 204 || r->status == 304 || r->status == 101;
+        char* te = r->headers->get("Transfer-Encoding");
+        char* cl = r->headers->get("Content-Length");
+        bool chunked = te != null && hasToken(te, "chunked");
+        int length = -1;
+        if (cl != null && !chunked) {
+            int v = 0;
+            int d = 0;
+            for (int i = 0; cl[i] != 0; i++) {
+                if (!isDigit(cl[i])) { d = 0; break; }
+                v = v * 10 + (cl[i] - '0');
+                d++;
+                if (d > 17) break;
+            }
+            if (d == 0 || d > 17) { fail("a bad Content-Length in the answer"); r->dispose(); return null; }
+            length = v;
+        }
+        bool keep = keepAlive;
+        char* conn = r->headers->get("Connection");
+        if (conn != null && hasToken(conn, "close")) keep = false;
+        if (!http11 && !(conn != null && hasToken(conn, "keep-alive"))) keep = false;
+        if (noBody) {
+            if (!headReq && r->status != 204 && r->status != 304) keep = false;
+        } else if (!chunked && length < 0) {
+            keep = false;                                     // the body runs until the connection closes
+        }
+        bool toSink = sink != null && r->status >= 200 && r->status < 300 && !noBody;
+        if (!noBody) {
+            int bms = phaseMs(bodyTimeoutMs, started);
+            if (bms < 0) { fail("the total time limit was reached"); r->dispose(); return null; }
+            net.setTimeout(l->fd, bms);
+            if (!readBody(l, r, chunked, length, toSink)) {
+                r->dispose();
+                return null;
+            }
+        }
+        // a gzip or deflate body is unpacked
+        char* ce = r->headers->get("Content-Encoding");
+        if (decompress && ce != null && r->body != null && r->bodyLen > 0 && !toSink) {
+            int pn = 0;
+            char* plain = null;
+            if (hasToken(ce, "gzip")) {
+                plain = zlib.gunzip(r->body, r->bodyLen, &pn);
+            } else if (hasToken(ce, "deflate")) {
+                plain = zlib.decompress(r->body, r->bodyLen, &pn);
+                if (plain == null) plain = zlib.inflateEx(r->body, r->bodyLen, null, 0, maxBody, false, &pn);
+            }
+            if (plain != null) {
+                free(r->body);
+                r->body = plain;
+                r->bodyLen = pn;
+                r->headers->remove("Content-Encoding");
+            }
+        }
+        if (keep && !sinkAborted) {
+            pool = l;
+        } else {
+            l->close();
+            free(l);
+        }
+        return r;
+    }
+
+    // adds body bytes: to the sink or to the memory buffer. false if the limit is passed or the sink said stop
+    private bool take(Reply* r, char* data, int n, bool toSink, int* cap) {
+        if (toSink) {
+            r->bytes = r->bytes + n;
+            sinkBytes = sinkBytes + n;
+            func f = sink;
+            if (f(sinkUser, data, n) != 0) {
+                sinkAborted = true;
+                return false;
+            }
+            return true;
+        }
+        if (r->bodyLen + n > maxBody) { fail("the answer body is too big"); return false; }
+        if (r->bodyLen + n + 1 > *cap) {
+            int nc = *cap * 2;
+            if (nc < 4096) nc = 4096;
+            while (nc < r->bodyLen + n + 1) nc = nc * 2;
+            char* nb = realloc(r->body, nc);
+            if (nb == null) { fail("out of memory"); return false; }
+            r->body = nb;
+            *cap = nc;
+        }
+        memcpy(&r->body[r->bodyLen], data, n);
+        r->bodyLen = r->bodyLen + n;
+        r->body[r->bodyLen] = 0;
+        r->bytes = r->bodyLen;
+        return true;
+    }
+
+    private bool readBody(Link* l, Reply* r, bool chunked, int length, bool toSink) {
+        int cap = 0;
+        char buf[4096];
+        if (length == 0 && !chunked) {
+            if (!toSink) { r->body = malloc(1); r->body[0] = 0; }
+            return true;
+        }
+        if (chunked) {
+            for (;;) {
+                char sz[80];
+                int n = l->readLine(&sz[0], 80);
+                if (n < 0) { fail("the chunked body ended early"); return false; }
+                int size = 0;
+                int digits = 0;
+                int k = 0;
+                while (hexv(sz[k] & 255) >= 0) { size = size * 16 + hexv(sz[k] & 255); k++; digits++; if (digits > 12) { fail("a bad chunk size"); return false; } }
+                if (digits == 0) { fail("a bad chunk size"); return false; }
+                if (size == 0) {
+                    // trailers up to an empty line
+                    char t[300];
+                    int tn = 0;
+                    while (tn < 100) {
+                        int x = l->readLine(&t[0], 300);
+                        if (x <= 0) break;
+                        tn++;
+                    }
+                    break;
+                }
+                int left = size;
+                while (left > 0) {
+                    int want = left > 4096 ? 4096 : left;
+                    int got = l->readSome(&buf[0], want);
+                    if (got <= 0) { fail("the chunked body ended early"); return false; }
+                    if (!take(r, &buf[0], got, toSink, &cap)) return false;
+                    left = left - got;
+                }
+                char crlf[8];
+                if (l->readLine(&crlf[0], 8) < 0) { fail("the chunked body ended early"); return false; }
+            }
+            if (r->body == null && !toSink) { r->body = malloc(1); r->body[0] = 0; }
+            return true;
+        }
+        if (length > 0) {
+            if (!toSink && length > maxBody) { fail("the answer body is too big"); return false; }
+            int left = length;
+            while (left > 0) {
+                int want = left > 4096 ? 4096 : left;
+                int got = l->readSome(&buf[0], want);
+                if (got <= 0) { fail("the body ended before Content-Length"); return false; }
+                if (!take(r, &buf[0], got, toSink, &cap)) return false;
+                left = left - got;
+            }
+            return true;
+        }
+        // until the connection closes
+        for (;;) {
+            int got = l->readSome(&buf[0], 4096);
+            if (got <= 0) break;
+            if (!take(r, &buf[0], got, toSink, &cap)) return false;
+        }
+        if (r->body == null && !toSink) { r->body = malloc(1); r->body[0] = 0; }
+        return true;
+    }
+
+    // ---- an upload with a chunked body: reader(user, buf, max) fills buf and returns the number of bytes, 0 at the end. No redirects or retries
+    // (the body cannot be sent twice)
+    public Reply* requestChunked(char* method, char* url, Headers* extra, func reader, char* user) {
+        int started = millis();
+        Url u;
+        if (!parseUrl(url, &u)) { fail("not an http:// or https:// URL"); return null; }
+        drop();
+        Link* l = connectTo(&u, started);
+        if (l == null) return null;
+        requests++;
+        char* req = malloc(strlen(&u.path[0]) + strlen(&u.host[0]) + 500 + (extra == null ? 0 : extra->len));
+        format(req, 600 + strlen(&u.path[0]), "%s %s HTTP/1.1\r\nHost: %s:%d\r\nUser-Agent: %s\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n", method, &u.path[0], &u.host[0], u.port, userAgent);
+        int o = strlen(req);
+        if (extra != null) {
+            for (int i = 0; i < extra->count(); i++) {
+                if (nameIs(extra->nameAt(i), "Content-Length") || nameIs(extra->nameAt(i), "Transfer-Encoding") || nameIs(extra->nameAt(i), "Host") || nameIs(extra->nameAt(i), "Connection")) continue;
+                format(&req[o], 500, "%s: %s\r\n", extra->nameAt(i), extra->valueAt(i));
+                o = o + strlen(&req[o]);
+            }
+        }
+        strcpy(&req[o], "\r\n");
+        net.setTimeout(l->fd, sendTimeoutMs);
+        bool ok = net.send(l->fd, req, strlen(req)) == strlen(req);
+        free(req);
+        char* chunk = malloc(8192 + 16);
+        while (ok) {
+            func rd = reader;
+            int n = rd(user, &chunk[10], 8192);
+            if (n < 0) { ok = false; break; }
+            char hexs[16];
+            if (n == 0) {
+                ok = net.sendText(l->fd, "0\r\n\r\n");
+                break;
+            }
+            format(&hexs[0], 16, "%x\r\n", n);
+            int hn = strlen(&hexs[0]);
+            memcpy(&chunk[10 - hn], &hexs[0], hn);
+            chunk[10 + n] = 13;
+            chunk[11 + n] = 10;
+            ok = net.send(l->fd, &chunk[10 - hn], hn + n + 2) == hn + n + 2;
+        }
+        free(chunk);
+        if (!ok) { l->close(); free(l); fail("sending the chunked body failed"); return null; }
+        bool saved = keepAlive;
+        keepAlive = false;
+        Reply* r = readReply(l, streq(method, "HEAD"), started, false, &u);
+        keepAlive = saved;
+        if (r == null) { l->close(); free(l); return null; }
+        r->url = dupStr(url);
+        return r;
+    }
+
+    public void dispose() {
+        drop();
+        if (headers != null) { headers->dispose(); free(headers); }
+        headers = null;
+    }
+}
+
+private int writeToFile(char* user, char* data, int n) {
+    DownloadState* d = (DownloadState*) user;
+    if (d->fd < 0) {
+        int flags = asys.F_WRITE | asys.F_CREATE | (d->append ? asys.F_APPEND : asys.F_TRUNC);
+        d->fd = asys.fileOpen(d->path, flags);
+        if (d->fd < 0) { d->failed = true; return 1; }
+    }
+    int done = 0;
+    while (done < n) {
+        int w = asys.fileWrite(d->fd, &data[done], n - done);
+        if (w <= 0) { d->failed = true; return 1; }
+        done = done + w;
+    }
+    return 0;
+}
