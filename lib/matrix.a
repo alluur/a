@@ -1,0 +1,2762 @@
+// =============================================================================
+//  matrix - dense and sparse matrices of doubles, linear algebra                                     import matrix;
+//
+//  Everything is plain `double` arithmetic (soft float in A: the results are identical on every target) and uses only the asys layer for
+//  memory, so it runs on all five targets and on AOS. Matrices are stored row by row. Nothing here is thread safe.
+//
+//  Matrix            rows x cols doubles:  matrix.Matrix m(3, 3);  m.set(0, 0, 2.5);  double v = m.get(0, 0);   m.d[i * m.cols + j] is the fast way
+//    construction    matrix.identity(n)  zeros(r, c)  ones(r, c)  diagonal(values, n)  fromArray(values, r, c)  m.copy()  m.submatrix(r0, c0, nr, nc)
+//    arithmetic      m.add(&b)  sub  mul  transpose()  scaled(k)  hadamard(&b)  mulVec(x, y)  mulVecT(x, y)  and the operators  a + b  a - b  a * b
+//    in place        addInPlace  subInPlace  scaleInPlace  axpyInPlace(k, &b)  transposeInPlace (square)  mulInto(&b, &c)  (c = this * b, c is a third matrix)
+//    properties      trace()  norm1()  normInf()  normFro()  normMax()  isSymmetric(tol)  isFinite()  det()  rank()  cond()  inverse()  solve(&b)
+//  LU                LU f(&a);  f.solve(b, x);  f.det();  f.inverse();  f.rcond()   partial pivoting; refuses singular matrices (see below)
+//  Cholesky          Cholesky c(&a);  c.solve(b, x);  c.det();  c.logDet();       A = L L^T for symmetric positive definite matrices
+//  QR                QR f(&a);  f.q(false)  f.r()  f.solveLS(b, x, &resid)        Householder, any shape
+//  lstsq(&a, b, x)   least squares for any matrix (QR, or the SVD minimum norm solution when A is rank deficient)
+//  SymEigen          SymEigen e(&a);  e.values[i]  e.vectors  (Jacobi, ascending order, orthonormal columns)
+//  SVD               SVD s(&a);  s.s[i]  s.u  s.v  s.rank()  s.cond()  s.pinv()  s.solve(b, x)       one sided Jacobi (Hestenes), singular values descending
+//  Sparse            SparseVector, CsrMatrix (built with CooBuilder), mulVec, mulVecT, mul, add, transpose, cg(...) conjugate gradient
+//  Complex           CMatrix with parallel re / im arrays: add sub mul conjTranspose scaled trace normFro mulVec, LU solve and determinant
+//  Vectors           vecDot vecNorm1 vecNorm2 vecNormInf vecAxpy vecScale vecCopy vecFill on plain double arrays
+//
+//  Errors. No operation crashes or hands out silent nonsense. A function that returns a status gives matrix.OK (0) or one of ERR_DIM (shapes do not
+//  fit), ERR_SINGULAR, ERR_NOT_SPD, ERR_NO_CONVERGE, ERR_MEMORY, ERR_NOT_FINITE (NaN or infinity in the input), ERR_RANK, ERR_ARG (null, empty or out of
+//  range argument), ERR_NOT_SYMMETRIC;  matrix.errorText(code) names it. A method that returns a Matrix returns an empty one on failure (rows = 0, d = null) whose
+//  `err` field tells why and whose ok() is false; an empty matrix given to any operation fails with ERR_ARG. NaN and infinity: the factorizations refuse input that
+//  contains them (ERR_NOT_FINITE) and results that overflow; plain arithmetic (add, mul, norms) follows IEEE rules (NaN spreads).
+//  A matrix is *singular* for solve() and inverse() when a pivot is exactly 0 or when the estimated reciprocal condition number rcond() is below
+//  matrix.EPS (2.2e-16, the threshold MATLAB warns at): the system then has no meaningful numeric answer, so it is refused with ERR_SINGULAR. LU f(&a, 0.0) turns the
+//  rcond test off (only exact zero pivots are refused) for ill conditioned systems that you know you want to solve anyway; f.rcond() tells how much to trust the answer.
+//  Rows with wildly different scales are "badly scaled": scale them to similar sizes first.
+//
+//  Memory. A Matrix is a handle: `Matrix b = a;` copies the handle, not the numbers (use copy()). dispose() frees the numbers; every class here has one, and nothing
+//  is freed behind your back. Operations are O(size) in memory (no hidden copies in loops); the in place variants and mulInto allocate nothing.
+//
+//  Example
+//    matrix.Matrix a(3, 3);   // 2 1 1 / 1 3 2 / 1 0 0
+//    double v[9] = {2, 1, 1, 1, 3, 2, 1, 0, 0};   for (int i = 0; i < 9; i++) { a.d[i] = v[i]; }
+//    matrix.LU f(&a);   double b[3] = {4, 5, 6};   double x[3];
+//    if (f.solve(b, x) == matrix.OK) { ... }          // x = 6, 15, -23
+//    printf("det %s rcond %s\n", ..., ...);           f.dispose();  a.dispose();
+//  The algorithms, accuracy, speed and tests are described in docs/ALGO.md.
+// =============================================================================
+import asys;
+import dmath;
+module matrix;
+
+public const OK = 0;
+public const ERR_DIM = 1;                 // the shapes do not fit
+public const ERR_SINGULAR = 2;            // singular (or numerically singular) matrix
+public const ERR_NOT_SPD = 3;             // Cholesky: not symmetric positive definite
+public const ERR_NO_CONVERGE = 4;         // an iteration did not converge
+public const ERR_MEMORY = 5;              // out of memory
+public const ERR_NOT_FINITE = 6;          // NaN or infinity in the input or in the result
+public const ERR_RANK = 7;                // rank deficient: no unique least squares solution
+public const ERR_ARG = 8;                 // null, empty, or out of range argument
+public const ERR_NOT_SYMMETRIC = 9;
+public const EPS = 2.220446049250313e-16;
+public const AUTO = -1.0;                 // "choose the default" for tolerance parameters
+public const ZERO = 0.0;
+
+private const MAX_ELEMS = 0x10000000;                  // 268 million numbers (2 GiB) at most per matrix
+
+public char* errorText(int code) {
+    if (code == OK) { return "ok"; }
+    if (code == ERR_DIM) { return "dimension mismatch"; }
+    if (code == ERR_SINGULAR) { return "singular matrix"; }
+    if (code == ERR_NOT_SPD) { return "matrix is not symmetric positive definite"; }
+    if (code == ERR_NO_CONVERGE) { return "no convergence"; }
+    if (code == ERR_MEMORY) { return "out of memory"; }
+    if (code == ERR_NOT_FINITE) { return "NaN or infinity"; }
+    if (code == ERR_RANK) { return "rank deficient"; }
+    if (code == ERR_ARG) { return "bad argument"; }
+    if (code == ERR_NOT_SYMMETRIC) { return "matrix is not symmetric"; }
+    return "unknown error";
+}
+
+// ---- helpers -------------------------------------------------------------------------------------------------------------------------------------------
+private double absd(double v) { return v < 0.0 ? -v : v; }
+private double nanValue() { return __dbl(0x7FF8000000000000); }
+private double infValue() { return __dbl(0x7FF0000000000000); }
+private bool finite(double v) { return ((__bits(v) >> 52) & 0x7FF) != 0x7FF; }
+private void freeMem(void* p) { if (p != null) { asys.free((char*) p); } }
+private double* newDoubles(int n) { return (double*) asys.alloc(n * 8); }
+private int* newInts(int n) { return (int*) asys.alloc(n * 8); }
+
+private bool allFinite(double* x, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!finite(x[i])) { return false; }
+    }
+    return true;
+}
+
+// ---- vectors (plain double arrays) --------------------------------------------------------------------------------------------------------------------
+public double vecDot(double* x, double* y, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; i++) { s += x[i] * y[i]; }
+    return s;
+}
+
+public double vecNorm1(double* x, int n) {
+    double s = 0.0;
+    for (int i = 0; i < n; i++) { s += absd(x[i]); }
+    return s;
+}
+
+public double vecNormInf(double* x, int n) {
+    double m = 0.0;
+    for (int i = 0; i < n; i++) {
+        double v = absd(x[i]);
+        if (v != v) { return v; }
+        if (v > m) { m = v; }
+    }
+    return m;
+}
+
+// the Euclidean norm without overflow or underflow of the squares
+public double vecNorm2(double* x, int n) {
+    double mx = vecNormInf(x, n);
+    if (mx != mx || mx == 0.0) { return mx; }
+    if (!finite(mx)) { return mx; }
+    double s = 0.0;
+    if (mx > 1.0e-100 && mx < 1.0e100) {
+        for (int i = 0; i < n; i++) { s += x[i] * x[i]; }
+        return dmath.sqrt(s);
+    }
+    for (int i = 0; i < n; i++) {
+        double q = x[i] / mx;
+        s += q * q;
+    }
+    return mx * dmath.sqrt(s);
+}
+
+// y = y + alpha * x
+public void vecAxpy(double alpha, double* x, double* y, int n) {
+    for (int i = 0; i < n; i++) { y[i] += alpha * x[i]; }
+}
+
+public void vecScale(double* x, double alpha, int n) {
+    for (int i = 0; i < n; i++) { x[i] *= alpha; }
+}
+
+public void vecCopy(double* src, double* dst, int n) {
+    for (int i = 0; i < n; i++) { dst[i] = src[i]; }
+}
+
+public void vecFill(double* x, double v, int n) {
+    for (int i = 0; i < n; i++) { x[i] = v; }
+}
+
+// norm of count entries starting at p with the given stride
+private double strideNorm(double* p, int stride, int count) {
+    double mx = 0.0;
+    for (int i = 0; i < count; i++) {
+        double v = absd(p[i * stride]);
+        if (v != v) { return v; }
+        if (v > mx) { mx = v; }
+    }
+    if (mx == 0.0 || !finite(mx)) { return mx; }
+    double s = 0.0;
+    if (mx > 1.0e-100 && mx < 1.0e100) {
+        for (int i = 0; i < count; i++) {
+            double v = p[i * stride];
+            s += v * v;
+        }
+        return dmath.sqrt(s);
+    }
+    for (int i = 0; i < count; i++) {
+        double q = p[i * stride] / mx;
+        s += q * q;
+    }
+    return mx * dmath.sqrt(s);
+}
+
+// ---- Matrix --------------------------------------------------------------------------------------------------------------------------------------------
+public class Matrix {
+    public int rows;
+    public int cols;
+    public double* d;                      // rows * cols numbers, row by row: element (i, j) is d[i * cols + j]
+    public int err;                        // why this matrix is empty (OK for a valid one)
+
+    // a zero filled rows x cols matrix; rows and cols must be at least 1 (otherwise the matrix is empty with err = ERR_ARG)
+    public Matrix(int r, int c) {
+        err = OK;
+        if (r <= 0 || c <= 0 || r > MAX_ELEMS / c) {
+            err = ERR_ARG;
+            return;
+        }
+        d = (double*) asys.alloc(r * c * 8);
+        if (d == null) {
+            err = ERR_MEMORY;
+            return;
+        }
+        rows = r;
+        cols = c;
+    }
+
+    public bool ok() { return d != null && rows > 0 && cols > 0; }
+    public int count() { return rows * cols; }
+    public bool isSquare() { return d != null && rows == cols; }
+
+    // element (i, j); NaN when i or j is out of range
+    public double get(int i, int j) {
+        if (d == null || i < 0 || i >= rows || j < 0 || j >= cols) { return nanValue(); }
+        return d[i * cols + j];
+    }
+
+    // sets element (i, j); false when i or j is out of range
+    public bool set(int i, int j, double v) {
+        if (d == null || i < 0 || i >= rows || j < 0 || j >= cols) { return false; }
+        d[i * cols + j] = v;
+        return true;
+    }
+
+    // a pointer to the first number of row i (null when out of range)
+    public double* row(int i) {
+        if (d == null || i < 0 || i >= rows) { return null; }
+        return &d[i * cols];
+    }
+
+    // gives the numbers back; the matrix is empty afterwards
+    public void dispose() {
+        freeMem(d);
+        d = null;
+        rows = 0;
+        cols = 0;
+    }
+
+    public Matrix copy() {
+        if (!ok()) { return failed(ERR_ARG); }
+        Matrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { r.d[i] = d[i]; }
+        return r;
+    }
+
+    // copies the numbers of src (same shape) into this matrix
+    public int copyFrom(Matrix* src) {
+        if (!ok() || src == null || !src->ok()) { return ERR_ARG; }
+        if (rows != src->rows || cols != src->cols) { return ERR_DIM; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { d[i] = src->d[i]; }
+        return OK;
+    }
+
+    public void fill(double v) {
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { d[i] = v; }
+    }
+
+    public void setIdentity() {
+        fill(0.0);
+        int m = (rows < cols) ? rows : cols;
+        for (int i = 0; i < m; i++) { d[i * cols + i] = 1.0; }
+    }
+
+    // ---- rows, columns, blocks
+    public int getRow(int i, double* out) {
+        if (!ok() || out == null || i < 0 || i >= rows) { return ERR_ARG; }
+        for (int j = 0; j < cols; j++) { out[j] = d[i * cols + j]; }
+        return OK;
+    }
+
+    public int getCol(int j, double* out) {
+        if (!ok() || out == null || j < 0 || j >= cols) { return ERR_ARG; }
+        for (int i = 0; i < rows; i++) { out[i] = d[i * cols + j]; }
+        return OK;
+    }
+
+    public int setRow(int i, double* v) {
+        if (!ok() || v == null || i < 0 || i >= rows) { return ERR_ARG; }
+        for (int j = 0; j < cols; j++) { d[i * cols + j] = v[j]; }
+        return OK;
+    }
+
+    public int setCol(int j, double* v) {
+        if (!ok() || v == null || j < 0 || j >= cols) { return ERR_ARG; }
+        for (int i = 0; i < rows; i++) { d[i * cols + j] = v[i]; }
+        return OK;
+    }
+
+    public int swapRows(int i, int k) {
+        if (!ok() || i < 0 || i >= rows || k < 0 || k >= rows) { return ERR_ARG; }
+        if (i == k) { return OK; }
+        for (int j = 0; j < cols; j++) {
+            double t = d[i * cols + j];
+            d[i * cols + j] = d[k * cols + j];
+            d[k * cols + j] = t;
+        }
+        return OK;
+    }
+
+    public int swapCols(int j, int k) {
+        if (!ok() || j < 0 || j >= cols || k < 0 || k >= cols) { return ERR_ARG; }
+        if (j == k) { return OK; }
+        for (int i = 0; i < rows; i++) {
+            double t = d[i * cols + j];
+            d[i * cols + j] = d[i * cols + k];
+            d[i * cols + k] = t;
+        }
+        return OK;
+    }
+
+    // the nr x nc block whose upper left corner is (r0, c0) as a new matrix
+    public Matrix submatrix(int r0, int c0, int nr, int nc) {
+        if (!ok() || r0 < 0 || c0 < 0 || nr <= 0 || nc <= 0 || r0 > rows - nr || c0 > cols - nc) { return failed(ERR_ARG); }
+        Matrix r(nr, nc);
+        if (!r.ok()) { return r; }
+        for (int i = 0; i < nr; i++) {
+            for (int j = 0; j < nc; j++) { r.d[i * nc + j] = d[(r0 + i) * cols + c0 + j]; }
+        }
+        return r;
+    }
+
+    // writes the matrix b into this one with its upper left corner at (r0, c0)
+    public int setSubmatrix(int r0, int c0, Matrix* b) {
+        if (!ok() || b == null || !b->ok() || r0 < 0 || c0 < 0 || r0 > rows - b->rows || c0 > cols - b->cols) { return ERR_ARG; }
+        for (int i = 0; i < b->rows; i++) {
+            for (int j = 0; j < b->cols; j++) { d[(r0 + i) * cols + c0 + j] = b->d[i * b->cols + j]; }
+        }
+        return OK;
+    }
+
+    // ---- arithmetic (new matrices)
+    public Matrix transpose() {
+        if (!ok()) { return failed(ERR_ARG); }
+        Matrix r(cols, rows);
+        if (!r.ok()) { return r; }
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) { r.d[j * rows + i] = d[i * cols + j]; }
+        }
+        return r;
+    }
+
+    public Matrix add(Matrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failed(ERR_ARG); }
+        if (rows != o->rows || cols != o->cols) { return failed(ERR_DIM); }
+        Matrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { r.d[i] = d[i] + o->d[i]; }
+        return r;
+    }
+
+    public Matrix sub(Matrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failed(ERR_ARG); }
+        if (rows != o->rows || cols != o->cols) { return failed(ERR_DIM); }
+        Matrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { r.d[i] = d[i] - o->d[i]; }
+        return r;
+    }
+
+    // element by element product
+    public Matrix hadamard(Matrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failed(ERR_ARG); }
+        if (rows != o->rows || cols != o->cols) { return failed(ERR_DIM); }
+        Matrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { r.d[i] = d[i] * o->d[i]; }
+        return r;
+    }
+
+    public Matrix scaled(double k) {
+        if (!ok()) { return failed(ERR_ARG); }
+        Matrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { r.d[i] = d[i] * k; }
+        return r;
+    }
+
+    // the matrix product this * o
+    public Matrix mul(Matrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failed(ERR_ARG); }
+        if (cols != o->rows) { return failed(ERR_DIM); }
+        Matrix r(rows, o->cols);
+        if (!r.ok()) { return r; }
+        mulCore(o, &r);
+        return r;
+    }
+
+    Matrix operator+(Matrix* o) { return add(o); }
+    Matrix operator-(Matrix* o) { return sub(o); }
+    Matrix operator*(Matrix* o) { return mul(o); }
+
+    // c = this * b into a matrix that already exists (no allocation); c must be a different matrix from this and b
+    public int mulInto(Matrix* b, Matrix* c) {
+        if (!ok() || b == null || !b->ok() || c == null || !c->ok()) { return ERR_ARG; }
+        if (cols != b->rows || c->rows != rows || c->cols != b->cols) { return ERR_DIM; }
+        if (c->d == d || c->d == b->d) { return ERR_ARG; }
+        mulCore(b, c);
+        return OK;
+    }
+
+    private void mulCore(Matrix* o, Matrix* r) {
+        int n = o->cols;
+        for (int i = 0; i < rows; i++) {
+            double* ri = &r->d[i * n];
+            for (int j = 0; j < n; j++) { ri[j] = 0.0; }
+            for (int k = 0; k < cols; k++) {
+                double aik = d[i * cols + k];
+                double* bk = &o->d[k * n];
+                for (int j = 0; j < n; j++) { ri[j] += aik * bk[j]; }
+            }
+        }
+    }
+
+    // y = this * x  (x has cols numbers, y has rows numbers; y must not be x)
+    public int mulVec(double* x, double* y) {
+        if (!ok() || x == null || y == null) { return ERR_ARG; }
+        if (x == y) { return ERR_ARG; }
+        for (int i = 0; i < rows; i++) {
+            double s = 0.0;
+            double* ri = &d[i * cols];
+            for (int j = 0; j < cols; j++) { s += ri[j] * x[j]; }
+            y[i] = s;
+        }
+        return OK;
+    }
+
+    // y = this^T * x  (x has rows numbers, y has cols numbers; y must not be x)
+    public int mulVecT(double* x, double* y) {
+        if (!ok() || x == null || y == null) { return ERR_ARG; }
+        if (x == y) { return ERR_ARG; }
+        for (int j = 0; j < cols; j++) { y[j] = 0.0; }
+        for (int i = 0; i < rows; i++) {
+            double xi = x[i];
+            double* ri = &d[i * cols];
+            for (int j = 0; j < cols; j++) { y[j] += ri[j] * xi; }
+        }
+        return OK;
+    }
+
+    // ---- arithmetic in place
+    public int addInPlace(Matrix* o) {
+        if (!ok() || o == null || !o->ok()) { return ERR_ARG; }
+        if (rows != o->rows || cols != o->cols) { return ERR_DIM; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { d[i] += o->d[i]; }
+        return OK;
+    }
+
+    public int subInPlace(Matrix* o) {
+        if (!ok() || o == null || !o->ok()) { return ERR_ARG; }
+        if (rows != o->rows || cols != o->cols) { return ERR_DIM; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { d[i] -= o->d[i]; }
+        return OK;
+    }
+
+    // this = this + k * o
+    public int axpyInPlace(double k, Matrix* o) {
+        if (!ok() || o == null || !o->ok()) { return ERR_ARG; }
+        if (rows != o->rows || cols != o->cols) { return ERR_DIM; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { d[i] += k * o->d[i]; }
+        return OK;
+    }
+
+    public void scaleInPlace(double k) {
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) { d[i] *= k; }
+    }
+
+    // transposes a square matrix without allocating (ERR_DIM when it is not square)
+    public int transposeInPlace() {
+        if (!ok()) { return ERR_ARG; }
+        if (rows != cols) { return ERR_DIM; }
+        for (int i = 0; i < rows; i++) {
+            for (int j = i + 1; j < cols; j++) {
+                double t = d[i * cols + j];
+                d[i * cols + j] = d[j * cols + i];
+                d[j * cols + i] = t;
+            }
+        }
+        return OK;
+    }
+
+    // ---- properties
+    public double trace() {
+        if (!ok()) { return nanValue(); }
+        int m = (rows < cols) ? rows : cols;
+        double s = 0.0;
+        for (int i = 0; i < m; i++) { s += d[i * cols + i]; }
+        return s;
+    }
+
+    // largest column sum of absolute values
+    public double norm1() {
+        if (!ok()) { return nanValue(); }
+        double best = 0.0;
+        for (int j = 0; j < cols; j++) {
+            double s = 0.0;
+            for (int i = 0; i < rows; i++) { s += absd(d[i * cols + j]); }
+            if (s != s) { return s; }
+            if (s > best) { best = s; }
+        }
+        return best;
+    }
+
+    // largest row sum of absolute values
+    public double normInf() {
+        if (!ok()) { return nanValue(); }
+        double best = 0.0;
+        for (int i = 0; i < rows; i++) {
+            double s = vecNorm1(&d[i * cols], cols);
+            if (s != s) { return s; }
+            if (s > best) { best = s; }
+        }
+        return best;
+    }
+
+    // Frobenius norm (without overflow of the squares)
+    public double normFro() {
+        if (!ok()) { return nanValue(); }
+        return vecNorm2(d, rows * cols);
+    }
+
+    // largest absolute value
+    public double normMax() {
+        if (!ok()) { return nanValue(); }
+        return vecNormInf(d, rows * cols);
+    }
+
+    public bool isFinite() { return ok() && allFinite(d, rows * cols); }
+
+    // |a(i,j) - a(j,i)| <= tol * (largest absolute value) everywhere (tol = 0 asks for exact symmetry)
+    public bool isSymmetric(double tol = ZERO) {
+        if (!ok() || rows != cols) { return false; }
+        double lim = tol * normMax();
+        for (int i = 0; i < rows; i++) {
+            for (int j = i + 1; j < cols; j++) {
+                double diff = absd(d[i * cols + j] - d[j * cols + i]);
+                if (!(diff <= lim)) { return false; }
+            }
+        }
+        return true;
+    }
+
+    // ---- conveniences built on the factorizations below (each allocates its own factorization and frees it)
+    // the determinant of a square matrix (NaN when the matrix is empty, not square or not finite; 0 for singular ones)
+    public double det() {
+        if (!ok() || rows != cols) { return nanValue(); }
+        LU f(this, 0.0);
+        double v = f.det();
+        f.dispose();
+        return v;
+    }
+
+    // the inverse; an empty matrix with err = ERR_SINGULAR when the matrix is (numerically) singular
+    public Matrix inverse() {
+        if (!ok()) { return failed(ERR_ARG); }
+        if (rows != cols) { return failed(ERR_DIM); }
+        LU f(this);
+        Matrix r = f.inverse();
+        f.dispose();
+        return r;
+    }
+
+    // solves this * X = b for a matrix b with the same number of rows; X is a new matrix
+    public Matrix solve(Matrix* b) {
+        if (!ok() || b == null || !b->ok()) { return failed(ERR_ARG); }
+        if (rows != cols || b->rows != rows) { return failed(ERR_DIM); }
+        LU f(this);
+        Matrix r = f.solveMatrix(b);
+        f.dispose();
+        return r;
+    }
+
+    // the numerical rank (singular values above tol * largest; tol < 0 means max(rows, cols) * eps, as NumPy does)
+    public int rank(double tol = AUTO) {
+        if (!ok()) { return -1; }
+        SVD s(this);
+        int r = (s.err == OK) ? s.rank(tol) : -1;
+        s.dispose();
+        return r;
+    }
+
+    // the 2-norm condition number (largest / smallest singular value; infinity for a singular matrix, NaN on failure)
+    public double cond() {
+        if (!ok()) { return nanValue(); }
+        SVD s(this);
+        double r = (s.err == OK) ? s.cond() : nanValue();
+        s.dispose();
+        return r;
+    }
+
+    // prints the matrix with the given number of significant digits, one row per line
+    public void show(int digits = 6) {
+        if (digits < 1) { digits = 1; }
+        if (digits > 17) { digits = 17; }
+        char buf[64];
+        for (int i = 0; i < rows && d != null; i++) {
+            for (int j = 0; j < cols; j++) {
+                sprintfd(&buf[0], "%.*g", digits, __bits(d[i * cols + j]));
+                if (j > 0) { print(" "); }
+                print(&buf[0]);
+            }
+            println("");
+        }
+    }
+}
+
+// an empty matrix that carries an error code
+private Matrix failed(int code) {
+    Matrix m;
+    m.err = code;
+    return m;
+}
+
+// ---- constructors --------------------------------------------------------------------------------------------------------------------------------------
+public Matrix zeros(int r, int c) {
+    Matrix m(r, c);
+    return m;
+}
+
+public Matrix ones(int r, int c) {
+    Matrix m(r, c);
+    if (m.ok()) { m.fill(1.0); }
+    return m;
+}
+
+public Matrix identity(int n) {
+    Matrix m(n, n);
+    if (m.ok()) { m.setIdentity(); }
+    return m;
+}
+
+// a square matrix with the n values on the diagonal
+public Matrix diagonal(double* values, int n) {
+    if (values == null) { return failed(ERR_ARG); }
+    Matrix m(n, n);
+    if (!m.ok()) { return m; }
+    for (int i = 0; i < n; i++) { m.d[i * n + i] = values[i]; }
+    return m;
+}
+
+// a copy of r * c numbers given row by row
+public Matrix fromArray(double* values, int r, int c) {
+    if (values == null) { return failed(ERR_ARG); }
+    Matrix m(r, c);
+    if (!m.ok()) { return m; }
+    int n = r * c;
+    for (int i = 0; i < n; i++) { m.d[i] = values[i]; }
+    return m;
+}
+
+// the outer product x y^T (n x m)
+public Matrix outer(double* x, int n, double* y, int m) {
+    if (x == null || y == null) { return failed(ERR_ARG); }
+    Matrix r(n, m);
+    if (!r.ok()) { return r; }
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < m; j++) { r.d[i * m + j] = x[i] * y[j]; }
+    }
+    return r;
+}
+
+// the Hilbert matrix 1 / (i + j + 1): a classic ill conditioned test matrix
+public Matrix hilbert(int n) {
+    Matrix m(n, n);
+    if (!m.ok()) { return m; }
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) { m.d[i * n + j] = 1.0 / (double) (i + j + 1); }
+    }
+    return m;
+}
+
+// ---- LU decomposition with partial pivoting -------------------------------------------------------------------------------------------------------------
+// Factors the n x n matrix a in place into L (unit lower, below the diagonal) and U (upper, with the diagonal): P A = L U. piv[i] is the row of the original
+// matrix that ended up in row i; *sign is +1 or -1 (the parity of the swaps); *zeroAt is the first column with an exactly zero pivot (-1 if none).
+// Returns OK, ERR_SINGULAR (exact zero pivot: the factorization is still complete, so the determinant is right) or ERR_NOT_FINITE.
+public int luFactor(double* a, int n, int* piv, int* sign, int* zeroAt) {
+    for (int i = 0; i < n; i++) { piv[i] = i; }
+    *sign = 1;
+    *zeroAt = -1;
+    if (!allFinite(a, n * n)) { return ERR_NOT_FINITE; }
+    int status = OK;
+    for (int k = 0; k < n; k++) {
+        int p = k;
+        double mx = absd(a[k * n + k]);
+        for (int i = k + 1; i < n; i++) {
+            double v = absd(a[i * n + k]);
+            if (v > mx) { mx = v; p = i; }
+        }
+        if (!finite(mx)) { return ERR_NOT_FINITE; }
+        if (p != k) {
+            for (int j = 0; j < n; j++) {
+                double t = a[k * n + j];
+                a[k * n + j] = a[p * n + j];
+                a[p * n + j] = t;
+            }
+            int tp = piv[k];
+            piv[k] = piv[p];
+            piv[p] = tp;
+            *sign = -(*sign);
+        }
+        double pivot = a[k * n + k];
+        if (pivot == 0.0) {
+            if (*zeroAt < 0) { *zeroAt = k; }
+            status = ERR_SINGULAR;
+            continue;
+        }
+        double* rk = &a[k * n];
+        for (int i = k + 1; i < n; i++) {
+            double* ri = &a[i * n];
+            double l = ri[k] / pivot;
+            ri[k] = l;
+            if (l != 0.0) {
+                for (int j = k + 1; j < n; j++) { ri[j] -= l * rk[j]; }
+            }
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (!finite(a[i * n + i])) { return ERR_NOT_FINITE; }
+    }
+    return status;
+}
+
+public class LU {
+    public Matrix lu;                      // L and U packed in one matrix
+    public int* piv;                       // row permutation: row i of P A is row piv[i] of A
+    public int n;
+    public int sign;                       // +1 or -1: parity of the row swaps
+    public int err;                        // OK, ERR_SINGULAR, ERR_NOT_FINITE ... (solve and inverse refuse unless OK)
+    public int zeroAt;                     // first column with an exactly zero pivot, -1 if none
+    private double* w;                     // n numbers of scratch space for solve
+    private double* w2;
+    private double anorm;                  // 1-norm of the original matrix
+    private double rc;                     // reciprocal condition number estimate (0 for a singular matrix)
+    private bool factored;                 // the factorization ran to the end (det() is valid)
+
+    // factors a copy of a. A matrix whose estimated rcond is below minRcond is reported as singular (err = ERR_SINGULAR); minRcond = 0 only refuses exact zero pivots
+    public LU(Matrix* a, double minRcond = EPS) {
+        err = OK;
+        zeroAt = -1;
+        sign = 1;
+        if (a == null || !a->ok()) { err = ERR_ARG; return; }
+        if (a->rows != a->cols) { err = ERR_DIM; return; }
+        n = a->rows;
+        anorm = a->norm1();
+        lu = a->copy();
+        piv = newInts(n);
+        w = newDoubles(n);
+        w2 = newDoubles(n);
+        if (!lu.ok() || piv == null || w == null || w2 == null) {
+            err = ERR_MEMORY;
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        err = luFactor(lu.d, n, piv, &sign, &zeroAt);
+        factored = (err == OK || err == ERR_SINGULAR);
+        if (err == OK) {
+            rc = estimateRcond();
+            if (!(rc >= minRcond) || rc == 0.0) { err = ERR_SINGULAR; }
+        }
+    }
+
+    public bool ok() { return err == OK; }
+    public int size() { return n; }
+
+    // the determinant (0 for a matrix with an exactly zero pivot; NaN when the input was not finite or the matrix is empty)
+    public double det() {
+        if (!factored) { return nanValue(); }
+        double v = (double) sign;
+        for (int i = 0; i < n; i++) { v *= lu.d[i * n + i]; }
+        return v;
+    }
+
+    // log |det| and the sign of the determinant (-1, 0 or 1): safe for matrices whose determinant would overflow
+    public double logAbsDet(int* detSign) {
+        *detSign = 0;
+        if (!factored) { return nanValue(); }
+        int sg = sign;
+        double s = 0.0;
+        for (int i = 0; i < n; i++) {
+            double u = lu.d[i * n + i];
+            if (u == 0.0) { *detSign = 0; return -infValue(); }
+            if (u < 0.0) { sg = -sg; u = -u; }
+            s += dmath.log(u);
+        }
+        *detSign = sg;
+        return s;
+    }
+
+    // the estimated reciprocal condition number in the 1-norm (1 = perfect, near 0 = nearly singular; 0 for a singular matrix)
+    public double rcond() { return factored ? rc : 0.0; }
+
+    // the estimated 1-norm condition number, infinity for a singular matrix
+    public double cond1() {
+        if (!factored || rc == 0.0) { return infValue(); }
+        return 1.0 / rc;
+    }
+
+    // solves A x = b (b and x may be the same array)
+    public int solve(double* b, double* x) {
+        if (err != OK) { return err; }
+        if (n == 0 || b == null || x == null) { return ERR_ARG; }
+        solveCore(b, x);
+        if (!allFinite(x, n)) { return ERR_NOT_FINITE; }
+        return OK;
+    }
+
+    // solves A^T x = b (b and x may be the same array)
+    public int solveTranspose(double* b, double* x) {
+        if (err != OK) { return err; }
+        if (n == 0 || b == null || x == null) { return ERR_ARG; }
+        solveTCore(b, x);
+        if (!allFinite(x, n)) { return ERR_NOT_FINITE; }
+        return OK;
+    }
+
+    private void solveCore(double* b, double* x) {
+        for (int i = 0; i < n; i++) { w[i] = b[piv[i]]; }
+        for (int i = 0; i < n; i++) {
+            double* ri = &lu.d[i * n];
+            double s = w[i];
+            for (int j = 0; j < i; j++) { s -= ri[j] * w[j]; }
+            w[i] = s;
+        }
+        for (int i = n - 1; i >= 0; i--) {
+            double* ri = &lu.d[i * n];
+            double s = w[i];
+            for (int j = i + 1; j < n; j++) { s -= ri[j] * w[j]; }
+            w[i] = s / ri[i];
+        }
+        for (int i = 0; i < n; i++) { x[i] = w[i]; }
+    }
+
+    // A^T = U^T L^T P: solve U^T y = b, L^T z = y, x = P^T z
+    private void solveTCore(double* b, double* x) {
+        for (int i = 0; i < n; i++) { w[i] = b[i]; }
+        for (int i = 0; i < n; i++) {
+            double s = w[i] / lu.d[i * n + i];
+            w[i] = s;
+            for (int j = i + 1; j < n; j++) { w[j] -= lu.d[i * n + j] * s; }
+        }
+        for (int i = n - 1; i >= 0; i--) {
+            double s = w[i];
+            for (int j = i + 1; j < n; j++) { s -= lu.d[j * n + i] * w[j]; }
+            w[i] = s;
+        }
+        for (int i = 0; i < n; i++) { x[piv[i]] = w[i]; }
+    }
+
+    // solves A X = B column by column; X is a new matrix with the shape of B
+    public Matrix solveMatrix(Matrix* b) {
+        if (err != OK) { return failed(err); }
+        if (n == 0 || b == null || !b->ok()) { return failed(ERR_ARG); }
+        if (b->rows != n) { return failed(ERR_DIM); }
+        Matrix r(n, b->cols);
+        if (!r.ok()) { return r; }
+        for (int c = 0; c < b->cols; c++) {
+            for (int i = 0; i < n; i++) { w2[i] = b->d[i * b->cols + c]; }
+            solveCore(w2, w2);
+            for (int i = 0; i < n; i++) { r.d[i * b->cols + c] = w2[i]; }
+        }
+        if (!allFinite(r.d, n * b->cols)) {
+            r.dispose();
+            return failed(ERR_NOT_FINITE);
+        }
+        return r;
+    }
+
+    // the inverse matrix (a new matrix)
+    public Matrix inverse() {
+        if (err != OK) { return failed(err); }
+        if (n == 0) { return failed(ERR_ARG); }
+        Matrix r(n, n);
+        if (!r.ok()) { return r; }
+        for (int c = 0; c < n; c++) {
+            for (int i = 0; i < n; i++) { w2[i] = 0.0; }
+            w2[c] = 1.0;
+            solveCore(w2, w2);
+            for (int i = 0; i < n; i++) { r.d[i * n + c] = w2[i]; }
+        }
+        if (!allFinite(r.d, n * n)) {
+            r.dispose();
+            return failed(ERR_NOT_FINITE);
+        }
+        return r;
+    }
+
+    // The unit lower and the upper triangle as separate matrices, and the permutation matrix P (P A = L U)
+    public Matrix lower() {
+        Matrix r(n, n);
+        if (!r.ok() || !factored) { return r; }
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < i; j++) { r.d[i * n + j] = lu.d[i * n + j]; }
+            r.d[i * n + i] = 1.0;
+        }
+        return r;
+    }
+
+    public Matrix upper() {
+        Matrix r(n, n);
+        if (!r.ok() || !factored) { return r; }
+        for (int i = 0; i < n; i++) {
+            for (int j = i; j < n; j++) { r.d[i * n + j] = lu.d[i * n + j]; }
+        }
+        return r;
+    }
+
+    public Matrix permutation() {
+        Matrix r(n, n);
+        if (!r.ok() || !factored) { return r; }
+        for (int i = 0; i < n; i++) { r.d[i * n + piv[i]] = 1.0; }
+        return r;
+    }
+
+    // Hager / Higham estimate of ||A^-1||_1, turned into rcond = 1 / (||A||_1 ||A^-1||_1)
+    private double estimateRcond() {
+        if (anorm == 0.0) { return 0.0; }
+        double est = 0.0;
+        double* x = w2;
+        double* y = newDoubles(n);
+        double* z = newDoubles(n);
+        if (y == null || z == null) {
+            freeMem(y);
+            freeMem(z);
+            return 0.0;
+        }
+        for (int i = 0; i < n; i++) { x[i] = 1.0 / (double) n; }
+        int lastJ = -1;
+        for (int iter = 0; iter < 5; iter++) {
+            solveCore(x, y);
+            double nrm = vecNorm1(y, n);
+            if (!finite(nrm)) { est = infValue(); break; }
+            if (iter > 0 && nrm <= est) { break; }
+            est = nrm;
+            for (int i = 0; i < n; i++) { z[i] = (y[i] >= 0.0) ? 1.0 : -1.0; }
+            solveTCore(z, z);
+            int j = 0;
+            double zmax = absd(z[0]);
+            for (int i = 1; i < n; i++) {
+                if (absd(z[i]) > zmax) { zmax = absd(z[i]); j = i; }
+            }
+            double zx = vecDot(z, x, n);
+            if (iter > 0 && (zmax <= zx || j == lastJ)) { break; }
+            for (int i = 0; i < n; i++) { x[i] = 0.0; }
+            x[j] = 1.0;
+            lastJ = j;
+        }
+        // Higham's second candidate: an alternating vector
+        if (n > 1 && finite(est)) {
+            double sgn = 1.0;
+            for (int i = 0; i < n; i++) {
+                x[i] = sgn * (1.0 + (double) i / (double) (n - 1));
+                sgn = -sgn;
+            }
+            solveCore(x, y);
+            double alt = 2.0 * vecNorm1(y, n) / (3.0 * (double) n);
+            if (alt > est) { est = alt; }
+        }
+        freeMem(y);
+        freeMem(z);
+        if (!finite(est) || est == 0.0) { return 0.0; }
+        return 1.0 / (anorm * est);
+    }
+
+    public void dispose() {
+        lu.dispose();
+        freeMem(piv);
+        freeMem(w);
+        freeMem(w2);
+        piv = null;
+        w = null;
+        w2 = null;
+        n = 0;
+        factored = false;
+        rc = 0.0;
+        err = ERR_ARG;
+    }
+}
+
+// ---- Cholesky decomposition -----------------------------------------------------------------------------------------------------------------------------
+// A = L L^T of a symmetric positive definite matrix. Only a check of the symmetry (relative 1e-10) is made, no pivoting. ERR_NOT_SPD for a matrix that is not
+// positive definite (also for a semi definite one: it has no unique factor), ERR_NOT_SYMMETRIC for a matrix that is not symmetric.
+public class Cholesky {
+    public Matrix l;                       // lower triangular factor (zero above the diagonal)
+    public int n;
+    public int err;
+    private double* w;
+
+    public Cholesky(Matrix* a) {
+        err = OK;
+        if (a == null || !a->ok()) { err = ERR_ARG; return; }
+        if (a->rows != a->cols) { err = ERR_DIM; return; }
+        if (!a->isFinite()) { err = ERR_NOT_FINITE; return; }
+        if (!a->isSymmetric(1.0e-10)) { err = ERR_NOT_SYMMETRIC; return; }
+        n = a->rows;
+        l = a->copy();
+        w = newDoubles(n);
+        if (!l.ok() || w == null) {
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        for (int j = 0; j < n; j++) {
+            double* rj = &l.d[j * n];
+            double s = rj[j];
+            for (int k = 0; k < j; k++) { s -= rj[k] * rj[k]; }
+            if (!(s > 0.0) || !finite(s)) {
+                err = ERR_NOT_SPD;
+                return;
+            }
+            double ljj = dmath.sqrt(s);
+            rj[j] = ljj;
+            for (int i = j + 1; i < n; i++) {
+                double* ri = &l.d[i * n];
+                double t = ri[j];
+                for (int k = 0; k < j; k++) { t -= ri[k] * rj[k]; }
+                ri[j] = t / ljj;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            for (int j = i + 1; j < n; j++) { l.d[i * n + j] = 0.0; }
+        }
+    }
+
+    public bool ok() { return err == OK; }
+
+    // solves A x = b (b and x may be the same array)
+    public int solve(double* b, double* x) {
+        if (err != OK) { return err; }
+        if (b == null || x == null) { return ERR_ARG; }
+        for (int i = 0; i < n; i++) {
+            double* ri = &l.d[i * n];
+            double s = b[i];
+            for (int j = 0; j < i; j++) { s -= ri[j] * w[j]; }
+            w[i] = s / ri[i];
+        }
+        for (int i = n - 1; i >= 0; i--) {
+            double s = w[i];
+            for (int j = i + 1; j < n; j++) { s -= l.d[j * n + i] * x[j]; }
+            x[i] = s / l.d[i * n + i];
+        }
+        if (!allFinite(x, n)) { return ERR_NOT_FINITE; }
+        return OK;
+    }
+
+    public double det() {
+        if (err != OK) { return nanValue(); }
+        double v = 1.0;
+        for (int i = 0; i < n; i++) { v *= l.d[i * n + i] * l.d[i * n + i]; }
+        return v;
+    }
+
+    public double logDet() {
+        if (err != OK) { return nanValue(); }
+        double s = 0.0;
+        for (int i = 0; i < n; i++) { s += dmath.log(l.d[i * n + i]); }
+        return 2.0 * s;
+    }
+
+    public Matrix inverse() {
+        if (err != OK) { return failed(err); }
+        Matrix r(n, n);
+        if (!r.ok()) { return r; }
+        double* e = newDoubles(n);
+        if (e == null) {
+            r.dispose();
+            return failed(ERR_MEMORY);
+        }
+        for (int c = 0; c < n; c++) {
+            for (int i = 0; i < n; i++) { e[i] = 0.0; }
+            e[c] = 1.0;
+            solve(e, e);
+            for (int i = 0; i < n; i++) { r.d[i * n + c] = e[i]; }
+        }
+        freeMem(e);
+        return r;
+    }
+
+    public void dispose() {
+        l.dispose();
+        freeMem(w);
+        w = null;
+        n = 0;
+        err = ERR_ARG;
+    }
+}
+
+// ---- QR decomposition (Householder) -----------------------------------------------------------------------------------------------------------------------
+// A = Q R for any m x n matrix. The reflectors are stored below the diagonal of `qr` (LAPACK style), R on and above it.
+public class QR {
+    public Matrix qr;
+    public double* tau;
+    public int m;
+    public int n;
+    public int err;
+    private double* w;
+
+    public QR(Matrix* a) {
+        err = OK;
+        if (a == null || !a->ok()) { err = ERR_ARG; return; }
+        if (!a->isFinite()) { err = ERR_NOT_FINITE; return; }
+        m = a->rows;
+        n = a->cols;
+        int k = (m < n) ? m : n;
+        qr = a->copy();
+        tau = newDoubles(k);
+        w = newDoubles(m);
+        if (!qr.ok() || tau == null || w == null) {
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        double* q = qr.d;
+        for (int j = 0; j < k; j++) {
+            double alpha = q[j * n + j];
+            double xnorm = strideNorm(&q[(j + 1) * n + j], n, m - j - 1);
+            if (xnorm == 0.0) {
+                tau[j] = 0.0;
+                continue;
+            }
+            double nrm = dmath.hypot(alpha, xnorm);
+            double beta = (alpha >= 0.0) ? -nrm : nrm;
+            tau[j] = (beta - alpha) / beta;
+            double sc = 1.0 / (alpha - beta);
+            for (int i = j + 1; i < m; i++) { q[i * n + j] *= sc; }
+            q[j * n + j] = beta;
+            for (int c = j + 1; c < n; c++) {
+                double s = q[j * n + c];
+                for (int i = j + 1; i < m; i++) { s += q[i * n + j] * q[i * n + c]; }
+                s *= tau[j];
+                q[j * n + c] -= s;
+                for (int i = j + 1; i < m; i++) { q[i * n + c] -= s * q[i * n + j]; }
+            }
+        }
+        if (!allFinite(q, m * n)) { err = ERR_NOT_FINITE; }
+    }
+
+    public bool ok() { return err == OK; }
+    public int rankLimit() { return (m < n) ? m : n; }
+
+    // b = Q^T b for a vector of m numbers
+    public void applyQt(double* b) {
+        int k = rankLimit();
+        for (int j = 0; j < k; j++) {
+            if (tau[j] == 0.0) { continue; }
+            double s = b[j];
+            for (int i = j + 1; i < m; i++) { s += qr.d[i * n + j] * b[i]; }
+            s *= tau[j];
+            b[j] -= s;
+            for (int i = j + 1; i < m; i++) { b[i] -= s * qr.d[i * n + j]; }
+        }
+    }
+
+    // b = Q b for a vector of m numbers
+    public void applyQ(double* b) {
+        int k = rankLimit();
+        for (int j = k - 1; j >= 0; j--) {
+            if (tau[j] == 0.0) { continue; }
+            double s = b[j];
+            for (int i = j + 1; i < m; i++) { s += qr.d[i * n + j] * b[i]; }
+            s *= tau[j];
+            b[j] -= s;
+            for (int i = j + 1; i < m; i++) { b[i] -= s * qr.d[i * n + j]; }
+        }
+    }
+
+    // Q as a matrix: m x min(m, n) (thin) or m x m (full)
+    public Matrix q(bool full = false) {
+        if (err != OK) { return failed(err); }
+        int cn = full ? m : rankLimit();
+        Matrix res(m, cn);
+        if (!res.ok()) { return res; }
+        for (int c = 0; c < cn; c++) {
+            for (int i = 0; i < m; i++) { w[i] = 0.0; }
+            w[c] = 1.0;
+            applyQ(w);
+            for (int i = 0; i < m; i++) { res.d[i * cn + c] = w[i]; }
+        }
+        return res;
+    }
+
+    // R as a min(m, n) x n upper triangular (trapezoidal) matrix
+    public Matrix r() {
+        if (err != OK) { return failed(err); }
+        int k = rankLimit();
+        Matrix res(k, n);
+        if (!res.ok()) { return res; }
+        for (int i = 0; i < k; i++) {
+            for (int j = i; j < n; j++) { res.d[i * n + j] = qr.d[i * n + j]; }
+        }
+        return res;
+    }
+
+    // the smallest |r(i,i)| relative to the largest: tiny values mean (numerical) rank deficiency
+    public double diagRatio() {
+        if (err != OK) { return 0.0; }
+        int k = rankLimit();
+        double mx = 0.0;
+        double mn = infValue();
+        for (int i = 0; i < k; i++) {
+            double v = absd(qr.d[i * n + i]);
+            if (v > mx) { mx = v; }
+            if (v < mn) { mn = v; }
+        }
+        if (mx == 0.0) { return 0.0; }
+        return mn / mx;
+    }
+
+    // Least squares: minimizes |A x - b|_2 for m >= n. b has m numbers, x has n numbers; *resid (optional) receives the norm of the residual.
+    // ERR_RANK when R has a (numerically) zero diagonal element: use matrix.lstsq, which falls back to the SVD.
+    public int solveLS(double* b, double* x, double* resid = null) {
+        if (err != OK) { return err; }
+        if (b == null || x == null) { return ERR_ARG; }
+        if (m < n) { return ERR_DIM; }
+        if (diagRatio() <= (double) m * EPS) { return ERR_RANK; }
+        for (int i = 0; i < m; i++) { w[i] = b[i]; }
+        applyQt(w);
+        for (int i = n - 1; i >= 0; i--) {
+            double s = w[i];
+            for (int j = i + 1; j < n; j++) { s -= qr.d[i * n + j] * x[j]; }
+            x[i] = s / qr.d[i * n + i];
+        }
+        if (resid != null) { *resid = vecNorm2(&w[n], m - n); }
+        if (!allFinite(x, n)) { return ERR_NOT_FINITE; }
+        return OK;
+    }
+
+    public void dispose() {
+        qr.dispose();
+        freeMem(tau);
+        freeMem(w);
+        tau = null;
+        w = null;
+        m = 0;
+        n = 0;
+        err = ERR_ARG;
+    }
+}
+
+// Least squares for any matrix: minimizes |A x - b|_2 (b has rows(A) numbers, x has cols(A) numbers) and, when the solution is not unique (rank deficient A,
+// or fewer rows than columns), picks the one with the smallest norm. Uses QR when A has full column rank and the SVD otherwise. *resid receives the norm of the
+// residual, *rankOut the numerical rank (both optional). Returns OK or an error code.
+public int lstsq(Matrix* a, double* b, double* x, double* resid = null, int* rankOut = null) {
+    if (a == null || !a->ok() || b == null || x == null) { return ERR_ARG; }
+    if (!a->isFinite() || !allFinite(b, a->rows)) { return ERR_NOT_FINITE; }
+    if (a->rows >= a->cols) {
+        QR f(a);
+        if (f.err == OK) {
+            int st = f.solveLS(b, x, resid);
+            if (st == OK) {
+                if (rankOut != null) { *rankOut = a->cols; }
+                f.dispose();
+                return OK;
+            }
+        }
+        f.dispose();
+    }
+    SVD s(a);
+    if (s.err != OK) {
+        int e = s.err;
+        s.dispose();
+        return e;
+    }
+    int st = s.solve(b, x, AUTO);
+    if (st == OK) {
+        if (rankOut != null) { *rankOut = s.rank(AUTO); }
+        if (resid != null) {
+            double* t = newDoubles(a->rows);
+            if (t == null) {
+                s.dispose();
+                return ERR_MEMORY;
+            }
+            a->mulVec(x, t);
+            for (int i = 0; i < a->rows; i++) { t[i] -= b[i]; }
+            *resid = vecNorm2(t, a->rows);
+            freeMem(t);
+        }
+    }
+    s.dispose();
+    return st;
+}
+
+// ---- eigenvalues of a symmetric matrix (cyclic Jacobi) ----------------------------------------------------------------------------------------------------
+// A = V diag(values) V^T with orthonormal columns in V. The values are in ascending order. Jacobi is slower than tridiagonal QL for big matrices (O(n^3) per sweep,
+// usually 6 to 10 sweeps) but is very accurate, also for small eigenvalues, and needs no other code. Only the upper triangle is used after the symmetry check
+// (relative 1e-10: ERR_NOT_SYMMETRIC). A zeroed SymEigen has n = 0.
+public class SymEigen {
+    public double* values;
+    public Matrix vectors;                 // column j is the eigenvector of values[j] (empty when wantVectors was false)
+    public int n;
+    public int err;
+    public int sweeps;                     // how many sweeps were needed
+
+    public SymEigen(Matrix* a, bool wantVectors = true) {
+        err = OK;
+        if (a == null || !a->ok()) { err = ERR_ARG; return; }
+        if (a->rows != a->cols) { err = ERR_DIM; return; }
+        if (!a->isFinite()) { err = ERR_NOT_FINITE; return; }
+        if (!a->isSymmetric(1.0e-10)) { err = ERR_NOT_SYMMETRIC; return; }
+        int nn = a->rows;
+        Matrix w = a->copy();
+        values = newDoubles(nn);
+        if (wantVectors) { vectors = identity(nn); }
+        if (!w.ok() || values == null || (wantVectors && !vectors.ok())) {
+            w.dispose();
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        n = nn;
+        double* A = w.d;
+        double* V = vectors.d;
+        bool done = false;
+        for (int sweep = 0; sweep < 100 && !done; sweep++) {
+            double sm = 0.0;
+            for (int p = 0; p < n - 1; p++) {
+                for (int q = p + 1; q < n; q++) { sm += absd(A[p * n + q]); }
+            }
+            if (sm == 0.0) { done = true; break; }
+            sweeps = sweep + 1;
+            double thresh = (sweep < 3) ? 0.2 * sm / (double) (n * n) : 0.0;
+            for (int p = 0; p < n - 1; p++) {
+                for (int q = p + 1; q < n; q++) {
+                    double apq = A[p * n + q];
+                    double g = 100.0 * absd(apq);
+                    double app = A[p * n + p];
+                    double aqq = A[q * n + q];
+                    if (sweep > 3 && absd(app) + g == absd(app) && absd(aqq) + g == absd(aqq)) {
+                        A[p * n + q] = 0.0;
+                    } else if (absd(apq) > thresh) {
+                        double h = aqq - app;
+                        double t;
+                        if (absd(h) + g == absd(h)) {
+                            t = apq / h;
+                        } else {
+                            double theta = 0.5 * h / apq;
+                            t = 1.0 / (absd(theta) + dmath.sqrt(1.0 + theta * theta));
+                            if (theta < 0.0) { t = -t; }
+                        }
+                        double c = 1.0 / dmath.sqrt(1.0 + t * t);
+                        double s = t * c;
+                        double tau = s / (1.0 + c);
+                        h = t * apq;
+                        A[p * n + p] = app - h;
+                        A[q * n + q] = aqq + h;
+                        A[p * n + q] = 0.0;
+                        for (int j = 0; j < p; j++) {
+                            double x = A[j * n + p];
+                            double y = A[j * n + q];
+                            A[j * n + p] = x - s * (y + x * tau);
+                            A[j * n + q] = y + s * (x - y * tau);
+                        }
+                        for (int j = p + 1; j < q; j++) {
+                            double x = A[p * n + j];
+                            double y = A[j * n + q];
+                            A[p * n + j] = x - s * (y + x * tau);
+                            A[j * n + q] = y + s * (x - y * tau);
+                        }
+                        for (int j = q + 1; j < n; j++) {
+                            double x = A[p * n + j];
+                            double y = A[q * n + j];
+                            A[p * n + j] = x - s * (y + x * tau);
+                            A[q * n + j] = y + s * (x - y * tau);
+                        }
+                        if (wantVectors) {
+                            for (int j = 0; j < n; j++) {
+                                double x = V[j * n + p];
+                                double y = V[j * n + q];
+                                V[j * n + p] = x - s * (y + x * tau);
+                                V[j * n + q] = y + s * (x - y * tau);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!done) {
+            double sm = 0.0;
+            for (int p = 0; p < n - 1; p++) {
+                for (int q = p + 1; q < n; q++) { sm += absd(A[p * n + q]); }
+            }
+            done = (sm == 0.0);
+        }
+        for (int i = 0; i < n; i++) { values[i] = A[i * n + i]; }
+        w.dispose();
+        if (!done) { err = ERR_NO_CONVERGE; }
+        // ascending order (selection sort: n is small compared to the n^3 work above)
+        for (int i = 0; i < n - 1; i++) {
+            int k = i;
+            for (int j = i + 1; j < n; j++) {
+                if (values[j] < values[k]) { k = j; }
+            }
+            if (k != i) {
+                double t = values[i];
+                values[i] = values[k];
+                values[k] = t;
+                if (wantVectors) { vectors.swapCols(i, k); }
+            }
+        }
+    }
+
+    public bool ok() { return err == OK && n > 0; }
+
+    // the largest |A v - lambda v| over all eigenpairs of the matrix a (a self check; needs the vectors)
+    public double maxResidual(Matrix* a) {
+        if (!ok() || vectors.d == null || a == null || !a->ok() || a->rows != n) { return nanValue(); }
+        double worst = 0.0;
+        double* v = newDoubles(n);
+        double* av = newDoubles(n);
+        if (v == null || av == null) {
+            freeMem(v);
+            freeMem(av);
+            return nanValue();
+        }
+        for (int j = 0; j < n; j++) {
+            vectors.getCol(j, v);
+            a->mulVec(v, av);
+            for (int i = 0; i < n; i++) { av[i] -= values[j] * v[i]; }
+            double r = vecNorm2(av, n);
+            if (r > worst) { worst = r; }
+        }
+        freeMem(v);
+        freeMem(av);
+        return worst;
+    }
+
+    public void dispose() {
+        freeMem(values);
+        values = null;
+        vectors.dispose();
+        n = 0;
+        err = ERR_ARG;
+    }
+}
+
+// ---- singular value decomposition (one sided Jacobi / Hestenes) -----------------------------------------------------------------------------------------------
+// A = U diag(s) V^T for any m x n matrix with k = min(m, n): U is m x k and V is n x k with orthonormal columns, s is in descending order. One sided Jacobi
+// orthogonalizes the columns of A by plane rotations, so it is simple and computes even tiny singular values to high relative accuracy. For a rank deficient matrix the
+// columns of U (or V) that belong to zero singular values are completed to an orthonormal set. ERR_NO_CONVERGE after 60 sweeps (never seen in practice).
+public class SVD {
+    public Matrix u;                       // m x k
+    public double* s;                      // k singular values, largest first
+    public Matrix v;                       // n x k
+    public int m;
+    public int n;
+    public int k;
+    public int err;
+    public int sweeps;
+
+    public SVD(Matrix* a) {
+        err = OK;
+        if (a == null || !a->ok()) { err = ERR_ARG; return; }
+        if (!a->isFinite()) { err = ERR_NOT_FINITE; return; }
+        m = a->rows;
+        n = a->cols;
+        k = (m < n) ? m : n;
+        bool wide = m < n;
+        int mm = wide ? n : m;                 // length of the columns of the tall matrix T = A (or A^T for a wide A)
+        int kk = k;
+        double* ut = newDoubles(kk * mm);      // row j of ut is column j of T
+        double* vt = newDoubles(kk * kk);      // row j of vt is column j of the rotation matrix
+        s = newDoubles(kk);
+        if (ut == null || vt == null || s == null) {
+            freeMem(ut);
+            freeMem(vt);
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        for (int j = 0; j < kk; j++) {
+            vt[j * kk + j] = 1.0;
+            for (int i = 0; i < mm; i++) { ut[j * mm + i] = wide ? a->d[j * n + i] : a->d[i * n + j]; }
+        }
+        bool done = false;
+        double tol = 1.0e-15;
+        for (int sweep = 0; sweep < 60 && !done; sweep++) {
+            bool rotated = false;
+            for (int p = 0; p < kk - 1; p++) {
+                for (int q = p + 1; q < kk; q++) {
+                    double* up = &ut[p * mm];
+                    double* uq = &ut[q * mm];
+                    double alpha = vecDot(up, up, mm);
+                    double beta = vecDot(uq, uq, mm);
+                    double gamma = vecDot(up, uq, mm);
+                    if (gamma == 0.0 || alpha == 0.0 || beta == 0.0) { continue; }
+                    if (absd(gamma) <= tol * dmath.sqrt(alpha) * dmath.sqrt(beta)) { continue; }
+                    rotated = true;
+                    double zeta = (beta - alpha) / (2.0 * gamma);
+                    double t;
+                    if (absd(zeta) > 1.0e150) {
+                        t = 0.5 / zeta;
+                    } else {
+                        t = 1.0 / (absd(zeta) + dmath.sqrt(1.0 + zeta * zeta));
+                        if (zeta < 0.0) { t = -t; }
+                    }
+                    double c = 1.0 / dmath.sqrt(1.0 + t * t);
+                    double sn = c * t;
+                    for (int i = 0; i < mm; i++) {
+                        double x = up[i];
+                        double y = uq[i];
+                        up[i] = c * x - sn * y;
+                        uq[i] = sn * x + c * y;
+                    }
+                    double* vp = &vt[p * kk];
+                    double* vq = &vt[q * kk];
+                    for (int i = 0; i < kk; i++) {
+                        double x = vp[i];
+                        double y = vq[i];
+                        vp[i] = c * x - sn * y;
+                        vq[i] = sn * x + c * y;
+                    }
+                }
+            }
+            sweeps = sweep + 1;
+            if (!rotated) { done = true; }
+        }
+        for (int j = 0; j < kk; j++) { s[j] = vecNorm2(&ut[j * mm], mm); }
+        // descending order
+        for (int i = 0; i < kk - 1; i++) {
+            int best = i;
+            for (int j = i + 1; j < kk; j++) {
+                if (s[j] > s[best]) { best = j; }
+            }
+            if (best != i) {
+                double ts = s[i];
+                s[i] = s[best];
+                s[best] = ts;
+                for (int c = 0; c < mm; c++) {
+                    double t = ut[i * mm + c];
+                    ut[i * mm + c] = ut[best * mm + c];
+                    ut[best * mm + c] = t;
+                }
+                for (int c = 0; c < kk; c++) {
+                    double t = vt[i * kk + c];
+                    vt[i * kk + c] = vt[best * kk + c];
+                    vt[best * kk + c] = t;
+                }
+            }
+        }
+        // unit columns; exactly zero columns are completed to an orthonormal set
+        int firstZero = kk;
+        for (int j = 0; j < kk; j++) {
+            if (s[j] > 0.0) {
+                double inv = 1.0 / s[j];
+                if (!finite(inv)) {
+                    for (int i = 0; i < mm; i++) { ut[j * mm + i] = ut[j * mm + i] / s[j]; }
+                } else {
+                    for (int i = 0; i < mm; i++) { ut[j * mm + i] *= inv; }
+                }
+            } else if (firstZero == kk) {
+                firstZero = j;
+            }
+        }
+        for (int j = firstZero; j < kk; j++) {
+            if (s[j] == 0.0) { completeColumn(ut, mm, j); }
+        }
+        // tall: u = ut / s (m x k), v = vt (n x k); wide: u = vt (m x k), v = ut / s (n x k)
+        u = zeros(m, kk);
+        v = zeros(n, kk);
+        if (!u.ok() || !v.ok()) {
+            freeMem(ut);
+            freeMem(vt);
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        for (int j = 0; j < kk; j++) {
+            for (int i = 0; i < mm; i++) {
+                if (wide) { v.d[i * kk + j] = ut[j * mm + i]; } else { u.d[i * kk + j] = ut[j * mm + i]; }
+            }
+            for (int i = 0; i < kk; i++) {
+                if (wide) { u.d[i * kk + j] = vt[j * kk + i]; } else { v.d[i * kk + j] = vt[j * kk + i]; }
+            }
+        }
+        freeMem(ut);
+        freeMem(vt);
+        if (!done) { err = ERR_NO_CONVERGE; }
+    }
+
+    // makes row j of ut (a column of length mm) a unit vector orthogonal to rows 0 .. j-1 that are nonzero or already completed
+    private void completeColumn(double* ut, int mm, int j) {
+        int used = j;                         // rows 0 .. j - 1 are unit vectors (the zero ones before j were completed first)
+        int bestT = 0;
+        double bestS = 2.0;
+        for (int t = 0; t < mm; t++) {
+            double sq = 0.0;
+            for (int i = 0; i < used; i++) {
+                double x = ut[i * mm + t];
+                sq += x * x;
+            }
+            if (sq < bestS) { bestS = sq; bestT = t; }
+        }
+        double* w = &ut[j * mm];
+        for (int i = 0; i < mm; i++) { w[i] = 0.0; }
+        w[bestT] = 1.0;
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < used; i++) {
+                double dp = vecDot(&ut[i * mm], w, mm);
+                for (int c = 0; c < mm; c++) { w[c] -= dp * ut[i * mm + c]; }
+            }
+        }
+        double nr = vecNorm2(w, mm);
+        if (nr > 0.0) {
+            for (int c = 0; c < mm; c++) { w[c] /= nr; }
+        }
+    }
+
+    public bool ok() { return err == OK && k > 0; }
+
+    // the number of singular values above rtol * (largest one); rtol = AUTO means max(m, n) * eps (the rule of NumPy)
+    public int rank(double rtol = AUTO) {
+        if (k == 0 || s == null) { return 0; }
+        double thr = threshold(rtol);
+        int r = 0;
+        for (int i = 0; i < k; i++) {
+            if (s[i] > thr) { r++; }
+        }
+        return r;
+    }
+
+    private double threshold(double rtol) {
+        double tol = rtol;
+        if (!(tol >= 0.0)) { tol = (double) ((m > n) ? m : n) * EPS; }
+        return s[0] * tol;
+    }
+
+    public double norm2() { return (k == 0 || s == null) ? nanValue() : s[0]; }
+
+    // largest / smallest singular value (infinity when the matrix is singular)
+    public double cond() {
+        if (k == 0 || s == null) { return nanValue(); }
+        if (s[k - 1] == 0.0) { return infValue(); }
+        return s[0] / s[k - 1];
+    }
+
+    // the Moore-Penrose pseudo inverse (n x m), singular values below the threshold count as zero
+    public Matrix pinv(double rtol = AUTO) {
+        if (!ok()) { return failed(err == OK ? ERR_ARG : err); }
+        double thr = threshold(rtol);
+        Matrix r(n, m);
+        if (!r.ok()) { return r; }
+        for (int j = 0; j < k; j++) {
+            if (!(s[j] > thr)) { continue; }
+            double inv = 1.0 / s[j];
+            for (int i = 0; i < n; i++) {
+                double vij = v.d[i * k + j] * inv;
+                for (int c = 0; c < m; c++) { r.d[i * m + c] += vij * u.d[c * k + j]; }
+            }
+        }
+        return r;
+    }
+
+    // the minimum norm least squares solution of A x = b (b has m numbers, x has n numbers)
+    public int solve(double* b, double* x, double rtol = AUTO) {
+        if (!ok()) { return err == OK ? ERR_ARG : err; }
+        if (b == null || x == null) { return ERR_ARG; }
+        double thr = threshold(rtol);
+        for (int i = 0; i < n; i++) { x[i] = 0.0; }
+        for (int j = 0; j < k; j++) {
+            if (!(s[j] > thr)) { continue; }
+            double t = 0.0;
+            for (int i = 0; i < m; i++) { t += u.d[i * k + j] * b[i]; }
+            t /= s[j];
+            for (int i = 0; i < n; i++) { x[i] += t * v.d[i * k + j]; }
+        }
+        if (!allFinite(x, n)) { return ERR_NOT_FINITE; }
+        return OK;
+    }
+
+    // U diag(s) V^T (for checking)
+    public Matrix reconstruct() {
+        if (!ok()) { return failed(err == OK ? ERR_ARG : err); }
+        Matrix r(m, n);
+        if (!r.ok()) { return r; }
+        for (int j = 0; j < k; j++) {
+            for (int i = 0; i < m; i++) {
+                double uij = u.d[i * k + j] * s[j];
+                for (int c = 0; c < n; c++) { r.d[i * n + c] += uij * v.d[c * k + j]; }
+            }
+        }
+        return r;
+    }
+
+    public void dispose() {
+        u.dispose();
+        v.dispose();
+        freeMem(s);
+        s = null;
+        m = 0;
+        n = 0;
+        k = 0;
+        err = ERR_ARG;
+    }
+}
+
+// ---- sparse vectors ---------------------------------------------------------------------------------------------------------------------------------------
+// A vector of dimension n that stores only its non zero entries, sorted by index. put() keeps the order (binary search, O(nnz) shifting), the other operations
+// are merges that cost O(nnz).
+public class SparseVector {
+    public int n;                          // the dimension
+    public int nnz;                        // the number of stored entries
+    private int* idx;
+    private double* val;
+    private int cap;
+
+    public SparseVector(int dim) {
+        n = dim;
+        if (n < 0) { n = 0; }
+    }
+
+    public int indexAt(int k) { return (k >= 0 && k < nnz) ? idx[k] : -1; }
+    public double valueAt(int k) { return (k >= 0 && k < nnz) ? val[k] : nanValue(); }
+
+    // the position of index i among the stored entries, or -(insert position) - 1
+    private int find(int i) {
+        int lo = 0;
+        int hi = nnz - 1;
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (idx[mid] == i) { return mid; }
+            if (idx[mid] < i) { lo = mid + 1; } else { hi = mid - 1; }
+        }
+        return -lo - 1;
+    }
+
+    private bool reserve(int want) {
+        if (want <= cap) { return true; }
+        int nc = (cap == 0) ? 8 : cap * 2;
+        while (nc < want) { nc = nc * 2; }
+        if (nc > 0x10000000) { return false; }
+        int* ni = newInts(nc);
+        double* nv = newDoubles(nc);
+        if (ni == null || nv == null) {
+            freeMem(ni);
+            freeMem(nv);
+            return false;
+        }
+        for (int i = 0; i < nnz; i++) {
+            ni[i] = idx[i];
+            nv[i] = val[i];
+        }
+        freeMem(idx);
+        freeMem(val);
+        idx = ni;
+        val = nv;
+        cap = nc;
+        return true;
+    }
+
+    // sets the entry i to v (v = 0 removes it); false when i is out of range or memory is short
+    public bool put(int i, double v) {
+        if (i < 0 || i >= n) { return false; }
+        int p = find(i);
+        if (p >= 0) {
+            if (v == 0.0) {
+                for (int j = p; j < nnz - 1; j++) {
+                    idx[j] = idx[j + 1];
+                    val[j] = val[j + 1];
+                }
+                nnz--;
+            } else {
+                val[p] = v;
+            }
+            return true;
+        }
+        if (v == 0.0) { return true; }
+        if (!reserve(nnz + 1)) { return false; }
+        int at = -p - 1;
+        for (int j = nnz; j > at; j--) {
+            idx[j] = idx[j - 1];
+            val[j] = val[j - 1];
+        }
+        idx[at] = i;
+        val[at] = v;
+        nnz++;
+        return true;
+    }
+
+    public double get(int i) {
+        if (i < 0 || i >= n) { return nanValue(); }
+        int p = find(i);
+        return (p >= 0) ? val[p] : 0.0;
+    }
+
+    public double dotDense(double* x) {
+        double s = 0.0;
+        for (int k = 0; k < nnz; k++) { s += val[k] * x[idx[k]]; }
+        return s;
+    }
+
+    // the dot product with another sparse vector of the same dimension (NaN if the dimensions differ)
+    public double dot(SparseVector* o) {
+        if (o == null || o->n != n) { return nanValue(); }
+        double s = 0.0;
+        int a = 0;
+        int b = 0;
+        while (a < nnz && b < o->nnz) {
+            if (idx[a] == o->idx[b]) {
+                s += val[a] * o->val[b];
+                a++;
+                b++;
+            } else if (idx[a] < o->idx[b]) {
+                a++;
+            } else {
+                b++;
+            }
+        }
+        return s;
+    }
+
+    // y = y + alpha * this for a dense vector y of n numbers
+    public void axpyDense(double alpha, double* y) {
+        for (int k = 0; k < nnz; k++) { y[idx[k]] += alpha * val[k]; }
+    }
+
+    public double norm2() { return vecNorm2(val, nnz); }
+
+    public void scale(double k) {
+        for (int i = 0; i < nnz; i++) { val[i] *= k; }
+    }
+
+    // writes the n numbers of the dense form
+    public void toDense(double* out) {
+        for (int i = 0; i < n; i++) { out[i] = 0.0; }
+        for (int k = 0; k < nnz; k++) { out[idx[k]] = val[k]; }
+    }
+
+    // this + alpha * o as a new vector (entries that cancel exactly are dropped); null on dimension mismatch or memory failure
+    public SparseVector* addScaled(double alpha, SparseVector* o) {
+        if (o == null || o->n != n) { return null; }
+        SparseVector* r = new SparseVector(n);
+        if (!r->reserve(nnz + o->nnz)) { return null; }
+        int a = 0;
+        int b = 0;
+        while (a < nnz || b < o->nnz) {
+            int ia = (a < nnz) ? idx[a] : 0x7FFFFFFFFFFFFFFF;
+            int ib = (b < o->nnz) ? o->idx[b] : 0x7FFFFFFFFFFFFFFF;
+            int at;
+            double v;
+            if (ia == ib) {
+                at = ia;
+                v = val[a] + alpha * o->val[b];
+                a++;
+                b++;
+            } else if (ia < ib) {
+                at = ia;
+                v = val[a];
+                a++;
+            } else {
+                at = ib;
+                v = alpha * o->val[b];
+                b++;
+            }
+            if (v != 0.0) {
+                r->idx[r->nnz] = at;
+                r->val[r->nnz] = v;
+                r->nnz++;
+            }
+        }
+        return r;
+    }
+
+    public void dispose() {
+        freeMem(idx);
+        freeMem(val);
+        idx = null;
+        val = null;
+        cap = 0;
+        nnz = 0;
+    }
+}
+
+// ---- compressed sparse row matrices ---------------------------------------------------------------------------------------------------------------------------
+// rowPtr[i] .. rowPtr[i + 1] - 1 are the entries of row i; colIdx is increasing inside a row; there are no duplicate entries.
+public class CsrMatrix {
+    public int rows;
+    public int cols;
+    public int nnz;
+    public int* rowPtr;                    // rows + 1 entries
+    public int* colIdx;                    // nnz entries
+    public double* val;                    // nnz entries
+    public int err;
+
+    // an empty matrix of the given shape with room for `capacity` entries (used by the builder and the operations)
+    public CsrMatrix(int r, int c, int capacity = 0) {
+        err = OK;
+        if (r <= 0 || c <= 0 || capacity < 0 || capacity > 0x10000000) {
+            err = ERR_ARG;
+            return;
+        }
+        rowPtr = newInts(r + 1);
+        colIdx = newInts(capacity);
+        val = newDoubles(capacity);
+        if (rowPtr == null || colIdx == null || val == null) {
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        rows = r;
+        cols = c;
+    }
+
+    public bool ok() { return rowPtr != null && rows > 0; }
+
+    // the entry (i, j), 0 when it is not stored, NaN when out of range
+    public double get(int i, int j) {
+        if (!ok() || i < 0 || i >= rows || j < 0 || j >= cols) { return nanValue(); }
+        int lo = rowPtr[i];
+        int hi = rowPtr[i + 1] - 1;
+        while (lo <= hi) {
+            int mid = lo + (hi - lo) / 2;
+            if (colIdx[mid] == j) { return val[mid]; }
+            if (colIdx[mid] < j) { lo = mid + 1; } else { hi = mid - 1; }
+        }
+        return 0.0;
+    }
+
+    // y = A x (x has cols numbers, y has rows numbers, y must not be x)
+    public int mulVec(double* x, double* y) {
+        if (!ok() || x == null || y == null || x == y) { return ERR_ARG; }
+        for (int i = 0; i < rows; i++) {
+            double s = 0.0;
+            for (int p = rowPtr[i]; p < rowPtr[i + 1]; p++) { s += val[p] * x[colIdx[p]]; }
+            y[i] = s;
+        }
+        return OK;
+    }
+
+    // y = A^T x (x has rows numbers, y has cols numbers, y must not be x)
+    public int mulVecT(double* x, double* y) {
+        if (!ok() || x == null || y == null || x == y) { return ERR_ARG; }
+        for (int j = 0; j < cols; j++) { y[j] = 0.0; }
+        for (int i = 0; i < rows; i++) {
+            double xi = x[i];
+            for (int p = rowPtr[i]; p < rowPtr[i + 1]; p++) { y[colIdx[p]] += val[p] * xi; }
+        }
+        return OK;
+    }
+
+    public CsrMatrix transpose() {
+        if (!ok()) { return failedCsr(ERR_ARG); }
+        CsrMatrix t(cols, rows, nnz);
+        if (!t.ok()) { return t; }
+        for (int p = 0; p < nnz; p++) { t.rowPtr[colIdx[p] + 1]++; }
+        for (int j = 0; j < cols; j++) { t.rowPtr[j + 1] += t.rowPtr[j]; }
+        int* next = newInts(cols);
+        if (next == null) {
+            t.dispose();
+            return failedCsr(ERR_MEMORY);
+        }
+        for (int j = 0; j < cols; j++) { next[j] = t.rowPtr[j]; }
+        for (int i = 0; i < rows; i++) {
+            for (int p = rowPtr[i]; p < rowPtr[i + 1]; p++) {
+                int q = next[colIdx[p]]++;
+                t.colIdx[q] = i;
+                t.val[q] = val[p];
+            }
+        }
+        freeMem(next);
+        t.nnz = nnz;
+        return t;
+    }
+
+    // this + alpha * o (entries that cancel exactly are dropped)
+    public CsrMatrix addScaled(double alpha, CsrMatrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failedCsr(ERR_ARG); }
+        if (rows != o->rows || cols != o->cols) { return failedCsr(ERR_DIM); }
+        CsrMatrix r(rows, cols, nnz + o->nnz);
+        if (!r.ok()) { return r; }
+        int cnt = 0;
+        for (int i = 0; i < rows; i++) {
+            int a = rowPtr[i];
+            int b = o->rowPtr[i];
+            int ae = rowPtr[i + 1];
+            int be = o->rowPtr[i + 1];
+            while (a < ae || b < be) {
+                int ja = (a < ae) ? colIdx[a] : 0x7FFFFFFFFFFFFFFF;
+                int jb = (b < be) ? o->colIdx[b] : 0x7FFFFFFFFFFFFFFF;
+                int j;
+                double v;
+                if (ja == jb) {
+                    j = ja;
+                    v = val[a] + alpha * o->val[b];
+                    a++;
+                    b++;
+                } else if (ja < jb) {
+                    j = ja;
+                    v = val[a];
+                    a++;
+                } else {
+                    j = jb;
+                    v = alpha * o->val[b];
+                    b++;
+                }
+                if (v != 0.0) {
+                    r.colIdx[cnt] = j;
+                    r.val[cnt] = v;
+                    cnt++;
+                }
+            }
+            r.rowPtr[i + 1] = cnt;
+        }
+        r.nnz = cnt;
+        return r;
+    }
+
+    // the product A * B of two sparse matrices (Gustavson's algorithm with a dense accumulator row)
+    public CsrMatrix mul(CsrMatrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failedCsr(ERR_ARG); }
+        if (cols != o->rows) { return failedCsr(ERR_DIM); }
+        int ocols = o->cols;
+        double* acc = newDoubles(ocols);
+        int* mark = newInts(ocols);                // mark[j] = row number + 1 when column j is in the current row
+        int* list = newInts(ocols);
+        if (acc == null || mark == null || list == null) {
+            freeMem(acc);
+            freeMem(mark);
+            freeMem(list);
+            return failedCsr(ERR_MEMORY);
+        }
+        int cap = nnz + o->nnz + 16;
+        int cnt = 0;
+        CsrMatrix r(rows, ocols, cap);
+        if (!r.ok()) {
+            freeMem(acc);
+            freeMem(mark);
+            freeMem(list);
+            return r;
+        }
+        for (int i = 0; i < rows; i++) {
+            int nl = 0;
+            for (int p = rowPtr[i]; p < rowPtr[i + 1]; p++) {
+                double a = val[p];
+                int kr = colIdx[p];
+                for (int q = o->rowPtr[kr]; q < o->rowPtr[kr + 1]; q++) {
+                    int j = o->colIdx[q];
+                    if (mark[j] != i + 1) {
+                        mark[j] = i + 1;
+                        acc[j] = 0.0;
+                        list[nl] = j;
+                        nl++;
+                    }
+                    acc[j] += a * o->val[q];
+                }
+            }
+            sortInts(list, nl);
+            if (cnt + nl > cap) {
+                int ncap = (cnt + nl) * 2;
+                if (ncap > 0x10000000 || cnt + nl > 0x10000000) {
+                    freeMem(acc);
+                    freeMem(mark);
+                    freeMem(list);
+                    r.dispose();
+                    return failedCsr(ERR_MEMORY);
+                }
+                int* nci = newInts(ncap);
+                double* nv = newDoubles(ncap);
+                if (nci == null || nv == null) {
+                    freeMem(nci);
+                    freeMem(nv);
+                    freeMem(acc);
+                    freeMem(mark);
+                    freeMem(list);
+                    r.dispose();
+                    return failedCsr(ERR_MEMORY);
+                }
+                for (int t = 0; t < cnt; t++) {
+                    nci[t] = r.colIdx[t];
+                    nv[t] = r.val[t];
+                }
+                freeMem(r.colIdx);
+                freeMem(r.val);
+                r.colIdx = nci;
+                r.val = nv;
+                cap = ncap;
+            }
+            for (int t = 0; t < nl; t++) {
+                double v = acc[list[t]];
+                if (v != 0.0) {
+                    r.colIdx[cnt] = list[t];
+                    r.val[cnt] = v;
+                    cnt++;
+                }
+            }
+            r.rowPtr[i + 1] = cnt;
+        }
+        r.nnz = cnt;
+        freeMem(acc);
+        freeMem(mark);
+        freeMem(list);
+        return r;
+    }
+
+    public CsrMatrix scaled(double k) {
+        if (!ok()) { return failedCsr(ERR_ARG); }
+        CsrMatrix r(rows, cols, nnz);
+        if (!r.ok()) { return r; }
+        for (int i = 0; i <= rows; i++) { r.rowPtr[i] = rowPtr[i]; }
+        for (int p = 0; p < nnz; p++) {
+            r.colIdx[p] = colIdx[p];
+            r.val[p] = val[p] * k;
+        }
+        r.nnz = nnz;
+        return r;
+    }
+
+    // the diagonal: min(rows, cols) numbers
+    public void diagonal(double* out) {
+        int m = (rows < cols) ? rows : cols;
+        for (int i = 0; i < m; i++) { out[i] = get(i, i); }
+    }
+
+    public Matrix toDense() {
+        if (!ok()) { return failed(ERR_ARG); }
+        Matrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        for (int i = 0; i < rows; i++) {
+            for (int p = rowPtr[i]; p < rowPtr[i + 1]; p++) { r.d[i * cols + colIdx[p]] = val[p]; }
+        }
+        return r;
+    }
+
+    public double normFro() { return (!ok()) ? nanValue() : vecNorm2(val, nnz); }
+
+    public void dispose() {
+        freeMem(rowPtr);
+        freeMem(colIdx);
+        freeMem(val);
+        rowPtr = null;
+        colIdx = null;
+        val = null;
+        rows = 0;
+        cols = 0;
+        nnz = 0;
+    }
+}
+
+private CsrMatrix failedCsr(int code) {
+    CsrMatrix m;
+    m.err = code;
+    return m;
+}
+
+// heap sort of a small int array
+private void sortInts(int* a, int n) {
+    if (n < 2) { return; }
+    if (n < 24) {
+        for (int i = 1; i < n; i++) {
+            int v = a[i];
+            int j = i - 1;
+            while (j >= 0 && a[j] > v) {
+                a[j + 1] = a[j];
+                j--;
+            }
+            a[j + 1] = v;
+        }
+        return;
+    }
+    for (int start = n / 2 - 1; start >= 0; start--) { siftDown(a, start, n); }
+    for (int end = n - 1; end > 0; end--) {
+        int t = a[0];
+        a[0] = a[end];
+        a[end] = t;
+        siftDown(a, 0, end);
+    }
+}
+
+private void siftDown(int* a, int root, int n) {
+    while (true) {
+        int child = 2 * root + 1;
+        if (child >= n) { return; }
+        if (child + 1 < n && a[child + 1] > a[child]) { child++; }
+        if (a[root] >= a[child]) { return; }
+        int t = a[root];
+        a[root] = a[child];
+        a[child] = t;
+        root = child;
+    }
+}
+
+// Collects entries (i, j, value) in any order and builds a CsrMatrix: duplicates are added up, entries that sum to exactly 0 are dropped.
+public class CooBuilder {
+    public int rows;
+    public int cols;
+    public int count;                      // entries added so far
+    private int* ri;
+    private int* ci;
+    private double* vv;
+    private int cap;
+
+    public CooBuilder(int r, int c) {
+        rows = r;
+        cols = c;
+    }
+
+    // false when (i, j) is out of range, v is not finite, or memory is short
+    public bool add(int i, int j, double v) {
+        if (i < 0 || i >= rows || j < 0 || j >= cols || !finite(v)) { return false; }
+        if (count == cap) {
+            int nc = (cap == 0) ? 16 : cap * 2;
+            if (nc > 0x10000000) { return false; }
+            int* nr = newInts(nc);
+            int* ncc = newInts(nc);
+            double* nv = newDoubles(nc);
+            if (nr == null || ncc == null || nv == null) {
+                freeMem(nr);
+                freeMem(ncc);
+                freeMem(nv);
+                return false;
+            }
+            for (int t = 0; t < count; t++) {
+                nr[t] = ri[t];
+                ncc[t] = ci[t];
+                nv[t] = vv[t];
+            }
+            freeMem(ri);
+            freeMem(ci);
+            freeMem(vv);
+            ri = nr;
+            ci = ncc;
+            vv = nv;
+            cap = nc;
+        }
+        ri[count] = i;
+        ci[count] = j;
+        vv[count] = v;
+        count++;
+        return true;
+    }
+
+    public CsrMatrix build() {
+        if (rows <= 0 || cols <= 0) { return failedCsr(ERR_ARG); }
+        // count sort by row, then sort every row by column and add up duplicates
+        int* start = newInts(rows + 1);
+        int* order = newInts(count > 0 ? count : 1);
+        if (start == null || order == null) {
+            freeMem(start);
+            freeMem(order);
+            return failedCsr(ERR_MEMORY);
+        }
+        for (int t = 0; t < count; t++) { start[ri[t] + 1]++; }
+        for (int i = 0; i < rows; i++) { start[i + 1] += start[i]; }
+        int* fillp = newInts(rows);
+        if (fillp == null) {
+            freeMem(start);
+            freeMem(order);
+            return failedCsr(ERR_MEMORY);
+        }
+        for (int i = 0; i < rows; i++) { fillp[i] = start[i]; }
+        for (int t = 0; t < count; t++) { order[fillp[ri[t]]++] = t; }
+        freeMem(fillp);
+        CsrMatrix r(rows, cols, count);
+        if (!r.ok()) {
+            freeMem(start);
+            freeMem(order);
+            return r;
+        }
+        int cnt = 0;
+        for (int i = 0; i < rows; i++) {
+            int lo = start[i];
+            int hi = start[i + 1];
+            sortByColumn(order, lo, hi);
+            int p = lo;
+            while (p < hi) {
+                int j = ci[order[p]];
+                double s = 0.0;
+                while (p < hi && ci[order[p]] == j) {
+                    s += vv[order[p]];
+                    p++;
+                }
+                if (s != 0.0) {
+                    r.colIdx[cnt] = j;
+                    r.val[cnt] = s;
+                    cnt++;
+                }
+            }
+            r.rowPtr[i + 1] = cnt;
+        }
+        r.nnz = cnt;
+        freeMem(start);
+        freeMem(order);
+        return r;
+    }
+
+    // sorts order[lo .. hi) by column index, stable (insertion sort for short rows, merge sort otherwise)
+    private void sortByColumn(int* order, int lo, int hi) {
+        int n = hi - lo;
+        if (n < 2) { return; }
+        if (n <= 24) {
+            for (int a = lo + 1; a < hi; a++) {
+                int v = order[a];
+                int b = a - 1;
+                while (b >= lo && ci[order[b]] > ci[v]) {
+                    order[b + 1] = order[b];
+                    b--;
+                }
+                order[b + 1] = v;
+            }
+            return;
+        }
+        int* tmp = newInts(n);
+        if (tmp == null) {
+            // no scratch memory: insertion sort (slow but correct)
+            for (int a = lo + 1; a < hi; a++) {
+                int v = order[a];
+                int b = a - 1;
+                while (b >= lo && ci[order[b]] > ci[v]) {
+                    order[b + 1] = order[b];
+                    b--;
+                }
+                order[b + 1] = v;
+            }
+            return;
+        }
+        int width = 1;
+        while (width < n) {
+            int pos = 0;
+            while (pos < n) {
+                int mid = pos + width;
+                if (mid > n) { mid = n; }
+                int end = pos + 2 * width;
+                if (end > n) { end = n; }
+                int a = pos;
+                int b = mid;
+                int o = pos;
+                while (a < mid && b < end) {
+                    if (ci[order[lo + b]] < ci[order[lo + a]]) { tmp[o++] = order[lo + b++]; } else { tmp[o++] = order[lo + a++]; }
+                }
+                while (a < mid) { tmp[o++] = order[lo + a++]; }
+                while (b < end) { tmp[o++] = order[lo + b++]; }
+                pos = end;
+            }
+            for (int t = 0; t < n; t++) { order[lo + t] = tmp[t]; }
+            width = width * 2;
+        }
+        freeMem(tmp);
+    }
+
+    public void dispose() {
+        freeMem(ri);
+        freeMem(ci);
+        freeMem(vv);
+        ri = null;
+        ci = null;
+        vv = null;
+        cap = 0;
+        count = 0;
+    }
+}
+
+// the sparse form of a dense matrix: entries with |value| <= tol are dropped
+public CsrMatrix fromDense(Matrix* m, double tol = ZERO) {
+    if (m == null || !m->ok()) { return failedCsr(ERR_ARG); }
+    CooBuilder b(m->rows, m->cols);
+    for (int i = 0; i < m->rows; i++) {
+        for (int j = 0; j < m->cols; j++) {
+            double v = m->d[i * m->cols + j];
+            if (absd(v) > tol || (v != v)) {
+                if (!b.add(i, j, v)) {
+                    b.dispose();
+                    return failedCsr(finite(v) ? ERR_MEMORY : ERR_NOT_FINITE);
+                }
+            }
+        }
+    }
+    CsrMatrix r = b.build();
+    b.dispose();
+    return r;
+}
+
+// Conjugate gradient for a symmetric positive definite sparse matrix (Jacobi preconditioned when `jacobi` is true). x holds the starting guess and receives the solution.
+// Stops when |r| <= tol * |b|; *iters (optional) receives the iterations used. OK, ERR_NO_CONVERGE after maxIter iterations (x is the last iterate), ERR_NOT_SPD
+// when a direction of non positive curvature shows up (the matrix is not positive definite), ERR_DIM / ERR_ARG for bad input.
+public int cg(CsrMatrix* a, double* b, double* x, int maxIter, double tol, int* iters = null, bool jacobi = true) {
+    if (a == null || !a->ok() || b == null || x == null || maxIter < 0) { return ERR_ARG; }
+    if (a->rows != a->cols) { return ERR_DIM; }
+    int n = a->rows;
+    double* r = newDoubles(n);
+    double* p = newDoubles(n);
+    double* q = newDoubles(n);
+    double* z = newDoubles(n);
+    double* dinv = newDoubles(n);
+    if (r == null || p == null || q == null || z == null || dinv == null) {
+        freeMem(r); freeMem(p); freeMem(q); freeMem(z); freeMem(dinv);
+        return ERR_MEMORY;
+    }
+    int status = OK;
+    for (int i = 0; i < n; i++) {
+        double dg = a->get(i, i);
+        dinv[i] = (jacobi && dg > 0.0) ? 1.0 / dg : 1.0;
+    }
+    a->mulVec(x, q);
+    for (int i = 0; i < n; i++) { r[i] = b[i] - q[i]; }
+    double bn = vecNorm2(b, n);
+    if (bn == 0.0) { bn = 1.0; }
+    for (int i = 0; i < n; i++) { z[i] = dinv[i] * r[i]; p[i] = z[i]; }
+    double rz = vecDot(r, z, n);
+    int it = 0;
+    while (vecNorm2(r, n) > tol * bn) {
+        if (it >= maxIter) { status = ERR_NO_CONVERGE; break; }
+        a->mulVec(p, q);
+        double pq = vecDot(p, q, n);
+        if (!(pq > 0.0)) { status = finite(pq) ? ERR_NOT_SPD : ERR_NOT_FINITE; break; }
+        double alpha = rz / pq;
+        for (int i = 0; i < n; i++) {
+            x[i] += alpha * p[i];
+            r[i] -= alpha * q[i];
+            z[i] = dinv[i] * r[i];
+        }
+        double rz2 = vecDot(r, z, n);
+        double beta = rz2 / rz;
+        rz = rz2;
+        for (int i = 0; i < n; i++) { p[i] = z[i] + beta * p[i]; }
+        it++;
+    }
+    if (iters != null) { *iters = it; }
+    freeMem(r); freeMem(p); freeMem(q); freeMem(z); freeMem(dinv);
+    return status;
+}
+
+// ---- complex matrices -----------------------------------------------------------------------------------------------------------------------------------------
+// Real and imaginary parts are stored in two parallel arrays (A has no complex number type): the element (i, j) is re[i * cols + j] + i * im[i * cols + j].
+public class CMatrix {
+    public int rows;
+    public int cols;
+    public double* re;
+    public double* im;
+    public int err;
+
+    public CMatrix(int r, int c) {
+        err = OK;
+        if (r <= 0 || c <= 0 || r > MAX_ELEMS / c) {
+            err = ERR_ARG;
+            return;
+        }
+        re = newDoubles(r * c);
+        im = newDoubles(r * c);
+        if (re == null || im == null) {
+            freeMem(re);
+            freeMem(im);
+            re = null;
+            im = null;
+            err = ERR_MEMORY;
+            return;
+        }
+        rows = r;
+        cols = c;
+    }
+
+    public bool ok() { return re != null && im != null && rows > 0 && cols > 0; }
+
+    public bool set(int i, int j, double r, double m) {
+        if (!ok() || i < 0 || i >= rows || j < 0 || j >= cols) { return false; }
+        re[i * cols + j] = r;
+        im[i * cols + j] = m;
+        return true;
+    }
+
+    public double getRe(int i, int j) {
+        if (!ok() || i < 0 || i >= rows || j < 0 || j >= cols) { return nanValue(); }
+        return re[i * cols + j];
+    }
+
+    public double getIm(int i, int j) {
+        if (!ok() || i < 0 || i >= rows || j < 0 || j >= cols) { return nanValue(); }
+        return im[i * cols + j];
+    }
+
+    public void setIdentity() {
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) {
+            re[i] = 0.0;
+            im[i] = 0.0;
+        }
+        int m = (rows < cols) ? rows : cols;
+        for (int i = 0; i < m; i++) { re[i * cols + i] = 1.0; }
+    }
+
+    public CMatrix copy() {
+        if (!ok()) { return failedC(ERR_ARG); }
+        CMatrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) {
+            r.re[i] = re[i];
+            r.im[i] = im[i];
+        }
+        return r;
+    }
+
+    public CMatrix add(CMatrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failedC(ERR_ARG); }
+        if (rows != o->rows || cols != o->cols) { return failedC(ERR_DIM); }
+        CMatrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) {
+            r.re[i] = re[i] + o->re[i];
+            r.im[i] = im[i] + o->im[i];
+        }
+        return r;
+    }
+
+    public CMatrix sub(CMatrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failedC(ERR_ARG); }
+        if (rows != o->rows || cols != o->cols) { return failedC(ERR_DIM); }
+        CMatrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) {
+            r.re[i] = re[i] - o->re[i];
+            r.im[i] = im[i] - o->im[i];
+        }
+        return r;
+    }
+
+    // multiplied by the complex number (kr + i ki)
+    public CMatrix scaled(double kr, double ki) {
+        if (!ok()) { return failedC(ERR_ARG); }
+        CMatrix r(rows, cols);
+        if (!r.ok()) { return r; }
+        int n = rows * cols;
+        for (int i = 0; i < n; i++) {
+            r.re[i] = re[i] * kr - im[i] * ki;
+            r.im[i] = re[i] * ki + im[i] * kr;
+        }
+        return r;
+    }
+
+    public CMatrix mul(CMatrix* o) {
+        if (!ok() || o == null || !o->ok()) { return failedC(ERR_ARG); }
+        if (cols != o->rows) { return failedC(ERR_DIM); }
+        CMatrix r(rows, o->cols);
+        if (!r.ok()) { return r; }
+        int n = o->cols;
+        for (int i = 0; i < rows; i++) {
+            for (int k = 0; k < cols; k++) {
+                double ar = re[i * cols + k];
+                double ai = im[i * cols + k];
+                for (int j = 0; j < n; j++) {
+                    double br = o->re[k * n + j];
+                    double bi = o->im[k * n + j];
+                    r.re[i * n + j] += ar * br - ai * bi;
+                    r.im[i * n + j] += ar * bi + ai * br;
+                }
+            }
+        }
+        return r;
+    }
+
+    // the conjugate transpose A^H
+    public CMatrix conjTranspose() {
+        if (!ok()) { return failedC(ERR_ARG); }
+        CMatrix r(cols, rows);
+        if (!r.ok()) { return r; }
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                r.re[j * rows + i] = re[i * cols + j];
+                r.im[j * rows + i] = -im[i * cols + j];
+            }
+        }
+        return r;
+    }
+
+    public int trace(double* outRe, double* outIm) {
+        if (!ok() || outRe == null || outIm == null) { return ERR_ARG; }
+        int m = (rows < cols) ? rows : cols;
+        double sr = 0.0;
+        double si = 0.0;
+        for (int i = 0; i < m; i++) {
+            sr += re[i * cols + i];
+            si += im[i * cols + i];
+        }
+        *outRe = sr;
+        *outIm = si;
+        return OK;
+    }
+
+    public double normFro() {
+        if (!ok()) { return nanValue(); }
+        double a = vecNorm2(re, rows * cols);
+        double b = vecNorm2(im, rows * cols);
+        return dmath.hypot(a, b);
+    }
+
+    // y = A x for complex vectors given as separate real and imaginary arrays
+    public int mulVec(double* xr, double* xi, double* yr, double* yi) {
+        if (!ok() || xr == null || xi == null || yr == null || yi == null) { return ERR_ARG; }
+        if (xr == yr || xi == yi || xr == yi || xi == yr) { return ERR_ARG; }
+        for (int i = 0; i < rows; i++) {
+            double sr = 0.0;
+            double si = 0.0;
+            for (int j = 0; j < cols; j++) {
+                double ar = re[i * cols + j];
+                double ai = im[i * cols + j];
+                sr += ar * xr[j] - ai * xi[j];
+                si += ar * xi[j] + ai * xr[j];
+            }
+            yr[i] = sr;
+            yi[i] = si;
+        }
+        return OK;
+    }
+
+    // the determinant (complex LU with partial pivoting); 0 for a singular matrix
+    public int det(double* outRe, double* outIm) {
+        if (!ok() || outRe == null || outIm == null) { return ERR_ARG; }
+        if (rows != cols) { return ERR_DIM; }
+        return cluSolve(this, null, null, null, null, outRe, outIm);
+    }
+
+    // solves A x = b for complex vectors (b and x may be the same arrays); ERR_SINGULAR when a pivot is exactly zero or the system is numerically singular
+    public int solve(double* br, double* bi, double* xr, double* xi) {
+        if (!ok() || br == null || bi == null || xr == null || xi == null) { return ERR_ARG; }
+        if (rows != cols) { return ERR_DIM; }
+        double dr;
+        double di;
+        return cluSolve(this, br, bi, xr, xi, &dr, &di);
+    }
+
+    public void dispose() {
+        freeMem(re);
+        freeMem(im);
+        re = null;
+        im = null;
+        rows = 0;
+        cols = 0;
+    }
+}
+
+private CMatrix failedC(int code) {
+    CMatrix m;
+    m.err = code;
+    return m;
+}
+
+// complex division (a + bi) / (c + di) by Smith's algorithm (no overflow of c * c + d * d)
+private void cdiv(double a, double b, double c, double d, double* qr, double* qi) {
+    if (absd(c) >= absd(d)) {
+        double r = d / c;
+        double den = c + d * r;
+        *qr = (a + b * r) / den;
+        *qi = (b - a * r) / den;
+    } else {
+        double r = c / d;
+        double den = c * r + d;
+        *qr = (a * r + b) / den;
+        *qi = (b * r - a) / den;
+    }
+}
+
+// complex LU with partial pivoting on a copy; computes the determinant and, when br is not null, solves for one right hand side
+private int cluSolve(CMatrix* a, double* br, double* bi, double* xr, double* xi, double* detRe, double* detIm) {
+    int n = a->rows;
+    if (!allFinite(a->re, n * n) || !allFinite(a->im, n * n)) { return ERR_NOT_FINITE; }
+    double* wr = newDoubles(n * n);
+    double* wi = newDoubles(n * n);
+    double* yr = newDoubles(n);
+    double* yi = newDoubles(n);
+    if (wr == null || wi == null || yr == null || yi == null) {
+        freeMem(wr); freeMem(wi); freeMem(yr); freeMem(yi);
+        return ERR_MEMORY;
+    }
+    for (int i = 0; i < n * n; i++) {
+        wr[i] = a->re[i];
+        wi[i] = a->im[i];
+    }
+    if (br != null) {
+        for (int i = 0; i < n; i++) {
+            yr[i] = br[i];
+            yi[i] = bi[i];
+        }
+    }
+    double dr = 1.0;
+    double di = 0.0;
+    int status = OK;
+    for (int k = 0; k < n; k++) {
+        int p = k;
+        double mx = absd(wr[k * n + k]) + absd(wi[k * n + k]);
+        for (int i = k + 1; i < n; i++) {
+            double v = absd(wr[i * n + k]) + absd(wi[i * n + k]);
+            if (v > mx) { mx = v; p = i; }
+        }
+        if (mx == 0.0) {
+            dr = 0.0;
+            di = 0.0;
+            status = ERR_SINGULAR;
+            break;
+        }
+        if (p != k) {
+            for (int j = 0; j < n; j++) {
+                double t = wr[k * n + j];
+                wr[k * n + j] = wr[p * n + j];
+                wr[p * n + j] = t;
+                t = wi[k * n + j];
+                wi[k * n + j] = wi[p * n + j];
+                wi[p * n + j] = t;
+            }
+            double t = yr[k];
+            yr[k] = yr[p];
+            yr[p] = t;
+            t = yi[k];
+            yi[k] = yi[p];
+            yi[p] = t;
+            dr = -dr;
+            di = -di;
+        }
+        double pr = wr[k * n + k];
+        double pi = wi[k * n + k];
+        double nr = dr * pr - di * pi;
+        di = dr * pi + di * pr;
+        dr = nr;
+        for (int i = k + 1; i < n; i++) {
+            double lr;
+            double li;
+            cdiv(wr[i * n + k], wi[i * n + k], pr, pi, &lr, &li);
+            wr[i * n + k] = lr;
+            wi[i * n + k] = li;
+            for (int j = k + 1; j < n; j++) {
+                double ur = wr[k * n + j];
+                double ui = wi[k * n + j];
+                wr[i * n + j] -= lr * ur - li * ui;
+                wi[i * n + j] -= lr * ui + li * ur;
+            }
+            double tr = lr * yr[k] - li * yi[k];
+            double ti = lr * yi[k] + li * yr[k];
+            yr[i] -= tr;
+            yi[i] -= ti;
+        }
+    }
+    *detRe = dr;
+    *detIm = di;
+    if (status == OK && br != null) {
+        // the pivot sizes decide whether the system is numerically singular: a pivot below eps * (largest pivot) is refused
+        double big = 0.0;
+        double small = infValue();
+        for (int i = 0; i < n; i++) {
+            double v = absd(wr[i * n + i]) + absd(wi[i * n + i]);
+            if (v > big) { big = v; }
+            if (v < small) { small = v; }
+        }
+        if (small <= EPS * big) { status = ERR_SINGULAR; }
+    }
+    if (status == OK && br != null) {
+        for (int i = n - 1; i >= 0; i--) {
+            double sr = yr[i];
+            double si = yi[i];
+            for (int j = i + 1; j < n; j++) {
+                sr -= wr[i * n + j] * xr[j] - wi[i * n + j] * xi[j];
+                si -= wr[i * n + j] * xi[j] + wi[i * n + j] * xr[j];
+            }
+            double qr;
+            double qi;
+            cdiv(sr, si, wr[i * n + i], wi[i * n + i], &qr, &qi);
+            xr[i] = qr;
+            xi[i] = qi;
+        }
+        if (!allFinite(xr, n) || !allFinite(xi, n)) { status = ERR_NOT_FINITE; }
+    }
+    freeMem(wr); freeMem(wi); freeMem(yr); freeMem(yi);
+    return status;
+}
