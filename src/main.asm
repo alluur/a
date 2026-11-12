@@ -2379,6 +2379,17 @@ cur_va_cnt:     resd 1
 agg_vis:        resd 1
 agg_union:      resd 1
 agg_virtual:    resd 1
+agg_cmods:      resd 1                  ; SF_ABSTRACT / SF_FINAL written before 'class'
+agg_mflags:     resd 1                  ; modifiers of the member being parsed: 1 static, 2 abstract, 4 override, 8 final
+cur_static:     resd 1                  ; compiling a static method
+pend_lbl_ptr:   resq 1                 ; a label that stands directly in front of the next statement
+pend_lbl_len:   resd 1
+stmt_lbl_ptr:   resq 1                  ; the label of the statement being parsed (taken by loop_push)
+stmt_lbl_len:   resd 1
+loop_lbl_ptr:   resq MAXLOOP            ; per loop / switch record: its label
+loop_lbl_len:   resd MAXLOOP
+assertbuf:      resb 512
+st_flags:       resd STRUCT_MAX         ; SF_* of every class
 in_amodule:     resd 1
 need_float:     resd 1
 float_entry:    resq 1

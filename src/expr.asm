@@ -16,6 +16,9 @@ CSTR msg_nomember,   "no such member"
 CSTR msg_privmember, "member is private to its class"
 CSTR msg_unktype,    "unknown type"
 CSTR alloc_name,     "alloc"
+CSTR w_is,           "is"
+CSTR w_as,           "as"
+CSTR w_isa,          "__isa"
 compound_map: db '+', '-', '*', '/', '%', '&', '|', '^', T_SHL, T_SHR
 
 section .text
@@ -654,9 +657,9 @@ is_type_start_impl:
     jz .no
     mov ecx, [rax+SYM_KIND]
     cmp ecx, S_STRUCT
-    je .yes
+    je .maybe_dot
     cmp ecx, S_ENUM
-    je .yes
+    je .maybe_dot
     cmp ecx, S_TYPEDEF
     je .yes
     cmp ecx, S_MODULE
@@ -699,6 +702,20 @@ is_type_start_impl:
     ret
 .no:
     xor eax, eax
+    ret
+; a class or enum name followed by '.' starts an expression (Counter.count, Color.Red), not a declaration
+.maybe_dot:
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor ebx, ebx
+    cmp qword [tk], '.'
+    setne bl
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    mov eax, ebx
     ret
 
 ; parse_type -> rax = type; consumes the type and any '*' suffixes
@@ -1419,6 +1436,10 @@ parse_primary:
     jne .this1
     ERR "'this' used outside of a method"
 .this1:
+    cmp dword [cur_static], 0
+    je .this2
+    ERR "'this' cannot be used in a static method"
+.this2:
     mov edi, [cur_this_off]
     CG load_local_a
     mov eax, [cur_class]
@@ -1589,6 +1610,14 @@ parse_primary:
     call fatal_error_tok
 .supm2:
     mov r12, rax
+    test dword [r12+SYM_FLAGS], F_STATIC
+    jz .supm2a
+    ERR "a static method is called with the name of its class, not with super"
+.supm2a:
+    test dword [r12+SYM_FLAGS], F_ABSTRACT
+    jz .supm2b
+    ERR "an abstract method of the base class has no code that super could call"
+.supm2b:
     call method_vis_ok
     test eax, eax
     jnz .supm3
@@ -1709,10 +1738,23 @@ parse_primary:
     mov rdi, [e_type]
     bt rdi, TF_ARRAY_BIT
     jnc .sz_scalar
-    ERR "sizeof of this array expression is not supported, use the name of the array"
+    call type_array_len                 ; an array field, a static field ...: the length travels with the type
+    test rax, rax
+    jnz .sz_alen
+    ERR "sizeof: the length of this array is not known here"
+.sz_alen:
+    mov r8, rax
+    mov rdi, [e_type]
+    TY_DECAY rdi
+    sub rdi, TY_PTR1
+    call type_size
+    imul rax, r8
+    mov rbx, rax
+    jmp .sz_close
 .sz_scalar:
     call type_size
     mov rbx, rax
+.sz_close:
     test r13d, r13d
     jz .sz_done
     mov edi, ')'
@@ -1861,6 +1903,8 @@ parse_primary:
 .new_bad:
     ERR "'new' needs a class or struct type"
 .new_ok:
+    mov rdi, rbx
+    call check_concrete
     mov r12, rbx
     shr r12, 16
     and r12d, 0xFFFF
@@ -2026,6 +2070,12 @@ parse_primary:
     mov edi, [cur_class]
     mov rsi, r13
     mov edx, r14d
+    call struct_find_static
+    test rax, rax
+    jnz .implicit_static
+    mov edi, [cur_class]
+    mov rsi, r13
+    mov edx, r14d
     call struct_find_method
     test rax, rax
     jnz .implicit_method
@@ -2050,6 +2100,8 @@ parse_primary:
     je .module
     cmp eax, S_ENUM
     je .enumname
+    cmp eax, S_STRUCT
+    je .structname
     ERR "a type name cannot be used as a value"
 
 .local:
@@ -2179,6 +2231,66 @@ parse_primary:
     call next_token
     jmp .dispatch
 
+; Class.member : a static field (a global of the class) or a static method call
+.structname:
+    mov rax, r12
+    call check_access
+    mov rbx, [r12+SYM_VAL]
+    cmp qword [tk], '.'
+    je .sn1
+    ERR "a class name can only be used in front of '.', as in Class.member"
+.sn1:
+    call next_token
+    cmp qword [tk], T_ID
+    je .sn2
+    ERR "expected a member name after the class name"
+.sn2:
+    mov edi, ebx
+    mov rsi, [tk_ptr]
+    mov edx, [tk_len]
+    call struct_find_static
+    test rax, rax
+    jz .sn_meth
+    mov r12, rax
+    call method_vis_ok
+    test eax, eax
+    jnz .sn3
+    mov edi, msg_privmember
+    call fatal_error_tok
+.sn3:
+    call next_token
+    jmp .global
+.sn_meth:
+    mov edi, ebx
+    mov rsi, [tk_ptr]
+    mov edx, [tk_len]
+    call struct_find_method
+    test rax, rax
+    jnz .sn4
+    mov edi, msg_nomember
+    call fatal_error_tok
+.sn4:
+    mov r12, rax
+    test dword [r12+SYM_FLAGS], F_STATIC
+    jnz .sn5
+    ERR "this method needs an object: it is not static"
+.sn5:
+    call method_vis_ok
+    test eax, eax
+    jnz .sn6
+    mov edi, msg_privmember
+    call fatal_error_tok
+.sn6:
+    call next_token
+    cmp qword [tk], '('
+    je .sn7
+    ERR "methods can only be called, not used as values"
+.sn7:
+    mov rdi, r12
+    xor esi, esi
+    call gen_call
+    jmp .out
+
 .enumname:
     mov rax, r12
     call sym_index
@@ -2280,7 +2392,21 @@ parse_primary:
     mov qword [e_lval], 0
     jmp .out
 
+.implicit_static:
+    mov r12, rax
+    call method_vis_ok
+    test eax, eax
+    jnz .isok
+    mov edi, msg_privmember
+    call fatal_error_tok
+.isok:
+    call next_token
+    jmp .global
 .implicit_field:
+    cmp dword [cur_static], 0
+    je .ifs
+    ERR "a static method has no object: this field needs one"
+.ifs:
     mov r12, rax
     mov eax, [r12+FD_VIS]
     mov edx, [r12+FD_OWNER]
@@ -2316,11 +2442,22 @@ parse_primary:
     je .im1
     ERR "methods can only be called, not used as values"
 .im1:
+    test dword [r12+SYM_FLAGS], F_STATIC
+    jnz .im_static
+    cmp dword [cur_static], 0
+    je .im2
+    ERR "a static method has no object: this method needs one"
+.im2:
     mov edi, [cur_this_off]
     CG load_local_a
     CG push_a
     mov rdi, r12
     mov esi, 1
+    call gen_call
+    jmp .out
+.im_static:
+    mov rdi, r12
+    xor esi, esi
     call gen_call
 
 .out:
@@ -2351,12 +2488,124 @@ parse_postfix:
     je .postdec
     cmp eax, '('
     je .callptr
+    cmp eax, T_ID
+    jne .out
+    mov rdi, w_is
+    call tk_is_word
+    test eax, eax
+    jnz .isop
+    mov rdi, w_as
+    call tk_is_word
+    test eax, eax
+    jnz .asop
 .out:
     pop r14
     pop r13
     pop r12
     pop rbx
     ret
+
+; x is Class  (a bool: x points to an object of that class or of a class derived from it)    x as Class  (x or null, of type Class*)
+; The object finds its class through the vtable pointer; the vtables of a class and of its base class are chained (see parse_aggregate)
+; and __isa in lib/std.a walks the chain.
+.isop:
+    xor r13d, r13d
+    jmp .isas
+.asop:
+    mov r13d, 1
+.isas:
+    call to_rvalue
+    mov rax, [e_type]
+    mov ecx, eax
+    and ecx, 0xFFFF
+    cmp ecx, TY_STRUCT | TY_PTR1
+    je .ia1
+    ERR "'is' and 'as' need a pointer to a class with virtual methods on the left"
+.ia1:
+    mov r12d, eax
+    shr r12d, 16
+    and r12d, 0xFFFF                    ; the class of the pointer
+    mov eax, [st_vptr + r12*4]
+    test eax, eax
+    jnz .ia2
+    ERR "'is' and 'as': this class has no virtual methods, so its objects do not know their class"
+.ia2:
+    dec eax
+    mov r14d, eax                       ; offset of the vtable pointer in the object
+    call next_token                     ; is / as
+    call parse_type
+    mov rbx, rax
+    mov ecx, ebx
+    and ecx, 0xFFFF
+    cmp ecx, TY_STRUCT
+    je .ia3
+    cmp ecx, TY_STRUCT | TY_PTR1
+    je .ia3
+    ERR "'is' and 'as' need the name of a class on the right"
+.ia3:
+    shr rbx, 16
+    and ebx, 0xFFFF                     ; the class that is tested for
+    mov eax, [st_vt + rbx*4]
+    test eax, eax
+    jnz .ia4
+    ERR "'is' and 'as': this class has no virtual methods"
+.ia4:
+    mov edi, ebx
+    mov esi, r12d
+    call class_is_a
+    test eax, eax
+    jnz .ia5
+    mov edi, r12d
+    mov esi, ebx
+    call class_is_a
+    test eax, eax
+    jnz .ia5
+    ERR "'is' and 'as': the two classes are not related by inheritance"
+.ia5:
+    CG push_a                           ; x, kept for 'as'
+    CG push_a                           ; first argument
+    mov edi, r14d
+    CG imm_a
+    CG push_a
+    mov edx, [st_vt + rbx*4]
+    dec edx
+    mov esi, R_DATA
+    CG lea_global_a
+    CG push_a
+    mov rdi, w_isa
+    call emit_call_named
+    mov edi, 3
+    CG drop
+    test r13d, r13d
+    jnz .as1
+    mov edi, 1
+    CG drop                             ; the saved x
+    mov qword [e_type], TY_BOOL
+    mov qword [e_lval], 0
+    jmp .loop
+.as1:
+    push 0
+    mov rdi, rsp
+    CG jz_chain                         ; not an instance: the result is null
+    CG pop_a
+    push 0
+    mov rdi, rsp
+    CG jmp_chain
+    mov rdi, [rsp+8]
+    call patch_here
+    mov edi, 1
+    CG drop
+    xor edi, edi
+    CG imm_a
+    pop rdi
+    call patch_here
+    add rsp, 8
+    mov rax, rbx
+    shl rax, 16
+    or rax, TY_STRUCT | TY_PTR1
+    mov [e_type], rax
+    mov qword [e_lval], 0
+    jmp .loop
 
 ; call through a function pointer:  fp(a, b)  -  the target is pushed first, then the arguments;
 ; the target is fetched back from below the arguments. The result is an int.
@@ -2509,10 +2758,22 @@ parse_postfix:
     call struct_find_method
     test rax, rax
     jnz .m1
+    mov edi, ebx
+    mov rsi, r13
+    mov edx, r14d
+    call struct_find_static
+    test rax, rax
+    jz .m0
+    ERR "a static field is used with the name of its class (Class.name), not through an object"
+.m0:
     mov edi, msg_nomember
     call fatal_error_tok
 .m1:
     mov r12, rax
+    test dword [r12+SYM_FLAGS], F_STATIC
+    jz .m1a
+    ERR "a static method is called with the name of its class (Class.name(...)), not through an object"
+.m1a:
     call method_vis_ok
     test eax, eax
     jnz .m2
@@ -3915,8 +4176,21 @@ const_unary:
     call enum_find
     test rax, rax
     jnz .ie2
+    mov rdi, w_count                    ; Color.count is a constant too
+    call tk_is_word
+    test eax, eax
+    jnz .ie_count
     mov edi, msg_nomember
     call fatal_error_tok
+.ie_count:
+    mov edi, ebx
+    call enum_count
+    mov eax, eax
+    push rax
+    call next_token
+    pop rax
+    xor edx, edx
+    jmp .out
 .ie2:
     mov r12, rax
     call next_token

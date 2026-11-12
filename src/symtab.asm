@@ -323,6 +323,64 @@ struct_find_method:
     pop rbx
     ret
 
+; struct_find_static_here: edi = struct index, rsi = name, edx = len -> rax = the static field of that class or 0
+struct_find_static_here:
+    mov r8d, edi
+    mov r9, rsi
+    mov r11d, edx
+    mov eax, [sym_count]
+.l:
+    test eax, eax
+    jz .none
+    dec eax
+    mov r10, rax
+    shl r10, 6
+    add r10, symtab
+    cmp dword [r10+SYM_KIND], S_GLOBAL
+    jne .l
+    test dword [r10+SYM_FLAGS], F_STATIC
+    jz .l
+    cmp [r10+SYM_OWNER], r8d
+    jne .l
+    cmp [r10+SYM_NLEN], r11d
+    jne .l
+    mov rdi, [r10+SYM_NAME]
+    mov rsi, r9
+    mov ecx, r11d
+    repe cmpsb
+    jne .l
+    mov rax, r10
+    ret
+.none:
+    xor eax, eax
+    ret
+
+; struct_find_static: like struct_find_static_here, then the base classes
+struct_find_static:
+    push rbx
+    push r12
+    push r13
+    mov ebx, edi
+    mov r12, rsi
+    mov r13d, edx
+.try:
+    mov edi, ebx
+    mov rsi, r12
+    mov edx, r13d
+    call struct_find_static_here
+    test rax, rax
+    jnz .out
+    mov eax, [st_base + rbx*4]
+    test eax, eax
+    jz .out
+    lea ebx, [rax-1]
+    jmp .try
+.out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
 struct_find_method_here:
     mov r8d, edi
     mov r9, rsi
@@ -339,6 +397,8 @@ struct_find_method_here:
     jz .l
     test dword [r10+SYM_FLAGS], F_CTOR
     jnz .l
+    cmp dword [r10+SYM_KIND], S_FUNC    ; (a static field is a global with F_METHOD)
+    jne .l
     cmp [r10+SYM_OWNER], r8d
     jne .l
     cmp [r10+SYM_NLEN], r11d
@@ -445,6 +505,21 @@ type_size:
     and eax, 0xFFFF
     shl rax, 5
     mov eax, [struct_tab+rax+ST_SIZE]
+    ret
+
+; check_concrete: rdi = type. Errors when the type is an abstract class itself (a value, not a pointer to one)
+check_concrete:
+    test edi, 0xFF00
+    jnz .ok
+    cmp dil, TY_STRUCT
+    jne .ok
+    mov eax, edi
+    shr eax, 16
+    and eax, 0xFFFF
+    test dword [st_flags + rax*4], SF_ABSTRACT
+    jz .ok
+    ERR "an abstract class has no objects of its own: create an object of a subclass and use a pointer to the abstract class"
+.ok:
     ret
 
 ; type_with_len: rdi = array type (the array flag is set), rsi = number of elements -> rax = the type with the length in bits

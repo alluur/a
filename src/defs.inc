@@ -167,6 +167,12 @@
 %define F_PROTECTED     8192
 %define F_EXTERN        16384   ; extern declaration: the storage is defined in another object
 %define F_BYREF         2048    ; a struct parameter: the slot holds the address of the caller's copy
+%define F_STATIC        0x8000  ; a class member that belongs to the class (static method: no 'this'; static field: a global with F_METHOD)
+%define F_ABSTRACT      0x10000 ; an abstract method: no body, every concrete subclass has to override it
+%define F_FINAL         0x20000 ; a method that subclasses may not override
+; per class flags (st_flags)
+%define SF_ABSTRACT     1       ; abstract class: no objects of it
+%define SF_FINAL        2       ; final class: nothing derives from it
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
 %define ST_NAME         0       ; qword

@@ -95,6 +95,8 @@ parse_params:
 .ptype:
     call parse_type
     mov rbx, rax
+    mov rdi, rax
+    call check_concrete                 ; a parameter passed by value is an object
     cmp rbx, TY_VOID
     jne .nv
     cmp qword [tk], ')'
@@ -306,8 +308,14 @@ compile_function:
     jne .noretstruct
     inc ebx
 .noretstruct:
+    mov dword [cur_static], 0
     test dword [r12+SYM_FLAGS], F_METHOD
     jz .params
+    test dword [r12+SYM_FLAGS], F_STATIC
+    jz .hasthis
+    mov dword [cur_static], 1           ; a static method has no 'this'
+    jmp .params
+.hasthis:
     inc ebx
     mov r14d, 1
     lea eax, [rbx-1]
@@ -596,6 +604,15 @@ parse_aggregate:
 .p2ok:
     mov rbx, [rax+SYM_VAL]
 .named:
+    cmp dword [pass], 1
+    jne .nofl
+    mov eax, [agg_cmods]
+    mov [st_flags + rbx*4], eax          ; abstract / final class
+    cmp eax, SF_ABSTRACT | SF_FINAL
+    jne .nofl
+    ERR "a class cannot be both abstract and final"
+.nofl:
+    mov dword [agg_cmods], 0
     mov r15d, r14d                  ; default member visibility: classes private
     cmp dword [agg_anon_nt], 0
     je .nt0
@@ -630,6 +647,10 @@ parse_aggregate:
 .base_ok:
     cmp dword [pass], 1
     jne .nobase
+    test dword [st_flags + r12*4], SF_FINAL
+    jz .notfinal
+    ERR "cannot derive from a final class"
+.notfinal:
     lea eax, [r12+1]
     mov [st_base + rbx*4], eax
 .nobase:
@@ -678,11 +699,37 @@ parse_aggregate:
     mov r15d, eax
     jmp .mloop
 .nomod:
+    cmp qword [tk], T_ID
+    jne .nosa
+    mov rdi, w_static_assert
+    call tk_is_word
+    test eax, eax
+    jz .nosa
+    call parse_static_assert
+    jmp .mloop
+.nosa:
     mov dword [agg_virtual], 0
+    mov dword [agg_mflags], 0
+.modl:
     cmp qword [tk], K_VIRTUAL
-    jne .nv
+    jne .m_st
     mov dword [agg_virtual], 1
     call next_token
+    jmp .modl
+.m_st:
+    cmp qword [tk], K_STATIC
+    jne .m_id
+    or dword [agg_mflags], 1
+    call next_token
+    jmp .modl
+.m_id:
+    cmp qword [tk], T_ID
+    jne .nv
+    call member_modifier                ; abstract / override / final
+    test eax, eax
+    jz .nv
+    or [agg_mflags], eax
+    jmp .modl
 .nv:
     ; constructor?  (identifier equal to the class name)
     cmp qword [tk], T_ID
@@ -762,11 +809,19 @@ parse_aggregate:
     cmp qword [tk], '('
     je .method
 ; ---- field
+    test dword [agg_mflags], 14
+    jz .fnomod
+    ERR "abstract, override and final can only be used on methods"
+.fnomod:
+    test dword [agg_mflags], 1
+    jnz .staticfield
     cmp dword [pass], 1
     je .f1
     call skip_to_semi
     jmp .mloop
 .f1:
+    mov rdi, [agg_mtype]
+    call check_concrete                 ; a field cannot be an object of an abstract class
     mov r13, [agg_mtype]
     mov rdi, r13
     call type_ls
@@ -843,6 +898,56 @@ parse_aggregate:
     mov edi, ';'
     call expect
     jmp .mloop
+; ---- a static field: an ordinary global that belongs to the class (found as Class.name, hidden from plain lookup by F_METHOD)
+.staticfield:
+    cmp dword [pass], 1
+    je .sf1
+    call skip_to_semi
+    jmp .mloop
+.sf1:
+    mov edi, ebx
+    mov rsi, [agg_mname]
+    mov edx, [agg_mnlen]
+    call struct_find_static_here
+    test rax, rax
+    jz .sf2
+    mov edi, msg_redef
+    mov rax, [agg_mname]
+    mov [tk_ptr], rax
+    mov eax, [agg_mnlen]
+    mov [tk_len], eax
+    call fatal_error_tok
+.sf2:
+    mov rdi, [agg_mtype]
+    call check_concrete
+    mov r12d, [sym_count]               ; the symbols that parse_global_vars creates are the static fields
+    mov r13d, [agg_vis]
+    mov dword [agg_vis], 0
+    mov rax, [agg_mtype]
+    mov [agg_gtype], rax
+    mov dword [extern_decl], 0
+    call parse_global_vars
+    mov [agg_vis], r13d
+.sf3:
+    cmp r12d, [sym_count]
+    jae .mloop
+    mov rax, r12
+    shl rax, 6
+    add rax, symtab
+    cmp dword [rax+SYM_KIND], S_GLOBAL
+    jne .sf4
+    or dword [rax+SYM_FLAGS], F_METHOD | F_STATIC
+    mov [rax+SYM_OWNER], ebx
+    cmp dword [agg_vis], 1
+    jne .sf5
+    or dword [rax+SYM_FLAGS], F_PRIVATE
+.sf5:
+    cmp dword [agg_vis], 2
+    jne .sf4
+    or dword [rax+SYM_FLAGS], F_PROTECTED
+.sf4:
+    inc r12d
+    jmp .sf3
 ; ---- method / constructor
 .method:
     call parse_params
@@ -859,7 +964,56 @@ parse_aggregate:
     mov qword [agg_mname], op_neg_name
     mov dword [agg_mnlen], 12
 .nounary:
+    ; = 0  after the parameters declares an abstract method (C++ style)
+    cmp qword [tk], '='
+    jne .noeq0
+    call next_token
+    cmp qword [tk], T_NUM
+    jne .eq0bad
+    cmp qword [tk_val], 0
+    je .eq0ok
+.eq0bad:
+    ERR "expected 0 after '=' in a method declaration (an abstract method)"
+.eq0ok:
+    call next_token
+    or dword [agg_mflags], 2
+.noeq0:
     mov r8d, F_METHOD
+    mov eax, [agg_mflags]
+    test eax, 15
+    jz .nomflags
+    cmp dword [agg_isctor], 0
+    je .m_notctor
+    ERR "a constructor cannot be static, abstract, override or final"
+.m_notctor:
+    test eax, 1
+    jz .m_nstatic
+    cmp dword [agg_virtual], 0
+    jne .m_stbad
+    test eax, 14
+    jz .m_stok
+.m_stbad:
+    ERR "a static method cannot be virtual, abstract, override or final"
+.m_stok:
+    or r8d, F_STATIC
+.m_nstatic:
+    test eax, 2
+    jz .m_nabs
+    test eax, 8
+    jz .m_abs1
+    ERR "an abstract method cannot be final"
+.m_abs1:
+    or r8d, F_ABSTRACT
+    mov dword [agg_virtual], 1          ; an abstract method is virtual
+.m_nabs:
+    test eax, 4
+    jz .m_novr
+    mov dword [agg_virtual], 1          ; override: virtual, the base class method is checked
+.m_novr:
+    test eax, 8
+    jz .nomflags
+    or r8d, F_FINAL
+.nomflags:
     cmp dword [agg_vis], 0
     je .mf1
     cmp dword [agg_vis], 2
@@ -881,6 +1035,9 @@ parse_aggregate:
     mov r13, rax
     cmp dword [pass], 1
     jne .nov
+    call check_method_mods              ; override / final / abstract rules
+    test dword [r13+SYM_FLAGS], F_STATIC
+    jnz .nov
     call register_virtual
 .nov:
     cmp qword [tk], ';'
@@ -892,6 +1049,11 @@ parse_aggregate:
     je .mb1
     ERR "expected '{' or ';' after the method declaration"
 .mb1:
+    test dword [r13+SYM_FLAGS], F_ABSTRACT
+    jz .mb1a
+    mov edi, msg_abstract_body
+    jmp fatal_method
+.mb1a:
     cmp dword [pass], 1
     jne .mb2
     test dword [r13+SYM_FLAGS], F_DEFINED
@@ -929,12 +1091,54 @@ parse_aggregate:
     mov r12d, [st_vcount + rbx*4]
     test r12d, r12d
     jz .semi
-    lea rdi, [r12*8]
+    ; a class that is not abstract has to implement every abstract method it inherits
+    test dword [st_flags + rbx*4], SF_ABSTRACT
+    jnz .abs_ok
+    xor r14d, r14d
+.abs_l:
+    cmp r14d, r12d
+    jae .abs_ok
+    mov rax, rbx
+    shl rax, 6
+    add rax, r14
+    mov eax, [vt_method + rax*4]
+    shl rax, 6
+    add rax, symtab
+    test dword [rax+SYM_FLAGS], F_ABSTRACT
+    jz .abs_n
+    mov rcx, [rax+SYM_NAME]
+    mov [tk_ptr], rcx
+    mov ecx, [rax+SYM_NLEN]
+    mov [tk_len], ecx
+    mov edi, msg_abstract_missing
+    call fatal_error_tok
+.abs_n:
+    inc r14d
+    jmp .abs_l
+.abs_ok:
+    ; the vtable is one header word (the address of the vtable of the base class, 0 if there is none: the chain that 'is' and
+    ; 'as' walk) and one code address per slot, filled in by the linker
+    lea rdi, [r12*8 + 8]
     mov esi, 8
     call data_alloc
-    lea ecx, [rax+1]
+    lea ecx, [rax+9]
     mov [st_vt + rbx*4], ecx
-    mov r13d, eax
+    mov r15d, eax                       ; the header
+    lea r13d, [rax+8]                   ; slot 0
+    mov eax, [st_base + rbx*4]
+    test eax, eax
+    jz .vt_nohdr
+    lea edx, [rax-1]
+    mov edx, [st_vt + rdx*4]
+    test edx, edx
+    jz .vt_nohdr
+    dec edx
+    mov [data_buf + r15], rdx           ; the data offset of the base vtable, made an address by the relocation
+    mov edi, r15d
+    mov esi, R_DATA64
+    xor edx, edx
+    call add_reloc
+.vt_nohdr:
     xor r14d, r14d
 .vt:
     cmp r14d, r12d
@@ -943,9 +1147,15 @@ parse_aggregate:
     shl rax, 6
     add rax, r14
     mov edx, [vt_method + rax*4]
+    mov rax, rdx
+    shl rax, 6
+    add rax, symtab
+    test dword [rax+SYM_FLAGS], F_ABSTRACT
+    jnz .vt_n                           ; an abstract slot stays 0
     lea edi, [r13 + r14*8]
     mov esi, R_CODE64
     call add_reloc
+.vt_n:
     inc r14d
     jmp .vt
 .semi:
@@ -1066,6 +1276,212 @@ register_virtual:
     add rdx, rcx
     mov [vt_method + rdx*4], eax
 .ret:
+    ret
+
+section .rodata
+CSTR msg_abstract_body,    "an abstract method has no body"
+CSTR msg_abstract_missing, "this class does not implement the abstract method"
+CSTR msg_abstract_decl,    "abstract method in a class that is not declared abstract (write abstract class ...)"
+CSTR msg_final_over,       "cannot override a final method"
+CSTR msg_over_nobase,      "'override' but no base class has a virtual method that this one overrides"
+CSTR msg_over_notvirt,     "'override' but the method of the base class is not virtual"
+CSTR msg_over_sig,         "the result or parameter types differ from the method that is overridden"
+CSTR msg_final_nobase,     "'final' method that overrides nothing (final is for overrides)"
+CSTR msg_static_over,      "a static method cannot hide a virtual method of a base class"
+w_abstract: db "abstract", 0
+w_override: db "override", 0
+w_final:    db "final", 0
+section .text
+
+; fatal_method: edi = message. The error names the member that is being declared (agg_mname)
+fatal_method:
+    mov rax, [agg_mname]
+    mov [tk_ptr], rax
+    mov eax, [agg_mnlen]
+    mov [tk_len], eax
+    jmp fatal_error_tok
+
+; member_modifier: the current token is an identifier -> eax = 2 abstract, 4 override, 8 final (and the word is consumed) when it is one of
+; those words in front of a type or another modifier, else 0 (nothing consumed)
+member_modifier:
+    push rbx
+    mov ebx, 2
+    mov rdi, w_abstract
+    call tk_is_word
+    test eax, eax
+    jnz .try
+    mov ebx, 4
+    mov rdi, w_override
+    call tk_is_word
+    test eax, eax
+    jnz .try
+    mov ebx, 8
+    mov rdi, w_final
+    call tk_is_word
+    test eax, eax
+    jnz .try
+    xor eax, eax
+    pop rbx
+    ret
+.try:
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    mov eax, [tk]
+    cmp eax, T_ID
+    je .yes
+    cmp eax, K_INT
+    jb .no
+.yes:
+    add rsp, 128
+    mov eax, ebx
+    pop rbx
+    ret
+.no:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    xor eax, eax
+    pop rbx
+    ret
+
+; class_modifier: the current token is an identifier -> eax = SF_ABSTRACT / SF_FINAL (the word is consumed) when it is 'abstract' or 'final'
+; in front of class / struct or another one of the two, else 0
+class_modifier:
+    push rbx
+    mov ebx, SF_ABSTRACT
+    mov rdi, w_abstract
+    call tk_is_word
+    test eax, eax
+    jnz .try
+    mov ebx, SF_FINAL
+    mov rdi, w_final
+    call tk_is_word
+    test eax, eax
+    jnz .try
+    xor eax, eax
+    pop rbx
+    ret
+.try:
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    mov eax, [tk]
+    cmp eax, K_CLASS
+    je .yes
+    cmp eax, K_STRUCT
+    je .yes
+    cmp eax, T_ID
+    jne .no
+    mov rdi, w_abstract
+    call tk_is_word
+    test eax, eax
+    jnz .yes
+    mov rdi, w_final
+    call tk_is_word
+    test eax, eax
+    jnz .yes
+.no:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    xor eax, eax
+    pop rbx
+    ret
+.yes:
+    add rsp, 128
+    mov eax, ebx
+    pop rbx
+    ret
+
+; check_method_mods: r13 = the method symbol just registered, ebx = class, pass 1. abstract needs an abstract class; a final method of a base
+; class cannot be overridden; override needs a virtual method of the base class with the same signature; final needs an override
+check_method_mods:
+    push r14
+    test dword [r13+SYM_FLAGS], F_ABSTRACT
+    jz .noabs
+    test dword [st_flags + rbx*4], SF_ABSTRACT
+    jnz .noabs
+    mov edi, msg_abstract_decl
+    jmp fatal_method
+.noabs:
+    xor r14d, r14d                      ; the method of the base class
+    mov eax, [st_base + rbx*4]
+    test eax, eax
+    jz .nobase
+    lea edi, [rax-1]
+    mov rsi, [agg_mname]
+    mov edx, [agg_mnlen]
+    call struct_find_method
+    mov r14, rax
+.nobase:
+    test r14, r14
+    jz .nobm
+    test dword [r13+SYM_FLAGS], F_CTOR
+    jnz .nobm
+    test dword [r14+SYM_FLAGS], F_FINAL
+    jz .notfinal
+    mov edi, msg_final_over
+    jmp fatal_method
+.notfinal:
+    test dword [r13+SYM_FLAGS], F_STATIC
+    jz .nobm
+    test dword [r14+SYM_FLAGS], F_VIRTUAL
+    jz .nobm
+    mov edi, msg_static_over
+    jmp fatal_method
+.nobm:
+    test dword [agg_mflags], 4
+    jz .noover
+    test r14, r14
+    jnz .ov1
+    mov edi, msg_over_nobase
+    jmp fatal_method
+.ov1:
+    test dword [r14+SYM_FLAGS], F_VIRTUAL
+    jnz .ov2
+    mov edi, msg_over_notvirt
+    jmp fatal_method
+.ov2:
+    ; same result type, same number of parameters, same parameter types
+    mov rax, [r13+SYM_TYPE]
+    cmp rax, [r14+SYM_TYPE]
+    jne .ovbad
+    mov ecx, [r13+SYM_NPAR]
+    cmp ecx, [r14+SYM_NPAR]
+    jne .ovbad
+    mov rsi, [r13+SYM_EXTRA]
+    mov rdi, [r14+SYM_EXTRA]
+    xor edx, edx
+.ovl:
+    cmp edx, ecx
+    jae .noover
+    mov rax, [rsi + rdx*8]
+    cmp rax, [rdi + rdx*8]
+    jne .ovbad
+    inc edx
+    jmp .ovl
+.ovbad:
+    mov edi, msg_over_sig
+    jmp fatal_method
+.noover:
+    jmp .chkfinal
+.noover2:
+.chkfinal:
+    test dword [agg_mflags], 8
+    jz .done
+    ; final: the method has to override a virtual method of a base class (with or without the word override)
+    test r14, r14
+    jz .fbad
+    test dword [r14+SYM_FLAGS], F_VIRTUAL
+    jnz .done
+.fbad:
+    mov edi, msg_final_nobase
+    jmp fatal_method
+.done:
+    pop r14
     ret
 
 ; ---- module / import -------------------------------------------------------------------------
@@ -1443,9 +1859,12 @@ parse_global_vars:
     push r15
     mov r12, [agg_gtype]
     cmp dword [pass], 1
-    je .again
+    je .p1
     call skip_to_semi
     jmp .out
+.p1:
+    mov rdi, r12
+    call check_concrete
 .again:
     mov rbx, r12
     xor r14d, r14d                      ; element count (0 = scalar)
@@ -1651,6 +2070,7 @@ parse_items:
     push r15
 .loop:
     mov dword [extern_decl], 0
+    mov dword [agg_cmods], 0
     cmp qword [tk], T_EOF
     je .done
     cmp dword [block_depth], 0
@@ -1680,6 +2100,24 @@ parse_items:
     jmp .loop
 .vdone:
     mov [agg_vis], ebx
+.cmod:
+    cmp qword [tk], T_ID
+    jne .cmdone
+    call class_modifier                 ; abstract class X { ... }   final class X { ... }
+    test eax, eax
+    jz .cmdone
+    or [agg_cmods], eax
+    jmp .cmod
+.cmdone:
+    cmp qword [tk], T_ID
+    jne .notsa
+    mov rdi, w_static_assert
+    call tk_is_word
+    test eax, eax
+    jz .notsa
+    call parse_static_assert
+    jmp .loop
+.notsa:
     mov eax, [tk]
     cmp eax, K_IMPORT
     je .import
