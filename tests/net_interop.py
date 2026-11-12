@@ -112,16 +112,18 @@ async def main():
             # A client -> Python server
             async def handler(ws):
                 async for m in ws: await ws.send("py:" + m if isinstance(m, str) else m)
-            async def origin_check(ws): await handler(ws)
             srv = await websockets.serve(handler, "127.0.0.1", 0, subprotocols=["chat"], origins=["https://good.example", None])
             sp = srv.sockets[0].getsockname()[1]
-            def run(args, e=None):
-                r = subprocess.run(args, capture_output=True, text=True, timeout=30, env=e or os.environ); return r.stdout + r.stderr
-            out = run([ws_cat, "ws://127.0.0.1:%d/" % sp, "--protocol", "chat", "--deflate", "hello", "wörld"])
+            async def run(args, e=None):
+                # not subprocess.run: the python servers live in this event loop and must keep running meanwhile
+                p = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=e or os.environ)
+                out, _ = await asyncio.wait_for(p.communicate(), 30)
+                return out.decode()
+            out = await run([ws_cat, "ws://127.0.0.1:%d/" % sp, "--protocol", "chat", "--deflate", "hello", "wörld"])
             ok("A client -> python server: echo, subprotocol, deflate", "py:hello" in out and "py:wörld" in out and "protocol=[chat] deflate=1" in out and "closed 1000" in out, out)
-            out = run([ws_cat, "ws://127.0.0.1:%d/" % sp, "--origin", "https://evil.example", "x"])
+            out = await run([ws_cat, "ws://127.0.0.1:%d/" % sp, "--origin", "https://evil.example", "x"])
             ok("A client: a refused Origin (403) is reported", "connect failed" in out and "403" in out, out)
-            out = run([ws_cat, "ws://127.0.0.1:%d/" % sp, "--origin", "https://good.example", "x"])
+            out = await run([ws_cat, "ws://127.0.0.1:%d/" % sp, "--origin", "https://good.example", "x"])
             ok("A client: an allowed Origin", "py:x" in out, out)
             srv.close(); await srv.wait_closed()
             ssrv = await websockets.serve(handler, "localhost", 0, ssl=ssl.create_default_context(ssl.Purpose.CLIENT_AUTH))
@@ -129,11 +131,11 @@ async def main():
             sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); sctx.load_cert_chain(cert, key); sctx.minimum_version = ssl.TLSVersion.TLSv1_3
             ssrv = await websockets.serve(handler, "127.0.0.1", 0, ssl=sctx)
             sp = ssrv.sockets[0].getsockname()[1]
-            out = run([ws_cat, "wss://127.0.0.1:%d/" % sp, "secure"], env)
+            out = await run([ws_cat, "wss://127.0.0.1:%d/" % sp, "secure"], env)
             ok("A client -> python wss server, certificate trusted through SSL_CERT_FILE", "py:secure" in out, out)
-            out = run([ws_cat, "wss://127.0.0.1:%d/" % sp, "secure"], dict(os.environ, SSL_CERT_FILE="/nonexistent"))
+            out = await run([ws_cat, "wss://127.0.0.1:%d/" % sp, "secure"], dict(os.environ, SSL_CERT_FILE="/nonexistent"))
             ok("A client refuses the same server without that trust", "connect failed" in out, out)
-            out = run([ws_cat, "wss://127.0.0.1:%d/" % sp, "--insecure", "secure"], dict(os.environ, SSL_CERT_FILE="/nonexistent"))
+            out = await run([ws_cat, "wss://127.0.0.1:%d/" % sp, "--insecure", "secure"], dict(os.environ, SSL_CERT_FILE="/nonexistent"))
             ok("... and talks to it with --insecure", "py:secure" in out, out)
             ssrv.close(); await ssrv.wait_closed()
             # A blocking wss server (acceptTls) <- python client
@@ -199,7 +201,6 @@ async def main():
         r = curl("-s", "-o", "/dev/null", "-w", "%{http_code}", base + "/../../etc/passwd", "--path-as-is"); ok("curl path traversal is refused", r.stdout in (b"403", b"404"), r.stdout)
         rpc = '{"jsonrpc":"2.0","method":"add","params":[40,2],"id":1}'
         r = curl("-H", "Content-Type: application/json", "-d", rpc, base + "/rpc"); ok("curl JSON-RPC over HTTP", json.loads(r.stdout) == {"jsonrpc": "2.0", "result": 42, "id": 1}, r.stdout)
-        r = curl("-H", "Content-Type: application/json", "-H", "Transfer-Encoding: chunked", "--data-binary", "@-", base + "/rpc") if False else None
         p = subprocess.run(["curl", "-s", "-H", "Transfer-Encoding: chunked", "-H", "Content-Type: application/json", "--data-binary", "@-", base + "/rpc"], input=rpc.encode(), capture_output=True, timeout=30)
         ok("curl with a chunked request body", json.loads(p.stdout)["result"] == 42, p.stdout)
         r = curl("-H", "Expect: 100-continue", "-d", rpc, "-D", "-", base + "/rpc"); ok("curl Expect: 100-continue", b"100 Continue" in r.stdout and b'"result":42' in r.stdout, r.stdout)
@@ -219,7 +220,7 @@ async def main():
             ok("SSE: text/event-stream", resp.headers.get("Content-Type", "").startswith("text/event-stream"))
             lines = []
             t0 = time.time()
-            for line in resp.iter_lines(decode_unicode=True):
+            for line in resp.iter_lines(chunk_size=1, decode_unicode=True):
                 lines.append(line)
                 if any(l.startswith("data: tick") for l in lines) or time.time() - t0 > 6: break
             resp.close()
