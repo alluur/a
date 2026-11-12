@@ -49,13 +49,13 @@ Everything else in this chapter is easier to follow when you have seen the bytes
 ### URLs
 
 `http.parseUrl` splits `scheme://host:port/path?query`. The port defaults to 80 for `http` and 443 for `https`, an empty path becomes
-`/`, and the query stays in the path. Characters that have a meaning in a URL must be escaped: `encoding.urlEncode` and
+`/`, and the query stays in the path. The scheme is turned to lower case. Characters that have a meaning in a URL must be escaped: `encoding.urlEncode` and
 `encoding.urlDecode` ([API reference of encoding](#api-encoding)) do that (a `+` in a form value means a space).
 
 {{sample http/url_parse}}
 
 **What to notice.** Only absolute `http://` and `https://` URLs are accepted; anything else gives `false`. A host name is kept as
-typed (case included). **IPv6 literals such as `http://[::1]/` are not supported** (sockets are IPv4 only).
+typed (case included). **IPv6 literals such as `http://[::1]/` are not supported** (sockets are IPv4 only): `parseUrl` splits such a URL wrongly, so a request to it fails with `cannot connect`.
 
 ### A client and a server
 
@@ -74,8 +74,10 @@ system picked. The samples therefore write the same loop themselves, on a listen
   `q->query` (still URL-encoded), `q->body` and `q->bodyLen` describe the request.
 * The server accepts a request, answers it and closes the connection; there is no keep-alive. Each `http.get` is a new connection.
 * `http.post` sends the body with `Content-Length`; `http.request` also lets you choose the method (`PUT` here) and add headers.
-* `http.download(url, path)` is a `GET` that writes the body to a file. It returns `200` when the file was written, the HTTP status
-  when that was not 200 (and then writes nothing), and `-1` when the request or the writing failed.
+
+`http.download(url, path)` (not used in the sample) is a `GET` that writes the body to a file. It returns `200` when the file was
+written, the HTTP status when that was not 200 (and then writes nothing), and `-1` when the request or the writing failed; the reason
+is in `http.error()`.
 
 ### Routing and status codes
 
@@ -100,7 +102,8 @@ form). `queryValue` reads `q->query`; for a form body, copy the body there first
 {{sample http/forms}}
 
 **What to notice.** `http.postForm(url, "a=1&b=2")` sends `application/x-www-form-urlencoded`; it expects the fields already
-encoded. A parameter that is not there makes `queryValue` return `false`, so give every parameter a default.
+encoded. A parameter that is not there makes `queryValue` return `false`, so give every parameter a default. `q->query` holds 1024
+bytes, so the handler copies a form body into it only when `q->bodyLen` is below 1000; a longer body would overflow it.
 
 ### Headers
 
@@ -126,7 +129,7 @@ when you need to see the redirect itself.
 
 ### How a response body ends
 
-The client has to know where the body stops. `http.readResponse` understands the three ways of HTTP/1.1:
+The client has to know where the body stops. `http.readResponse` understands the three ways a response can say it:
 
 {{sample http/chunked}}
 
@@ -152,7 +155,7 @@ connection can read it, so use it only over https.
 
 ### Compression
 
-`http.setCompression(true)` adds `Accept-Encoding: gzip, deflate` to every request. A compressed response is **always** unpacked by
+`http.setCompression(true)` adds `Accept-Encoding: gzip, deflate` to every request. A `gzip` or `deflate` response is **always** unpacked by
 the client, whether you asked for compression or not, so `r->body` is the plain text. On the server, `http.respondGzip` sends a body
 compressed.
 
@@ -181,7 +184,7 @@ dir, count)` is a complete web server for a directory. `http.mimeType(path)` pic
 
 {{sample http/errors}}
 
-**What to notice.** All failures return `null` and `http.error()` has a short text: `not an http:// URL`, `cannot connect`,
+**What to notice.** All failures return `null` and `http.error()` has a short text, for example `not an http:// URL`, `cannot connect`,
 `not an HTTP response`, `connection closed before the response`, `too many redirects`, or the TLS problem for https. A server that
 answers with `500` is **not** a failure of the call: you get a `Response` with `status` 500.
 
@@ -195,11 +198,12 @@ port; start it and try `curl "http://localhost:8080/hello?name=World"`.
 
 **What to notice.**
 
-* Every request costs about 6 KB of memory that is never freed (A's `alloc` has no `free`, and `readRequest` allocates). That is
+* Every request costs about 6 KB of memory that is never freed (`new` and `alloc` never free, and `readRequest` allocates). That is
   fine for tools and tests; for a service that runs for weeks, restart it now and then, or `fork` a child for each connection and let
   it exit.
-* Limits of the module: methods up to 15 characters, paths and queries up to 1023, header lines up to 4095, request bodies up to
-  64 MiB, one request per connection, no keep-alive, no cookies, no multipart forms, no proxies, no HTTP/2. Handlers must answer
+* Limits of the module: methods up to 15 characters, paths and queries up to 1023, header lines up to 4095 (a longer line is read as
+  two), request bodies up to 64 MiB (a larger `Content-Length` gets `400`), a 15-second time limit on every read and write of a
+  client (a client that sends nothing holds up the others for that long), one request per connection, no keep-alive, no cookies, no multipart forms, no proxies, no HTTP/2. Handlers must answer
   with `respond` (or write the response themselves) before they return.
 * `examples/http_server.a` is a small web server and `examples/http_get.a` a command-line client with an `--insecure` switch.
 
@@ -214,9 +218,9 @@ a `conn.Connection`), then `sendText`, `sendBinary`, `ping`, `receive` and `clos
 
 ### The handshake
 
-The client sends `Upgrade: websocket` and a random `Sec-WebSocket-Key`. The server proves that it understood by answering `101
+The client sends `Upgrade: websocket` and a `Sec-WebSocket-Key` made of 16 bytes from `rand()`. The server proves that it understood by answering `101
 Switching Protocols` with `Sec-WebSocket-Accept`: the SHA-1 of the key plus a fixed GUID, in base64. `acceptKey` computes it, and
-the RFC's own example is a test.
+the sample checks it with the example key from the RFC.
 
 {{sample http/ws_handshake}}
 
@@ -237,7 +241,7 @@ are not.
 
 {{sample http/ws_frames}}
 
-**What to notice.** The bytes are the examples of RFC 6455 section 5.7, so you can compare them with the standard. `buildFrame`
+**What to notice.** The first two frames are the examples of RFC 6455 section 5.7, so you can compare them with the standard; the three lengths at the end show where the length field changes size. `buildFrame`
 writes a frame and `parseHeader` reads one: it returns the header length, `0` when it needs more bytes, `-1` for an invalid
 header (reserved bits set). The same `unmask` call masks and unmasks. You only need these functions to write a proxy or a test: the
 `WebSocket` methods use them for you.
@@ -302,10 +306,11 @@ authority I trust? is it valid today?) and then both sides agree on secret keys 
 from scratch, with no C library or OpenSSL behind it:
 
 * a **client** with certificate checking, and a **server**;
-* cipher suites `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256` and `TLS_AES_256_GCM_SHA384`, X25519 key exchange;
+* cipher suites `TLS_AES_128_GCM_SHA256`, `TLS_CHACHA20_POLY1305_SHA256` and `TLS_AES_256_GCM_SHA384`; X25519 is the only key exchange;
 * server signatures RSA-PSS, ECDSA P-256 and ECDSA P-384; certificates and keys in PEM (RSA or EC);
-* **not** supported: TLS 1.2 and older (a server that only speaks 1.2 makes the handshake fail with an error such as `the peer sent alert 70`, "protocol version"), session
-  resumption, 0-RTT, client certificates, ALPN, revocation checks. `docs/TLS.md` in the repository lists the details.
+* **not** supported: TLS 1.2 and older, session resumption, 0-RTT, client certificates, ALPN, revocation checks. A server that only
+  speaks TLS 1.2 makes the handshake fail with `the peer sent alert 70` ("protocol version"). `docs/TLS.md` in the repository lists
+  the details.
 
 ::: warning
 
@@ -338,8 +343,8 @@ says why not. It is what every TLS client runs, and with a fixed `now` it is det
 
 * The certificate fits `localhost` and `127.0.0.1` because both are in its alternative names; the match for a host name is not case
   sensitive, and a `*.` wildcard stands for exactly one label.
-* **Trust** comes from the store of root certificates. On Linux and Android the system's `ca-certificates` file is loaded on the first
-  check (on Windows the system's certificate store). `x509.addRootPem(text)` adds one of your own, and `x509.clearRoots()` removes
+* **Trust** comes from the store of root certificates. The system's roots are loaded on the first check: the file named by
+  `SSL_CERT_FILE`, or else the usual bundle such as `/etc/ssl/certs/ca-certificates.crt` (on Windows the system's certificate store). `x509.addRootPem(text)` adds one of your own, and `x509.clearRoots()` removes
   them all, the system's included (and stops them from being loaded).
 * The messages tell the problems apart: no trusted root at all, a different host name, a date before or after the validity, an unknown
   authority. A self-signed certificate is accepted only when you added it as a root.
@@ -388,10 +393,10 @@ The same server, six clients:
 * `verify = false` accepts anything: encryption without authentication protects against eavesdroppers but not against someone who
   *is* the server. Use it only for a server you know, and never as the default.
 * A self-signed certificate is refused until you trust it explicitly. The message for a certificate that no trusted root vouches for
-  depends on what is in the store: with no roots at all it says so; with an unrelated root it says `self signed (not trusted)`.
+  depends on what is in the store: with no roots at all it says so; with an unrelated root it says `self signed (not trusted)` for a self-signed certificate like this one, and `issued by an unknown authority` for any other.
 * The host name check is separate from the trust check. The right certificate for the wrong name is refused.
 * A host given as an IP address (`127.0.0.1`) is matched only against the IP entries in the certificate's alternative names, and a
-  host name only against its DNS entries.
+  host name only against its DNS entries. Only a certificate with no alternative names at all falls back to its common name, and then for host names only.
 
 ### https in `http`
 
@@ -455,5 +460,5 @@ version; what is new is the TLS step before them. `websocket.connect` is not use
 * [Networking](#chap-networking): the sockets, addresses and packets under all of this.
 * API references: [http](#api-http), [websocket](#api-websocket), [tls](#api-tls), [x509](#api-x509), [conn](#api-conn).
 * Bigger programs in `examples/`: `http_server.a`, `http_get.a`, `httpsd.a` (HTTPS server for a directory), `ws_echo.a`,
-  `chat_server.a`.
+  `chat_server.a` (a plain TCP chat server built on `conn`).
 * `docs/TLS.md` in the repository: the whole list of supported suites, the trust store, and how TLS is tested.

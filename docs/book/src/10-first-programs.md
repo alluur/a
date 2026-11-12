@@ -22,7 +22,7 @@ What to notice:
 - `compute()` is called before the line where it is defined. Functions may appear in any order, and you never need to write a prototype.
 - A comment is either `// to the end of the line` or `/* a block */`. Block comments do not nest.
 - Statements end with `;`. Whitespace is not significant.
-- Put types, constants and enums before the code that uses them. A class that extends another one must come after its base class.
+- Declare types, constants and enums before the declarations that use them: a function signature, a field, an array size or another constant. A function body may refer to a type or constant that comes later, but putting them first always works. A class that extends another one must come after its base class.
 
 ::: note
 
@@ -64,8 +64,8 @@ What to notice:
 | `%x` `%X` | hexadecimal, lower or upper case |
 | `%o` `%b` | octal, binary |
 | `%c` | one character |
-| `%s` | a string |
-| `%p` | a pointer, as `0x...` |
+| `%s` | a string (`(null)` for a null pointer) |
+| `%p` | a pointer, as `0x...` (`(nil)` for null) |
 | `%%` | a percent sign |
 
 Between `%` and the letter you can put flags `-` (left align), `0` (pad with zeros), `+` (always a sign), a space (a space for positive numbers) and `#` (a `0x`, `0` or `0b` prefix), then a minimum width, then `.precision` (at least that many digits for numbers, at most that many characters for `%s`). A `*` takes the width or precision from the next value. The C length modifiers `h hh l ll z j t` are accepted: `h` and `hh` cut the value to 16 or 8 bits, the others change nothing.
@@ -108,7 +108,7 @@ Standard input is whatever the user types, or a file or another program's output
 
 | Function | Result |
 |---|---|
-| `readLine(buf, max)` | reads one line into `buf` without its line break (`\n` or `\r\n`), returns its length, `-1` at the end of the input |
+| `readLine(buf, max)` | reads one line into `buf` without its line break (`\n` or `\r\n`; carriage returns are dropped), returns its length, `-1` at the end of the input |
 | `readChar()` | the next byte, `-1` at the end of the input |
 | `readAll()` | the rest of the input as one heap string |
 | `input(prompt)` | prints the prompt, returns the line as a new string, `null` at the end |
@@ -146,7 +146,7 @@ some more
 
 What to notice:
 
-- `isSpace` is one of the prelude's character tests, `trim` removes white space at both ends of a string (both are covered in chapter 19).
+- `isSpace` is one of the prelude's character tests. `trim` cuts white space at both ends of a string in place and returns the new start. Both are covered in [chapter 19](#chap-standard-prelude).
 - `readAll()` takes the rest of the input, newline included, and returns it as a string that lives on the heap until the program ends.
 
 The prompt functions are the shortest way to write an interactive program:
@@ -163,8 +163,8 @@ y
 What to notice:
 
 - `askInt` rejected `forty` with a message and asked again; it returned 36 for the second answer. At the end of the input it would return 0.
-- Because the answers come from a file here, they are not echoed and the prompts run together on one line. In a terminal each answer appears after its prompt.
-- `input` returns a heap string (or `null` when the input has ended), so check for `null` when the program may be run without a terminal.
+- Because the answers come from a file here, they are not echoed, so `Your name: ` and `Your age: ` run together on one line. In a terminal each answer appears after its prompt.
+- `input` returns a heap string (or `null` when the input has ended), so check for `null` when the program may be run without a terminal. It reads at most 1023 characters of a line; `confirm` returns `false` at the end of the input.
 
 ## Command line arguments
 
@@ -182,7 +182,7 @@ What to notice:
 
 ## Exit codes
 
-The number that `main` returns, or that you pass to `exit(code)`, is the exit code of the process. `0` means success; anything else tells the shell or the calling program that something went wrong. `exit` can be called from any function and ends the program at once, after running functions registered with `atexit` and writing out buffered file output.
+The number that `main` returns, or that you pass to `exit(code)`, is the exit code of the process. `0` means success; anything else tells the shell or the calling program that something went wrong. `exit` can be called from any function and ends the program at once. First it runs the functions registered with `atexit` (a function of the `cstdlib` module) and writes out data that is still waiting in buffered `cstdio` streams.
 
 {{sample lang/exit_code}}
 
@@ -195,7 +195,7 @@ What to notice:
 
 ## Working with files
 
-There are two levels of file functions. The simple ones work on whole files; the handle-based ones read and write in pieces. All of them work the same way on Linux, Android and Windows, and paths are relative to the current directory.
+There are two levels of file functions. The simple ones work on whole files; the handle-based ones read and write in pieces. They are part of the prelude on every target, and a relative path is relative to the current directory.
 
 | Function | Description |
 |---|---|

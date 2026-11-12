@@ -35,7 +35,7 @@ The `math` module is the small, fast collection: greatest common divisor, powers
 
 What to notice:
 
-* `%` and `/` truncate towards zero, like in C: `-7 % 3` is -1 and `-7 / 2` is -3. `mod(a, m)` always returns 0 to `m - 1`, and `floorDiv` rounds towards minus infinity.
+* `%` and `/` truncate towards zero, like in C: `-7 % 3` is -1 and `-7 / 2` is -3. `mod(a, m)` returns 0 to `m - 1` when `m` is positive, and `floorDiv` rounds towards minus infinity.
 * `isqrt` is the integer square root, rounded down. `isPrime`, `nextPrime`, `powMod`, `factorial`, `fibonacci` and `binomial` are what you expect; `factorial(21)` or `fibonacci(93)` no longer fit in an `int`.
 * The statistics functions take an array and a length: `sum`, `minOf`, `maxOf`.
 
@@ -81,7 +81,8 @@ What to notice:
 
 * `factorize(n, primes, max)` stores the prime factors, with repeats, and returns how many. It handles numbers like 600851475143 instantly.
 * `isPrime` is exact for every 64-bit number, including 2^61 - 1.
-* `mulMod`, `powMod` and `modInverse` work without overflow for any positive modulus: `mulMod` multiplies two 63-bit numbers modulo `m` correctly. `modInverse` returns -1 when no inverse exists.
+* `mulMod`, `powMod` and `modInverse` work without overflow for any positive modulus: `mulMod` multiplies two `int` values modulo `m` correctly, even when the product needs more than 64 bits. `modInverse` returns -1 when no inverse exists.
+* `totient(n)` is Euler's totient (how many numbers up to `n` have no common factor with it), `divisorCount(n)` counts the divisors and `nextPrime(n)` is the first prime above `n`.
 * `extGcd(a, b, &x, &y)` solves `a*x + b*y = gcd(a, b)`.
 
 ### Counting and digits
@@ -105,7 +106,7 @@ What to notice:
 * `H(10)` is computed exactly: 7381/2520. A floating point sum would have rounding errors.
 * `floor()`, `ceil()` and `round()` convert to an integer.
 * The numerators and denominators are `int`, so very long sums overflow. Use `bigint` when you need more.
-* `rat(1, 0)` gives 0/1 instead of crashing.
+* `rat(1, 0)` gives the fraction 0/1 (which `str()` writes as `0`) instead of crashing.
 
 See the [API reference of `arith`](#api-arith).
 
@@ -139,9 +140,9 @@ What to notice:
 
 What to notice:
 
-* `parse(text)` accepts `[-]digits` and returns `null` for anything else. `fromInt(n)` converts an `int`; `toInt()` goes back, and only means something when the value fits in 63 bits.
+* `parse(text)` accepts digits with an optional `-` or `+` in front and returns `null` for anything else. `fromInt(n)` converts an `int`; `toInt()` goes back, and only means something when the value fits in 63 bits.
 * `add`, `sub`, `mul`, `negate`, `pow`, `cmp` (-1, 0 or 1), `isZero()`.
-* **Division is only by small numbers** (below 2^31): `divSmall(a, d, &rem)` returns the quotient and stores the remainder. There is no big-by-big division yet. `mulSmall(a, m)` multiplies by a small number.
+* **Division is only by small numbers** (below 2^31): `divSmall(a, d, &rem)` returns the quotient and stores the remainder. There is no big-by-big division yet. `mulSmall(a, m)` multiplies by a small non-negative number.
 
 {{sample numbers/bigint_digits}}
 
@@ -200,7 +201,7 @@ Different scales meet when you convert currencies or compute rates.
 What to notice:
 
 * `rescale(v, fromScale, toScale)` changes the scale. Going to a larger scale is exact, going to a smaller one rounds half away from zero.
-* `mul(a, b, scale)` and `div(a, b, scale)` take two values of the **same** scale and give a result in that scale, rounded. `a * b` must fit in 63 bits, so keep the scales reasonable.
+* `mul(a, b, scale)` and `div(a, b, scale)` take two values of the **same** scale and give a result in that scale, rounded. The intermediate product (`a * b` for `mul`, `a * 10^scale` for `div`) must fit in 63 bits, so keep the scales reasonable.
 * `div` by zero returns 0 instead of crashing.
 
 See the [API reference of `decimal`](#api-decimal).
@@ -213,11 +214,11 @@ A has a `double` type: an IEEE 754 binary64 number, the same as in C. `float` is
 
 What to notice:
 
-* An `int` mixed with a `double` becomes a `double`. Assigning a `double` to an `int` needs a **cast**, which truncates towards zero: `(int) -7.75` is -7. Note that `n / 2` with two `int` operands is still an integer division, even when it is assigned to a `double`.
+* An `int` mixed with a `double` becomes a `double`. To turn a `double` into an `int`, write a **cast**; it truncates towards zero: `(int) -7.75` is -7. Note that `n / 2` with two `int` operands is still an integer division, even when it is assigned to a `double`.
 * `printlnDouble` prints the **shortest text that reads back as exactly the same number**: `0.30000000000000004` for `0.1 + 0.2`, `1e+22` for ten sextillion. `doubleToFixed(d, 3)` rounds to a number of decimals (exactly, not with a floating point trick), `doubleToSci(d, 2)` writes scientific notation and `doubleToText(d)` is the shortest form as a string.
 * `parseDouble(text)` reads a number; text without digits gives 0.
 * Overflow gives infinity, and infinity minus infinity gives NaN, which is not equal to anything, not even itself. `isInf`, `isNaN` and `isFinite` test for these.
-* `printf("%d", x)` prints integers only. For `%f`, `%e` and `%g` use `printfd` from the C library (see [the C library tour](#chap-c-library-tour)) or the helpers above.
+* `printf("%d", x)` prints integers only. `printf("%f", x)` does not format a `double`: it prints the characters `%f`. Use the helpers above, or `printfd` from the `cfloat` module (see [the C library tour](#chap-c-library-tour)).
 
 A double is 64 bits wide. `__bits(d)` returns them as an `int` and `__dbl(i)` builds a double from bits.
 

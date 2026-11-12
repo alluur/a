@@ -14,7 +14,7 @@ In this chapter:
 
 ## if and else
 
-`if (condition) statement` runs the statement when the condition is true. The condition is any integer or pointer: zero and `null` are false, everything else is true. Add `else` for the other case; `else if` chains several tests. The body of `if`, `else`, `while` and `for` is either a single statement or a `{ block }`.
+`if (condition) statement` runs the statement when the condition is true. The condition is any integer or pointer: zero and `null` are false, everything else is true. (A `double` also works: it is false when it equals 0.) Add `else` for the other case; `else if` chains several tests. The body of `if`, `else`, `while` and `for` is either a single statement or a `{ block }`.
 
 {{sample lang/if_else}}
 
@@ -85,11 +85,11 @@ What to notice:
 - `case 1:` and `case 2:` share one result because `case 1:` has no code of its own.
 - The `level` switch shows the fall-through: it started at `case 3` and ran through `case 2` and `case 1` until the `break`. `case 0` was never reached.
 - Inside a `switch` that is inside a loop, `continue` belongs to the loop: `case 1: continue;` skipped the rest of that round, including `[after 1]`. `break` leaves only the `switch`, so `[after 3]` was still printed.
-- `switch` compares integers (including `char` and enum values). To choose between strings, use `if` with `streq`.
+- `switch` compares integers (including `char` and enum values). It does not compare the text of strings: a string label is accepted by the compiler but compares addresses, so it does not do what you want. To choose between strings, use `if` with `streq`.
 
 ## goto
 
-`goto label;` jumps to `label:` in the same function, forwards or backwards. Labels belong to a function (at most 64 of them) and a label name may be used once. A `goto` to a label that does not exist is the error `goto to a label that is not defined in this function`; a second label with the same name is `duplicate label`.
+`goto label;` jumps to `label:` in the same function, forwards or backwards. Labels belong to a function (at most 64 of them) and a label name may be used only once in a function (two functions may use the same name). A `goto` to a label that does not exist is the error `goto to a label that is not defined in this function`; a second label with the same name is `duplicate label`.
 
 {{sample lang/goto_demo}}
 
@@ -113,7 +113,7 @@ What to notice:
 
 ## static if
 
-`static if (constant) { ... } else { ... }` is decided **while compiling**. The branch that is not chosen is skipped: it may name things that do not exist on the current target and is never compiled. It works around declarations at file level, inside classes, and inside function bodies. The condition is a constant expression: your own `const` values, or the built-in constants `__ARCH` (0 x86-64, 1 ARM64, 2 RISC-V 64, 3 LoongArch 64) and `__OS` (0 Linux, 1 Windows, 2 Android). The standard prelude itself uses `static if (__ARCH == 0)` to pick faster x86-64 routines.
+`static if (constant) { ... } else { ... }` is decided **while compiling**. The branch that is not chosen is skipped: it may name things that do not exist on the current target and is never compiled. It works around declarations at file level and around statements inside function bodies. It does not work between the members of a class: a `static if` in a class body is an error (`unknown type`). The condition is a constant expression: your own `const` values, or the built-in constants `__ARCH` (0 x86-64, 1 ARM64, 2 RISC-V 64, 3 LoongArch 64) and `__OS` (0 Linux, 1 Windows, 2 Android). The standard prelude itself uses `static if (__ARCH == 0)` to pick faster x86-64 routines.
 
 {{sample lang/static_if}}
 
@@ -131,7 +131,7 @@ What to notice:
 - `switch` labels are constant expressions that fit in 32 bits; without `break` execution falls through.
 - `goto` and labels work within one function; leaving nested loops is the good use.
 - `defer` runs an expression at function exit, last in first out, at most 16 per function and only at the top level of the body.
-- `static if` selects code at compile time using constants such as `__ARCH` and `__OS`.
+- `static if` selects code at compile time using constants such as `__ARCH` and `__OS`. It works at file level and in function bodies, not inside a class body.
 
 ## Where next
 

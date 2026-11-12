@@ -20,13 +20,13 @@ In this chapter:
 | `void` | none | no value; `void*` is a pointer to anything |
 | `T*` | 8 bytes | pointer to `T`: `int*`, `char**`, `Node*` |
 | `T name[N]` | `N * sizeof(T)` | fixed size array, `N` is a constant expression |
-| `struct S`, `class C` | sum of the fields | see [structs and classes](#chap-structs-and-classes) |
+| `struct S`, `class C` | the fields, each aligned to its own size, rounded up to a multiple of 8 | see [structs and classes](#chap-structs-and-classes) |
 | `enum E` | 8 bytes | behaves like `int`; `enum E : uint8` picks a smaller type |
 | `int8` `int16` `int32` `int64` | 1, 2, 4, 8 bytes | signed integers of exactly that width |
 | `uint8` `uint16` `uint32` `uint64` | 1, 2, 4, 8 bytes | unsigned integers |
 | `size_t` `uintptr_t` | 8 bytes | `uint64` |
 | `ssize_t` `intptr_t` `ptrdiff_t` | 8 bytes | `int64` |
-| `double` (alias `float`) | 8 bytes | IEEE 754 binary64, see the end of this chapter |
+| `double` (alias `float`) | 8 bytes | IEEE 754 binary64 (the usual 64-bit floating point format), see the end of this chapter |
 | `func` | 8 bytes | pointer to a function, see [functions](#chap-functions) |
 
 ## int and long
@@ -74,11 +74,11 @@ What to notice:
 
 - `(int) nothing` is 0: `null` is the number zero. Pointers that are not initialised are `null`, because every variable starts as zero.
 - `if (!nothing)` is the usual way to test for `null`; `nothing == null` says the same thing more explicitly.
-- Dereferencing a `null` pointer crashes the program. A tells you nothing in advance, so test before you follow a pointer that may be `null`.
+- Dereferencing a `null` pointer crashes the program (a segmentation fault on Linux). A gives no warning, so test before you follow a pointer that may be `null`.
 
 ## Fixed size arrays
 
-`T name[N]` is an array of `N` elements stored next to each other. `N` must be a constant expression: a number, a `const`, `sizeof`, or arithmetic on them. A variable is not allowed (`int a[n]` is the compile error `name is not a constant`); for sizes only known at run time use `alloc` (see [chapter 17](#chap-memory-and-pointers)). Arrays are zeroed when they are created, indices start at 0, and A does not check them.
+`T name[N]` is an array of `N` elements stored next to each other. `N` must be a constant expression: a number, a `const`, `sizeof`, or arithmetic on them. A variable is not allowed (`int a[n]` is the compile error `name is not a constant`); for sizes only known at run time use `alloc` (see [memory and pointers](#chap-memory-and-pointers)). Arrays are zeroed when they are created, indices start at 0, and A does not check them.
 
 {{sample lang/fixed_arrays}}
 
@@ -97,8 +97,8 @@ When the width matters (file formats, network protocols, hardware) use `int8`, `
 
 What to notice:
 
-- A value is cut to the width of the type when it is **stored**: `uint8 b = 300` keeps 44, `int8 s = 200` becomes -56. Reading a signed type sign-extends, reading an unsigned type zero-extends.
-- Arithmetic on two 32-bit values of the same type wraps at 32 bits: `uint32 0 - 1` is 4294967295. `int8`, `int16` and `uint16` are promoted to `int` in arithmetic, as in C: `u + 1` is 65536 and becomes 0 only when it is stored into a `uint16`.
+- A value is cut to the width of the type when it is **stored**: `uint8 b = 300` keeps 44, `int8 s = 200` becomes -56. Reading a signed type **sign-extends** it (the value keeps its sign when it is widened to 64 bits: -56 stays -56), reading an unsigned type **zero-extends** it (the new upper bits are zero).
+- `w - 1` is calculated as a plain `int` (the literal `1` is one), so it is -1, and the store cuts it to 32 bits: 4294967295. When **both** operands are the same 32-bit type (`uint32 - uint32`, `int32 + int32`) the result itself is cut to 32 bits. `int8`, `int16` and `uint16` are promoted to `int` in arithmetic, as in C: `u + 1` is 65536 and becomes 0 only when it is stored into a `uint16`.
 - A `uint64` makes division, remainder, right shift and comparisons unsigned. `printf("%d")` shows a `uint64` above 2<sup>63</sup> as a negative number; use `%u` for those.
 - `Header` is 24 bytes: `kind` is at offset 0, `length` at 2, `id` at 4, `delta` at 8, `offset` at 10, `code` at 12 and `stamp` at 16. Each field sits at a multiple of its own size.
 - `short`, `long`, `signed` and `unsigned` are accepted but mean plain 64-bit `int`: use the names above whenever the width matters.
@@ -164,7 +164,7 @@ What to notice:
 
 ## String literals and escapes
 
-A string literal such as `"hello\n"` has the type `char*`, ends with a zero byte, and lives in writable data. The escape sequences are:
+A string literal such as `"hello\n"` has the type `char*` and ends with a zero byte. The escape sequences are:
 
 | Escape | Character |
 |---|---|
@@ -172,7 +172,7 @@ A string literal such as `"hello\n"` has the type `char*`, ends with a zero byte
 | `\0` | the zero byte |
 | `\e` | escape (27) |
 | `\\` `\"` `\'` | backslash, double quote, single quote |
-| `\xHH` | the byte with the hexadecimal value `HH` |
+| `\xHH` | the byte with the hexadecimal value `HH` (exactly two digits) |
 
 Two or more literals next to each other are joined into one, also across lines.
 
@@ -180,13 +180,13 @@ Two or more literals next to each other are joined into one, also across lines.
 
 What to notice:
 
-- Each escape stands for **one** character: the table of numbers (`10 9 13 0 27 92`) shows their values.
+- Each escape stands for **one** character: the table of numbers (`10 9 13 0 27 92`) shows their values. `\x` needs exactly two hex digits, and any escape not in the table (`\a`, `\b`, `\101`, `\u0041` ...) is the compile error `invalid escape sequence`.
 - `strlen` counts the characters before the zero byte, so a `\0` inside a string literal ends it as far as the string functions are concerned.
-- Because string literals are writable, `editable[0] = 'X'` works. Do not rely on two equal literals sharing the same address.
+- `editable` is an array that was filled from a literal, so it is your own copy and you may change it. The literal itself also sits in writable data, but do not modify literals, and do not rely on two equal literals sharing, or not sharing, the same address.
 
 ## Floating point with double
 
-`double` is an IEEE 754 binary64 number, the same format as the `double` of C, and `float` is another name for it: both are 8 bytes. The compiler calls a built-in **software** implementation (the module `dfloat`, loaded only when a program uses a floating point value), so results are bit for bit identical on every processor and system. The price is speed: an addition takes tens of nanoseconds instead of one, which is fine for tools, simulations and plots, but not for millions of calls. This section stays at the language level; [the numbers chapter](#chap-numbers) goes deeper into `double`, `dfloat` and `dmath`.
+`double` is an IEEE 754 binary64 number, the same format as the `double` of C, and `float` is another name for it: both are 8 bytes. The compiler calls a built-in **software** implementation (the module `dfloat`, loaded only when a program uses a floating point value), so results are bit for bit identical on every processor and system. The price is speed: every operation is a function call, much slower than a hardware instruction, which is fine for tools, simulations and plots, but not for heavy number crunching. This section stays at the language level; [the numbers chapter](#chap-numbers) goes deeper into `double`, `dfloat` and `dmath`.
 
 ### Literals, conversions and operators
 
@@ -211,12 +211,12 @@ A double can be a variable, a global, a struct field, an array element, a parame
 What to notice:
 
 - `v.x = 3;` converted the `int` 3 to `3.0` when it was stored.
-- `dot` receives two structs by value, and `scaled` returns a struct of doubles: all the rules of [chapter 14](#chap-functions) apply.
+- `dot` receives two structs by value, and `scaled` returns a struct of doubles: all the rules of [the functions chapter](#chap-functions) apply.
 - `samples[i] = i * 0.25;` is an `int` times a `double`: the result is a double.
 
 ### Printing, parsing and inspecting
 
-`printf` from the prelude does not understand `%f`. Use the double helpers: `printlnDouble(d)` and `printDouble(d)` write the **shortest text that reads back as exactly the same number**; `doubleToText(d)` returns the same text as a string; `doubleToFixed(d, n)` rounds to `n` decimals; `doubleToSci(d, n)` writes scientific notation; `parseDouble(text)` reads a number; `isNaN`, `isInf` and `isFinite` classify a value. `__bits(d)` returns the 64 raw bits of a double as an `int`, and `__dbl(i)` builds a double from 64 bits.
+`printf` from the prelude does not understand `%f` (it prints the two characters `%f` as they are). Use the double helpers: `printlnDouble(d)` and `printDouble(d)` write the **shortest text that reads back as exactly the same number**; `doubleToText(d)` returns the same text as a string; `doubleToFixed(d, n)` rounds to `n` decimals; `doubleToSci(d, n)` writes scientific notation; `parseDouble(text)` reads a number; `isNaN`, `isInf` and `isFinite` classify a value. `__bits(d)` returns the 64 raw bits of a double as an `int`, and `__dbl(i)` builds a double from 64 bits.
 
 {{sample lang/double_text}}
 
@@ -225,17 +225,18 @@ What to notice:
 - `0.1 + 0.2` prints as `0.30000000000000004`, and `2.0 / 3` as `0.6666666666666666`: those are the shortest texts that identify the numbers. Binary floating point cannot hold 0.1 exactly; every IEEE system behaves like this.
 - Division by zero gives infinity and `inf - inf` is **NaN** ("not a number"). A NaN is not equal to anything, not even itself: `nan == nan` is 0. Use `isNaN`.
 - `__bits(1.0)` is `3ff0000000000000`. Adding 1 to the bits of `1.0` gives the next larger double, `1.0000000000000002`.
-- The C library functions `printfd`, `sprintfd` and the like (module `cfloat`) understand `%f %e %g %a` but take **bit patterns**, not doubles: write `printfd("%.2f", __bits(d))`. Passing the double itself converts it to an `int` first and prints nonsense, without a warning.
+- The C library functions `printfd`, `sprintfd` and the like (module `cfloat`, which a program that uses `double` loads automatically) understand `%f %e %g %a` but take **bit patterns**, not doubles. With `double d = 2.5;`, `printfd("%.2f\n", __bits(d))` prints `2.50`, but `printfd("%.2f\n", d)` prints `0.00`: the parameters are `int`, so `d` is first converted to the integer 2 and that is read as a bit pattern (a tiny number). There is no warning.
 
 ### Mathematics
 
-The mathematical functions live in the `dmath` module: `sqrt cbrt pow exp exp2 expm1 log log2 log10 log1p hypot sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh floor ceil round trunc fabs fmod fmin fmax copysign`, the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`, and `nan()`. They are the functions of C's `<math.h>`, correctly rounded.
+The mathematical functions live in the `dmath` module: `sqrt cbrt pow exp exp2 expm1 log log2 log10 log1p hypot sin cos tan asin acos atan atan2 sinh cosh tanh asinh acosh atanh floor ceil round trunc fabs fmod fmin fmax copysign`, the constants `PI E TAU SQRT2 LN2 LN10 INFINITY EPSILON`, and `nan()`. They are the functions of C's `<math.h>`, computed in software: `sqrt` is exact and the others are within 1 unit in the last place (nearly always correctly rounded), the same on every processor.
 
 {{sample lang/double_math}}
 
 What to notice:
 
-- Call them with the module name: `dmath.sqrt(2)`. A bare `sqrt(...)` after `import dmath;` is **not** the same function: it is the C library's version, which expects a bit pattern. In a test, `sqrt(2.0)` printed `2.1906148709472164e+18`, a wrong result, while `dmath.sqrt(2.0)` printed `1.4142135623730951`.
+- Call them with the module name: `dmath.sqrt(2)`. `import dmath;` does **not** bring the bare names into scope: `PI` alone is the compile error `undeclared identifier 'PI'`.
+- A bare `sqrt(...)` is a different function, and it compiles without a warning. Names that are declared in a `module` are reached as `module.name`; a name from a file without a `module` line is global and can be written bare. The C library module `cmath` has no `module` line, so its `sqrt` is the global `sqrt`. It is loaded automatically in every program that uses `double` (and by `import dmath;`), and it takes and returns an `int` that holds a **bit pattern**. `sqrt(2.0)` therefore converts `2.0` to the integer 2, takes the square root of that bit pattern, and hands back the bits of the answer as an `int`, which `printlnDouble` then shows as the number `2.1906148709472164e+18`: nonsense. `dmath.sqrt(2.0)` prints `1.4142135623730951`. Inside `dmath` every function is just `__dbl(::sqrt(__bits(x)))`: it feeds the bits to the global function (`::name` means "the global name") and turns the answer back into a `double`.
 - The functions take `int` arguments too, as in `dmath.sqrt(2)`: the compiler converts them to `double`.
 - `dmath.round(area)` is a `double` (`20.0`); the `(int)` cast makes it an integer.
 - `sin(PI / 6)` is `0.49999999999999994`, as in C: the result is exact for the rounded input, which is not exactly pi / 6.

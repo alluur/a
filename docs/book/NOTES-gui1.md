@@ -49,7 +49,7 @@ first, then set `onChange` and the start value.
 ### 6. Small points
 
 * `gimg.savePng` writes uncompressed PNGs (a 120 x 60 picture is 28 928 bytes); `shots.py` recompresses them with Pillow for the book.
-* `gui.messageBox` has a fixed window of 280 x 110: a long text is cut off.
+* `gui.messageBox` makes its window `F_FIXED`, then calls `fit()`: one `Label`, no wrapping, so a long text gives a very wide window.
 * `Window.createWindow` returns `null` after 63 windows per connection, `Display.after` returns -1 when 32 timers are pending (no error message).
 * `datetime` is UTC only (the clock sample says so in its title and label).
 * The window placement of `wsrv` is a cascade: the first window with position -1,-1 gets its client area at 40,74 and each next one is 28 pixels further. `shots.py` relies on it

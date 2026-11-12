@@ -163,7 +163,7 @@ Two safe ways to choose nonces: a random 12 byte nonce for each message (fine fo
 * The vector is section 2.8.2 of RFC 8439. The tag `1ae10b59...` is the one printed in the RFC.
 * The key is the bytes `0x80` to `0x9f`, written with a loop, because a published vector often has a pattern.
 
-`chacha.xorStream` is the ChaCha20 stream cipher without the authentication. It exists because TLS and other protocols need the raw stream, and it is dangerous for everything else.
+The module also exposes the plain ChaCha20 stream cipher, `chacha.xorStream`, without any authentication. Protocols can be built on it, and on its own it is dangerous.
 
 {{sample crypto/chacha_stream}}
 
@@ -180,7 +180,7 @@ Two safe ways to choose nonces: a random 12 byte nonce for each message (fine fo
 
 * The file layout is `nonce | cipher text | tag`. The nonce is new and random for each file, so one key can protect many files.
 * A damaged byte, and a wrong key, both give `null`. There is no way to get half of the text.
-* The associated data `v1` is not in the file, so the reader must know it. That is the point of it: it binds the cipher text to a context. A file whose header says `v2` could not be read as `v1`.
+* The associated data `v1` is not stored in the file. The reader has to supply the same value, so the cipher text is bound to a context: the same bytes would be refused by code that expects `v2`.
 * A real program needs a place to keep the key. This sample only generates one. How the key reaches the program (a prompt, a key file with strict permissions, an operating system store) is the hard part, and a key derivation function from a password is not in the library.
 
 ## Key agreement with X25519

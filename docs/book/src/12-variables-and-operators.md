@@ -12,7 +12,7 @@ In this chapter:
 
 ## Declaring variables
 
-A declaration names a type and one or more variables. Every variable is **zero-initialised**: locals, arrays, structs and heap memory start as zero, so you never read a random leftover value.
+A declaration names a type and one or more variables. Every variable is **zero-initialised**: locals, arrays, structs and the memory from `new` and `alloc` start as zero, so you never read a random leftover value.
 
 {{sample lang/variables}}
 
@@ -33,7 +33,7 @@ What to notice:
 
 - The type is inferred (`int` for `MAX`, a string for `TITLE`), or you can write it: `const int MASK = 0xF0;`.
 - A typed constant is cut to its type: `const uint8 SMALL = 300;` is 44.
-- Constant expressions support all arithmetic, bitwise, comparison and logical operators, so `AREA` and `FLAG` are computed at compile time. `MAX / 10` sized the array `values`.
+- Constant expressions support the arithmetic, bitwise, comparison and logical operators (but not `?:`), so `AREA` and `FLAG` are computed at compile time. `MAX / 10` sized the array `values`.
 - The two commented lines would not compile: `MAX = 5;` gives `left side of assignment is not assignable`, and `&MAX` gives `cannot take the address of a value`. Both messages are real compiler output.
 
 ## Scope and shadowing
@@ -45,9 +45,10 @@ A variable lives until the end of the block (`{ ... }`) it was declared in. A de
 What to notice:
 
 - The inner `x` was a different variable: after the block, the outer `x` still had its value 1.
-- The loop variable `i` is gone after the loop; reusing the name in a later loop is fine.
+- `x += i` in the loop changed the outer `x`, which is why it ended at 4 (1 + 0 + 1 + 2).
+- The loop variable `i` exists only inside the loop. Using `i` after the loop is the error `undeclared identifier 'i'`, and a later loop may declare its own `i`.
 - A local named `counter` hides the global `counter`. Shadowing is legal, but it makes code harder to read: prefer different names.
-- You can also use a name for a local that the prelude uses for a function (`max`, `min`), because locals hide functions. You cannot *define a function* with such a name at the top level, see [chapter 19](#chap-standard-prelude).
+- You can also use a name for a local that the prelude uses for a function (`max`, `min`), because locals hide functions. You cannot *define a function* with such a name at the top level, see [the standard prelude chapter](#chap-standard-prelude).
 
 ## Global variables
 
@@ -63,7 +64,7 @@ What to notice:
 
 ## Arithmetic
 
-The arithmetic operators are `+`, `-`, `*`, `/` and `%`, and the unary `-` and `+`. All of them work on 64-bit signed integers. Division truncates toward zero, like in C, and the remainder has the sign of the left operand.
+The arithmetic operators are `+`, `-`, `*`, `/` and `%`, and the unary `-` and `+`. On integers they work on 64-bit signed values (`+`, `-`, `*` and `/` also work on `double`). Division truncates toward zero, like in C, and the remainder has the sign of the left operand.
 
 {{sample lang/arithmetic}}
 
@@ -75,7 +76,7 @@ What to notice:
 
 ## Comparison and logical operators
 
-The comparison operators are `<`, `<=`, `>`, `>=`, `==`, `!=` and the three-way `<=>`. The logical operators are `&&`, `||` and `!`. They always produce **0 or 1**. Any integer or pointer can be a condition: zero and `null` are false, everything else is true.
+The comparison operators are `<`, `<=`, `>`, `>=`, `==`, `!=` and the three-way `<=>`. The logical operators are `&&`, `||` and `!`. All of these give **0 or 1**, except `<=>`, which gives -1, 0 or 1. Any integer or pointer can be a condition: zero and `null` are false, everything else is true.
 
 {{sample lang/comparison_logic}}
 
@@ -84,6 +85,7 @@ What to notice:
 - `12 && 3` is 1, not 3: logical operators never return one of their operands.
 - `a <=> b` is -1, 0 or 1. It makes a compare function for sorting a one-liner, and it compares a `uint64` as unsigned.
 - Pointers can be compared with `==` and `!=`, and with `<`, `>` when they point into the same array.
+- `==` on two `char*` values compares the addresses, not the text. Compare strings with `streq` (see [the standard prelude chapter](#chap-standard-prelude)).
 
 ### Short-circuit evaluation
 
@@ -98,7 +100,7 @@ What to notice:
 
 ## Bitwise operators and shifts
 
-`&`, `|`, `^` and `~` work on the individual bits of a 64-bit value (and, or, exclusive or, complement). `<<` shifts left and `>>` shifts right. `>>` is an **arithmetic** shift on signed values: it copies the sign bit, so a negative number stays negative. On a `uint64` it is a logical shift.
+`&`, `|`, `^` and `~` work on the individual bits of a 64-bit value (and, or, exclusive or, complement). `<<` shifts left and `>>` shifts right. `>>` is an **arithmetic** shift on signed values: it copies the sign bit, so a negative number stays negative. On a `uint64` it is a logical shift. Keep the shift count between 0 and 63: for larger counts the result depends on the processor (on x86-64 the count is taken modulo 64, so `1 << 64` is 1).
 
 {{sample lang/bitwise_ops}}
 
@@ -153,7 +155,7 @@ What to notice:
 What to notice:
 
 - `a > 1 and not (b > 0) or retry` reads like English and means `a > 1 && !(b > 0) || retry`.
-- `3 xor 4` is 0: both sides are true, so exactly one is not true. The bitwise exclusive or is the single character `^` (`3 ^ 4` is 7).
+- `3 xor 4` is 0: both sides are true, and `xor` is true only when exactly one side is. The bitwise exclusive or is the single character `^` (`3 ^ 4` is 7).
 
 ## Precedence
 
@@ -172,23 +174,25 @@ Operators with higher precedence are applied first. The table lists them from hi
 | 9 | `^` | bitwise exclusive or |
 | 10 | `\|` | bitwise or |
 | 11 | `&&` | short circuit |
-| 12 | `\|\|` | short circuit |
-| 12a | `^^`  `xor` | logical exclusive or, between `&&` and `\|\|` |
-| 13 | `c ? a : b`  `a ?? b` | right to left |
-| 14 | `=  +=  -=  *=  /=  %=  &=  \|=  ^=  <<=  >>=` | right to left |
+| 12 | `^^`  `xor` | logical exclusive or: both sides run |
+| 13 | `\|\|` | short circuit |
+| 14 | `c ? a : b`  `a ?? b` | right to left |
+| 15 | `=  +=  -=  *=  /=  %=  &=  \|=  ^=  <<=  >>=` | right to left |
+
+The word forms `and`, `or` and `not` have the precedence of `&&`, `||` and `!`, and `xor` that of `^^`.
 
 {{sample lang/precedence}}
 
 What to notice:
 
 - `1 + 2 << 3` is `(1 + 2) << 3` = 24: `+` binds tighter than `<<`.
-- `6 & 3 == 3` is `6 & (3 == 3)` = 0, because `==` binds tighter than `&`. This is the same trap as in C: put parentheses around bit tests, `(6 & 3) == 3`.
+- `6 & 3 == 3` is `6 & (3 == 3)` = 0, because `==` binds tighter than `&`. This is the same trap as in C: put parentheses around bit tests, `(6 & 3) == 2`, as the next line of the sample does.
 - Assignment groups from the right: `a = b = c = 7` sets all three.
 - When in doubt, add parentheses. They cost nothing.
 
 ## Summary
 
-- Every variable starts as zero; arrays, structs and heap memory too.
+- Every variable starts as zero; arrays, structs and memory from `new` and `alloc` too.
 - `const NAME = value;` is a compile-time constant; a typed constant is cut to its type.
 - A variable lives to the end of its block; an inner declaration may shadow an outer one; globals need constant initializers.
 - Arithmetic is 64-bit and wraps; division truncates toward zero; division by zero is not checked.

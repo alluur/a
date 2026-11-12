@@ -39,7 +39,7 @@ What to notice:
 
 * `push` and `pop` work at the end, so an `IntList` is also a stack. `insert(i, v)` and `removeAt(i)` shift the elements after `i`, which costs time proportional to the length.
 * `get(100)` on a short list returns 0, and `set` with a bad index does nothing. `insert` and `removeAt` with a bad index do nothing either (`removeAt` returns 0).
-* `items()` returns the raw array. That is how you hand a list to `sort.sortInts`. The pointer is only valid until the next `push`, because the storage may move.
+* `items()` returns the raw array. That is how you hand a list to `sort.sortInts`. The pointer is only valid until the next `push` or `insert`, because the storage may move.
 
 {{sample collections/strlist}}
 
@@ -181,7 +181,7 @@ What to notice:
 
 ## Bits: `bits`
 
-The `bits` module is for code that cares about single bits: flags, hashes, protocols, bitboards. The functions with a number in their name (`clz32`, `rotl32`, `bswap16`, ...) work on exactly that many bits and ignore the bits above. The others work on a whole 64 bit `int`.
+The `bits` module is for code that cares about single bits: flags, hashes, protocols, bitboards. The functions whose name ends in a bit width (`clz32`, `rotl32`, `bswap16`, `rev8`, ...) work on exactly that many bits and ignore the bits above. The others (`popcount`, `log2`, `isPow2`, `get`, `field`, ...) work on a whole 64 bit `int`.
 
 ### Counting
 
@@ -261,7 +261,7 @@ See the [API reference of `bytebuf`](#api-bytebuf).
 * Maps and sets are walked slot by slot (`capacity`, `keyAt`, `usedAt`) in hash order. Sort the keys when you need a stable listing.
 * `sort` sorts ints and strings in place; `algo.sortBy` takes a comparator and is stable.
 * `algo` has binary search helpers, permutations, dynamic programming, string distance, a prime sieve, union-find and a graph class with BFS, DFS, Dijkstra and topological order.
-* `bits` counts, rotates, swaps and extracts bits; a number in a function's name is the exact width it works on.
+* `bits` counts, rotates, swaps and extracts bits; a bit width at the end of a function's name (`rotl32`, `bswap16`) is the exact width it works on, the other functions use the whole 64 bit `int`.
 * `bytebuf` reads and writes integers in big or little endian, builds messages with `Buf` and parses them with the range-checked `Reader`.
 
 ## Where next

@@ -2,7 +2,7 @@
 
 A has a small networking stack written in A itself: sockets (`net`), addresses (`netaddr`), name lookup (`dns`), buffered connections
 (`conn`), what the system knows about the network (`netif`), everyday tools (`netutil`) and packet building (`packet`, `rawnet`). The same
-code runs on Linux, Android and Windows, and there is nothing to install: the modules are built into the compiler. This chapter is the
+code runs on Linux, Android and Windows (only `rawnet` is limited to Linux and Android), and there is nothing to install: the modules are built into the compiler. This chapter is the
 plumbing; [the next chapter](#chap-http-websocket-tls) builds HTTP, WebSocket and TLS on top of it.
 
 In this chapter:
@@ -32,7 +32,7 @@ In this chapter:
 | exchange messages with a browser in both directions | `websocket` (next chapter) |
 | encrypt a connection | `tls`, usually through `http` (next chapter) |
 
-The modules form layers. Everything is built on `net`, except `packet` and `netaddr`, which only compute and do no network I/O at all.
+The picture below is a rough guide to what builds on what, not the list of `import` lines: `net` imports nothing and most of the others import it (`netaddr` only to reuse `parseIp`). `netaddr` and `packet` only compute: they open no sockets and do no network I/O at all.
 
 ```text
 http  websocket          protocols
@@ -45,7 +45,7 @@ netaddr                  numbers and text
 ## How the samples in this chapter work
 
 A program that talks to a network needs a partner, and a book sample has to run alone and print the same thing every time. So the
-samples talk to themselves over the loopback address `127.0.0.1`, which never leaves the computer, and follow three rules:
+samples talk to themselves over the loopback address `127.0.0.1`, which never leaves the computer, and follow three rules (the few samples that need a real network are only compiled, never run, and so are exempt):
 
 * **No fixed ports.** A server asks for port `0`, which means "any free port", and reads the answer with `net.localPort`. Two samples
   can then run at the same time and a port that is already in use never gets in the way.
@@ -104,7 +104,7 @@ so the functions work on buffers you provide.
 
 **What to notice.**
 
-* `ip6ToText` shortens the longest run of zero groups to `::` and writes the groups without leading zeros, like every modern tool.
+* `ip6ToText` shortens the longest run of zero groups to `::` and writes the groups in lower case without leading zeros.
   An IPv4 address inside IPv6 (`::ffff:10.1.2.3`) is printed in hexadecimal groups, not with dots.
 * IPv6 addresses can be parsed and printed, but **sockets are IPv4 only**: `net` cannot connect to or listen on an IPv6 address.
 
@@ -112,7 +112,7 @@ so the functions work on buffers you provide.
 
 {{sample net/addr_misc}}
 
-**What to notice.** `serviceName` knows about 40 well-known ports and returns `null` for any other port, so check before you print it.
+**What to notice.** `serviceName` knows 41 well-known ports and returns `null` for any other port, so check before you print it.
 The Internet checksum (RFC 1071) is what IP, ICMP, UDP and TCP use: add up all 16-bit words, fold the carries, invert. Data that carries
 its correct checksum adds up to zero, which is how a receiver checks it. You will meet it again in the packet section.
 
@@ -129,7 +129,7 @@ end of the data). All calls **block** until they are done; the section on errors
 | `net.connect(host, port)` | connect to a server; `host` may be a name |
 | `net.send(h, buf, n)` | send all `n` bytes, returns `n` or a negative number; `net.sendText(h, text)` for a string |
 | `net.recv(h, buf, max)` | at least one and at most `max` bytes; `0` when the peer closed; negative on error or time out |
-| `net.recvLine(h, buf, max)` | one line without its `\n` or `\r\n`; `-1` when the connection ended before any byte |
+| `net.recvLine(h, buf, max)` | one line without its `\n` or `\r\n` (an empty line gives `0`); `-1` when the connection ended before any byte |
 | `net.close(h)` | close a socket |
 | `net.localPort(h)`, `net.peer(h, &ip, &port)`, `net.localIp(h)` | the addresses of a socket |
 
@@ -160,7 +160,7 @@ is the usual loop. It stops early only when `recv` returns `0` or a negative num
 ### Framing: one line per message
 
 The simplest way to cut a stream into messages is a text protocol with one line per message. `net.recvLine` reads up to the newline and
-removes it (and a `\r` before it, so `telnet`-style clients work too).
+removes it (and every `\r` in the line, so `telnet`-style clients work too).
 
 {{sample net/tcp_protocol}}
 
@@ -169,7 +169,7 @@ removes it (and a `\r` before it, so `telnet`-style clients work too).
 * The "server" in this sample is the function `serve`, called between the client's send and receive. In a real program it would
   loop over `accept` in its own process; the next sample shows that shape.
 * `recvLine` never overruns your buffer, but a line longer than `max - 1` is **split**: the rest comes out as the next "line". Size the
-  buffer for the longest line you accept, and treat anything longer as an error.
+  buffer for the longest line you accept, and treat anything longer as an error. (`conn.readLine` behaves differently: it keeps the first `max - 1` bytes and drops the rest of the line. Both drop every `\r`.)
 * Protocols with binary data usually send a length first (`readExact` in `conn`, below, is made for that).
 
 ### Closing one direction: `shutdown`
@@ -188,8 +188,8 @@ last `recv` returns `0` too. `net.shutdown(h, 0)` stops reading and `net.shutdow
 {{sample net/tcp_peer}}
 
 **What to notice.** `net.peer` gives the address and port of the other side, `net.localIp` the address of your own side (the
-interface the connection uses). The socket options (`setNoDelay` to send small packets at once, `setKeepAlive`, `setReuse`) return
-`true` when the system accepted them. Servers set `SO_REUSEADDR` automatically on Linux, so restarting a server does not wait for old
+interface the connection uses). `net.peer` returns `false` for a socket that is not connected, as the last line of the output shows. The socket options (`setNoDelay` to send small packets at once, `setKeepAlive`, `setReuse`) return
+`true` when the system accepted them. `listenOn` sets `SO_REUSEADDR` itself on Linux and Android, so restarting a server does not wait for old
 connections to time out.
 
 ### A server in its own process
@@ -213,7 +213,7 @@ puts the server in a child process made by `fork`.
 {{sample net/tcp_bulk}}
 
 **What to notice.** The system keeps only a limited amount of unread data for a socket. When that is full, `net.send` **blocks** until
-the reader makes room, which is why the sender here is a separate process: with both sides in one thread, a large send to a socket
+the reader makes room. How much fits depends on the system (on Linux loopback a few megabytes, so one megabyte would still fit, but you cannot rely on that), which is why the sender here is a separate process: with both sides in one thread, a send of more than the system can hold for a socket
 that nobody reads yet would wait forever. A slow reader slows the writer down (flow control); nothing is lost.
 
 ### Talking to the real Internet
@@ -225,7 +225,7 @@ failure, and it should bound every wait. This sample only compiles (it needs a n
 
 **What to notice.** `net.httpGet` is the smallest possible HTTP client (HTTP/1.0, no redirects, no TLS); the `http` module of the next
 chapter does the real job. `net.resolve` asks `/etc/hosts` first and then the DNS servers of the system (and, as a last resort,
-`8.8.8.8` and `1.1.1.1`). With no network that can take several seconds, because every server is tried twice with a two-second time limit.
+`8.8.8.8` and `1.1.1.1`). With no network that can take several seconds, because every server is tried twice with a two-second time limit (so one silent server costs four seconds).
 
 ## UDP datagrams
 
@@ -250,8 +250,7 @@ loopback interface they do not, but real networks do).
 {{sample net/udp_boundaries}}
 
 **What to notice.** Three sends are three receives, even a datagram of zero bytes. A buffer that is smaller than the datagram
-**truncates** it silently: the rest is thrown away. Give `recvFrom` a buffer for the largest datagram your protocol allows (a datagram
-on Ethernet is at most about 1472 bytes of data without fragmentation).
+**truncates** it silently: the rest is thrown away. Give `recvFrom` a buffer for the largest datagram your protocol allows (on Ethernet, a datagram with more than 1472 bytes of data, which is 1500 minus 20 for IP and 8 for UDP, has to be split into fragments).
 
 ### Lost datagrams: time out and ask again
 
@@ -260,6 +259,8 @@ socket a time limit, and `recvFrom` then returns `-1` when it expires. Retrying 
 many other UDP protocols do exactly this.
 
 {{sample net/udp_retry}}
+
+**What to notice.** The "network" here is simulated: the server reads the first two requests and stays silent, so the client waits 100 ms each time and asks again. The third request is answered. The loop also stops after five attempts, because a real client must give up at some point.
 
 ### Broadcast and multicast
 
@@ -280,7 +281,7 @@ It takes arrays of handles and events and fills an array of results.
 | Event | Meaning |
 |---|---|
 | `net.READABLE` | `recv` will not block: data, a new client (for a listening socket) or the end of the stream |
-| `net.WRITABLE` | `send` will not block for a moment |
+| `net.WRITABLE` | there is room in the socket, so `send` can hand over at least some bytes without waiting |
 | `net.FAILED`, `net.HUNGUP` | only in the results: the socket has an error, or the peer is gone |
 
 {{sample net/poll_ready}}
@@ -303,27 +304,27 @@ time limits of the next sections. `net.connectTimeout` uses a non-blocking conne
 
 ## Buffered connections: `conn`
 
-`net.recv` returns arbitrary pieces, and `net.send` makes one system call per call. The `conn` module wraps a socket in a
+`net.recv` returns arbitrary pieces, and every `net.send` goes to the system at once (at least one system call per call). The `conn` module wraps a socket in a
 `conn.Connection` with a read buffer and a write buffer, so a program can ask for lines or exact byte counts and write many small
-pieces that leave as one packet. `conn.Listener` accepts connections, `conn.open` makes one, and `conn.Poller` serves many at once.
+pieces that leave as one packet. `conn.Listener(port)` accepts connections (it listens on every interface with a backlog of 64; `ok()` tells whether it worked), `conn.open` makes one, and `conn.Poller` serves many at once.
 
 | Method of `conn.Connection` | What it does |
 |---|---|
-| `readLine(buf, max)` | one line without its line end; `-1` at the end of the connection |
+| `readLine(buf, max)` | one line without its line end; `-1` at the end of the connection; a line longer than `max - 1` is cut and the rest of it is **dropped** |
 | `readExact(buf, n)` | exactly `n` bytes (fewer only when the connection ends) |
 | `read(buf, max)`, `readByte()` | whatever is available; one byte or `-1` |
-| `writeLine(text)`, `writeText(text)`, `write(buf, n)` | put data in the write buffer |
+| `writeLine(text)`, `writeText(text)`, `write(buf, n)` | put data in the write buffer (`writeLine` adds `\r\n`; a `write` of 4096 bytes or more is sent at once) |
 | `flush()` | send the buffer now (also done by `close()`) |
 | `readable(ms)`, `buffered()` | would a read block? how many bytes are already waiting |
-| `peer(&ip, &port)`, `localPort()`, `setTimeout(ms)`, `bytesIn`, `bytesOut` | information and limits |
+| `handle()`, `isOpen()`, `peer(&ip, &port)`, `localPort()`, `setTimeout(ms)`, `bytesIn`, `bytesOut` | the socket handle, information and limits |
 
 {{sample net/conn_lines}}
 
 **What to notice.**
 
-* Nothing is sent until `flush()` (or until 4096 bytes have collected, or `close()`). Forgetting `flush()` before waiting for the
+* Nothing is sent until `flush()` (or until the next write would not fit into the 4096-byte buffer, or `close()`). Forgetting `flush()` before waiting for the
   answer is the classic bug: both sides wait for each other.
-* The two lines and the ten digits came from the read buffer without further system calls: `buffered()` counts what is already there.
+* The client flushed once, so all 35 bytes (two lines with `\r\n` and ten digits) normally arrive together. After the two lines were read, `buffered()` still counts the ten digits that wait in the read buffer.
 * `readLine` returns `-1` at the end of the connection, and `readExact` returns fewer bytes than asked for only when the connection
   ends (or a time limit runs out).
 
@@ -333,7 +334,7 @@ A `Poller` is a set of connections with a tag each. `wait(ms)` returns how many 
 
 {{sample net/conn_poller}}
 
-**What to notice.** The server loop is "wait, serve everything that is ready, repeat". A `Poller` holds up to 128 entries; remove a
+**What to notice.** The server loop is "wait, serve everything that is ready, repeat". A `Poller` holds up to 128 entries (`add` returns `false` when it is full); remove a
 connection with `remove` when it is done. `examples/chat_server.a` is the bigger version of this: a chat for many clients in one
 thread.
 
@@ -344,11 +345,11 @@ Network code fails more often than anything else, so every function has a way to
 | Call | Failure looks like |
 |---|---|
 | `net.connect`, `net.connectTimeout`, `net.listen`, `net.listenOn`, `net.accept`, `net.udpBind` | a negative handle |
-| `net.send`, `net.sendTo` | a negative number (a write to a peer that has gone away returns `-1`; it does **not** kill the program with a signal) |
+| `net.send`, `net.sendTo` | a negative number (a write to a peer that has gone away fails with `-1` and does **not** kill the program with a signal; the first write after the peer closed can still succeed, because the system learns of the closed connection only from the answer) |
 | `net.recv` | `0` = the peer closed, negative = error or time out |
 | `net.recvFrom` | `-1` on error or time out |
 | `net.resolve`, `net.parseIp` | `-1` |
-| `conn.open`, `Listener.accept` | `null` |
+| `conn.open`, `Listener.accept` | `null` (`new conn.Listener(port)` always gives an object: ask `ok()`) |
 | `Connection.readLine` | `-1` (the end of the connection, and also a time out) |
 
 A program that ignores a failure usually crashes a few lines later, so check the first call that can fail: `connect` before `send`,
@@ -376,7 +377,7 @@ Nothing in the network promises that the other side ever answers, so every wait 
 | a DNS name | `net.resolve` and `dns.query` wait two seconds per try (below) |
 
 The `http` module sets 15 seconds on its connections, `conn.open` sets three times the connect time on reads and writes, and
-`tls.connect` gives the handshake 10 seconds. Plain `net.connect` has **no** limit of its own.
+`tls.connect` allows 5 seconds for the TCP connection and waits at most 10 seconds at each step of the handshake. Plain `net.connect` has **no** limit of its own.
 
 {{sample net/err_timeouts}}
 
@@ -388,13 +389,13 @@ blocking.
 
 **What to notice.** `Listener.accept(100)` returns `null` after 100 ms without a client, and `openRetry` tries several times with a
 pause. `Connection.readLine` returns `-1` both at the end of the connection and when its time limit ran out; if you must tell them
-apart, use `net.waitReadable` on `handle()` before reading.
+apart, ask `readable(ms)` first: it is `true` when data or the end of the connection is waiting, and `false` when the time ran out.
 
 ## Names: DNS
 
 `net.resolve(name)` is all most programs need: it knows IPv4 addresses, `localhost`, the entries of `/etc/hosts` and, failing those,
 asks a DNS server over UDP (the servers in `/etc/resolv.conf`, then `8.8.8.8` and `1.1.1.1`; on Windows the system resolver).
-`net.connect` calls it for you. The `dns` module goes further: it asks for any record type (`A`, `NS`, `CNAME`, `SOA`, `PTR`, `MX`,
+`net.connect` calls it for you. The `dns` module goes further: it asks for these record types and decodes them (`A`, `NS`, `CNAME`, `SOA`, `PTR`, `MX`,
 `TXT`, `AAAA`, `SRV`), and it exposes the packets, so you can write a DNS server, or test a client without a network.
 
 ### The messages
@@ -426,11 +427,11 @@ DNS replies come from the network.
 ### A client against a server of your own
 
 `dns.query` blocks until a server answers, so the sample runs a tiny DNS server in a child process. It reads the name from each query
-with `dns.readName` and answers with `dns.buildReply`.
+with `dns.readName` and answers with `dns.buildReply`, which writes a minimal reply: one `A` record (time to live 60 seconds) or "no such name".
 
 {{sample net/dns_fake_server}}
 
-**What to notice.** `dns.setServer(ip, port)` replaces the servers of the system, and `net.setDns` does the same for `net.resolve`.
+**What to notice.** `dns.setServer(ip, port)` replaces the servers of the system (it takes the address as a number), and `net.setDns("127.0.0.1", port)` does the same for `net.resolve` (it takes the address as text).
 `lookupA` does no query at all for a text that is already an address. `dns.query` returns the number of answers, `-1` if nobody answered
 and `0` with `rcode()` `3` for a name that does not exist.
 
@@ -440,17 +441,19 @@ Against the real DNS the sample only compiles, because it needs a network and it
 
 {{sample net/dns_lookup}}
 
+**What to notice.** `dns.lookupA` gives `-1` when there is no answer, `dns.query` leaves its records in the module until the next query (read them with `recordAt(i)`), and `dns.reverse` returns `null` when an address has no name.
+
 ## What the system knows: `netif`
 
 `netif` reads the tables of the operating system: the interfaces (like `ifconfig` or `ip addr`), the ARP cache, the routes, the open TCP
-and UDP sockets (like `netstat`) and the DNS servers. Linux and Android read `/proc` and ask the kernel; Windows uses `iphlpapi.dll`.
+and UDP sockets (like `netstat`) and the DNS servers (`dnsServers`, which reads `/etc/resolv.conf`, so on Linux and Android only). Linux and Android read `/proc` and ask the kernel; Windows uses `iphlpapi.dll` for the rest.
 The text parsers behind it are public, so they can be tested with fixed text.
 
 {{sample net/netif_parsers}}
 
 **What to notice.**
 
-* `parseRoutes`, `parseArp`, `parseSockets` and `parseNetDev` **replace** the module's table with what the text says; `routeAt(i)`,
+* `parseRoutes`, `parseArp` and `parseNetDev` **replace** the module's table with what the text says, and so does `parseSockets` when its last argument (`replace`) is `true`; with `false` it adds to the list; `routeAt(i)`,
   `arpAt(i)` and `connectionAt(i)` read that table. The functions that count or search (`routeCount`, `defaultGateway`, `arpCount`,
   `arpLookup`, `connectionCount`, `interfaceCount`) first **refresh the table from the real system**, which throws your parsed
   table away. Use the counts from the parser's return value in a test.
@@ -463,7 +466,7 @@ happened:
 
 **What to notice.** Every lookup (`findInterface`, `interfaceCount`) reads the system again and makes **new** `Iface` objects, so an
 object you kept does not change: fetch it again to see new numbers. Two limits to know when you list sockets: the table holds at most
-512 sockets, and a machine with more (a busy server, or one with many connections in `TIME_WAIT`) silently loses the rest; and the
+512 sockets (and, in the same way, 64 interfaces, 256 ARP entries and 128 routes), and a machine with more (a busy server, or one with many connections in `TIME_WAIT`) silently loses the rest; and the
 kernel's table can change while it is being read, so an entry may be missed or listed twice. Do not build logic on "this socket must
 be in the list".
 
@@ -569,7 +572,7 @@ Android and permission (root or `CAP_NET_RAW`); without it `rawnet.open` returns
 {{sample net/rawnet_capture}}
 
 **What to notice.** `capture` writes a `.pcap` file, `arping` is the ARP request of the previous section sent for real, and
-`rawnet.send(h, frame, n)` takes any frame built with `packet.ethBuild`. `examples/arping.a` is a command-line tool around the same
+`rawnet.send(h, frame, n)` takes any frame built with `packet.ethBuild`. The time stamps that `capture` writes count from the start of the capture, not from 1970, so Wireshark shows them as a date in January 1970. `examples/arping.a` is a command-line tool around the same
 calls.
 
 ## Summary
