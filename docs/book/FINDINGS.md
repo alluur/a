@@ -2,7 +2,7 @@
 
 Every module and language feature of the book was run, so the book also became a test of the compiler and the library. This is the index of what turned up. Every item was reproduced on this branch; the reproductions (3 to 15 lines each) are in the `NOTES-*.md` file named in the last column. The chapters describe the **real** behaviour and warn the reader where it is a trap.
 
-Nothing here was fixed by the book work: `lib/` and `src/` were left alone on purpose (the tier-2 work changes them).
+Nothing here was fixed by the book work: `lib/` and `src/` were left alone on purpose (the tier-2 work changes them). Items that the tier-2 work has since fixed are struck through.
 
 ## Compiler and language
 
@@ -12,7 +12,7 @@ Nothing here was fixed by the book work: `lib/` and `src/` were left alone on pu
 | `==` on two struct values compiles and silently does not compare the fields | NOTES-lang 4 |
 | A bare `sqrt(2.0)` after `import dmath;` calls the C-library bit-pattern function and gives 2.19e+18 with no diagnostic (use `dmath.sqrt`); likewise `double x = M_PI;` and `printfd("%f", d)` with a double variable | NOTES-lang 2, 3; NOTES-stdlib2 |
 | A `void` function used as a value compiles and crashes at run time (`char* u = strUpper(line);`) | NOTES-net 1 |
-| Duplicate `case` labels are not diagnosed | NOTES-lang 5 |
+| ~~Duplicate `case` labels are not diagnosed~~ **fixed** by the language work that landed after the first book version (`duplicate case label`, also for ranges and texts); a `switch` on text now compares the text | NOTES-lang 5 |
 | Structs, constants and enums may be used before their declaration inside function bodies (the reference says they may not); a base class must still come first | NOTES-lang 5, chapter 10 |
 | A top-level function cannot reuse a prelude name (`max`, `min`, `find`); a global named `find` gives an error that points into `<std>` | NOTES-lang 5, NOTES-gui2 a4 |
 | `const char*` gives "unknown type"; octal literals do not exist (`0755` is decimal 755) | NOTES-stdlib2 4, 5 |
