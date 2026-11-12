@@ -42,7 +42,7 @@ The finished counter has a step (a `SpinBox`), limits that disable the buttons, 
 **What changed, and why**
 
 * `show()` does more now: it also sets the title with `win->setTitle`, and enables or disables the two buttons with `setEnabled` at the limits. Everything that depends on `count` is in that one function, so no path can forget one of them.
-* `add(delta)` is the only place that changes `count`; it clamps the value to -20 .. 20. Buttons, keys and Reset all go through it.
+* `add(delta)` changes `count` for the buttons and the keys `+` and `-`; it clamps the value to -20 .. 20. Reset sets `count` to 0 itself, and every path ends in `show()`.
 * `win->onKey` gets the keys that no widget used. The focused widget gets a key first; a button has no use for `+`, so it falls through to the window. (A focused spin box would take the digit `0` for itself.) The picture shows the result of three clicks of step 2 and then the `+` key: 8.
 * The callbacks use globals (`win`, `shown`, `less`, `more`, `step`). This program has one window with one set of widgets, and a global is the simplest way for a callback to reach them. With several windows, use the `userData` field that every widget and every window has.
 
@@ -77,7 +77,7 @@ A `ListBox` cannot change an item, mark one, or remove one. So the finished prog
 * `toggleTask` and `removeTask` work on `list->selected`, the index of the selected row. A row of the list is a task of the array with the same index, so no search is needed.
 * `save()` writes `todo.txt` after every change, one line per task (`x text` for a done task, `- text` for an open one), and `load()` reads it at the start. Run the program, add tasks, close it and run it again in the same directory:
   the tasks are back. The picture shows the result of three tasks typed, the second one selected and **Done / not done** pressed: "2 of 3 tasks open".
-* The helper `appendLine` builds a new string with `malloc`, `strcpy` and `strcat`. A is not a language with a string type, so text work is done with these small functions; the previous string is never freed, which is fine for a file of a few lines.
+* The helper `appendLine` builds a new string with `malloc`, `strcpy` and `strcat`. A has no built-in string type (a string is a `char*`), so text work is done with small functions like these; the `strings` module has a `StringBuilder` for the same job. The previous string is never freed, which is fine for a file of a few lines.
 
 ## A drawing program
 
@@ -111,7 +111,7 @@ Moving the mouse quickly makes events that are far apart, so a thick brush must 
 * The slider sets the radius of the brush. `dab` draws a filled circle in the selected colour. `mouse` calls it once for every pixel between the old and the new position (`steps` is the larger of the two distances), so strokes are solid at any speed.
 * The first version joined two points with `line`, which is always one pixel thick. The finished one replaces it with dabs, so the brush can have any radius from 1 to 12.
 * **Clear** fills the canvas surface with white, **Save** writes it with `gimg.savePng(canvas->surf, "painting.png")` and reports it in a label. The canvas *is* the document: there is nothing else to save.
-* The window is made with `fit()`, which resizes it to the preferred size of its content. The toolbar row asks for 530 pixels, so the canvas surface is 528 pixels wide to match it.
+* The window is made with `fit()`, which resizes it to the preferred size of its content. The toolbar row asks for 530 pixels and a column gives every child the full width, so the canvas widget is 530 pixels wide. Its surface is 528 pixels, about the same; the two missing pixels show as a thin strip of background inside the right border.
 * The picture was made with a click on the red cell and a drag, a click on blue and a drag, and so on: four strokes in four colours.
 
 ## An analog clock
@@ -154,7 +154,7 @@ and a command line argument: `clock 10:08:35` shows that time and does not tick,
 
 * **Counter**: remember the value in a file as the to-do list does; add a menu bar with Quit and Reset (`guix`).
 * **To-do list**: ask before removing (`guix.confirm`), edit a task with `guix.prompt`, keep a due date with `guix.chooseDate`.
-* **Drawing program**: an eraser is just the white colour; add a File menu with `guix.saveFile` and `guix.openFile` (`gimg.load` gives you the picture back), and an undo that keeps a copy of the surface.
+* **Drawing program**: the white cell of the palette already works as an eraser; add a File menu with `guix.saveFile` and `guix.openFile` (`gimg.load` gives you the picture back), and an undo that keeps a copy of the surface.
 * **Clock**: a time zone offset in a spin box, an alarm with `guix.notify`, a digital clock widget made with `textScaled`.
 
 ## Summary

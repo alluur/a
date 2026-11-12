@@ -14,6 +14,7 @@ The first lines of a sample may carry directives in comments:
     // book: args=one two        command line arguments
     // book: sorted              compare the lines of the output in sorted order (threads)
     // book: linux-only          the program needs Linux (fork, signals, /proc ...): --targets builds only the Linux targets
+    // book: cpu-dependent       the output names the CPU it runs on: --run-target skips it (the x86-64 output is the recorded one)
     // book: link                (directory samples) separate compilation: every .a file of the directory is compiled with -c to an
                                  object, then main.a's object and the others are linked (headers next to them are #included as usual)
 Next to the program:  NAME.in is read as standard input, NAME.out is the expected standard output.
@@ -131,6 +132,8 @@ def run_one(path, ac, update, targets, verbose, run_target=None):
                 r = build(t, os.path.join(work, "x-" + t))
                 if r.returncode != 0:
                     return name, False, "compile error for target %s:\n%s" % (t, (r.stderr or r.stdout)[:1500])
+        if run_target and d.get("cpu-dependent"):
+            return name, True, "skipped on %s: the output names the CPU" % run_target
         if d.get("compile-only") or d.get("gui"):
             return name, True, "compiled" + (" (targets too)" if targets else "")
         stdin_path = path[:-2] + ".in" if not multi else os.path.join(srcdir, "main.in")
