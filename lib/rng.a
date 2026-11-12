@@ -1,2 +1,1276 @@
-// placeholder
+// =============================================================================
+//  rng - pseudo random generators with explicit state, distributions, shuffling and sampling                      import rng;
+//
+//  Generators (every one is a class derived from rng.Rng; the same seed gives the same sequence on every target, exactly as documented here)
+//    rng.SplitMix64 g(seed)       Vigna's splitmix64, one 64 bit state; also used to seed the others        g.nextU64()
+//    rng.Xoshiro256 g(seed)       xoshiro256** 1.0 (4 x 64 bit state, period 2^256 - 1), seeded by 4 outputs of SplitMix64(seed); jump() / longJump() skip 2^128 / 2^192
+//    rng.Pcg32 g(seed, stream)    PCG-XSH-RR 64/32 as in the PCG C library: pcg32_srandom_r(seed, stream); native 32 bit output nextU32()
+//    rng.Pcg64 g(seed, stream)    PCG-XSL-RR 128/64 (pcg64) as in the PCG C library with a 128 bit state, pcg_setseq_128_srandom_r(seed, stream) (the high halves are 0)
+//    rng.Mt19937 g(seed)          the Mersenne Twister MT19937: init_genrand(seed) as in the reference code; g.seedArray(key, n) = init_by_array; g.seedPython(seed) =
+//                                 Python's random.seed(int); nextDouble() is genrand_res53, so Mt19937 + seedPython gives exactly Python's random.random()
+//    rng.ChaCha20Rng g(key32)     a ChaCha20 CSPRNG with fast key erasure (see below); without a key it is seeded from the operating system and reseeds itself
+//    rng.system()                 one shared ChaCha20Rng seeded from the system (a pointer to it): rng.system()->below(100)
+//  A plain  rng.Rng r;  (without a generator) uses the system CSPRNG, so  rng.Rng r; r.uuid4(buf);  is all you need for good random numbers.
+//  Pcg32 and Mt19937 produce 32 bit words: nextU64() puts the first word in the upper half, the second in the lower half.
+//
+//  Methods of every generator (all are defined on rng.Rng and use only nextU64())
+//    nextU64() nextU32() nextInt() (0 .. 2^63 - 1) nextBool() fillBytes(buf, n)
+//    below(n)  an integer 0 .. n - 1 without modulo bias (Lemire's multiplication method)      uniformInt(lo, hi)  lo .. hi, both included, also the full range
+//    nextDouble()  a double in [0, 1) with 53 random bits (nextU64() >> 11) * 2^-53           nextDoubleOpen()  in (0, 1]       uniform(a, b)
+//    normal() normalAt(mu, sigma) lognormal(mu, sigma)   exponential() exponentialRate(rate)   gamma(shape) gammaAt(shape, scale)   beta(a, b)   chiSquared(k)
+//    poisson(lambda)  binomial(n, p)  geometric(p)  bernoulli(p)
+//    shuffle(a, n)  shuffleItems(base, n, itemSize)  sample(n, k, out)  sampleSorted(n, k, out)  weighted(weights, n)  uuid4(out37)
+//  rng.AliasTable (categorical distribution, O(1) per draw), rng.ReservoirSampler (k random items of a stream)
+//
+//  The distributions follow the algorithms of NumPy's Generator (ziggurat normal and exponential with 256 layers, Marsaglia-Tsang gamma, Johnk / gamma ratio
+//  beta, multiplication and PTRS Poisson, inversion binomial, search / inversion geometric), consuming the random bits in the same order. With a Pcg64 in the
+//  same state they give NumPy's numbers (to rounding of the last digit). Doubles are soft-float here, so results are identical on all targets.
+//
+//  Example
+//    rng.Xoshiro256 g(12345);   int roll = g.uniformInt(1, 6);   double x = g.normalAt(100.0, 15.0);   int k = g.poisson(4.5);
+//    int deck[52]; algo.iota(deck, 52, 0); g.shuffle(deck, 52);          char id[40]; rng.Rng().uuid4(id);        // "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+//
+//  Not for secrets: everything except ChaCha20Rng (and rng.Rng / rng.system()) is predictable from a few outputs. Nothing here is thread safe.
+// =============================================================================
+import asys;
+import bits;
+import chacha;
+import dmath;
 module rng;
+
+// ---- helpers ---------------------------------------------------------------------------------------------------------------------------
+private void freeMem(void* p) {
+    if (p != null) { asys.free((char*) p); }
+}
+
+// the high 64 bits of the 128 bit product a * b
+public uint64 mulhi64(uint64 a, uint64 b) {
+    uint64 a0 = a & 0xFFFFFFFF;
+    uint64 a1 = a >> 32;
+    uint64 b0 = b & 0xFFFFFFFF;
+    uint64 b1 = b >> 32;
+    uint64 p00 = a0 * b0;
+    uint64 p01 = a0 * b1;
+    uint64 p10 = a1 * b0;
+    uint64 p11 = a1 * b1;
+    uint64 mid = (p00 >> 32) + (p01 & 0xFFFFFFFF) + (p10 & 0xFFFFFFFF);
+    return p11 + (p01 >> 32) + (p10 >> 32) + (mid >> 32);
+}
+
+// 64 random bits from the operating system (getrandom, /dev/urandom or the Windows generator): a good seed
+public uint64 systemSeed() {
+    char b[8];
+    asys.randomBytes(&b[0], 8);
+    uint64 v = 0;
+    for (int i = 0; i < 8; i++) { v = (v << 8) | b[i]; }
+    return v;
+}
+
+// a seed from the clock (milliseconds since the epoch, the monotonic clock, an address and a call counter); different on every call, but guessable:
+// use systemSeed() when it matters
+public uint64 timeSeed() {
+    seedCounter++;
+    uint64 a = asys.nowMs();
+    uint64 b = asys.monoMs();
+    int local = 0;
+    uint64 c = (int) &local;
+    SplitMix64 m(a * 0x9E3779B97F4A7C15 + b + (uint64) seedCounter * 0xD1B54A32D192ED03);
+    return m.nextU64() ^ c;
+}
+
+private int seedCounter;
+
+private int logFactorialInit;
+
+// log(Gamma(x)) for x > 0, the series of NumPy's random_loggam (shift to x >= 7, then the Stirling series)
+private double logGamma(double x) {
+    if (x == 1.0 || x == 2.0) { return 0.0; }
+    int n = 0;
+    if (x < 7.0) { n = (int) (7.0 - x); }
+    double x0 = x + (double) n;
+    double x2 = (1.0 / x0) * (1.0 / x0);
+    double lg2pi = 1.8378770664093453;
+    double gl0 = -1.39243221690590;
+    gl0 = gl0 * x2 + 1.796443723688307e-01;
+    gl0 = gl0 * x2 + -2.955065359477124e-02;
+    gl0 = gl0 * x2 + 6.410256410256410e-03;
+    gl0 = gl0 * x2 + -1.917526917526918e-03;
+    gl0 = gl0 * x2 + 8.417508417508418e-04;
+    gl0 = gl0 * x2 + -5.952380952380952e-04;
+    gl0 = gl0 * x2 + 7.936507936507937e-04;
+    gl0 = gl0 * x2 + -2.777777777777778e-03;
+    gl0 = gl0 * x2 + 8.333333333333333e-02;
+    double gl = gl0 / x0 + 0.5 * lg2pi + (x0 - 0.5) * dmath.log(x0) - x0;
+    if (x < 7.0) {
+        for (int k = 1; k <= n; k++) {
+            gl = gl - dmath.log(x0 - 1.0);
+            x0 = x0 - 1.0;
+        }
+    }
+    return gl;
+}
+
+// ---- ziggurat tables for the normal and the exponential distribution (256 layers, built on first use) --------------------------------
+private bool zigReady;
+private double zigW[256];                   // normal: layer width / 2^52
+private uint64 zigK[256];                   // normal: acceptance limit of the 52 bit random number
+private double zigF[256];                   // normal: density at the layer edges
+private double zeW[256];                    // exponential: width / 2^53
+private uint64 zeK[256];
+private double zeF[256];
+private const NOR_R = 3.6541528853610088;           // start of the tail
+private const NOR_INV_R = 0.27366123732975828;
+private const NOR_V = 0.004928673233974658;         // area of every layer: R f(R) + the tail
+private const EXP_R = 7.69711747013104972;
+private const EXP_V = 0.003949659822581556;
+
+private void zigInit() {
+    if (zigReady) { return; }
+    double xs[256];
+    // normal: f(x) = exp(-x^2 / 2)
+    double m1 = 4503599627370496.0;                 // 2^52
+    xs[255] = NOR_R;
+    for (int i = 254; i >= 1; i--) {
+        xs[i] = dmath.sqrt(-2.0 * dmath.log(NOR_V / xs[i + 1] + dmath.exp(-0.5 * xs[i + 1] * xs[i + 1])));
+    }
+    double fr = dmath.exp(-0.5 * NOR_R * NOR_R);
+    double q = NOR_V / fr;
+    zigK[0] = (uint64) ((NOR_R / q) * m1);
+    zigK[1] = 0;
+    zigW[0] = q / m1;
+    zigW[255] = NOR_R / m1;
+    zigF[0] = 1.0;
+    zigF[255] = fr;
+    for (int i = 254; i >= 1; i--) {
+        zigK[i + 1] = (uint64) ((xs[i] / xs[i + 1]) * m1);
+        zigW[i] = xs[i] / m1;
+        zigF[i] = dmath.exp(-0.5 * xs[i] * xs[i]);
+    }
+    // exponential: f(x) = exp(-x)
+    double m2 = 9007199254740992.0;                 // 2^53
+    xs[255] = EXP_R;
+    for (int i = 254; i >= 1; i--) {
+        xs[i] = -dmath.log(EXP_V / xs[i + 1] + dmath.exp(-xs[i + 1]));
+    }
+    double fe = dmath.exp(-EXP_R);
+    double qe = EXP_V / fe;
+    zeK[0] = (uint64) ((EXP_R / qe) * m2);
+    zeK[1] = 0;
+    zeW[0] = qe / m2;
+    zeW[255] = EXP_R / m2;
+    zeF[0] = 1.0;
+    zeF[255] = fe;
+    for (int i = 254; i >= 1; i--) {
+        zeK[i + 1] = (uint64) ((xs[i] / xs[i + 1]) * m2);
+        zeW[i] = xs[i] / m2;
+        zeF[i] = dmath.exp(-xs[i]);
+    }
+    zigReady = true;
+}
+
+// ---- the base class ----------------------------------------------------------------------------------------------------------------------
+public class Rng {
+    // constants of the last Poisson and binomial parameters (the logarithms and exponentials are slow, so repeated draws with the same
+    // parameters reuse them)
+    private double pcLam;
+    private double pcEnlam;
+    private double pcLogLam;
+    private double pcA;
+    private double pcB;
+    private double pcInvAlpha;
+    private double pcLogInvAlpha;
+    private double pcVr;
+    private int bcN;
+    private double bcP;
+    private double bcQn;
+    private int bcBound;
+    private double gcP;
+    private double gcLog1p;
+
+    // 64 random bits. A generator overrides this; the base class itself uses the system CSPRNG.
+    public virtual uint64 nextU64() {
+        return system()->nextU64();
+    }
+
+    // 32 random bits (the upper half of nextU64() unless the generator has native 32 bit words)
+    public virtual int nextU32() {
+        return (int) (nextU64() >> 32);
+    }
+
+    // a non-negative int: 63 random bits
+    public int nextInt() {
+        return (int) (nextU64() >> 1);
+    }
+
+    public bool nextBool() {
+        return (nextU64() >> 63) != 0;
+    }
+
+    // a double in [0, 1) with 53 random bits: every multiple of 2^-53 is possible, 1.0 never
+    public virtual double nextDouble() {
+        uint64 v = nextU64() >> 11;
+        return (double) v * 1.1102230246251565e-16;
+    }
+
+    // a double in (0, 1]: never 0 (safe for log)
+    public double nextDoubleOpen() {
+        uint64 v = (nextU64() >> 11) + 1;
+        return (double) v * 1.1102230246251565e-16;
+    }
+
+    // a double in [a, b)
+    public double uniform(double a, double b) {
+        return a + (b - a) * nextDouble();
+    }
+
+    // n random bytes into buf (little endian words of nextU64())
+    public void fillBytes(char* buf, int n) {
+        int i = 0;
+        while (i < n) {
+            uint64 v = nextU64();
+            for (int k = 0; k < 8 && i < n; k++) {
+                buf[i] = v & 255;
+                v = v >> 8;
+                i++;
+            }
+        }
+    }
+
+    // An unsigned integer 0 .. n - 1 without modulo bias (Lemire: one multiplication, a division only in the rare case that a retry is possible).
+    // n == 0 gives 0.
+    public uint64 belowU64(uint64 n) {
+        if (n <= 1) { return 0; }
+        uint64 x = nextU64();
+        uint64 lo = x * n;
+        uint64 hi = mulhi64(x, n);
+        if (lo < n) {
+            uint64 t = (0 - n) % n;
+            while (lo < t) {
+                x = nextU64();
+                lo = x * n;
+                hi = mulhi64(x, n);
+            }
+        }
+        return hi;
+    }
+
+    // an int 0 .. n - 1 (0 for n <= 1), no modulo bias
+    public int below(int n) {
+        if (n <= 1) { return 0; }
+        return (int) belowU64((uint64) n);
+    }
+
+    // an int lo .. hi, both included (the two are swapped when lo > hi); the full range of int works
+    public int uniformInt(int lo, int hi) {
+        if (lo > hi) { int t = lo; lo = hi; hi = t; }
+        uint64 span = (uint64) hi - (uint64) lo + 1;          // 0 when it covers all 2^64 values
+        if (span == 0) { return (int) nextU64(); }
+        return (int) ((uint64) lo + belowU64(span));
+    }
+
+    // true with probability p (p <= 0 never, p >= 1 always)
+    public bool bernoulli(double p) {
+        if (p <= 0.0) { return false; }
+        if (p >= 1.0) { return true; }
+        return nextDouble() < p;
+    }
+
+    // ---- continuous distributions (NumPy's algorithms) ----------------------------------------------------------------------------------
+    // standard normal (mean 0, standard deviation 1): ziggurat, about 99 percent of the draws need one 64 bit word and one multiplication
+    public double normal() {
+        zigInit();
+        for (;;) {
+            uint64 r = nextU64();
+            int idx = (int) (r & 0xFF);
+            r = r >> 8;
+            bool neg = (r & 1) != 0;
+            uint64 rabs = (r >> 1) & 0x000FFFFFFFFFFFFF;
+            double x = (double) rabs * zigW[idx];
+            if (neg) { x = -x; }
+            if (rabs < zigK[idx]) { return x; }
+            if (idx == 0) {
+                for (;;) {
+                    double xx = -NOR_INV_R * dmath.log1p(-nextDouble());
+                    double yy = -dmath.log1p(-nextDouble());
+                    if (yy + yy > xx * xx) {
+                        if (((rabs >> 8) & 1) != 0) { return -(NOR_R + xx); }
+                        return NOR_R + xx;
+                    }
+                }
+            } else {
+                if ((zigF[idx - 1] - zigF[idx]) * nextDouble() + zigF[idx] < dmath.exp(-0.5 * x * x)) { return x; }
+            }
+        }
+        return 0.0;
+    }
+
+    public double normalAt(double mu, double sigma) {
+        return mu + sigma * normal();
+    }
+
+    public double lognormal(double mu, double sigma) {
+        return dmath.exp(mu + sigma * normal());
+    }
+
+    // standard exponential (mean 1): ziggurat
+    public double exponential() {
+        zigInit();
+        for (;;) {
+            uint64 ri = nextU64();
+            ri = ri >> 3;
+            int idx = (int) (ri & 0xFF);
+            ri = ri >> 8;
+            double x = (double) ri * zeW[idx];
+            if (ri < zeK[idx]) { return x; }
+            if (idx == 0) { return EXP_R - dmath.log1p(-nextDouble()); }
+            if ((zeF[idx - 1] - zeF[idx]) * nextDouble() + zeF[idx] < dmath.exp(-x)) { return x; }
+        }
+        return 0.0;
+    }
+
+    // exponential with rate lambda (mean 1 / lambda)
+    public double exponentialRate(double rate) {
+        return exponential() / rate;
+    }
+
+    // gamma distribution with shape k and scale 1 (Marsaglia-Tsang for k > 1; an exponential for k = 1; the NumPy variant for k < 1); mean k
+    public double gamma(double shape) {
+        if (shape == 1.0) { return exponential(); }
+        if (shape == 0.0) { return 0.0; }
+        if (shape < 1.0) {
+            for (;;) {
+                double u = nextDouble();
+                double v = exponential();
+                if (u <= 1.0 - shape) {
+                    double x = dmath.pow(u, 1.0 / shape);
+                    if (x <= v) { return x; }
+                } else {
+                    double y = -dmath.log((1.0 - u) / shape);
+                    double x = dmath.pow(1.0 - shape + shape * y, 1.0 / shape);
+                    if (x <= (v + y)) { return x; }
+                }
+            }
+        }
+        double b = shape - 1.0 / 3.0;
+        double c = 1.0 / dmath.sqrt(9.0 * b);
+        for (;;) {
+            double x;
+            double v;
+            do {
+                x = normal();
+                v = 1.0 + c * x;
+            } while (v <= 0.0);
+            v = v * v * v;
+            double u = nextDouble();
+            if (u < 1.0 - 0.0331 * (x * x) * (x * x)) { return b * v; }
+            if (dmath.log(u) < 0.5 * x * x + b * (1.0 - v + dmath.log(v))) { return b * v; }
+        }
+        return 0.0;
+    }
+
+    // gamma with shape k and scale theta (mean k * theta)
+    public double gammaAt(double shape, double scale) {
+        return scale * gamma(shape);
+    }
+
+    // beta distribution on (0, 1): Johnk's algorithm when a <= 1 and b <= 1, else a ratio of two gammas
+    public double beta(double a, double b) {
+        if (a <= 1.0 && b <= 1.0) {
+            for (;;) {
+                double u = nextDouble();
+                double v = nextDouble();
+                double x = dmath.pow(u, 1.0 / a);
+                double y = dmath.pow(v, 1.0 / b);
+                double xpy = x + y;
+                if (xpy <= 1.0 && u + v > 0.0) {
+                    if (xpy > 0.0) { return x / xpy; }
+                    double logX = dmath.log(u) / a;
+                    double logY = dmath.log(v) / b;
+                    double logM = (logX > logY) ? logX : logY;
+                    logX = logX - logM;
+                    logY = logY - logM;
+                    return dmath.exp(logX - dmath.log(dmath.exp(logX) + dmath.exp(logY)));
+                }
+            }
+        }
+        double ga = gamma(a);
+        double gb = gamma(b);
+        return ga / (ga + gb);
+    }
+
+    // chi-squared with k degrees of freedom
+    public double chiSquared(double k) {
+        return 2.0 * gamma(k / 2.0);
+    }
+
+    // ---- discrete distributions -----------------------------------------------------------------------------------------------------------
+    // Poisson with mean lambda >= 0: multiplication of uniforms below 10, PTRS (Hoermann's transformed rejection) from 10 on
+    public int poisson(double lambda) {
+        if (lambda >= 10.0) {
+            if (pcLam != lambda || pcB == 0.0) {
+                double slam = dmath.sqrt(lambda);
+                pcLam = lambda;
+                pcLogLam = dmath.log(lambda);
+                pcB = 0.931 + 2.53 * slam;
+                pcA = -0.059 + 0.02483 * pcB;
+                pcInvAlpha = 1.1239 + 1.1328 / (pcB - 3.4);
+                pcLogInvAlpha = dmath.log(pcInvAlpha);
+                pcVr = 0.9277 - 3.6224 / (pcB - 2.0);
+            }
+            double a = pcA;
+            double b = pcB;
+            for (;;) {
+                double u = nextDouble() - 0.5;
+                double v = nextDouble();
+                double us = 0.5 - dmath.fabs(u);
+                int k = (int) dmath.floor((2.0 * a / us + b) * u + lambda + 0.43);
+                if (us >= 0.07 && v <= pcVr) { return k; }
+                if (k < 0 || (us < 0.013 && v > us)) { continue; }
+                if ((dmath.log(v) + pcLogInvAlpha - dmath.log(a / (us * us) + b)) <= (-lambda + (double) k * pcLogLam - logGamma((double) (k + 1)))) { return k; }
+            }
+        }
+        if (lambda <= 0.0) { return 0; }
+        if (pcLam != lambda || pcB != 0.0) {
+            pcLam = lambda;
+            pcB = 0.0;
+            pcEnlam = dmath.exp(-lambda);
+        }
+        double enlam = pcEnlam;
+        int x = 0;
+        double prod = 1.0;
+        for (;;) {
+            double u = nextDouble();
+            prod = prod * u;
+            if (prod > enlam) { x++; } else { return x; }
+        }
+        return 0;
+    }
+
+    // inversion for small n * p (NumPy's random_binomial_inversion); p <= 0.5
+    private int binomialInversion(int n, double p) {
+        double q = 1.0 - p;
+        if (bcN != n || bcP != p || bcQn == 0.0) {
+            bcN = n;
+            bcP = p;
+            bcQn = dmath.exp((double) n * dmath.log(q));
+            double np = (double) n * p;
+            double lim = np + 10.0 * dmath.sqrt(np * q + 1.0);
+            bcBound = (lim < (double) n) ? (int) lim : n;
+        }
+        double qn = bcQn;
+        int bound = bcBound;
+        int x = 0;
+        double px = qn;
+        double u = nextDouble();
+        while (u > px) {
+            x++;
+            if (x > bound) {
+                x = 0;
+                px = qn;
+                u = nextDouble();
+            } else {
+                u = u - px;
+                px = (((double) (n - x + 1)) * p * px) / ((double) x * q);
+            }
+        }
+        return x;
+    }
+
+    // Binomial(n, p) for p <= 0.5: inversion when n * p <= 30, else the exact order statistic split (a Beta draw cuts the problem in two)
+    private int binomialLow(int n, double p) {
+        int acc = 0;
+        for (;;) {
+            if (n <= 0 || p <= 0.0) { return acc; }
+            if ((double) n * p <= 30.0) { return acc + binomialInversion(n, p); }
+            int a = 1 + n / 2;
+            int b = n + 1 - a;
+            double x = beta((double) a, (double) b);
+            if (x >= p) {
+                n = a - 1;
+                p = p / x;
+            } else {
+                acc = acc + a;
+                n = b - 1;
+                p = (p - x) / (1.0 - x);
+            }
+            if (p > 0.5) { return acc + n - binomialLow(n, 1.0 - p); }
+        }
+        return acc;
+    }
+
+    // the number of successes in n independent trials of probability p; n up to 2^53 (exact up to rounding of the doubles in the Beta draws)
+    public int binomial(int n, double p) {
+        if (n <= 0 || p <= 0.0) { return 0; }
+        if (p >= 1.0) { return n; }
+        if (p <= 0.5) { return binomialLow(n, p); }
+        return n - binomialLow(n, 1.0 - p);
+    }
+
+    // the number of trials up to and including the first success (1, 2, 3 ...) when every trial succeeds with probability p; p <= 0 gives 0, p >= 1 gives 1
+    public int geometric(double p) {
+        if (p <= 0.0) { return 0; }
+        if (p >= 1.0) { return 1; }
+        if (p >= 0.333333333333333333333333) {
+            int x = 1;
+            double sum = p;
+            double prod = p;
+            double q = 1.0 - p;
+            double u = nextDouble();
+            while (u > sum) {
+                prod = prod * q;
+                sum = sum + prod;
+                x++;
+            }
+            return x;
+        }
+        if (gcP != p) { gcP = p; gcLog1p = dmath.log1p(-p); }
+        double z = dmath.ceil(-exponential() / gcLog1p);
+        if (z >= 9.0e18) { return 0x7FFFFFFFFFFFFFFF; }
+        return (int) z;
+    }
+
+    // ---- arrays ------------------------------------------------------------------------------------------------------------------------------
+    // Fisher-Yates: a uniformly random order of a[0..n)
+    public void shuffle(int* a, int n) {
+        for (int i = n - 1; i > 0; i--) {
+            int j = below(i + 1);
+            int t = a[i];
+            a[i] = a[j];
+            a[j] = t;
+        }
+    }
+
+    // the same for n items of itemSize bytes each (structs, strings of fixed size ...)
+    public void shuffleItems(char* base, int n, int itemSize) {
+        if (itemSize <= 0) { return; }
+        for (int i = n - 1; i > 0; i--) {
+            int j = below(i + 1);
+            if (j == i) { continue; }
+            char* p = &base[i * itemSize];
+            char* q = &base[j * itemSize];
+            for (int k = 0; k < itemSize; k++) {
+                char t = p[k];
+                p[k] = q[k];
+                q[k] = t;
+            }
+        }
+    }
+
+    // k different integers from 0 .. n - 1 in a random order, written to out (room for k ints); false when k > n, k < 0, or memory ran out.
+    // Floyd's algorithm: O(k) time and memory however large n is.
+    public bool sample(int n, int k, int* out) {
+        if (k < 0 || k > n || n < 0) { return false; }
+        if (k == 0) { return true; }
+        if (n <= 4 * k) {
+            // dense: a partial Fisher-Yates shuffle of 0 .. n - 1
+            int* idx = (int*) asys.alloc(n * 8);
+            if (idx == null) { return false; }
+            for (int i = 0; i < n; i++) { idx[i] = i; }
+            for (int i = 0; i < k; i++) {
+                int j = i + below(n - i);
+                int t = idx[i];
+                idx[i] = idx[j];
+                idx[j] = t;
+                out[i] = idx[i];
+            }
+            freeMem(idx);
+            return true;
+        }
+        int slots = 16;
+        while (slots < 2 * k) { slots = slots * 2; }
+        int* table = (int*) asys.alloc(slots * 8);           // open addressing, stores value + 1
+        if (table == null) { return false; }
+        int cnt = 0;
+        for (int j = n - k; j < n; j++) {
+            int t = below(j + 1);
+            int s = (int) (mixHash(t) & (slots - 1));
+            bool found = false;
+            for (;;) {
+                if (table[s] == 0) { break; }
+                if (table[s] == t + 1) { found = true; break; }
+                s = (s + 1) & (slots - 1);
+            }
+            int pick = t;
+            if (found) {
+                pick = j;
+                s = (int) (mixHash(j) & (slots - 1));
+                while (table[s] != 0) { s = (s + 1) & (slots - 1); }
+            }
+            table[s] = pick + 1;
+            out[cnt] = pick;
+            cnt++;
+        }
+        freeMem(table);
+        shuffle(out, k);
+        return true;
+    }
+
+    // the same, in increasing order
+    public bool sampleSorted(int n, int k, int* out) {
+        if (!sample(n, k, out)) { return false; }
+        sortInts(out, k);
+        return true;
+    }
+
+    // an index 0 .. n - 1 chosen with probability weights[i] / sum of the weights (integer weights >= 0, so the result is exact); -1 when n <= 0,
+    // a weight is negative, the sum is 0 or does not fit in 63 bits
+    public int weighted(int* weights, int n) {
+        if (n <= 0) { return -1; }
+        uint64 total = 0;
+        for (int i = 0; i < n; i++) {
+            if (weights[i] < 0) { return -1; }
+            uint64 nt = total + (uint64) weights[i];
+            if (nt < total || nt > 0x7FFFFFFFFFFFFFFF) { return -1; }
+            total = nt;
+        }
+        if (total == 0) { return -1; }
+        uint64 r = belowU64(total);
+        for (int i = 0; i < n; i++) {
+            uint64 w = (uint64) weights[i];
+            if (r < w) { return i; }
+            r = r - w;
+        }
+        return n - 1;
+    }
+
+    // a random (version 4) UUID as 36 characters plus the terminating 0 into out (37 bytes): "f47ac10b-58cc-4372-a567-0e02b2c3d479"
+    public void uuid4(char* out) {
+        char b[16];
+        fillBytes(&b[0], 16);
+        b[6] = (b[6] & 0x0F) | 0x40;
+        b[8] = (b[8] & 0x3F) | 0x80;
+        char* hex = "0123456789abcdef";
+        int k = 0;
+        for (int i = 0; i < 16; i++) {
+            if (i == 4 || i == 6 || i == 8 || i == 10) { out[k] = '-'; k++; }
+            out[k] = hex[(b[i] >> 4) & 15];
+            out[k + 1] = hex[b[i] & 15];
+            k = k + 2;
+        }
+        out[k] = 0;
+    }
+}
+
+private int mixHash(int x) {
+    uint64 z = x;
+    z = (z ^ (z >> 33)) * 0xFF51AFD7ED558CCD;
+    z = (z ^ (z >> 33)) * 0xC4CEB9FE1A85EC53;
+    z = z ^ (z >> 33);
+    return (int) (z & 0x7FFFFFFFFFFFFFFF);
+}
+
+// heap sort of ints (no allocation, O(n log n) worst case)
+private void sortInts(int* a, int n) {
+    for (int i = n / 2 - 1; i >= 0; i--) { siftDown(a, i, n); }
+    for (int end = n - 1; end > 0; end--) {
+        int t = a[0]; a[0] = a[end]; a[end] = t;
+        siftDown(a, 0, end);
+    }
+}
+
+private void siftDown(int* a, int i, int n) {
+    for (;;) {
+        int c = 2 * i + 1;
+        if (c >= n) { return; }
+        if (c + 1 < n && a[c + 1] > a[c]) { c++; }
+        if (a[i] >= a[c]) { return; }
+        int t = a[i]; a[i] = a[c]; a[c] = t;
+        i = c;
+    }
+}
+
+// ---- SplitMix64 --------------------------------------------------------------------------------------------------------------------------
+// state += 0x9E3779B97F4A7C15; z = state; z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9; z = (z ^ (z >> 27)) * 0x94D049BB133111EB; return z ^ (z >> 31)
+public class SplitMix64 : Rng {
+    private uint64 s;
+
+    public SplitMix64(uint64 seed = 0) {
+        s = seed;
+    }
+
+    public void seed(uint64 seed) {
+        s = seed;
+    }
+
+    public uint64 nextU64() {
+        s = s + 0x9E3779B97F4A7C15;
+        uint64 z = s;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EB;
+        return z ^ (z >> 31);
+    }
+}
+
+// ---- xoshiro256** ------------------------------------------------------------------------------------------------------------------------
+public class Xoshiro256 : Rng {
+    private uint64 s0;
+    private uint64 s1;
+    private uint64 s2;
+    private uint64 s3;
+    private bool ready;
+
+    public Xoshiro256(uint64 seed = 0) {
+        this.seed(seed);
+    }
+
+    // the four state words are the first four outputs of SplitMix64(seed)
+    public void seed(uint64 seed) {
+        SplitMix64 m(seed);
+        s0 = m.nextU64();
+        s1 = m.nextU64();
+        s2 = m.nextU64();
+        s3 = m.nextU64();
+        ready = true;
+    }
+
+    // sets the four state words directly; an all zero state is not allowed (it would stay zero) and is replaced by seed(0)
+    public void setState(uint64 a, uint64 b, uint64 c, uint64 d) {
+        if ((a | b | c | d) == 0) { seed(0); return; }
+        s0 = a; s1 = b; s2 = c; s3 = d;
+        ready = true;
+    }
+
+    public uint64 getState(int i) {
+        if (i == 0) { return s0; }
+        if (i == 1) { return s1; }
+        if (i == 2) { return s2; }
+        return s3;
+    }
+
+    public uint64 nextU64() {
+        if (!ready) { seed(0); }
+        uint64 result = bits.rotl64(s1 * 5, 7) * 9;
+        uint64 t = s1 << 17;
+        s2 = s2 ^ s0;
+        s3 = s3 ^ s1;
+        s1 = s1 ^ s2;
+        s0 = s0 ^ s3;
+        s2 = s2 ^ t;
+        s3 = bits.rotl64(s3, 45);
+        return result;
+    }
+
+    private void jumpWith(uint64* poly) {
+        uint64 a = 0;
+        uint64 b = 0;
+        uint64 c = 0;
+        uint64 d = 0;
+        for (int i = 0; i < 4; i++) {
+            for (int bit = 0; bit < 64; bit++) {
+                if ((poly[i] & ((uint64) 1 << bit)) != 0) {
+                    a = a ^ s0;
+                    b = b ^ s1;
+                    c = c ^ s2;
+                    d = d ^ s3;
+                }
+                nextU64();
+            }
+        }
+        s0 = a; s1 = b; s2 = c; s3 = d;
+    }
+
+    // advances the generator by 2^128 steps: 2^128 non-overlapping streams for parallel work
+    public void jump() {
+        uint64 poly[4];
+        poly[0] = 0x180EC6D33CFD0ABA;
+        poly[1] = 0xD5A61266F0C9392C;
+        poly[2] = 0xA9582618E03FC9AA;
+        poly[3] = 0x39ABDC4529B1661C;
+        jumpWith(&poly[0]);
+    }
+
+    // advances by 2^192 steps
+    public void longJump() {
+        uint64 poly[4];
+        poly[0] = 0x76E15D3EFEFDCBBF;
+        poly[1] = 0xC5004E441C522FB3;
+        poly[2] = 0x77710069854EE241;
+        poly[3] = 0x39109BB02ACBE635;
+        jumpWith(&poly[0]);
+    }
+}
+
+// ---- PCG32 (XSH RR 64/32) -----------------------------------------------------------------------------------------------------------------
+public class Pcg32 : Rng {
+    private uint64 state;
+    private uint64 inc;
+    private bool ready;
+
+    // pcg32_srandom_r(seed, stream): any seed, any stream (two streams never overlap); the default pair is the one of the PCG demo program
+    public Pcg32(uint64 seed = 42, uint64 stream = 54) {
+        this.seed(seed, stream);
+    }
+
+    public void seed(uint64 seed, uint64 stream) {
+        state = 0;
+        inc = (stream << 1) | 1;
+        nextU32();
+        state = state + seed;
+        nextU32();
+        ready = true;
+    }
+
+    // one 32 bit output (as a non-negative int)
+    public int nextU32() {
+        if (!ready && inc == 0) { seed(42, 54); }
+        uint64 old = state;
+        state = old * 6364136223846793005 + inc;
+        uint64 xorshifted = (((old >> 18) ^ old) >> 27) & 0xFFFFFFFF;
+        int rot = (int) (old >> 59);
+        uint64 r = ((xorshifted >> rot) | (xorshifted << ((32 - rot) & 31))) & 0xFFFFFFFF;
+        return (int) r;
+    }
+
+    // two outputs: the first one in the upper half
+    public uint64 nextU64() {
+        uint64 hi = (uint64) nextU32();
+        uint64 lo = (uint64) nextU32();
+        return (hi << 32) | lo;
+    }
+}
+
+// ---- PCG64 (XSL RR 128/64) ---------------------------------------------------------------------------------------------------------------
+public class Pcg64 : Rng {
+    private uint64 sHi;
+    private uint64 sLo;
+    private uint64 iHi;                    // the increment (always odd)
+    private uint64 iLo;
+    private bool ready;
+
+    // pcg_setseq_128_srandom_r(seed, stream) with the high halves 0
+    public Pcg64(uint64 seed = 0, uint64 stream = 0) {
+        seed128(0, seed, 0, stream);
+    }
+
+    // the same with 128 bit seed and stream (hi, lo)
+    public void seed128(uint64 seedHi, uint64 seedLo, uint64 streamHi, uint64 streamLo) {
+        sHi = 0; sLo = 0;
+        iHi = (streamHi << 1) | (streamLo >> 63);
+        iLo = (streamLo << 1) | 1;
+        step();
+        uint64 lo = sLo + seedLo;
+        uint64 carry = (lo < sLo) ? 1 : 0;
+        sHi = sHi + seedHi + carry;
+        sLo = lo;
+        step();
+        ready = true;
+    }
+
+    // sets the 128 bit state and the 128 bit increment directly (the increment is made odd), like NumPy's state dictionary
+    public void setState(uint64 stateHi, uint64 stateLo, uint64 incHi, uint64 incLo) {
+        sHi = stateHi; sLo = stateLo;
+        iHi = incHi; iLo = incLo | 1;
+        ready = true;
+    }
+
+    public uint64 getState(int i) {
+        if (i == 0) { return sHi; }
+        if (i == 1) { return sLo; }
+        if (i == 2) { return iHi; }
+        return iLo;
+    }
+
+    // state = state * 47026247687942121848144207491837523525 + increment (mod 2^128)
+    private void step() {
+        uint64 mHi = 0x2360ED051FC65DA4;
+        uint64 mLo = 0x4385DF649FCCF645;
+        uint64 lo = sLo * mLo;
+        uint64 hi = mulhi64(sLo, mLo) + sLo * mHi + sHi * mLo;
+        uint64 lo2 = lo + iLo;
+        uint64 carry = (lo2 < lo) ? 1 : 0;
+        sHi = hi + iHi + carry;
+        sLo = lo2;
+    }
+
+    public uint64 nextU64() {
+        if (!ready) { seed128(0, 0, 0, 0); }
+        step();
+        uint64 x = sHi ^ sLo;
+        int rot = (int) (sHi >> 58);
+        return bits.rotr64(x, rot);
+    }
+}
+
+// ---- Mersenne Twister MT19937 ------------------------------------------------------------------------------------------------------------
+public class Mt19937 : Rng {
+    private int* mt;                       // 624 words (in the low 32 bits of ints)
+    private int mti;                       // next word to use; 624 = refill
+
+    public Mt19937(int seed = 5489) {
+        this.seed(seed);
+    }
+
+    private bool alloc() {
+        if (mt != null) { return true; }
+        mt = (int*) asys.alloc(624 * 8);
+        return mt != null;
+    }
+
+    // init_genrand(seed): only the low 32 bits of seed are used (5489 is the default of the reference code)
+    public void seed(int seed) {
+        if (!alloc()) { return; }
+        mt[0] = seed & 0xFFFFFFFF;
+        for (int i = 1; i < 624; i++) {
+            int prev = mt[i - 1];
+            mt[i] = (1812433253 * (prev ^ (prev >> 30)) + i) & 0xFFFFFFFF;
+        }
+        mti = 624;
+    }
+
+    // init_by_array(key, n): n 32 bit words (the low 32 bits of every int)
+    public void seedArray(int* key, int n) {
+        if (!alloc() || n <= 0) { return; }
+        seed(19650218);
+        int i = 1;
+        int j = 0;
+        int k = (624 > n) ? 624 : n;
+        for (; k > 0; k--) {
+            int prev = mt[i - 1];
+            mt[i] = ((mt[i] ^ ((prev ^ (prev >> 30)) * 1664525)) + (key[j] & 0xFFFFFFFF) + j) & 0xFFFFFFFF;
+            i++;
+            j++;
+            if (i >= 624) { mt[0] = mt[623]; i = 1; }
+            if (j >= n) { j = 0; }
+        }
+        for (k = 623; k > 0; k--) {
+            int prev = mt[i - 1];
+            mt[i] = ((mt[i] ^ ((prev ^ (prev >> 30)) * 1566083941)) - i) & 0xFFFFFFFF;
+            i++;
+            if (i >= 624) { mt[0] = mt[623]; i = 1; }
+        }
+        mt[0] = 0x80000000;
+        mti = 624;
+    }
+
+    // what Python's random.seed(seed) does for an int: init_by_array with the 32 bit pieces of abs(seed), lowest first
+    public void seedPython(int seed) {
+        int key[3];
+        uint64 v = (seed < 0) ? (uint64) (0 - seed) : (uint64) seed;
+        int n = 1;
+        key[0] = (int) (v & 0xFFFFFFFF);
+        if ((v >> 32) != 0) { key[1] = (int) (v >> 32); n = 2; }
+        seedArray(&key[0], n);
+    }
+
+    private void twist() {
+        for (int kk = 0; kk < 624; kk++) {
+            int y = (mt[kk] & 0x80000000) | (mt[(kk + 1) % 624] & 0x7FFFFFFF);
+            int v = mt[(kk + 397) % 624] ^ (y >> 1);
+            if ((y & 1) != 0) { v = v ^ 0x9908B0DF; }
+            mt[kk] = v;
+        }
+        mti = 0;
+    }
+
+    // genrand_int32: the next 32 bit output
+    public int nextU32() {
+        if (mt == null) { seed(5489); }
+        if (mt == null) { return 0; }
+        if (mti >= 624) { twist(); }
+        int y = mt[mti];
+        mti++;
+        y = y ^ (y >> 11);
+        y = y ^ ((y << 7) & 0x9D2C5680);
+        y = y ^ ((y << 15) & 0xEFC60000);
+        y = y ^ (y >> 18);
+        return y & 0xFFFFFFFF;
+    }
+
+    // two outputs: the first one in the upper half
+    public uint64 nextU64() {
+        uint64 hi = (uint64) nextU32();
+        uint64 lo = (uint64) nextU32();
+        return (hi << 32) | lo;
+    }
+
+    // genrand_res53: (a >> 5) * 2^26 + (b >> 6), divided by 2^53 (a and b are two consecutive 32 bit outputs): Python's random.random()
+    public double nextDouble() {
+        int a = nextU32() >> 5;
+        int b = nextU32() >> 6;
+        return ((double) a * 67108864.0 + (double) b) * 1.1102230246251565e-16;
+    }
+
+    public void dispose() {
+        freeMem(mt);
+        mt = null;
+        mti = 0;
+    }
+}
+
+// ---- ChaCha20 CSPRNG -----------------------------------------------------------------------------------------------------------------------
+// Fast key erasure (Bernstein): the generator keeps a 32 byte key. To refill it computes 1024 bytes of ChaCha20 keystream for the key (nonce 0,
+// block counter 0..15); the first 32 bytes are the NEW key (the old one is overwritten, so earlier output cannot be recovered from a later memory dump),
+// the other 992 bytes are the output, handed out as little endian 64 bit words in order. Seeded from the system (no key given), it also mixes 32 fresh
+// system bytes into the key after every 1 MiB of output. With an explicit key the sequence is fixed and the same on every target.
+public class ChaCha20Rng : Rng {
+    private char* mem;                     // 32 byte key, 12 byte nonce (zero), 1024 byte buffer
+    private int pos;                       // next unread byte of the buffer; 1024 = empty
+    private int sinceReseed;
+    private bool autoReseed;
+
+    // key32: 32 seed bytes (null: seed from the operating system)
+    public ChaCha20Rng(char* key32 = null) {
+        if (key32 == null) { reseedFromSystem(); autoReseed = true; }
+        else { seedBytes(key32); }
+    }
+
+    private bool ensure() {
+        if (mem != null) { return true; }
+        mem = asys.alloc(32 + 12 + 1024);
+        pos = 1024;
+        return mem != null;
+    }
+
+    // uses the 32 bytes at key32 as the key (the sequence is then fixed)
+    public void seedBytes(char* key32) {
+        if (!ensure()) { return; }
+        memcpy(mem, key32, 32);
+        pos = 1024;
+        sinceReseed = 0;
+        autoReseed = false;
+    }
+
+    // a key from a 64 bit seed: the 32 key bytes are four SplitMix64(seed) outputs, little endian (for tests and examples; weak: 64 bits of entropy)
+    public void seedUint64(uint64 seed) {
+        char key[32];
+        SplitMix64 m(seed);
+        for (int w = 0; w < 4; w++) {
+            uint64 v = m.nextU64();
+            for (int i = 0; i < 8; i++) { key[w * 8 + i] = v & 255; v = v >> 8; }
+        }
+        seedBytes(&key[0]);
+    }
+
+    // a new key from the operating system; discards buffered output
+    public void reseedFromSystem() {
+        if (!ensure()) { return; }
+        asys.randomBytes(mem, 32);
+        pos = 1024;
+        sinceReseed = 0;
+    }
+
+    // mixes bytes (any number) into the key: the key becomes the XOR of the old key and the first 32 of them
+    public void mixIn(char* data, int n) {
+        if (!ensure()) { return; }
+        for (int i = 0; i < n && i < 32; i++) { mem[i] = mem[i] ^ data[i]; }
+        pos = 1024;
+    }
+
+    private void refill() {
+        char* buf = &mem[44];
+        memset(buf, 0, 1024);
+        chacha.xorStream(mem, &mem[32], 0, buf, 1024, buf);
+        memcpy(mem, buf, 32);                                // the new key
+        pos = 32;
+        if (autoReseed) {
+            sinceReseed = sinceReseed + 992;
+            if (sinceReseed >= 1048576) {
+                char fresh[32];
+                asys.randomBytes(&fresh[0], 32);
+                for (int i = 0; i < 32; i++) { mem[i] = mem[i] ^ fresh[i]; }
+                sinceReseed = 0;
+                for (int i = 0; i < 32; i++) { fresh[i] = 0; }
+            }
+        }
+    }
+
+    public uint64 nextU64() {
+        if (mem == null) {
+            if (!ensure()) {
+                // no memory: take the bytes straight from the system (slow, but never predictable and never constant)
+                return systemSeed();
+            }
+            reseedFromSystem();
+            autoReseed = true;
+        }
+        if (pos + 8 > 1024) { refill(); }
+        char* p = &mem[44 + pos];
+        uint64 v = 0;
+        for (int i = 7; i >= 0; i--) { v = (v << 8) | p[i]; }
+        pos = pos + 8;
+        return v;
+    }
+
+    // wipes the key and the buffer and frees them; the object can be used again (it reseeds from the system)
+    public void dispose() {
+        if (mem != null) {
+            memset(mem, 0, 32 + 12 + 1024);
+            freeMem(mem);
+        }
+        mem = null;
+        pos = 1024;
+        sinceReseed = 0;
+        autoReseed = false;
+    }
+}
+
+private Rng* sysRng;
+
+// the shared system seeded CSPRNG of this program (created on first use; never freed): rng.system()->below(6)
+public Rng* system() {
+    if (sysRng == null) { sysRng = (Rng*) new ChaCha20Rng(); }
+    return sysRng;
+}
+
+// a random UUID (version 4, 36 characters + 0 into out) from the system CSPRNG
+public void uuid4(char* out) {
+    system()->uuid4(out);
+}
+
+// ---- the alias method ---------------------------------------------------------------------------------------------------------------------
+// Walker / Vose: after an O(n) setup every draw of an index with probability weight[i] / sum costs one below(n) and one nextDouble().
+public class AliasTable {
+    private double* prob;                  // acceptance probability of every column
+    private int* alias;
+    private int n;
+
+    // weights: n non-negative doubles (not all 0, no NaN or infinity); ok() tells whether the table could be built
+    public AliasTable(double* weights, int count) {
+        build(weights, count);
+    }
+
+    public bool ok() { return n > 0; }
+    public int size() { return n; }
+
+    public bool build(double* weights, int count) {
+        dispose();
+        if (count <= 0 || count > 0x10000000) { return false; }
+        double total = 0.0;
+        for (int i = 0; i < count; i++) {
+            double w = weights[i];
+            if (!(w >= 0.0) || w > 1.0e300) { return false; }        // negative, NaN or huge
+            total = total + w;
+        }
+        if (!(total > 0.0) || total > 1.0e300) { return false; }
+        prob = (double*) asys.alloc(count * 8);
+        alias = (int*) asys.alloc(count * 8);
+        int* small = (int*) asys.alloc(count * 8);
+        int* large = (int*) asys.alloc(count * 8);
+        double* scaled = (double*) asys.alloc(count * 8);
+        if (prob == null || alias == null || small == null || large == null || scaled == null) {
+            freeMem(small); freeMem(large); freeMem(scaled);
+            dispose();
+            return false;
+        }
+        int ns = 0;
+        int nl = 0;
+        for (int i = 0; i < count; i++) {
+            scaled[i] = weights[i] * (double) count / total;
+            if (scaled[i] < 1.0) { small[ns] = i; ns++; } else { large[nl] = i; nl++; }
+        }
+        while (ns > 0 && nl > 0) {
+            ns--;
+            int s = small[ns];
+            int l = large[nl - 1];
+            prob[s] = scaled[s];
+            alias[s] = l;
+            scaled[l] = (scaled[l] + scaled[s]) - 1.0;
+            if (scaled[l] < 1.0) {
+                nl--;
+                small[ns] = l;
+                ns++;
+            }
+        }
+        while (nl > 0) { nl--; prob[large[nl]] = 1.0; alias[large[nl]] = large[nl]; }
+        while (ns > 0) { ns--; prob[small[ns]] = 1.0; alias[small[ns]] = small[ns]; }      // only by rounding
+        freeMem(small); freeMem(large); freeMem(scaled);
+        n = count;
+        return true;
+    }
+
+    // the same for integer weights
+    public bool buildInts(int* weights, int count) {
+        if (count <= 0 || count > 0x10000000) { dispose(); return false; }
+        double* w = (double*) asys.alloc(count * 8);
+        if (w == null) { dispose(); return false; }
+        for (int i = 0; i < count; i++) {
+            if (weights[i] < 0) { freeMem(w); dispose(); return false; }
+            w[i] = (double) weights[i];
+        }
+        bool ok = build(w, count);
+        freeMem(w);
+        return ok;
+    }
+
+    // a random index; -1 when the table is empty
+    public int sample(Rng* r) {
+        if (n <= 0) { return -1; }
+        int i = r->below(n);
+        if (r->nextDouble() < prob[i]) { return i; }
+        return alias[i];
+    }
+
+    // the exact probability the table gives to index i (for tests)
+    public double probabilityOf(int idx) {
+        if (idx < 0 || idx >= n) { return 0.0; }
+        double p = prob[idx];
+        for (int j = 0; j < n; j++) {
+            if (j != idx && alias[j] == idx) { p = p + (1.0 - prob[j]); }
+        }
+        return p / (double) n;
+    }
+
+    public void dispose() {
+        freeMem(prob);
+        freeMem(alias);
+        prob = null;
+        alias = null;
+        n = 0;
+    }
+}
+
+// ---- reservoir sampling ------------------------------------------------------------------------------------------------------------------
+// keeps k items chosen uniformly at random from a stream of unknown length (Algorithm R): after offering m >= k items every one of them is in the
+// reservoir with probability k / m.
+public class ReservoirSampler {
+    private int* items;
+    private int k;
+    private int filled;
+    private int seen;
+
+    public ReservoirSampler(int capacity) {
+        if (capacity > 0 && capacity <= 0x10000000) {
+            items = (int*) asys.alloc(capacity * 8);
+            if (items != null) { k = capacity; }
+        }
+    }
+
+    public bool ok() { return k > 0; }
+    public int capacity() { return k; }
+    // how many items are in the reservoir now (min(k, offered))
+    public int size() { return filled; }
+    // how many items were offered
+    public int offered() { return seen; }
+
+    // offers the next item of the stream; r supplies the random numbers
+    public void offer(Rng* r, int value) {
+        if (k == 0) { return; }
+        seen++;
+        if (filled < k) {
+            items[filled] = value;
+            filled++;
+            return;
+        }
+        int j = r->below(seen);
+        if (j < k) { items[j] = value; }
+    }
+
+    public int get(int i) {
+        if (i < 0 || i >= filled) { return 0; }
+        return items[i];
+    }
+
+    // forgets the items, keeps the capacity
+    public void clear() {
+        filled = 0;
+        seen = 0;
+    }
+
+    public void dispose() {
+        freeMem(items);
+        items = null;
+        k = 0;
+        filled = 0;
+        seen = 0;
+    }
+}
