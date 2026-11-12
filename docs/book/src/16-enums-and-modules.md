@@ -52,7 +52,7 @@ What to notice:
 
 - `sizeof(Kind)` is 1. In `Frame`, the fields are aligned like any other: the `Kind` is at offset 0, the `uint16` at offset 2 and the second `Kind` at offset 4. That is 5 bytes of data, and the size of a structure is rounded up to a multiple of 8, so `sizeof(Frame)` is 8.
 - The value is cut to the base type when stored: `Kind k = 300;` holds 44.
-- `Kind.name(Kind.Image)` and the other reflection functions work the same way.
+- `Kind.name(Kind.Image)` and the other functions of the table above work the same way.
 
 ## Modules in files
 
@@ -82,7 +82,7 @@ What to notice:
 
 ### Where imports are found
 
-`import name;` looks, in this order, in: the directory of the importing file, a `lib/` directory in the current directory, `/usr/lib/a/`, `/usr/local/lib/a/`, and a `lib/` next to the main source file. A dot in the name becomes a directory separator, and a quoted name is a file name.
+`import name;` looks, in this order, in: the directory of the importing file, the library modules built into the compiler, a `lib/` directory in the current directory, `/usr/lib/a/`, `/usr/local/lib/a/`, and a `lib/` next to the main source file. So a file next to your source replaces a built-in module of the same name, but a `lib/` directory does not. A dot in the name becomes a directory separator, and a quoted name is a file name.
 
 The directory of this sample holds `main.a`, `plain.a`, `util/math.a` and `extras/tools.a`.
 
@@ -135,7 +135,7 @@ What to notice:
 
 ## Summary
 
-- `enum E { A, B = 5, C }` declares `int` constants; `E.count`, `E.name(v)`, `E.parse(text)` and `E.has(v)` give reflection.
+- `enum E { A, B = 5, C }` declares `int` constants; `E.count`, `E.name(v)`, `E.parse(text)` and `E.has(v)` describe the enum.
 - `enum E : uint8 { ... }` stores the enum in the given integer type.
 - `module name;` at the top of a file and `import name;` in another make `name.member` available; `import a.b;` finds `a/b.a`.
 - `private` hides a top-level declaration from other files; files are compiled once.

@@ -44,7 +44,7 @@ For constants, the compile-time features of A itself, `const` and `static if`, a
 
 ## Conditional compilation
 
-`#ifdef X` and `#ifndef X` test whether a macro is defined; `#if expr` tests a number. In `expr` you can use `defined(X)`, integers, character constants, parentheses and the operators `+ - * / % << >> & | ^ ~ ! && || == != < > <= >=`. The conditional operator `? :` is not supported. A name that is not a macro counts as 0. The lines that are not selected are skipped completely: they need not be valid A code.
+`#ifdef X` and `#ifndef X` test whether a macro is defined; `#if expr` tests a number. In `expr` you can use `defined(X)`, integers (decimal, `0x`, `0b`), parentheses, unary `-` and the operators `+ - * / % << >> & | ^ ~ ! && || == != < > <= >=`. The conditional operator `? :` is not supported. Do not use character constants that contain a letter, such as `'a'`: the preprocessor reads the letter as an unknown name and turns it into 0, so `'a' == 'b'` is true. Compare with numbers instead (`97`). A name that is not a macro counts as 0. The lines that are not selected are skipped completely: they need not be valid A code.
 
 {{sample lang/pp_conditional}}
 
@@ -94,7 +94,7 @@ These macros always exist:
 What to notice:
 
 - The values describe the target the program is being compiled for, not the machine the compiler runs on: `ac -t windows` makes `__OS__` 1.
-- `__FILE__` is the path as the compiler was given it, so the sample only checks the ending. Do not print it into output that must be reproducible.
+- `__FILE__` is the path as the compiler was given it (inside an included file it is the path of that file), so the sample only checks the ending. Do not print it into output that must be reproducible.
 
 The options of `ac` that matter here:
 
@@ -173,7 +173,7 @@ ac: error: the object was made for another target or architecture 'shapes-arm.ao
 What to notice:
 
 - Each `ac -c` produced one `.ao` file, and the link step joined the two into one program. The program's output is the recorded output above.
-- `Point` and `Counter` are defined in the header, so both units know them. The methods of a class that is defined in a header may be compiled into every unit that includes it; this is the one kind of definition that is allowed to appear twice.
+- `Point` and `Counter` are defined in the header, so both units know them. The methods of a class that is defined in a header may be compiled into every unit that includes it; together with `static` functions, it is a definition that may appear in more than one unit.
 - `created` is one variable: it is defined in `shapes.a` (`int created = 0;`), declared with `extern` in the header, and `main.a` reads and writes the very same variable. The `100` that `main` stores is what `createdTwice()` in `shapes.a` sees.
 - `scale()` is `static`, so only `shapes.a` can call it. Two units may each have their own `static` function of the same name.
 - The order of the objects on the command line does not matter, and `main` must be defined in exactly one object.
@@ -181,7 +181,7 @@ What to notice:
 - Every function and global variable that is not `private` or `static` is visible to the other objects; `static` and `private` ones belong to their own object.
 - A unit contains the code and data of its own file, and of the files it `#include`s or `import`s from disk. The built-in library (`println`, `collections`, `net`, ...) is not part of an object: the link step compiles the parts the objects use, so there is only one copy, and library state (the heap, `rand`) is shared.
 - Because every unit is compiled without seeing the others, an `import` of a user file in two units would make two copies of it. Put shared declarations in a header and the definitions in exactly one unit.
-- All objects must be made for the same target (`-t`) and by the same compiler version: an object records both, and mixing them is an error (`the object was made for another target or architecture`).
+- All objects must be made for the same target (`-t`): an object records its target and architecture, and mixing them is an error (`the object was made for another target or architecture`). An object also records the version of the object file format; a file that this compiler cannot read is rejected with `not a valid object file`.
 - Calls between objects go through a relocation (an indirect call), so a call to another object is a little slower than a call inside one unit.
 
 Use separate compilation for big programs that you rebuild often, or when you want to link A units with others built at another time. Use `import` and modules (see [chapter 16](#chap-enums-and-modules)) for everything else.
@@ -205,7 +205,7 @@ What to notice:
 - `a` went into register A and `b` into B; `add rax, rcx` (the bytes `0x48, 0x01, 0xC8`) added them, and the result stayed in A, which is the value of the expression.
 - The `asm()` statement with no operands is a no-operation on every CPU. The program continued after it.
 - The section names are `x64` (also `x86_64`, `amd64`), `arm64` (`aarch64`), `riscv64` (`rv64`) and `loongarch64` (`la64`). An unknown name is an error (`unknown CPU name in the asm block`).
-- The sample was compiled for all nine targets, but only **run** on x86-64 here: the arm64, riscv64 and loongarch64 words were not executed.
+- The book's checker compiles this sample for all nine targets, but only **runs** it on x86-64: the arm64, riscv64 and loongarch64 words were not executed when the book was checked.
 - The code must not change the stack pointer permanently, must keep the registers listed under "keep intact", and must not jump out of the block (jumps inside it are fine; offsets are relative). The standard prelude uses `asm` for fast `strlen`, `memcpy` and `memset` on x86-64, and the `cpu` and `thread` modules are written with it.
 
 A block must have a section for the CPU being compiled, otherwise the compiler stops with `this asm block has no code for the CPU being compiled`. When you only have code for one processor, combine `asm` with `static if` and give the other targets a version written in A:

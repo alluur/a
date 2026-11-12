@@ -1,8 +1,8 @@
 # The C library tour
 
-A comes with the C library, written in A. If you know C, you already know most of it: `printf` and `scanf`, `fopen` and `fgets`, `strtok`, `qsort`, `malloc`, `strftime`, `getopt`, `sqrt`. The names, the arguments and the results are those of C, with a few changes that come from the language (a 64 bit `int`, no variable argument lists, doubles that travel as bit patterns). This chapter is a hands-on tour: one idea per sample, run it, read the output. The last part ports a small C program to A, step by step.
+A comes with the C library, written in A. If you know C, you already know most of it: `printf` and `scanf`, `fopen` and `fgets`, `strtok`, `qsort`, `malloc`, `strftime`, `getopt`, `sqrt`. The names, the arguments and the results are those of C, with a few changes that come from the language (a 64 bit `int`, no `va_list`, and doubles that travel as bit patterns inside an `int`). This chapter is a hands-on tour: one idea per sample, run it, read the output. The last part ports small C programs to A, step by step.
 
-The complete list of functions is in the reference chapter on the C library (it is generated from the modules). Read this tour to learn how the parts fit, and the reference to look things up.
+The complete list of functions is in the API references, which are generated from the library sources (start with [clib](#api-clib)). The [C library reference](#chap-c-library-reference) describes the same modules in prose; where it says that A has no `float` or `double` type, it is out of date (see "Floating point" below). Read this tour to learn how the parts fit, and the references to look things up.
 
 In this chapter:
 
@@ -18,7 +18,7 @@ In this chapter:
 
 ## The modules
 
-`import clib;` makes the whole library available. You can also import the modules one by one, which keeps small programs small: only the functions that a program uses end up in the executable. The names go into the global namespace, like the C headers do, so you write `fopen(...)`, not `cstdio.fopen(...)`.
+`import clib;` makes the whole library available. You can also import the modules one by one, which shows what a program depends on. Either way, only the functions that a program really uses end up in the executable: an unused `import clib;` adds a few hundred bytes of data, not the library. The names go into the global namespace, like the C headers do, so you write `fopen(...)`, not `cstdio.fopen(...)`.
 
 | Module | C headers | Contents |
 |---|---|---|
@@ -67,7 +67,7 @@ Some C functions are not in a module because every program already has them: `pr
 | the locale changes `printf` and `isalpha` | there is only the "C" locale; text is UTF-8 |
 | `double` is hardware | `double` is a type of the language, calculated in software, the same bits on every platform |
 
-Functions that fail return `-1`, `null` or `EOF` and set `errno`, as in C. `fork`, `kill`, `link`, `symlink`, `signal` and `alarm` exist on Linux and Android only; on Windows they fail with `ENOSYS`. `time` zones follow the POSIX `TZ` rules.
+Functions that fail return `-1`, `null` or `EOF` and set `errno`, as in C. `fork`, `waitpid`, `kill`, `link`, `symlink`, `signal`, `alarm` and `pause` work on Linux and Android only; on Windows they fail with `ENOSYS`. Time zones follow the POSIX `TZ` rules.
 
 ## Characters, limits, errors
 
@@ -112,7 +112,7 @@ Functions that fail return `-1`, `null` or `EOF` and set `errno`, as in C. `fork
 
 ### Assertions
 
-`assert(cond)` stops the program when the condition is false. It writes a message to standard error and ends with exit code 134, the code that a C program gets from `abort`.
+`assert(cond)` stops the program when the condition is false. It writes `assertion failed` to standard error and ends with exit code 134, the code that a C program gets from `abort`.
 
 {{sample clib/assert_ok}}
 
@@ -130,7 +130,7 @@ Functions that fail return `-1`, `null` or `EOF` and set `errno`, as in C. `fork
 
 **What to notice.**
 
-* There is exactly one locale, "C". `setlocale` accepts `""`, `"C"`, `"POSIX"` and names that end in `.UTF-8`, and always reports "C". Unknown names give `null`.
+* There is exactly one locale, "C". `setlocale` accepts `""`, `"C"`, `"POSIX"` and names that end in `.UTF-8` or `.utf8`, and always reports "C". Unknown names give `null`.
 * Numbers are formatted with a `.` and without digit grouping, whatever the environment says. Text is UTF-8.
 
 ## Strings and memory
@@ -189,7 +189,7 @@ The language's own `new` and `alloc` never free memory, which suits short progra
 * `calloc(count, size)` and `malloc(size)` return zeroed memory. In A, even a block that was used and freed before is cleared when it is handed out again.
 * `realloc` keeps the old content in front of a bigger block. Always use the returned pointer; the block may have moved.
 * A freed block is reused: the second `malloc(100)` returns the same address. That is a reason for `free` to be your last use of the pointer.
-* `free(null)` does nothing. Only pointers from `malloc`, `calloc` and `realloc` may be freed, not those of `alloc` or `new`.
+* `free(null)` does nothing. Only pointers from `malloc`, `calloc` and `realloc` may be freed (also the buffers that `asprintf` and `getline` allocate), not those of `alloc`, `new` or `strdup`: they have no block header, and freeing them is a bug that can corrupt the heap.
 
 ### Text to numbers
 
@@ -221,7 +221,7 @@ The language's own `new` and `alloc` never free memory, which suits short progra
 
 * `div(a, b)` returns a pointer to a static `div_t` with `quot` and `rem`. The next call to `div` overwrites it.
 * Division truncates toward zero, so `-17 / 5` is -3 with remainder -2: the remainder has the sign of the dividend.
-* Functions registered with `atexit` run when the program ends, the last registered first. `exit` runs them. In this implementation so do `_Exit`, `quick_exit` and `abort`, which in C skip them; only `_exit` of `cunistd` leaves at once.
+* Functions registered with `atexit` run when the program ends, the last registered first (at most 32 can be registered: the 33rd call returns -1). `exit` runs them, and so does a `return` from `main`. In this implementation so do `_Exit`, `quick_exit` and `abort`, which in C skip them; only `_exit` of `cunistd` leaves at once.
 
 ### Random numbers
 
@@ -231,7 +231,7 @@ The language's own `new` and `alloc` never free memory, which suits short progra
 
 * `srand48`, `lrand48`, `mrand48` and `drand48` give the same sequences as the C library of Linux (glibc): `srand48(2026)` starts with 894009023 there as well. That is useful when you must reproduce a sequence.
 * `drand48` returns a double as a bit pattern; print it with `printfd`.
-* `erand48` keeps its state in an array of three ints that you pass, so several generators can run next to each other.
+* `erand48` keeps its state in an array of three ints that you pass (each holds 16 bits of the 48 bit state), so several generators can run next to each other.
 * None of these is for security. For keys use `secure.bytes` (see [Cryptography](#chap-cryptography)).
 
 ## Streams: stdio
@@ -245,7 +245,7 @@ The language's own `new` and `alloc` never free memory, which suits short progra
 * The formats are those of C: flags `- 0 + space #`, width and precision (also `*`), the conversions `d i u x X o b c s p %` (`%b` is binary, which C does not have) and the length modifiers `h hh l ll z`.
 * At most eight values follow the format. A longer list goes through an array and `vprintf`, `vsnprintf` and their relatives.
 * `snprintf` never writes more than `size` bytes, including the zero, and returns the length of the full text. `asprintf` allocates the buffer for you (free it with `free`). `dprintf` writes to a file descriptor.
-* `printf` knows integers and text only. `%f` is for `printfd` (below).
+* `printf` knows integers and text only. It does not understand `%f`, `%e` or `%g`: they come out as the characters you wrote. Numbers with a fraction are printed with `printfd` (below).
 
 ### Reading and writing files
 
@@ -353,8 +353,8 @@ The language's own `new` and `alloc` never free memory, which suits short progra
 **What to notice.**
 
 * The option string `":vo:n:"`: each letter is an option, a letter followed by `:` takes an argument (in `optarg`). The leading `:` makes a missing argument return `':'` instead of `'?'`.
-* `-n5` and `-n 5` both work, and `-x` is unknown: `getopt` returns `'?'` and puts the letter in `optopt`. It also prints a message on standard error unless you set `opterr = 0`.
-* When the options are used up `getopt` returns `-1`, and `optind` is the index of the first argument that is not an option.
+* `-n5` and `-n 5` both work, and `-x` is unknown: `getopt` returns `'?'` and puts the letter in `optopt`. When the option string does not start with `:` it also prints a message on standard error, unless you set `opterr = 0`. The sample starts it with `:`, so it prints nothing and reports the problem itself.
+* `getopt` stops at the first argument that is not an option (`file1`), or after `--`. It does not move options that come later to the front, as GNU `getopt` does. It returns `-1`, and `optind` is the index of the first argument that was not used.
 * The `cli` module of [System programming](#chap-system-programming) does the same with long options, defaults and a help text.
 
 ### Wildcards
@@ -397,7 +397,7 @@ Times are `int` seconds since 1970-01-01 00:00:00 UTC. Functions that take a `ti
 **What to notice.**
 
 * `timegm` (UTC) and `mktime` (local time) normalise the fields first. Month 13 is January of the next year, day 0 is the last day of the previous month, February 31 becomes March 3. To add a month or 100 days, change the field and convert.
-* The difference of two times is a number of seconds; divide by 86400 for days. `difftime(a, b)` is `a - b`.
+* The difference of two times is a number of seconds; divide by 86400 for days. `difftime(a, b)` is `a - b`, an `int` (in C it returns a `double`).
 
 ### Reading a date
 
@@ -422,17 +422,17 @@ Times are `int` seconds since 1970-01-01 00:00:00 UTC. Functions that take a `ti
 
 ## Floating point
 
-A has a `double` type (and `float` is an alias for it): a real IEEE 754 binary64 number that you can use in expressions, compare, store in structs and print with `printlnDouble`. It is calculated in software, so the results are the same on every platform. The chapter on numbers ([Numbers](#chap-numbers)) describes the type and the `dmath` module, which has the mathematical functions for `double` values.
+A has a `double` type (and `float` is an alias for it, so `sizeof(float)` is 8): a real IEEE 754 binary64 number that you can use in expressions, compare, store in structs and print with `printlnDouble`. It is calculated in software, so the results are the same on every platform. The chapter on numbers ([Numbers](#chap-numbers)) describes the type and the `dmath` module, which has the mathematical functions for `double` values.
 
-The C library works with the **same 64 bits**, but it passes them as an `int`: a "bit pattern". An `int` is accepted everywhere, including by `printf` style functions with a list of values. So the C style functions of `cmath`, `cfloat` and `ccomplex` take and return `int`:
+The C library works with the **same 64 bits**, but it declares every double parameter and result as an `int` that holds them: a "bit pattern". An `int` is accepted everywhere, including by `printf` style functions with a list of values. So the C style functions of `cmath`, `cfloat` and `ccomplex` take and return `int`:
 
 ```a
 int x = dlit("2.5");               // text to a double, as bits
 int r = sqrt(dmul(x, x));          // functions on bit patterns: dadd dsub dmul ddiv dneg, sqrt sin pow ...
-printfd("%.3f\n", r);              // printf with %f %e %g %a
+printfd("%.3f\n", r);              // printf with %f %e %g %a: prints 2.500
 ```
 
-The two styles meet in two compiler functions: `__bits(d)` gives the 64 bits of a `double` as an `int`, and `__dbl(i)` makes a `double` from 64 bits.
+The two styles meet in two compiler functions: `__bits(d)` gives the 64 bits of a `double` as an `int`, and `__dbl(i)` makes a `double` from 64 bits. Neither changes a single bit; they only change what the compiler thinks the value is.
 
 | You want to | With the `double` type | With bit patterns (C library) |
 |---|---|---|
@@ -440,13 +440,24 @@ The two styles meet in two compiler functions: `__bits(d)` gives the 64 bits of 
 | calculate | `a * b + 1` | `dadd(dmul(a, b), itod(1))` |
 | compare | `a < b` | `dlt(a, b)`, `deq(a, b)` |
 | square root, sine, power | `dmath.sqrt(x)`, `dmath.sin(x)`, `dmath.pow(x, y)` | `sqrt(x)`, `sin(x)`, `pow(x, y)` |
+| pi, e | `dmath.PI`, `dmath.E` | `M_PI`, `M_E` |
 | convert to an `int` | `(int) d` | `dtoi(x)` |
 | print | `printlnDouble(d)`, `doubleToFixed(d, 3)` | `printfd("%.3f", x)` |
 | read from text | `parseDouble(text)` | `strtod`, `atof`, `dlit`, `sscanf` with `%lf` |
 
+### The bridge and its traps
+
+The compiler converts between `int` and `double` by itself wherever the declared types differ. An `int` where a `double` is expected becomes the number with that value (3 becomes 3.0). A `double` where an `int` is expected is cut toward zero (2.75 becomes 2, -2.9 becomes -2). That is exactly what you want in ordinary code. It is also the trap, because a bit pattern is an `int` only by its type: the number it stands for is something else. The compiler does not warn, so these mistakes compile and run.
+
 ::: warning
 
-The conversion is where mistakes happen. A `double` that you pass where an `int` is expected is *converted to an integer*, not reinterpreted: `printf("%d", 3.99)` prints 3, and `printfd("%.2f", 3.99)` prints `0.00` because it reads the integer 3 as the bits of a tiny number. Pass `__bits(d)`. The other way round, `double x = M_PI;` converts the integer that holds the bits of pi and gives 4.6e18. Write `__dbl(M_PI)`, or use `dmath.PI`.
+Bit patterns and `double` values are never converted into each other by the compiler. Every crossing needs `__bits` or `__dbl`.
+
+* **A `double` goes into a C function.** The parameter is an `int`, so the value is converted to an integer, not reinterpreted: `printf("%d", 3.99)` prints 3, and `printfd("%.2f", 3.99)` prints `0.00` because it reads the integer 3 as the bits of a tiny number. `sqrt(x)` with `x = 2.0` is the square root of the number whose bits are 2, about 3.1e-162. Pass `__bits(d)`.
+* **A C function result goes into a `double`.** The result is an `int`, so it is converted to the number with that value: `double y = sqrt(dlit("2"));` gives 4.6e18, the value of the bits as a whole number. Write `double y = __dbl(sqrt(dlit("2")));`.
+* **The constants of `cmath` are bit patterns.** `double x = M_PI;` converts the integer `0x400921FB54442D18` and gives 4.6e18, not 3.14159. Write `__dbl(M_PI)`, or use `dmath.PI`. The same holds for `M_E`, `INFINITY`, `NAN`, `DBL_MAX` and `DBL_EPSILON`.
+* **Comparisons compile too.** `3.5 > M_PI` compares 3.5 with 4.6e18 and is false. `dlt(a, b)` and the other `d...` functions want bits, so give them `__bits(a)`, or use `a < b`.
+* **Do not calculate on bit patterns with `+` or `<`.** That treats the 64 bits as a whole number. Use `dadd`, `dlt` and the other `d...` functions on bit patterns, and the operators on typed `double` values.
 
 :::
 
@@ -458,8 +469,9 @@ The next sample shows the bridge in both directions, and the mistakes.
 
 * The wrappers `sqrtd` and `powd` are one line each: bits out, C function, bits back. If you use the C functions with typed doubles a lot, write such wrappers, or use `dmath`, which has them.
 * `printfd` takes `__bits(...)` for each `%f`. Integers, like the `3` in `3 items of`, are passed as they are.
-* `sscanf("%lf", &v)` stores through a pointer to a `double` variable: the pointer is just an address.
+* `sscanf("%lf", &v)` stores through a pointer to a `double` variable: the pointer is just an address, so no conversion takes place.
 * `(3 + 4) * 0.5` and `dmul(dadd(itod(3), itod(4)), dlit("0.5"))` produce the same 64 bits. The two styles are two ways to write the same arithmetic.
+* The five lines after `3.141592653589793` are the mistakes. `double wrong = M_PI;` and `double alsoWrong = sqrt(dlit("2"));` print 4.614256656552046e+18 and 4.6090478708451727e+18: the bit patterns, read as whole numbers. `printf("%d", 3.99)` shows `3`, and `printfd("%.2f", 3.99)` shows `0.00`. The last line, 3.1434555694052576e-162, is `sqrt(x)` for the double `x = 2.0`.
 
 The samples below use the bit pattern style, because that is the style of the C library and of the C programs that you port. When a C program says `double x = sqrt(y) * 2`, you can write the same with the `double` type and `dmath`, as the port at the end of this chapter does.
 
@@ -470,21 +482,21 @@ The samples below use the bit pattern style, because that is the style of the C 
 **What to notice.**
 
 * `strtod(text, &end)` converts what it can (decimal, hexadecimal, `inf`, `nan`) and sets `end` like `strtol`. Nothing converted: `end` is the start of the text and the result is 0.
-* `dtostr(x)` is the shortest text that reads back as exactly `x`: `0.1`, `-2500.0`, `inf`.
+* `dtostr(x)` is the shortest text that reads back as exactly `x`: `3.14159`, `-2500.0`, `inf`.
 * `atof` has no way to report an error. Use `strtod` when the text is not yours.
 
 {{sample clib/float_printf}}
 
 **What to notice.**
 
-* `printfd`, `sprintfd`, `snprintfd` and `fprintfd` understand `%f %F %e %E %g %G %a %A` with the usual flags, width and precision. All other conversions work as in `printf`.
+* `printfd`, `sprintfd`, `snprintfd` and `fprintfd` (the last one is in `cstdio`) understand `%f %F %e %E %g %G %a %A` with the usual flags, width and precision. All other conversions work as in `printf`.
 * The digits are exact: `%.30f` of 0.1 shows `0.100000000000000005551115123126`, and `%.0f` of 1e22 shows all 23 digits.
-* `%g` chooses the shorter of `%f` and `%e` and drops trailing zeros. `%a` is the exact hexadecimal form.
-* The eight value limit applies: the format of `printfd` and its values must fit.
+* `%g` works as in C: it uses the `%e` style when the exponent is below -4 or not below the precision (6 by default), the `%f` style otherwise, and drops trailing zeros (`1234.57`, `1.234e-05`, `1.23457e+08` in the sample). `%a` is the exact hexadecimal form.
+* The eight value limit applies, as for `printf`: after the format come at most eight values, and the compiler rejects a longer call. Each `%f` value must be a bit pattern, `__bits(d)` for a `double` (see above).
 
 ### Mathematical functions: cmath
 
-`cmath` has the functions of `<math.h>`, on bit patterns: `sqrt cbrt pow exp exp2 expm1 log log2 log10 log1p hypot`, the trigonometric and hyperbolic functions and their inverses, `floor ceil round rint trunc fmod remainder`, `erf tgamma lgamma`, classification (`isnan`, `isinf`, `fpclassify`) and the constants `M_PI`, `M_E`, `INFINITY`, `NAN`, `DBL_EPSILON` and the rest of `<float.h>`. `sqrt` and the basic operations are exact; the others are computed with about 100 bits and rounded once, so they are within one unit in the last place, and nearly always correctly rounded.
+`cmath` has the functions of `<math.h>`, on bit patterns: `sqrt cbrt pow exp exp2 expm1 log log2 log10 log1p hypot`, the trigonometric and hyperbolic functions and their inverses, `floor ceil round rint trunc fmod remainder`, `erf tgamma lgamma`, classification (`isnan`, `isinf`, `fpclassify`) and the constants `M_PI`, `M_E`, `INFINITY`, `NAN` and the `DBL_` constants of `<float.h>` (`DBL_EPSILON`, `DBL_MAX` ...). The constants that are doubles (`M_PI`, `INFINITY`, `DBL_EPSILON` ...) are bit patterns, not `double` values. `sqrt` and the basic operations are exact; the others are computed with about 100 bits and rounded once, so they are within one unit in the last place, and nearly always correctly rounded.
 
 {{sample clib/math_basic}}
 
@@ -529,7 +541,7 @@ The samples below use the bit pattern style, because that is the style of the C 
 
 ### Complex numbers: ccomplex
 
-A complex number is a pointer to a `Complex` with two doubles (as bit patterns). Functions that make a number return a new one on the heap, so expressions nest.
+A complex number is a pointer to a `Complex` with two doubles (as bit patterns). Functions that make a number return a new one on the heap (with `new`, so it is never freed), and so expressions nest.
 
 {{sample clib/complex_basic}}
 
@@ -667,7 +679,7 @@ The output is character for character what `gcc` prints for the C version. These
 | `qsort(table, used, sizeof table[0], compare)` | `qsort((char*) table, used, sizeof(Entry), compare)` | the array is passed as `char*` |
 | `100.0 * count / total` printed with `%5.1f` | `double percent = ...;` and `printfd(..., __bits(percent))` | the `double` type works as in C, but `printfd` takes bits |
 
-What did *not* have to change: the declarations with several names (`int len = 0, c, total = 0;`), `word[len++] = tolower(c)`, the `for (int i = 0; ...)` loops, `strncpy`, `strcmp`, `getchar`, the `printf` formats `%-10s %3d`.
+What did *not* have to change: the declarations with several names (`int len = 0, c, total = 0;`), `word[len++] = tolower(c)`, the `for (int i = 0; ...)` loops, `strncpy`, `strcmp`, `getchar`, the formats `%-10s %3d`, which `printfd` reads like `printf`.
 
 ### Step 2: a program with options and error messages
 
@@ -715,22 +727,22 @@ The third program reads numbers and prints their mean and standard deviation. In
 4. Check every `printf` with more than eight values, and every `va_list`.
 5. Replace octal numbers by decimal or binary ones.
 6. Check sizes: `%d` for 64 bit `int`, `%hhd` in `scanf` for bytes, `uint32` where 32 bit wrap matters.
-7. Print doubles with `printfd(..., __bits(x))`, and pass `__bits(x)` to the C math functions or use `dmath`.
+7. Print doubles with `printfd(..., __bits(x))`. Pass `__bits(x)` to the C math functions and wrap their results in `__dbl(...)`, or use `dmath`, which does both for you.
 8. Run the original and the port on the same input, and compare the output.
 
 ## Summary
 
-* `import clib;` gives all of the C library; the individual modules (`cstdio`, `cstring`, ...) keep programs small. The names are the C names, in the global namespace.
+* `import clib;` gives all of the C library; the individual modules (`cstdio`, `cstring`, ...) show what a program depends on. The names are the C names, in the global namespace.
 * `int` is 64 bits, `char` is an unsigned byte, there are no octal literals, and `printf`-style functions take up to eight values (arrays go through the `v...` functions).
 * `strtol`, `strtod` and `sscanf` tell you how much of the text they used; check it. `snprintf`, `strlcpy` and `getline` avoid overflowing buffers.
 * `qsort`, `bsearch`, `atexit` and `signal` take `func` pointers; the arguments are `char*` or `int`, and you cast inside.
 * `cunistd` has descriptors, `stat`, directories, `getopt`, `fnmatch`, `fork` and `signal`; `ctime` has `gmtime`, `mktime`, `strftime`, `strptime` and POSIX time zones.
-* `double` is a type of the language; the C math and print functions take it as a bit pattern: `__bits(d)` and `__dbl(i)` connect the two. A `double` passed to an `int` is converted, not reinterpreted.
+* `double` is a type of the language; the C math and print functions take it as a bit pattern in an `int`: `__bits(d)` and `__dbl(i)` connect the two. The compiler converts between `int` and `double` but never reinterprets bits, so `double x = M_PI;` gives 4.6e18 and `printfd("%.2f", 3.99)` prints `0.00`.
 * Porting is mostly renaming: headers become imports, `const` and `void*` become `char*`, and the output of `printf("%f")` becomes `printfd`.
 
 ## Where next
 
-* [Numbers](#chap-numbers) for the `double` type, `dmath`, `bigint`, `decimal` and `fixed`.
+* [Numbers](#chap-numbers) for the `double` type, `dmath`, `bigint`, `decimal` and `fixed` ([dmath](#api-dmath) and [dfloat](#api-dfloat) in the API reference).
 * [System programming](#chap-system-programming) for `os`, `thread`, `cli`, `log` and `testing`, which use these functions at a higher level.
 * [Cryptography](#chap-cryptography) for `secure`, which you should use instead of `rand` for secrets.
 * API references: [cstdio](#api-cstdio), [cstdlib](#api-cstdlib), [cstring](#api-cstring), [ctime](#api-ctime), [cunistd](#api-cunistd), [cmath](#api-cmath), [cfloat](#api-cfloat), [ccomplex](#api-ccomplex), [cwchar](#api-cwchar), [cctype](#api-cctype), [cerrno](#api-cerrno), [cassert](#api-cassert), [climits](#api-climits), [clocale](#api-clocale) and [clib](#api-clib).

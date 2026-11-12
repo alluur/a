@@ -13,7 +13,7 @@ In this chapter:
 * a drawing program: mouse strokes, a palette widget of your own, saving a picture;
 * a clock: a custom widget drawn with polygons, a repeating timer and a module of its own.
 
-All programs run against a display server as explained in [the chapter on windows and widgets](#chap-gui-basics). Each one has a picture taken after the clicks and keys written at the top of the sample.
+All programs run against a display server as explained in [the chapter on windows and widgets](#chap-gui-basics). Each picture was taken by running the program against a headless display server and performing the clicks and keys written at the top of the sample (the first clock has none).
 
 ## A counter
 
@@ -44,7 +44,7 @@ The finished counter has a step (a `SpinBox`), limits that disable the buttons, 
 * `show()` does more now: it also sets the title with `win->setTitle`, and enables or disables the two buttons with `setEnabled` at the limits. Everything that depends on `count` is in that one function, so no path can forget one of them.
 * `add(delta)` is the only place that changes `count`; it clamps the value to -20 .. 20. Buttons, keys and Reset all go through it.
 * `win->onKey` gets the keys that no widget used. The focused widget gets a key first; a button has no use for `+`, so it falls through to the window. (A focused spin box would take the digit `0` for itself.) The picture shows the result of three clicks of step 2 and then the `+` key: 8.
-* The callbacks use globals (`win`, `shown`, `less`, `more`, `step`). A graphical program has one window with one set of widgets, and a global is the simplest way for a callback to reach them; for several windows use `userData` of the widget or the window.
+* The callbacks use globals (`win`, `shown`, `less`, `more`, `step`). This program has one window with one set of widgets, and a global is the simplest way for a callback to reach them. With several windows, use the `userData` field that every widget and every window has.
 
 ## A to-do list
 
@@ -109,8 +109,9 @@ Moving the mouse quickly makes events that are far apart, so a thick brush must 
 
 * `Palette` overrides `prefW`, `prefH`, `paint` and `onMouse`, as in [the custom widget of the basics chapter](#chap-gui-basics). A click on cell `mx / 32` selects it, and the selected cell has an accent outline.
 * The slider sets the radius of the brush. `dab` draws a filled circle in the selected colour. `mouse` calls it once for every pixel between the old and the new position (`steps` is the larger of the two distances), so strokes are solid at any speed.
+* The first version joined two points with `line`, which is always one pixel thick. The finished one replaces it with dabs, so the brush can have any radius from 1 to 12.
 * **Clear** fills the canvas surface with white, **Save** writes it with `gimg.savePng(canvas->surf, "painting.png")` and reports it in a label. The canvas *is* the document: there is nothing else to save.
-* The window is made with `fit()`, so the width follows the toolbar row; the canvas is 528 pixels wide to match it.
+* The window is made with `fit()`, which resizes it to the preferred size of its content. The toolbar row asks for 530 pixels, so the canvas surface is 528 pixels wide to match it.
 * The picture was made with a click on the red cell and a drag, a click on blue and a drag, and so on: four strokes in four colours.
 
 ## An analog clock
@@ -144,7 +145,7 @@ and a command line argument: `clock 10:08:35` shows that time and does not tick,
 
 **What changed, and why**
 
-* The program is two files. `clockface.a` starts with `module clockface;` and has `public class ClockFace`; `main.a` uses it as `clockface.ClockFace`. The widget can now be used by any program.
+* The program is two files. `clockface.a` declares `module clockface;` after its imports and has `public class ClockFace`; `main.a` uses it as `clockface.ClockFace`. The widget can now be used by any program.
 * `tick` reads the time with `datetime.now()` (UTC: the `datetime` module knows no time zones), shows it, and starts the next timer: a timer fires only once.
 * `show` is the one function that turns a time into widgets, as `show` of the counter did. The command line decides where the time comes from: without an argument `tick(0)` starts the clock, with one `show` is called once.
 * The check box has `onChange`; its callback sets the field and calls `invalidate()` on the face. The picture was taken after one click on it: the second hand is gone.

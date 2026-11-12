@@ -24,18 +24,30 @@ so the samples need nothing but loopback.
 
 ## Fetching pages
 
-`gnet.Fetch` is an HTTP/1.1 request that does not block. `start(display, address, extraHeaders)` returns at once; the answer is read as it arrives, and `onDone` runs at the end.
+`gnet.Fetch` is an HTTP/1.1 request that does not block. `start(display, address, extraHeaders)` returns at once; the answer is read as it arrives, and `onDone` runs at the end. `extraHeaders` is `null`, or raw header lines that are added to the request, each one ending in `\r\n`.
 
 {{sample guinet/fetch}}
 
 **What to notice**
 
 * After the fetch: `status`, `headers`, `body`, `bodyLen`, `error`, `url` (the address that was finally fetched), `contentLength` (or -1), `received` and `elapsed`. `onProgress` runs while data arrives.
-* A `302` was followed (up to 5 redirects). Chunked bodies and `Content-Length` are handled, and a body that is shorter than the header promised is an error, not a silent short result.
+* A `302` was followed. Redirects (`301`, `302`, `303`, `307`, `308`) are followed up to 5 times, and `url` is the last address. Chunked bodies and `Content-Length` are handled; a body that is shorter than the `Content-Length` promised (the server hung up early) is an error, not a silent short result. A response bigger than `maxBytes` (8 MB unless you change it) fails with "the response is too large".
 * `start` returns `false` for an address it cannot use (here `ftp://`), with the reason in `error` ("not a valid http:// address"); a server that is not there gives `false` and the error "cannot connect". `cancel()` stops a running fetch.
-* **`https://`** works too, with TLS 1.3: the certificate is checked against the system's roots unless `f->verifyCerts = false`; afterwards `secure`, `cipher` and, for a refused certificate, `certError`
-  tell what happened (see [the TLS notes](#chap-tls-notes)). This chapter does not fetch from the Internet, so the https path was not run here.
 * Connecting and the name lookup still wait (4 seconds at most); only the transfer is event driven.
+
+### https
+
+`https://` addresses work with the same calls. The connection uses TLS 1.3 (the `tls` module), and the server's certificate is checked against the system's root certificates unless you set `f->verifyCerts = false`. Afterwards `secure` tells whether the answer came over TLS, `cipher` names the cipher suite, and `certError` holds the reason when a certificate was refused (the fetch then fails with the same text in `error`). More about certificates is in [the TLS notes](#chap-tls-notes) and [HTTP, WebSocket and TLS](#chap-http-websocket-tls).
+
+The sample uses the loopback technique of that chapter: a child process is a small HTTPS server with a throw-away test certificate, so nothing leaves the machine. The test certificate is not in anybody's list of roots, so the first fetch is refused; `x509.addRootPem` adds it as a root, and then the same fetch works.
+
+{{sample guinet/fetch_https}}
+
+**What to notice**
+
+* The untrusted certificate is refused before any request is sent: `status` is 0, `secure` is 0 and `error` and `certError` say why.
+* After `x509.addRootPem(...)` the fetch works: status 200, `secure` 1 and the cipher `TLS_AES_128_GCM_SHA256`. With `verifyCerts = false` it also works, but nothing proves who is at the other end: use that only for tests.
+* This was run against the loopback server only. Fetching from real sites uses the system roots and the same code, but it was not tried for this book.
 
 ### POST and cookies
 
@@ -46,14 +58,14 @@ so the samples need nothing but loopback.
 **What to notice**
 
 * Before the login the site does not know the client; after `/login` the jar holds one cookie (`session`), and the next request carries it: `welcome back`.
-* The jar knows hosts and names only. **Path, Domain and the expiry are not used**: a cookie lives until the program ends or the server deletes it (`Max-Age=0`, or an empty value). `f->useCookies = false` skips the jar.
-* A form POST that is answered with a redirect is followed with a GET, like a browser does.
+* The jar knows hosts and names only. **Path, Domain, the port and the expiry are not used**: a cookie lives until the program ends or the server deletes it (`Max-Age=0`, or an empty value). The jar holds at most 128 cookies. `f->useCookies = false` skips the jar, and `gnet.cookies()->clear()` empties it.
+* A POST that is answered with `301`, `302` or `303` is followed with a GET, like a browser does; `307` and `308` repeat the POST.
 * `gnet.Fetch` is what `abrowse`, the browser example, uses for every page and picture.
 
 ## TCP and UDP
 
-`gnet.Conn` is a TCP connection in the event loop. With `onLine` it delivers text lines (split at newlines, also when they arrive together or in pieces); with `onData` it delivers raw bytes.
-`gnet.Listener` accepts connections.
+`gnet.Conn` is a TCP connection in the event loop. With `onLine` it delivers text lines (split at newlines, also when they arrive together or in pieces; a line longer than 64 KB closes the connection); with `onData` it delivers raw bytes
+(`data` and `dataLen`). `gnet.Listener` accepts connections.
 
 {{sample guinet/tcp}}
 
@@ -61,7 +73,7 @@ so the samples need nothing but loopback.
 
 * `Listener.start(display, host, port)`: port 0 means any free port, and `l->port` says which. `onAccept` gets the new connection in `l->accepted`; set its callbacks there.
 * `sendLine` sends the text and a newline. When one side closes, the other side's `onClose` is called once and `open` is false.
-* `connect(display, host, port, timeoutMs)` waits for the connection (the time limit is the last argument) and returns `false` when nothing is listening.
+* `connect(display, host, port, timeoutMs)` waits for the connection (the time limit is the last argument) and returns `false` when nothing is listening. Sending also waits, for one second at most.
 * None of this blocks the window: while the sample "waits", the server of the display keeps getting turns.
 
 `gnet.Beacon` does the same for UDP datagrams, including broadcasts to the local network:
@@ -71,37 +83,39 @@ so the samples need nothing but loopback.
 **What to notice**
 
 * An address is an `int`: `0x7F000001` is `127.0.0.1`. `broadcast(port, text)` goes to `255.255.255.255`.
-* In `onPacket` you get `text`, `fromIp` and `fromPort`. `start(display, 0)` takes any free UDP port.
+* In `onPacket` you get `text`, `fromIp` and `fromPort`. `start(display, 0)` takes any free UDP port, and `port` says which. A datagram of more than 1499 bytes is cut.
 
 ### A port scanner
 
-`gnet.Scan` tests the ports of a host one per turn of the event loop.
+`gnet.Scan` tests the ports of a host, one port per turn of the event loop.
 
 {{sample guinet/scan}}
 
 **What to notice**
 
-* `start(display, host, first, last, timeoutMs)` returns `false` for a range that is empty or not between 1 and 65535. `onFound`, `onProgress` and `onDone` report; `stop()` ends a scan early, and a scanner can be started again.
-* A scan is polite by construction: one connection attempt per turn of the loop, so it cannot flood anything, and it needs the timeout you give for every closed port that does not answer.
+* `start(display, host, first, last, timeoutMs)` returns `false` for a range that is empty or not between 1 and 65535 (and while the scanner is still running). `onFound`, `onProgress` and `onDone` report; `stop()` ends a scan early, and a scanner can be started again.
+* A scan is polite by construction: one connection attempt per turn of the loop, so it cannot flood anything. But the attempt itself **waits**: a closed port on the same machine answers at once, while a host that silently drops the packets costs the whole `timeoutMs` for every port, and the window is stuck for that time. Keep the timeout short (a few hundred milliseconds) and the range small.
 * Scan only machines you may scan. The sample only looks at the loopback address.
 
 ### A chat
 
 `gnet.Chat` is a peer-to-peer chat made from the parts above: every program listens, announces its name by UDP every 3 seconds, and connects to the others it hears. Of two peers the one whose `name@port` sorts higher connects,
-so there is one connection per pair; duplicate names are refused.
+so there is one connection per pair; duplicate names are refused. A chat holds up to 32 connections.
 
 {{sample guinet/chat}}
 
 **What to notice**
 
 * `Chat(name, tcpPort, udpPort)`: port 0 takes a free one. On a local network the announcements are broadcasts; the sample points them at each other with `addTarget(ip, udpPort)` and calls `announce()` at once.
-* `onEvent` reports with `eventKind`: 1 a peer joined, 2 left, 3 a message (with `eventName` and `eventText`). `say(text)` reaches everybody, `peerCount()` and `peerName(i)` list the peers.
+* `onEvent` reports with `eventKind`: 1 a peer joined, 2 left, 3 a message (with `eventName` and `eventText`). `say(text)` reaches everybody, `peerCount()` and `peerName(i)` list the peers. `connectTo(host, port)` connects to a peer by hand (for example over a VPN, where there are no broadcasts).
 * `stop()` says goodbye to every peer first: `ada` was told that `bob` left.
 * There is **no encryption and no login**: use it on a network you trust. `examples/gui/achat.a` is a chat program with a peer list, a log, and notifications for messages that arrive while the window is in the background.
 
 ## Showing HTML and Markdown
 
-`ghtml` has two halves. The functions parse and convert text without any window: `parseHtml`, `markdownToHtml`, `plainText`, `decodeEntities` and `resolveUrl`. The widget `HtmlView` lays a page out and draws it.
+`ghtml` has two halves. The functions parse and convert text without any window: `parseHtml`, `markdownToHtml`, `plainText`, `decodeEntities`, `resolveUrl` and `urlEncode`. The widget `HtmlView` lays a page out and draws it.
+
+`ghtml` is a small viewer, not a full browser. The list of what it can and cannot do is in the section "Limits" at the end of the chapter.
 
 {{sample guinet/html_text}}
 
@@ -110,7 +124,7 @@ so there is one connection per pair; duplicate names are refused.
 * `parseHtml(page, baseUrl)` builds a `Doc` with the blocks, the `title` and the links (already **absolute**: `guide.html` became `http://example.org/docs/guide.html`). `<style>` and `<script>` are skipped.
 * `plainText` is the page as text: headings and list items on their own lines, tags gone, entities decoded.
 * `decodeEntities` knows the usual names and numbers (`&amp;`, `&#65;`, `&#x42;`, `&copy;`) and leaves an unknown name (`&unknown;`) or a lone `&` alone.
-* `markdownToHtml` handles headings, paragraphs, lists, code blocks, quotes, tables, rules, links, images, bold, emphasis and code. The Markdown view is built on it.
+* `markdownToHtml` handles a small, common part of Markdown: `#` headings, paragraphs, lists (`-`, `*`, `+` and `1.`, nested by indentation), code blocks fenced with three backticks, `>` quotes, tables with `|`, rules (`---`, `***`), and inside a line `[links](url)`, `![images](src)`, `**bold**`, `*emphasis*` and `` `code` ``. It does not know setext headings, indented code blocks, `~~~` fences, `_emphasis_`, strike-through or link titles, and HTML inside the Markdown is shown as text. The Markdown view is built on it.
 
 Links in a page are written relative to the page. `resolveUrl(base, ref)` does what a browser does:
 
@@ -123,7 +137,7 @@ Links in a page are written relative to the page. `resolveUrl(base, ref)` does w
 
 ### The view
 
-`HtmlView` draws headings (the big ones scaled), paragraphs, nested lists, preformatted text, block quotes, rules, tables with cells side by side, links, bold, code, underline and images with their alt text until they load.
+`HtmlView` draws headings (the big ones scaled), paragraphs, nested lists, preformatted text, block quotes, rules, tables with cells side by side (`<th>` cells are bold), links, bold, code, underline and images with their alt text until they load.
 It scrolls (wheel, keys and a scroll bar), shows the hand cursor over links, and lays out again when its width changes.
 
 {{sample guinet/html_view}}
@@ -134,13 +148,13 @@ It scrolls (wheel, keys and a scroll bar), shows the hand cursor over links, and
 
 * `setHtml(html, baseAddress)` shows a page; `onLink` gets `linkHref` already resolved against the address, `onHover` gets `hoverHref` (null when the pointer leaves a link).
 * The hover events came when the pointer entered the link, left it and entered it again, and the click came after the third. The pointer was put on a word of the link: the gaps between the words of a link are not part of it.
-* Pictures are loaded by you: `imageCount()` and `imageSource(i)` list the wanted ones, `setImage(address, surface)` supplies one. `abrowse` fetches four at a time in the background with `gnet.Fetch` and `gimg`.
-* It does **not** do CSS, frames or scripts (they are skipped), italics or colours.
+* Pictures are loaded by you: `imageCount()` and `imageSource(i)` list the wanted ones (the addresses are already absolute), `setImage(address, surface)` supplies one (at most 64 pictures per view). `abrowse` fetches four at a time in the background with `gnet.Fetch` and `gimg`. A picture that is also a link gets a thin frame in the link colour.
+* It does **not** do CSS, frames or scripts (they are skipped), and `<i>` and `<em>` are shown upright. Colours do not come from the page: text, links, code and the background have fixed colours, which you can change for all views with the module variables `ghtml.colorText`, `ghtml.colorLink`, `ghtml.colorCode` and `ghtml.colorBack`.
 
 ### Forms
 
-`<form>` with `input` (text, password, search, email, number ..., checkbox, radio, submit, button, hidden), `textarea`, `select` with `option`, and `button` become real widgets inside the view. They scroll with the page and
-Tab moves between them. A click on a submit button, or Enter in a text field, calls `onSubmit`.
+Forms work, although the header comment of `ghtml.a` and the GUI reference still say they do not. `<form>` with `input` (text, password, search, email, number ..., checkbox, radio, submit, button, reset, image, hidden), `textarea`, `select` with `option`, and `button` become real widgets inside the view. They scroll with the page and
+Tab moves between them (and scrolls the focused one into view). A click on a submit button, or Enter in a text field, calls `onSubmit`.
 
 {{sample guinet/html_form}}
 
@@ -153,6 +167,9 @@ Tab moves between them. A click on a submit button, or Enter in a text field, ca
 * The body is URL encoded: `+` for spaces, `%26` for `&`, `%0D%0A` for the line break of a text area. The unchecked check box was left out, only the chosen radio button is sent, and only the submit button
   that was used.
 * `ghtml.urlEncode(text)` makes the same encoding for your own use.
+* A GET form puts the fields after the `?` of the action address (after an existing `&` if the address already has a query, and a `#fragment` of the action is dropped); `submitBody` is empty then. Fields without a `name` are not sent, and an empty field is sent as `name=`.
+* The limits of forms: the body is always URL encoded (`enctype="multipart/form-data"` is ignored, so there is no file upload and `type=file` is just a text field); `<select multiple>`, `maxlength`, `readonly`, `<label>` clicks and form validation are not supported; a `reset` button is only a button that does nothing. A page can have at most 16 forms and 128 controls, and a `select` at most 64 options.
+* `ghtml` does not store cookies and does not send anything by itself. Cookies belong to `gnet.Fetch`, which is why a browser built from the parts sends the form with `gnet.Fetch` and gets the cookies of the login for free.
 
 ### Markdown
 
@@ -170,12 +187,12 @@ Tab moves between them. A click on a submit button, or Enter in a text field, ca
 
 `examples/gui/abrowse.a` is a browser made of exactly these pieces: `HtmlView`, `gnet.Fetch` (pages load without freezing the window), `gimg` (pictures load in the background), and the toolbar widgets of
 `guix` (address bar, back, forward, reload, history that remembers the scroll position). It shows files and Markdown (`abrowse docs/GUI.md`), plain text and the source of a page. For `https://` the status
-bar says `Secure: TLS_AES_128_GCM_SHA256`, and a refused certificate gives a "Your connection is not private" page with "Back to safety" and "Proceed anyway (unsafe)". That program was compiled for this chapter but not run against real sites.
+bar says `Secure: TLS_AES_128_GCM_SHA256`, and a refused certificate gives a "Your connection is not private" page with a "Back to safety" link and a "Proceed to HOST anyway (unsafe)" link. That program was compiled for this chapter, but it was not run against real sites.
 
 ## A terminal in a window
 
-`gterm.Terminal` is a widget that understands the usual ANSI and xterm escape sequences. It runs a program on a pseudo terminal (`start(display, command)`), or it can be used as a plain screen you write to with `feed(text)`,
-which is what the first sample does. What the user types is collected for `takeSent()`.
+`gterm.Terminal` is a widget that understands the usual ANSI and xterm escape sequences. It runs a program on a pseudo terminal (a pair of devices that make a program believe it talks to a real terminal; `start(display, command)`), or it can be used as a plain screen you write to with `feed(text)`,
+which is what the first sample does. Without a program, what the user types (and what you pass to `send(text)`) is collected for `takeSent()`; with a program it goes to the program.
 
 {{sample guinet/term_feed}}
 
@@ -183,8 +200,8 @@ which is what the first sample does. What the user types is collected for `takeS
 
 * The widget has the size of its window: 30 columns by 5 rows here (`cellW()` and `cellH()` are the size of a cell in pixels, so you can size a window for a number of columns).
 * `feed` interprets escape sequences (`\e[1;8H` moves the cursor, `\e[K` erases to the end of the line, `\e[2J` clears) and wraps long lines. `lineText(row)`, `cursorRow`, `cursorCol` and `selectedText()` read the screen back.
-* `historyCount()` and `historyText(i)` give the scrollback (2000 lines, the mouse wheel or Shift+PageUp scroll it). When the history is full, the oldest line object is used again as the new bottom line, so a program that prints
-  100 MB needs no more memory than one that prints 2000 lines.
+* `historyCount()` and `historyText(i)` (0 is the oldest) give the scrollback: at most 2000 lines, and the mouse wheel (3 lines a step) or Shift+PageUp scroll it. When the history is full, the oldest line is used again as the new bottom line: in a test, feeding 6000 lines
+  created only 2058 line objects, so a long output does not make the program grow.
 
 What the widget draws:
 
@@ -194,9 +211,9 @@ What the widget draws:
 
 **What to notice**
 
-* Bold, dim, underline and reverse work; **italics are not drawn**. 16, 256 and 24 bit colours work (the gray ramp and a cube slice come from `48;5;n`, the red to blue ramp from `48;2;r;g;b`).
+* Bold, dim, underline and reverse work; **italics** (`\e[3m`) are understood but drawn upright. 16, 256 and 24 bit colours work (the gray ramp and a cube slice come from `48;5;n`, the red to blue ramp from `48;2;r;g;b`).
 * Box drawing and block characters are drawn as lines and rectangles, so they join without gaps; arrows and triangles are small solid shapes. A few punctuation and symbol characters get plain ASCII stand-ins (the ellipsis is `.`, a check mark `*`);
-  other characters outside Latin-1 show as `?`. Wide (CJK) characters take **one** cell here.
+  other characters outside Latin-1 are drawn as `?` (`lineText` still returns the real character). Wide (CJK) characters take **one** cell here.
 * Mouse reporting for programs (1000, 1002, 1003 with the SGR form), bracketed paste, focus reports, window titles (`OSC 0` and `2`) and the size report `CSI 18 t` work, which is what [the terminal toolkit](#chap-terminal-ui) needs. Hold Shift to select text instead of sending the mouse to the program.
 
 Running a real program:
@@ -205,26 +222,26 @@ Running a real program:
 
 **What to notice**
 
-* `start(display, command)` runs the command through `/bin/sh -c` on a pseudo terminal and returns `false` when that fails. The program sees a terminal of the widget's size (`stty size` printed `6 40`) and `TERM=xterm-256color`.
-* `onExit` is called when the program has ended; `exitStatus` holds its status (3 here). The widget collects the process, so there are no zombies.
+* `start(display, command)` runs the command through `/bin/sh -c` on a pseudo terminal and returns `false` when that fails. With `null` or an empty command it runs your shell (`$SHELL`, or `/bin/sh`). The program sees a terminal of the widget's size (`stty size` printed `6 40`: rows, then columns), `TERM=xterm-256color` and `COLORTERM=truecolor`.
+* `onExit` is called when the program has ended; `exitStatus` holds its exit code (3 here), but 0 when the program was killed by a signal. The widget collects the process, so there are no zombies. `stop()` ends a running program: it gets `SIGHUP`, and `SIGKILL` if it is still there after 300 ms.
 * The size of the pseudo terminal follows the widget: the program gets `SIGWINCH` when the window is resized.
-* Linux and Android only: on Windows `start` returns false (there are no pseudo terminals), while `feed` still works. `aterm` (`examples/gui/aterm.a`) is a terminal program made of this widget:
+* `start` needs a pseudo terminal, so it is for Linux and Android: on Windows it returns false, while `feed` still works. `aterm` (`examples/gui/aterm.a`) is a terminal program made of this widget:
   `ADISPLAY=0 ./aterm` opens your shell, Ctrl+Shift+N opens another window, Ctrl+Shift+C and V copy and paste.
 
 ## Limits
 
-* `HtmlView` has no CSS, no scripts, no frames, no italics or colours; tables are cells side by side, not a full table layout.
-* `gnet.Fetch` is HTTP/1.1 GET and POST; connecting and DNS wait for up to 4 seconds; cookies know hosts and names only.
-* `gnet.Chat` and `gnet.Conn` are unencrypted. `gnet.Scan` tests one port per turn of the loop.
+* `HtmlView` has no CSS, no scripts, no frames, no italics and no colours from the page; tables are cells side by side, not a full table layout. Forms work, but with URL encoded bodies only (no file upload, no `multiple` selects). `markdownToHtml` knows a small part of Markdown.
+* `gnet.Fetch` is HTTP/1.1 GET and POST, with `Connection: close`; connecting and DNS wait for up to 4 seconds; cookies know hosts and names only; a response is limited to `maxBytes` (8 MB by default).
+* `gnet.Chat` and `gnet.Conn` are unencrypted. `gnet.Scan` tests one port per turn of the loop, and each attempt waits for its timeout.
 * `gterm` has one font size, no wide characters, no italics, no `OSC 52` clipboard sequence, and needs a pseudo terminal (Linux and Android).
 
 ## Summary
 
 * `gnet`, `ghtml` and `gterm` live inside the event loop of `gui`: `d->watch(fd, ...)` calls a function when a descriptor is readable, so a window stays responsive.
-* `gnet.Fetch` makes non blocking HTTP requests (redirects, chunked bodies, POST, cookies, https); `Conn`, `Listener`, `Beacon`, `Scan` and `Chat` cover TCP, UDP, port scanning and a peer-to-peer chat.
-* `ghtml` parses and converts HTML and Markdown without a window, resolves links, and `HtmlView` shows a page with links, images, tables and working forms.
+* `gnet.Fetch` makes non blocking HTTP requests (redirects, chunked bodies, POST, cookies, https with a checked certificate); `Conn`, `Listener`, `Beacon`, `Scan` and `Chat` cover TCP, UDP, port scanning and a peer-to-peer chat.
+* `ghtml` parses and converts HTML and Markdown without a window, resolves links, and `HtmlView` shows a page with links, images, tables and working forms (no CSS, scripts or frames).
 * `gterm.Terminal` is a terminal emulator widget: feed it escape sequences from a string, or run a program on a pseudo terminal.
-* None of the network code encrypts anything except `https://`: use a tunnel or a trusted network for the rest.
+* None of the network code encrypts anything except `https://` in `gnet.Fetch`: use a tunnel or a trusted network for the rest.
 
 ## Where next
 

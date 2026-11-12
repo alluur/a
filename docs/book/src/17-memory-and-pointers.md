@@ -1,6 +1,6 @@
 # Memory and pointers
 
-A runs close to the machine: there is no garbage collector, no hidden runtime and no bounds checking. In return you always know where a value lives and what it costs. This chapter explains where memory comes from, how pointers work, how to allocate and free memory, and how to jump out of deeply nested code with `setjmp` and `longjmp`.
+A runs close to the machine: there is no garbage collector and no bounds checking. In return you always know where a value lives and what it costs. This chapter explains where memory comes from, how pointers work, how to allocate and free memory, and how to jump out of deeply nested code with `setjmp` and `longjmp`.
 
 In this chapter:
 

@@ -216,7 +216,7 @@ If four threads each do `hits = hits + 1`, updates get lost: two threads read th
 
 * `cpu.atomicAdd(&n, 1)` returns the value *before* the addition. That makes it a ticket machine: every caller gets a different number.
 * `cpu.atomicCas(&n, expected, desired)` ("compare and swap") stores `desired` only if `n` still holds `expected`. It returns the old value either way, so you can see whether it worked.
-* The other operations are `atomicSub`, `atomicInc`, `atomicDec`, `atomicSwap`, `atomicLoad` and `atomicStore`. All of them are full memory barriers.
+* The other operations are `atomicSub`, `atomicInc`, `atomicDec`, `atomicSwap`, `atomicLoad` and `atomicStore`. The ones that change memory (everything except `atomicLoad`) are full memory barriers. `atomicLoad` reads the 64 bit value in one piece, but on x86-64 it is an ordinary load instruction and not a full barrier; call `cpu.fence()` when you need one.
 
 ### Locks
 
@@ -398,7 +398,7 @@ The `log` module writes lines with a level to standard error (so that your real 
 * The sample sends the log to standard output with `setFd(1)` and removes the time stamp, so that its output can be recorded. In a real program you would leave both alone.
 * The tag has a fixed width (`[INFO ]`, `[WARN ]`), so messages line up.
 * `log.setLevel(log.OFF)` silences the log completely.
-* Keep messages short. A message of about 2,000 characters is the limit for the plain functions (a longer one is cut and loses its line break), and the `f` functions cut the formatted text at 1,023 characters.
+* Keep messages short. The whole output line, including the time stamp and the tag, has room for about 2,200 bytes in the plain functions (a longer message is cut and loses its line break), and the `f` functions cut the formatted text at 1,023 characters.
 
 ### Formatted messages
 
@@ -406,7 +406,7 @@ The `log` module writes lines with a level to standard error (so that your real 
 
 **What to notice.**
 
-* The `f` functions take a format and exactly four values. Text is passed as `(int) text`, like all values of `printf`.
+* The `f` functions take a format and exactly four values; a call with fewer is a compile error, so pass `0` for the unused ones. The values are `int` parameters, but text and numbers can be passed as they are: the cast `(int) user` in the sample is allowed and not needed.
 * A message that is not shown costs very little: the formatting is skipped when the level is too low.
 * For a message that you build yourself, with more than four values, use `format` and the plain functions.
 
@@ -446,7 +446,7 @@ A program cannot import both `log` and the C library modules `cstdio` or `cmath`
 
 * `assertEq` takes the *expected* value first. A message that reads "expected 4 but got 6" is only right when you keep to that order.
 * A test that passes prints nothing. Only the summary line is printed.
-* `return testing.summary();` makes the exit code the number of failures, so a script can see that tests failed. An exit code is a byte: 256 failures would look like success. If that can happen to you, return `failed > 0 ? 1 : 0` instead.
+* `return testing.summary();` makes the exit code the number of failures, so a script can see that tests failed. An exit code is a byte: 256 failures would look like success. If that can happen to you, return `testing.summary() > 0 ? 1 : 0` instead.
 
 ### What a failure looks like
 

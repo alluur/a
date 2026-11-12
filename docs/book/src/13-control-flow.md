@@ -74,7 +74,7 @@ What to notice:
 
 ## switch
 
-`switch (value)` jumps to the `case` whose label equals the value, or to `default` when there is none. Labels are **constant expressions** (numbers, characters, `const` names, enum members) and must fit in 32 bits (`case 5000000000:` is the error `case value does not fit in 32 bits`). Using a variable as a label gives `name is not a constant`.
+`switch (value)` jumps to the `case` whose label equals the value, or to `default` when there is none. Labels are **constant expressions** (numbers, characters, `const` names, enum members) and must fit in a signed 32-bit integer (`case 5000000000:` and `case 2147483648:` are the error `case value does not fit in 32 bits`). Using a variable as a label gives `name is not a constant`.
 
 Execution **falls through**: after the matching case runs, it continues into the next one unless a `break` (or `return`) stops it. Two labels in a row share the same code.
 
@@ -113,7 +113,7 @@ What to notice:
 
 ## static if
 
-`static if (constant) { ... } else { ... }` is decided **while compiling**. The branch that is not chosen is skipped: it may name things that do not exist on the current target and is never compiled. It works around declarations at file level and around statements inside function bodies. It does not work between the members of a class: a `static if` in a class body is an error (`unknown type`). The condition is a constant expression: your own `const` values, or the built-in constants `__ARCH` (0 x86-64, 1 ARM64, 2 RISC-V 64, 3 LoongArch 64) and `__OS` (0 Linux, 1 Windows, 2 Android). The standard prelude itself uses `static if (__ARCH == 0)` to pick faster x86-64 routines.
+`static if (constant) { ... } else { ... }` is decided **while compiling**. The branch that is not chosen is skipped: it may name things that do not exist on the current target and is never compiled. It works around declarations at file level and around statements inside function bodies. It does not work between the members of a class: a `static if` in a class body is an error (`unknown type`). Both branches need braces (`static if (X) stmt;` is the error `expected '{' after static if (...)`). The condition is a constant expression, and a variable is rejected with `name is not a constant`: your own `const` values, or the built-in constants `__ARCH` (0 x86-64, 1 ARM64, 2 RISC-V 64, 3 LoongArch 64) and `__OS` (0 Linux, 1 Windows, 2 Android). The standard prelude itself uses `static if (__ARCH == 0)` to pick faster x86-64 routines.
 
 {{sample lang/static_if}}
 
@@ -128,7 +128,7 @@ What to notice:
 - `if`, `else if` and `else` test integers and pointers; zero and `null` are false.
 - `while` tests before each round, `do ... while` after it, `for` has init, condition and step, each of them optional.
 - `break` leaves the innermost loop or `switch`; `continue` starts the next round of the innermost loop.
-- `switch` labels are constant expressions that fit in 32 bits; without `break` execution falls through.
+- `switch` labels are constant expressions that fit in a signed 32-bit integer; without `break` execution falls through.
 - `goto` and labels work within one function; leaving nested loops is the good use.
 - `defer` runs an expression at function exit, last in first out, at most 16 per function and only at the top level of the body.
 - `static if` selects code at compile time using constants such as `__ARCH` and `__OS`. It works at file level and in function bodies, not inside a class body.

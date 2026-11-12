@@ -1,6 +1,6 @@
 # Drawing and images
 
-A has a complete 2D graphics library written in A itself: `gfx` draws into a **surface**, a rectangle of pixels in memory, and `gimg` reads and writes
+A has a 2D graphics library written in A itself: `gfx` draws into a **surface**, a rectangle of pixels in memory, and `gimg` reads and writes
 picture files. Nothing here needs a window or a display server, so every program in this chapter is an ordinary program that draws, prints what it did,
 and saves a PNG. The pictures in the chapter are those PNGs.
 
@@ -12,13 +12,13 @@ In this chapter:
 * text, the built-in fonts, other sizes and your own font files;
 * copying pictures, working pixel by pixel, and the picture formats of `gimg`.
 
-Windows and widgets come in the [next chapter](#chap-gui-basics); they use exactly the functions you learn here to paint themselves.
+Windows and widgets come in the [next chapter](#chap-gui-basics); they use the functions you learn here to paint themselves.
 
 ## Surfaces and pixels
 
 A `gfx.Surface` has a width `w`, a height `h` and an array of pixels `px`. A pixel is one `int` of the form `0xAARRGGBB`: alpha, red, green and blue,
 eight bits each. Alpha 255 is opaque. The point 0, 0 is the top left corner, x grows to the right and **y grows downwards**.
-A new surface is all zeros: transparent black. Every drawing function **clips** to the surface, so drawing outside of it is safe and does nothing.
+A new surface is all zeros: transparent black. Every drawing function **clips** to the surface, so drawing outside of it is safe and does nothing. (A width or height below 1 is made 1.)
 
 {{sample gfx/surface_basics}}
 
@@ -27,7 +27,7 @@ A new surface is all zeros: transparent black. Every drawing function **clips** 
 **What to notice**
 
 * `fill(x, y, w, h, c)` is a filled rectangle, `rect` only its outline, `hline` and `vline` take a start and a length.
-* `get` outside the surface returns 0 and `put` outside is ignored. Neither stops the program.
+* `get` outside the surface returns 0 and `put` outside is ignored. Neither stops the program. (`put` also obeys the clip rectangle, see "Clipping" below; `get` does not.)
 * A pixel is an `int`, so a surface takes 8 bytes per pixel in memory (`new gfx.Surface(1000, 1000)` is 8 MB). `release()` gives the memory back.
 * `gimg.savePng` writes the picture; `savePPM` and `saveBMP` are methods of the surface itself (see "Picture files" below).
 
@@ -44,7 +44,7 @@ alpha, and `gfx.red`, `green`, `blue` and `alpha` read the parts back. The const
 **What to notice**
 
 * `mix(a, b, t)` blends two colours: 0 gives `a`, 255 gives `b`. `lighten(c, t)` and `darken(c, t)` are `mix` with white and with black. The result is always opaque.
-* The bars in the picture are one `vline` per column with `mix(BLUE, YELLOW, x)`: a horizontal gradient is a loop.
+* The top bar in the picture is one `vline` per column with `mix(BLUE, YELLOW, x)`: a horizontal gradient is a loop. The other two bars use `lighten` and `darken` the same way.
 * `withAlpha(c, a)` keeps the colour and replaces the alpha.
 
 ## Lines and circles
@@ -71,12 +71,12 @@ alpha, and `gfx.red`, `green`, `blue` and `alpha` read the parts back. The const
 
 **What to notice**
 
-* Radius 0 is a plain rectangle. The pixels in the corners are not touched, so the background shines through.
+* With a radius above 0 the pixels in the corners are not touched, so the background shines through (the first line of output). Radius 0 is a plain rectangle: the yellow one in the picture.
 * Draw the fill first and the outline over it, as the first button does.
 
 ## Polygons
 
-`fillPolygon(xs, ys, n, c)` fills the polygon whose corners are `xs[i], ys[i]`. It takes 3 to 256 corners and uses the **even-odd rule**: a point is inside when a line
+`fillPolygon(xs, ys, n, c)` fills the polygon whose corners are `xs[i], ys[i]`. It takes 3 to 256 corners (with any other number it draws nothing) and uses the **even-odd rule**: a point is inside when a line
 from it to the outside crosses the outline an odd number of times. That is why the middle of the star stays empty.
 
 {{sample gfx/polygons}}
@@ -100,13 +100,13 @@ Angles are in degrees, measured **clockwise from the right** (3 o'clock), becaus
 
 **What to notice**
 
-* `isin(30)` is 512 and `icos(60)` is 512: half of 1024. `isin` is an approximation (the error is below 0.2 % of 1024); the section "Plotting with real numbers" at the end shows the exact way.
-* Each slice of the pie starts where the previous one ended. Arcs, rings and pies are drawn as short straight steps (about every 4 degrees), so a big pie shows its corners if you look closely.
+* `isin(30)` is 512 and `icos(60)` is 512: half of 1024. `isin` is an approximation (the error is at most 2 out of 1024, about 0.2 %); the section "Plotting with real numbers" at the end shows the exact way.
+* Each slice of the pie starts where the previous one ended. Pies and rings are drawn as short straight steps of about 4 degrees, and `arc` as steps of about 2 degrees, so a big pie shows its corners if you look closely.
 * A pie of 360 degrees or more is a full disc. The gauges and the pie chart of [the chapter on more widgets](#chap-gui-more-widgets) are made with `thickArc` and `fillPie`.
 
 ## Gradients and shadows
 
-`gradientV(x, y, w, h, top, bottom)` fills a rectangle with a vertical gradient. `shadow(x, y, w, h, spread, maxAlpha)` draws `spread` rings of translucent black around a rectangle:
+`gradientV(x, y, w, h, top, bottom)` fills a rectangle with a vertical gradient. `shadow(x, y, w, h, spread, maxAlpha)` draws `spread` rings of translucent black, one pixel wide each, around a rectangle:
 draw it first, then draw the rectangle over it.
 
 {{sample gfx/gradients_shadows}}
@@ -116,13 +116,13 @@ draw it first, then draw the rectangle over it.
 **What to notice**
 
 * The first line of output shows the gradient: the top pixel is the first colour and the last row is the second.
-* The rings of `shadow` get **darker with the distance** from the rectangle: the pixel next to the card is almost the background colour (`0xffededf1`), the pixel 8 away is darker (`0xffe4e4e8`).
-  Use a small `maxAlpha`, and look at the picture.
-* A gradient in another direction is a loop of `vline` or `hline` calls with `mix`, as in the previous section.
+* The rings of `shadow` get **darker with the distance** from the rectangle, not lighter: the pixel next to the card is almost the background colour (`0xffededf1`, the ring has alpha 1), the pixel 8 away is darker (`0xffe4e4e8`, alpha 11), and then the shadow stops with a sharp edge.
+  A ring at distance `g` from the rectangle (1 is the ring next to it, `spread` the outermost) has the alpha `maxAlpha * g / (spread * spread)`. So `maxAlpha` is not the alpha you see: the darkest ring has `maxAlpha / spread` (11 for 90 and 8). The whole effect is faint. Look at the picture.
+* A gradient in another direction is a loop of `vline` or `hline` calls with `mix`, as in the sample above (the red to yellow bar on the right).
 
 ## Transparency
 
-A colour whose alpha is below 255 is **blended** with the pixel that is already there, by every drawing function: `fill`, `line`, `fillCircle`, text, and the others.
+A colour whose alpha is below 255 is **blended** with the pixel that is already there, by the drawing functions: `fill`, `line`, `fillCircle`, text, and the others. (`put`, `blit` and `clear` store the colour as it is.)
 `blend(x, y, c, cover)` does it for one pixel and scales the alpha by `cover` (0 to 255), which is how the antialiased edges of text are made.
 `blitBlend` (see "Copying pictures" below) blends a whole surface.
 
@@ -134,12 +134,12 @@ A colour whose alpha is below 255 is **blended** with the pixel that is already 
 
 * The overlap of the three circles shows all three colours: each one was blended with what the earlier ones had left.
 * `put` stores a colour exactly as it is, alpha included; the drawing functions blend.
-* The result of blending is **always opaque**. Drawing a translucent colour onto a transparent pixel (which counts as black) gives a darker opaque pixel (`0xff800000`), not a translucent one.
+* The result of blending is **opaque** (only a colour with alpha 0 changes nothing, so a transparent pixel stays transparent). Drawing a translucent colour onto a transparent pixel (which counts as black) gives a darker opaque pixel (`0xff800000`), not a translucent one.
   So draw translucent shapes over an opaque background, and keep transparent sprites made of opaque shapes on a transparent surface.
 
 ## Clipping
 
-`setClip(x, y, w, h)` restricts drawing to a rectangle (cut to the surface); `resetClip()` takes it off; `inside(x, y)` tells whether a point may be drawn.
+`setClip(x, y, w, h)` restricts drawing to a rectangle (cut to the surface); `resetClip()` takes it off; `inside(x, y)` tells whether a point may be drawn. The fields `clipX0`, `clipY0`, `clipX1` and `clipY1` hold the rectangle: the end values are exclusive (`clip: 25,20 to 85,80` in the output below is 60 pixels wide).
 The widgets use this: a widget can only draw inside its own rectangle.
 
 {{sample gfx/clipping}}
@@ -149,8 +149,9 @@ The widgets use this: a widget can only draw inside its own rectangle.
 **What to notice**
 
 * The grey circle outline was drawn before the clip and is complete. The blue disc, the text and the red diagonal line were drawn with the clip: only the square part shows.
-* `fill`, `line`, text, `blit` and the other drawing functions obey the clip. **`clear` does not**: it always paints the whole surface.
-* `setClip` with a rectangle that sticks out is cut to the surface (the second line of output).
+* `fill`, `line`, text, `put`, `blend`, `blit` and the other drawing functions obey the clip. **`clear` does not**: it always paints the whole surface. `get` does not look at the clip either.
+* `setClip` with a rectangle that sticks out is cut to the surface (the third line of output).
+* The gradient in the square on the right was asked for with a width of 200, far more than fits, and the clip keeps it inside the black frame.
 
 ## Text and fonts
 
@@ -164,7 +165,7 @@ A `gfx.Font` has `height` (the distance between lines) and `ascent` (from the to
 
 **What to notice**
 
-* All three fonts are 17 pixels high; `mono` has equal widths (8 pixels a character), the others have proportional widths.
+* All three fonts have a `height` of 17 pixels (a line of text); `mono` has equal widths (8 pixels a character), the others have proportional widths.
 * The return value of `text` lets you continue on the same line with another font, as the first line does.
 * The translucent red text is blended like any other drawing.
 
@@ -178,8 +179,8 @@ The fonts have the characters 32 to 255 (ISO Latin-1). `text` decodes UTF-8; a c
 
 **What to notice**
 
-* `strlen` counts bytes (32), `textWidth` counts pixels (131): the line has 21 characters and each `Ä` is two bytes in the source file.
-* `gfx.nextCode(s, &pos)` reads one code point and advances `pos`: it returns 233 for `é` and moves 2 bytes.
+* `strlen` counts bytes (32), `textWidth` counts pixels (131): the first line has 21 characters, and each of its 11 letters with an accent or ring (`Ä`, `é`, `ß` ...) is two bytes in the source file.
+* `gfx.nextCode(s, &pos)` reads one code point and advances `pos`: it returns 233 for `é` and moves 2 bytes. For a character that needs three or more bytes (the euro sign) it returns 63, the code of `?`, and moves over all its bytes.
 * The euro sign, the Greek letters and the arrows are above 255 and all come out as `?`.
 
 ### Where the built-in fonts come from: `gfxfont`
@@ -196,12 +197,12 @@ The module `gfxfont` is only data: three functions, `sans()`, `sansBold()` and `
 
 * The three data sets are 9 798, 10 570 and 9 770 bytes. A font that is made from the empty string is not `valid` (nothing can be drawn with it).
 * You almost never import `gfxfont` yourself: use `gfx.sans()`, `sansBold()` and `mono()`, which also honour `$AFONT_CONF` and `/etc/fonts.conf` (see "Your own font file" below).
-* `scaleFont` works on any font object, so a font made by hand can be scaled like the built-in ones (the last line of the picture).
+* `scaleFont` works on any font object, so a font made by hand can be scaled like the built-in ones (the last line of the picture, drawn at 150 percent).
 
 ### Text at other sizes
 
 `gfx.scaleFont(font, percent)` makes a copy of a font at 20 to 400 percent (a smaller or larger number gives `null`). The glyphs are sampled again with integer arithmetic, so the
-result is the same on every target. `surface->textScaled(font, x, y, s, c, percent)` draws one string at another size without making a font (smoother, slower), and `scaledWidth` measures it.
+result is the same on every target. `surface->textScaled(font, x, y, s, c, percent)` draws one string at another size without making a font (it draws the string small on a temporary surface and resamples that, so it is slower than `text`; below 20 percent it draws nothing), and `scaledWidth` measures it.
 
 {{sample gfx/font_scaling}}
 
@@ -216,13 +217,14 @@ and `mono()` (second number) *in place*. Every widget holds a pointer to the sam
 
 **What to notice**
 
-* The `ui` pointer was taken once and shows three different sizes: the font object itself changed.
+* The `ui` pointer was taken once and still shows different sizes (height 17, then 26, then 17 again): the font object itself changed.
+* `setFontScales` limits both percentages to 50 to 300. (`scaleFont` accepts 20 to 400.)
 * `setFontScales(100, 100)` gives the exact original fonts back. The glyph sets are cached (48 of them), so going back and forth costs no memory after the first visit of a size.
-* `gfx.setUiFont("mono")` (or `"sans"`, or the path of a font file) chooses which font `sans()` shows; `gfx.uiFontScale()` and `monoFontScale()` read the current sizes.
+* `gfx.setUiFont("mono")` (or `"sans"`, or the path of a font file) chooses which font `sans()` and `sansBold()` show and returns `false` when a file cannot be used; `gfx.uiFontScale()` and `monoFontScale()` read the current sizes.
 
 ### Your own font file
 
-`gfx.loadFont(path)` loads a font from a binary file and returns `null` when the file is missing or damaged. The format is small: a byte for the ascent, a byte for the line height, then for
+`gfx.loadFont(path)` loads a font from a binary file and returns `null` when the file is missing or damaged, or is 256 KiB (262 144 bytes) or larger. The format is small: a byte for the ascent, a byte for the line height, then for
 each code from 32 to 255 five bytes (advance, left bearing, top, width, height; the bearing and the top are signed) followed by `width * height` coverage values of 4 bits, two per byte, the first one in the high nibble.
 The sample makes a font that has only the ten digits, written as 5 by 7 bitmaps.
 
@@ -251,7 +253,7 @@ transparent parts of the sprite show the background, and `opacity` (0 to 255) ma
 * The sprite is a surface that starts transparent (`0`) with opaque shapes drawn on it. `blitBlend` keeps the sky around the circle, five times, and the sixth is a ghost at opacity 110.
 * `blit` can copy a surface onto itself: the strip in the lower part is a copy of the upper part.
 * `pack` and `unpack` move a rectangle to and from a byte buffer, four bytes per pixel (blue, green, red, alpha): the format of the display protocol.
-* `checksum()` gives one number for the whole picture. The same program draws the same pixels on every target, which is how the tests of the graphics library compare Linux, ARM, RISC-V and Windows.
+* `checksum()` gives one number for the whole picture. The drawing code uses only integer arithmetic, so the same program draws the same pixels on every target: the tests of the graphics library print checksums and compare them with one recorded answer on all targets. (For this chapter, 13 of its samples were built for x86-64, ARM64 and RISC-V 64, run on each, and their PNG files were byte for byte equal.)
 
 ## Working pixel by pixel
 
@@ -291,7 +293,7 @@ and PPM/PGM (P2, P3, P5, P6).
 
 **What to notice**
 
-* The file has 28 928 bytes: 120 x 60 x 4 bytes of pixels plus 128 bytes of headers.
+* The file has 28 928 bytes: 120 x 60 x 4 bytes of pixels plus 128 bytes of overhead (the PNG headers, the zlib wrapper and one filter byte for each of the 60 rows).
 * Saving and loading gives the same `checksum()`; so does encoding to memory and decoding again. The pixel `put` with alpha 100 survives (`0x640000ff`).
 * Garbage and missing files give `null`, never a crash.
 
@@ -302,7 +304,7 @@ and PPM/PGM (P2, P3, P5, P6).
 **What to notice**
 
 * The sizes follow from the formats: the PPM is the header `P6\n64 40\n255\n` (13 bytes) plus 3 bytes a pixel, the BMP is 54 bytes of header plus rows padded to a multiple of 4, the PNG has 4 bytes a pixel.
-* PPM and BMP have no alpha; `load` makes the pixels opaque. The picture used here is opaque, so all three files give the same pixels.
+* The PPM and BMP files that `savePPM` and `saveBMP` write have no alpha, so `load` gives opaque pixels. The picture used here is opaque, so all three files give the same pixels. (A 32-bit BMP made by another program keeps its alpha byte.)
 * A PPM can be written by hand: `P3` is the text form, with the numbers of the pixels as decimal text.
 
 {{sample gfx/image_scale}}
@@ -325,14 +327,20 @@ The Mandelbrot set takes a few lines of integer arithmetic when numbers are fixe
 
 **What to notice**
 
-* The number of pixels inside the set and the checksum are the same on every target, because integer arithmetic is.
-* A palette is a call of `mix` between two colours, chosen by the number of steps before the point escaped.
+* The number of pixels inside the set and the checksum are the same on every target, because the arithmetic is all integer (the PNG was equal on x86-64, ARM64 and RISC-V 64).
+* The colour is a `mix` of two colours (in two ranges: dark blue to light blue, then light blue to white), chosen by the number of steps before the point escaped.
 
 A function plot: a grid, labels made with `textCentered`, and one `line` for each step of the curve.
 
 {{sample gfx/plot_function}}
 
 {{shot gfx/plot_function}}
+
+**What to notice**
+
+* The plot is 288 pixels wide for 360 degrees, so `deg = x * 360 / PW` and each step of the curve is one `line` from the last point to the new one.
+* Both curves use `isin` and `icos`, which are 1024 times the real value: `isin(deg) * (PH / 2) / 1024` scales the result to half the plot height.
+* The grid and the labels are drawn first, so the curves cover them.
 
 ## Plotting with real numbers
 

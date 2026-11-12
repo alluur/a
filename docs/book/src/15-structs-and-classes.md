@@ -21,7 +21,7 @@ What to notice:
 - `Point q = p;` copied the struct: changing `q.x` did not change `p`.
 - `r.bottomRight = (Point){6, 5};` assigns a whole struct from a compound literal. `strcpy(r.name, "window")` fills the `char` array field.
 - Pointers use either spelling: `pp->x`, `(*pp).y` and `pp.x` mean the same.
-- Fields are laid out in the order you wrote them. An `int` is 8 bytes in A, so `Point` is 8 + 8 = 16 bytes. `char`, `bool` and `char` arrays can start at any byte; every other field (integers, pointers, nested structs) starts at a multiple of 8. `Rect` is 16 + 16 + 12 = 44 bytes, which is rounded up to 48. The size of every struct is a multiple of 8, so a one-byte struct still takes 8.
+- Fields are laid out in the order you wrote them. An `int` is 8 bytes in A, so `Point` is 8 + 8 = 16 bytes. `char`, `bool` and `char` arrays can start at any byte; the sized integers (`int16`, `uint32`, ...) start at a multiple of their own size; every other field (`int`, `double`, pointers, nested structs) starts at a multiple of 8. `Rect` is 16 + 16 + 12 = 44 bytes, which is rounded up to 48. The size of every struct is a multiple of 8, so a one-byte struct still takes 8.
 - `new Point` allocates a zeroed struct on the heap and returns a pointer; see [chapter 17](#chap-memory-and-pointers) for what that means.
 - There is no automatic comparison. `a == b` on two struct values compiles, but it does not compare the fields: it compares where the two variables are stored, so it is true only when both names are the same variable. Write a function that compares the fields, or define `operator==` (see below).
 
@@ -62,7 +62,7 @@ How you declare an object decides whether the constructor runs:
 | `Counter c;` | object is **zeroed**, the constructor does **not** run |
 | `new Counter;` | compile error when the class has a constructor |
 
-Only a declaration with parentheses, or `new`, runs the constructor. `Counter c;` does not run it, wherever it appears: a local variable, a global, a field of another class, or an element of an array are all just zeroed. (If the class has virtual methods, the object still gets its vtable pointer; see below.) The sample below prints a line from inside the constructor, so you can see when it runs.
+Only a declaration with parentheses, or `new`, runs the constructor. `Counter c;` does not run it, wherever it appears: a local variable, a global, a field of another class, or an element of an array are all just zeroed. (If the class has virtual methods, a local or a global object still gets its vtable pointer; a field or array element does not, see below.) The sample below prints a line from inside the constructor, so you can see when it runs.
 
 {{sample lang/class_ctor_runs}}
 
@@ -133,7 +133,7 @@ What to notice:
 
 - `describe()` is written once in `Animal` and calls `speak()`. Each object answered with its own `speak`: 1000 + 0 legs, 2000 + 4, and 12000 + 4 for `Puppy`, whose `speak` calls `super.speak()` and adds 10. The local `Dog local();` works the same way: `local.speak()` is 2.
 - `Puppy` has no constructor, so `new Puppy()` used `Dog`'s, which called `Animal(4)`.
-- The object gets its vtable pointer when it is created with `new`, declared as a local, or declared as a global. Copying an object copies the pointer too: there is no protection against slicing, no destructor, no multiple inheritance and no abstract class.
+- The object gets its vtable pointer when it is created with `new`, declared as a local, or declared as a global. A class-typed field of another class and the elements of an array of objects are only zeroed, so calling a virtual method on them crashes. Copying an object copies the pointer too: there is no protection against slicing, no destructor, no multiple inheritance and no abstract class.
 - A virtual method must have a body; otherwise the program does not link (`undefined function`).
 
 ## A class that points to itself

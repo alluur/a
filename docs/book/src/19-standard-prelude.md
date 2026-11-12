@@ -161,9 +161,9 @@ What to notice:
 
 What to notice:
 
-- Two handles are open at the same time, and each error path closes what was opened.
+- Two handles are open at the same time, and the error path that can leave one open (the target cannot be created) closes the source first. The function does not check the result of `fileWrite`, so a full disk would go unnoticed.
 - `fileRead` returned fewer bytes than asked at the end of the file (96 bytes as 64 plus 32), then 0.
-- The function returns the number of bytes copied, or -1 on error. A count is never negative, so -1 can safely mean "failed"; the caller does not learn which step failed.
+- The function returns the number of bytes copied, or -1 when one of the two files cannot be opened. A count is never negative, so -1 can safely mean "failed"; the caller does not learn which file it was.
 
 ## A small tool
 

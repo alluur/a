@@ -78,7 +78,7 @@ What to notice:
 
 ## Recursion
 
-A function may call itself. Each call has its own parameters and locals on the **stack**, which is 8 MiB.
+A function may call itself. Each call has its own parameters and locals on the **stack**, which is 8 MiB by default (on Linux the operating system decides; see [memory and pointers](#chap-memory-and-pointers)).
 
 {{sample lang/recursion}}
 
