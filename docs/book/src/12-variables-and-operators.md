@@ -33,7 +33,7 @@ What to notice:
 
 - The type is inferred (`int` for `MAX`, a string for `TITLE`), or you can write it: `const int MASK = 0xF0;`.
 - A typed constant is cut to its type: `const uint8 SMALL = 300;` is 44.
-- Constant expressions support the arithmetic, bitwise, comparison and logical operators (but not `?:`), so `AREA` and `FLAG` are computed at compile time. `MAX / 10` sized the array `values`.
+- Constant expressions support the arithmetic, bitwise, comparison and `&&`, `||`, `!` operators (but not `?:`, `??` and `^^`/`xor`), so `AREA` and `FLAG` are computed at compile time. `MAX / 10` sized the array `values`.
 - The two commented lines would not compile: `MAX = 5;` gives `left side of assignment is not assignable`, and `&MAX` gives `cannot take the address of a value`. Both messages are real compiler output.
 
 ## Scope and shadowing
@@ -52,19 +52,19 @@ What to notice:
 
 ## Global variables
 
-A variable declared outside any function is a **global**. Every function can use it. A global's initializer must be a constant expression: numbers, constants, enum members, `sizeof`, strings and operators on them. Without an initializer a global is zero.
+A variable declared outside any function is a **global**. Every function can use it. A global's initializer must be a constant expression: numbers, constants, enum members, `sizeof`, strings and operators on them (the same operators as in a `const`: no `?:`, `??` or `^^`/`xor`). Without an initializer a global is zero.
 
 {{sample lang/globals}}
 
 What to notice:
 
-- `total` has no initializer: it lives in a zero-filled area (`bss`) that costs nothing in the program file. A global `int big[10000000];` (80 MB) still gives a program of about 4 KB. A global array **with** an initializer is stored in the file in full: `int table[1000000] = {1, 2, 3};` made an 8 MB program in a test.
+- `total` has no initializer: it lives in a zero-filled area (`bss`) that costs nothing in the program file. A global `int big[10000000];` (80 MB) adds nothing to the program file: a program with an empty `main` is about 4 KB with or without it. A global array **with** an initializer is stored in the file in full: `int table[1000000] = {1, 2, 3};` made an 8 MB program in a test.
 - `start` shows that constants may appear in the initializer: `BASE * 4 + 2`.
 - A global is initialised before `main` starts, so its initializer must be constant: `int g = f();` and `int g = n + 1;` (with `n` another variable) are rejected with `name is not a constant`. Set such values at the start of `main` instead.
 
 ## Arithmetic
 
-The arithmetic operators are `+`, `-`, `*`, `/` and `%`, and the unary `-` and `+`. On integers they work on 64-bit signed values (`+`, `-`, `*` and `/` also work on `double`). Division truncates toward zero, like in C, and the remainder has the sign of the left operand.
+The arithmetic operators are `+`, `-`, `*`, `/` and `%`, and the unary `-` and `+`. On integers they work on 64-bit values: signed, except that a `uint64` is divided and compared as unsigned (`+`, `-`, `*` and `/` also work on `double`). Division truncates toward zero, like in C, and the remainder has the sign of the left operand.
 
 {{sample lang/arithmetic}}
 
@@ -198,7 +198,7 @@ What to notice:
 - Arithmetic is 64-bit and wraps; division truncates toward zero; division by zero is not checked.
 - Comparisons and logical operators give 0 or 1; `&&` and `||` short-circuit; `and`, `or`, `not`, `xor` and `^^` are the word forms.
 - `>>` keeps the sign of a signed value; `&`, `|`, `^`, `~` work bit by bit.
-- `?:` chooses, `??` replaces 0 or `null`, `++` and `--` come in prefix and postfix form, and every binary operator has a compound assignment.
+- `?:` chooses, `??` replaces 0 or `null`, `++` and `--` come in prefix and postfix form, and the arithmetic and bitwise operators and the shifts have compound assignments such as `+=` and `<<=`.
 
 ## Where next
 

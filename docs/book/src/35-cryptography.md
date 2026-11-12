@@ -227,7 +227,7 @@ rsa.verifyPss(modulus, modLen, exponent, expLen, hashBits, digest, signature, si
 rsa.signPss(modulus, modLen, privateExponent, dLen, hashBits, digest, out)
 ```
 
-`hashBits` is 256, 384 or 512 (and 160 for the SHA-1 signatures of old certificates, for verification only). The modulus has 512 to 8192 bits for verification. PSS here uses MGF1 with the same hash and a salt as long as the hash, which is what TLS 1.3 uses.
+`hashBits` is 256, 384 or 512 (and 160 for the SHA-1 signatures of old certificates: it works in all three calls, but SHA-1 is broken, so use it only to check old signatures). The modulus has 512 to 8192 bits for verification. PSS here uses MGF1 with the same hash and a salt as long as the hash, which is what TLS 1.3 uses.
 
 {{sample crypto/rsa_verify}}
 
@@ -248,7 +248,7 @@ rsa.signPss(modulus, modLen, privateExponent, dLen, hashBits, digest, out)
 
 ### ECDSA
 
-ECDSA signatures are much shorter than RSA ones (two 32 byte numbers for P-256, against 256 bytes for RSA-2048). Checking one is not faster in this library, though: on the machine described above a P-256 check took about 5 ms and an RSA-2048 check about 3.5 ms. `ec.verify(bits, pub, publen, digest, dlen, r, rlen, s, slen)` takes the curve (256 or 384), the public key as an uncompressed point `04 || X || Y`, the digest, and the two numbers of the signature as big-endian bytes.
+ECDSA signatures are much shorter than RSA ones (two 32 byte numbers for P-256, against 256 bytes for RSA-2048). Checking one is not faster in this library, though: on the machine described above a P-256 check took about 5 ms and an RSA-2048 check (public exponent 65537) 3.5 to 4.5 ms. `ec.verify(bits, pub, publen, digest, dlen, r, rlen, s, slen)` takes the curve (256 or 384), the public key as an uncompressed point `04 || X || Y`, the digest, and the two numbers of the signature as big-endian bytes.
 
 {{sample crypto/ecdsa_verify}}
 
@@ -283,7 +283,7 @@ A certificate is a signed statement: "this public key belongs to this name". `x5
 
 **What to notice.**
 
-* `x509.parsePem(text, out, max)` reads every `CERTIFICATE` block of a PEM text and returns how many it found. `x509.parse(der, len)` takes the DER bytes of one certificate.
+* `x509.parsePem(text, out, max)` reads the `CERTIFICATE` blocks of a PEM text (at most `max`) into `out` and returns how many it found. `x509.parse(der, len)` takes the DER bytes of one certificate.
 * The fields of `Cert` that you will use are `cn` (common name), `san` and `sanIp` (the subject alternative names, `sanCount` of them), `notBefore` and `notAfter` (seconds since 1970), `isCA`, `keyKind` (1 RSA, 2 EC), `curve`, `sigKind` and `sigHash`.
 * The certificate is a test certificate made for this book. It is valid until 2100.
 
