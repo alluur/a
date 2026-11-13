@@ -261,6 +261,13 @@ tuple_expect_here:
     mov [tup_expect_tok], rax
 .r: ret
 
+; tuple_expect_any: the expression that starts at the current token is a tuple of any types (var x = (1, "a");  (a, _) = (b, c);)
+tuple_expect_any:
+    mov qword [tup_expect], -1
+    mov rax, [tk_start]
+    mov [tup_expect_tok], rax
+    ret
+
 ; tuple_check: rdi = the type wanted for the value in A (type e_type). A tuple on either side has to match exactly.
 tuple_check:
     cmp rdi, [e_type]
@@ -280,7 +287,7 @@ tuple_check:
     ret
 
 ; parse_tuple_rest: the first element of a literal has been parsed (A, e_type) and the current token is ','.
-; rdi = the expected tuple type (0 = none). Leaves the literal in A (a temporary of the frame, e_lval = 1) and consumes the ')'.
+; rdi = the expected tuple type (0 = none, -1 = a tuple of any types). Leaves the literal in A (a temporary of the frame, e_lval = 1) and consumes the ')'.
 parse_tuple_rest:
     push rbx
     push r12
@@ -288,15 +295,15 @@ parse_tuple_rest:
     push r14
     push r15
     sub rsp, TUPLE_MAX * 8
-    mov r13, rdi
+    mov r13, rdi                        ; the expectation: 0 none, -1 a tuple of any types, else the tuple type
     xor ebx, ebx
-    xor r14d, r14d
-    test r13, r13
-    jz .elem
-    mov r14, r13                        ; expected tuple type
+    xor r14d, r14d                      ; the tuple type that is expected (0 = none)
+    cmp r13, -1
+    je .elem
+    mov r14, r13
 .elem:
     call to_rvalue
-    test r13, r13
+    test r14, r14
     jz .noexp
     mov rdi, r14
     call tuple_count
@@ -331,7 +338,12 @@ parse_tuple_rest:
     ERR "too many tuple elements (at most 16)"
 .more:
     call next_token
-    test r13, r13
+    cmp r13, -1
+    jne .more1
+    call tuple_expect_any               ; a tuple in a tuple
+    jmp .parse
+.more1:
+    test r14, r14
     jz .parse
     mov rdi, r14
     call tuple_count
@@ -348,7 +360,7 @@ parse_tuple_rest:
 .done:
     mov edi, ')'
     call expect
-    test r13, r13
+    test r14, r14
     jz .mk
     mov rdi, r14
     call tuple_count
@@ -655,7 +667,10 @@ parse_tuple_decl_go:
     call tuple_type                     ; (the types are the first TUPLE_MAX qwords of the frame)
     mov rdi, rax
     call tuple_expect_here
+    jmp .exgo
 .exno:
+    call tuple_expect_any               ; var or _ : the literal on the right is a tuple of any types
+.exgo:
     call parse_assign
     call to_rvalue
     mov edi, r12d
@@ -785,7 +800,10 @@ parse_tuple_assign:
     call tuple_type
     mov rdi, rax
     call tuple_expect_here
+    jmp .exgo
 .exno:
+    call tuple_expect_any
+.exgo:
     call parse_assign
     call to_rvalue
     mov edi, r12d

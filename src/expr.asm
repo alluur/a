@@ -1842,9 +1842,15 @@ parse_primary:
     jnz .cast
     xor r13d, r13d
     cmp r12, [tup_expect_tok]
-    jne .pp
+    jne .legacy
+    ; a tuple is expected here (return in a function that returns one, a tuple variable, var, a pattern, an argument): (a, b) is a literal
     mov r13, [tup_expect]
     mov qword [tup_expect_tok], 0
+    cmp r13, -1
+    jne .pt
+    call tuple_expect_any               ; var / a pattern without types: any tuple, the elements too
+    jmp .pp
+.pt:
     mov rdi, r13                        ; the first element has the type of the first field of the tuple
     xor esi, esi
     call tuple_field
@@ -1854,6 +1860,11 @@ parse_primary:
     call parse_assign
     cmp qword [tk], ','
     je .tuple
+    mov edi, ')'
+    call expect
+    jmp .out
+.legacy:
+    call parse_expr                     ; without such a context  (a, b)  is the comma operator: a is evaluated, the value is b
     mov edi, ')'
     call expect
     jmp .out

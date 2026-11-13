@@ -866,6 +866,7 @@ parse_var_decl:
     jne .i1
     ERR "cannot infer the type of the variable from a {...} list: write the type"
 .i1:
+    call tuple_expect_any               ; var t = (1, "a");  a parenthesized list that starts the initializer is a tuple
     xor ebx, ebx
     cmp qword [tk], K_NULL
     jne .i2
