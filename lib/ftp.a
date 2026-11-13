@@ -1,0 +1,1370 @@
+// =============================================================================
+//  ftp - an FTP client (RFC 959, 2428, 3659, 2228 / 4217 for TLS, 2640 for UTF-8)                                       import ftp;
+//
+//    ftp.Client* c = ftp.connect("ftp://user:secret@ftp.example.org/");           // ftps:// = TLS from the start (port 990); null: ftp.error() says why
+//    c->cwd("/pub");   println(c->pwd());                                          // heap strings are yours to free
+//    ftp.EntryList* l = c->listEntries("");                                        // MLSD when the server has it, else LIST: name, kind, size, mtime, perms
+//    for (int i = 0; i < l->count; i++) println(l->get(i)->name);   l->dispose();
+//    c->download("notes.txt", "/tmp/notes.txt", false);                            // a file, with resume (REST) when the third argument is true
+//    c->upload("/tmp/report.pdf", "report.pdf", false);   c->store("hello.txt", "hi\n", 3);
+//    int n;  char* data = c->retrieveAll("small.txt", &n, 1 << 20);   free(data);   // into memory, at most 1 MiB
+//    c->mkd("new");  c->rename("new", "old");  c->dele("x");  c->size("f");  c->mdtm("f");
+//    c->quit();  c->dispose();
+//
+//  Data connections are passive by default (EPSV, then PASV when the server does not know EPSV); c->opt->passive = false makes the server connect back to us (EPRT, then PORT). The
+//  address in a PASV reply is NOT used: the data connection goes to the host of the control connection (a server that names another address could point the client at a machine
+//  of its choice, for a port scan or an attack); in active mode only a connection from the address of the server is accepted. TYPE I (binary, default) and TYPE A
+//  (c->type(false): lines are CRLF on the wire; the client converts to and from LF).
+//
+//  TLS (RFC 4217): ftps:// (implicit) or AUTH TLS (opt->authTls: STARTTLS_IF_OFFERED by default, STARTTLS_REQUIRED fails when the server does not offer it), then PBSZ 0 and PROT P so that the
+//  data connections are encrypted too (opt->protectData, default on). The user name and password are never sent without TLS when opt->authTls is STARTTLS_REQUIRED (or a ftps:// URL is
+//  used): with the default, a server that offers no AUTH TLS gets the login in the clear (as every FTP client does) unless opt->requireTlsForLogin is set (default for URLs that carry a password).
+//  Not supported: servers that insist on TLS session reuse for the data connections, IPv6, proxies, FXP.
+//
+//  Time outs: connectTimeoutMs (TCP and TLS), commandTimeoutMs (every command and its reply), dataTimeoutMs (a data connection that moves not one byte for that long fails; there is no limit on
+//  the time of a transfer that keeps moving). Limits: a reply over 1000 lines or 256 KiB, a directory listing over opt->maxList (8 MiB), retrieveAll over its limit.
+//  Names that a server sends (listings) are data: ftp.safeName() makes one fit to be a local file name (no path, no control characters). Paths that you give with CR, LF or NUL are refused.
+// =============================================================================
+import netline;
+import netio;
+import net;
+import tls;
+import datetime;
+import asys;
+import cstdlib;
+import cstring;
+module ftp;
+
+public const STARTTLS_NEVER = 0;
+public const STARTTLS_IF_OFFERED = 1;
+public const STARTTLS_REQUIRED = 2;
+
+public const K_UNKNOWN = 0;
+public const K_FILE = 1;
+public const K_DIR = 2;
+public const K_LINK = 3;
+public const K_OTHER = 4;
+
+private char lastErr[200];
+
+private void setErr(char* s) {
+    int n = strlen(s);
+    if (n > 190) n = 190;
+    memcpy(&lastErr[0], s, n);
+    lastErr[n] = 0;
+}
+
+public char* error() { return &lastErr[0]; }
+
+private char* copyText(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+private char* copyN(char* s, int n) {
+    char* r = malloc(n + 1);
+    if (r == null) return null;
+    if (n > 0) memcpy(r, s, n);
+    r[n] = 0;
+    return r;
+}
+
+// ---- directory entries and listing parsers -------------------------------------------------------------------------------------------------
+public class Entry {
+    public char* name;              // as the server sent it (data: see safeName)
+    public int kind;                // K_FILE, K_DIR, K_LINK, K_OTHER, K_UNKNOWN
+    public int size;                // bytes, -1 when the listing has none
+    public int mtime;               // seconds since 1970 (UTC), -1 when unknown
+    public char* perms;             // "rwxr-xr-x" or the perm facts of MLSD ("adfr"), or null
+    public char* target;            // the target of a symbolic link, or null
+}
+
+public class EntryList {
+    public Entry** items;
+    public int count;
+    public int cap;
+    public int unparsed;            // lines of a listing that were not understood
+
+    public Entry* get(int i) { return (i >= 0 && i < count) ? items[i] : null; }
+
+    public Entry* add() {
+        if (count >= cap) {
+            int nc = cap == 0 ? 16 : cap * 2;
+            Entry** ni = (Entry**) malloc(nc * 8);
+            if (ni == null) return null;
+            for (int i = 0; i < count; i++) ni[i] = items[i];
+            if (items != null) free((char*) items);
+            items = ni;
+            cap = nc;
+        }
+        Entry* e = (Entry*) malloc(sizeof(Entry));
+        if (e == null) return null;
+        e->size = -1;
+        e->mtime = -1;
+        items[count] = e;
+        count++;
+        return e;
+    }
+
+    // the entry with this name or null
+    public Entry* find(char* name) {
+        for (int i = 0; i < count; i++) {
+            if (streq(items[i]->name, name)) return items[i];
+        }
+        return null;
+    }
+
+    public void dispose() {
+        for (int i = 0; i < count; i++) {
+            if (items[i]->name != null) free(items[i]->name);
+            if (items[i]->perms != null) free(items[i]->perms);
+            if (items[i]->target != null) free(items[i]->target);
+            free((char*) items[i]);
+        }
+        if (items != null) free((char*) items);
+        items = null;
+        count = 0;
+        cap = 0;
+    }
+}
+
+public EntryList* newEntryList() { return (EntryList*) malloc(sizeof(EntryList)); }
+
+private int monthOf(char* s, int n) {
+    if (n != 3) return 0;
+    char* names = "janfebmaraprmayjunjulaugsepoctnovdec";
+    for (int m = 0; m < 12; m++) {
+        if (toLower(s[0] & 255) == names[m * 3] && toLower(s[1] & 255) == names[m * 3 + 1] && toLower(s[2] & 255) == names[m * 3 + 2]) return m + 1;
+    }
+    return 0;
+}
+
+// the next token of the line (blanks separate): its start and length, the position behind it; false at the end
+private bool token(char* s, int n, int* pos, int* start, int* len) {
+    int i = *pos;
+    while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+    if (i >= n) return false;
+    *start = i;
+    while (i < n && s[i] != ' ' && s[i] != '\t') i++;
+    *len = i - *start;
+    *pos = i;
+    return true;
+}
+
+private bool allDigits(char* s, int n) {
+    if (n < 1) return false;
+    for (int i = 0; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+    }
+    return true;
+}
+
+private int toInt(char* s, int n) {
+    int v = 0;
+    for (int i = 0; i < n; i++) {
+        v = v * 10 + (s[i] - '0');
+        if (v > 1000000000000000) return -1;
+    }
+    return v;
+}
+
+// A line of "ls -l" (Unix FTP servers): "drwxr-xr-x   2 ftp  ftp      4096 Nov 13 14:30 name", the year instead of the time for old files, "name -> target" for links, a
+// missing group column. now: the clock for files without a year (a date more than a day in the future is last year). Returns false for a line that is not one.
+public bool parseUnixLine(char* s, int n, Entry* e, int now) {
+    int pos = 0;
+    int a = 0;
+    int l = 0;
+    if (!token(s, n, &pos, &a, &l)) return false;
+    if (l < 10) return false;
+    int t = s[a] & 255;
+    if (t != '-' && t != 'd' && t != 'l' && t != 'b' && t != 'c' && t != 'p' && t != 's') return false;
+    for (int i = 1; i < 10; i++) {
+        int c = s[a + i] & 255;
+        if (c != 'r' && c != 'w' && c != 'x' && c != '-' && c != 's' && c != 'S' && c != 't' && c != 'T') return false;
+    }
+    int permStart = a + 1;
+    // links count, owner, [group], size, month, day, time or year: the size is the last number before the month
+    int tok[10];
+    int tl[10];
+    int nt = 0;
+    int save = pos;
+    while (nt < 9 && token(s, n, &pos, &a, &l)) {
+        tok[nt] = a;
+        tl[nt] = l;
+        nt++;
+        if (nt >= 4 && monthOf(&s[tok[nt - 1]], tl[nt - 1]) > 0 && allDigits(&s[tok[nt - 2]], tl[nt - 2])) break;
+    }
+    int mi = -1;
+    for (int i = 2; i < nt; i++) {
+        if (monthOf(&s[tok[i]], tl[i]) > 0 && allDigits(&s[tok[i - 1]], tl[i - 1])) { mi = i; break; }
+    }
+    if (mi < 0) return false;
+    // the day and the time or the year follow the month
+    int p2 = tok[mi] + tl[mi];
+    int d0 = 0;
+    int dl = 0;
+    int y0 = 0;
+    int yl = 0;
+    if (!token(s, n, &p2, &d0, &dl) || !allDigits(&s[d0], dl) || dl > 2) return false;
+    if (!token(s, n, &p2, &y0, &yl)) return false;
+    // the name: after exactly one blank behind the time or year
+    int ns = p2;
+    if (ns < n && s[ns] == ' ') ns++;
+    if (ns >= n) return false;
+    int month = monthOf(&s[tok[mi]], 3);
+    int day = toInt(&s[d0], dl);
+    int year = 0;
+    int hh = 0;
+    int mm = 0;
+    bool hasTime = false;
+    for (int i = 0; i < yl; i++) { if (s[y0 + i] == ':') hasTime = true; }
+    if (hasTime) {
+        if (yl < 4 || yl > 5) return false;
+        int c = 0;
+        while (c < yl && s[y0 + c] != ':') c++;
+        hh = toInt(&s[y0], c);
+        mm = toInt(&s[y0 + c + 1], yl - c - 1);
+    } else {
+        if (yl != 4 || !allDigits(&s[y0], 4)) return false;
+        year = toInt(&s[y0], 4);
+    }
+    e->kind = t == 'd' ? K_DIR : (t == 'l' ? K_LINK : (t == '-' ? K_FILE : K_OTHER));
+    e->size = toInt(&s[tok[mi - 1]], tl[mi - 1]);
+    e->perms = copyN(&s[permStart], 9);
+    char* name = &s[ns];
+    int nlen = n - ns;
+    if (e->kind == K_LINK) {
+        for (int i = 0; i + 4 <= nlen; i++) {
+            if (name[i] == ' ' && name[i + 1] == '-' && name[i + 2] == '>' && name[i + 3] == ' ') {
+                e->target = copyN(&name[i + 4], nlen - i - 4);
+                nlen = i;
+                break;
+            }
+        }
+    }
+    e->name = copyN(name, nlen);
+    if (month >= 1 && day >= 1 && day <= datetime.daysInMonth(2000, month)) {
+        if (!hasTime) {
+            e->mtime = datetime.toUnix(year, month, day, 0, 0, 0);
+        } else {
+            datetime.DateTime d(now);
+            year = d.year;
+            int u = datetime.toUnix(year, month, day, hh, mm, 0);
+            if (u > now + 86400) u = datetime.toUnix(year - 1, month, day, hh, mm, 0);
+            e->mtime = u;
+        }
+    }
+    return e->name != null;
+}
+
+// A line of the DOS / IIS format: "11-13-26  02:30PM       <DIR>          name" and "11-13-2026 02:30PM 1234 name". false when it is not one.
+public bool parseDosLine(char* s, int n, Entry* e) {
+    int pos = 0;
+    int a = 0;
+    int l = 0;
+    if (!token(s, n, &pos, &a, &l) || l < 8 || l > 10 || s[a + 2] != '-' || s[a + 5] != '-') return false;
+    int mo = toInt(&s[a], 2);
+    int dd = toInt(&s[a + 3], 2);
+    int yy = toInt(&s[a + 6], l - 6);
+    if (l == 8) yy = yy < 70 ? yy + 2000 : yy + 1900;
+    int ta = 0;
+    int tl2 = 0;
+    if (!token(s, n, &pos, &ta, &tl2) || tl2 < 6 || tl2 > 7 || toUpper(s[ta + tl2 - 1] & 255) != 'M') return false;
+    int ap = toUpper(s[ta + tl2 - 2] & 255);
+    if (ap != 'A' && ap != 'P') return false;
+    int colon = 0;
+    while (colon < tl2 && s[ta + colon] != ':') colon++;
+    if (colon < 1 || colon > 2) return false;
+    int hh = toInt(&s[ta], colon);
+    int mm = toInt(&s[ta + colon + 1], 2);
+    bool pm = toUpper(s[ta + tl2 - 2] & 255) == 'P';
+    if (hh == 12) hh = 0;
+    if (pm) hh = hh + 12;
+    int sa = 0;
+    int sl = 0;
+    if (!token(s, n, &pos, &sa, &sl)) return false;
+    int ns = pos;
+    while (ns < n && s[ns] == ' ') ns++;                      // the name starts at a fixed column: the blanks before it are padding
+    if (ns >= n) return false;
+    if (sl == 5 && memcmp(&s[sa], "<DIR>", 5) == 0) {
+        e->kind = K_DIR;
+    } else if (allDigits(&s[sa], sl)) {
+        e->kind = K_FILE;
+        e->size = toInt(&s[sa], sl);
+    } else {
+        return false;
+    }
+    if (mo >= 1 && mo <= 12 && dd >= 1 && dd <= 31 && yy >= 1970 && hh < 24 && mm < 60) e->mtime = datetime.toUnix(yy, mo, dd, hh, mm, 0);
+    e->name = copyN(&s[ns], n - ns);
+    return e->name != null;
+}
+
+// A line of MLSD or MLST (RFC 3659): "type=file;size=12;modify=20261113143000;perm=adfr; name". The entries of the current and the parent directory (type=cdir, pdir) are skipped:
+// *skip is set for them. false when it is not an MLSx line.
+public bool parseMlsdLine(char* s, int n, Entry* e, bool* skip) {
+    *skip = false;
+    int sp = -1;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == ' ') { sp = i; break; }
+    }
+    if (sp < 0) return false;
+    int ns = sp + 1;
+    if (ns >= n) return false;
+    bool haveType = false;
+    int i = 0;
+    while (i < sp) {
+        int fa = i;
+        while (i < sp && s[i] != ';') i++;
+        int eq = fa;
+        while (eq < i && s[eq] != '=') eq++;
+        if (eq < i) {
+            int fl = eq - fa;
+            char* v = &s[eq + 1];
+            int vl = i - eq - 1;
+            if (fl == 4 && strncasecmp2(&s[fa], "type", 4)) {
+                haveType = true;
+                if (vl == 4 && strncasecmp2(v, "file", 4)) e->kind = K_FILE;
+                else if (vl == 3 && strncasecmp2(v, "dir", 3)) e->kind = K_DIR;
+                else if (vl == 4 && strncasecmp2(v, "cdir", 4)) *skip = true;
+                else if (vl == 4 && strncasecmp2(v, "pdir", 4)) *skip = true;
+                else if (vl >= 13 && strncasecmp2(v, "OS.unix=slink", 13)) e->kind = K_LINK;
+                else e->kind = K_OTHER;
+            } else if (fl == 4 && strncasecmp2(&s[fa], "size", 4)) {
+                if (allDigits(v, vl)) e->size = toInt(v, vl);
+            } else if (fl == 6 && strncasecmp2(&s[fa], "modify", 6)) {
+                if (vl >= 14 && allDigits(v, 14)) {
+                    int y = toInt(v, 4);
+                    int mo = toInt(&v[4], 2);
+                    int d = toInt(&v[6], 2);
+                    int h = toInt(&v[8], 2);
+                    int mi = toInt(&v[10], 2);
+                    int sec = toInt(&v[12], 2);
+                    if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31 && h < 24 && mi < 60 && sec < 61) e->mtime = datetime.toUnix(y, mo, d, h, mi, sec);
+                }
+            } else if (fl == 4 && strncasecmp2(&s[fa], "perm", 4)) {
+                if (e->perms != null) free(e->perms);
+                e->perms = copyN(v, vl);
+            }
+        }
+        i++;
+    }
+    if (!haveType) return false;
+    e->name = copyN(&s[ns], n - ns);
+    return e->name != null;
+}
+
+private bool strncasecmp2(char* a, char* b, int n) {
+    for (int i = 0; i < n; i++) {
+        if (toLower(a[i] & 255) != toLower(b[i] & 255)) return false;
+    }
+    return true;
+}
+
+// Reads a whole listing (LIST, or MLSD with mlsd = true; lines end with CRLF or LF) into out. "total" lines and empty lines are skipped; the entries "." and ".." are left out;
+// other lines count in out->unparsed. now: the clock for the dates without a year (0: the real clock). At most maxEntries entries. Returns how many entries were added.
+public int parseListing(char* text, int n, bool mlsd, EntryList* out, int now = 0, int maxEntries = 100000) {
+    if (now == 0) now = datetime.now();
+    int added = 0;
+    int i = 0;
+    while (i < n && out->count < maxEntries) {
+        int e = i;
+        while (e < n && text[e] != 10) e++;
+        int le = e;
+        if (le > i && text[le - 1] == 13) le--;
+        int ln = le - i;
+        i = e < n ? e + 1 : e;
+        if (ln == 0) continue;
+        if (ln >= 5 && memcmp(&text[le - ln], "total", 5) == 0 && !mlsd) continue;
+        Entry probe;
+        probe.size = -1;
+        probe.mtime = -1;
+        bool ok = false;
+        bool skip = false;
+        char* line = &text[le - ln];
+        if (mlsd) {
+            ok = parseMlsdLine(line, ln, &probe, &skip);
+        } else {
+            ok = parseUnixLine(line, ln, &probe, now) || parseDosLine(line, ln, &probe);
+            if (!ok && ln > 8 && memcmp(line, "type=", 5) == 0) ok = parseMlsdLine(line, ln, &probe, &skip);
+        }
+        if (!ok) {
+            out->unparsed++;
+            if (probe.name != null) free(probe.name);
+            if (probe.perms != null) free(probe.perms);
+            if (probe.target != null) free(probe.target);
+            continue;
+        }
+        if (skip || streq(probe.name, ".") || streq(probe.name, "..")) {
+            free(probe.name);
+            if (probe.perms != null) free(probe.perms);
+            if (probe.target != null) free(probe.target);
+            continue;
+        }
+        Entry* ne = out->add();
+        if (ne == null) { free(probe.name); break; }
+        ne->name = probe.name;
+        ne->kind = probe.kind;
+        ne->size = probe.size;
+        ne->mtime = probe.mtime;
+        ne->perms = probe.perms;
+        ne->target = probe.target;
+        added++;
+    }
+    return added;
+}
+
+// A name that a server sent, made fit to be a local file name: the last component (after / or \), no control characters, no leading dots, at most 120 bytes; "file" when nothing is left. A heap string.
+public char* safeName(char* name) {
+    int n = name == null ? 0 : strlen(name);
+    int from = 0;
+    for (int i = 0; i < n; i++) {
+        if (name[i] == '/' || name[i] == '\\') from = i + 1;
+    }
+    char* r = malloc(n + 2);
+    if (r == null) return null;
+    int k = 0;
+    for (int i = from; i < n && k < 120; i++) {
+        int c = name[i] & 255;
+        if (c < 32 || c == 127 || c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') c = '_';
+        if (k == 0 && c == '.') continue;
+        r[k] = c;
+        k++;
+    }
+    while (k > 0 && (r[k - 1] == ' ' || r[k - 1] == '.')) k--;
+    if (k == 0) { strcpy(r, "file"); return r; }
+    r[k] = 0;
+    return r;
+}
+
+// ---- the replies to PASV, EPSV --------------------------------------------------------------------------------------------------------------------
+// "227 Entering Passive Mode (192,168,1,2,19,136)": the port (and the address into *ip, host order), or -1 when the reply is not like that
+public int parsePasv(char* text, int* ip) {
+    int n = strlen(text);
+    int open = -1;
+    for (int i = 0; i < n; i++) {
+        if (text[i] == '(') { open = i; break; }
+    }
+    int p = open >= 0 ? open + 1 : 0;
+    if (open < 0) {
+        while (p < n && !(text[p] >= '0' && text[p] <= '9')) p++;
+    }
+    int v[6];
+    for (int k = 0; k < 6; k++) {
+        if (p >= n || text[p] < '0' || text[p] > '9') return -1;
+        int x = 0;
+        int digs = 0;
+        while (p < n && text[p] >= '0' && text[p] <= '9') { x = x * 10 + (text[p] - '0'); p++; digs++; if (digs > 3) return -1; }
+        if (x > 255) return -1;
+        v[k] = x;
+        if (k < 5) {
+            if (p >= n || text[p] != ',') return -1;
+            p++;
+        }
+    }
+    int port = v[4] * 256 + v[5];
+    if (port < 1) return -1;
+    if (ip != null) *ip = (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3];
+    return port;
+}
+
+// "229 Entering Extended Passive Mode (|||6446|)": the port, or -1 (the delimiter is the character behind the parenthesis; the protocol and the address between the first
+// delimiters may be empty and are not used)
+public int parseEpsv(char* text) {
+    int n = strlen(text);
+    int open = -1;
+    for (int i = 0; i < n; i++) {
+        if (text[i] == '(') { open = i; break; }
+    }
+    if (open < 0 || open + 5 >= n) return -1;
+    int d = text[open + 1] & 255;
+    if (d < 33 || d > 126 || d == '(' || (d >= '0' && d <= '9')) return -1;
+    int p = open + 2;
+    for (int k = 0; k < 2; k++) {
+        while (p < n && (text[p] & 255) != d) p++;
+        if (p >= n) return -1;
+        p++;
+    }
+    int port = 0;
+    int digs = 0;
+    while (p < n && text[p] >= '0' && text[p] <= '9') { port = port * 10 + (text[p] - '0'); p++; digs++; if (digs > 5) return -1; }
+    if (digs == 0 || p >= n || (text[p] & 255) != d || port < 1 || port > 65535) return -1;
+    return port;
+}
+
+// ---- options --------------------------------------------------------------------------------------------------------------------------------------
+public class Options {
+    public char* username;              // default "anonymous"
+    public char* password;              // default "anonymous@"
+    public bool passive;                // default true
+    public bool useEpsv;                // try EPSV before PASV (default true)
+    public bool useEprt;                // try EPRT before PORT in active mode (default true)
+    public bool useTls;                 // TLS from the start (port 990)
+    public int authTls;                 // AUTH TLS: STARTTLS_NEVER, STARTTLS_IF_OFFERED (default), STARTTLS_REQUIRED
+    public bool protectData;            // PROT P after AUTH TLS (default true)
+    public bool requireTlsForLogin;     // no USER / PASS without TLS (default false; true for URLs with a password)
+    public bool verify;                 // check the certificates (default true)
+    public bool record;                 // keep a transcript
+    public int connectTimeoutMs;        // default 10000
+    public int commandTimeoutMs;        // default 30000
+    public int dataTimeoutMs;           // no byte for this long on a data connection: fails (default 30000)
+    public int maxList;                 // bytes of a directory listing (default 8 MiB)
+    public int now;                     // the clock for dates without a year (0: the real clock)
+    public char* activeAddress;         // the address to announce in active mode (default: the local address of the control connection)
+
+    public Options() { init(); }
+
+    public void init() {
+        username = "anonymous";
+        password = "anonymous@";
+        passive = true;
+        useEpsv = true;
+        useEprt = true;
+        authTls = STARTTLS_IF_OFFERED;
+        protectData = true;
+        verify = true;
+        connectTimeoutMs = 10000;
+        commandTimeoutMs = 30000;
+        dataTimeoutMs = 30000;
+        maxList = 8388608;
+    }
+}
+
+public Options* newOptions() {
+    Options* o = (Options*) malloc(sizeof(Options));
+    if (o != null) o->init();
+    return o;
+}
+
+// ---- the client ------------------------------------------------------------------------------------------------------------------------------------
+public class Client {
+    public netline.Conn* conn;
+    public Options* opt;
+    public char* error;
+    public int code;                    // the code of the last reply
+    public netline.Reply reply;
+    public bool secure;                 // the control connection is encrypted
+    public bool dataProtected;          // PROT P is in force: data connections are encrypted
+    public bool loggedIn;
+    public bool binary;                 // TYPE I is the current type
+    public bool hasMlsd;                // what FEAT said
+    public bool hasSize;
+    public bool hasMdtm;
+    public bool hasRest;
+    public bool hasUtf8;
+    public bool broken;
+    public bool heap;
+
+    private char* host;
+    private int port;
+    private bool ownsOpt;
+    private bool ownsCreds;
+    private int peerIp;                 // the address of the server (host order)
+    private bool epsvBroken;
+    private bool eprtBroken;
+    private bool typeKnown;
+    private int restart;                // an offset that REST announced for the next transfer
+
+    public bool isOpen() { return conn != null && conn->isOpen() && !broken; }
+
+    public char* transcript() { return conn == null ? "" : conn->transcript(); }
+
+    private bool fail(char* why) {
+        error = why;
+        setErr(why);
+        return false;
+    }
+
+    private void breakConn() {
+        broken = true;
+        if (conn != null) conn->close();
+    }
+
+    // a command and its reply: the code, or a negative netline code when the connection failed (it is closed then)
+    private int command(char* line, char* noteAs = null) {
+        if (!isOpen()) { error = "not connected"; return netline.E_EOF; }
+        if (!conn->writeLine(line, opt->commandTimeoutMs, noteAs)) {
+            error = conn->error;
+            breakConn();
+            return netline.E_FAILED;
+        }
+        return readReply();
+    }
+
+    private int readReply() {
+        int c = conn->readReply(&reply, netline.STYLE_FTP, opt->commandTimeoutMs);
+        if (c < 0) {
+            error = conn->error;
+            breakConn();
+            code = 0;
+            return c;
+        }
+        code = c;
+        if (c == 421) {
+            error = "the server closed the connection (421)";
+            breakConn();
+        }
+        return c;
+    }
+
+    // the text of the last reply (lines separated by LF)
+    public char* lastReply() { return reply.text(); }
+
+    // the first line of the last reply, as an error text
+    private bool replyFail(char* what) {
+        char first[200];
+        reply.line(0, &first[0], 200);
+        char msg[300];
+        format(&msg[0], 300, "%s: %d %s", what, code, &first[0], 0, 0, 0);
+        setErr(&msg[0]);
+        error = &lastErr[0];
+        return false;
+    }
+
+    private bool login() {
+        char cmd[400];
+        if (!netline.isLineSafe(opt->username) || !netline.isLineSafe(opt->password)) return fail("the user name and the password must not contain CR or LF");
+        format(&cmd[0], 400, "USER %s", opt->username, 0, 0, 0, 0, 0);
+        int c = command(&cmd[0]);
+        if (c < 0) return false;
+        if (c == 230) { loggedIn = true; return true; }
+        if (c != 331 && c != 332) return replyFail("USER refused");
+        format(&cmd[0], 400, "PASS %s", opt->password, 0, 0, 0, 0, 0);
+        c = command(&cmd[0], "PASS ****");
+        if (c < 0) return false;
+        if (c != 230 && c != 202) return replyFail("login failed");
+        loggedIn = true;
+        return true;
+    }
+
+    private void parseFeat() {
+        hasMlsd = false; hasSize = false; hasMdtm = false; hasRest = false; hasUtf8 = false;
+        char line[200];
+        for (int i = 1; i < reply.lines; i++) {
+            if (!reply.line(i, &line[0], 200)) break;
+            int a = 0;
+            while (line[a] == ' ') a++;
+            char* f = &line[a];
+            if (strncasecmp2(f, "MLST", 4)) hasMlsd = true;
+            else if (strncasecmp2(f, "SIZE", 4)) hasSize = true;
+            else if (strncasecmp2(f, "MDTM", 4)) hasMdtm = true;
+            else if (strncasecmp2(f, "REST", 4)) hasRest = true;
+            else if (strncasecmp2(f, "UTF8", 4)) hasUtf8 = true;
+        }
+    }
+
+    // Connects: TCP (and TLS), greeting, AUTH TLS, login, FEAT, TYPE I. false: error says why (the client is closed).
+    public bool connect() {
+        broken = false;
+        secure = false;
+        dataProtected = false;
+        loggedIn = false;
+        epsvBroken = false;
+        eprtBroken = false;
+        typeKnown = false;
+        if (conn != null) { conn->dispose(); conn = null; }
+        conn = netline.open(host, port, opt->connectTimeoutMs, opt->useTls, opt->verify);
+        if (conn == null) return fail(netline.lastError());
+        conn->recording = opt->record;
+        secure = opt->useTls;
+        netio.Link* lk = conn->link;
+        int ip = 0;
+        net.peer(lk->fd, &ip, null);
+        peerIp = ip;
+        int c = conn->readReply(&reply, netline.STYLE_FTP, opt->commandTimeoutMs);
+        if (c == 120) c = conn->readReply(&reply, netline.STYLE_FTP, opt->commandTimeoutMs);
+        if (c < 0) { char* why = conn->error; breakConn(); return fail(why); }
+        code = c;
+        if (c != 220) { breakConn(); return fail(c == 421 ? "the server is not ready (421)" : "the greeting is not 220"); }
+        bool needTls = (opt->authTls == STARTTLS_REQUIRED || opt->requireTlsForLogin) && !secure;
+        if (!secure && opt->authTls != STARTTLS_NEVER) {
+            c = command("AUTH TLS");
+            if (c < 0) return fail(error);
+            if (c == 234) {
+                if (!conn->startTls(host, opt->verify, opt->connectTimeoutMs)) { char* why = conn->error; breakConn(); return fail(why); }
+                secure = true;
+            } else if (needTls) {
+                breakConn();
+                return fail("the server does not offer AUTH TLS (and it is required)");
+            }
+        } else if (needTls) {
+            breakConn();
+            return fail("AUTH TLS is required and not allowed by the options");
+        }
+        if (secure && opt->protectData) {
+            c = command("PBSZ 0");
+            if (c < 0) return fail(error);
+            if (c == 200) {
+                c = command("PROT P");
+                if (c < 0) return fail(error);
+                dataProtected = c == 200;
+            }
+            if (!dataProtected && opt->authTls == STARTTLS_REQUIRED) { breakConn(); return fail("the server does not allow encrypted data connections (PROT P)"); }
+        }
+        if (!login()) { breakConn(); return false; }
+        c = command("FEAT");
+        if (c == 211) parseFeat();
+        else if (c < 0) return false;
+        if (hasUtf8) command("OPTS UTF8 ON");
+        c = command("TYPE I");
+        if (c < 0) return false;
+        binary = true;
+        typeKnown = true;
+        return true;
+    }
+
+    // TYPE I (binary) or TYPE A (text: CRLF on the wire, LF in the files and buffers of this side)
+    public bool type(bool isBinary) {
+        if (typeKnown && binary == isBinary) return true;
+        int c = command(isBinary ? "TYPE I" : "TYPE A");
+        if (c < 0) return false;
+        if (c != 200) return replyFail("TYPE refused");
+        binary = isBinary;
+        typeKnown = true;
+        return true;
+    }
+
+    private bool simple(char* verb, char* arg, int want, char* what) {
+        if (arg != null && !netline.isLineSafe(arg)) return fail("a path must not contain CR, LF or NUL");
+        char cmd[1100];
+        if (arg != null) {
+            if (strlen(arg) > 1000) return fail("the path is too long");
+            format(&cmd[0], 1100, "%s %s", verb, arg, 0, 0, 0, 0);
+        } else {
+            format(&cmd[0], 1100, "%s", verb, 0, 0, 0, 0, 0);
+        }
+        int c = command(&cmd[0]);
+        if (c < 0) return false;
+        if (c / 100 != want / 100) return replyFail(what);
+        return true;
+    }
+
+    public bool cwd(char* path) { return simple("CWD", path, 250, "CWD failed"); }
+    public bool cdup() { return simple("CDUP", null, 250, "CDUP failed"); }
+    public bool mkd(char* path) { return simple("MKD", path, 257, "MKD failed"); }
+    public bool rmd(char* path) { return simple("RMD", path, 250, "RMD failed"); }
+    public bool dele(char* path) { return simple("DELE", path, 250, "DELE failed"); }
+    public bool noop() { return simple("NOOP", null, 200, "NOOP failed"); }
+    public bool site(char* args) { return simple("SITE", args, 200, "SITE failed"); }
+
+    // RNFR then RNTO
+    public bool rename(char* from, char* to) {
+        if (!simple("RNFR", from, 350, "RNFR failed")) return false;
+        return simple("RNTO", to, 250, "RNTO failed");
+    }
+
+    // the current directory (a heap string) or null: "257 "/pub" is the current directory" (a doubled quote in the name is one quote)
+    public char* pwd() {
+        int c = command("PWD");
+        if (c < 0) return null;
+        if (c != 257) { replyFail("PWD failed"); return null; }
+        char* t = reply.text();
+        int n = strlen(t);
+        if (n < 2 || t[0] != '"') { fail("a PWD reply without a quoted path"); return null; }
+        char* r = malloc(n + 1);
+        int k = 0;
+        int i = 1;
+        while (i < n) {
+            if (t[i] == '"') {
+                if (i + 1 < n && t[i + 1] == '"') { r[k] = '"'; k++; i = i + 2; continue; }
+                break;
+            }
+            r[k] = t[i];
+            k++;
+            i++;
+        }
+        r[k] = 0;
+        return r;
+    }
+
+    // the size of a file in bytes, -1 when the server does not know it
+    public int size(char* path) {
+        if (!simple("SIZE", path, 213, "SIZE failed")) return -1;
+        char* t = reply.text();
+        int v = 0;
+        int digs = 0;
+        for (int i = 0; t[i] >= '0' && t[i] <= '9'; i++) { v = v * 10 + (t[i] - '0'); digs++; if (digs > 15) return -1; }
+        return digs > 0 ? v : -1;
+    }
+
+    // the modification time of a file (seconds since 1970, UTC), -1 when unknown ("213 20261113143000")
+    public int mdtm(char* path) {
+        if (!simple("MDTM", path, 213, "MDTM failed")) return -1;
+        char* t = reply.text();
+        if (strlen(t) < 14 || !allDigits(t, 14)) return -1;
+        return datetime.toUnix(toInt(t, 4), toInt(&t[4], 2), toInt(&t[6], 2), toInt(&t[8], 2), toInt(&t[10], 2), toInt(&t[12], 2));
+    }
+
+    // announces an offset for the next RETR or STOR (REST); false when the server does not take it
+    public bool rest(int offset) {
+        char cmd[40];
+        format(&cmd[0], 40, "REST %d", offset, 0, 0, 0, 0, 0);
+        int c = command(&cmd[0]);
+        if (c < 0) return false;
+        if (c != 350) return replyFail("REST refused");
+        restart = offset;
+        return true;
+    }
+
+    // ---- data connections -------------------------------------------------------------------------------------------------------------------------
+    public int activeListener;
+    private bool activePending;
+
+    // makes the data connection ready: passive: connected now (returns the link); active: the listener is open and the server knows where to connect (the link
+    // comes from acceptData after the transfer command). null when it fails (error says why).
+    private netio.Link* openData() {
+        activePending = false;
+        if (opt->passive) {
+            int dport = -1;
+            if (opt->useEpsv && !epsvBroken) {
+                int c = command("EPSV");
+                if (c < 0) return null;
+                if (c == 229) dport = parseEpsv(reply.text());
+                else if (c == 500 || c == 501 || c == 502 || c == 522 || c == 504) epsvBroken = true;
+                else { replyFail("EPSV failed"); return null; }
+                if (c == 229 && dport < 0) { fail("a reply to EPSV that cannot be read"); return null; }
+            }
+            if (dport < 0) {
+                int c = command("PASV");
+                if (c < 0) return null;
+                if (c != 227) { replyFail("PASV failed"); return null; }
+                dport = parsePasv(reply.text(), null);
+                if (dport < 0) { fail("a reply to PASV that cannot be read"); return null; }
+            }
+            netio.Link* l = netio.newLink();
+            if (l == null) { fail("out of memory"); return null; }
+            if (!l->open(host, dport, opt->connectTimeoutMs, dataProtected, opt->verify)) {
+                char* why = l->error != null ? l->error : "cannot open the data connection";
+                l->dispose();
+                fail(why);
+                return null;
+            }
+            return l;
+        }
+        // active: a listener on the local address of the control connection
+        int lip = net.localIp(conn->link->fd);
+        char ipText[24];
+        format(&ipText[0], 24, "%d.%d.%d.%d", (lip >> 24) & 255, (lip >> 16) & 255, (lip >> 8) & 255, lip & 255, 0, 0);
+        char* announce = opt->activeAddress != null ? opt->activeAddress : &ipText[0];
+        activeListener = net.listenOn(&ipText[0], 0, 1);
+        if (activeListener < 0) { fail("cannot listen for the data connection"); return null; }
+        int lport = net.localPort(activeListener);
+        char cmd[100];
+        int c = 0;
+        bool done = false;
+        if (opt->useEprt && !eprtBroken) {
+            format(&cmd[0], 100, "EPRT |1|%s|%d|", announce, lport, 0, 0, 0);
+            c = command(&cmd[0]);
+            if (c < 0) { net.close(activeListener); activeListener = -1; return null; }
+            if (c == 200) done = true;
+            else if (c == 500 || c == 501 || c == 502 || c == 522 || c == 504) eprtBroken = true;
+            else { net.close(activeListener); activeListener = -1; replyFail("EPRT failed"); return null; }
+        }
+        if (!done) {
+            int a0 = 0; int a1 = 0; int a2 = 0; int a3 = 0;
+            // the announced address as numbers (the text may have been overridden)
+            int ai = net.parseIp(announce);
+            a0 = (ai >> 24) & 255; a1 = (ai >> 16) & 255; a2 = (ai >> 8) & 255; a3 = ai & 255;
+            format(&cmd[0], 100, "PORT %d,%d,%d,%d,%d,%d", a0, a1, a2, a3, lport / 256, lport % 256);
+            c = command(&cmd[0]);
+            if (c < 0) { net.close(activeListener); activeListener = -1; return null; }
+            if (c != 200) { net.close(activeListener); activeListener = -1; replyFail("PORT failed"); return null; }
+        }
+        activePending = true;
+        return null;
+    }
+
+    // active mode: waits for the server to connect (only the address of the server is accepted) and makes the link
+    private netio.Link* acceptData() {
+        int t0 = millis();
+        netio.Link* l = null;
+        while (millis() - t0 < opt->dataTimeoutMs) {
+            if (!net.waitReadable(activeListener, 100)) continue;
+            int s = net.acceptSome(activeListener);
+            if (s < 0) continue;
+            int pip = 0;
+            net.peer(s, &pip, null);
+            if (pip != peerIp) { net.rawClose(s); continue; }        // not the server: a connection of someone else is dropped
+            l = netio.newLink();
+            if (l == null) { net.rawClose(s); break; }
+            if (!l->adopt(s, dataProtected ? 1 : 0, host, opt->verify, null, opt->connectTimeoutMs)) { char* why = l->error; l->dispose(); fail(why != null ? why : "data connection"); l = null; break; }
+            if (dataProtected && !l->finish(opt->connectTimeoutMs)) { char* why = l->error; l->dispose(); fail(why != null ? why : "TLS on the data connection failed"); l = null; }
+            break;
+        }
+        net.close(activeListener);
+        activeListener = -1;
+        activePending = false;
+        if (l == null && lastErr[0] == 0) fail("the server did not connect for the data");
+        return l;
+    }
+
+    private void closeActive() {
+        if (activeListener > 0) { net.close(activeListener); }
+        activeListener = -1;
+        activePending = false;
+    }
+
+    // Starts a transfer: the data connection, the command (with REST when an offset is set), the preliminary reply. Returns the open data link, or null (error says why).
+    private netio.Link* startTransfer(char* verb, char* path, int offset) {
+        if (!isOpen()) { error = "not connected"; return null; }
+        if (path != null && !netline.isLineSafe(path)) { fail("a path must not contain CR, LF or NUL"); return null; }
+        if (path != null && strlen(path) > 1000) { fail("the path is too long"); return null; }
+        lastErr[0] = 0;
+        restart = 0;
+        netio.Link* l = openData();
+        if (l == null && !activePending) return null;
+        if (offset > 0) {
+            if (!rest(offset)) { if (l != null) l->dispose(); closeActive(); return null; }
+        }
+        char cmd[1100];
+        if (path != null && path[0] != 0) format(&cmd[0], 1100, "%s %s", verb, path, 0, 0, 0, 0);
+        else format(&cmd[0], 1100, "%s", verb, 0, 0, 0, 0, 0);
+        int c = command(&cmd[0]);
+        if (c < 0) { if (l != null) l->dispose(); closeActive(); return null; }
+        if (c / 100 != 1) {
+            if (l != null) l->dispose();
+            closeActive();
+            replyFail("the transfer was refused");
+            return null;
+        }
+        if (activePending) {
+            l = acceptData();
+            if (l == null) { readReply(); return null; }
+        }
+        return l;
+    }
+
+    // after the data link is closed: the final reply of the transfer
+    private bool finishTransfer(bool dataOk) {
+        int c = readReply();
+        if (c < 0) return false;
+        if (!dataOk) {
+            if (error == null || error[0] == 0) error = "the transfer failed";
+            return false;
+        }
+        if (c / 100 != 2) return replyFail("the transfer failed");
+        return true;
+    }
+
+    // Receives a transfer into the callback: cb(user, data, n) returns 0 to go on, < 0 to stop (the transfer is aborted: the data connection is closed). path may be "" for a listing command
+    // without an argument. Returns true when the server confirmed the transfer (226).
+    private bool receive(char* verb, char* path, int offset, func cb, char* user, bool text) {
+        netio.Link* l = startTransfer(verb, path, offset);
+        if (l == null) return false;
+        char* buf = malloc(16384);
+        if (buf == null) { l->dispose(); fail("out of memory"); breakConn(); return false; }
+        bool ok = true;
+        bool pendingCr = false;
+        char* conv = text ? malloc(16400) : null;
+        int t0 = millis();
+        for (;;) {
+            int n = l->recv(buf, 16384);
+            if (n == -2) {
+                if (!l->waitReadable(100) && millis() - t0 > opt->dataTimeoutMs) { error = "the data connection was silent for too long"; ok = false; break; }
+                continue;
+            }
+            if (n < 0) { error = "the data connection failed"; ok = false; break; }
+            if (n == 0) break;
+            t0 = millis();
+            char* p = buf;
+            int pn = n;
+            if (text) {
+                // CRLF -> LF (a CR that ends a block is held back until the next byte is known)
+                int o = 0;
+                for (int i = 0; i < n; i++) {
+                    int ch = buf[i] & 255;
+                    if (pendingCr) {
+                        pendingCr = false;
+                        if (ch != 10) { conv[o] = 13; o++; }
+                    }
+                    if (ch == 13) { pendingCr = true; continue; }
+                    conv[o] = ch;
+                    o++;
+                }
+                p = conv;
+                pn = o;
+            }
+            if (pn > 0 && cb(user, p, pn) < 0) { error = "the transfer was stopped"; ok = false; break; }
+        }
+        if (ok && text && pendingCr) { char cr = 13; cb(user, &cr, 1); }
+        free(buf);
+        if (conv != null) free(conv);
+        l->dispose();
+        if (!ok) {
+            // the server is told by the closed connection; its reply (426) is read to keep the control connection in step
+            readReply();
+            return false;
+        }
+        return finishTransfer(true);
+    }
+
+    // ---- listings ----------------------------------------------------------------------------------------------------------------------------------
+    private netio.Queue* sinkQ;
+    private int sinkMax;
+    private bool sinkFull;
+
+    // collects data into a Queue (limit: sinkMax)
+    public int collect(char* data, int n) {
+        if (sinkMax > 0 && sinkQ->pending() + n > sinkMax) { sinkFull = true; return -1; }
+        return sinkQ->add(data, n) ? 0 : -1;
+    }
+
+    // the raw text of a listing command (LIST, NLST, MLSD) into out (limit opt->maxList): true when the transfer was completed
+    public bool listRaw(char* verb, char* path, netio.Queue* out) {
+        sinkQ = out;
+        sinkMax = opt->maxList;
+        sinkFull = false;
+        bool ok = receive(verb, path, 0, collectCb, (char*) this, false);
+        if (sinkFull) { error = "the listing is longer than the limit"; setErr(error); }
+        return ok;
+    }
+
+    // the raw text of LIST for a path ("" for the current directory)
+    public bool list(char* path, netio.Queue* out) { return listRaw("LIST", path, out); }
+
+    // the names (NLST) as a heap string, one per line (LF); null on failure
+    public char* nlst(char* path) {
+        netio.Queue q;
+        q.max = opt->maxList;
+        if (!listRaw("NLST", path, &q)) { q.release(); return null; }
+        q.reserve(1);
+        char* t = q.data();
+        int n = q.pending();
+        char* r = malloc(n + 1);
+        memcpy(r, t, n);
+        r[n] = 0;
+        q.release();
+        return r;
+    }
+
+    // The entries of a directory: MLSD when the server offered MLST in FEAT, else LIST. null on failure. A list that is yours (dispose it).
+    public EntryList* listEntries(char* path) {
+        netio.Queue q;
+        bool mlsd = hasMlsd;
+        bool ok = listRaw(mlsd ? "MLSD" : "LIST", path, &q);
+        if (!ok && mlsd && code >= 500 && code < 600) {
+            q.release();
+            mlsd = false;
+            ok = listRaw("LIST", path, &q);
+        }
+        if (!ok) { q.release(); return null; }
+        EntryList* l = newEntryList();
+        if (l == null) { q.release(); return null; }
+        parseListing(q.data(), q.pending(), mlsd, l, opt->now);
+        q.release();
+        return l;
+    }
+
+    // ---- downloads ---------------------------------------------------------------------------------------------------------------------------------
+    // Receives a file into the callback cb(user, data, n) (< 0 stops it), starting at offset (REST). In TYPE A the line ends are converted to LF.
+    public bool retrieveWith(char* path, int offset, func cb, char* user) {
+        return receive("RETR", path, offset, cb, user, !binary);
+    }
+
+    private netio.Queue* memQ;
+    private int memMax;
+    private bool memFull;
+
+    public int memSink(char* data, int n) {
+        if (memQ->pending() + n > memMax) { memFull = true; return -1; }
+        return memQ->add(data, n) ? 0 : -1;
+    }
+
+    // A file into memory: a heap buffer with a 0 byte behind the data, its length in *len; null on failure. At most maxBytes (more: failure, "the file is bigger than the limit").
+    public char* retrieveAll(char* path, int* len, int maxBytes) {
+        netio.Queue q;
+        memQ = &q;
+        memMax = maxBytes;
+        memFull = false;
+        bool ok = receive("RETR", path, 0, memCb, (char*) this, !binary);
+        if (memFull) { fail("the file is bigger than the limit"); ok = false; }
+        if (!ok) { q.release(); return null; }
+        int n = q.pending();
+        char* r = malloc(n + 1);
+        if (r == null) { q.release(); fail("out of memory"); return null; }
+        if (n > 0) memcpy(r, q.data(), n);
+        r[n] = 0;
+        q.release();
+        if (len != null) *len = n;
+        return r;
+    }
+
+    private int fileFd;
+
+    public int fileSink(char* data, int n) {
+        return asys.fileWrite(fileFd, data, n) == n ? 0 : -1;
+    }
+
+    // Downloads a file to a local path. resume: the local file is continued from its size (REST); else it is replaced. false on failure (the part that came stays).
+    public bool download(char* remote, char* localPath, bool resume) {
+        int offset = 0;
+        int flags = asys.F_WRITE | asys.F_CREATE | asys.F_TRUNC;
+        if (resume) {
+            asys.Stat st;
+            if (asys.stat(localPath, &st) >= 0 && st.isFile()) { offset = st.size; flags = asys.F_WRITE | asys.F_CREATE | asys.F_APPEND; }
+        }
+        fileFd = asys.fileOpen(localPath, flags, 420);
+        if (fileFd < 0) return fail("cannot open the local file");
+        bool ok = receive("RETR", remote, offset, fileCb, (char*) this, !binary);
+        asys.fileClose(fileFd);
+        fileFd = -1;
+        return ok;
+    }
+
+    // ---- uploads ----------------------------------------------------------------------------------------------------------------------------------
+    // Sends data produced by readCb(user, buf, max) (the bytes put in buf, 0 at the end, < 0 an error) with STOR (append: APPE), after REST offset when offset > 0. In TYPE A the LF line ends become CRLF.
+    public bool storeWith(char* path, int offset, bool append, func readCb, char* user) {
+        netio.Link* l = startTransfer(append ? "APPE" : "STOR", path, append ? 0 : offset);
+        if (l == null) return false;
+        char* buf = malloc(16384);
+        char* out = malloc(16384 * 2 + 8);
+        if (buf == null || out == null) { l->dispose(); if (buf != null) free(buf); if (out != null) free(out); fail("out of memory"); breakConn(); return false; }
+        bool ok = true;
+        bool text = !binary;
+        bool lastCr = false;
+        for (;;) {
+            int n = readCb(user, buf, 16384);
+            if (n < 0) { error = "reading the data failed"; ok = false; break; }
+            if (n == 0) break;
+            char* p = buf;
+            int pn = n;
+            if (text) {
+                int o = 0;
+                for (int i = 0; i < n; i++) {
+                    int ch = buf[i] & 255;
+                    if (ch == 10 && !lastCr) { out[o] = 13; o++; }
+                    out[o] = ch;
+                    o++;
+                    lastCr = ch == 13;
+                }
+                p = out;
+                pn = o;
+            }
+            int off = 0;
+            int t0 = millis();
+            while (off < pn) {
+                int w = l->send(&p[off], pn - off);
+                if (w < 0) { error = "the data connection failed"; ok = false; break; }
+                if (w == 0) {
+                    net.waitWritable(l->fd, 100);
+                    if (millis() - t0 > opt->dataTimeoutMs) { error = "the data connection was silent for too long"; ok = false; break; }
+                    continue;
+                }
+                off = off + w;
+                t0 = millis();
+            }
+            if (!ok) break;
+        }
+        free(buf);
+        free(out);
+        if (ok) {
+            // the TLS backlog is sent before the connection is closed
+            int t0 = millis();
+            while (l->hasBacklog() && millis() - t0 < opt->dataTimeoutMs) { l->flush(); net.waitWritable(l->fd, 50); }
+        }
+        l->dispose();
+        if (!ok) { readReply(); return false; }
+        return finishTransfer(true);
+    }
+
+    private char* memSrc;
+    private int memSrcLen;
+    private int memSrcPos;
+
+    public int memSource(char* buf, int max) {
+        int n = memSrcLen - memSrcPos;
+        if (n > max) n = max;
+        if (n > 0) { memcpy(buf, &memSrc[memSrcPos], n); memSrcPos = memSrcPos + n; }
+        return n;
+    }
+
+    // stores n bytes as a file (replacing it); store at an offset with storeAt, append with append
+    public bool store(char* path, char* data, int n) { return storeAt(path, data, n, 0, false); }
+    public bool append(char* path, char* data, int n) { return storeAt(path, data, n, 0, true); }
+    public bool storeAt(char* path, char* data, int n, int offset, bool isAppend) {
+        memSrc = data;
+        memSrcLen = n;
+        memSrcPos = 0;
+        return storeWith(path, offset, isAppend, memSourceCb, (char*) this);
+    }
+
+    private int upFd;
+
+    public int fileSource(char* buf, int max) {
+        int n = asys.fileRead(upFd, buf, max);
+        return n;
+    }
+
+    // Uploads a local file. resume: the size of the file on the server (SIZE) is the offset to continue from (REST); the local file must be at least that long.
+    public bool upload(char* localPath, char* remote, bool resume) {
+        upFd = asys.fileOpen(localPath, asys.F_READ, 0);
+        if (upFd < 0) return fail("cannot open the local file");
+        int offset = 0;
+        if (resume) {
+            int sz = size(remote);
+            if (sz > 0) {
+                offset = sz;
+                asys.Stat st;
+                if (asys.fstat(upFd, &st) < 0 || st.size < sz) { asys.fileClose(upFd); return fail("the local file is shorter than the file on the server"); }
+                asys.fileSeek(upFd, sz, 0);
+            }
+        }
+        bool ok = storeWith(remote, offset, false, fileSourceCb, (char*) this);
+        asys.fileClose(upFd);
+        upFd = -1;
+        return ok;
+    }
+
+    // ---- the end -----------------------------------------------------------------------------------------------------------------------------------
+    public void quit() {
+        if (isOpen()) command("QUIT");
+        broken = true;
+        if (conn != null) conn->close();
+    }
+
+    public void dispose() {
+        closeActive();
+        if (conn != null) { conn->dispose(); conn = null; }
+        reply.release();
+        if (host != null) free(host);
+        if (ownsCreds && opt != null) {
+            if (opt->username != null) free(opt->username);
+            if (opt->password != null) free(opt->password);
+        }
+        if (ownsOpt && opt != null) free((char*) opt);
+        if (heap) { heap = false; free((char*) this); }
+    }
+
+    public void setHost(char* h, int p) {
+        if (host != null) free(host);
+        host = copyText(h);
+        port = p;
+    }
+
+    public void setOwns(bool options, bool creds) {
+        ownsOpt = options;
+        ownsCreds = creds;
+    }
+}
+
+// callbacks of the transfers (a function pointer cannot be a method: the client object travels as `user`)
+private int collectCb(char* user, char* data, int n) {
+    Client* c = (Client*) user;
+    return c->collect(data, n);
+}
+
+private int memCb(char* user, char* data, int n) {
+    Client* c = (Client*) user;
+    return c->memSink(data, n);
+}
+
+private int fileCb(char* user, char* data, int n) {
+    Client* c = (Client*) user;
+    return c->fileSink(data, n);
+}
+
+private int memSourceCb(char* user, char* buf, int max) {
+    Client* c = (Client*) user;
+    return c->memSource(buf, max);
+}
+
+private int fileSourceCb(char* user, char* buf, int max) {
+    Client* c = (Client*) user;
+    return c->fileSource(buf, max);
+}
+
+// a client for host:port (call connect()); it works on its own copy of the options (null: the defaults)
+public Client* newClient(char* host, int port, Options* options) {
+    Client* c = (Client*) malloc(sizeof(Client));
+    if (c == null) return null;
+    c->heap = true;
+    c->activeListener = -1;
+    Options* mine = (Options*) malloc(sizeof(Options));
+    if (mine == null) { free((char*) c); return null; }
+    if (options != null) memcpy((char*) mine, (char*) options, sizeof(Options)); else mine->init();
+    c->opt = mine;
+    c->setOwns(true, false);
+    c->setHost(host, port);
+    return c;
+}
+
+private int hexv(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+private char* urlDecode(char* s, int n) {
+    char* r = malloc(n + 1);
+    if (r == null) return null;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2 < n) {
+            int a = hexv(s[i + 1]);
+            int b = hexv(s[i + 2]);
+            if (a >= 0 && b >= 0) { r[k] = a * 16 + b; k++; i = i + 2; continue; }
+        }
+        r[k] = s[i];
+        k++;
+    }
+    r[k] = 0;
+    return r;
+}
+
+// Connects to "ftp://[user[:password]@]host[:port][/path]" (port 21) or "ftps://..." (TLS from the start, port 990). The path is not used (use cwd). Without a user name the login
+// is anonymous. With a password AUTH TLS is required when the server is not an implicit TLS one. null on failure: ftp.error().
+public Client* connectWith(char* url, Options* options) {
+    bool secure = false;
+    int i = 0;
+    if (startsWith(url, "ftps://")) { secure = true; i = 7; }
+    else if (startsWith(url, "ftp://")) i = 6;
+    else { setErr("the URL must start with ftp:// or ftps://"); return null; }
+    int at = -1;
+    for (int k = i; url[k] != 0 && url[k] != '/'; k++) { if (url[k] == '@') at = k; }
+    char* user = null;
+    char* pass = null;
+    if (at >= 0) {
+        int colon = -1;
+        for (int k = i; k < at; k++) { if (url[k] == ':') { colon = k; break; } }
+        int ue = colon >= 0 ? colon : at;
+        user = urlDecode(&url[i], ue - i);
+        if (colon >= 0) pass = urlDecode(&url[colon + 1], at - colon - 1);
+        i = at + 1;
+    }
+    char hostBuf[256];
+    int hl = 0;
+    while (url[i] != 0 && url[i] != ':' && url[i] != '/') {
+        if (hl >= 255) { setErr("host name too long"); return null; }
+        hostBuf[hl] = url[i];
+        hl++;
+        i++;
+    }
+    hostBuf[hl] = 0;
+    if (hl == 0) { setErr("no host in the URL"); return null; }
+    int port = 0;
+    if (url[i] == ':') {
+        i++;
+        while (isDigit(url[i])) { port = port * 10 + (url[i] - '0'); if (port > 65535) { setErr("bad port"); return null; } i++; }
+        if (port == 0) { setErr("bad port"); return null; }
+    }
+    if (port == 0) port = secure ? 990 : 21;
+    Client* c = newClient(&hostBuf[0], port, options);
+    if (c == null) { setErr("out of memory"); return null; }
+    if (secure) c->opt->useTls = true;
+    if (user != null) {
+        c->opt->username = user;
+        c->opt->password = pass == null ? copyText("") : pass;
+        c->setOwns(true, true);
+        if (!secure) c->opt->requireTlsForLogin = pass != null;
+    }
+    if (!c->connect()) {
+        setErr(c->error != null ? c->error : "cannot connect");
+        c->dispose();
+        return null;
+    }
+    return c;
+}
+
+public Client* connect(char* url) { return connectWith(url, null); }

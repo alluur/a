@@ -1,0 +1,1516 @@
+// =============================================================================
+//  ftpd - a small FTP server for tests and for AOS (RFC 959, 2428, 3659, 2228 / 4217 for TLS, 2640 for UTF-8, 2577 for the security)          import ftpd;
+//
+//    ftpd.Server* s = ftpd.newServer();
+//    s->addUser("ann", "secret", "/srv/ftp/ann", ftpd.P_ALL);                          // a user, her directory (the jail), what she may do
+//    s->addAnonymous("/srv/ftp/pub", ftpd.P_READ | ftpd.P_LIST);                       // "anonymous" and "ftp", any password; read only
+//    s->tlsConfig = tls.loadConfig(certPem, keyPem);                                    // AUTH TLS, PBSZ, PROT P; s->requireTls = true refuses logins without it
+//    if (!s->listen(2121)) { ... }                                                      // port 0 picks a free one (s->port); s->listenTls(990, cfg) is TLS from the start
+//    s->run();                                                                          // or for (;;) { s->poll(50); ... }
+//
+//  One thread serves every control and data connection (netsrv with the data sockets in the same poll set): no blocking call, a transfer does not hold up the others.
+//
+//  THE JAIL. Every path is first normalised as a virtual path ("/a/b"; "." and ".." are resolved and ".." at the root stays at the root, as in a chroot; a name must be a valid
+//  file name: no backslash, no control character, at most 255 bytes (55 on AOS)) and then looked up below the user's directory component by component with lstat: **a symbolic
+//  link anywhere on the way ends the lookup** (the file does not exist as far as the client can tell), so a link cannot lead out of the jail, and symbolic links are hidden from listings.
+//  A path that the client sends is never decoded (no %2e): what is sent is what is looked at. Remaining weakness: a race between the check and the use (someone else who can write to
+//  the directory replaces a directory by a link in between); the server is for directories that nobody else changes.
+//
+//  No bounce. PORT and EPRT are only accepted for the address of the client itself (RFC 2577) and for ports from activePortMin (1024) up; `allowActive = false` turns active mode off.
+//  A passive data connection must come from the address of the control connection (another one is closed on the spot), the passive listener closes with the first connection or after
+//  dataTimeoutMs, and a session has at most one data connection or listener (a new PASV closes the old one).
+//
+//  Permissions per user: P_READ (RETR, SIZE, MDTM), P_LIST (LIST, NLST, MLSD, MLST, CWD), P_WRITE (STOR, APPE, MKD), P_DELETE (DELE, RMD), P_RENAME (RNFR / RNTO), P_ALL.
+//  Limits (settable): maxSessions (200), maxPerIp (0: none), idleTimeoutMs (control, 300000; not while a transfer runs), dataTimeoutMs (30000: waiting for a data connection, and no
+//  byte moving), maxLoginFailures (3: 421), maxLine (4096), maxList (4 MiB of listing), maxUpload (bytes of one upload, 0: none), activePortMin, pasvMin / pasvMax (the range of passive ports, 0: any).
+//  TYPE A converts line ends (LF on disk, CRLF on the wire). REST works for RETR and STOR. Not supported: STOU, ACCT, SMNT, REIN, SITE, wildcards in LIST, IPv6, TLS session reuse
+//  as a requirement of the client.
+// =============================================================================
+import netline;
+import netsrv;
+import netio;
+import net;
+import tls;
+import asys;
+import datetime;
+import cstdlib;
+import cstring;
+module ftpd;
+
+public const P_READ = 1;
+public const P_LIST = 2;
+public const P_WRITE = 4;
+public const P_DELETE = 8;
+public const P_RENAME = 16;
+public const P_ALL = 31;
+
+public const MAX_USERS = 32;
+
+const DS_NONE = 0;
+const DS_LISTEN = 1;                // passive: the listener waits for the client
+const DS_ACTIVE = 2;                // active: PORT / EPRT was given, nothing connected yet
+const DS_CONNECTING = 3;            // active: the connect to the client is on its way
+const DS_HANDSHAKE = 4;             // TLS handshake of the data connection
+const DS_READY = 5;                 // the data connection is there, no transfer yet
+const DS_BUSY = 6;
+
+const OP_NONE = 0;
+const OP_RETR = 1;
+const OP_STOR = 2;
+const OP_APPE = 3;
+const OP_LIST = 4;                  // the text is in the buffer
+
+
+const EV_READ = 1;
+const EV_WRITE = 4;
+
+private void nClose(int fd) { net.close(fd); }
+private void nRawClose(int fd) { net.rawClose(fd); }
+private int nListenOn(char* ip, int port) { return net.listenOn(ip, port, 1); }
+private void nSetNonBlocking(int fd) { net.setNonBlocking(fd, true); }
+private int nAcceptSome(int fd) { return net.acceptSome(fd); }
+private int nPeerIp(int fd) { int ip = 0; net.peer(fd, &ip, null); return ip; }
+private int nParseIp(char* t) { return net.parseIp(t); }
+private int nLocalIp(int fd) { return net.localIp(fd); }
+private int nLocalPort(int fd) { return net.localPort(fd); }
+private int nConnectStart(char* ip, int port) { return net.connectStart(ip, port); }
+private int nConnectDone(int fd) { return net.connectDone(fd); }
+
+private class Account {
+    public char* name;
+    public char* pass;
+    public char* root;
+    public int perms;
+    public bool anonymous;
+}
+
+public class Session {
+    public int id;
+    public netsrv.Conn* conn;
+    public netline.Lines lines;
+    public char* userName;
+    public Account* acct;
+    public bool loggedIn;
+    public int failures;
+    public char* cwd;
+    public char* rnfr;                  // a virtual path
+    public bool binary;
+    public int restOffset;
+    public bool restArmed;
+    public bool epsvAll;
+    public bool tlsOn;
+    public bool pbsz;
+    public bool protP;
+    public bool wantTls;
+    public bool closeAfter;
+    public int lastCmd;                 // when the last command came
+    // data
+    public int dstate;
+    public int listenFd;
+    public int connFd;
+    public int connAt;
+    public netio.Link* link;
+    public int activeIp;
+    public int activePort;
+    public int dataSince;               // when the state began (a wait is limited by dataTimeoutMs)
+    public int lastMove;                // the last time a byte moved
+    public int op;
+    public bool opPending;              // the command is waiting for the data connection
+    public int fd;                      // the file of the transfer
+    public int fileSize;
+    public int offsetNow;
+    public int moved;
+    public bool atEof;
+    public bool lastCr;
+    public int flushed;
+    public netio.Queue buf;
+    public bool watching;
+    public int watchedFd;
+}
+
+private char* copyText(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+// ---- paths ----------------------------------------------------------------------------------------------------------------------------------------
+// Makes a virtual path of `path` (relative to the virtual directory cwd unless it starts with "/"): "/a/b", never with a trailing slash, "/" for the root. "." parts and empty
+// parts go, ".." goes up and stays at the root. Every other part must be a valid file name (asys.validName: not "", no "/" or "\", no control characters, at most 255 bytes (55 on AOS)).
+// Writes into out (max bytes); returns the length, or -1 when the path is not acceptable (a bad name, too long).
+public int normalizePath(char* cwd, char* path, char* out, int max) {
+    int n = 0;
+    out[0] = 0;
+    if (path[0] != '/') {
+        // start from the current directory (it is normalised already)
+        int cl = strlen(cwd);
+        if (cl >= max) return -1;
+        memcpy(out, cwd, cl);
+        n = cl;
+        if (n == 1) n = 0;                                      // "/" : nothing to append to
+    }
+    int i = 0;
+    while (path[i] != 0) {
+        while (path[i] == '/') i++;
+        int a = i;
+        while (path[i] != 0 && path[i] != '/') i++;
+        int l = i - a;
+        if (l == 0) continue;
+        if (l == 1 && path[a] == '.') continue;
+        if (l == 2 && path[a] == '.' && path[a + 1] == '.') {
+            while (n > 0 && out[n - 1] != '/') n--;
+            if (n > 0) n--;
+            continue;
+        }
+        char comp[300];
+        if (l > 255) return -1;
+        memcpy(&comp[0], &path[a], l);
+        comp[l] = 0;
+        if (!asys.validName(&comp[0])) return -1;
+        bool dots = true;
+        for (int k = 0; k < l; k++) {
+            if (comp[k] != '.') dots = false;
+            if (comp[k] == ':' && asys.isWindows()) return -1;          // a drive or a stream name on Windows
+        }
+        if (dots) return -1;                                          // "...": Windows reads it as something else
+        if (n + 1 + l >= max) return -1;
+        out[n] = '/';
+        memcpy(&out[n + 1], &comp[0], l);
+        n = n + 1 + l;
+    }
+    if (n == 0) { out[0] = '/'; out[1] = 0; return 1; }
+    out[n] = 0;
+    return n;
+}
+
+// the path on the disk for a virtual path below root: walks the parts with lstat. Returns 0 when the whole path exists (a file or a directory), 1 when only the last part is
+// missing (the parent directory exists), -1 for anything else: a part that is missing in the middle, a symbolic link on the way (also as the last part), a path that is too long.
+// *isDir tells what an existing path is.
+public int resolve(char* root, char* vpath, char* real, int max, bool* isDir) {
+    int rl = strlen(root);
+    if (rl >= max - 2) return -1;
+    memcpy(real, root, rl);
+    int n = rl;
+    while (n > 1 && real[n - 1] == '/') n--;
+    real[n] = 0;
+    *isDir = true;
+    int i = 0;
+    int vl = strlen(vpath);
+    while (i < vl) {
+        while (i < vl && vpath[i] == '/') i++;
+        int a = i;
+        while (i < vl && vpath[i] != '/') i++;
+        int l = i - a;
+        if (l == 0) break;
+        if (n + 1 + l >= max) return -1;
+        real[n] = '/';
+        memcpy(&real[n + 1], &vpath[a], l);
+        n = n + 1 + l;
+        real[n] = 0;
+        asys.Stat st;
+        int r = asys.lstat(real, &st);
+        if (r < 0) {
+            // missing: only fine for the last part
+            int j = i;
+            while (j < vl && vpath[j] == '/') j++;
+            if (j < vl) return -1;
+            return 1;
+        }
+        if (st.isLink()) return -1;
+        *isDir = st.isDir();
+        if (!st.isDir() && !st.isFile()) return -1;
+        int j = i;
+        while (j < vl && vpath[j] == '/') j++;
+        if (j < vl && !st.isDir()) return -1;
+    }
+    return 0;
+}
+
+// ---- listing lines -------------------------------------------------------------------------------------------------------------------------------
+private char* monthName(int m) {
+    char* names = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    return &names[(m - 1) * 3];
+}
+
+// "-rw-r--r--   1 ftp      ftp          1234 Nov 13 14:30 name" and CRLF (for the names that are fit to be shown)
+private void lsLine(netio.Queue* q, char* name, asys.Stat* st, int now) {
+    char line[700];
+    datetime.DateTime d(st->mtime);
+    char t = st->isDir() ? 'd' : '-';
+    int mode = st->mode & 511;
+    if (mode == 0) mode = st->isDir() ? 493 : 420;
+    char perm[12];
+    for (int k = 0; k < 9; k++) perm[k] = ((mode >> (8 - k)) & 1) != 0 ? "rwxrwxrwx"[k] : '-';
+    perm[9] = 0;
+    char date[24];
+    char mon[4];
+    memcpy(&mon[0], monthName(d.month), 3);
+    mon[3] = 0;
+    if (now - st->mtime < 15552000 && st->mtime <= now + 86400) format(&date[0], 24, "%s %2d %02d:%02d", &mon[0], d.day, d.hour, d.minute, 0, 0);
+    else format(&date[0], 24, "%s %2d  %04d", &mon[0], d.day, d.year, 0, 0, 0);
+    int n = format(&line[0], 700, "%c%s %3d ftp      ftp      %12d %s ", t, &perm[0], 1, st->isDir() ? 4096 : st->size, &date[0], 0);
+    q->add(&line[0], n);
+    q->addText(name);
+    q->add("\r\n", 2);
+}
+
+// "type=file;size=12;modify=20261113143000;perm=adfr; name" CRLF
+private void mlsdLine(netio.Queue* q, char* name, asys.Stat* st, int perms, char* typeOverride) {
+    char line[200];
+    datetime.DateTime d(st->mtime);
+    char permText[16];
+    int k = 0;
+    if (st->isDir()) {
+        if ((perms & P_WRITE) != 0) { permText[k] = 'c'; k++; permText[k] = 'm'; k++; permText[k] = 'p'; k++; }
+        if ((perms & P_DELETE) != 0) { permText[k] = 'd'; k++; }
+        if ((perms & P_RENAME) != 0) { permText[k] = 'f'; k++; }
+        if ((perms & P_LIST) != 0) { permText[k] = 'e'; k++; permText[k] = 'l'; k++; }
+    } else {
+        if ((perms & P_WRITE) != 0) { permText[k] = 'a'; k++; permText[k] = 'w'; k++; }
+        if ((perms & P_DELETE) != 0) { permText[k] = 'd'; k++; }
+        if ((perms & P_RENAME) != 0) { permText[k] = 'f'; k++; }
+        if ((perms & P_READ) != 0) { permText[k] = 'r'; k++; }
+    }
+    permText[k] = 0;
+    char* type = typeOverride != null ? typeOverride : (st->isDir() ? "dir" : "file");
+    char when[24];
+    format(&when[0], 24, "%04d%02d%02d%02d%02d%02d", d.year, d.month, d.day, d.hour, d.minute, d.second);
+    int n = format(&line[0], 200, "type=%s;size=%d;modify=%s;perm=%s; ", type, st->isDir() ? 0 : st->size, &when[0], &permText[0], 0, 0);
+    q->add(&line[0], n);
+    q->addText(name);
+    q->add("\r\n", 2);
+}
+
+// a name that may be shown in a listing: no control characters (a line break would forge a line)
+private bool showable(char* name) {
+    for (int i = 0; name[i] != 0; i++) {
+        if ((name[i] & 255) < 32 || name[i] == 127) return false;
+    }
+    return true;
+}
+
+// ---- the server --------------------------------------------------------------------------------------------------------------------------------------
+public class Server {
+    public netsrv.Server* net;
+    public int port;
+    public char* hostname;
+    public char* banner;                // the text of the 220 greeting
+    public tls.Config* tlsConfig;
+    public bool requireTls;             // no USER / PASS before AUTH TLS (or on a TLS port)
+    public bool requireDataTls;         // transfers only after PROT P
+    public bool allowActive;
+    public int activePortMin;
+    public int pasvMin;
+    public int pasvMax;
+    public char* pasvAddress;           // the address to announce for PASV (behind NAT); default: the local address of the control connection
+    public int maxLoginFailures;
+    public int maxLine;
+    public int maxList;
+    public int maxUpload;
+    public int idleTimeoutMs;
+    public int dataTimeoutMs;
+    public int fakeNow;                 // tests: a fixed clock (unix seconds) for the dates in listings
+    public int sessions;
+    public int transfers;               // transfers completed
+    public int logins;
+    public int loginFailures;
+    public int rejected;                // commands refused by the jail or by a permission
+
+    private Account* accounts[32];
+    private int naccounts;
+    private Session* slist[400];
+    private int nslist;
+    private int nextId;
+    private char* chunk;
+
+    public Server() {
+        hostname = "ftpd";
+        banner = "FTP server ready.";
+        allowActive = true;
+        activePortMin = 1024;
+        maxLoginFailures = 3;
+        maxLine = 4096;
+        maxList = 4194304;
+        idleTimeoutMs = 300000;
+        dataTimeoutMs = 30000;
+        nextId = 1;
+        net = new netsrv.Server();
+        net->user = (char*) this;
+        net->onOpen = ftpOpen;
+        net->onData = ftpData;
+        net->onClose = ftpClose;
+        net->onTick = ftpTick;
+        net->onWatch = ftpWatch;
+        net->maxConns = 200;
+        net->idleTimeoutMs = 0;
+        net->handshakeTimeoutMs = 10000;
+    }
+
+    public bool addUser(char* name, char* pass, char* root, int perms) {
+        if (naccounts >= MAX_USERS || name == null || pass == null || root == null) return false;
+        Account* a = (Account*) malloc(sizeof(Account));
+        if (a == null) return false;
+        a->name = copyText(name);
+        a->pass = copyText(pass);
+        a->root = copyText(root);
+        a->perms = perms;
+        accounts[naccounts] = a;
+        naccounts++;
+        return true;
+    }
+
+    // "anonymous" and "ftp": any password (an e-mail address by custom) is accepted
+    public bool addAnonymous(char* root, int perms) {
+        if (!addUser("anonymous", "", root, perms)) return false;
+        accounts[naccounts - 1]->anonymous = true;
+        return true;
+    }
+
+    public bool listen(int p) {
+        bool ok = net->listen(p);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenTls(int p, tls.Config* cfg) {
+        bool ok = net->listenTls(p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenOn(char* host, int p, tls.Config* cfg) {
+        bool ok = net->listenOn(host, p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public int poll(int ms) { return net->poll(ms); }
+    public void run() { net->run(); }
+    public void stop() { net->stop(); }
+
+    // after the switch to TLS the session starts again (RFC 4217): the login, the protection and the data connection are forgotten
+    public void tlsStarted(Session* s) {
+        s->tlsOn = true;
+        s->wantTls = false;
+        s->loggedIn = false;
+        s->acct = null;
+        s->pbsz = false;
+        s->protP = false;
+        if (s->userName != null) { free(s->userName); s->userName = null; }
+        s->lines.clear();
+        dataClose(s, true);
+    }
+
+    public void shutdown() {
+        net->shutdown();
+        for (int i = 0; i < naccounts; i++) { free(accounts[i]->name); free(accounts[i]->pass); free(accounts[i]->root); free((char*) accounts[i]); }
+        naccounts = 0;
+        if (chunk != null) { free(chunk); chunk = null; }
+    }
+
+    private int nowSec() { return fakeNow != 0 ? fakeNow : datetime.now(); }
+
+    // ---- sessions --------------------------------------------------------------------------------------------------------------------------------
+    public Session* find(int id) {
+        for (int i = 0; i < nslist; i++) {
+            if (slist[i]->id == id) return slist[i];
+        }
+        return null;
+    }
+
+    public Session* openSession(netsrv.Conn* c) {
+        if (nslist >= 400) return null;
+        Session* s = (Session*) malloc(sizeof(Session));
+        if (s == null) return null;
+        s->id = nextId;
+        nextId++;
+        s->conn = c;
+        s->lines.maxLine = maxLine;
+        s->lines.maxBuffer = maxLine * 4;
+        s->cwd = copyText("/");
+        s->binary = true;
+        s->listenFd = -1;
+        s->connFd = -1;
+        s->fd = -1;
+        s->tlsOn = c->secure;
+        s->lastCmd = millis();
+        s->buf.max = maxList;
+        slist[nslist] = s;
+        nslist++;
+        sessions++;
+        char g[300];
+        int n = format(&g[0], 300, "220 %s\r\n", banner, 0, 0, 0, 0, 0);
+        c->out.add(&g[0], n);
+        return s;
+    }
+
+    public void freeSession(Session* s) {
+        dataClose(s, true);
+        for (int i = 0; i < nslist; i++) {
+            if (slist[i] == s) { nslist--; slist[i] = slist[nslist]; slist[nslist] = null; break; }
+        }
+        if (s->userName != null) free(s->userName);
+        if (s->cwd != null) free(s->cwd);
+        if (s->rnfr != null) free(s->rnfr);
+        s->lines.release();
+        s->buf.release();
+        sessions--;
+        free((char*) s);
+    }
+
+    public void say(Session* s, int code, char* text) {
+        char line[1200];
+        int n = format(&line[0], 1200, "%d %s\r\n", code, text, 0, 0, 0, 0);
+        if (n > 1198) { n = 1198; line[1198] = 13; line[1199] = 10; }
+        s->conn->out.add(&line[0], n);
+    }
+
+    // ---- the control connection -----------------------------------------------------------------------------------------------------------------
+    public int feed(Session* s, char* bytes, int n) {
+        if (s->closeAfter) return -1;
+        if (!s->lines.feed(bytes, n)) { say(s, 421, "Input buffer overflow."); s->closeAfter = true; return -1; }
+        char* line = malloc(maxLine + 4);
+        if (line == null) { s->closeAfter = true; return -1; }
+        for (;;) {
+            if (s->closeAfter) break;
+            int k = s->lines.next(line, maxLine);
+            if (k == -1) break;
+            if (k == -2) { say(s, 500, "Command line too long."); continue; }
+            command(s, line, k);
+            if (s->wantTls) {
+                if (s->lines.pending() > 0) { s->wantTls = false; s->closeAfter = true; }
+                break;
+            }
+        }
+        free(line);
+        return s->closeAfter ? -1 : 0;
+    }
+
+    // the command line without Telnet sequences (0xFF IP, 0xFF SYNCH, 0xFF WILL / WONT / DO / DONT option); returns the new length
+    private int stripTelnet(char* line, int n) {
+        int k = 0;
+        for (int i = 0; i < n; i++) {
+            int c = line[i] & 255;
+            if (c == 255 && i + 1 < n) {
+                int nx = line[i + 1] & 255;
+                if (nx >= 251 && nx <= 254) { i = i + 2; continue; }
+                if (nx == 255) { line[k] = 255; k++; i++; continue; }
+                i++;
+                continue;
+            }
+            line[k] = c;
+            k++;
+        }
+        line[k] = 0;
+        return k;
+    }
+
+    private bool isCmd(char* cmd, char* name) {
+        int i = 0;
+        while (name[i] != 0) {
+            if (toUpper(cmd[i] & 255) != name[i]) return false;
+            i++;
+        }
+        return cmd[i] == 0;
+    }
+
+    private bool needPerm(Session* s, int perm) {
+        if (s->acct == null || (s->acct->perms & perm) == 0) {
+            rejected++;
+            say(s, 550, "Permission denied.");
+            return false;
+        }
+        return true;
+    }
+
+    private void command(Session* s, char* line, int n) {
+        for (int i = 0; i < n; i++) {
+            if (line[i] == 0) { say(s, 500, "NUL in a command."); return; }
+        }
+        if (s->lines.bare) { say(s, 500, "Bare CR or LF in a command."); return; }
+        n = stripTelnet(line, n);
+        s->lastCmd = millis();
+        // the verb and the argument (one blank between them is the separator; the rest is the argument as it is)
+        char verb[12];
+        int vl = 0;
+        int i = 0;
+        while (i < n && line[i] != ' ' && vl < 10) { verb[vl] = toUpper(line[i] & 255); vl++; i++; }
+        verb[vl] = 0;
+        if (i < n && line[i] != ' ') { say(s, 500, "Unknown command."); return; }
+        char* arg = &line[i < n ? i + 1 : n];
+        bool hasArg = i < n;
+        if (streq(&verb[0], "")) { say(s, 500, "Unknown command."); return; }
+        // what a transfer in progress allows
+        if (s->dstate == DS_BUSY && !(streq(&verb[0], "ABOR") || streq(&verb[0], "STAT") || streq(&verb[0], "NOOP") || streq(&verb[0], "QUIT"))) {
+            say(s, 425, "A transfer is in progress.");
+            return;
+        }
+        if (!streq(&verb[0], "REST")) s->restArmed = false;
+        if (!streq(&verb[0], "RNTO") && s->rnfr != null) { free(s->rnfr); s->rnfr = null; }
+        if (streq(&verb[0], "USER")) { cmdUser(s, arg, hasArg); return; }
+        if (streq(&verb[0], "PASS")) { cmdPass(s, arg, hasArg); return; }
+        if (streq(&verb[0], "QUIT")) { say(s, 221, "Goodbye."); s->closeAfter = true; dataClose(s, true); return; }
+        if (streq(&verb[0], "NOOP")) { say(s, 200, "NOOP ok."); return; }
+        if (streq(&verb[0], "FEAT")) { cmdFeat(s); return; }
+        if (streq(&verb[0], "AUTH")) { cmdAuth(s, arg, hasArg); return; }
+        if (streq(&verb[0], "PBSZ")) { cmdPbsz(s, arg, hasArg); return; }
+        if (streq(&verb[0], "PROT")) { cmdProt(s, arg, hasArg); return; }
+        if (streq(&verb[0], "SYST")) { say(s, 215, "UNIX Type: L8"); return; }
+        if (streq(&verb[0], "HELP")) { say(s, 214, "The commands are in RFC 959."); return; }
+        if (streq(&verb[0], "OPTS")) {
+            if (hasArg && streqi(arg, "UTF8 ON")) say(s, 200, "UTF8 is on."); else say(s, 501, "Option not understood.");
+            return;
+        }
+        if (!s->loggedIn) { say(s, 530, "Please login with USER and PASS."); return; }
+        if (streq(&verb[0], "PWD") || streq(&verb[0], "XPWD")) { cmdPwd(s); return; }
+        if (streq(&verb[0], "CWD") || streq(&verb[0], "XCWD")) { cmdCwd(s, arg, hasArg); return; }
+        if (streq(&verb[0], "CDUP") || streq(&verb[0], "XCUP")) { cmdCwd(s, "..", true); return; }
+        if (streq(&verb[0], "TYPE")) { cmdType(s, arg, hasArg); return; }
+        if (streq(&verb[0], "MODE")) { if (hasArg && streqi(arg, "S")) say(s, 200, "Mode is stream."); else say(s, 504, "Only stream mode."); return; }
+        if (streq(&verb[0], "STRU")) { if (hasArg && streqi(arg, "F")) say(s, 200, "Structure is file."); else say(s, 504, "Only file structure."); return; }
+        if (streq(&verb[0], "ALLO")) { say(s, 202, "ALLO is not needed."); return; }
+        if (streq(&verb[0], "PASV")) { cmdPasv(s, false); return; }
+        if (streq(&verb[0], "EPSV")) { cmdEpsv(s, arg, hasArg); return; }
+        if (streq(&verb[0], "PORT")) { cmdPort(s, arg, hasArg); return; }
+        if (streq(&verb[0], "EPRT")) { cmdEprt(s, arg, hasArg); return; }
+        if (streq(&verb[0], "REST")) { cmdRest(s, arg, hasArg); return; }
+        if (streq(&verb[0], "RETR")) { cmdRetr(s, arg, hasArg); return; }
+        if (streq(&verb[0], "STOR")) { cmdStor(s, arg, hasArg, false); return; }
+        if (streq(&verb[0], "APPE")) { cmdStor(s, arg, hasArg, true); return; }
+        if (streq(&verb[0], "LIST")) { cmdList(s, arg, hasArg, 0); return; }
+        if (streq(&verb[0], "NLST")) { cmdList(s, arg, hasArg, 1); return; }
+        if (streq(&verb[0], "MLSD")) { cmdList(s, arg, hasArg, 2); return; }
+        if (streq(&verb[0], "MLST")) { cmdMlst(s, arg, hasArg); return; }
+        if (streq(&verb[0], "DELE")) { cmdDele(s, arg, hasArg); return; }
+        if (streq(&verb[0], "RMD") || streq(&verb[0], "XRMD")) { cmdRmd(s, arg, hasArg); return; }
+        if (streq(&verb[0], "MKD") || streq(&verb[0], "XMKD")) { cmdMkd(s, arg, hasArg); return; }
+        if (streq(&verb[0], "RNFR")) { cmdRnfr(s, arg, hasArg); return; }
+        if (streq(&verb[0], "RNTO")) { cmdRnto(s, arg, hasArg); return; }
+        if (streq(&verb[0], "SIZE")) { cmdSize(s, arg, hasArg); return; }
+        if (streq(&verb[0], "MDTM")) { cmdMdtm(s, arg, hasArg); return; }
+        if (streq(&verb[0], "ABOR")) { cmdAbor(s); return; }
+        if (streq(&verb[0], "STAT")) { cmdStat(s, arg, hasArg); return; }
+        if (streq(&verb[0], "SITE") || streq(&verb[0], "STOU") || streq(&verb[0], "ACCT") || streq(&verb[0], "SMNT") || streq(&verb[0], "REIN")) { say(s, 502, "Command not implemented."); return; }
+        say(s, 500, "Unknown command.");
+    }
+
+    // ---- login ---------------------------------------------------------------------------------------------------------------------------------
+    private Account* findAccount(char* name) {
+        for (int i = 0; i < naccounts; i++) {
+            if (accounts[i]->anonymous) {
+                if (streqi(name, "anonymous") || streqi(name, "ftp")) return accounts[i];
+            } else if (streq(accounts[i]->name, name)) {
+                return accounts[i];
+            }
+        }
+        return null;
+    }
+
+    private bool tlsOk(Session* s) { return !requireTls || s->tlsOn; }
+
+    private void cmdUser(Session* s, char* arg, bool hasArg) {
+        if (s->loggedIn) { say(s, 530, "Can't change user."); return; }
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error in parameters or arguments."); return; }
+        if (!tlsOk(s)) { say(s, 530, "Login only after AUTH TLS."); return; }
+        if (strlen(arg) > 255) { say(s, 501, "User name too long."); return; }
+        if (s->userName != null) free(s->userName);
+        s->userName = copyText(arg);
+        say(s, 331, "Please specify the password.");
+    }
+
+    private void cmdPass(Session* s, char* arg, bool hasArg) {
+        if (s->loggedIn) { say(s, 503, "Already logged in."); return; }
+        if (s->userName == null) { say(s, 503, "Login with USER first."); return; }
+        if (!tlsOk(s)) { say(s, 530, "Login only after AUTH TLS."); return; }
+        Account* a = findAccount(s->userName);
+        bool ok = false;
+        if (a != null) {
+            if (a->anonymous) {
+                ok = true;
+            } else {
+                // the same work whether the name exists or not, no early exit
+                char* pw = hasArg ? arg : "";
+                int la = strlen(pw);
+                int lb = strlen(a->pass);
+                int diff = la ^ lb;
+                int m = la < lb ? la : lb;
+                for (int i = 0; i < m; i++) diff = diff | ((pw[i] ^ a->pass[i]) & 255);
+                ok = diff == 0;
+            }
+        }
+        free(s->userName);
+        s->userName = null;
+        if (!ok) {
+            s->failures++;
+            loginFailures++;
+            say(s, 530, "Login incorrect.");
+            if (s->failures >= maxLoginFailures) {
+                say(s, 421, "Too many login failures.");
+                s->closeAfter = true;
+            }
+            return;
+        }
+        s->acct = a;
+        s->loggedIn = true;
+        logins++;
+        say(s, 230, "Login successful.");
+    }
+
+    private void cmdFeat(Session* s) {
+        netio.Queue* o = &s->conn->out;
+        o->addText("211-Features:\r\n");
+        o->addText(" EPSV\r\n EPRT\r\n");
+        o->addText(" MLST type*;size*;modify*;perm*;\r\n");
+        o->addText(" REST STREAM\r\n SIZE\r\n MDTM\r\n UTF8\r\n");
+        if (tlsConfig != null && !s->tlsOn) o->addText(" AUTH TLS\r\n");
+        if (s->tlsOn) o->addText(" PBSZ\r\n PROT\r\n");
+        o->addText("211 End\r\n");
+    }
+
+    private void cmdAuth(Session* s, char* arg, bool hasArg) {
+        if (tlsConfig == null || s->tlsOn) { say(s, 534, "TLS is not available."); return; }
+        if (!hasArg || !(streqi(arg, "TLS") || streqi(arg, "SSL") || streqi(arg, "TLS-C"))) { say(s, 504, "Only AUTH TLS."); return; }
+        if (s->loggedIn) { say(s, 503, "Already logged in."); return; }
+        say(s, 234, "Proceed with the TLS handshake.");
+        s->wantTls = true;
+    }
+
+    private void cmdPbsz(Session* s, char* arg, bool hasArg) {
+        if (!s->tlsOn) { say(s, 503, "PBSZ needs a TLS connection."); return; }
+        if (!hasArg || !streq(arg, "0")) { say(s, 501, "PBSZ must be 0 for TLS."); return; }
+        s->pbsz = true;
+        say(s, 200, "PBSZ=0");
+    }
+
+    private void cmdProt(Session* s, char* arg, bool hasArg) {
+        if (!s->tlsOn) { say(s, 503, "PROT needs a TLS connection."); return; }
+        if (!s->pbsz) { say(s, 503, "PROT needs PBSZ first."); return; }
+        if (!hasArg) { say(s, 501, "Syntax error."); return; }
+        if (streqi(arg, "P")) { s->protP = true; say(s, 200, "Data connections will be encrypted."); return; }
+        if (streqi(arg, "C")) {
+            if (requireDataTls) { say(s, 534, "Data connections must be encrypted."); return; }
+            s->protP = false;
+            say(s, 200, "Data connections will be clear.");
+            return;
+        }
+        say(s, 504, "PROT is P or C.");
+    }
+
+    // ---- directories and names -------------------------------------------------------------------------------------------------------------------
+    private void cmdPwd(Session* s) {
+        char line[1200];
+        mailQuote(&line[0], 1100, s->cwd);
+        s->conn->out.addText(&line[0]);
+    }
+
+    // `257 "path" is the current directory.` with a doubled quote for every quote in the path
+    private void mailQuote(char* out, int max, char* path) {
+        int k = 0;
+        char* head = "257 \"";
+        for (int i = 0; head[i] != 0; i++) { out[k] = head[i]; k++; }
+        for (int i = 0; path[i] != 0 && k < max - 40; i++) {
+            if (path[i] == '"') { out[k] = '"'; k++; }
+            out[k] = path[i];
+            k++;
+        }
+        char* tail = "\" is the current directory.\r\n";
+        for (int i = 0; tail[i] != 0; i++) { out[k] = tail[i]; k++; }
+        out[k] = 0;
+    }
+
+    // the virtual and the real path for an argument; false (and the reply is queued) when the name is not acceptable
+    private bool pathOf(Session* s, char* arg, char* vpath, char* real, int* state, bool* isDir) {
+        if (normalizePath(s->cwd, arg, vpath, 1100) < 0) { rejected++; say(s, 553, "File name not allowed."); return false; }
+        int r = resolve(s->acct->root, vpath, real, 1400, isDir);
+        *state = r;
+        if (r < 0) {
+            rejected++;
+            say(s, 550, "No such file or directory.");
+            return false;
+        }
+        return true;
+    }
+
+    private void cmdCwd(Session* s, char* arg, bool hasArg) {
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error in parameters or arguments."); return; }
+        if (!needPerm(s, P_LIST)) return;
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state != 0 || !isDir) { say(s, 550, "Failed to change directory."); return; }
+        free(s->cwd);
+        s->cwd = copyText(&vpath[0]);
+        say(s, 250, "Directory successfully changed.");
+    }
+
+    private void cmdType(Session* s, char* arg, bool hasArg) {
+        if (!hasArg) { say(s, 501, "Syntax error."); return; }
+        if (streqi(arg, "I") || streqi(arg, "L 8") || streqi(arg, "L8")) { s->binary = true; say(s, 200, "Switching to Binary mode."); return; }
+        if (streqi(arg, "A") || streqi(arg, "A N")) { s->binary = false; say(s, 200, "Switching to ASCII mode."); return; }
+        say(s, 504, "Type not supported.");
+    }
+
+    private void cmdRest(Session* s, char* arg, bool hasArg) {
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error."); return; }
+        int v = 0;
+        for (int i = 0; arg[i] != 0; i++) {
+            if (arg[i] < '0' || arg[i] > '9' || i > 14) { say(s, 501, "Bad REST parameter."); return; }
+            v = v * 10 + (arg[i] - '0');
+        }
+        s->restOffset = v;
+        s->restArmed = true;
+        char t[60];
+        format(&t[0], 60, "Restart position accepted (%d).", v, 0, 0, 0, 0, 0);
+        say(s, 350, &t[0]);
+    }
+
+    private void cmdSize(Session* s, char* arg, bool hasArg) {
+        if (!hasArg) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_READ)) return;
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        asys.Stat st;
+        if (state != 0 || isDir || asys.lstat(&real[0], &st) < 0) { say(s, 550, "Could not get the file size."); return; }
+        char t[40];
+        format(&t[0], 40, "%d", st.size, 0, 0, 0, 0, 0);
+        say(s, 213, &t[0]);
+    }
+
+    private void cmdMdtm(Session* s, char* arg, bool hasArg) {
+        if (!hasArg) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_READ)) return;
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        // MDTM with a time to set (two arguments) is not supported
+        for (int i = 0; arg[i] != 0; i++) {
+            if (arg[i] == ' ' && i >= 14 && arg[0] >= '0' && arg[0] <= '9') { say(s, 550, "Setting the time is not supported."); return; }
+        }
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        asys.Stat st;
+        if (state != 0 || isDir || asys.lstat(&real[0], &st) < 0) { say(s, 550, "Could not get the file time."); return; }
+        datetime.DateTime d(st.mtime);
+        char t[40];
+        format(&t[0], 40, "%04d%02d%02d%02d%02d%02d", d.year, d.month, d.day, d.hour, d.minute, d.second);
+        say(s, 213, &t[0]);
+    }
+
+    private void cmdMkd(Session* s, char* arg, bool hasArg) {
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_WRITE)) return;
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state == 0) { say(s, 550, "The directory exists already."); return; }
+        if (asys.mkdir(&real[0], 493) < 0) { say(s, 550, "Create directory operation failed."); return; }
+        char t[1300];
+        int n = 0;
+        t[n] = '"'; n++;
+        for (int i = 0; vpath[i] != 0 && n < 1250; i++) { if (vpath[i] == '"') { t[n] = '"'; n++; } t[n] = vpath[i]; n++; }
+        char* tail = "\" directory created.";
+        for (int i = 0; tail[i] != 0; i++) { t[n] = tail[i]; n++; }
+        t[n] = 0;
+        say(s, 257, &t[0]);
+    }
+
+    private void cmdRmd(Session* s, char* arg, bool hasArg) {
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_DELETE)) return;
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state != 0 || !isDir || streq(&vpath[0], "/")) { say(s, 550, "Remove directory operation failed."); return; }
+        if (asys.rmdir(&real[0]) < 0) { say(s, 550, "Remove directory operation failed."); return; }
+        say(s, 250, "Remove directory operation successful.");
+    }
+
+    private void cmdDele(Session* s, char* arg, bool hasArg) {
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_DELETE)) return;
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state != 0 || isDir) { say(s, 550, "Delete operation failed."); return; }
+        if (asys.unlink(&real[0]) < 0) { say(s, 550, "Delete operation failed."); return; }
+        say(s, 250, "Delete operation successful.");
+    }
+
+    private void cmdRnfr(Session* s, char* arg, bool hasArg) {
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_RENAME)) return;
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state != 0 || streq(&vpath[0], "/")) { say(s, 550, "RNFR command failed."); return; }
+        s->rnfr = copyText(&vpath[0]);
+        say(s, 350, "Ready for RNTO.");
+    }
+
+    private void cmdRnto(Session* s, char* arg, bool hasArg) {
+        if (s->rnfr == null) { say(s, 503, "RNFR required first."); return; }
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_RENAME)) { free(s->rnfr); s->rnfr = null; return; }
+        char vpath[1100];
+        char real[1400];
+        char fromReal[1400];
+        int state = 0;
+        bool isDir = false;
+        bool fromDir = false;
+        int fs = resolve(s->acct->root, s->rnfr, &fromReal[0], 1400, &fromDir);
+        free(s->rnfr);
+        s->rnfr = null;
+        if (fs != 0) { say(s, 550, "RNTO command failed."); return; }
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state == 0) { say(s, 550, "The target exists already."); return; }
+        if (asys.rename(&fromReal[0], &real[0]) < 0) { say(s, 550, "Rename failed."); return; }
+        say(s, 250, "Rename successful.");
+    }
+
+    // ---- listings ------------------------------------------------------------------------------------------------------------------------------------
+    // mode 0 LIST, 1 NLST, 2 MLSD
+    private void cmdList(Session* s, char* arg, bool hasArg, int mode) {
+        if (!needPerm(s, P_LIST)) return;
+        if (s->dstate == DS_NONE) { say(s, 425, "Use PASV or PORT first."); return; }
+        // options like -la are ignored
+        char* a = hasArg ? arg : "";
+        if (mode != 2) {
+            while (a[0] == '-') {
+                while (a[0] != 0 && a[0] != ' ') a++;
+                while (a[0] == ' ') a++;
+            }
+        }
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, a[0] == 0 ? "." : a, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state != 0) { say(s, 550, "No such file or directory."); return; }
+        if (mode == 2 && !isDir) { say(s, 501, "Not a directory."); return; }
+        s->buf.clear();
+        s->buf.max = maxList;
+        int now = nowSec();
+        if (!isDir) {
+            asys.Stat st;
+            if (asys.lstat(&real[0], &st) >= 0) {
+                int ln = strlen(&vpath[0]);
+                int sl = ln;
+                while (sl > 0 && vpath[sl - 1] != '/') sl--;
+                if (mode == 1) { s->buf.addText(&vpath[sl]); s->buf.add("\r\n", 2); }
+                else lsLine(&s->buf, &vpath[sl], &st, now);
+            }
+        } else {
+            asys.DirList dl;
+            if (asys.listDir(&real[0], &dl) < 0) { say(s, 550, "Cannot read the directory."); return; }
+            dl.sort(true, true);
+            for (int i = 0; i < dl.count && !s->buf.overflow; i++) {
+                char* nm = dl.name(i);
+                if (!showable(nm) || dl.kind(i) == asys.K_LINK) continue;
+                char full[1700];
+                format(&full[0], 1700, "%s/%s", &real[0], nm, 0, 0, 0, 0);
+                asys.Stat st;
+                if (asys.lstat(&full[0], &st) < 0 || st.isLink()) continue;
+                if (mode == 1) { s->buf.addText(nm); s->buf.add("\r\n", 2); }
+                else if (mode == 2) mlsdLine(&s->buf, nm, &st, s->acct->perms, null);
+                else lsLine(&s->buf, nm, &st, now);
+            }
+            dl.dispose();
+        }
+        startOp(s, OP_LIST, null);
+    }
+
+    private void cmdMlst(Session* s, char* arg, bool hasArg) {
+        if (!needPerm(s, P_LIST)) return;
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, hasArg && arg[0] != 0 ? arg : ".", &vpath[0], &real[0], &state, &isDir)) return;
+        if (state != 0) { say(s, 550, "No such file or directory."); return; }
+        asys.Stat st;
+        if (asys.lstat(&real[0], &st) < 0) { say(s, 550, "No such file or directory."); return; }
+        netio.Queue q;
+        q.max = 4000;
+        mlsdLine(&q, &vpath[0], &st, s->acct->perms, null);
+        netio.Queue* o = &s->conn->out;
+        o->addText("250-Listing ");
+        o->addText(&vpath[0]);
+        o->addText("\r\n ");
+        o->add(q.data(), q.pending() >= 2 ? q.pending() - 2 : 0);
+        o->addText("\r\n250 End\r\n");
+        q.release();
+    }
+
+    private void cmdStat(Session* s, char* arg, bool hasArg) {
+        netio.Queue* o = &s->conn->out;
+        if (hasArg && arg[0] != 0 && s->loggedIn) {
+            if (!needPerm(s, P_LIST)) return;
+            char vpath[1100];
+            char real[1400];
+            int state = 0;
+            bool isDir = false;
+            if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+            if (state != 0 || !isDir) { say(s, 550, "Not a directory."); return; }
+            o->addText("213-Status of ");
+            o->addText(&vpath[0]);
+            o->addText(":\r\n");
+            asys.DirList dl;
+            if (asys.listDir(&real[0], &dl) >= 0) {
+                dl.sort(true, true);
+                int now = nowSec();
+                netio.Queue q;
+                q.max = 65536;
+                for (int i = 0; i < dl.count && !q.overflow; i++) {
+                    char* nm = dl.name(i);
+                    if (!showable(nm) || dl.kind(i) == asys.K_LINK) continue;
+                    char full[1700];
+                    format(&full[0], 1700, "%s/%s", &real[0], nm, 0, 0, 0, 0);
+                    asys.Stat st;
+                    if (asys.lstat(&full[0], &st) < 0 || st.isLink()) continue;
+                    lsLine(&q, nm, &st, now);
+                }
+                o->add(q.data(), q.pending());
+                q.release();
+            }
+            dl.dispose();
+            o->addText("213 End of status\r\n");
+            return;
+        }
+        o->addText("211-FTP server status:\r\n");
+        char t[200];
+        int ip = s->conn->ip;
+        int n = format(&t[0], 200, "     Connected to %d.%d.%d.%d\r\n", (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255, 0, 0);
+        o->add(&t[0], n);
+        if (s->loggedIn) { o->addText("     Logged in\r\n"); }
+        o->addText(s->binary ? "     TYPE: BINARY\r\n" : "     TYPE: ASCII\r\n");
+        o->addText("211 End of status\r\n");
+    }
+
+    // ---- data connections: set up --------------------------------------------------------------------------------------------------------------
+    private void watchFd(Session* s, int fd, int events) {
+        net->watch(fd, events, s->id);
+        s->watching = true;
+        s->watchedFd = fd;
+    }
+
+    private void unwatchFd(Session* s) {
+        if (s->watching) { net->unwatch(s->watchedFd); s->watching = false; }
+    }
+
+    // gives up every part of the data connection (the listener, the link, the file); the session may set up a new one
+    public void dataClose(Session* s, bool silent) {
+        unwatchFd(s);
+        if (s->listenFd >= 0) { nClose(s->listenFd); s->listenFd = -1; }
+        if (s->connFd >= 0) { nRawClose(s->connFd); s->connFd = -1; }
+        if (s->link != null) { s->link->dispose(); s->link = null; }
+        if (s->fd >= 0 && s->op != OP_NONE) { asys.fileClose(s->fd); }
+        s->fd = -1;
+        s->op = OP_NONE;
+        s->opPending = false;
+        s->dstate = DS_NONE;
+        s->buf.release();
+        s->buf.max = maxList;
+        s->activeIp = 0;
+        s->activePort = 0;
+    }
+
+    private bool dataReady(Session* s) {
+        if (requireDataTls && !s->protP) { say(s, 522, "Data connections must be encrypted (PROT P)."); return false; }
+        return true;
+    }
+
+    private void localText(Session* s, char* out) {
+        int lip = nLocalIp(s->conn->fd);
+        format(out, 24, "%d.%d.%d.%d", (lip >> 24) & 255, (lip >> 16) & 255, (lip >> 8) & 255, lip & 255, 0, 0);
+    }
+
+    // opens the passive listener on the local address of the control connection; returns the port or -1
+    private int openListener(Session* s) {
+        dataClose(s, true);
+        char ip[24];
+        localText(s, &ip[0]);
+        int fd = -1;
+        int port = 0;
+        if (pasvMin > 0 && pasvMax >= pasvMin) {
+            int span = pasvMax - pasvMin + 1;
+            char rnd[2];
+            asys.randomBytes(&rnd[0], 2);
+            int start = ((rnd[0] & 255) * 256 + (rnd[1] & 255)) % span;
+            for (int k = 0; k < span && fd < 0; k++) {
+                int p = pasvMin + (start + k) % span;
+                fd = nListenOn(&ip[0], p);
+                if (fd >= 0) port = p;
+            }
+        } else {
+            fd = nListenOn(&ip[0], 0);
+            if (fd >= 0) port = nLocalPort(fd);
+        }
+        if (fd < 0) return -1;
+        nSetNonBlocking(fd);
+        s->listenFd = fd;
+        s->dstate = DS_LISTEN;
+        s->dataSince = millis();
+        watchFd(s, fd, EV_READ);
+        return port;
+    }
+
+    private void cmdPasv(Session* s, bool unused) {
+        if (s->epsvAll) { say(s, 501, "EPSV ALL was given: PASV is not allowed."); return; }
+        if (!dataReady(s)) return;
+        int p = openListener(s);
+        if (p < 0) { say(s, 425, "Cannot open a passive port."); return; }
+        char ip[24];
+        if (pasvAddress != null) strcpy(&ip[0], pasvAddress); else localText(s, &ip[0]);
+        int a = nParseIp(&ip[0]);
+        char t[100];
+        format(&t[0], 100, "Entering Passive Mode (%d,%d,%d,%d,%d,%d).", (a >> 24) & 255, (a >> 16) & 255, (a >> 8) & 255, a & 255, p / 256, p % 256);
+        say(s, 227, &t[0]);
+    }
+
+    private void cmdEpsv(Session* s, char* arg, bool hasArg) {
+        if (hasArg && arg[0] != 0) {
+            if (streqi(arg, "ALL")) { s->epsvAll = true; say(s, 200, "EPSV ALL ok."); return; }
+            if (!streq(arg, "1")) { say(s, 522, "Network protocol not supported, use (1)."); return; }
+        }
+        if (!dataReady(s)) return;
+        int p = openListener(s);
+        if (p < 0) { say(s, 425, "Cannot open a passive port."); return; }
+        char t[100];
+        format(&t[0], 100, "Entering Extended Passive Mode (|||%d|).", p, 0, 0, 0, 0, 0);
+        say(s, 229, &t[0]);
+    }
+
+    // PORT and EPRT: the client names where the server should connect. Only the address of the client itself and a port from activePortMin up are accepted (RFC 2577: no bounce).
+    private void setActive(Session* s, int ip, int port) {
+        if (!allowActive) { say(s, 500, "Active mode is not allowed."); return; }
+        if (s->epsvAll) { say(s, 501, "EPSV ALL was given."); return; }
+        if (ip != s->conn->ip) { rejected++; say(s, 504, "The address is not the address of the client."); return; }
+        if (port < activePortMin || port > 65535) { rejected++; say(s, 504, "The port is not allowed."); return; }
+        if (!dataReady(s)) return;
+        dataClose(s, true);
+        s->activeIp = ip;
+        s->activePort = port;
+        s->dstate = DS_ACTIVE;
+        s->dataSince = millis();
+        say(s, 200, "Command okay.");
+    }
+
+    private void cmdPort(Session* s, char* arg, bool hasArg) {
+        if (!hasArg) { say(s, 501, "Syntax error."); return; }
+        int v[6];
+        int p = 0;
+        for (int k = 0; k < 6; k++) {
+            int x = 0;
+            int digs = 0;
+            while (arg[p] >= '0' && arg[p] <= '9') { x = x * 10 + (arg[p] - '0'); p++; digs++; if (digs > 3) { say(s, 501, "Illegal PORT command."); return; } }
+            if (digs == 0 || x > 255) { say(s, 501, "Illegal PORT command."); return; }
+            v[k] = x;
+            if (k < 5) { if (arg[p] != ',') { say(s, 501, "Illegal PORT command."); return; } p++; }
+        }
+        if (arg[p] != 0) { say(s, 501, "Illegal PORT command."); return; }
+        setActive(s, (v[0] << 24) | (v[1] << 16) | (v[2] << 8) | v[3], v[4] * 256 + v[5]);
+    }
+
+    private void cmdEprt(Session* s, char* arg, bool hasArg) {
+        if (!hasArg || strlen(arg) < 7) { say(s, 501, "Illegal EPRT command."); return; }
+        int d = arg[0] & 255;
+        if (d < 33 || d > 126 || (d >= '0' && d <= '9')) { say(s, 501, "Illegal EPRT command."); return; }
+        // |proto|address|port|
+        char f[400];
+        int fi = 0;
+        int fl = 0;
+        int p = 1;
+        while (arg[p] != 0 && fi < 3) {
+            if ((arg[p] & 255) == d) { f[fi * 100 + fl] = 0; fi++; fl = 0; p++; continue; }
+            if (fl >= 98) { say(s, 501, "Illegal EPRT command."); return; }
+            f[fi * 100 + fl] = arg[p];
+            fl++;
+            p++;
+        }
+        if (fi != 3 || arg[p] != 0) { say(s, 501, "Illegal EPRT command."); return; }
+        if (!streq(&f[0], "1")) { say(s, 522, "Network protocol not supported, use (1)."); return; }
+        int ip = nParseIp(&f[100]);
+        if (ip < 0) { say(s, 501, "Illegal EPRT command."); return; }
+        int port = 0;
+        int digs = 0;
+        for (int i = 0; f[200 + i] != 0; i++) {
+            if (f[200 + i] < '0' || f[200 + i] > '9' || digs > 5) { say(s, 501, "Illegal EPRT command."); return; }
+            port = port * 10 + (f[200 + i] - '0');
+            digs++;
+        }
+        if (digs == 0) { say(s, 501, "Illegal EPRT command."); return; }
+        setActive(s, ip, port);
+    }
+
+    // ---- transfers: the commands ---------------------------------------------------------------------------------------------------------------------------
+    private bool transferAllowed(Session* s) {
+        if (s->dstate == DS_NONE) { say(s, 425, "Use PASV or PORT first."); return false; }
+        if (!dataReady(s)) return false;
+        return true;
+    }
+
+    private void cmdRetr(Session* s, char* arg, bool hasArg) {
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_READ)) return;
+        if (s->dstate == DS_NONE) { say(s, 425, "Use PASV or PORT first."); return; }
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state != 0 || isDir) { say(s, 550, "Failed to open the file."); return; }
+        int fd = asys.fileOpen(&real[0], asys.F_READ | asys.F_NOFOLLOW, 0);
+        if (fd < 0) { say(s, 550, "Failed to open the file."); return; }
+        asys.Stat st;
+        if (asys.fstat(fd, &st) < 0 || !st.isFile()) { asys.fileClose(fd); say(s, 550, "Failed to open the file."); return; }
+        int off = s->restArmed ? s->restOffset : 0;
+        if (off > st.size) { asys.fileClose(fd); say(s, 554, "Invalid REST parameter."); return; }
+        if (off > 0) asys.fileSeek(fd, off, 0);
+        s->fileSize = st.size;
+        s->offsetNow = off;
+        s->fd = fd;
+        s->restArmed = false;
+        startOp(s, OP_RETR, null);
+    }
+
+    private void cmdStor(Session* s, char* arg, bool hasArg, bool isAppend) {
+        if (!hasArg || arg[0] == 0) { say(s, 501, "Syntax error."); return; }
+        if (!needPerm(s, P_WRITE)) return;
+        if (s->dstate == DS_NONE) { say(s, 425, "Use PASV or PORT first."); return; }
+        char vpath[1100];
+        char real[1400];
+        int state = 0;
+        bool isDir = false;
+        if (!pathOf(s, arg, &vpath[0], &real[0], &state, &isDir)) return;
+        if (state == 0 && isDir) { say(s, 553, "Could not create the file."); return; }
+        int off = s->restArmed && !isAppend ? s->restOffset : 0;
+        int flags = asys.F_WRITE | asys.F_CREATE | asys.F_NOFOLLOW;
+        if (isAppend) flags = flags | asys.F_APPEND;
+        else if (off == 0) flags = flags | asys.F_TRUNC;
+        int fd = asys.fileOpen(&real[0], flags, 420);
+        if (fd < 0) { say(s, 553, "Could not create the file."); return; }
+        if (off > 0) {
+            asys.Stat st;
+            if (asys.fstat(fd, &st) < 0 || off > st.size) { asys.fileClose(fd); say(s, 554, "Invalid REST parameter."); return; }
+            asys.fileSeek(fd, off, 0);
+        }
+        s->offsetNow = off;
+        s->fd = fd;
+        s->restArmed = false;
+        startOp(s, isAppend ? OP_APPE : OP_STOR, null);
+    }
+
+    // ---- transfers: state machine --------------------------------------------------------------------------------------------------------------------------
+    // a transfer command is ready: starts it now (the data connection is there), or when the connection comes
+    private void startOp(Session* s, int op, char* unused) {
+        s->op = op;
+        s->moved = 0;
+        s->atEof = false;
+        s->lastCr = false;
+        if (op != OP_LIST) s->buf.clear();
+        s->lastMove = millis();
+        if (s->dstate == DS_READY) { beginTransfer(s); return; }
+        if (s->dstate == DS_LISTEN || s->dstate == DS_CONNECTING || s->dstate == DS_HANDSHAKE) { s->opPending = true; s->dataSince = millis(); return; }
+        if (s->dstate == DS_ACTIVE) {
+            s->opPending = true;
+            if (!connectActive(s)) { failOp(s, 425, "Cannot open the data connection."); }
+            return;
+        }
+        s->op = OP_NONE;
+        if (s->fd >= 0) { asys.fileClose(s->fd); s->fd = -1; }
+        say(s, 425, "Use PASV or PORT first.");
+    }
+
+    // active mode: the connect to the client begins (it never waits)
+    private bool connectActive(Session* s) {
+        char ip[24];
+        format(&ip[0], 24, "%d.%d.%d.%d", (s->activeIp >> 24) & 255, (s->activeIp >> 16) & 255, (s->activeIp >> 8) & 255, s->activeIp & 255, 0, 0);
+        int fd = nConnectStart(&ip[0], s->activePort);
+        if (fd < 0) return false;
+        s->connFd = fd;
+        s->dstate = DS_CONNECTING;
+        s->dataSince = millis();
+        watchFd(s, fd, EV_WRITE);
+        return true;
+    }
+
+    // the data socket of a new connection becomes the link (TLS server handshake when PROT P)
+    private void adoptSocket(Session* s, int sock) {
+        unwatchFd(s);
+        netio.Link* l = netio.newLink();
+        if (l == null) { nRawClose(sock); failOp(s, 425, "Out of memory."); return; }
+        int mode = s->protP && s->tlsOn ? 2 : 0;
+        if (!l->adopt(sock, mode, null, false, tlsConfig, dataTimeoutMs)) { l->dispose(); failOp(s, 425, "Cannot use the data connection."); return; }
+        s->link = l;
+        s->connFd = -1;
+        if (mode == 2) {
+            s->dstate = DS_HANDSHAKE;
+            s->dataSince = millis();
+            watchFd(s, l->fd, EV_READ | EV_WRITE);
+            stepHandshake(s);
+        } else {
+            dataUp(s);
+        }
+    }
+
+    private void stepHandshake(Session* s) {
+        int r = s->link->openStep();
+        if (r < 0) { failOp(s, 425, "TLS handshake of the data connection failed."); return; }
+        if (r > 0) dataUp(s);
+    }
+
+    // the data connection is ready
+    private void dataUp(Session* s) {
+        unwatchFd(s);
+        s->dstate = DS_READY;
+        watchFd(s, s->link->fd, EV_READ);
+        if (s->opPending) beginTransfer(s);
+    }
+
+    private void beginTransfer(Session* s) {
+        s->opPending = false;
+        s->dstate = DS_BUSY;
+        s->lastMove = millis();
+        char t[200];
+        if (s->op == OP_RETR) {
+            format(&t[0], 200, "Opening %s mode data connection (%d bytes).", s->binary ? "BINARY" : "ASCII", s->fileSize - s->offsetNow, 0, 0, 0);
+        } else if (s->op == OP_LIST) {
+            format(&t[0], 200, "Here comes the directory listing.", 0, 0, 0, 0, 0, 0);
+        } else {
+            format(&t[0], 200, "Ok to send data (%s mode).", s->binary ? "BINARY" : "ASCII", 0, 0, 0, 0);
+        }
+        say(s, 150, &t[0]);
+        watchFd(s, s->link->fd, s->op == OP_STOR || s->op == OP_APPE ? EV_READ : EV_READ | EV_WRITE);
+        pump(s);
+    }
+
+    // a transfer or the set-up of the data connection failed: the reply, everything given up
+    private void failOp(Session* s, int code, char* text) {
+        bool wasBusy = s->dstate == DS_BUSY;
+        dataClose(s, true);
+        say(s, code, text);
+        if (wasBusy) { }
+    }
+
+    private void finishOp(Session* s, char* text) {
+        // the data connection ends: the TLS goodbye and the close
+        unwatchFd(s);
+        if (s->link != null) { s->link->dispose(); s->link = null; }
+        if (s->fd >= 0) { asys.fileClose(s->fd); s->fd = -1; }
+        s->op = OP_NONE;
+        s->dstate = DS_NONE;
+        s->buf.release();
+        s->buf.max = maxList;
+        transfers++;
+        say(s, 226, text);
+    }
+
+    // a step of the transfer (also called when the data socket is ready): never more than a few blocks, so that one transfer does not hold up the others
+    private void pump(Session* s) {
+        if (s->dstate != DS_BUSY || s->link == null) return;
+        if (chunk == null) chunk = malloc(65536 + 64);
+        if (chunk == null) { failOp(s, 451, "Out of memory."); return; }
+        netio.Link* l = s->link;
+        for (int round = 0; round < 8; round++) {
+            if (s->op == OP_STOR || s->op == OP_APPE) {
+                int n = l->recv(chunk, 16384);
+                if (n == -2) return;
+                if (n < 0) { failOp(s, 426, "The data connection failed."); return; }
+                if (n == 0) {
+                    asys.fileClose(s->fd);
+                    s->fd = -1;
+                    finishOp(s, "Transfer complete.");
+                    return;
+                }
+                s->lastMove = millis();
+                char* p = chunk;
+                int pn = n;
+                if (!s->binary) {
+                    // CRLF -> LF
+                    int o = 0;
+                    char* tmp = chunk + 32768;
+                    for (int i = 0; i < n; i++) {
+                        int ch = chunk[i] & 255;
+                        if (s->lastCr) {
+                            s->lastCr = false;
+                            if (ch != 10) { tmp[o] = 13; o++; }
+                        }
+                        if (ch == 13) { s->lastCr = true; continue; }
+                        tmp[o] = ch;
+                        o++;
+                    }
+                    p = tmp;
+                    pn = o;
+                }
+                if (maxUpload > 0 && s->moved + pn > maxUpload) { failOp(s, 552, "The file is bigger than the limit."); return; }
+                if (pn > 0 && asys.fileWrite(s->fd, p, pn) != pn) { failOp(s, 451, "Write error."); return; }
+                s->moved = s->moved + pn;
+                continue;
+            }
+            // sending: refill the buffer, send what the socket takes
+            if (s->buf.pending() == 0 && !s->atEof) {
+                if (s->op == OP_RETR) {
+                    int n = asys.fileRead(s->fd, chunk, 16384);
+                    if (n < 0) { failOp(s, 451, "Read error."); return; }
+                    if (n == 0) { s->atEof = true; }
+                    else if (s->binary) { s->buf.add(chunk, n); }
+                    else {
+                        for (int i = 0; i < n; i++) {
+                            int ch = chunk[i] & 255;
+                            if (ch == 10 && !s->lastCr) s->buf.addByte(13);
+                            s->buf.addByte(ch);
+                            s->lastCr = ch == 13;
+                        }
+                    }
+                } else {
+                    s->atEof = true;                // a listing is in the buffer from the start
+                }
+            }
+            if (s->buf.pending() == 0 && s->atEof) {
+                // everything is handed to the link: its backlog (TLS) must leave before the close
+                if (l->hasBacklog()) {
+                    if (!l->flush()) { failOp(s, 426, "The data connection failed."); return; }
+                    if (l->hasBacklog()) { watchFd(s, l->fd, EV_READ | EV_WRITE); return; }
+                }
+                finishOp(s, "Transfer complete.");
+                return;
+            }
+            if (s->buf.pending() > 0) {
+                int w = l->send(s->buf.data(), s->buf.pending() > 16384 ? 16384 : s->buf.pending());
+                if (w < 0) { failOp(s, 426, "The data connection failed."); return; }
+                if (w == 0) { watchFd(s, l->fd, EV_READ | EV_WRITE); return; }
+                s->buf.consume(w);
+                s->moved = s->moved + w;
+                s->lastMove = millis();
+            }
+        }
+        // more to do next turn: look for the socket to be writable again (or run again at once from the tick)
+        if (s->op == OP_RETR || s->op == OP_LIST) watchFd(s, l->fd, EV_READ | EV_WRITE);
+    }
+
+    private void cmdAbor(Session* s) {
+        if (s->dstate == DS_BUSY || s->opPending) {
+            dataClose(s, true);
+            say(s, 426, "Transfer aborted.");
+            say(s, 226, "ABOR successful.");
+        } else {
+            dataClose(s, true);
+            say(s, 226, "No transfer to abort.");
+        }
+    }
+
+    // ---- data events ---------------------------------------------------------------------------------------------------------------------------------
+    public void dataEvent(Session* s, int revents) {
+        if (s->dstate == DS_LISTEN) {
+            int sock = nAcceptSome(s->listenFd);
+            if (sock < 0) return;
+            int pip = nPeerIp(sock);
+            if (pip != s->conn->ip) { rejected++; nRawClose(sock); return; }            // not the client: dropped, the listener goes on
+            unwatchFd(s);
+            nClose(s->listenFd);
+            s->listenFd = -1;
+            adoptSocket(s, sock);
+            return;
+        }
+        if (s->dstate == DS_CONNECTING) {
+            int r = nConnectDone(s->connFd);
+            if (r == 0) return;
+            if (r < 0) { failOp(s, 425, "Cannot connect to the client."); return; }
+            int sock = s->connFd;
+            s->connFd = -1;
+            adoptSocket(s, sock);
+            return;
+        }
+        if (s->dstate == DS_HANDSHAKE) { stepHandshake(s); return; }
+        if (s->dstate == DS_BUSY) { pump(s); return; }
+        if (s->dstate == DS_READY) {
+            // something arrives on a connection that has no transfer: the client closed it, or it is garbage
+            char b[64];
+            int n = s->link->recv(&b[0], 64);
+            if (n == -2) return;
+            dataClose(s, true);
+        }
+    }
+
+    // ---- timers --------------------------------------------------------------------------------------------------------------------------------------
+    public void tick(int now) {
+        for (int i = 0; i < nslist; i++) {
+            Session* s = slist[i];
+            if (s->closeAfter) continue;
+            if (s->dstate == DS_BUSY) {
+                if (s->op == OP_RETR || s->op == OP_LIST) pump(s);                // a transfer that was cut at the end of a turn goes on
+                if (s->dstate == DS_BUSY && now - s->lastMove > dataTimeoutMs) failOp(s, 426, "The data connection timed out.");
+                continue;
+            }
+            if (s->dstate == DS_LISTEN || s->dstate == DS_CONNECTING || s->dstate == DS_HANDSHAKE || s->dstate == DS_READY || s->dstate == DS_ACTIVE) {
+                if (now - s->dataSince > dataTimeoutMs) {
+                    bool had = s->opPending;
+                    dataClose(s, true);
+                    if (had) say(s, 425, "Cannot open the data connection (timed out).");
+                }
+            }
+            if (idleTimeoutMs > 0 && now - s->lastCmd > idleTimeoutMs && s->dstate != DS_BUSY) {
+                say(s, 421, "Timeout.");
+                s->closeAfter = true;
+                net->close(s->conn);
+            }
+        }
+    }
+}
+
+// ---- callbacks of the network layer ----------------------------------------------------------------------------------------------------------------
+private int ftpOpen(netsrv.Server* ns, netsrv.Conn* c) {
+    Server* sv = (Server*) ns->user;
+    Session* s = sv->openSession(c);
+    if (s == null) return -1;
+    c->user = (char*) s;
+    return 0;
+}
+
+private int ftpData(netsrv.Server* ns, netsrv.Conn* c, char* data, int n) {
+    Server* sv = (Server*) ns->user;
+    Session* s = (Session*) c->user;
+    if (s == null) return -1;
+    int r = sv->feed(s, data, n);
+    if (s->wantTls) {
+        if (!ns->startTls(c, sv->tlsConfig)) { s->wantTls = false; return -1; }
+        sv->tlsStarted(s);
+    }
+    return r;
+}
+
+private int ftpClose(netsrv.Server* ns, netsrv.Conn* c) {
+    Server* sv = (Server*) ns->user;
+    Session* s = (Session*) c->user;
+    if (s == null) return 0;
+    c->user = null;
+    sv->freeSession(s);
+    return 0;
+}
+
+private int ftpTick(netsrv.Server* ns, int now) {
+    Server* sv = (Server*) ns->user;
+    sv->tick(now);
+    return 0;
+}
+
+private int ftpWatch(netsrv.Server* ns, int tag, int fd, int revents) {
+    Server* sv = (Server*) ns->user;
+    Session* s = sv->find(tag);
+    if (s == null) return 0;
+    sv->dataEvent(s, revents);
+    return 0;
+}
+
+public Server* newServer() { return new Server(); }

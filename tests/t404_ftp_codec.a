@@ -1,0 +1,221 @@
+// The pieces of the FTP modules that need no connection: the replies to PASV and EPSV, the listing formats (Unix ls -l with and without a year, links, names with blanks,
+// a missing group, the DOS format, MLSD facts, lines that are none of them), names that servers send (safeName), and the jail of the server: the normalisation of paths (every
+// way to climb out of the root, bad names, a path that is too long) and the lookup below the root with lstat (a symbolic link on the way ends the lookup).
+import ftp;
+import ftpd;
+import asys;
+import datetime;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+bool norm(char* cwd, char* path, char* want) {
+    char out[1100];
+    int n = ftpd.normalizePath(cwd, path, &out[0], 1100);
+    bool ok = want == null ? n < 0 : (n >= 0 && streq(&out[0], want) && n == strlen(want));
+    if (!ok) printf("     normalizePath(%s, %s) = %d [%s], wanted [%s]\n", cwd, path, n, &out[0], want == null ? "refused" : want);
+    return ok;
+}
+
+bool entryIs(ftp.EntryList* l, int i, char* name, int kind, int size) {
+    ftp.Entry* e = l->get(i);
+    return e != null && streq(e->name, name) && e->kind == kind && e->size == size;
+}
+
+char root[200];
+
+void rmTree(char* path) {
+    asys.DirList dl;
+    if (asys.listDir(path, &dl) < 0) return;
+    for (int i = 0; i < dl.count; i++) {
+        char sub[400];
+        format(&sub[0], 400, "%s/%s", path, dl.name(i), 0, 0, 0, 0);
+        asys.Stat st;
+        if (asys.lstat(&sub[0], &st) >= 0 && st.isDir()) rmTree(&sub[0]); else asys.unlink(&sub[0]);
+    }
+    dl.dispose();
+    asys.rmdir(path);
+}
+
+int main() {
+    // ---- PASV and EPSV ------------------------------------------------------------------------------------------------------------------------------------
+    int ip = 0;
+    check("PASV: the usual reply", ftp.parsePasv("Entering Passive Mode (192,168,1,2,19,136).", &ip) == 19 * 256 + 136 && ip == 0xC0A80102);
+    check("PASV: without parentheses, other texts", ftp.parsePasv("Entering Passive Mode 10,0,0,5,4,1", &ip) == 1025 && ip == 0x0A000005 && ftp.parsePasv("(1,2,3,4,0,80)", null) == 80);
+    check("PASV: numbers over 255, too few numbers, letters, port 0, a missing comma", ftp.parsePasv("(1,2,3,256,0,80)", null) == -1 && ftp.parsePasv("(1,2,3,4,5)", null) == -1 && ftp.parsePasv("(a,b,c,d,e,f)", null) == -1
+        && ftp.parsePasv("(1,2,3,4,0,0)", null) == -1 && ftp.parsePasv("(1,2,3,4 5,6)", null) == -1 && ftp.parsePasv("Entering", null) == -1 && ftp.parsePasv("(1,2,3,4,5,6,7)", null) == 5 * 256 + 6);
+    check("EPSV: the usual reply and other delimiters", ftp.parseEpsv("Entering Extended Passive Mode (|||6446|)") == 6446 && ftp.parseEpsv("Extended Passive Mode OK (!!!2121!)") == 2121 && ftp.parseEpsv("(|1|127.0.0.1|5000|)") == 5000);
+    check("EPSV: bad replies", ftp.parseEpsv("(|||0|)") == -1 && ftp.parseEpsv("(|||70000|)") == -1 && ftp.parseEpsv("(|||abc|)") == -1 && ftp.parseEpsv("(|||123)") == -1 && ftp.parseEpsv("no parentheses") == -1
+        && ftp.parseEpsv("(|||)") == -1 && ftp.parseEpsv("()") == -1 && ftp.parseEpsv("(1||2|3|)") == -1);
+
+    // ---- listings ------------------------------------------------------------------------------------------------------------------------------------------
+    int now = 1794580200;                            // 13 Nov 2026 14:30 UTC
+    char* unix =
+        "total 48\r\n"
+        "drwxr-xr-x   2 ftp      ftp          4096 Nov 13 14:30 docs\r\n"
+        "-rw-r--r--   1 ftp      ftp          1234 Nov 10 09:05 notes.txt\r\n"
+        "-rw-r--r--   1 ftp      ftp         98765 Jan  3  2025 old file with blanks.txt\r\n"
+        "lrwxrwxrwx   1 ftp      ftp             9 Mar  1 10:00 latest -> notes.txt\r\n"
+        "-rw-r--r--   1 someone    4321 Dec 31 23:59 nogroup.dat\r\n"
+        "drwxrwxrwt  12 root     root         4096 Nov 13 14:31 future\r\n"
+        "-rwxr-xr-x   1 1000     1000      1099511627776 Feb 29  2024 huge\r\n"
+        "this line is nothing\r\n"
+        "\r\n"
+        "drwxr-xr-x   2 ftp      ftp          4096 Nov 13 14:30 .\r\n"
+        "drwxr-xr-x   2 ftp      ftp          4096 Nov 13 14:30 ..\r\n";
+    ftp.EntryList l1;
+    int added = ftp.parseListing(unix, strlen(unix), false, &l1, now);
+    check("Unix listing: eight lines make eight entries? seven (. and .. skipped), the junk line is counted", added == 7 && l1.count == 7 && l1.unparsed == 1);
+    check("Unix listing: names, kinds, sizes", entryIs(&l1, 0, "docs", ftp.K_DIR, 4096) && entryIs(&l1, 1, "notes.txt", ftp.K_FILE, 1234) && entryIs(&l1, 2, "old file with blanks.txt", ftp.K_FILE, 98765)
+        && entryIs(&l1, 3, "latest", ftp.K_LINK, 9) && entryIs(&l1, 4, "nogroup.dat", ftp.K_FILE, 4321) && entryIs(&l1, 6, "huge", ftp.K_FILE, 1099511627776));
+    check("Unix listing: a link has its target, permissions are kept", streq(l1.get(3)->target, "notes.txt") && streq(l1.get(0)->perms, "rwxr-xr-x") && streq(l1.get(5)->perms, "rwxrwxrwt"));
+    check("Unix listing: dates with a time are this year (13 Nov 14:30 is now), 10 Nov", l1.get(0)->mtime == now && l1.get(1)->mtime == datetime.toUnix(2026, 11, 10, 9, 5, 0));
+    check("Unix listing: a date with a year", l1.get(2)->mtime == datetime.toUnix(2025, 1, 3, 0, 0, 0) && l1.get(6)->mtime == datetime.toUnix(2024, 2, 29, 0, 0, 0));
+    check("Unix listing: a time in the future (31 Dec 23:59, 14:31 today) is last year, or just ahead of now", l1.get(4)->mtime == datetime.toUnix(2025, 12, 31, 23, 59, 0) && l1.get(5)->mtime == datetime.toUnix(2026, 11, 13, 14, 31, 0));
+    check("entry list: find", l1.find("notes.txt") == l1.get(1) && l1.find("nothing") == null);
+    l1.dispose();
+    char* dos =
+        "11-13-26  02:30PM       <DIR>          Program Files\r\n"
+        "11-10-2026 09:05AM              123456 report.doc\r\n"
+        "01-03-25  12:00AM                   10 midnight\r\n"
+        "01-03-25  12:30PM                   20 noon thirty\r\n"
+        "garbage here\r\n";
+    ftp.EntryList l2;
+    ftp.parseListing(dos, strlen(dos), false, &l2, now);
+    check("DOS listing: directory, sizes, 12 hour times", l2.count == 4 && l2.unparsed == 1 && entryIs(&l2, 0, "Program Files", ftp.K_DIR, -1) && entryIs(&l2, 1, "report.doc", ftp.K_FILE, 123456)
+        && l2.get(0)->mtime == datetime.toUnix(2026, 11, 13, 14, 30, 0) && l2.get(1)->mtime == datetime.toUnix(2026, 11, 10, 9, 5, 0) && l2.get(2)->mtime == datetime.toUnix(2025, 1, 3, 0, 0, 0)
+        && l2.get(3)->mtime == datetime.toUnix(2025, 1, 3, 12, 30, 0));
+    l2.dispose();
+    char* mlsd =
+        "type=cdir;modify=20261113143000; .\r\n"
+        "type=pdir;modify=20261113143000; ..\r\n"
+        "type=dir;modify=20261113143000;perm=flcdmpe; sub dir\r\n"
+        "type=file;size=1234;modify=20261110090500.123;perm=adfrw; a file; with semicolon.txt\r\n"
+        "Type=FILE;SIZE=7;Modify=20200101000000; upper\r\n"
+        "type=OS.unix=slink:/etc;size=4; link\r\n"
+        "size=5;modify=20200101000000; no type\r\n";
+    ftp.EntryList l3;
+    ftp.parseListing(mlsd, strlen(mlsd), true, &l3, now);
+    check("MLSD: cdir and pdir are skipped, facts in any case, names with blanks and semicolons, a line without type is not one", l3.count == 4 && l3.unparsed == 1 && entryIs(&l3, 0, "sub dir", ftp.K_DIR, -1) && entryIs(&l3, 1, "a file; with semicolon.txt", ftp.K_FILE, 1234)
+        && entryIs(&l3, 2, "upper", ftp.K_FILE, 7) && l3.get(3)->kind == ftp.K_LINK && streq(l3.get(1)->perms, "adfrw") && l3.get(1)->mtime == datetime.toUnix(2026, 11, 10, 9, 5, 0) && l3.get(2)->mtime == datetime.toUnix(2020, 1, 1, 0, 0, 0));
+    l3.dispose();
+    ftp.EntryList l4;
+    ftp.parseListing(mlsd, strlen(mlsd), false, &l4, now);
+    check("a listing that is MLSD text is recognised by LIST parsing too (type= lines)", l4.count >= 3);
+    l4.dispose();
+    ftp.EntryList l5;
+    ftp.parseListing("", 0, false, &l5, now);
+    check("an empty listing has no entries", l5.count == 0 && l5.unparsed == 0);
+    l5.dispose();
+    ftp.EntryList l6;
+    ftp.parseListing("-rw-r--r-- 1 a b 5 Nov 13 14:30 ok\n-rw-r--r-- 1 a b x Nov 13 14:30 bad size\ndrwxr-xr-x\n-rw-r--r-- 1 a b 5 Foo 13 14:30 bad month\n-rw-r--r-- 1 a b 5 Nov 99 14:30 bad day\n", 150, false, &l6, now);
+    check("lines with a bad size, month or day, or too short, are not entries (LF line ends work too)", l6.count == 1 && l6.unparsed == 4 && streq(l6.get(0)->name, "ok"));
+    l6.dispose();
+    char* big = alloc(60000);
+    int bp = 0;
+    for (int i = 0; i < 1000; i++) bp = bp + format(&big[bp], 60, "-rw-r--r-- 1 a b %d Nov 13 14:30 f%d\r\n", i, i, 0, 0, 0, 0);
+    ftp.EntryList l7;
+    check("maxEntries stops a long listing", ftp.parseListing(big, bp, false, &l7, now, 100) == 100 && l7.count == 100);
+    l7.dispose();
+        char* sn = ftp.safeName("../../etc/passwd");
+    bool s1 = streq(sn, "passwd");
+    free(sn);
+    sn = ftp.safeName("C:\\x\\.hidden");
+    bool s2 = streq(sn, "hidden");
+    free(sn);
+    sn = ftp.safeName("a\x01" "b:c*d.txt");
+    bool s3 = streq(sn, "a_b_c_d.txt");
+    free(sn);
+    sn = ftp.safeName("");
+    bool s4 = streq(sn, "file");
+    free(sn);
+    sn = ftp.safeName("dir/");
+    bool s5 = streq(sn, "file");
+    free(sn);
+    check("safeName: the last component, no dots in front, no control characters, no reserved ones, 'file' when nothing is left", s1 && s2 && s3 && s4 && s5);
+
+    // ---- the jail: normalising paths -------------------------------------------------------------------------------------------------------------------------
+    check("normalize: relative and absolute", norm("/a/b", "x", "/a/b/x") && norm("/a/b", "/x", "/x") && norm("/", "x", "/x") && norm("/", "", "/") && norm("/a/b", "", "/a/b") && norm("/a/b", ".", "/a/b") && norm("/a/b", "/", "/"));
+    check("normalize: . and empty parts, double slashes, a trailing slash", norm("/a/b", "x/./y/../z", "/a/b/x/z") && norm("/a", "x///y//", "/a/x/y") && norm("/a", "//x///y//", "/x/y") && norm("/a", "x/", "/a/x") && norm("/", "./././x", "/x"));
+    check("normalize: .. goes up, at the root it stays at the root", norm("/a/b", "../x", "/a/x") && norm("/a/b", "../../x", "/x") && norm("/a/b", "../../../x", "/x") && norm("/a/b", "../../../../../../../../x", "/x") && norm("/a/b", "..", "/a")
+        && norm("/", "..", "/") && norm("/", "../..", "/") && norm("/a/b", "/../../../x", "/x"));
+    check("normalize: the classic attacks stay inside the root", norm("/pub", "../../../../etc/passwd", "/etc/passwd") && norm("/pub", "/../../etc/passwd", "/etc/passwd") && norm("/pub", "a/../../../etc/passwd", "/etc/passwd") && norm("/", "/etc/../../etc/shadow", "/etc/shadow")
+        && norm("/pub", "....//....//etc", null));
+    check("normalize: no decoding (%2e%2e is a name), a name is taken as it is", norm("/a", "%2e%2e/x", "/a/%2e%2e/x") && norm("/a", "..%2fx", "/a/..%2fx") && norm("/a", "x%00y", "/a/x%00y") && norm("/a", "\xE2\x82\xAC.txt", "/a/\xE2\x82\xAC.txt"));
+    check("normalize: backslash and control characters are refused", norm("/a", "..\\x", null) && norm("/a", "x\\y", null) && norm("/a", "a/\x01" "b", null) && norm("/a", "a\x1B[2Jb", null) && norm("/a", "a\x7F" "b", null));
+    check("normalize: names of only dots, and a name that is too long", norm("/a", "...", null) && norm("/a", "x/..../y", null) && norm("/a", "a b", "/a/a b") && norm("/a", "....a", "/a/....a"));
+    char longName[300];
+    for (int i = 0; i < 255; i++) longName[i] = 'n';
+    longName[255] = 0;
+    char out255[1100];
+    check("normalize: a name of 255 bytes is fine where file names may be that long (not on AOS: 55)", (ftpd.normalizePath("/", &longName[0], &out255[0], 1100) == 256) == (asys.nameMax() >= 255));
+    longName[255] = 'n';
+    longName[256] = 0;
+    check("normalize: 256 bytes are refused", norm("/", &longName[0], null));
+    mailBuf = alloc(2000);
+    for (int i = 0; i < 1200; i++) { mailBuf[i * 2] = '/'; mailBuf[i * 2 + 1] = 'd'; }
+    mailBuf[2400 - 1] = 0;
+    check("normalize: a path of 2400 bytes does not fit into 1100: refused", norm("/", mailBuf, null));
+
+    // ---- the jail: looking up a path below the root --------------------------------------------------------------------------------------------------------------
+    char rnd[4];
+    asys.randomBytes(&rnd[0], 4);
+    format(&root[0], 200, "build/tests/t404-%d", (rnd[0] & 255) * 65536 + (rnd[1] & 255) * 256 + (rnd[2] & 255), 0, 0, 0, 0);
+    char p1[400];
+    format(&p1[0], 400, "%s/jail/sub", &root[0], 0, 0, 0, 0, 0);
+    asys.mkdirs(&p1[0]);
+    format(&p1[0], 400, "%s/outside", &root[0], 0, 0, 0, 0, 0);
+    asys.mkdirs(&p1[0]);
+    format(&p1[0], 400, "%s/jail/sub/f.txt", &root[0], 0, 0, 0, 0, 0);
+    asys.writeFile(&p1[0], "x", 1);
+    format(&p1[0], 400, "%s/outside/secret.txt", &root[0], 0, 0, 0, 0, 0);
+    asys.writeFile(&p1[0], "s", 1);
+    char jail[400];
+    format(&jail[0], 400, "%s/jail", &root[0], 0, 0, 0, 0, 0);
+    char real[600];
+    bool isDir = false;
+    check("resolve: a file, a directory, the root", ftpd.resolve(&jail[0], "/sub/f.txt", &real[0], 600, &isDir) == 0 && !isDir && endsWith(&real[0], "/jail/sub/f.txt") && ftpd.resolve(&jail[0], "/sub", &real[0], 600, &isDir) == 0 && isDir
+        && ftpd.resolve(&jail[0], "/", &real[0], 600, &isDir) == 0 && isDir && endsWith(&real[0], "/jail"));
+    check("resolve: only the last part missing is 1 (a new file may be made), a part missing in the middle is -1", ftpd.resolve(&jail[0], "/sub/new.txt", &real[0], 600, &isDir) == 1 && ftpd.resolve(&jail[0], "/nodir/new.txt", &real[0], 600, &isDir) == -1
+        && ftpd.resolve(&jail[0], "/sub/f.txt/below", &real[0], 600, &isDir) == -1);
+    if (asys.hasLinks()) {
+        char target[400];
+        char link[400];
+        format(&target[0], 400, "%s/outside", &root[0], 0, 0, 0, 0, 0);
+        format(&link[0], 400, "%s/jail/escape", &root[0], 0, 0, 0, 0, 0);
+        asys.symlink(&target[0], &link[0]);
+        format(&target[0], 400, "%s/outside/secret.txt", &root[0], 0, 0, 0, 0, 0);
+        format(&link[0], 400, "%s/jail/sub/filelink", &root[0], 0, 0, 0, 0, 0);
+        asys.symlink(&target[0], &link[0]);
+        format(&link[0], 400, "%s/jail/rootlink", &root[0], 0, 0, 0, 0, 0);
+        asys.symlink("..", &link[0]);
+        check("resolve: a link to a directory outside, as a part in the middle or as the last part, is -1", ftpd.resolve(&jail[0], "/escape/secret.txt", &real[0], 600, &isDir) == -1 && ftpd.resolve(&jail[0], "/escape", &real[0], 600, &isDir) == -1);
+        check("resolve: a link to a file outside is -1, a link to .. as well, even to create below it", ftpd.resolve(&jail[0], "/sub/filelink", &real[0], 600, &isDir) == -1 && ftpd.resolve(&jail[0], "/rootlink/outside", &real[0], 600, &isDir) == -1
+            && ftpd.resolve(&jail[0], "/escape/newfile", &real[0], 600, &isDir) == -1);
+        check("resolve: the files that are no links still work", ftpd.resolve(&jail[0], "/sub/f.txt", &real[0], 600, &isDir) == 0);
+    } else {
+        check("resolve: symbolic links are not available here (no test)", true);
+        check("resolve: (no test)", true);
+        check("resolve: (no test)", true);
+    }
+    char* tooLong = alloc(1500);
+    for (int i = 0; i < 1400; i++) tooLong[i] = 'p';
+    tooLong[0] = '/';
+    check("resolve: a path that does not fit the buffer is -1", ftpd.resolve(&jail[0], tooLong, &real[0], 600, &isDir) == -1);
+    rmTree(&root[0]);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
+
+char* mailBuf;
