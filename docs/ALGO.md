@@ -1,18 +1,21 @@
-# Data structures, string algorithms and random numbers
+# Algorithms: data structures, strings, random numbers, statistics, matrices and numerical methods
 
-Three modules for everyday programming, written in A and built into the compiler (`import ds;`, `import strx;`, `import rng;`):
+Six modules for everyday programming and for numerical work, written in A and built into the compiler (`import ds;`, `import strx;`, `import rng;`, `import stats;`, `import matrix;`, `import optim;`):
 
 | Module | What it is |
 |---|---|
 | [`ds`](#ds---data-structures) | deque, ring buffers, binary heap with handles, ordered map and set (AVL tree), hash maps for ints and texts, trie with wildcard search, union-find, bit set, Fenwick and segment trees with lazy updates, interval set, LRU cache, Bloom filter, count-min sketch |
 | [`strx`](#strx---string-algorithms) | KMP, Horspool, Rabin-Karp, Aho-Corasick, edit distances and similarities, LCS, Myers diff with unified output, suffix array, Manacher, fuzzy matching (quick open), glob matching, Soundex, natural order |
 | [`rng`](#rng---random-numbers) | SplitMix64, xoshiro256\*\*, PCG32, PCG64, MT19937, a ChaCha20 CSPRNG; unbiased bounded integers, 53 bit doubles, normal / exponential / gamma / beta / Poisson / binomial / geometric, shuffle, sampling, alias method, reservoir sampling, UUID v4 |
+| [`stats`](#stats---statistics-distributions-and-tests) | descriptive statistics with the nine quantile definitions, streaming and windowed statistics, histograms with automatic bins, least squares regression (QR based) with standard errors and p values, accurate special functions and 11 distributions (pdf, cdf, upper tail, quantile), t / chi-square / F / Mann-Whitney tests, confidence intervals, bootstrap, autocorrelation, k-means, PCA |
+| [`matrix`](#matrix---dense-and-sparse-linear-algebra) | dense and sparse double matrices: arithmetic, in place variants, LU with partial pivoting, Cholesky, Householder QR, least squares, symmetric eigenvalues (Jacobi), SVD (one sided Jacobi), rank, condition estimates, pseudo inverse, CSR matrices with conjugate gradient, complex matrices; singular matrices are reported, never solved into nonsense |
+| [`optim`](#optim---numerical-methods) | root finding (bisection, Brent, Newton, secant, systems), minimisation (golden section, Brent, Nelder-Mead, BFGS, gradient descent), integration (trapezoid, Simpson, Romberg, adaptive Gauss-Kronrod, Gauss-Legendre), ODEs (RK4, adaptive RK45), interpolation (linear, cubic splines, Lagrange, Chebyshev), polynomials (roots, fit), FFT for any length and convolution, a simplex linear programming solver, special sequences |
 
-They compose and extend [`algo`](LANGUAGE.md#12b-built-in-modules) (sorting, union-find, graphs, `editDistance`, `kmpFind`), `collections` and `random`, whose APIs are unchanged.
+They compose and extend [`algo`](LANGUAGE.md#12b-built-in-modules) (sorting, union-find, graphs, `editDistance`, `kmpFind`), `collections`, `random`, `math`, `dmath` and `bigint`, whose APIs are unchanged.
 Everything works on all five targets and on AOS, uses only the `asys` layer for memory and the system random source, and gives the same results everywhere
-(`rng` doubles are soft float, so a seed gives the same numbers on every CPU).
+(`double` arithmetic is soft float in A, so a seed or an input gives the same numbers on every CPU, and the results of algorithms that use only `+ - * /` and `sqrt` are bit for bit the results of a hardware double computation: t469 compares them with Python floats).
 
-Contents: [conventions](#conventions) · [ds](#ds---data-structures) · [strx](#strx---string-algorithms) · [rng](#rng---random-numbers) · [speed](#speed) · [tests](#tests) · [limitations](#limitations)
+Contents: [conventions](#conventions) · [ds](#ds---data-structures) · [strx](#strx---string-algorithms) · [rng](#rng---random-numbers) · [stats](#stats---statistics-distributions-and-tests) · [matrix](#matrix---dense-and-sparse-linear-algebra) · [optim](#optim---numerical-methods) · [speed](#speed) · [tests](#tests) · [limitations](#limitations)
 
 ---
 
@@ -35,6 +38,14 @@ Contents: [conventions](#conventions) · [ds](#ds---data-structures) · [strx](#
 * **Texts** in `strx` are `char*` plus a length `(s, n)`; `n = -1` means "up to the terminating 0", and a `null` pointer is an empty text. Texts that are not 0 terminated are never read past `n`.
   A flag `utf8 = true` on the distance and similarity functions compares code points instead of bytes (invalid bytes count as one symbol each).
 * **Not thread safe.**
+* **Numeric modules** (`stats`, `matrix`, `optim`): numbers are `double`, arrays are `double*` plus a count, and a null pointer or a count below 1 is an invalid argument, never a crash: functions that return a number give NaN,
+  functions that return a status give an error code (`matrix.ERR_...`, `optim.ERR_...`), builders return an empty object whose `ok()` is false. **NaN in the input** gives NaN (or a refusal with `ERR_NOT_FINITE` / `ERR_NAN` where an
+  algorithm would turn it into nonsense), infinity follows IEEE arithmetic. Objects that own memory (`Matrix`, `LU`, `Spline`, `Regression`, `Histogram`, `FftPlan` ...) have `dispose()`, which is safe on a failed, a zeroed
+  (declared without parentheses) and an already disposed object and leaves an empty one; `Type t = u;` copies the *handle*, not the numbers. Callbacks are `func` values with a context pointer (see [optim](#callbacks-and-how-to-pass-context)).
+  t466 calls every public function and method with null pointers, zero and negative counts, NaN, infinity, 1e308 and one null among valid arguments, and checks that nothing crashes, hangs or leaks; t464 and t465 check the
+  documented answers to hostile input.
+* **A file called `stats.a`, `matrix.a` or `optim.a` next to your program shadows the module** (the directory of the importing file is searched first, see LANGUAGE.md section 10): the old example `examples/stats.a` is a program
+  with a `main`, so a program in the `examples` folder cannot `import stats;`. The numeric examples are therefore in `examples/numeric/`.
 
 ---
 
@@ -252,9 +263,294 @@ char id[40];  rng.uuid4(id);                          // from the system generat
 
 ---
 
+## stats - statistics, distributions and tests
+
+`import stats;` (it uses the built-in `matrix` and `rng` modules). Data are `double*` plus a count; everything else is an ordinary `double` or `int`.
+
+**Conventions.** An invalid argument (`n < 1`, a probability outside [0, 1], a negative scale, a null pointer) gives **NaN**, never a crash. **NaN in the data gives NaN**; the functions that sort
+(`median`, `quantile`, `mode`, `ranks`, `spearman`, `kendall`, `mad`, `iqr` and the tests that use ranks) refuse data with NaN instead of sorting it into nonsense. Infinity follows IEEE arithmetic
+(`mean` of data with +inf is +inf, `variance` is NaN). The empty sum is 0. Nothing allocates unless it says so; functions that need a sorted copy allocate it and free it before they return
+(and give NaN when memory is short). `ddof` is the divisor `n - ddof` (1 = sample variance, 0 = population variance). Only the objects that are built (`Histogram`, `RollingStats`, `Regression`,
+`KMeans`, `Pca`) have `dispose()`.
+
+### Descriptive statistics
+
+| Function | What |
+|---|---|
+| `sum` `mean` `variance(x, n, ddof = 1)` `stddev` `sem` | `sum` uses Neumaier's compensated summation (the error does not grow with `n`); `variance` is two-pass with the correction term of Chan, Golub and LeVeque, so data with a huge offset keep their digits |
+| `median` `quantile(x, n, p, method = 7)` `quantiles(x, n, ps, k, out, method)` `quantileSorted` `iqr` `mad` | the nine quantile definitions of Hyndman and Fan: 1 to 3 are step functions, 4 to 9 interpolate; 7 is NumPy / Excel / R, 6 is Minitab and Python's `"exclusive"`, 5 Hazen, 8 median unbiased, 9 normal unbiased. `quantiles` sorts once for many probabilities |
+| `mode` `multimode(x, n, out, max)` | the most frequent value (the smallest when tied) / all of them |
+| `minimum` `maximum` `rangeOf` | NaN for empty data or NaN in the data |
+| `skewness(x, n, bias = true)` `kurtosis(x, n, bias = true, excess = true)` | `bias = false` gives the sample statistics G1 and G2 (NaN below 3 / 4 values) |
+| `covariance` `correlation` (Pearson) `spearman` `kendall` (tau-b, O(n^2)) `ranks` (ties get the average rank) `zscores` | a constant variable has no correlation: NaN |
+| `geometricMean` `harmonicMean` `weightedMean` | NaN for negative values or negative weights; a zero gives 0 |
+| `covarianceMatrix(&data)` `correlationMatrix(&data)` | a `matrix.Matrix` with one observation per row and one variable per column |
+
+### Streaming statistics and windows
+
+| Class / function | What |
+|---|---|
+| `Welford` | online mean, variance, skewness and kurtosis in O(1) memory (Welford and Pebay's update formulas), minimum and maximum, `merge(&other)` for parallel or chunked data; the sums are kept relative to the first value, so a million plus a spread of one keeps every digit |
+| `Ema` | exponential moving average with `alpha` (`emaAlphaFromSpan`, `emaAlphaFromHalfLife` give pandas' conversions); `adjust = true` weights the history like pandas `ewm(adjust=True)` |
+| `RollingStats(window)` | mean, sum, variance, minimum, maximum and median of the last `window` values; the sums are recomputed from scratch every `window` values so rounding errors cannot build up, the extremes use monotone queues (O(1) amortised), the median a sorted copy (O(window)); a NaN poisons the window only while it is inside it |
+| `movingAverage` `weightedMovingAverage` `emaSeries` `cumsum` | whole-series versions (`cumsum` is compensated) |
+
+### Histograms
+
+`Histogram h(bins, lo, hi)` counts with equal width bins (the last bin includes `hi`, as in NumPy; values outside go to `below` / `above`, NaN to `nans`); `histogramAuto(x, n, rule)` chooses the range and
+the number of bins with NumPy's rules `STURGES`, `SQRT_RULE`, `RICE`, `SCOTT`, `FD` (Freedman-Diaconis), `DOANE` and `AUTO_RULE` (the larger of Sturges and FD); `binWidth` and `binCount` give the rule's answer
+without building anything. `count(i)`, `density(i)`, `edge(i)`, `binOf(x)`, `modeBin()`.
+
+### Regression
+
+`linearFit(x, y, n)`, `polyFit(x, y, n, degree)` and the general `olsFit(&X, y, addIntercept, weights)` return a `Regression`: coefficients, standard errors, t values and p values, `r2`, `adjR2`,
+the residual standard error `sigma`, the F statistic and its p value, `fitted[]` and `residuals[]`; `predict(x)` for the one-variable fits. The fit is a **Householder QR** of the (column scaled) design matrix, never the
+normal equations, so it stays accurate where the normal equations lose their digits (t451 fits a quadratic at x around 1000 and compares with the exact solution in fractions); a rank deficient design (a constant column next to the intercept, more coefficients than points) gives an error status (`matrix.ERR_RANK` or `matrix.ERR_ARG`).
+`dispose()` frees the arrays. Weighted least squares takes non-negative case weights.
+
+### Special functions and distributions
+
+| Special functions | `erf erfc erfInv erfcInv gamma lgamma digamma beta lbeta incGammaP incGammaQ incGammaPInv incBeta incBetaInv stdNormalCdf stdNormalSf stdNormalPdf stdNormalQuantile` |
+|---|---|
+
+| Family | Functions (parameters follow the name) |
+|---|---|
+| normal | `normalPdf(x, mu, sigma)` `normalLogPdf` `normalCdf` `normalSf` `normalQuantile(p, mu, sigma)` |
+| Student t | `tPdf(x, df)` `tCdf` `tSf` `tQuantile(p, df)` |
+| chi-square | `chi2Pdf(x, k)` `chi2Cdf` `chi2Sf` `chi2Quantile` |
+| F | `fPdf(x, d1, d2)` `fCdf` `fSf` `fQuantile` |
+| gamma, beta | `gammaPdf(x, shape, scale)` ... `betaPdf(x, a, b)` ... (`Pdf Cdf Sf Quantile` each) |
+| exponential, uniform, lognormal | `expPdf(x, rate)` ..., `uniformPdf(x, a, b)` ..., `lognormalPdf(x, mu, sigma)` ... |
+| binomial, Poisson | `binomPmf(k, n, p)` `binomCdf` `binomSf` `binomQuantile` `poissonPmf(k, lambda)` `poissonCdf` `poissonSf` `poissonQuantile`; `k` and `n` are doubles that must hold whole numbers |
+
+`...Sf` is the upper tail 1 - cdf computed directly, so a p value of 1e-300 is not rounded to 0: use `2 * tSf(|t|, df)` rather than `2 * (1 - tCdf(...))`. Quantiles are found by a safeguarded Newton iteration on the exact cdf (bisection whenever a step would leave the bracket), starting from an approximation (Cornish-Fisher for the t distribution; the normal quantile itself starts from Abramowitz and Stegun 26.2.23 and is polished by Halley steps).
+
+**Accuracy** (checked in t447 to t449 against 70 digit decimal references computed independently in Python: series, continued fractions and Gauss-Legendre quadrature of the definitions): `erf`, `erfc`, `lgamma`
+and `gamma` agree to 1e-15 relative error on the whole tested range, `digamma` and `lbeta` to 1e-14, `erfInv` and the normal quantile to 1e-14, the incomplete gamma functions to 1e-13 and the incomplete beta function
+to 1e-12; the upper tails `...Sf` and `incGammaQ` are computed directly, so they keep their relative accuracy where `1 - cdf` would be 0 (the normal quantile is tested down to p = 1e-300). The distribution functions are as accurate as the
+special function behind them. The exact identities (`gamma(n + 1) = n!`, `I_x(1, 1) = x`, `P + Q = 1`, `erf + erfc = 1`, symmetry of the normal and t distributions) are tests of their own.
+Invalid parameters (`sigma <= 0`, `df <= 0`, `p` outside [0, 1]) give NaN; the quantile of 0 and 1 is the end of the support (`-inf` / `+inf` for the normal).
+
+**Large parameters.** The continued fractions and series behind the incomplete gamma and beta functions need about `sqrt(parameter)` terms and every term rounds, so the relative error grows like `1e-16 * sqrt(parameter)`:
+about 1e-13 for parameters up to 1e5 and 1e-12 up to 1e8 (t465 compares `incBeta(0.4, 1e5, 1.5e5)`, `incGammaP(1e8, 1e8)`, `binomCdf(4900, 10000, 0.5)` and others with 50 digit references).
+Three measures keep this honest: (1) the binomial prefactor of the incomplete beta function takes the complement `n - x` as an exact input (without it `tCdf(1, 1e9)` was wrong in the ninth digit);
+(2) the Student t distribution switches for `df >= 1e5` (and `t^2 < 2e-4 df`) to its expansion in `1 / df` (Cornish-Fisher polynomials to third order, 1e-14 relative, checked from `df = 1e5` to `1e17`); (3) when the
+iteration needs more than 10^6 terms (a parameter above about 1e11) the function returns **NaN** instead of a wrong number (it took 0.5 s and answered 0.0126 for `incGammaP(1e15, 1e15)` before).
+
+### Tests and confidence intervals
+
+Every test returns `TestResult { stat, pvalue, df, df2, err }` (NaN everywhere and `err = matrix.ERR_ARG` for bad input: a null pointer, too few values, NaN in the data, a variance of 0, an unknown `tail`); `tail` is `TAIL_TWO`, `TAIL_LESS` or `TAIL_GREATER`. `Interval { lo, hi }` is NaN for bad input (a level outside (0, 1), `k > n`, an unknown method).
+
+| Function | Test |
+|---|---|
+| `ttestOneSample(x, n, mu0, tail)` `ttestTwoSample(x, nx, y, ny, pooled, tail)` `ttestPaired` | Student t tests; the two-sample test is Welch's (Welch-Satterthwaite degrees of freedom) unless `pooled` |
+| `chiSquareGof(observed, expected, k, ddof)` `chiSquareIndependence(table, rows, cols, yates)` | goodness of fit (`expected = null`: all categories equally likely) and independence of a contingency table (Yates' correction for 2 x 2) |
+| `mannWhitney(x, nx, y, ny, tail)` | the U test; the p value is **exact** (dynamic programming over all arrangements) when there are no ties and both samples have at most 25 values, otherwise the normal approximation with tie and continuity corrections (SciPy's `"exact"` and `"asymptotic"`) |
+| `anovaOneWay(data, sizes, k)` `varianceTest` `jarqueBera` | F tests and the Jarque-Bera normality test |
+| `meanCI(x, n, level)` `meanDiffCI` `varianceCI` `proportionCI(k, n, level, method)` | Student t, Welch, chi-square intervals; proportions with `CI_WALD`, `CI_WILSON` (default) or `CI_CLOPPER_PEARSON` (exact, through the beta quantile) |
+| `bootstrapCI(x, n, statFn, ctx, resamples, level, &rng)` | percentile bootstrap of **any** statistic: `statFn` is `double f(double* sample, int n, void* ctx)`; the resampling uses the generator you pass, so a seed gives the same interval on every target |
+
+### Time series, clustering and PCA
+
+`autocovariance`, `autocorrelation(x, n, maxLag, out)`, `partialAutocorrelation` (Levinson-Durbin) and `ljungBox(x, n, lags, modelDf)`. `kmeans(data, n, dim, k, &rng, maxIter, restarts)` is k-means++ seeding
+and Lloyd's iterations with the best of several restarts (`KMeans`: `centers`, `labels`, `inertia`, `predict(point)`); the same generator state gives the same clusters on every target. `Pca(&data, keep, scale)` takes the
+eigenvectors of the covariance matrix with the Jacobi solver of `matrix`: `components`, `variance`, `ratio` (share of the total variance), `transform` and `inverseTransform`; the sign of every axis is fixed (its largest
+component is positive) so results do not flip between runs.
+
+```c
+import stats;
+
+double x[8] = {2.1, 2.5, 3.1, 3.6, 4.0, 4.4, 5.2, 5.9};   double y[8] = {1.1, 1.7, 2.0, 2.8, 3.1, 3.9, 4.2, 5.0};
+double m = stats.mean(x, 8),  sd = stats.stddev(x, 8, 1),  med = stats.median(x, 8);
+double q1 = stats.quantile(x, 8, 0.25, 7);                         // NumPy's default definition
+stats.Regression r = stats.linearFit(x, y, 8);                     // r.coef[0] + r.coef[1] x, r.r2, r.pvalue[1], r.residuals[i]
+stats.TestResult t = stats.ttestTwoSample(x, 8, y, 8, false, stats.TAIL_TWO);   // Welch: t.stat, t.pvalue
+double p = stats.tSf(2.5, 7.0);   double z = stats.normalQuantile(0.975, 0.0, 1.0);           // 1.959963984540054
+stats.Interval ci = stats.meanCI(x, 8, 0.95);                      // ci.lo, ci.hi
+r.dispose();
+```
+
+---
+
+
+## matrix - dense and sparse linear algebra
+
+`import matrix;`. Numbers are `double`, matrices are stored row by row (`m.d[i * m.cols + j]` is the fast access, `get(i, j)` / `set(i, j, v)` check their indexes), memory comes only from the `asys` layer, so it runs on all five
+targets and on AOS.
+
+```c
+import matrix;
+
+matrix.Matrix a(3, 3);                                         // 2 1 1 / 1 3 2 / 1 0 0
+double v[9] = {2, 1, 1, 1, 3, 2, 1, 0, 0};   for (int i = 0; i < 9; i++) { a.d[i] = v[i]; }
+matrix.LU f(&a);                                               // P A = L U with partial pivoting
+double b[3] = {4, 5, 6};   double x[3];
+if (f.solve(b, x) == matrix.OK) { /* x = 6, 15, -23 */ } else { printf("%s\n", matrix.errorText(f.err)); }
+double d = f.det();  double rc = f.rcond();                    // 1-norm reciprocal condition estimate
+f.dispose();  a.dispose();
+```
+
+### What is there
+
+| Area | Classes and functions |
+|---|---|
+| construction | `Matrix(r, c)` (zero filled), `identity zeros ones diagonal fromArray outer hilbert`, `copy submatrix`, `getRow getCol setRow setCol swapRows swapCols setSubmatrix` |
+| arithmetic | new matrices: `add sub mul transpose scaled hadamard` and the operators `+ - *`; **in place** (no allocation): `addInPlace subInPlace axpyInPlace scaleInPlace transposeInPlace mulInto(&b, &c)`, vectors: `mulVec mulVecT` |
+| properties | `trace norm1 normInf normFro normMax isSymmetric isFinite det rank cond inverse solve`, vectors `vecDot vecNorm1 vecNorm2 vecNormInf vecAxpy vecScale vecCopy vecFill` (`vecNorm2` does not overflow or underflow) |
+| `LU` | partial pivoting; `solve solveTranspose solveMatrix inverse det logAbsDet rcond cond1 lower upper permutation`; the loose function `luFactor` works in place on a plain array |
+| `Cholesky` | `A = L L^T` for symmetric positive definite matrices; `solve det logDet inverse` |
+| `QR` | Householder (LAPACK's storage); any shape; `q(full) r applyQ applyQt solveLS diagRatio`; `lstsq(&a, b, x, &resid, &rank)` solves least squares for **any** matrix (QR when it has full column rank, otherwise the SVD's minimum norm solution) |
+| `SymEigen` | symmetric eigenvalues and orthonormal eigenvectors (cyclic Jacobi), ascending order |
+| `SVD` | one sided Jacobi (Hestenes): `s u v rank cond pinv solve reconstruct norm2`, singular values descending, `U` and `V` thin (`m x k`, `n x k`) |
+| sparse | `SparseVector` (sorted entries), `CsrMatrix` (built with `CooBuilder` or `fromDense`): `get mulVec mulVecT transpose addScaled mul scaled diagonal toDense`, and `cg(&a, b, x, maxIter, tol)` (Jacobi preconditioned conjugate gradient) |
+| complex | `CMatrix` with parallel `re` / `im` arrays (A has no complex type): `add sub mul scaled conjTranspose trace normFro mulVec det solve` |
+
+### Errors: no crash, no silent nonsense
+
+Functions that can fail return a status: `matrix.OK` (0) or `ERR_DIM` (the shapes do not fit), `ERR_SINGULAR`, `ERR_NOT_SPD`, `ERR_NO_CONVERGE`, `ERR_MEMORY`, `ERR_NOT_FINITE` (NaN or infinity in the input or in the
+result), `ERR_RANK`, `ERR_ARG` (null, empty or out of range argument), `ERR_NOT_SYMMETRIC`; `matrix.errorText(code)` names them. A method that returns a `Matrix` returns an **empty** one on failure (`ok()` is false,
+`rows = 0`, `d = null`) whose `err` field says why; an empty matrix given to any operation fails with `ERR_ARG`. A *zeroed* object (declared without parentheses) or a disposed one is simply empty.
+
+* **Singular matrices.** `solve()` and `inverse()` refuse a matrix with `ERR_SINGULAR` when a pivot is exactly 0 **or** when the estimated reciprocal condition number `rcond()` is below `matrix.EPS` (2.2e-16, the
+  threshold at which MATLAB warns): such a system has no meaningful numeric answer. `LU f(&a, 0.0)` turns the rcond test off (only exact zero pivots are refused) when you know that you want an answer for an ill conditioned system;
+  `f.rcond()` tells how much to trust it (about `log10(1 / rcond)` digits are lost). The determinant of an exactly singular matrix is 0. `rcond` is the 1-norm estimator of Hager and Higham (what LAPACK's `xGECON` does, within a small
+  factor of the true value, checked in t441); `cond()` is the exact 2-norm condition number from the SVD.
+* **Hilbert matrices** are the classic test: `hilbert(6)` solves with a visible loss of 7 digits (`rcond` about 1e-8), `hilbert(12)` is refused as singular to working precision, and with `minRcond = 0` it is solved and the answer is wrong
+  in the fourth digit (t441 checks all three).
+* **NaN and infinity.** The factorizations refuse input that contains them (`ERR_NOT_FINITE`) and results that overflow; `det()`, `cond()` and `norm...` of such a matrix give NaN; plain arithmetic (`add`, `mul`, norms) follows IEEE
+  rules (NaN spreads). `vecNorm2` of a vector with infinity is infinity, with NaN NaN.
+* **Not symmetric / not positive definite.** `Cholesky` and `SymEigen` check the symmetry (relative 1e-10: `ERR_NOT_SYMMETRIC`); `Cholesky` reports `ERR_NOT_SPD` for an indefinite **and** for a semi definite matrix (it has no unique factor).
+* **Failed constructions still own memory.** When a factorization reports a numeric error (`Cholesky` with `ERR_NOT_SPD`, `LU` with `ERR_SINGULAR`) its parts are kept so that you can look at them (`LU.zeroAt`, `LU.det()`):
+  call `dispose()` in every case; it is safe on a failed, a zeroed and an already disposed object.
+
+### Memory
+
+A `Matrix` is a **handle**: `Matrix b = a;` copies the handle, not the numbers (use `a.copy()`); `dispose()` frees the numbers and nothing is freed behind your back. Every operation is O(size) in memory: no operation copies a matrix inside a loop
+(`mulInto`, the in place variants and `solve(b, x)` with `b` and `x` the same array allocate nothing, t468 counts the blocks). Sizes are limited to 2^28 numbers per matrix (`ERR_ARG` above, also when `rows * cols` would
+overflow); a failed allocation gives `ERR_MEMORY`, never a crash. Big blocks (above 128 KiB, a 128 x 128 matrix) are the ones to reuse on AOS (see the limitations).
+
+### Algorithms and cost
+
+| | Algorithm | Cost | Notes |
+|---|---|---|---|
+| `LU` | Gaussian elimination, partial pivoting, row oriented | n^3 / 3 multiply-adds | `rcond` costs a few extra solves (O(n^2)) |
+| `Cholesky` | row oriented | n^3 / 3 | half the work of LU, no pivoting needed |
+| `QR` | Householder reflectors | 2 m n^2 | stable for ill conditioned least squares: the residual is minimised without squaring the condition number |
+| `SymEigen` | cyclic Jacobi with a threshold in the first sweeps | 6 to 10 sweeps of O(n^3) | slower than tridiagonal QL for big n, but accurate to the last digits for small eigenvalues and tiny code; `sweeps` tells how many were needed; up to 100 sweeps, then `ERR_NO_CONVERGE` |
+| `SVD` | one sided Jacobi (Hestenes), `A` or `A^T` is rotated so that the columns are orthogonal | same order | high relative accuracy even for tiny singular values (the Hilbert matrix of order 8 in t443 keeps all its singular values, down to 1e-10); columns of `U` that belong to zero singular values are completed to an orthonormal set |
+| `rank` / `pinv` / `lstsq` | from the SVD, threshold `max(m, n) * eps * s[0]` (NumPy's rule) | | pass `rtol` to change the threshold |
+| `cg` | conjugate gradient, Jacobi preconditioner | O(nnz) per iteration | `ERR_NOT_SPD` when it meets a direction of non positive curvature, `ERR_NO_CONVERGE` after `maxIter` (x keeps the last iterate), `ERR_NOT_FINITE` for NaN |
+| `CsrMatrix.mul` | Gustavson's algorithm with a dense accumulator row | O(flops + cols) | entries that cancel exactly are dropped |
+
+---
+
+
+## optim - numerical methods
+
+`import optim;` (it uses `matrix` for the linear algebra inside). Roots, minima, integrals, differential equations, interpolation, polynomials, the FFT, linear programming and a few special sequences. All numbers are `double`.
+
+### Callbacks and how to pass context
+
+A has no closures, so a callback is an ordinary function whose name you pass as a `func` value, plus a **context pointer** (`void* ctx`) that is handed back to it on every call: a pointer to a struct of your own with the
+parameters and counters the function needs, or `null`. The callbacks return a `double` (the library reads it back with `__dbl`); the signatures are
+
+| Used by | Signature |
+|---|---|
+| scalar function: roots, 1-D minima, integrals, derivatives, `Chebyshev`, `findBracket` | `double f(double x, void* ctx)` |
+| objective of `n` variables: `nelderMead bfgs gradientDescent gradientNum hessianNum`; also the statistic of `stats.bootstrapCI` (`double f(double* sample, int n, void* ctx)`) | `double f(double* x, int n, void* ctx)` |
+| gradient (optional, `null` means central differences) | `void grad(double* x, int n, double* g, void* ctx)` |
+| ODE right hand side `y' = rhs(t, y)` | `void rhs(double t, double* y, double* dydt, int n, void* ctx)` |
+| `n` equations `F(x) = 0` for `newtonSystem` and `jacobianNum` | `void fvec(double* x, int n, double* out, void* ctx)` |
+
+```c
+import optim;
+import dmath;
+
+struct Decay { double k; int calls; }                              // the context: a parameter and a counter
+
+double f(double x, void* c) { Decay* p = (Decay*) c;  p->calls++;  return dmath.exp(-p->k * x) - 0.5; }
+
+Decay p;  p.k = 2.0;  p.calls = 0;
+optim.Result r = optim.brent(f, &p, 0.0, 5.0, 1.0e-12, 100);      // the root of exp(-k x) = 1/2 in [0, 5]
+if (r.status == optim.OK) { /* r.x = ln 2 / 2, r.fx, r.iterations, r.evals, p.calls */ }
+```
+
+A callback that returns NaN or infinity where a number is needed makes the call return `ERR_NAN`; it is never turned into a wrong answer. A **null** callback gives `ERR_ARG` (or NaN for the functions that return a number).
+Every function that can fail returns a status (`optim.OK`, `ERR_ARG`, `ERR_BRACKET` (no sign change), `ERR_NO_CONVERGE`, `ERR_NAN`, `ERR_SINGULAR`, `ERR_MEMORY`, `LP_INFEASIBLE`, `LP_UNBOUNDED`) in its result or as its
+return value; `optim.errorText(status)` names it. Bad arguments (NaN or infinite limits, `tol < 0`, a count below 1, reversed or empty intervals where that matters) are `ERR_ARG`; `ERR_NO_CONVERGE` still returns the best estimate.
+
+### Roots and minima
+
+| Function | Method and notes |
+|---|---|
+| `bisection(f, ctx, a, b, tol, maxIter)` | one binary digit per evaluation, always converges; `f(a)`, `f(b)` must have opposite signs (`ERR_BRACKET` otherwise) |
+| `brent(f, ctx, a, b, tol, maxIter)` | Brent's method (inverse quadratic interpolation, secant, bisection fallback): superlinear for smooth functions with the guarantee of bisection; `tol` is absolute |
+| `newton(f, df, ctx, x0, tol, maxIter)` | `df = null` uses a central difference; `ERR_SINGULAR` for a zero derivative, `ERR_NAN` when the iterate leaves the numbers |
+| `secant(f, ctx, x0, x1, tol, maxIter)` | no derivative, no bracket guarantee |
+| `findBracket(f, ctx, x0, step, &a, &b)` | walks away from `x0` with steps that grow by 1.6 until the sign changes (60 expansions at most) |
+| `newtonSystem(fvec, ctx, x, n, tol, maxIter)` | Newton for `n` equations: numerical Jacobian, LU from `matrix`, the step is halved while the residual does not decrease; `ERR_SINGULAR` for a singular Jacobian |
+| `goldenSection` `brentMin` `bracketMin` | one variable minimisation on `[a, b]` (the precision of the minimiser is about `sqrt(eps)`, because the function is flat there) and a downhill bracketing |
+| `nelderMead(f, ctx, x, n, step, tol, maxEval)` | simplex method, no derivatives; `x` holds the start and receives the minimiser |
+| `bfgs(f, grad, ctx, x, n, gtol, maxIter)` | quasi-Newton with a line search; `grad = null` uses central differences (2n evaluations, precision limited to about 1e-8) |
+| `gradientDescent(f, grad, ctx, x, n, step0, gtol, maxIter)` | steepest descent with Armijo backtracking (robust, slow in narrow valleys) |
+| `derivative derivative5 gradientNum jacobianNum hessianNum` | central differences with the step `cbrt(eps) * max(|x|, 1)` (about 1e-10 relative error), a five point formula, gradient, Jacobian (forward differences) and Hessian (about 6 digits) |
+
+`Result { x, fx, err, iterations, evals, status }`: `err` is the half width of the final interval (roots), the final simplex size (`nelderMead`) or the gradient norm (`bfgs`).
+
+### Integration and differential equations
+
+| Function | Method and notes |
+|---|---|
+| `trapezoid simpson(f, ctx, a, b, n)` | composite rules, `n` panels (Simpson rounds up to even) |
+| `romberg(f, ctx, a, b, tol, maxLevels)` | trapezoid rules with 1, 2, 4 ... 2^(maxLevels - 1) panels and Richardson extrapolation: excellent for smooth functions on finite intervals |
+| `gaussKronrod(f, ctx, a, b, absTol, relTol, maxSub)` | **adaptive G7 / K15** (QUADPACK's `qag` rule): the subinterval with the largest error estimate is bisected until `max(absTol, relTol |I|)` is reached; **infinite limits** (`+-dmath.INFINITY`) are mapped to a finite interval; integrable endpoint singularities converge slowly but converge; `error`, `evals` and `intervals` are reported |
+| `gaussLegendre(n, x, w)` `integrateGL` | the `n` point rule on `[-1, 1]` / `[a, b]` (exact for degree 2n - 1; nodes by Newton's method on `P_n`) |
+| `integrateSamples simpsonSamples` | the trapezoid / Simpson rule for tabulated data |
+| `rk4(rhs, ctx, n, t0, y0, t1, steps, yOut, traj)` | the classical fixed step Runge-Kutta; the whole trajectory on request |
+| `Rk45 s(rhs, ctx, n, t0, y0, rtol, atol)` | Dormand-Prince 5(4) with adaptive step (error per step `atol + rtol max(|y|, |ynew|)`, automatic first step): `step(tEnd)`, `solveTo(tEnd, maxSteps)`, `solveAt(times, count, out, maxSteps)`; counters `nfev nsteps nrejected`; `ERR_NAN` for a right hand side that returns NaN, `ERR_NO_CONVERGE` when the step underflows or `maxSteps` is exceeded |
+
+`Integral { value, error, evals, intervals, status }`.
+
+### Interpolation and polynomials
+
+| Function | Notes |
+|---|---|
+| `interpLinear(xs, ys, n, x)` | piecewise linear, end values outside the range (like `numpy.interp`) |
+| `Spline(x, y, n, bc, d0, dn)` | cubic spline, `SPLINE_NATURAL` or `SPLINE_CLAMPED` (end slopes `d0`, `dn`); `value derivative(x, order) integral(a, b)` (exact); outside the range the end cubic continues; `err = ERR_ARG` for x not strictly increasing |
+| `Barycentric(x, y, n)` | Lagrange interpolation in barycentric form: stable for any distinct nodes, O(n) per evaluation |
+| `chebyshevNodes(n, a, b, out)` `Chebyshev(f, ctx, a, b, terms)` | nodes of the first kind and a Chebyshev series fitted to a function: `value` (Clenshaw), `derivative`, `integral`, `coefficient(j)` |
+| `polyEval polyEvalDeriv polyDeriv polyIntegral polyAdd polyMul polyDivide polyFromRoots` | coefficients in **increasing** order (`coef[k]` belongs to `x^k`); Horner evaluation |
+| `polyRoots(coef, degree, re, im)` | **Aberth-Ehrlich** iteration (all roots at once, cubic convergence for simple roots), Newton polishing on the original polynomial, zero roots taken out first; the roots come sorted by real part then imaginary part (conjugate pairs together); a multiple root has half the digits, as with every numerical method (t459 includes (x - 1)^4); returns the number of roots or `-ERR_...` |
+| `polyFit(x, y, n, degree, coef)` | least squares through the QR decomposition of `matrix` (x is scaled to [-1, 1] internally for conditioning) |
+
+### FFT and convolution
+
+`fft(re, im, n, inverse)` transforms `n` complex numbers (separate `re` and `im` arrays) in place for **any** `n >= 1`: a radix-2 algorithm for powers of two and Bluestein's chirp-z algorithm for every other length (O(n log n)
+always); the inverse includes the factor `1 / n`. `FftPlan plan(n)` computes the twiddle factors (and for other lengths the chirp and the transform of its kernel) once for many transforms of the same length: `plan.forward(re, im)`,
+`plan.inverse(re, im)`. `rfft(x, n, outRe, outIm)` / `irfft` take real input (`n / 2 + 1` outputs), `convolve(a, na, b, nb, out)` is direct for short inputs and FFT based for long ones (`convolveDirect`, `convolveFft`
+force one), `crossCorrelate`, `fftFrequencies(n, d, out)` (as `numpy.fft.fftfreq`) and `windowFunction(WIN_HANN ..., n, out)`. The twiddle factors come from `sincosTurns(k, n, &s, &c)`: exact integer octant reduction and a
+Taylor series (about 1 ulp, ten times faster than `dmath.sin`), so a transform has the same bits on every target. The results match the O(n^2) definition to 1e-11 for lengths up to 100 and the round trips are exact to 1e-12 for
+n = 1009, 1024, 2053, 3000, 4096 (t460); the FFT convolution of integer data is rounded back to exact integers in the tests.
+
+### Linear programming
+
+`linprog(c, n, A, m, b, kinds, maximize, x, &objective, &iterations)` solves `max (or min) c.x` subject to `m` rows `A x <= b` / `= b` / `>= b` (`kinds[i]` is `optim.LE`, `EQ` or `GE`; `null` means all `LE`) and `x >= 0`
+with the **two phase simplex method** on a dense tableau (O(m (n + m)) memory). Dantzig's pricing is used, Bland's rule takes over when degenerate pivots repeat, so the method cannot cycle; the pivot count is bounded
+(`ERR_NO_CONVERGE`). Returns `OK`, `LP_INFEASIBLE`, `LP_UNBOUNDED`, `ERR_NAN` (non-finite data), `ERR_ARG` or `ERR_MEMORY`; tolerance 1e-9 relative to the size of the data. t461 checks 60 random programs against the
+exact optimum found by enumerating **all vertices** in fractions, and infeasible and unbounded programs by construction.
+
+### Special sequences
+
+`fibonacciD lucasD catalanD factorialD binomialD harmonicD bernoulliD` (as `double`: exact while below 2^53, `+inf` beyond the range of a double, NaN for negative arguments where there is no value) and the orthogonal polynomials
+`legendreP chebyshevT chebyshevU hermiteH laguerreL` (three term recurrences, NaN for a negative degree); `fibonacciD(-n)` follows `F(-n) = (-1)^(n+1) F(n)`; `bernoulliD` uses the exact fractions up to n = 30 and the zeta
+series above (relative error about 1e-13), `B(1) = -1/2`. The integer sequences up to 2^63 are in `math` and `arith`, the big ones in `bigint`.
+
+---
+
+
 ## Speed
 
-Measured by `examples/algo_bench.a` (native x86-64, one run on a shared 4 CPU machine: expect plus or minus 20 percent; everything is compiled by `ac`, doubles are soft float).
+Measured by `examples/algo_bench.a` (`ds`, `strx`, `rng`) and `examples/numeric/algo2_bench.a` (`matrix`, `stats`, `optim`); native x86-64, one run on a shared 4 CPU machine: expect plus or minus 20 percent; everything is compiled by `ac`, doubles are soft float.
 
 **ds**
 
@@ -328,8 +624,64 @@ Measured by `examples/algo_bench.a` (native x86-64, one run on a shared 4 CPU ma
 | AliasTable.sample (1000 categories) | 3.3 M |
 | uuid4 | 685 K |
 
+**matrix** (`examples/numeric/algo2_bench.a`; a "flop" is one multiply-add)
+
+| operation | per second |
+|---|---:|
+| `Matrix.mulInto` 100 x 100 (flops) | 5.8 M |
+| `LU` factorization of 150 x 150 (n^3 / 3 flops) | 5.0 M |
+| `LU.solve` of one right hand side (150 x 150) | 254 |
+| `Cholesky` 120 x 120 (n^3 / 3 flops) | 10.5 M |
+| `QR` (Householder) 120 x 60 (2 m n^2 flops) | 13.8 M |
+| `SymEigen` (Jacobi) of a 40 x 40 matrix | 3 |
+| `SVD` (one sided Jacobi) of a 50 x 30 matrix | 4 |
+| `CsrMatrix.mulVec` (60000 entries): entries | 7.0 M |
+| `cg` on a 20000 x 20000 tridiagonal system: iterations | 32 |
+
+**stats**
+
+| operation | per second |
+|---|---:|
+| `mean` + `variance`: numbers | 2.1 M |
+| `median` (sorts a copy): numbers | 3.2 M |
+| `correlation` + `skewness` + `kurtosis`: numbers | 1.0 M |
+| `spearman`: numbers | 510 K |
+| `Welford.add` (four moments) | 360 K |
+| `RollingStats(100)`: `add` + `mean` + `median` | 145 K |
+| `normalCdf` | 6.5 K |
+| `tCdf` (9 degrees of freedom) | 2.5 K |
+| `tQuantile` | 214 |
+| `gamma` + `lgamma` (per pair) | 7.1 K |
+| `incBeta` | 2.1 K |
+| `binomPmf` + `poissonCdf` (per pair) | 6.2 K |
+| `olsFit` with 2000 observations and 4 variables: fits | 33 |
+| `ttestTwoSample` of 2 x 20000 numbers: numbers | 1.0 M |
+| `mannWhitney` of 2 x 5000 numbers: numbers | 1.0 M |
+| `kmeans` (2000 points, k = 4, 2 restarts): points x restarts | 19 K |
+
+**optim**
+
+| operation | per second |
+|---|---:|
+| `brent`: roots of cos(x) - x to 1e-12 | 4.2 K |
+| `gaussKronrod`: integrals of exp(-x^2) over [-4, 4] to 1e-12 | 122 |
+| `romberg`: the same integral | 54 |
+| `Rk45`: accepted steps (two equations, tolerance 1e-9) | 8.9 K |
+| `bfgs` with a numerical gradient: Rosenbrock minimisations | 1.7 K |
+| `nelderMead`: Rosenbrock minimisations | 2.5 K |
+| `FftPlan` transforms of length 1024 (radix 2) | 238 |
+| `FftPlan` transforms of length 4096 (radix 2) | 49 |
+| `FftPlan` transforms of length 1000 (Bluestein) | 50 |
+| `FftPlan` transforms of length 4099 (Bluestein) | 5 |
+| `convolve` of two 2000 number arrays (FFT) | 13 |
+| `polyRoots` of a polynomial of degree 20 | 98 |
+| `linprog` with 30 variables and 30 constraints | 113 |
+
 How to read it: the byte and letter rates are for the whole run of one search or build; the others are single operations. `Kmp`, `Horspool`, `RabinKarp` and `AhoCorasick` scan 4 MB of random text over four letters. Soft float makes the `double` based
 functions much slower than the integer ones (`normal` needs about 1 microsecond, `gamma` 10, `poisson(100)` 50, because their rare branches call the 45 microsecond `log` and `exp`); the integer generators run at 15 to 200 million numbers per second.
+
+The numeric modules pay for the soft float in every operation: about 5 million multiply-adds per second (a 100 x 100 matrix product takes 0.2 s, an LU solve of 150 unknowns 4 ms), a transcendental function about 45 microseconds. That is fine for the sizes
+of everyday work (hundreds of unknowns, thousands of data points, FFTs of a few thousand points) and too slow for big ones: a Jacobi eigenvalue problem of order 200 takes minutes. The riscv64 target under `qemu-user` is about 16 times slower again.
 
 ---
 
@@ -347,6 +699,32 @@ Tests t410 to t419 (`ds`), t420 to t428 (`strx`), t429 (null pointers and negati
 
 ---
 
+**Numeric modules: tests t440 to t469.** t440 to t445 are `matrix` (basics, LU, Cholesky and QR, eigenvalues and SVD, sparse, complex), t446 to t453 `stats` (descriptive statistics, special functions, continuous and discrete distributions,
+streaming and histograms, regression, tests and intervals, time series / k-means / PCA), t454 to t462 `optim` (roots, minima, integrals, ODEs, interpolation, polynomials, FFT, linear programming, sequences), and t463 to t469 the cross
+cutting tests: the examples of the module headers and of this file run as printed (t463), hostile input to `matrix` (t464) and to `stats` and `optim` (t465), every public function and method called with hostile arguments and checked for
+leaks (t466, generated by `tests/algo2_ref/mk_t466.py` from the signatures in `lib/*.a`), problems with a planted solution and cross checks between independent methods (t467), memory behaviour in the AOS allocator mode (t468) and bit exact
+results against hardware doubles (t469). They run on all five targets and, as the `algo2` test of `tests/boot_test.py` of the AOS repository, inside AOS.
+
+* **The expected outputs come from Python** (`tests/algo2_ref/gen_t4NN.py`, regenerate with `python3 tests/algo2_ref/gen_all.py`), written independently of the library and using only the standard library: exact `fractions` (normal
+  equations, Gaussian elimination, adjugates, splines, Mann-Whitney by dynamic programming), 60 and 70 digit `decimal` arithmetic (the special functions and distributions of `refspecial.py` from series, continued fractions and
+  quadrature of the definitions; DFTs; eigenvalues and singular values by a cyclic Jacobi iteration; roots by Newton's method; roots of unity by their trigonometric form), and `statistics.NormalDist`. The printed values are rounded
+  to 9 significant digits (or a tolerance is checked), so every target prints the same text. t469 is the exception that proves the arithmetic: its expected output is the bits of a hardware double computation, which the soft float
+  must reproduce exactly.
+* **Hard cases**: the Hilbert matrix (condition number 1.5e10 at order 8, singular to working precision at order 12), a polynomial fit at x around 1000, columns of size 1e150 and 1, rank one and rank deficient matrices,
+  Wilkinson's polynomial and multiple roots, 60 random linear programs checked against the exact optimum by enumerating all vertices (t461) and 12 against their duals (t467), table rows of every continuous distribution with tail
+  probabilities down to 1e-300, huge degrees of freedom and shape parameters (t465).
+* **Planted solutions** (t467): random systems of 1 to 70 unknowns with a known integer solution, `Q diag(d) Q^T` with known eigenvalues, `U diag(s) V^T` with known singular values, data with a known covariance for PCA, three
+  clusters for k-means, polynomials built from known roots; plus cross checks (Cholesky against LU, CG against LU, regression against the normal equations, three quadrature rules against each other, three minimisers, spline against
+  Lagrange against the function, the FFT against the O(n^2) definition and the circular convolution theorem).
+* **Robustness** (t464 to t466): null pointers, null callbacks, zero and negative counts, NaN, infinity, 1e308, absurd shapes (`Matrix(2^63 - 1, 2)`), singular and indefinite matrices, zeroed and disposed objects, aliased arguments.
+  The generated test t466 makes about 2700 hostile calls and checks `asys.memInUse()` after each one. The first run of this idea found about 45 crashes (null callbacks, `luFactor(null)`,
+  `SparseVector.dotDense(null)`, `Welford.addAll(null)`, `vecDot(null, ...)` ...), two practically endless loops (`catalanD` and `binomialD` with huge arguments), a silent wrong answer (`incGammaP(1e15, 1e15)`) and the loss of digits of
+  every beta based distribution at large parameters; all are fixed and covered.
+* **Memory** (t468): with `asys.setKeepBigBlocks(1)` (the behaviour of AOS and Windows) every workload is repeated and must not map new memory in the second round; everything is given back; the in place operations allocate nothing.
+* Timing: every test takes at most 1.5 seconds natively (the slowest, t460, 1.2 s; riscv64 under `qemu-user` is about 16 times slower, the limit of the test runner is 60 seconds).
+
+---
+
 ## Limitations
 
 * **Not thread safe**; no containers of structs (ints only: store pointers or indexes).
@@ -359,3 +737,16 @@ Tests t410 to t419 (`ds`), t420 to t428 (`strx`), t429 (null pointers and negati
 * ChaCha20Rng is as secure as ChaCha20 and the operating system random source; nothing else in `rng` is suitable for secrets. There is no fork detection.
 * On AOS big blocks (above 128 KiB) come from a bump allocator that never reuses address space: code that must run there should reuse big buffers (the library does). The tests run on AOS with exactly the same
   inputs as on Linux (nothing is shrunk for AOS); the `algo` boot test checks that every one of them prints the same bytes there.
+* **Numeric modules.** Soft float: everything numeric is 20 to 100 times slower than the same code on a CPU with a floating point unit (see Speed); `SymEigen` and `SVD` are Jacobi methods (O(n^3) per sweep, 6 to 10 sweeps): fine up to
+  about 100 x 100, slow beyond. `matrix` holds at most 2^28 numbers per matrix, has no sparse direct solver (conjugate gradient only, for symmetric positive definite matrices), no complex eigenvalues or SVD, and no banded or triangular
+  special cases. `Cholesky` and `SymEigen` check the symmetry to 1e-10 relative and use the upper triangle.
+* **Accuracy limits**: the incomplete gamma and beta functions (and with them the gamma, beta, F, binomial and Poisson functions) lose `1e-16 * sqrt(parameter)` relative accuracy (1e-12 up to parameters of 1e8, NaN above about 1e11;
+  Student t is accurate to 1e-14 for df >= 1e5 by its expansion); `bernoulliD` is exact to n = 30 and 1e-13 relative above; `harmonicD` above 1000 uses the asymptotic series (1e-16); `Rk45` and `gaussKronrod` stop at the tolerance you
+  give, not at the last digit; numerical derivatives are good to about 1e-10 (`derivative`) and 1e-6 (`hessianNum`); `polyRoots` finds a root of multiplicity m with about 16 / m digits; `bfgs` without a gradient stops at about 1e-8.
+* `stats`: `mannWhitney` is exact only for samples of at most 25 values without ties (otherwise the normal approximation with corrections), `kendall` is O(n^2), no Fisher exact test and no Kolmogorov-Smirnov test, `bootstrapCI` is the
+  percentile method. `kmeans` needs the data in memory as one array. Quantile and rank based functions allocate a sorted copy (and give NaN when memory is short).
+* `optim`: `linprog` uses a dense tableau (O(m (n + m)) memory, at most 100000 variables and rows but the tableau must stay below 2^28 numbers), `polyFit` and `Spline` need their points sorted or distinct as documented, `interpLinear` checks only
+  `xs[0] < xs[n - 1]`, `legendreP(n, x)` and the other recurrences take O(n) time for a huge degree `n`. A callback that returns NaN is reported (`ERR_NAN`); an infinity is an error for integrals and ODEs but an ordinary huge number for root finders
+  (a pole looks like a sign change) and minimisers.
+* On AOS the numeric tests run with exactly the same inputs as on Linux (the `algo2` boot test compares every output byte for byte); a matrix above 128 KiB is a big block there (see above): build a matrix once and reuse it, the library does the same inside its loops.
+
