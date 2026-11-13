@@ -695,7 +695,7 @@ makes line ends CRLF and stuffs dots, deletes at QUIT only (a connection that br
 | `t409` | POP3: the exact dialogue, CRLF and dot-stuffing, TOP, deletions at QUIT, a message of 300 KB in blocks, the client, APOP, STLS with a real handshake, plain bytes behind STLS, limits, memory |
 
 Bugs that the tests found in these modules while they were written (they are fixed, the tests keep them fixed): a use after free in the AUTH LOGIN of `smtpd` (the user name was read after it was freed), a CR LF header block that TOP could not split (`pop3d`), the REST offset that was
-forgotten before RETR (`ftpd`), a reply that was read twice after a refused active-mode transfer (`ftp`), an `EntryList` that did not free itself, and a recursion in socket wrappers.
+forgotten before RETR (`ftpd`), a reply that was read twice after a refused active-mode transfer (`ftp`), and an `EntryList` that did not free itself.
 
 **Not done / not verified.** The AOS boot test of the AOS repository runs `t340` to `t399`, so `t397` to `t399` run inside AOS there; `t400` to `t409` were **not run on AOS** (the modules use only layers that AOS has, the file names they make are shorter than 55 characters, and nothing assumes socket buffers or backlogs, but this was not tried).
 The servers were checked only against the clients in this repository, Python's `email` package for message parsing and building, and raw sockets; they were **not** checked against `curl`, `lftp`, `Thunderbird`, Postfix or Dovecot (none of them is on the development machine), and the SMTP, FTP and POP3 clients were not run against real servers on the internet.
