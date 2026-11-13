@@ -1,0 +1,3316 @@
+// =============================================================================
+//  stats - statistics, distributions, hypothesis tests, regression, clustering                         import stats;
+//
+//  All numbers are `double` (soft float in A: the results are identical on every target) and all arrays are `double*` plus a count. Nothing here is thread safe.
+//  An invalid argument (n < 1, a probability outside [0, 1], a negative scale ...) gives NaN, never a crash; NaN in the data gives NaN (for the order statistics
+//  median, quantile, mode, ranks and the tests that use them too: sort based functions refuse data with NaN). Infinity in the data follows IEEE arithmetic.
+//
+//  Descriptive      sum (compensated)  mean  variance(x, n, ddof)  stddev  sem  median  quantile(x, n, p, method)  quantiles  iqr  mad  mode  multimode
+//                   minimum  maximum  rangeOf  skewness  kurtosis  covariance  correlation (Pearson)  spearman  kendall  ranks  zscores  geometricMean
+//                   harmonicMean  weightedMean  covarianceMatrix  correlationMatrix       quantile methods 1..9 are those of Hyndman and Fan (7 = NumPy / Excel,
+//                   6 = Minitab / Python "exclusive", 4 .. 9 interpolate, 1 .. 3 are step functions)
+//  Streaming        Welford (count, mean, variance, skewness, kurtosis, min, max, merge)   Ema (exponential moving average)   RollingStats (a window of the
+//                   last w values: mean, variance, min, max, median; O(1) queries, exact after outliers)   movingAverage  weightedMovingAverage  emaSeries  cumsum
+//  Histogram        Histogram h(bins, lo, hi) or histogramAuto(x, n, rule): rules STURGES SQRT_RULE RICE SCOTT FD DOANE AUTO_RULE (NumPy's); counts, density, edges
+//  Regression       linearFit(x, y, n)  polyFit(x, y, n, degree)  olsFit(&X, y, intercept, weights): coefficients, standard errors, t and p values, R squared,
+//                   adjusted R squared, F test, residuals (QR based, no normal equations)
+//  Distributions    normal  student t (t)  chi-square (chi2)  F  gamma  beta  exponential  uniform  lognormal:  xxxPdf xxxCdf xxxSf (upper tail, accurate for p values)
+//                   xxxQuantile;  binomial  Poisson:  binomPmf binomCdf binomSf binomQuantile  poissonPmf ...;  parameters follow the name: normalCdf(x, mu, sigma)
+//  Special functions  erf erfc erfInv erfcInv gamma lgamma digamma beta lbeta incGammaP incGammaQ incBeta incBetaInv incGammaPInv   (1e-15 to 1e-13, up to 2e-12 for parameters of 1e5: see docs/ALGO.md)
+//  Tests            ttestOneSample  ttestTwoSample (Welch or pooled)  ttestPaired  chiSquareGof  chiSquareIndependence  mannWhitney  anovaOneWay
+//                   varianceTest  jarqueBera   each returns a TestResult { stat, pvalue, df, df2 }, tails TAIL_TWO / TAIL_LESS / TAIL_GREATER
+//  Intervals        meanCI  proportionCI (Wald, Wilson, Clopper-Pearson)  varianceCI  meanDiffCI  bootstrapCI
+//  Time series      autocovariance  autocorrelation(x, n, maxLag, out)  partialAutocorrelation  ljungBox
+//  Clustering       kmeans(data, n, dim, k, &rng, ...) (k-means++ and Lloyd, several restarts)   Pca (principal components through the symmetric eigen solver of matrix)
+//
+//  Example
+//    double x[8] = {2.1, 2.5, 3.1, 3.6, 4.0, 4.4, 5.2, 5.9};   double y[8] = {1.1, 1.7, 2.0, 2.8, 3.1, 3.9, 4.2, 5.0};
+//    double m = stats.mean(x, 8);   double sd = stats.stddev(x, 8, 1);   double med = stats.median(x, 8);
+//    stats.Regression r = stats.linearFit(x, y, 8);          // r.coef[0] + r.coef[1] * x, r.r2, r.residuals[i], r.pvalue[1]
+//    stats.TestResult t = stats.ttestTwoSample(x, 8, y, 8, false, stats.TAIL_TWO);     // t.stat, t.pvalue
+//    double p = stats.tSf(2.5, 7.0);   double q = stats.normalQuantile(0.975, 0.0, 1.0);        // 1.959963984540054
+//    r.dispose();
+//  The algorithms, accuracy, speed and tests are described in docs/ALGO.md.
+// =============================================================================
+import asys;
+import cmath;
+import dmath;
+import matrix;
+import rng;
+module stats;
+
+public const TAIL_TWO = 0;
+public const TAIL_LESS = -1;
+public const TAIL_GREATER = 1;
+
+public const STURGES = 1;                  // histogram bin rules
+public const SQRT_RULE = 2;
+public const RICE = 3;
+public const SCOTT = 4;
+public const FD = 5;                       // Freedman-Diaconis
+public const DOANE = 6;
+public const AUTO_RULE = 7;                // the larger number of bins of STURGES and FD (NumPy's "auto")
+
+public const CI_WALD = 0;                  // proportion confidence intervals
+public const CI_WILSON = 1;
+public const CI_CLOPPER_PEARSON = 2;
+
+private const SQRT_2PI = 2.5066282746310002;
+private const SQRT_2 = 1.4142135623730951;
+private const LN_SQRT_2PI = 0.9189385332046727;
+private const DBL_EPS = 2.220446049250313e-16;
+private const FPMIN = 1.0e-300;
+private const ROLL_REL = 1.0e-10;               // RollingStats: the running mean and variance are recomputed when their error bound exceeds this fraction
+
+// ---- helpers -------------------------------------------------------------------------------------------------------------------------------
+private double nanValue() { return __dbl(0x7FF8000000000000); }
+private double infValue() { return __dbl(0x7FF0000000000000); }
+private bool finite(double v) { return ((__bits(v) >> 52) & 0x7FF) != 0x7FF; }
+private bool isNan(double v) { return v != v; }
+private double absd(double v) { return v < 0.0 ? -v : v; }
+private double sqr(double v) { return v * v; }
+private void freeMem(void* p) { if (p != null) { asys.free((char*) p); } }
+private double* newDoubles(int n) { return (double*) asys.alloc((n < 1 ? 1 : n) * 8); }
+
+private bool hasNan(double* x, int n) {
+    for (int i = 0; i < n; i++) {
+        if (x[i] != x[i]) { return true; }
+    }
+    return false;
+}
+
+// ---- sorting ---------------------------------------------------------------------------------------------------------------------------------
+// Sorts n doubles in increasing order (introsort: quicksort with median of three, insertion sort for short parts, heap sort when the recursion gets too deep).
+// NaN must not be in the array (the order is undefined with NaN: the functions of this module check before they sort).
+public void sortDoubles(double* a, int n) {
+    if (a == null || n < 2) { return; }
+    int depth = 0;
+    int m = n;
+    while (m > 1) { depth += 2; m = m >> 1; }
+    introSort(a, 0, n - 1, depth);
+}
+
+private void insertionSort(double* a, int lo, int hi) {
+    for (int i = lo + 1; i <= hi; i++) {
+        double v = a[i];
+        int j = i - 1;
+        while (j >= lo && a[j] > v) {
+            a[j + 1] = a[j];
+            j--;
+        }
+        a[j + 1] = v;
+    }
+}
+
+private void heapSift(double* a, int lo, int root, int n) {
+    while (true) {
+        int child = 2 * root + 1;
+        if (child >= n) { return; }
+        if (child + 1 < n && a[lo + child + 1] > a[lo + child]) { child++; }
+        if (a[lo + root] >= a[lo + child]) { return; }
+        double t = a[lo + root];
+        a[lo + root] = a[lo + child];
+        a[lo + child] = t;
+        root = child;
+    }
+}
+
+private void heapSort(double* a, int lo, int hi) {
+    int n = hi - lo + 1;
+    for (int s = n / 2 - 1; s >= 0; s--) { heapSift(a, lo, s, n); }
+    for (int e = n - 1; e > 0; e--) {
+        double t = a[lo];
+        a[lo] = a[lo + e];
+        a[lo + e] = t;
+        heapSift(a, lo, 0, e);
+    }
+}
+
+private void introSort(double* a, int lo, int hi, int depth) {
+    while (hi - lo > 16) {
+        if (depth == 0) {
+            heapSort(a, lo, hi);
+            return;
+        }
+        depth--;
+        int mid = lo + (hi - lo) / 2;
+        // median of three to a[lo]
+        if (a[mid] < a[lo]) { double t = a[mid]; a[mid] = a[lo]; a[lo] = t; }
+        if (a[hi] < a[lo]) { double t = a[hi]; a[hi] = a[lo]; a[lo] = t; }
+        if (a[hi] < a[mid]) { double t = a[hi]; a[hi] = a[mid]; a[mid] = t; }
+        double pivot = a[mid];
+        int i = lo;
+        int j = hi;
+        while (i <= j) {
+            while (a[i] < pivot) { i++; }
+            while (a[j] > pivot) { j--; }
+            if (i <= j) {
+                double t = a[i];
+                a[i] = a[j];
+                a[j] = t;
+                i++;
+                j--;
+            }
+        }
+        // recurse into the smaller part, loop on the larger one
+        if (j - lo < hi - i) {
+            introSort(a, lo, j, depth);
+            lo = i;
+        } else {
+            introSort(a, i, hi, depth);
+            hi = j;
+        }
+    }
+    insertionSort(a, lo, hi);
+}
+
+// a sorted copy (null on NaN in the data or when memory is short)
+private double* sortedCopy(double* x, int n) {
+    if (x == null || n < 1 || hasNan(x, n)) { return null; }
+    double* c = newDoubles(n);
+    if (c == null) { return null; }
+    for (int i = 0; i < n; i++) { c[i] = x[i]; }
+    sortDoubles(c, n);
+    return c;
+}
+
+// ============================================================================================================================================
+//  Special functions
+// ============================================================================================================================================
+public double erf(double x) { return __dbl(::erf(__bits(x))); }
+public double erfc(double x) { return __dbl(::erfc(__bits(x))); }
+public double lgamma(double x) { return __dbl(::lgamma(__bits(x))); }
+public double gamma(double x) { return __dbl(::tgamma(__bits(x))); }
+
+// ln B(a, b) = lgamma(a) + lgamma(b) - lgamma(a + b), computed without cancellation for large arguments (Stirling series with the correction stirlerr) and
+// from the gamma function itself for small ones (R's algorithm)
+public double lbeta(double a, double b) {
+    if (a != a || b != b || a < 0.0 || b < 0.0) { return nanValue(); }
+    double p = (a < b) ? a : b;
+    double q = (a < b) ? b : a;
+    if (p == 0.0) { return infValue(); }
+    if (!finite(q)) { return -infValue(); }
+    if (p >= 10.0) {
+        double corr = stirlerr(p) + stirlerr(q) - stirlerr(p + q);
+        return dmath.log(q) * -0.5 + LN_SQRT_2PI + corr + (p - 0.5) * dmath.log(p / (p + q)) + q * dmath.log1p(-p / (p + q));
+    }
+    if (q >= 10.0) {
+        double corr = stirlerr(q) - stirlerr(p + q);
+        return lgamma(p) + corr + p - p * dmath.log(p + q) + (q - 0.5) * dmath.log1p(-p / (p + q));
+    }
+    if (p < 1.0e-306) { return lgamma(p) + (lgamma(q) - lgamma(p + q)); }
+    return dmath.log(gamma(p) * (gamma(q) / gamma(p + q)));
+}
+public double beta(double a, double b) { return dmath.exp(lbeta(a, b)); }
+
+// the digamma function psi(x) = d/dx ln Gamma(x) (recurrence up to x >= 10, then the asymptotic series; reflection for x < 0)
+public double digamma(double x) {
+    if (x != x) { return x; }
+    if (x <= 0.0 && dmath.floor(x) == x) { return nanValue(); }
+    if (x < 0.0) { return digamma(1.0 - x) - dmath.PI / dmath.tan(dmath.PI * x); }
+    double r = 0.0;
+    while (x < 10.0) {
+        r -= 1.0 / x;
+        x += 1.0;
+    }
+    double f = 1.0 / (x * x);
+    double t = f * (-1.0 / 12.0 + f * (1.0 / 120.0 + f * (-1.0 / 252.0 + f * (1.0 / 240.0 + f * (-1.0 / 132.0 + f * (691.0 / 32760.0 + f * (-1.0 / 12.0)))))));
+    return r + dmath.log(x) - 0.5 / x + t;
+}
+
+// the error of Stirling's formula: ln Gamma(n + 1) - ((n + 0.5) ln n - n + 0.5 ln(2 pi)) for n > 0, without cancellation
+// (Loader's saddle point method needs it: the plain difference of lgamma values loses digits for large n)
+private double stirlerr(double n) {
+    if (!(n > 0.0)) { return infValue(); }
+    double extra = 0.0;
+    // stirlerr(n) = stirlerr(n + 1) + sum u^(2k) / (2k + 1) with u = 1 / (2n + 1): step up to n >= 16, then the series
+    while (n < 16.0) {
+        double u = 1.0 / (2.0 * n + 1.0);
+        double u2 = u * u;
+        double term = u2;
+        double s = 0.0;
+        for (int k = 1; k < 200; k++) {
+            double add = term / (double) (2 * k + 1);
+            s += add;
+            if (add < 1.0e-19 * s) { break; }
+            term *= u2;
+        }
+        extra += s;
+        n += 1.0;
+    }
+    double n2 = n * n;
+    double s2;
+    if (n > 500.0) {
+        s2 = (1.0 / 12.0 - 1.0 / (360.0 * n2)) / n;
+    } else if (n > 80.0) {
+        s2 = (1.0 / 12.0 - (1.0 / 360.0 - 1.0 / (1260.0 * n2)) / n2) / n;
+    } else if (n > 35.0) {
+        s2 = (1.0 / 12.0 - (1.0 / 360.0 - (1.0 / 1260.0 - 1.0 / (1680.0 * n2)) / n2) / n2) / n;
+    } else {
+        s2 = (1.0 / 12.0 - (1.0 / 360.0 - (1.0 / 1260.0 - (1.0 / 1680.0 - 1.0 / (1188.0 * n2)) / n2) / n2) / n2) / n;
+    }
+    return s2 + extra;
+}
+
+// the deviance term x ln(x / np) + np - x without cancellation when x is close to np
+private double bd0(double x, double np) {
+    if (!finite(x) || !finite(np) || np == 0.0) { return nanValue(); }
+    if (absd(x - np) < 0.1 * (x + np)) {
+        double v = (x - np) / (x + np);
+        double s = (x - np) * v;
+        if (absd(s) < 2.2250738585072014e-308) { return s; }
+        double ej = 2.0 * x * v;
+        v = v * v;
+        for (int j = 1; j < 1000; j++) {
+            ej *= v;
+            double s1 = s + ej / (double) (2 * j + 1);
+            if (s1 == s) { return s1; }
+            s = s1;
+        }
+        return s;
+    }
+    return x * dmath.log(x / np) + np - x;
+}
+
+// Poisson probability of x (x may be fractional) with mean lambda, by Loader's algorithm
+private double dpoisRaw(double x, double lambda) {
+    if (lambda == 0.0) { return (x == 0.0) ? 1.0 : 0.0; }
+    if (!finite(lambda)) { return 0.0; }
+    if (x < 0.0) { return 0.0; }
+    if (x <= lambda * 2.2250738585072014e-308) { return dmath.exp(-lambda); }
+    if (lambda < x * 2.2250738585072014e-308) {
+        if (!finite(x)) { return 0.0; }
+        return dmath.exp(-lambda + x * dmath.log(lambda) - lgamma(x + 1.0));
+    }
+    return dmath.exp(-stirlerr(x) - bd0(x, lambda)) / dmath.sqrt(2.0 * dmath.PI * x);
+}
+
+// binomial probability of x successes in n trials, success probability p (q = 1 - p), by Loader's algorithm; nmx = n - x must be given exactly (the caller often knows it
+// without a subtraction: for the incomplete beta function n = a + b and nmx = b, and a + b - a would lose the digits of b when a is huge)
+private double dbinomRawC(double x, double nmx, double n, double p, double q) {
+    if (p == 0.0) { return (x == 0.0) ? 1.0 : 0.0; }
+    if (q == 0.0) { return (x == n) ? 1.0 : 0.0; }
+    if (x < 0.0 || nmx < 0.0) { return 0.0; }
+    if (x == 0.0) {
+        if (n == 0.0) { return 1.0; }
+        double lc = (p < 0.1) ? -bd0(n, n * q) - n * p : n * dmath.log(q);
+        return dmath.exp(lc);
+    }
+    if (nmx == 0.0) {
+        double lc = (q < 0.1) ? -bd0(n, n * p) - n * q : n * dmath.log(p);
+        return dmath.exp(lc);
+    }
+    double lc = stirlerr(n) - stirlerr(x) - stirlerr(nmx) - bd0(x, n * p) - bd0(nmx, n * q);
+    double ratio = (2.0 * x > n) ? dmath.log(nmx / n) : dmath.log1p(-x / n);         // log(1 - x / n) without cancellation when x is close to n
+    double lf = 2.0 * LN_SQRT_2PI + dmath.log(x) + ratio;
+    return dmath.exp(lc - 0.5 * lf);
+}
+
+private double dbinomRaw(double x, double n, double p, double q) {
+    if (x > n) { return 0.0; }
+    return dbinomRawC(x, n - x, n, p, q);
+}
+
+// ---- incomplete gamma ------------------------------------------------------------------------------------------------------------------------
+// P(a, x) and Q(a, x) = 1 - P(a, x): the regularized lower and upper incomplete gamma functions, both computed without cancellation
+private void incGammaBoth(double a, double x, double* P, double* Q) {
+    if (a != a || x != x || !(a > 0.0) || x < 0.0) {
+        *P = nanValue();
+        *Q = nanValue();
+        return;
+    }
+    if (x == 0.0) {
+        *P = 0.0;
+        *Q = 1.0;
+        return;
+    }
+    if (!finite(x)) {
+        *P = 1.0;
+        *Q = 0.0;
+        return;
+    }
+    double pre = a * dpoisRaw(a, x);                       // x^a e^-x / Gamma(a), by Loader's saddle point method (accurate for large a)
+    if (x < a + 1.0) {
+        double ap = a;
+        double del = 1.0 / a;
+        double sum = del;
+        bool converged = false;
+        for (int n = 0; n < 1000000; n++) {
+            ap += 1.0;
+            del *= x / ap;
+            sum += del;
+            if (absd(del) < absd(sum) * 1.0e-17) { converged = true; break; }
+        }
+        if (!converged) {                                  // a above about 1e12: the series needs more than 10^6 terms; NaN is better than a wrong number
+            *P = nanValue();
+            *Q = nanValue();
+            return;
+        }
+        double p = sum * pre;
+        if (p > 1.0) { p = 1.0; }
+        *P = p;
+        *Q = 1.0 - p;
+    } else {
+        double b = x + 1.0 - a;
+        double c = 1.0 / FPMIN;
+        double d = 1.0 / b;
+        double h = d;
+        bool converged = false;
+        for (int i = 1; i < 1000000; i++) {
+            double an = -(double) i * ((double) i - a);
+            b += 2.0;
+            d = an * d + b;
+            if (absd(d) < FPMIN) { d = FPMIN; }
+            c = b + an / c;
+            if (absd(c) < FPMIN) { c = FPMIN; }
+            d = 1.0 / d;
+            double del = d * c;
+            h *= del;
+            if (absd(del - 1.0) < 1.0e-16) { converged = true; break; }
+        }
+        if (!converged) {
+            *P = nanValue();
+            *Q = nanValue();
+            return;
+        }
+        double q = pre * h;
+        if (q > 1.0) { q = 1.0; }
+        *Q = q;
+        *P = 1.0 - q;
+    }
+}
+
+// the regularized lower incomplete gamma function P(a, x) = (1 / Gamma(a)) integral from 0 to x of t^(a-1) e^-t dt
+public double incGammaP(double a, double x) {
+    double p;
+    double q;
+    incGammaBoth(a, x, &p, &q);
+    return p;
+}
+
+// the regularized upper incomplete gamma function Q(a, x) = 1 - P(a, x) (accurate when it is tiny)
+public double incGammaQ(double a, double x) {
+    double p;
+    double q;
+    incGammaBoth(a, x, &p, &q);
+    return q;
+}
+
+// ---- incomplete beta -------------------------------------------------------------------------------------------------------------------------
+private double betaCf(double a, double b, double x) {
+    double qab = a + b;
+    double qap = a + 1.0;
+    double qam = a - 1.0;
+    double c = 1.0;
+    double d = 1.0 - qab * x / qap;
+    if (absd(d) < FPMIN) { d = FPMIN; }
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m < 1000000; m++) {
+        double m2 = 2.0 * (double) m;
+        double aa = (double) m * (b - (double) m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if (absd(d) < FPMIN) { d = FPMIN; }
+        c = 1.0 + aa / c;
+        if (absd(c) < FPMIN) { c = FPMIN; }
+        d = 1.0 / d;
+        h *= d * c;
+        aa = -(a + (double) m) * (qab + (double) m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if (absd(d) < FPMIN) { d = FPMIN; }
+        c = 1.0 + aa / c;
+        if (absd(c) < FPMIN) { c = FPMIN; }
+        d = 1.0 / d;
+        double del = d * c;
+        h *= del;
+        if (absd(del - 1.0) < 1.0e-16) { return h; }
+    }
+    return nanValue();                                     // no convergence within 10^6 terms (a or b above about 1e12): NaN, never a wrong number
+}
+
+// I_x(a, b) and 1 - I_x(a, b), both without cancellation; y must be 1 - x (the caller computes it from the exact data where possible)
+private void incBetaBoth(double x, double y, double a, double b, double* lo, double* up) {
+    if (a != a || b != b || x != x || y != y || !(a > 0.0) || !(b > 0.0) || x < 0.0 || y < 0.0) {
+        *lo = nanValue();
+        *up = nanValue();
+        return;
+    }
+    if (x == 0.0) {
+        *lo = 0.0;
+        *up = 1.0;
+        return;
+    }
+    if (y == 0.0) {
+        *lo = 1.0;
+        *up = 0.0;
+        return;
+    }
+    double bt = dbinomRawC(a, b, a + b, x, y) * a * b / (a + b);          // x^a y^b / B(a, b) through the binomial probability (Loader)
+    if (x < (a + 1.0) / (a + b + 2.0)) {
+        double v = bt * betaCf(a, b, x) / a;
+        if (v > 1.0) { v = 1.0; }
+        *lo = v;
+        *up = 1.0 - v;
+    } else {
+        double v = bt * betaCf(b, a, y) / b;
+        if (v > 1.0) { v = 1.0; }
+        *up = v;
+        *lo = 1.0 - v;
+    }
+}
+
+// the regularized incomplete beta function I_x(a, b) for 0 <= x <= 1
+public double incBeta(double x, double a, double b) {
+    double lo;
+    double up;
+    incBetaBoth(x, 1.0 - x, a, b, &lo, &up);
+    return lo;
+}
+
+// ============================================================================================================================================
+//  Normal distribution
+// ============================================================================================================================================
+// P(Z > z) for the standard normal Z. For |z| >= 2 the argument z / sqrt(2) of erfc is computed as a sum of two doubles (an exact product by Dekker's method plus the
+// error of the constant sqrt(2) / 2), because erfc(t) changes by the relative amount 2 t dt: the rounding of t alone would cost 1e-16 z^2 in the tail (1.5e-14 at z = 10)
+private double normalTail(double z) {
+    if (z != z) { return z; }
+    double c = 0.7071067811865476;
+    if (z < 2.0) { return 0.5 * erfc(z * c); }
+    if (z > 38.6) { return 0.0; }
+    double p = z * c;
+    // z * c = p + e exactly: split both factors into halves of 26 bits
+    double zs = 134217729.0 * z;
+    double zh = zs - (zs - z);
+    double zl = z - zh;
+    double cs = 134217729.0 * c;
+    double ch = cs - (cs - c);
+    double cl = c - ch;
+    double e = ((zh * ch - p) + zh * cl + zl * ch) + zl * cl;
+    double delta = e + z * -4.833646656726457e-17;          // z / sqrt(2) = p + delta
+    double ec = erfc(p);
+    if (!(ec > 0.0)) { return 0.0; }
+    double slope = 1.1283791670955126 * dmath.exp(-p * p) / ec;       // -d ln erfc / dt
+    return 0.5 * ec * (1.0 - slope * delta);
+}
+
+public double stdNormalCdf(double x) { return normalTail(-x); }
+public double stdNormalSf(double x) { return normalTail(x); }
+public double stdNormalPdf(double x) { return dmath.exp(-0.5 * x * x) / SQRT_2PI; }
+
+// the inverse of the standard normal cdf: Acklam-free: a rational start (Abramowitz and Stegun 26.2.23) polished by Halley steps on the exact erfc based cdf
+public double stdNormalQuantile(double p) {
+    if (p != p || p < 0.0 || p > 1.0) { return nanValue(); }
+    if (p == 0.0) { return -infValue(); }
+    if (p == 1.0) { return infValue(); }
+    if (p == 0.5) { return 0.0; }
+    if (p > 0.5) { return -stdNormalQuantile(1.0 - p); }
+    double t = dmath.sqrt(-2.0 * dmath.log(p));
+    double x = -(t - (2.515517 + t * (0.802853 + t * 0.010328)) / (1.0 + t * (1.432788 + t * (0.189269 + t * 0.001308))));
+    for (int it = 0; it < 8; it++) {
+        double e = stdNormalCdf(x) - p;
+        double u = e * SQRT_2PI * dmath.exp(0.5 * x * x);
+        double dx = u / (1.0 + 0.5 * x * u);
+        x -= dx;
+        if (absd(dx) <= 1.0e-16 * absd(x)) { break; }
+    }
+    return x;
+}
+
+public double normalPdf(double x, double mu, double sigma) {
+    if (!(sigma > 0.0)) { return nanValue(); }
+    double z = (x - mu) / sigma;
+    return dmath.exp(-0.5 * z * z) / (sigma * SQRT_2PI);
+}
+
+public double normalLogPdf(double x, double mu, double sigma) {
+    if (!(sigma > 0.0)) { return nanValue(); }
+    double z = (x - mu) / sigma;
+    return -0.5 * z * z - dmath.log(sigma) - LN_SQRT_2PI;
+}
+
+public double normalCdf(double x, double mu, double sigma) {
+    if (!(sigma > 0.0)) { return nanValue(); }
+    return stdNormalCdf((x - mu) / sigma);
+}
+
+public double normalSf(double x, double mu, double sigma) {
+    if (!(sigma > 0.0)) { return nanValue(); }
+    return stdNormalSf((x - mu) / sigma);
+}
+
+public double normalQuantile(double p, double mu, double sigma) {
+    if (!(sigma > 0.0)) { return nanValue(); }
+    return mu + sigma * stdNormalQuantile(p);
+}
+
+// the inverse error function: erf(erfInv(y)) = y for -1 < y < 1
+public double erfInv(double y) {
+    if (y != y || y < -1.0 || y > 1.0) { return nanValue(); }
+    if (y == 0.0) { return y; }
+    if (y == 1.0) { return infValue(); }
+    if (y == -1.0) { return -infValue(); }
+    double ay = absd(y);
+    double r;
+    if (ay > 0.5) {
+        r = erfcInv(1.0 - ay);
+    } else {
+        double x = ay * 0.8862269254527580;           // sqrt(pi) / 2 * y
+        for (int it = 0; it < 12; it++) {
+            double dx = (erf(x) - ay) / (1.1283791670955126 * dmath.exp(-x * x));
+            x -= dx;
+            if (absd(dx) <= 1.0e-16 * x) { break; }
+        }
+        r = x;
+    }
+    return (y < 0.0) ? -r : r;
+}
+
+// the inverse complementary error function for 0 < q < 2
+public double erfcInv(double q) {
+    if (q != q || q < 0.0 || q > 2.0) { return nanValue(); }
+    if (q == 0.0) { return infValue(); }
+    if (q == 2.0) { return -infValue(); }
+    if (q > 1.0) { return -erfcInv(2.0 - q); }
+    if (q > 0.5) { return erfInv(1.0 - q); }
+    return -stdNormalQuantile(0.5 * q) / SQRT_2;
+}
+
+// ============================================================================================================================================
+//  Quantile search for continuous distributions (safeguarded Newton: a bracket, Newton steps with the density, bisection when a step leaves the bracket)
+// ============================================================================================================================================
+private const KIND_T = 1;
+private const KIND_CHI2 = 2;
+private const KIND_F = 3;
+private const KIND_GAMMA = 4;
+private const KIND_BETA = 5;
+
+private void distBoth(int kind, double x, double a, double b, double* lo, double* up) {
+    if (kind == KIND_T && a >= 1.0e5 && finite(a) && x * x < 2.0e-4 * a) {
+        // Large degrees of freedom: the incomplete beta function loses digits there (its continued fraction needs about sqrt(df) terms and rounds in every one: the error is
+        // 1e-12 at df = 1e5 and 1e-9 at 1e8), the expansion of the t distribution in 1 / df does not. With the Cornish-Fisher polynomials (Abramowitz and Stegun 26.7.5)
+        //   g1 = (t^3 + t) / 4,  g2 = (5 t^5 + 16 t^3 + 3 t) / 96,  g3 = (3 t^7 + 19 t^5 + 17 t^3 - 15 t) / 384
+        // the normal quantile z of the t value (the inverse series: z = t + a1 / df + a2 / df^2 + a3 / df^3) has a1 = -g1, a2 = g1 g1' - g2, a3 = g2' g1 - g3 - g1' a2 - g1'' g1^2 / 2.
+        // In the domain t^2 < 2e-4 df the first neglected term is below 1e-14 relative
+        double ax = absd(x);
+        double x2 = ax * ax;
+        double g1 = (x2 * ax + ax) * 0.25;
+        double g1d = (3.0 * x2 + 1.0) * 0.25;
+        double g1dd = 1.5 * ax;
+        double g2 = ((5.0 * x2 * x2 + 16.0 * x2) * ax + 3.0 * ax) / 96.0;
+        double g2d = (25.0 * x2 * x2 + 48.0 * x2 + 3.0) / 96.0;
+        double g3 = ((3.0 * x2 * x2 * x2 + 19.0 * x2 * x2 + 17.0 * x2) * ax - 15.0 * ax) / 384.0;
+        double a2 = g1 * g1d - g2;
+        double a3 = g2d * g1 - g3 - g1d * a2 - 0.5 * g1dd * g1 * g1;
+        double z = ax - g1 / a + a2 / (a * a) + a3 / (a * a * a);
+        double tail = normalTail(z);
+        if (x >= 0.0) { *up = tail; *lo = 1.0 - tail; } else { *lo = tail; *up = 1.0 - tail; }
+        return;
+    }
+    if (kind == KIND_T && absd(x) > 1.0e150 && x * x > 1.0e18 * a) {
+        // t^2 would overflow (or the beta argument v / (v + t^2) underflow): far out the tail is the power law C |x|^-df with C = df^((df - 2) / 2) / B(df / 2, 1 / 2),
+        // exact to double precision once t^2 > 1e18 df
+        double tail = dmath.exp(0.5 * (a - 2.0) * dmath.log(a) - lbeta(a * 0.5, 0.5) - a * dmath.log(absd(x)));
+        if (x >= 0.0) { *up = tail; *lo = 1.0; } else { *lo = tail; *up = 1.0; }
+        return;
+    }
+    if (kind == KIND_T) {
+        double v = a;
+        double xx = x * x;
+        double den = v + xx;
+        double half;
+        double other;
+        incBetaBoth(v / den, xx / den, v * 0.5, 0.5, &half, &other);      // P(|T| > |x|) = I_{v / (v + x^2)}(v / 2, 1 / 2) = half
+        double tail = 0.5 * half;
+        if (x >= 0.0) { *up = tail; *lo = 1.0 - tail; } else { *lo = tail; *up = 1.0 - tail; }
+    } else if (kind == KIND_CHI2) {
+        incGammaBoth(a * 0.5, x * 0.5, lo, up);
+    } else if (kind == KIND_GAMMA) {
+        incGammaBoth(a, x / b, lo, up);
+    } else if (kind == KIND_F) {
+        double den = a * x + b;
+        incBetaBoth(a * x / den, b / den, a * 0.5, b * 0.5, lo, up);
+    } else {
+        incBetaBoth(x, 1.0 - x, a, b, lo, up);
+    }
+}
+
+private double distPdf(int kind, double x, double a, double b) {
+    if (kind == KIND_T) { return tPdf(x, a); }
+    if (kind == KIND_CHI2) { return chi2Pdf(x, a); }
+    if (kind == KIND_GAMMA) { return gammaPdf(x, a, b); }
+    if (kind == KIND_F) { return fPdf(x, a, b); }
+    return betaPdf(x, a, b);
+}
+
+// finds x with cdf(x) = p; (lowBound, highBound) is the support, guess a starting point
+private double solveQuantile(int kind, double p, double a, double b, double lowBound, double highBound, double guess) {
+    bool upper = p > 0.5;                                  // work with the smaller tail
+    double target = upper ? 1.0 - p : p;
+    double lo = lowBound;
+    double hi = highBound;
+    double x = guess;
+    if (!(x > lo) || !(x < hi)) { x = (finite(lo) && finite(hi)) ? 0.5 * (lo + hi) : (finite(lo) ? lo + 1.0 : (finite(hi) ? hi - 1.0 : 0.0)); }
+    for (int it = 0; it < 400; it++) {
+        double cl;
+        double cu;
+        distBoth(kind, x, a, b, &cl, &cu);
+        double f = upper ? target - cu : cl - target;       // increasing in x
+        if (f == 0.0) { return x; }
+        if (f < 0.0) { lo = x; } else { hi = x; }
+        double pdf = distPdf(kind, x, a, b);
+        double nx = x;
+        bool ok = false;
+        if (pdf > 0.0 && finite(pdf)) {
+            nx = x - f / pdf;
+            ok = nx > lo && nx < hi;
+        }
+        if (!ok) {
+            if (finite(lo) && finite(hi)) {
+                if (lo > 0.0 && hi / lo > 4.0) {
+                    nx = dmath.sqrt(lo) * dmath.sqrt(hi);
+                } else if (lo == 0.0 && hi > 0.0 && lowBound == 0.0) {
+                    nx = hi * 0.0625;
+                } else {
+                    nx = 0.5 * (lo + hi);
+                }
+            } else if (!finite(hi)) {
+                nx = (x > 0.0) ? 2.0 * x : x + 1.0 + absd(x);
+            } else {
+                nx = (x < 0.0) ? 2.0 * x : x - 1.0 - absd(x);
+            }
+        }
+        if (absd(nx - x) <= 4.0 * DBL_EPS * absd(nx)) { return nx; }
+        if (finite(lo) && finite(hi) && hi - lo <= 4.0 * DBL_EPS * absd(nx)) { return nx; }
+        x = nx;
+    }
+    return x;
+}
+
+// ============================================================================================================================================
+//  Student t, chi-square, F, gamma, beta, exponential, uniform, lognormal
+// ============================================================================================================================================
+public double tPdf(double x, double df) {
+    if (x != x || !(df > 0.0)) { return nanValue(); }
+    if (!finite(x)) { return 0.0; }
+    if (!finite(df)) { return stdNormalPdf(x); }
+    // Loader's saddle point formula (the method of R's dt): no cancellation between lgamma values, accurate for any df
+    double t = -bd0(df * 0.5, (df + 1.0) * 0.5) + stirlerr((df + 1.0) * 0.5) - stirlerr(df * 0.5);
+    double x2n = x * x / df;
+    double ax = 0.0;
+    double lx2n;
+    double u;
+    bool lrg = x2n > 1.0 / DBL_EPS;
+    if (lrg) {
+        ax = absd(x);
+        lx2n = dmath.log(ax) - dmath.log(df) * 0.5;
+        u = df * lx2n;
+    } else if (x2n > 0.2) {
+        lx2n = dmath.log(1.0 + x2n) * 0.5;
+        u = df * lx2n;
+    } else {
+        lx2n = dmath.log1p(x2n) * 0.5;
+        u = -bd0(df * 0.5, (df + x * x) * 0.5) + x * x * 0.5;
+    }
+    double isq = lrg ? dmath.sqrt(df) / ax : dmath.exp(-lx2n);
+    return dmath.exp(t - u) * (1.0 / SQRT_2PI) * isq;
+}
+
+public double tCdf(double x, double df) {
+    if (x != x || !(df > 0.0)) { return nanValue(); }
+    if (!finite(df)) { return stdNormalCdf(x); }
+    if (!finite(x)) { return (x > 0.0) ? 1.0 : 0.0; }
+    double lo;
+    double up;
+    distBoth(KIND_T, x, df, 0.0, &lo, &up);
+    return lo;
+}
+
+// P(T > x): the upper tail, accurate when it is tiny (use it for p values: p = 2 * tSf(|t|, df))
+public double tSf(double x, double df) {
+    if (x != x || !(df > 0.0)) { return nanValue(); }
+    if (!finite(df)) { return stdNormalSf(x); }
+    if (!finite(x)) { return (x > 0.0) ? 0.0 : 1.0; }
+    double lo;
+    double up;
+    distBoth(KIND_T, x, df, 0.0, &lo, &up);
+    return up;
+}
+
+// The quantile (inverse of tCdf). df = 1 (Cauchy) and df = 2 use their closed forms, which stay accurate for any p; a tail below 1e-12 is solved on the
+// logarithmic scale (the tail is a power law x^-df far out, so Newton's method on log x converges in a few steps even for p = 1e-300). A quantile beyond the
+// double range (df < 1 and a tiny p) is -infinity or infinity.
+public double tQuantile(double p, double df) {
+    if (p != p || p < 0.0 || p > 1.0 || !(df > 0.0)) { return nanValue(); }
+    if (p == 0.0) { return -infValue(); }
+    if (p == 1.0) { return infValue(); }
+    if (p == 0.5) { return 0.0; }
+    if (!finite(df)) { return stdNormalQuantile(p); }
+    double q = (p < 0.5) ? p : 1.0 - p;                                       // the smaller tail (1 - p is exact for p >= 0.5)
+    double sgn = (p < 0.5) ? -1.0 : 1.0;
+    if (df == 1.0) {                                                          // Cauchy: x = cot(pi q), written so that nothing cancels
+        if (q > 0.25) { return sgn * dmath.tan(dmath.PI * (0.5 - q)); }
+        return sgn / dmath.tan(dmath.PI * q);
+    }
+    if (df == 2.0) { return sgn * (1.0 - 2.0 * q) / dmath.sqrt(2.0 * q * (1.0 - q)); }
+    if (q < 1.0e-12) { return sgn * tTailQuantile(q, df); }
+    double z = stdNormalQuantile(p);
+    // Cornish-Fisher start
+    double g = z + (z * z * z + z) / (4.0 * df) + (5.0 * dmath.pow(z, 5.0) + 16.0 * z * z * z + 3.0 * z) / (96.0 * df * df);
+    return solveQuantile(KIND_T, p, df, 0.0, -infValue(), infValue(), g);
+}
+
+// x > 0 with P(T > x) = q for a tiny q (the quantile of the upper tail). P(T > x) <= C x^-df for every x with C = df^((df - 2) / 2) / B(df / 2, 1 / 2), and
+// the two agree to double precision once x^2 > 1e18 df, so the power law gives a bracket and, far out, the answer itself. Otherwise Newton's method on
+// log(tail) as a function of log x (nearly a straight line, so it does not matter that the start is a rough Cornish-Fisher value).
+private double tTailQuantile(double q, double df) {
+    double lq = dmath.log(q);
+    double lc = 0.5 * (df - 2.0) * dmath.log(df) - lbeta(df * 0.5, 0.5);
+    double u0 = (lc - lq) / df;                       // log x of the power law
+    if (u0 > 709.0) { return infValue(); }
+    double xhi = dmath.exp(u0);
+    if (xhi * xhi > 1.0e18 * df) { return xhi; }
+    double xlo = 0.0;
+    double z = -stdNormalQuantile(q);
+    double x = z + (z * z * z + z) / (4.0 * df) + (5.0 * z * z * z * z * z + 16.0 * z * z * z + 3.0 * z) / (96.0 * df * df);
+    if (!(x > 0.0) || !(x < xhi)) { x = 0.5 * xhi; }
+    for (int it = 0; it < 200; it++) {
+        double cl;
+        double cu;
+        distBoth(KIND_T, x, df, 0.0, &cl, &cu);
+        double pdf = tPdf(x, df);
+        double nx;
+        if (cu > 0.0 && pdf > 0.0 && finite(pdf)) {
+            double g = dmath.log(cu) - lq;            // > 0: x is too small
+            if (g > 0.0) { xlo = x; } else { xhi = x; }
+            double e = g * cu / (pdf * x);            // the Newton step in log x
+            if (e > 30.0) { e = 30.0; }
+            if (e < -30.0) { e = -30.0; }
+            nx = x * dmath.exp(e);
+            if (absd(e) <= 1.0e-8 && nx > xlo && nx < xhi * (1.0 + 1.0e-7)) { return nx; }
+        } else {
+            xhi = x;                                  // the tail underflowed: x is far too large
+            nx = x;
+        }
+        if (!(nx > xlo) || !(nx < xhi)) { nx = (xlo > 0.0) ? dmath.sqrt(xlo) * dmath.sqrt(xhi) : 0.5 * xhi; }
+        if (nx == x) { return x; }
+        x = nx;
+    }
+    return x;
+}
+
+public double chi2Pdf(double x, double k) {
+    if (x != x || !(k > 0.0)) { return nanValue(); }
+    return gammaPdf(x, 0.5 * k, 2.0);
+}
+
+public double chi2Cdf(double x, double k) {
+    if (x != x || !(k > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 0.0; }
+    return incGammaP(0.5 * k, 0.5 * x);
+}
+
+public double chi2Sf(double x, double k) {
+    if (x != x || !(k > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 1.0; }
+    return incGammaQ(0.5 * k, 0.5 * x);
+}
+
+public double chi2Quantile(double p, double k) {
+    if (p != p || p < 0.0 || p > 1.0 || !(k > 0.0)) { return nanValue(); }
+    if (p == 0.0) { return 0.0; }
+    if (p == 1.0) { return infValue(); }
+    double z = stdNormalQuantile(p);
+    double w = 2.0 / (9.0 * k);
+    double g = k * dmath.pow(1.0 - w + z * dmath.sqrt(w), 3.0);        // Wilson-Hilferty
+    if (!(g > 0.0)) { g = k * 0.01 + 1.0e-8; }
+    return solveQuantile(KIND_CHI2, p, k, 0.0, 0.0, infValue(), g);
+}
+
+public double gammaPdf(double x, double shape, double scale) {
+    if (x != x || !(shape > 0.0) || !(scale > 0.0)) { return nanValue(); }
+    if (x < 0.0) { return 0.0; }
+    if (x == 0.0) {
+        if (shape < 1.0) { return infValue(); }
+        if (shape > 1.0) { return 0.0; }
+        return 1.0 / scale;
+    }
+    if (shape < 1.0) { return dpoisRaw(shape, x / scale) * shape / x; }
+    return dpoisRaw(shape - 1.0, x / scale) / scale;
+}
+
+public double gammaCdf(double x, double shape, double scale) {
+    if (x != x || !(shape > 0.0) || !(scale > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 0.0; }
+    return incGammaP(shape, x / scale);
+}
+
+public double gammaSf(double x, double shape, double scale) {
+    if (x != x || !(shape > 0.0) || !(scale > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 1.0; }
+    return incGammaQ(shape, x / scale);
+}
+
+public double gammaQuantile(double p, double shape, double scale) {
+    if (p != p || p < 0.0 || p > 1.0 || !(shape > 0.0) || !(scale > 0.0)) { return nanValue(); }
+    if (p == 0.0) { return 0.0; }
+    if (p == 1.0) { return infValue(); }
+    double z = stdNormalQuantile(p);
+    double w = 1.0 / (9.0 * shape);
+    double g = shape * dmath.pow(1.0 - w + z * dmath.sqrt(w), 3.0);
+    if (!(g > 0.0)) { g = shape * 0.01 + 1.0e-8; }
+    return scale * solveQuantile(KIND_GAMMA, p, shape, 1.0, 0.0, infValue(), g);
+}
+
+public double fPdf(double x, double d1, double d2) {
+    if (x != x || !(d1 > 0.0) || !(d2 > 0.0)) { return nanValue(); }
+    if (x < 0.0) { return 0.0; }
+    if (x == 0.0) {
+        if (d1 < 2.0) { return infValue(); }
+        if (d1 > 2.0) { return 0.0; }
+        return 1.0;
+    }
+    double lg = 0.5 * d1 * dmath.log(d1) + 0.5 * d2 * dmath.log(d2) + (0.5 * d1 - 1.0) * dmath.log(x)
+                - 0.5 * (d1 + d2) * dmath.log(d2 + d1 * x) - lbeta(0.5 * d1, 0.5 * d2);
+    return dmath.exp(lg);
+}
+
+public double fCdf(double x, double d1, double d2) {
+    if (x != x || !(d1 > 0.0) || !(d2 > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 0.0; }
+    if (!finite(x)) { return 1.0; }
+    double lo;
+    double up;
+    distBoth(KIND_F, x, d1, d2, &lo, &up);
+    return lo;
+}
+
+public double fSf(double x, double d1, double d2) {
+    if (x != x || !(d1 > 0.0) || !(d2 > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 1.0; }
+    if (!finite(x)) { return 0.0; }
+    double lo;
+    double up;
+    distBoth(KIND_F, x, d1, d2, &lo, &up);
+    return up;
+}
+
+public double fQuantile(double p, double d1, double d2) {
+    if (p != p || p < 0.0 || p > 1.0 || !(d1 > 0.0) || !(d2 > 0.0)) { return nanValue(); }
+    if (p == 0.0) { return 0.0; }
+    if (p == 1.0) { return infValue(); }
+    // start from the beta quantile relation F = d2 y / (d1 (1 - y)) with y = Beta(d1 / 2, d2 / 2) quantile
+    double y = betaQuantile(p, 0.5 * d1, 0.5 * d2);
+    double g = (y > 0.0 && y < 1.0) ? d2 * y / (d1 * (1.0 - y)) : 1.0;
+    if (!(g > 0.0) || !finite(g)) { g = 1.0; }
+    return solveQuantile(KIND_F, p, d1, d2, 0.0, infValue(), g);
+}
+
+public double betaPdf(double x, double a, double b) {
+    if (x != x || !(a > 0.0) || !(b > 0.0)) { return nanValue(); }
+    if (x < 0.0 || x > 1.0) { return 0.0; }
+    if (x == 0.0) {
+        if (a < 1.0) { return infValue(); }
+        if (a > 1.0) { return 0.0; }
+        return b;
+    }
+    if (x == 1.0) {
+        if (b < 1.0) { return infValue(); }
+        if (b > 1.0) { return 0.0; }
+        return a;
+    }
+    double lv = (a - 1.0) * dmath.log(x) + (b - 1.0) * dmath.log1p(-x) - lbeta(a, b);
+    return dmath.exp(lv);
+}
+
+public double betaCdf(double x, double a, double b) {
+    if (x != x || !(a > 0.0) || !(b > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 0.0; }
+    if (x >= 1.0) { return 1.0; }
+    return incBeta(x, a, b);
+}
+
+public double betaSf(double x, double a, double b) {
+    if (x != x || !(a > 0.0) || !(b > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 1.0; }
+    if (x >= 1.0) { return 0.0; }
+    double lo;
+    double up;
+    incBetaBoth(x, 1.0 - x, a, b, &lo, &up);
+    return up;
+}
+
+// the inverse of the regularized incomplete beta function: x with I_x(a, b) = p
+public double betaQuantile(double p, double a, double b) {
+    if (p != p || p < 0.0 || p > 1.0 || !(a > 0.0) || !(b > 0.0)) { return nanValue(); }
+    if (p == 0.0) { return 0.0; }
+    if (p == 1.0) { return 1.0; }
+    // start: Abramowitz and Stegun 26.5.22 for a, b >= 1, the power law near the ends otherwise
+    double x;
+    if (a >= 1.0 && b >= 1.0) {
+        double pp = (p < 0.5) ? p : 1.0 - p;
+        double t = dmath.sqrt(-2.0 * dmath.log(pp));
+        double z = (2.30753 + t * 0.27061) / (1.0 + t * (0.99229 + t * 0.04481)) - t;
+        if (p < 0.5) { z = -z; }
+        double al = (z * z - 3.0) / 6.0;
+        double h = 2.0 / (1.0 / (2.0 * a - 1.0) + 1.0 / (2.0 * b - 1.0));
+        double w = z * dmath.sqrt(al + h) / h - (1.0 / (2.0 * b - 1.0) - 1.0 / (2.0 * a - 1.0)) * (al + 5.0 / 6.0 - 2.0 / (3.0 * h));
+        x = a / (a + b * dmath.exp(2.0 * w));
+    } else {
+        double lna = dmath.log(a / (a + b));
+        double lnb = dmath.log(b / (a + b));
+        double t = dmath.exp(a * lna) / a;
+        double u = dmath.exp(b * lnb) / b;
+        double w = t + u;
+        if (p < t / w) { x = dmath.pow(a * w * p, 1.0 / a); } else { x = 1.0 - dmath.pow(b * w * (1.0 - p), 1.0 / b); }
+    }
+    if (!(x > 0.0) || !(x < 1.0)) { x = 0.5; }
+    return solveQuantile(KIND_BETA, p, a, b, 0.0, 1.0, x);
+}
+
+// the inverse of the regularized lower incomplete gamma function: x with P(a, x) = p
+public double incGammaPInv(double a, double p) { return gammaQuantile(p, a, 1.0); }
+
+// the inverse of incBeta(x, a, b)
+public double incBetaInv(double p, double a, double b) { return betaQuantile(p, a, b); }
+
+public double expPdf(double x, double rate) {
+    if (x != x || !(rate > 0.0)) { return nanValue(); }
+    if (x < 0.0) { return 0.0; }
+    return rate * dmath.exp(-rate * x);
+}
+
+public double expCdf(double x, double rate) {
+    if (x != x || !(rate > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 0.0; }
+    return -dmath.expm1(-rate * x);
+}
+
+public double expSf(double x, double rate) {
+    if (x != x || !(rate > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 1.0; }
+    return dmath.exp(-rate * x);
+}
+
+public double expQuantile(double p, double rate) {
+    if (p != p || p < 0.0 || p > 1.0 || !(rate > 0.0)) { return nanValue(); }
+    if (p == 1.0) { return infValue(); }
+    return -dmath.log1p(-p) / rate;
+}
+
+public double uniformPdf(double x, double a, double b) {
+    if (x != x || !(a < b)) { return nanValue(); }
+    return (x >= a && x <= b) ? 1.0 / (b - a) : 0.0;
+}
+
+public double uniformCdf(double x, double a, double b) {
+    if (x != x || !(a < b)) { return nanValue(); }
+    if (x <= a) { return 0.0; }
+    if (x >= b) { return 1.0; }
+    return (x - a) / (b - a);
+}
+
+public double uniformQuantile(double p, double a, double b) {
+    if (p != p || p < 0.0 || p > 1.0 || !(a < b)) { return nanValue(); }
+    return a + p * (b - a);
+}
+
+public double lognormalPdf(double x, double mu, double sigma) {
+    if (x != x || !(sigma > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 0.0; }
+    double z = (dmath.log(x) - mu) / sigma;
+    return dmath.exp(-0.5 * z * z) / (x * sigma * SQRT_2PI);
+}
+
+public double lognormalCdf(double x, double mu, double sigma) {
+    if (x != x || !(sigma > 0.0)) { return nanValue(); }
+    if (x <= 0.0) { return 0.0; }
+    return stdNormalCdf((dmath.log(x) - mu) / sigma);
+}
+
+public double lognormalQuantile(double p, double mu, double sigma) {
+    if (!(sigma > 0.0)) { return nanValue(); }
+    double z = stdNormalQuantile(p);
+    if (z != z) { return z; }
+    return dmath.exp(mu + sigma * z);
+}
+
+// ============================================================================================================================================
+//  Binomial and Poisson
+// ============================================================================================================================================
+private bool isWhole(double v) { return finite(v) && dmath.floor(v) == v; }
+
+public double binomPmf(double k, double n, double p) {
+    if (k != k || n != n || p != p || !(n >= 0.0) || !isWhole(n) || p < 0.0 || p > 1.0) { return nanValue(); }
+    if (!isWhole(k) || k < 0.0 || k > n) { return 0.0; }
+    return dbinomRaw(k, n, p, 1.0 - p);
+}
+
+// P(X <= k)
+public double binomCdf(double k, double n, double p) {
+    if (k != k || n != n || p != p || !(n >= 0.0) || !isWhole(n) || p < 0.0 || p > 1.0) { return nanValue(); }
+    double kf = dmath.floor(k);
+    if (kf < 0.0) { return 0.0; }
+    if (kf >= n) { return 1.0; }
+    double lo;
+    double up;
+    incBetaBoth(1.0 - p, p, n - kf, kf + 1.0, &lo, &up);          // P(X <= k) = I_{1-p}(n - k, k + 1)
+    return lo;
+}
+
+// P(X > k)
+public double binomSf(double k, double n, double p) {
+    if (k != k || n != n || p != p || !(n >= 0.0) || !isWhole(n) || p < 0.0 || p > 1.0) { return nanValue(); }
+    double kf = dmath.floor(k);
+    if (kf < 0.0) { return 1.0; }
+    if (kf >= n) { return 0.0; }
+    double lo;
+    double up;
+    incBetaBoth(1.0 - p, p, n - kf, kf + 1.0, &lo, &up);
+    return up;
+}
+
+// the smallest integer k with P(X <= k) >= p
+public double binomQuantile(double p, double n, double pr) {
+    if (p != p || p < 0.0 || p > 1.0 || n != n || pr != pr || !(n >= 0.0) || !isWhole(n) || pr < 0.0 || pr > 1.0) { return nanValue(); }
+    if (p == 0.0) { return 0.0; }
+    if (p == 1.0 || pr == 1.0) { return n; }
+    if (pr == 0.0) { return 0.0; }
+    double lo = 0.0;                                       // cdf(lo - 1) < p <= cdf(hi)
+    double hi = n;
+    while (lo < hi) {
+        double mid = dmath.floor(0.5 * (lo + hi));
+        if (binomCdf(mid, n, pr) >= p) { hi = mid; } else { lo = mid + 1.0; }
+    }
+    return lo;
+}
+
+public double poissonPmf(double k, double lambda) {
+    if (k != k || lambda != lambda || !(lambda >= 0.0)) { return nanValue(); }
+    if (!isWhole(k) || k < 0.0) { return 0.0; }
+    return dpoisRaw(k, lambda);
+}
+
+// P(X <= k) = Q(k + 1, lambda)
+public double poissonCdf(double k, double lambda) {
+    if (k != k || lambda != lambda || !(lambda >= 0.0)) { return nanValue(); }
+    double kf = dmath.floor(k);
+    if (kf < 0.0) { return 0.0; }
+    if (lambda == 0.0 || !finite(kf)) { return 1.0; }
+    return incGammaQ(kf + 1.0, lambda);
+}
+
+// P(X > k) = P(k + 1, lambda)
+public double poissonSf(double k, double lambda) {
+    if (k != k || lambda != lambda || !(lambda >= 0.0)) { return nanValue(); }
+    double kf = dmath.floor(k);
+    if (kf < 0.0) { return 1.0; }
+    if (lambda == 0.0 || !finite(kf)) { return 0.0; }
+    return incGammaP(kf + 1.0, lambda);
+}
+
+public double poissonQuantile(double p, double lambda) {
+    if (p != p || p < 0.0 || p > 1.0 || lambda != lambda || !(lambda >= 0.0)) { return nanValue(); }
+    if (p == 0.0 || lambda == 0.0) { return 0.0; }
+    if (p == 1.0 || !finite(lambda)) { return infValue(); }
+    double hi = dmath.ceil(lambda + 1.0);
+    while (poissonCdf(hi, lambda) < p) { hi = hi * 2.0; }
+    double lo = 0.0;
+    while (lo < hi) {
+        double mid = dmath.floor(0.5 * (lo + hi));
+        if (poissonCdf(mid, lambda) >= p) { hi = mid; } else { lo = mid + 1.0; }
+    }
+    return lo;
+}
+
+// ============================================================================================================================================
+//  Descriptive statistics
+// ============================================================================================================================================
+// the sum of n numbers (Neumaier's compensated summation: the error does not grow with n)
+public double sum(double* x, int n) {
+    if (x == null || n < 1) { return 0.0; }
+    double s = 0.0;
+    double c = 0.0;
+    for (int i = 0; i < n; i++) {
+        double v = x[i];
+        double t = s + v;
+        if (absd(s) >= absd(v)) { c += (s - t) + v; } else { c += (v - t) + s; }
+        s = t;
+    }
+    double r = s + c;
+    if (r != r && finite(s) == false) { return s; }          // keep an infinite sum infinite (c is NaN then)
+    return r;
+}
+
+public double mean(double* x, int n) {
+    if (x == null || n < 1) { return nanValue(); }
+    return sum(x, n) / (double) n;
+}
+
+// the variance with divisor n - ddof (ddof = 1: sample variance, 0: population variance); two passes with the compensation term of Chan, Golub and LeVeque
+public double variance(double* x, int n, int ddof = 1) {
+    if (x == null || n < 1 || n - ddof < 1) { return nanValue(); }
+    double m = mean(x, n);
+    if (m != m || !finite(m)) { return (m != m) ? m : nanValue(); }
+    double s = 0.0;
+    double c = 0.0;
+    for (int i = 0; i < n; i++) {
+        double d = x[i] - m;
+        s += d * d;
+        c += d;
+    }
+    double v = (s - c * c / (double) n) / (double) (n - ddof);
+    return (v < 0.0) ? 0.0 : v;
+}
+
+public double stddev(double* x, int n, int ddof = 1) {
+    double v = variance(x, n, ddof);
+    return (v != v) ? v : dmath.sqrt(v);
+}
+
+// the standard error of the mean: s / sqrt(n)
+public double sem(double* x, int n) {
+    if (n < 2) { return nanValue(); }
+    return stddev(x, n, 1) / dmath.sqrt((double) n);
+}
+
+public double minimum(double* x, int n) {
+    if (x == null || n < 1) { return nanValue(); }
+    double m = x[0];
+    for (int i = 0; i < n; i++) {
+        if (x[i] != x[i]) { return x[i]; }
+        if (x[i] < m) { m = x[i]; }
+    }
+    return m;
+}
+
+public double maximum(double* x, int n) {
+    if (x == null || n < 1) { return nanValue(); }
+    double m = x[0];
+    for (int i = 0; i < n; i++) {
+        if (x[i] != x[i]) { return x[i]; }
+        if (x[i] > m) { m = x[i]; }
+    }
+    return m;
+}
+
+public double rangeOf(double* x, int n) { return maximum(x, n) - minimum(x, n); }
+
+private double lerp(double a, double b, double t) {
+    if (a == b) { return a; }
+    return (t >= 0.5) ? b - (b - a) * (1.0 - t) : a + (b - a) * t;
+}
+
+// The quantile p (0 .. 1) of already sorted data (no copy, no NaN check). method is the Hyndman and Fan type 1 .. 9 as in R's quantile():
+//   1 inverse of the empirical cdf   2 the same with averaging at jumps   3 nearest even order statistic   4 linear interpolation of the empirical cdf
+//   5 piecewise linear, knots at the middle of the steps (Hazen)   6 Weibull, (n + 1) p (Minitab, Python "exclusive")   7 (n - 1) p + 1 (NumPy, Excel, R default,
+//   Python "inclusive")   8 median unbiased   9 approximately unbiased for the normal distribution
+public double quantileSorted(double* s, int n, double p, int method = 7) {
+    if (s == null || n < 1 || p != p || p < 0.0 || p > 1.0 || method < 1 || method > 9) { return nanValue(); }
+    double fuzz = 4.0 * DBL_EPS;
+    double nn = (double) n;
+    double nppm;
+    double h;
+    double jd;
+    if (method <= 3) {
+        nppm = (method == 3) ? nn * p - 0.5 : nn * p;
+        jd = dmath.floor(nppm + fuzz);
+        if (method == 1) {
+            h = (nppm > jd) ? 1.0 : 0.0;
+        } else if (method == 2) {
+            h = (nppm > jd) ? 1.0 : 0.5;
+        } else {
+            bool odd = dmath.fmod(jd, 2.0) != 0.0;
+            h = (nppm != jd || odd) ? 1.0 : 0.0;
+        }
+    } else {
+        double a = 0.0;
+        double b = 1.0;
+        if (method == 5) { a = 0.5; b = 0.5; }
+        if (method == 6) { a = 0.0; b = 0.0; }
+        if (method == 7) { a = 1.0; b = 1.0; }
+        if (method == 8) { a = 1.0 / 3.0; b = 1.0 / 3.0; }
+        if (method == 9) { a = 0.375; b = 0.375; }
+        nppm = a + p * (nn + 1.0 - a - b);
+        jd = dmath.floor(nppm + fuzz);
+        h = nppm - jd;
+        if (absd(h) < fuzz) { h = 0.0; }
+    }
+    int j = 0;
+    if (jd < 0.0) { j = -1; } else if (jd > nn + 1.0) { j = n + 1; } else { j = (int) jd; }
+    int i0 = j - 1;
+    int i1 = j;
+    if (i0 < 0) { i0 = 0; }
+    if (i0 > n - 1) { i0 = n - 1; }
+    if (i1 < 0) { i1 = 0; }
+    if (i1 > n - 1) { i1 = n - 1; }
+    if (h == 0.0) { return s[i0]; }
+    if (h == 1.0) { return s[i1]; }
+    return lerp(s[i0], s[i1], h);
+}
+
+// the quantile p of unsorted data (sorts a copy; NaN when the data contains NaN or memory is short)
+public double quantile(double* x, int n, double p, int method = 7) {
+    double* c = sortedCopy(x, n);
+    if (c == null) { return nanValue(); }
+    double r = quantileSorted(c, n, p, method);
+    freeMem(c);
+    return r;
+}
+
+// k quantiles with one sort: out[i] = quantile(x, n, ps[i]); returns false on bad data
+public bool quantiles(double* x, int n, double* ps, int k, double* out, int method = 7) {
+    double* c = sortedCopy(x, n);
+    if (c == null || ps == null || out == null) {
+        freeMem(c);
+        return false;
+    }
+    bool good = true;
+    for (int i = 0; i < k; i++) {
+        out[i] = quantileSorted(c, n, ps[i], method);
+        if (out[i] != out[i]) { good = false; }             // an invalid probability or method (the data have no NaN: it was checked)
+    }
+    freeMem(c);
+    return good;
+}
+
+public double median(double* x, int n) { return quantile(x, n, 0.5, 7); }
+
+// the interquartile range (third minus first quartile)
+public double iqr(double* x, int n, int method = 7) {
+    double* c = sortedCopy(x, n);
+    if (c == null) { return nanValue(); }
+    double r = quantileSorted(c, n, 0.75, method) - quantileSorted(c, n, 0.25, method);
+    freeMem(c);
+    return r;
+}
+
+// the median absolute deviation from the median (not scaled)
+public double mad(double* x, int n) {
+    double* c = sortedCopy(x, n);
+    if (c == null) { return nanValue(); }
+    double med = quantileSorted(c, n, 0.5, 7);
+    for (int i = 0; i < n; i++) { c[i] = absd(c[i] - med); }
+    sortDoubles(c, n);
+    double r = quantileSorted(c, n, 0.5, 7);
+    freeMem(c);
+    return r;
+}
+
+// the most frequent value (the smallest one when several values are equally frequent); NaN for empty data or data with NaN
+public double mode(double* x, int n) {
+    double* c = sortedCopy(x, n);
+    if (c == null) { return nanValue(); }
+    double best = c[0];
+    int bestRun = 0;
+    int i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n && c[j] == c[i]) { j++; }
+        if (j - i > bestRun) { bestRun = j - i; best = c[i]; }
+        i = j;
+    }
+    freeMem(c);
+    return best;
+}
+
+// all values that have the highest frequency, in increasing order: stores up to max of them in out and returns how many there are (-1 on bad data)
+public int multimode(double* x, int n, double* out, int max) {
+    double* c = sortedCopy(x, n);
+    if (c == null) { return -1; }
+    int bestRun = 0;
+    int i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n && c[j] == c[i]) { j++; }
+        if (j - i > bestRun) { bestRun = j - i; }
+        i = j;
+    }
+    int count = 0;
+    i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n && c[j] == c[i]) { j++; }
+        if (j - i == bestRun) {
+            if (out != null && count < max) { out[count] = c[i]; }
+            count++;
+        }
+        i = j;
+    }
+    freeMem(c);
+    return count;
+}
+
+// the central moments m2, m3, m4 (divisor n) of the data
+private void centralMoments(double* x, int n, double* m2, double* m3, double* m4) {
+    double m = mean(x, n);
+    double s2 = 0.0;
+    double s3 = 0.0;
+    double s4 = 0.0;
+    for (int i = 0; i < n; i++) {
+        double d = x[i] - m;
+        double d2 = d * d;
+        s2 += d2;
+        s3 += d2 * d;
+        s4 += d2 * d2;
+    }
+    *m2 = s2 / (double) n;
+    *m3 = s3 / (double) n;
+    *m4 = s4 / (double) n;
+}
+
+// the skewness g1 = m3 / m2^1.5; with bias = false the sample skewness G1 = g1 sqrt(n (n - 1)) / (n - 2) (NaN for n < 3)
+public double skewness(double* x, int n, bool bias = true) {
+    if (x == null || n < 1) { return nanValue(); }
+    double m2;
+    double m3;
+    double m4;
+    centralMoments(x, n, &m2, &m3, &m4);
+    if (!(m2 > 0.0)) { return nanValue(); }
+    double g1 = m3 / (m2 * dmath.sqrt(m2));
+    if (bias) { return g1; }
+    if (n < 3) { return nanValue(); }
+    return g1 * dmath.sqrt((double) n * (double) (n - 1)) / (double) (n - 2);
+}
+
+// the kurtosis g2 = m4 / m2^2 - 3 (excess, 0 for a normal distribution; excess = false adds the 3 back); bias = false gives the sample excess kurtosis G2
+public double kurtosis(double* x, int n, bool bias = true, bool excess = true) {
+    if (x == null || n < 1) { return nanValue(); }
+    double m2;
+    double m3;
+    double m4;
+    centralMoments(x, n, &m2, &m3, &m4);
+    if (!(m2 > 0.0)) { return nanValue(); }
+    double g2 = m4 / (m2 * m2) - 3.0;
+    if (!bias) {
+        if (n < 4) { return nanValue(); }
+        double nn = (double) n;
+        g2 = ((nn + 1.0) * g2 + 6.0) * (nn - 1.0) / ((nn - 2.0) * (nn - 3.0));
+    }
+    return excess ? g2 : g2 + 3.0;
+}
+
+public double covariance(double* x, double* y, int n, int ddof = 1) {
+    if (x == null || y == null || n < 1 || n - ddof < 1) { return nanValue(); }
+    double mx = mean(x, n);
+    double my = mean(y, n);
+    double s = 0.0;
+    double cx = 0.0;
+    double cy = 0.0;
+    for (int i = 0; i < n; i++) {
+        double dx = x[i] - mx;
+        double dy = y[i] - my;
+        s += dx * dy;
+        cx += dx;
+        cy += dy;
+    }
+    return (s - cx * cy / (double) n) / (double) (n - ddof);
+}
+
+// the Pearson correlation coefficient (NaN when one of the variables is constant)
+public double correlation(double* x, double* y, int n) {
+    if (x == null || y == null || n < 2) { return nanValue(); }
+    double mx = mean(x, n);
+    double my = mean(y, n);
+    double sxy = 0.0;
+    double sxx = 0.0;
+    double syy = 0.0;
+    for (int i = 0; i < n; i++) {
+        double dx = x[i] - mx;
+        double dy = y[i] - my;
+        sxy += dx * dy;
+        sxx += dx * dx;
+        syy += dy * dy;
+    }
+    if (!(sxx > 0.0) || !(syy > 0.0)) { return nanValue(); }
+    double r = sxy / (dmath.sqrt(sxx) * dmath.sqrt(syy));
+    if (r > 1.0) { r = 1.0; }
+    if (r < -1.0) { r = -1.0; }
+    return r;
+}
+
+// the ranks 1 .. n of the data, tied values get the average of their ranks; returns false when the data contains NaN or memory is short
+public bool ranks(double* x, int n, double* out) {
+    if (x == null || out == null || n < 1 || hasNan(x, n)) { return false; }
+    int* idx = (int*) asys.alloc(n * 8);
+    int* tmp = (int*) asys.alloc(n * 8);
+    if (idx == null || tmp == null) {
+        freeMem(idx);
+        freeMem(tmp);
+        return false;
+    }
+    for (int i = 0; i < n; i++) { idx[i] = i; }
+    // merge sort of the indexes by value (stable)
+    int width = 1;
+    while (width < n) {
+        int pos = 0;
+        while (pos < n) {
+            int mid = (pos + width < n) ? pos + width : n;
+            int end = (pos + 2 * width < n) ? pos + 2 * width : n;
+            int a = pos;
+            int b = mid;
+            int o = pos;
+            while (a < mid && b < end) {
+                if (x[idx[b]] < x[idx[a]]) { tmp[o++] = idx[b++]; } else { tmp[o++] = idx[a++]; }
+            }
+            while (a < mid) { tmp[o++] = idx[a++]; }
+            while (b < end) { tmp[o++] = idx[b++]; }
+            pos = end;
+        }
+        for (int i = 0; i < n; i++) { idx[i] = tmp[i]; }
+        width = width * 2;
+    }
+    int i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n && x[idx[j]] == x[idx[i]]) { j++; }
+        double r = 0.5 * (double) (i + 1 + j);              // the average of the ranks i + 1 .. j
+        for (int t = i; t < j; t++) { out[idx[t]] = r; }
+        i = j;
+    }
+    freeMem(idx);
+    freeMem(tmp);
+    return true;
+}
+
+// Spearman's rank correlation (the Pearson correlation of the ranks)
+public double spearman(double* x, double* y, int n) {
+    if (x == null || y == null || n < 2) { return nanValue(); }
+    double* rx = newDoubles(n);
+    double* ry = newDoubles(n);
+    double r = nanValue();
+    if (rx != null && ry != null && ranks(x, n, rx) && ranks(y, n, ry)) { r = correlation(rx, ry, n); }
+    freeMem(rx);
+    freeMem(ry);
+    return r;
+}
+
+// Kendall's tau-b (corrects for ties), O(n^2)
+public double kendall(double* x, double* y, int n) {
+    if (x == null || y == null || n < 2 || hasNan(x, n) || hasNan(y, n)) { return nanValue(); }
+    double conc = 0.0;
+    double tiesX = 0.0;
+    double tiesY = 0.0;
+    double pairs = 0.0;
+    for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            double dx = x[i] - x[j];
+            double dy = y[i] - y[j];
+            pairs += 1.0;
+            if (dx == 0.0 && dy == 0.0) {
+                tiesX += 1.0;
+                tiesY += 1.0;
+            } else if (dx == 0.0) {
+                tiesX += 1.0;
+            } else if (dy == 0.0) {
+                tiesY += 1.0;
+            } else if ((dx > 0.0) == (dy > 0.0)) {
+                conc += 1.0;
+            } else {
+                conc -= 1.0;
+            }
+        }
+    }
+    double den = dmath.sqrt(pairs - tiesX) * dmath.sqrt(pairs - tiesY);
+    if (!(den > 0.0)) { return nanValue(); }
+    return conc / den;
+}
+
+// (x - mean) / stddev for every element
+public bool zscores(double* x, int n, double* out, int ddof = 0) {
+    if (x == null || out == null || n < 1) { return false; }
+    double m = mean(x, n);
+    double sd = stddev(x, n, ddof);
+    if (!(sd > 0.0)) { return false; }
+    for (int i = 0; i < n; i++) { out[i] = (x[i] - m) / sd; }
+    return true;
+}
+
+public double geometricMean(double* x, int n) {
+    if (x == null || n < 1) { return nanValue(); }
+    double s = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (!(x[i] >= 0.0)) { return nanValue(); }
+        if (x[i] == 0.0) { return 0.0; }
+        s += dmath.log(x[i]);
+    }
+    return dmath.exp(s / (double) n);
+}
+
+public double harmonicMean(double* x, int n) {
+    if (x == null || n < 1) { return nanValue(); }
+    double s = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (!(x[i] >= 0.0)) { return nanValue(); }
+        if (x[i] == 0.0) { return 0.0; }
+        s += 1.0 / x[i];
+    }
+    return (double) n / s;
+}
+
+public double weightedMean(double* x, double* w, int n) {
+    if (x == null || w == null || n < 1) { return nanValue(); }
+    double sw = 0.0;
+    double s = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (!(w[i] >= 0.0)) { return nanValue(); }
+        sw += w[i];
+        s += w[i] * x[i];
+    }
+    return (sw > 0.0) ? s / sw : nanValue();
+}
+
+// the covariance matrix of a data matrix with one observation per row and one variable per column (columns x columns)
+public matrix.Matrix covarianceMatrix(matrix.Matrix* data, int ddof = 1) {
+    matrix.Matrix none;
+    none.err = matrix.ERR_ARG;
+    if (data == null || !data->ok() || data->rows - ddof < 1) { return none; }
+    int n = data->rows;
+    int p = data->cols;
+    double* means = newDoubles(p);
+    matrix.Matrix cov(p, p);
+    if (means == null || !cov.ok()) {
+        freeMem(means);
+        cov.dispose();
+        none.err = matrix.ERR_MEMORY;
+        return none;
+    }
+    for (int j = 0; j < p; j++) {
+        double s = 0.0;
+        for (int i = 0; i < n; i++) { s += data->d[i * p + j]; }
+        means[j] = s / (double) n;
+    }
+    for (int a = 0; a < p; a++) {
+        for (int b = a; b < p; b++) {
+            double s = 0.0;
+            for (int i = 0; i < n; i++) { s += (data->d[i * p + a] - means[a]) * (data->d[i * p + b] - means[b]); }
+            double v = s / (double) (n - ddof);
+            cov.d[a * p + b] = v;
+            cov.d[b * p + a] = v;
+        }
+    }
+    freeMem(means);
+    return cov;
+}
+
+// the Pearson correlation matrix of the columns
+public matrix.Matrix correlationMatrix(matrix.Matrix* data) {
+    matrix.Matrix cov = covarianceMatrix(data, 1);
+    if (!cov.ok()) { return cov; }
+    int p = cov.rows;
+    for (int a = 0; a < p; a++) {
+        for (int b = 0; b < p; b++) {
+            if (a == b) { continue; }
+            double den = dmath.sqrt(cov.d[a * p + a]) * dmath.sqrt(cov.d[b * p + b]);
+            cov.d[a * p + b] = (den > 0.0) ? cov.d[a * p + b] / den : nanValue();
+        }
+    }
+    for (int a = 0; a < p; a++) { cov.d[a * p + a] = (cov.d[a * p + a] > 0.0) ? 1.0 : nanValue(); }
+    return cov;
+}
+
+// ============================================================================================================================================
+//  Streaming accumulators
+// ============================================================================================================================================
+// Welford's online algorithm extended to the third and fourth moments (Pebay's update formulas): O(1) memory, numerically stable, mergeable. The sums are kept
+// relative to the first value (`shift`), so data with a huge offset (a million plus a spread of one) keeps all its digits; use mean(), not the fields.
+public class Welford {
+    public int count;
+    public double shift;                   // the first value seen
+    public double dev;                     // the running mean of (value - shift)
+    public double m2;                      // sums of powers of the deviations from that mean
+    public double m3;
+    public double m4;
+    public double lo;                      // smallest and largest value seen
+    public double hi;
+
+    public void add(double x) {
+        if (x != x) {
+            dev = x;                       // NaN poisons everything, as it does in the batch functions
+            m2 = x;
+            m3 = x;
+            m4 = x;
+            lo = x;
+            hi = x;
+            count++;
+            return;
+        }
+        if (count == 0) { shift = x; }
+        int n1 = count;
+        count++;
+        double n = (double) count;
+        double delta = (x - shift) - dev;
+        double dn = delta / n;
+        double dn2 = dn * dn;
+        double term1 = delta * dn * (double) n1;
+        dev += dn;
+        m4 += term1 * dn2 * (n * n - 3.0 * n + 3.0) + 6.0 * dn2 * m2 - 4.0 * dn * m3;
+        m3 += term1 * dn * (n - 2.0) - 3.0 * dn * m2;
+        m2 += term1;
+        if (n1 == 0 || x < lo) { lo = x; }
+        if (n1 == 0 || x > hi) { hi = x; }
+    }
+
+    public void addAll(double* x, int n) {
+        if (x == null) { return; }
+        for (int i = 0; i < n; i++) { add(x[i]); }
+    }
+
+    // adds the statistics of another accumulator (as if its values had been added here)
+    public void merge(Welford* o) {
+        if (o == null || o->count == 0) { return; }
+        if (count == 0) {
+            count = o->count;
+            shift = o->shift;
+            dev = o->dev;
+            m2 = o->m2;
+            m3 = o->m3;
+            m4 = o->m4;
+            lo = o->lo;
+            hi = o->hi;
+            return;
+        }
+        double na = (double) count;
+        double nb = (double) o->count;
+        double n = na + nb;
+        double delta = (o->shift - shift) + (o->dev - dev);        // the difference of the two means
+        double d2 = delta * delta;
+        double nm4 = m4 + o->m4 + d2 * d2 * na * nb * (na * na - na * nb + nb * nb) / (n * n * n)
+                     + 6.0 * d2 * (na * na * o->m2 + nb * nb * m2) / (n * n) + 4.0 * delta * (na * o->m3 - nb * m3) / n;
+        double nm3 = m3 + o->m3 + d2 * delta * na * nb * (na - nb) / (n * n) + 3.0 * delta * (na * o->m2 - nb * m2) / n;
+        double nm2 = m2 + o->m2 + d2 * na * nb / n;
+        dev = dev + delta * nb / n;
+        m2 = nm2;
+        m3 = nm3;
+        m4 = nm4;
+        count += o->count;
+        if (o->lo < lo) { lo = o->lo; }
+        if (o->hi > hi) { hi = o->hi; }
+    }
+
+    public int size() { return count; }
+    public double mean() { return count > 0 ? shift + dev : nanValue(); }
+    public double variance(int ddof = 1) { return (count - ddof >= 1) ? m2 / (double) (count - ddof) : nanValue(); }
+    public double stddev(int ddof = 1) { return (count - ddof >= 1) ? dmath.sqrt(m2 / (double) (count - ddof)) : nanValue(); }
+    public double sem() { return (count >= 2) ? dmath.sqrt(m2 / (double) (count - 1) / (double) count) : nanValue(); }
+    public double minimum() { return count > 0 ? lo : nanValue(); }
+    public double maximum() { return count > 0 ? hi : nanValue(); }
+    public double skewness() {
+        if (count < 1 || !(m2 > 0.0)) { return nanValue(); }
+        return dmath.sqrt((double) count) * m3 / (m2 * dmath.sqrt(m2));
+    }
+    public double kurtosis() {
+        if (count < 1 || !(m2 > 0.0)) { return nanValue(); }
+        return (double) count * m4 / (m2 * m2) - 3.0;
+    }
+    public void reset() {
+        count = 0;
+        shift = 0.0;
+        dev = 0.0;
+        m2 = 0.0;
+        m3 = 0.0;
+        m4 = 0.0;
+        lo = 0.0;
+        hi = 0.0;
+    }
+}
+
+// Exponential moving average with smoothing factor alpha (0 < alpha <= 1): v = alpha x + (1 - alpha) v. adjust = true weights the history like pandas
+// ewm(adjust=True): value = sum (1 - alpha)^i x_{t-i} / sum (1 - alpha)^i, which removes the start-up bias; the first value is the first sample in both modes.
+public class Ema {
+    public double alpha;
+    public bool adjust;
+    public int count;
+    private double value;
+    private double num;
+    private double den;
+
+    public Ema(double a, bool adjustWeights = false) {
+        alpha = a;
+        adjust = adjustWeights;
+    }
+
+    // adds a sample and returns the new average
+    public double add(double x) {
+        if (!(alpha > 0.0) || alpha > 1.0) { return nanValue(); }
+        if (adjust) {
+            num = x + (1.0 - alpha) * num;
+            den = 1.0 + (1.0 - alpha) * den;
+            value = num / den;
+        } else if (count == 0) {
+            value = x;
+        } else {
+            value = alpha * x + (1.0 - alpha) * value;
+        }
+        count++;
+        return value;
+    }
+
+    public double current() { return count > 0 ? value : nanValue(); }
+
+    public void reset() {
+        count = 0;
+        value = 0.0;
+        num = 0.0;
+        den = 0.0;
+    }
+}
+
+// alpha for a span of `span` samples (alpha = 2 / (span + 1), as in pandas) and for a half life of `hl` samples
+public double emaAlphaFromSpan(double span) { return 2.0 / (span + 1.0); }
+public double emaAlphaFromHalfLife(double hl) { return 1.0 - dmath.exp(-dmath.LN2 / hl); }
+
+// Statistics of the last `window` values: mean, variance, standard deviation, sum, minimum, maximum and median. add() is O(1) for mean and variance (Welford
+// with removal on values shifted by the window mean of the last refresh), O(1) amortized for the extremes (monotone queues) and O(window) for the median
+// (a sorted copy is maintained: add() shifts it). mean(), variance(), stddev(), minimum(), maximum() and median() are O(1); sum() is O(window) (an exact
+// compensated sum). Removing a value from a running Welford state leaves the rounding error of that value's square behind: after a huge outlier has left the
+// window the running variance would be wrong by that error (a 1e12 outlier among values of order 1 spoils 7 digits). Therefore the state carries a bound of its
+// accumulated rounding error and is recomputed from the window (two passes, compensated) as soon as the bound exceeds 1e-10 of the mean or variance, and in any
+// case every `window` adds. In ordinary data this costs nothing; an outlier costs one O(window) recomputation. A NaN in the window makes every result NaN until it
+// has left (an infinity: mean = IEEE sum / n, variance NaN); the state is recomputed when it leaves.
+public class RollingStats {
+    private double* ring;
+    private double* sorted;
+    private int* maxq;                     // indexes into the stream, values decreasing
+    private int* minq;
+    private int cap;
+    private int total;                     // how many values were added in all
+    private int len;                       // how many are in the window
+    private int slen;                      // how many of them are in the sorted copy (NaN is not)
+    private int mqh;
+    private int mqt;
+    private int nqh;
+    private int nqt;
+    private double shift;                  // the window mean at the last refresh: the Welford state works on x - shift (no cancellation for data far from 0)
+    private double mu;                     // mean of (x - shift)
+    private double s2;                     // sum of squared deviations
+    private double errMu;                  // bound of the accumulated rounding error of mu
+    private double errS2;                  // and of s2
+    private int sinceFresh;
+    private int nanCount;                  // NaNs in the window
+    private int badCount;                  // NaNs and infinities in the window
+
+    public RollingStats(int window) {
+        if (window < 1 || window > 0x4000000) { return; }
+        ring = newDoubles(window);
+        sorted = newDoubles(window);
+        maxq = (int*) asys.alloc(window * 8);
+        minq = (int*) asys.alloc(window * 8);
+        if (ring == null || sorted == null || maxq == null || minq == null) {
+            dispose();
+            return;
+        }
+        cap = window;
+    }
+
+    public bool ok() { return cap > 0; }
+    public int window() { return cap; }
+    public int size() { return len; }
+    public bool full() { return cap > 0 && len == cap; }
+    public int added() { return total; }
+
+    private double at(int streamIndex) { return ring[streamIndex % cap]; }
+
+    // adds a value; the oldest one leaves when the window is full
+    public void add(double x) {
+        if (cap == 0) { return; }
+        bool dirty = false;
+        if (len == cap) {
+            double old = ring[total % cap];
+            // remove old from the sorted copy and from the Welford state
+            if (old == old) {
+                int p = findSorted(old);
+                for (int i = p; i < slen - 1; i++) { sorted[i] = sorted[i + 1]; }
+                slen--;
+                sorted[slen] = 0.0;
+            } else {
+                nanCount--;
+            }
+            if (!finite(old)) {
+                badCount--;
+                dirty = true;                      // a NaN or infinity leaves the window: the running state is NaN and has to be recomputed
+            }
+            int nn = len - 1;
+            if (nn == 0) {
+                mu = 0.0;
+                s2 = 0.0;
+                errMu = 0.0;
+                errS2 = 0.0;
+            } else {
+                double oy = old - shift;
+                double delta = oy - mu;
+                double nmu = mu - delta / (double) nn;
+                double term = delta * (oy - nmu);
+                errMu += DBL_EPS * (absd(mu) + absd(nmu) + 2.0 * absd(delta) / (double) nn + absd(oy) / (double) nn);
+                errS2 += DBL_EPS * (absd(s2) + 3.0 * absd(term)) + errMu * (absd(delta) + absd(oy - nmu));
+                s2 -= term;
+                if (s2 < 0.0) { s2 = 0.0; }
+                mu = nmu;
+            }
+            len = nn;
+            // the extremes: pop the front of the queues when they hold the leaving index
+            if (mqh < mqt && maxq[mqh % cap] == total - cap) { mqh++; }
+            if (nqh < nqt && minq[nqh % cap] == total - cap) { nqh++; }
+        }
+        if (len == 0) {                            // an empty window: start the state fresh, centred on the first value
+            shift = finite(x) ? x : 0.0;
+            mu = 0.0;
+            s2 = 0.0;
+            errMu = 0.0;
+            errS2 = 0.0;
+        }
+        ring[total % cap] = x;
+        // sorted insert (NaN is not sorted: nanCount instead)
+        if (x == x) {
+            int lo = 0;
+            int hi = slen;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (sorted[mid] <= x) { lo = mid + 1; } else { hi = mid; }
+            }
+            for (int i = slen; i > lo; i--) { sorted[i] = sorted[i - 1]; }
+            sorted[lo] = x;
+            slen++;
+        } else {
+            nanCount++;
+        }
+        if (!finite(x)) { badCount++; }
+        len++;
+        double xy = x - shift;
+        double d1 = xy - mu;
+        mu += d1 / (double) len;
+        double term = d1 * (xy - mu);
+        errMu += DBL_EPS * (absd(mu) + absd(d1) / (double) len + absd(xy) / (double) len);
+        errS2 += DBL_EPS * (absd(s2) + 3.0 * absd(term)) + errMu * (absd(d1) + absd(xy - mu));
+        s2 += term;
+        // monotone queues (stored as stream indexes in a ring of `cap` slots)
+        while (mqt > mqh && at(maxq[(mqt - 1) % cap]) <= x) { mqt--; }
+        maxq[mqt % cap] = total;
+        mqt++;
+        while (nqt > nqh && at(minq[(nqt - 1) % cap]) >= x) { nqt--; }
+        minq[nqt % cap] = total;
+        nqt++;
+        total++;
+        sinceFresh++;
+        if (dirty || sinceFresh >= cap) {
+            refresh();
+        } else if (len > 1 && errS2 > ROLL_REL * s2) {
+            refresh();
+        } else if (errMu > ROLL_REL * absd(shift + mu) && errMu * errMu * (double) len > ROLL_REL * ROLL_REL * s2) {
+            refresh();                             // the mean is off by more than 1e-10 of its size and of the standard deviation
+        }
+    }
+
+    private int findSorted(double v) {
+        int lo = 0;
+        int hi = slen - 1;
+        while (lo < hi) {
+            int mid = (lo + hi) / 2;
+            if (sorted[mid] < v) { lo = mid + 1; } else { hi = mid; }
+        }
+        return lo;
+    }
+
+    // recomputes the mean and the sum of squares from the window (compensated sum, corrected two pass algorithm) and resets the error bounds
+    private void refresh() {
+        sinceFresh = 0;
+        errMu = 0.0;
+        errS2 = 0.0;
+        if (len == 0) {
+            shift = 0.0;
+            mu = 0.0;
+            s2 = 0.0;
+            return;
+        }
+        double sm = 0.0;
+        double comp = 0.0;
+        for (int k = 0; k < len; k++) {
+            double v = at(total - len + k);
+            double t = sm + v;
+            if (absd(sm) >= absd(v)) { comp += (sm - t) + v; } else { comp += (v - t) + sm; }
+            sm = t;
+        }
+        double m = (sm + comp) / (double) len;
+        double s = 0.0;
+        double cc = 0.0;
+        for (int k = 0; k < len; k++) {
+            double d = at(total - len + k) - m;
+            s += d * d;
+            cc += d;
+        }
+        s -= cc * cc / (double) len;
+        shift = m;
+        mu = cc / (double) len;                    // the mean of x - shift is not exactly 0: m was rounded (it matters when the variance is tiny against |mean|)
+        s2 = (s < 0.0) ? 0.0 : s;
+    }
+
+    public double mean() {
+        if (len == 0 || nanCount > 0) { return nanValue(); }
+        if (badCount > 0) {                        // an infinity in the window: the IEEE result of the plain sum (inf, -inf or NaN)
+            double t = 0.0;
+            for (int k = 0; k < len; k++) { t += at(total - len + k); }
+            return t / (double) len;
+        }
+        return shift + mu;
+    }
+
+    public double sum() {
+        if (len == 0) { return 0.0; }
+        if (nanCount > 0) { return nanValue(); }
+        double s = 0.0;
+        double c = 0.0;
+        for (int k = 0; k < len; k++) {
+            double v = at(total - len + k);
+            double t = s + v;
+            if (absd(s) >= absd(v)) { c += (s - t) + v; } else { c += (v - t) + s; }
+            s = t;
+        }
+        return s + c;
+    }
+
+    public double variance(int ddof = 1) {
+        if (len - ddof < 1) { return nanValue(); }
+        if (badCount > 0) { return nanValue(); }
+        return s2 / (double) (len - ddof);
+    }
+
+    public double stddev(int ddof = 1) {
+        double v = variance(ddof);
+        return (v != v) ? v : dmath.sqrt(v);
+    }
+
+    public double minimum() {
+        if (len == 0 || nanCount > 0) { return nanValue(); }
+        return at(minq[nqh % cap]);
+    }
+
+    public double maximum() {
+        if (len == 0 || nanCount > 0) { return nanValue(); }
+        return at(maxq[mqh % cap]);
+    }
+
+    public double median() {
+        if (len == 0 || nanCount > 0) { return nanValue(); }
+        return quantileSorted(sorted, len, 0.5, 7);
+    }
+
+    public void dispose() {
+        freeMem(ring);
+        freeMem(sorted);
+        freeMem(maxq);
+        freeMem(minq);
+        ring = null;
+        sorted = null;
+        maxq = null;
+        minq = null;
+        cap = 0;
+        len = 0;
+        slen = 0;
+        total = 0;
+        nanCount = 0;
+        badCount = 0;
+    }
+}
+
+// the simple moving average of a window: out[i] is the mean of x[i] .. x[i + window - 1] (n - window + 1 values; returns how many, 0 for bad arguments)
+public int movingAverage(double* x, int n, int window, double* out) {
+    if (x == null || out == null || window < 1 || window > n) { return 0; }
+    int cnt = n - window + 1;
+    double s = 0.0;
+    for (int i = 0; i < window; i++) { s += x[i]; }
+    out[0] = s / (double) window;
+    for (int i = 1; i < cnt; i++) {
+        // exact every `window` steps, incremental in between
+        if (i % window == 0) {
+            s = 0.0;
+            for (int k = 0; k < window; k++) { s += x[i + k]; }
+        } else {
+            s += x[i + window - 1] - x[i - 1];
+        }
+        out[i] = s / (double) window;
+    }
+    return cnt;
+}
+
+// the linearly weighted moving average (the newest value of a window has weight `window`, the oldest 1)
+public int weightedMovingAverage(double* x, int n, int window, double* out) {
+    if (x == null || out == null || window < 1 || window > n) { return 0; }
+    int cnt = n - window + 1;
+    double wsum = (double) window * (double) (window + 1) / 2.0;
+    for (int i = 0; i < cnt; i++) {
+        double s = 0.0;
+        for (int k = 0; k < window; k++) { s += (double) (k + 1) * x[i + k]; }
+        out[i] = s / wsum;
+    }
+    return cnt;
+}
+
+// the exponential moving average of a whole series (out has n entries)
+public bool emaSeries(double* x, int n, double alpha, bool adjust, double* out) {
+    if (x == null || out == null || n < 1 || !(alpha > 0.0) || alpha > 1.0) { return false; }
+    Ema e(alpha, adjust);
+    for (int i = 0; i < n; i++) { out[i] = e.add(x[i]); }
+    return true;
+}
+
+public void cumsum(double* x, int n, double* out) {
+    if (x == null || out == null || n < 1) { return; }
+    double s = 0.0;
+    double c = 0.0;
+    for (int i = 0; i < n; i++) {
+        double t = s + x[i];
+        if (absd(s) >= absd(x[i])) { c += (s - t) + x[i]; } else { c += (x[i] - t) + s; }
+        s = t;
+        out[i] = s + c;
+    }
+}
+
+// ============================================================================================================================================
+//  Histograms
+// ============================================================================================================================================
+// `bins` equal width bins over [lo, hi]; the last bin includes hi (as in NumPy). Values outside go to `below` / `above`, NaN to `nans`.
+public class Histogram {
+    public int bins;
+    public double lo;
+    public double hi;
+    public int total;                      // values inside [lo, hi]
+    public int below;
+    public int above;
+    public int nans;
+    private int* counts;
+
+    public Histogram(int binCount, double low, double high) {
+        if (binCount < 1 || binCount > 0x10000000 || !(low < high) || !finite(low) || !finite(high)) { return; }
+        counts = (int*) asys.alloc(binCount * 8);
+        if (counts == null) { return; }
+        bins = binCount;
+        lo = low;
+        hi = high;
+    }
+
+    public bool ok() { return counts != null && bins > 0; }
+    public double width() { return (hi - lo) / (double) bins; }
+
+    // the lower edge of bin i (edge(bins) is hi)
+    public double edge(int i) {
+        if (!ok() || i < 0 || i > bins) { return nanValue(); }
+        if (i == bins) { return hi; }
+        return lo + (hi - lo) * (double) i / (double) bins;
+    }
+
+    // the bin of x, -1 below the range, bins above it (and for NaN: -2)
+    public int binOf(double x) {
+        if (!ok()) { return -2; }
+        if (x != x) { return -2; }
+        if (x < lo) { return -1; }
+        if (x > hi) { return bins; }
+        if (x == hi) { return bins - 1; }
+        int b = (int) ((x - lo) / (hi - lo) * (double) bins);
+        if (b < 0) { b = 0; }
+        if (b > bins - 1) { b = bins - 1; }
+        // correct rounding at the edges: the bin has to satisfy edge(b) <= x < edge(b + 1)
+        if (b + 1 < bins && x >= edge(b + 1)) { b++; }
+        else if (b > 0 && x < edge(b)) { b--; }
+        return b;
+    }
+
+    public void add(double x) {
+        int b = binOf(x);
+        if (b == -2) { nans++; return; }
+        if (b == -1) { below++; return; }
+        if (b == bins) { above++; return; }
+        counts[b]++;
+        total++;
+    }
+
+    public void addAll(double* x, int n) {
+        if (x == null) { return; }
+        for (int i = 0; i < n; i++) { add(x[i]); }
+    }
+
+    public int count(int i) { return (ok() && i >= 0 && i < bins) ? counts[i] : 0; }
+
+    // counts / (total * width): integrates to 1 over the range
+    public double density(int i) {
+        if (!ok() || i < 0 || i >= bins || total == 0) { return nanValue(); }
+        return (double) counts[i] / ((double) total * width());
+    }
+
+    // the index of the fullest bin (the first one when equal), -1 when empty
+    public int modeBin() {
+        if (!ok() || total == 0) { return -1; }
+        int best = 0;
+        for (int i = 1; i < bins; i++) {
+            if (counts[i] > counts[best]) { best = i; }
+        }
+        return best;
+    }
+
+    public void dispose() {
+        freeMem(counts);
+        counts = null;
+        bins = 0;
+        total = 0;
+        below = 0;
+        above = 0;
+        nans = 0;
+    }
+}
+
+// the bin width a rule suggests (0 when it cannot say: fewer than 2 points or all values equal)
+public double binWidth(double* x, int n, int rule) {
+    if (x == null || n < 2 || hasNan(x, n)) { return 0.0; }
+    double ptp = rangeOf(x, n);
+    double nn = (double) n;
+    if (!(ptp > 0.0)) { return 0.0; }
+    if (rule == SQRT_RULE) { return ptp / dmath.sqrt(nn); }
+    if (rule == STURGES) { return ptp / (dmath.log2(nn) + 1.0); }
+    if (rule == RICE) { return ptp / (2.0 * dmath.pow(nn, 1.0 / 3.0)); }
+    if (rule == SCOTT) { return dmath.pow(24.0 * dmath.sqrt(dmath.PI) / nn, 1.0 / 3.0) * stddev(x, n, 0); }
+    if (rule == DOANE) {
+        if (n <= 2) { return 0.0; }
+        double sg1 = dmath.sqrt(6.0 * (nn - 2.0) / ((nn + 1.0) * (nn + 3.0)));
+        double sigma = stddev(x, n, 0);
+        if (!(sigma > 0.0)) { return 0.0; }
+        double g1 = skewness(x, n, true);
+        return ptp / (1.0 + dmath.log2(nn) + dmath.log2(1.0 + absd(g1) / sg1));
+    }
+    if (rule == FD || rule == AUTO_RULE) {
+        double fd = 2.0 * iqr(x, n, 7) * dmath.pow(nn, -1.0 / 3.0);
+        if (rule == FD) { return fd; }
+        double st = ptp / (dmath.log2(nn) + 1.0);
+        return (fd > 0.0) ? ((fd < st) ? fd : st) : st;
+    }
+    return 0.0;
+}
+
+// the number of bins a rule suggests for the data (NumPy's bin_edges rule: ceil(range / width), 1 when the rule gives no width)
+public int binCount(double* x, int n, int rule) {
+    if (x == null || n < 1 || hasNan(x, n)) { return 0; }
+    double w = binWidth(x, n, rule);
+    double ptp = rangeOf(x, n);
+    if (!(w > 0.0) || !(ptp > 0.0)) { return 1; }
+    double b = dmath.ceil(ptp / w);
+    if (b > 100000000.0) { b = 100000000.0; }
+    return (int) b;
+}
+
+// a histogram of the data over [min, max] with the number of bins a rule suggests, already filled; bins = 0 uses the rule, a positive number fixes the bins.
+// The range of constant data is widened by 0.5 on both sides (as NumPy does). dispose() the result.
+public Histogram histogramAuto(double* x, int n, int rule, int bins = 0) {
+    Histogram none;
+    if (x == null || n < 1 || hasNan(x, n)) { return none; }
+    double lo = minimum(x, n);
+    double hi = maximum(x, n);
+    int b = (bins > 0) ? bins : binCount(x, n, rule);
+    if (lo == hi) {
+        lo -= 0.5;
+        hi += 0.5;
+    }
+    Histogram h(b, lo, hi);
+    if (h.ok()) { h.addAll(x, n); }
+    return h;
+}
+
+// ============================================================================================================================================
+//  Regression
+// ============================================================================================================================================
+// The result of a least squares fit y = X b. coef, stdErr, tvalue and pvalue have p entries (for linearFit and polyFit: coefficient k belongs to x^k),
+// fitted and residuals have n entries. A failed fit has err != 0 (matrix.ERR_...) and no arrays. dispose() frees the arrays.
+public class Regression {
+    public int n;                          // observations
+    public int p;                          // coefficients (with the intercept)
+    public int df;                         // residual degrees of freedom n - p
+    public int err;
+    public bool intercept;
+    public double* coef;
+    public double* stdErr;                 // standard errors of the coefficients
+    public double* tvalue;
+    public double* pvalue;                 // two sided p values of the t tests of coef[k] = 0
+    public double* fitted;
+    public double* residuals;              // y - fitted
+    public double r2;                      // 1 - SSE / SST (centered when there is an intercept)
+    public double adjR2;
+    public double sigma;                   // the residual standard error sqrt(SSE / df)
+    public double sse;
+    public double sst;
+    public double fstat;                   // the F statistic of the whole regression (NaN without an intercept or with one coefficient)
+    public double fpvalue;
+
+    public bool ok() { return err == 0 && coef != null; }
+
+    // sum coef[k] x^k (for the fits of one variable)
+    public double predict(double x) {
+        if (!ok()) { return nanValue(); }
+        double r = 0.0;
+        for (int k = p - 1; k >= 0; k--) { r = r * x + coef[k]; }
+        return r;
+    }
+
+    public void dispose() {
+        freeMem(coef);
+        freeMem(stdErr);
+        freeMem(tvalue);
+        freeMem(pvalue);
+        freeMem(fitted);
+        freeMem(residuals);
+        coef = null;
+        stdErr = null;
+        tvalue = null;
+        pvalue = null;
+        fitted = null;
+        residuals = null;
+        n = 0;
+        p = 0;
+    }
+}
+
+private Regression regFailed(int code) {
+    Regression r;
+    r.err = code;
+    return r;
+}
+
+// Ordinary (or weighted) least squares with the columns of X as predictors: y has X.rows entries; addIntercept puts a constant column first (coef[0]);
+// weights (null for none) are non negative case weights. The fit uses a Householder QR decomposition of the (column scaled) design matrix, so it stays
+// accurate for ill conditioned problems where the normal equations would fail; a rank deficient X gives err = matrix.ERR_RANK.
+public Regression olsFit(matrix.Matrix* X, double* y, bool addIntercept = true, double* weights = null) {
+    if (X == null || !X->ok() || y == null) { return regFailed(matrix.ERR_ARG); }
+    int n = X->rows;
+    int p = X->cols + (addIntercept ? 1 : 0);
+    if (n < p) { return regFailed(matrix.ERR_DIM); }
+    if (!X->isFinite() || !allFiniteArr(y, n)) { return regFailed(matrix.ERR_NOT_FINITE); }
+    if (weights != null) {
+        for (int i = 0; i < n; i++) {
+            if (!(weights[i] >= 0.0) || !finite(weights[i])) { return regFailed(matrix.ERR_ARG); }
+        }
+    }
+    matrix.Matrix D(n, p);
+    double* yy = newDoubles(n);
+    double* scale = newDoubles(p);
+    double* b = newDoubles(p);
+    if (!D.ok() || yy == null || scale == null || b == null) {
+        D.dispose();
+        freeMem(yy);
+        freeMem(scale);
+        freeMem(b);
+        return regFailed(matrix.ERR_MEMORY);
+    }
+    int off = addIntercept ? 1 : 0;
+    for (int i = 0; i < n; i++) {
+        double sw = (weights != null) ? dmath.sqrt(weights[i]) : 1.0;
+        if (addIntercept) { D.d[i * p] = sw; }
+        for (int j = 0; j < X->cols; j++) { D.d[i * p + off + j] = sw * X->d[i * X->cols + j]; }
+        yy[i] = sw * y[i];
+    }
+    bool bad = false;
+    for (int j = 0; j < p; j++) {
+        double nrm = 0.0;
+        double mx = 0.0;
+        for (int i = 0; i < n; i++) { if (absd(D.d[i * p + j]) > mx) { mx = absd(D.d[i * p + j]); } }
+        if (mx == 0.0) { bad = true; scale[j] = 1.0; continue; }
+        double sq = 0.0;
+        for (int i = 0; i < n; i++) {
+            double q = D.d[i * p + j] / mx;
+            sq += q * q;
+        }
+        nrm = mx * dmath.sqrt(sq);
+        scale[j] = nrm;
+        for (int i = 0; i < n; i++) { D.d[i * p + j] /= nrm; }
+    }
+    matrix.QR f(&D);
+    Regression res;
+    int st = bad ? matrix.ERR_RANK : f.err;
+    double resid = 0.0;
+    if (st == 0) { st = f.solveLS(yy, b, &resid); }
+    if (st != 0) {
+        f.dispose();
+        D.dispose();
+        freeMem(yy);
+        freeMem(scale);
+        freeMem(b);
+        return regFailed(st);
+    }
+    res.n = n;
+    res.p = p;
+    res.df = n - p;
+    res.intercept = addIntercept;
+    res.coef = newDoubles(p);
+    res.stdErr = newDoubles(p);
+    res.tvalue = newDoubles(p);
+    res.pvalue = newDoubles(p);
+    res.fitted = newDoubles(n);
+    res.residuals = newDoubles(n);
+    matrix.Matrix rinv(p, p);
+    if (res.coef == null || res.stdErr == null || res.tvalue == null || res.pvalue == null || res.fitted == null || res.residuals == null || !rinv.ok()) {
+        res.dispose();
+        rinv.dispose();
+        f.dispose();
+        D.dispose();
+        freeMem(yy);
+        freeMem(scale);
+        freeMem(b);
+        return regFailed(matrix.ERR_MEMORY);
+    }
+    for (int j = 0; j < p; j++) { res.coef[j] = b[j] / scale[j]; }
+    // fitted values and residuals of the original (unweighted) problem
+    double sse = 0.0;
+    double swSum = 0.0;
+    double swY = 0.0;
+    for (int i = 0; i < n; i++) {
+        double fv = addIntercept ? res.coef[0] : 0.0;
+        for (int j = 0; j < X->cols; j++) { fv += res.coef[off + j] * X->d[i * X->cols + j]; }
+        res.fitted[i] = fv;
+        res.residuals[i] = y[i] - fv;
+        double w = (weights != null) ? weights[i] : 1.0;
+        sse += w * res.residuals[i] * res.residuals[i];
+        swSum += w;
+        swY += w * y[i];
+    }
+    double sst = 0.0;
+    if (addIntercept) {
+        double ybar = swY / swSum;
+        for (int i = 0; i < n; i++) {
+            double w = (weights != null) ? weights[i] : 1.0;
+            sst += w * (y[i] - ybar) * (y[i] - ybar);
+        }
+    } else {
+        for (int i = 0; i < n; i++) {
+            double w = (weights != null) ? weights[i] : 1.0;
+            sst += w * y[i] * y[i];
+        }
+    }
+    res.sse = sse;
+    res.sst = sst;
+    res.r2 = (sst > 0.0) ? 1.0 - sse / sst : nanValue();
+    int dfTot = addIntercept ? n - 1 : n;
+    res.adjR2 = (sst > 0.0 && res.df > 0) ? 1.0 - (1.0 - res.r2) * (double) dfTot / (double) res.df : nanValue();
+    res.sigma = (res.df > 0) ? dmath.sqrt(sse / (double) res.df) : nanValue();
+    // R^-1 by back substitution (R is the p x p upper triangle of the QR factor)
+    matrix.Matrix R = f.r();
+    for (int c = 0; c < p; c++) {
+        for (int i = c; i >= 0; i--) {
+            double s = (i == c) ? 1.0 : 0.0;
+            for (int j = i + 1; j <= c; j++) { s -= R.d[i * p + j] * rinv.d[j * p + c]; }
+            rinv.d[i * p + c] = s / R.d[i * p + i];
+        }
+    }
+    for (int j = 0; j < p; j++) {
+        double v = 0.0;
+        for (int k = j; k < p; k++) { v += rinv.d[j * p + k] * rinv.d[j * p + k]; }
+        double se = res.sigma * dmath.sqrt(v) / scale[j];
+        res.stdErr[j] = se;
+        if (res.df > 0) {
+            double t = res.coef[j] / se;
+            res.tvalue[j] = t;
+            res.pvalue[j] = (t != t) ? t : 2.0 * tSf(absd(t), (double) res.df);
+        } else {
+            res.tvalue[j] = nanValue();
+            res.pvalue[j] = nanValue();
+        }
+    }
+    if (addIntercept && p > 1 && res.df > 0 && sst > 0.0) {
+        double ms = (sst - sse) / (double) (p - 1);
+        double me = sse / (double) res.df;
+        res.fstat = ms / me;
+        res.fpvalue = fSf(res.fstat, (double) (p - 1), (double) res.df);
+    } else {
+        res.fstat = nanValue();
+        res.fpvalue = nanValue();
+    }
+    R.dispose();
+    rinv.dispose();
+    f.dispose();
+    D.dispose();
+    freeMem(yy);
+    freeMem(scale);
+    freeMem(b);
+    return res;
+}
+
+private bool allFiniteArr(double* x, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!finite(x[i])) { return false; }
+    }
+    return true;
+}
+
+// the straight line y = coef[0] + coef[1] x
+public Regression linearFit(double* x, double* y, int n) {
+    if (x == null || y == null || n < 2) { return regFailed(matrix.ERR_ARG); }
+    matrix.Matrix X(n, 1);
+    if (!X.ok()) { return regFailed(X.err); }
+    for (int i = 0; i < n; i++) { X.d[i] = x[i]; }
+    Regression r = olsFit(&X, y, true, null);
+    X.dispose();
+    return r;
+}
+
+// the polynomial y = coef[0] + coef[1] x + ... + coef[degree] x^degree (degree < n)
+public Regression polyFit(double* x, double* y, int n, int degree) {
+    if (x == null || y == null || degree < 1 || n <= degree) { return regFailed(matrix.ERR_ARG); }
+    matrix.Matrix X(n, degree);
+    if (!X.ok()) { return regFailed(X.err); }
+    for (int i = 0; i < n; i++) {
+        double v = 1.0;
+        for (int k = 0; k < degree; k++) {
+            v *= x[i];
+            X.d[i * degree + k] = v;
+        }
+    }
+    Regression r = olsFit(&X, y, true, null);
+    X.dispose();
+    return r;
+}
+
+// Horner evaluation of coef[0] + coef[1] x + ... (degree + 1 coefficients)
+public double polyEval(double* coef, int degree, double x) {
+    if (coef == null || degree < 0) { return nanValue(); }
+    double r = 0.0;
+    for (int k = degree; k >= 0; k--) { r = r * x + coef[k]; }
+    return r;
+}
+
+// ============================================================================================================================================
+//  Hypothesis tests and confidence intervals
+// ============================================================================================================================================
+public struct TestResult {
+    double stat;                           // the test statistic (t, chi-square, U, F ...)
+    double pvalue;
+    double df;                             // degrees of freedom (the numerator's for F tests)
+    double df2;                            // the denominator's degrees of freedom of F tests
+    int err;                               // 0, or matrix.ERR_ARG for unusable input (the other fields are NaN then)
+}
+
+private TestResult badTest() {
+    TestResult r;
+    r.stat = nanValue();
+    r.pvalue = nanValue();
+    r.df = nanValue();
+    r.df2 = nanValue();
+    r.err = matrix.ERR_ARG;
+    return r;
+}
+
+private bool validTail(int tail) { return tail == TAIL_TWO || tail == TAIL_LESS || tail == TAIL_GREATER; }
+
+private double tPvalue(double t, double df, int tail) {
+    if (t != t) { return t; }
+    if (!validTail(tail)) { return nanValue(); }
+    if (tail == TAIL_GREATER) { return tSf(t, df); }
+    if (tail == TAIL_LESS) { return tSf(-t, df); }
+    double p = 2.0 * tSf(absd(t), df);
+    return (p > 1.0) ? 1.0 : p;
+}
+
+// one sample t test of the hypothesis that the mean is mu0
+public TestResult ttestOneSample(double* x, int n, double mu0, int tail = TAIL_TWO) {
+    if (x == null || n < 2 || hasNan(x, n)) { return badTest(); }
+    TestResult r;
+    double s = stddev(x, n, 1);
+    r.df = (double) (n - 1);
+    r.df2 = 0.0;
+    r.stat = (mean(x, n) - mu0) / (s / dmath.sqrt((double) n));
+    r.pvalue = tPvalue(r.stat, r.df, tail);
+    return r;
+}
+
+// two sample t test of equal means: Welch's test (unequal variances, Welch-Satterthwaite degrees of freedom) or, with pooled = true, Student's test
+public TestResult ttestTwoSample(double* x, int nx, double* y, int ny, bool pooled = false, int tail = TAIL_TWO) {
+    if (x == null || y == null || nx < 2 || ny < 2 || hasNan(x, nx) || hasNan(y, ny)) { return badTest(); }
+    TestResult r;
+    double mx = mean(x, nx);
+    double my = mean(y, ny);
+    double vx = variance(x, nx, 1);
+    double vy = variance(y, ny, 1);
+    double ax = (double) nx;
+    double ay = (double) ny;
+    r.df2 = 0.0;
+    if (pooled) {
+        double sp = ((ax - 1.0) * vx + (ay - 1.0) * vy) / (ax + ay - 2.0);
+        r.df = ax + ay - 2.0;
+        r.stat = (mx - my) / dmath.sqrt(sp * (1.0 / ax + 1.0 / ay));
+    } else {
+        double a = vx / ax;
+        double b = vy / ay;
+        r.stat = (mx - my) / dmath.sqrt(a + b);
+        r.df = (a + b) * (a + b) / (a * a / (ax - 1.0) + b * b / (ay - 1.0));
+    }
+    r.pvalue = tPvalue(r.stat, r.df, tail);
+    return r;
+}
+
+// paired t test: a one sample test of the differences x - y
+public TestResult ttestPaired(double* x, double* y, int n, int tail = TAIL_TWO) {
+    if (x == null || y == null || n < 2) { return badTest(); }
+    double* d = newDoubles(n);
+    if (d == null) { return badTest(); }
+    for (int i = 0; i < n; i++) { d[i] = x[i] - y[i]; }
+    TestResult r = ttestOneSample(d, n, 0.0, tail);
+    freeMem(d);
+    return r;
+}
+
+// chi-square goodness of fit of k observed counts against expected counts (null: all categories equally likely); ddof is the number of parameters
+// estimated from the data (degrees of freedom k - 1 - ddof). The expected counts have to be positive.
+public TestResult chiSquareGof(double* observed, double* expected, int k, int ddof = 0) {
+    if (observed == null || k < 2 || k - 1 - ddof < 1) { return badTest(); }
+    TestResult r;
+    double total = 0.0;
+    for (int i = 0; i < k; i++) {
+        if (!(observed[i] >= 0.0) || !finite(observed[i])) { return badTest(); }
+        total += observed[i];
+    }
+    double stat = 0.0;
+    for (int i = 0; i < k; i++) {
+        double e = (expected != null) ? expected[i] : total / (double) k;
+        if (!(e > 0.0) || !finite(e)) { return badTest(); }
+        double d = observed[i] - e;
+        stat += d * d / e;
+    }
+    r.stat = stat;
+    r.df = (double) (k - 1 - ddof);
+    r.df2 = 0.0;
+    r.pvalue = chi2Sf(stat, r.df);
+    return r;
+}
+
+// chi-square test of independence of a rows x cols contingency table (counts, row by row); for 2 x 2 tables yates = true applies the continuity correction
+public TestResult chiSquareIndependence(double* table, int rows, int cols, bool yates = false) {
+    if (table == null || rows < 2 || cols < 2 || rows > 100000 || cols > 100000) { return badTest(); }
+    double* rs = newDoubles(rows);
+    double* cs = newDoubles(cols);
+    if (rs == null || cs == null) {
+        freeMem(rs);
+        freeMem(cs);
+        return badTest();
+    }
+    double total = 0.0;
+    bool bad = false;
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            double v = table[i * cols + j];
+            if (!(v >= 0.0) || !finite(v)) { bad = true; }
+            rs[i] += v;
+            cs[j] += v;
+            total += v;
+        }
+    }
+    for (int i = 0; i < rows; i++) { if (!(rs[i] > 0.0)) { bad = true; } }
+    for (int j = 0; j < cols; j++) { if (!(cs[j] > 0.0)) { bad = true; } }
+    if (bad) {
+        freeMem(rs);
+        freeMem(cs);
+        return badTest();
+    }
+    double stat = 0.0;
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            double e = rs[i] * cs[j] / total;
+            double d = absd(table[i * cols + j] - e);
+            if (yates && rows == 2 && cols == 2) {
+                d -= 0.5;
+                if (d < 0.0) { d = 0.0; }
+            }
+            stat += d * d / e;
+        }
+    }
+    freeMem(rs);
+    freeMem(cs);
+    TestResult r;
+    r.stat = stat;
+    r.df = (double) ((rows - 1) * (cols - 1));
+    r.df2 = 0.0;
+    r.pvalue = chi2Sf(stat, r.df);
+    return r;
+}
+
+// the exact distribution of the Mann-Whitney U statistic (no ties): the probability that U <= u, as the number of arrangements divided by C(n1 + n2, n1)
+private void mannWhitneyExact(int n1, int n2, double u, double* pLess, double* pGreater) {
+    int total = n1 + n2;
+    int maxSum = n1 * (2 * total - n1 + 1) / 2;
+    // dp[j][s]: the number of ways to choose j of the ranks 1 .. i with sum s
+    double* dp = newDoubles((n1 + 1) * (maxSum + 1));
+    if (dp == null) {
+        *pLess = nanValue();
+        *pGreater = nanValue();
+        return;
+    }
+    dp[0] = 1.0;
+    for (int i = 1; i <= total; i++) {
+        int jmax = (i < n1) ? i : n1;
+        for (int j = jmax; j >= 1; j--) {
+            for (int s = maxSum; s >= i; s--) { dp[j * (maxSum + 1) + s] += dp[(j - 1) * (maxSum + 1) + s - i]; }
+        }
+    }
+    double all = 0.0;
+    double le = 0.0;
+    double ge = 0.0;
+    int base = n1 * (n1 + 1) / 2;
+    for (int s = 0; s <= maxSum; s++) {
+        double w = dp[n1 * (maxSum + 1) + s];
+        if (w == 0.0) { continue; }
+        double uu = (double) (s - base);
+        all += w;
+        if (uu <= u) { le += w; }
+        if (uu >= u) { ge += w; }
+    }
+    freeMem(dp);
+    *pLess = le / all;
+    *pGreater = ge / all;
+}
+
+// Mann-Whitney U test (Wilcoxon rank sum) of the hypothesis that x and y come from the same distribution. stat is U of the first sample (the number of pairs
+// x_i > y_j, ties count a half). The p value is exact when there are no ties and both samples have at most 25 values, otherwise the normal approximation with
+// the tie correction and a continuity correction (the same as SciPy's method "exact" / "asymptotic").
+public TestResult mannWhitney(double* x, int nx, double* y, int ny, int tail = TAIL_TWO) {
+    if (x == null || y == null || nx < 1 || ny < 1 || !validTail(tail) || hasNan(x, nx) || hasNan(y, ny)) { return badTest(); }
+    int n = nx + ny;
+    double* all = newDoubles(n);
+    double* rk = newDoubles(n);
+    if (all == null || rk == null) {
+        freeMem(all);
+        freeMem(rk);
+        return badTest();
+    }
+    for (int i = 0; i < nx; i++) { all[i] = x[i]; }
+    for (int i = 0; i < ny; i++) { all[nx + i] = y[i]; }
+    ranks(all, n, rk);
+    double r1 = 0.0;
+    for (int i = 0; i < nx; i++) { r1 += rk[i]; }
+    double u1 = r1 - (double) nx * (double) (nx + 1) / 2.0;
+    // ties
+    sortDoubles(all, n);
+    double tieSum = 0.0;
+    bool ties = false;
+    int i = 0;
+    while (i < n) {
+        int j = i;
+        while (j < n && all[j] == all[i]) { j++; }
+        double t = (double) (j - i);
+        if (j - i > 1) { ties = true; }
+        tieSum += t * t * t - t;
+        i = j;
+    }
+    freeMem(all);
+    freeMem(rk);
+    TestResult r;
+    r.stat = u1;
+    r.df = 0.0;
+    r.df2 = 0.0;
+    double n1 = (double) nx;
+    double n2 = (double) ny;
+    if (!ties && nx <= 25 && ny <= 25) {
+        double le;
+        double ge;
+        mannWhitneyExact(nx, ny, u1, &le, &ge);
+        if (tail == TAIL_GREATER) { r.pvalue = ge; }
+        else if (tail == TAIL_LESS) { r.pvalue = le; }
+        else {
+            double p = 2.0 * ((le < ge) ? le : ge);
+            r.pvalue = (p > 1.0) ? 1.0 : p;
+        }
+        return r;
+    }
+    double mu = n1 * n2 / 2.0;
+    double nt = n1 + n2;
+    double s = dmath.sqrt(n1 * n2 / 12.0 * ((nt + 1.0) - tieSum / (nt * (nt - 1.0))));
+    if (!(s > 0.0)) {
+        r.pvalue = nanValue();
+        return r;
+    }
+    if (tail == TAIL_GREATER) {
+        r.pvalue = stdNormalSf((u1 - mu - 0.5) / s);
+    } else if (tail == TAIL_LESS) {
+        r.pvalue = stdNormalCdf((u1 - mu + 0.5) / s);
+    } else {
+        double z = (absd(u1 - mu) - 0.5) / s;
+        double p = 2.0 * stdNormalSf(z);
+        r.pvalue = (p > 1.0) ? 1.0 : p;
+    }
+    return r;
+}
+
+// one way analysis of variance: the data of the k groups one after the other in `data`, group g has sizes[g] (>= 1) values; stat is F, df = k - 1, df2 = N - k
+public TestResult anovaOneWay(double* data, int* sizes, int k) {
+    if (data == null || sizes == null || k < 2) { return badTest(); }
+    int total = 0;
+    for (int g = 0; g < k; g++) {
+        if (sizes[g] < 1) { return badTest(); }
+        total += sizes[g];
+    }
+    if (total - k < 1 || hasNan(data, total)) { return badTest(); }
+    double grand = mean(data, total);
+    double ssb = 0.0;
+    double ssw = 0.0;
+    int off = 0;
+    for (int g = 0; g < k; g++) {
+        double m = mean(&data[off], sizes[g]);
+        ssb += (double) sizes[g] * (m - grand) * (m - grand);
+        for (int i = 0; i < sizes[g]; i++) {
+            double d = data[off + i] - m;
+            ssw += d * d;
+        }
+        off += sizes[g];
+    }
+    TestResult r;
+    r.df = (double) (k - 1);
+    r.df2 = (double) (total - k);
+    r.stat = (ssb / r.df) / (ssw / r.df2);
+    r.pvalue = fSf(r.stat, r.df, r.df2);
+    return r;
+}
+
+// the F test of equal variances of two samples: stat = var(x) / var(y), df = nx - 1, df2 = ny - 1
+public TestResult varianceTest(double* x, int nx, double* y, int ny, int tail = TAIL_TWO) {
+    if (x == null || y == null || nx < 2 || ny < 2 || !validTail(tail) || hasNan(x, nx) || hasNan(y, ny)) { return badTest(); }
+    TestResult r;
+    r.df = (double) (nx - 1);
+    r.df2 = (double) (ny - 1);
+    r.stat = variance(x, nx, 1) / variance(y, ny, 1);
+    double lo = fCdf(r.stat, r.df, r.df2);
+    double up = fSf(r.stat, r.df, r.df2);
+    if (tail == TAIL_GREATER) { r.pvalue = up; }
+    else if (tail == TAIL_LESS) { r.pvalue = lo; }
+    else {
+        double p = 2.0 * ((lo < up) ? lo : up);
+        r.pvalue = (p > 1.0) ? 1.0 : p;
+    }
+    return r;
+}
+
+// the Jarque-Bera normality test: stat = n / 6 (S^2 + K^2 / 4) with the skewness S and the excess kurtosis K, df = 2
+public TestResult jarqueBera(double* x, int n) {
+    if (x == null || n < 3 || hasNan(x, n)) { return badTest(); }
+    double s = skewness(x, n, true);
+    double k = kurtosis(x, n, true, true);
+    if (s != s || k != k) { return badTest(); }
+    TestResult r;
+    r.stat = (double) n / 6.0 * (s * s + k * k / 4.0);
+    r.df = 2.0;
+    r.df2 = 0.0;
+    r.pvalue = chi2Sf(r.stat, 2.0);
+    return r;
+}
+
+public struct Interval {
+    double lo;
+    double hi;
+}
+
+private Interval badInterval() {
+    Interval v;
+    v.lo = nanValue();
+    v.hi = nanValue();
+    return v;
+}
+
+// the confidence interval of the mean (Student t, level 0 < level < 1, e.g. 0.95)
+public Interval meanCI(double* x, int n, double level) {
+    if (x == null || n < 2 || !(level > 0.0) || !(level < 1.0) || hasNan(x, n)) { return badInterval(); }
+    double m = mean(x, n);
+    double h = tQuantile(0.5 + 0.5 * level, (double) (n - 1)) * sem(x, n);
+    Interval v;
+    v.lo = m - h;
+    v.hi = m + h;
+    return v;
+}
+
+// the confidence interval of the difference of two means (Welch)
+public Interval meanDiffCI(double* x, int nx, double* y, int ny, double level) {
+    if (x == null || y == null || nx < 2 || ny < 2 || !(level > 0.0) || !(level < 1.0) || hasNan(x, nx) || hasNan(y, ny)) { return badInterval(); }
+    double ax = variance(x, nx, 1) / (double) nx;
+    double ay = variance(y, ny, 1) / (double) ny;
+    double df = (ax + ay) * (ax + ay) / (ax * ax / (double) (nx - 1) + ay * ay / (double) (ny - 1));
+    double d = mean(x, nx) - mean(y, ny);
+    double h = tQuantile(0.5 + 0.5 * level, df) * dmath.sqrt(ax + ay);
+    Interval v;
+    v.lo = d - h;
+    v.hi = d + h;
+    return v;
+}
+
+// the confidence interval of the variance of normal data (chi-square)
+public Interval varianceCI(double* x, int n, double level) {
+    if (x == null || n < 2 || !(level > 0.0) || !(level < 1.0) || hasNan(x, n)) { return badInterval(); }
+    double ss = variance(x, n, 1) * (double) (n - 1);
+    double a = 0.5 * (1.0 - level);
+    Interval v;
+    v.lo = ss / chi2Quantile(1.0 - a, (double) (n - 1));
+    v.hi = ss / chi2Quantile(a, (double) (n - 1));
+    return v;
+}
+
+// the confidence interval of a proportion (k successes in n trials): CI_WALD, CI_WILSON (score interval) or CI_CLOPPER_PEARSON (exact)
+public Interval proportionCI(int k, int n, double level, int method = CI_WILSON) {
+    if (n < 1 || k < 0 || k > n || !(level > 0.0) || !(level < 1.0) || (method != CI_WALD && method != CI_WILSON && method != CI_CLOPPER_PEARSON)) { return badInterval(); }
+    double nn = (double) n;
+    double ph = (double) k / nn;
+    double a = 0.5 * (1.0 - level);
+    Interval v;
+    if (method == CI_CLOPPER_PEARSON) {
+        v.lo = (k == 0) ? 0.0 : betaQuantile(a, (double) k, nn - (double) k + 1.0);
+        v.hi = (k == n) ? 1.0 : betaQuantile(1.0 - a, (double) k + 1.0, nn - (double) k);
+        return v;
+    }
+    double z = stdNormalQuantile(1.0 - a);
+    if (method == CI_WALD) {
+        double h = z * dmath.sqrt(ph * (1.0 - ph) / nn);
+        v.lo = ph - h;
+        v.hi = ph + h;
+        if (v.lo < 0.0) { v.lo = 0.0; }
+        if (v.hi > 1.0) { v.hi = 1.0; }
+        return v;
+    }
+    double z2 = z * z;
+    double den = 1.0 + z2 / nn;
+    double center = (ph + z2 / (2.0 * nn)) / den;
+    double h = z * dmath.sqrt(ph * (1.0 - ph) / nn + z2 / (4.0 * nn * nn)) / den;
+    v.lo = center - h;
+    v.hi = center + h;
+    if (k == 0 || v.lo < 0.0) { v.lo = 0.0; }              // for k = 0 the exact bound is 0: the difference would leave rounding noise
+    if (k == n || v.hi > 1.0) { v.hi = 1.0; }
+    return v;
+}
+
+// The percentile bootstrap confidence interval of any statistic: `resamples` samples of size n are drawn with replacement using the generator g (rng module),
+// statFn(sample, n, ctx) computes the statistic: a function  double f(double* sample, int n, void* ctx)  (ctx is whatever you pass: a pointer to your own data, or null).
+public Interval bootstrapCI(double* x, int n, func statFn, void* ctx, int resamples, double level, rng.Rng* g) {
+    if (x == null || n < 1 || resamples < 10 || !(level > 0.0) || !(level < 1.0) || g == null || statFn == null) { return badInterval(); }
+    double* buf = newDoubles(n);
+    double* stats = newDoubles(resamples);
+    if (buf == null || stats == null) {
+        freeMem(buf);
+        freeMem(stats);
+        return badInterval();
+    }
+    for (int b = 0; b < resamples; b++) {
+        for (int i = 0; i < n; i++) { buf[i] = x[g->below(n)]; }
+        stats[b] = __dbl(statFn(buf, n, ctx));
+    }
+    Interval v = badInterval();
+    if (!hasNan(stats, resamples)) {
+        sortDoubles(stats, resamples);
+        double a = 0.5 * (1.0 - level);
+        v.lo = quantileSorted(stats, resamples, a, 7);
+        v.hi = quantileSorted(stats, resamples, 1.0 - a, 7);
+    }
+    freeMem(buf);
+    freeMem(stats);
+    return v;
+}
+
+// ============================================================================================================================================
+//  Time series
+// ============================================================================================================================================
+// the autocovariance at lag k with divisor n (the usual biased estimator: the matrix of autocovariances is positive semi definite)
+public double autocovariance(double* x, int n, int lag) {
+    if (x == null || n < 1 || lag < 0 || lag >= n) { return nanValue(); }
+    double m = mean(x, n);
+    double s = 0.0;
+    for (int i = lag; i < n; i++) { s += (x[i] - m) * (x[i - lag] - m); }
+    return s / (double) n;
+}
+
+// the autocorrelation function r(0) = 1, r(1) ... r(maxLag) into out (maxLag + 1 numbers); false for bad arguments or constant data
+public bool autocorrelation(double* x, int n, int maxLag, double* out) {
+    if (x == null || out == null || n < 2 || maxLag < 0 || maxLag >= n) { return false; }
+    double m = mean(x, n);
+    double c0 = 0.0;
+    for (int i = 0; i < n; i++) { c0 += (x[i] - m) * (x[i] - m); }
+    if (!(c0 > 0.0) || !finite(c0)) { return false; }
+    for (int k = 0; k <= maxLag; k++) {
+        double s = 0.0;
+        for (int i = k; i < n; i++) { s += (x[i] - m) * (x[i - k] - m); }
+        out[k] = s / c0;
+    }
+    return true;
+}
+
+// the partial autocorrelation function (Levinson-Durbin recursion on the autocorrelations): out[0] = 1, out[k] for k = 1 .. maxLag
+public bool partialAutocorrelation(double* x, int n, int maxLag, double* out) {
+    if (x == null || out == null || n < 2 || maxLag < 0 || maxLag >= n) { return false; }
+    double* r = newDoubles(maxLag + 1);
+    double* phi = newDoubles(maxLag + 1);
+    double* prev = newDoubles(maxLag + 1);
+    if (r == null || phi == null || prev == null) {
+        freeMem(r);
+        freeMem(phi);
+        freeMem(prev);
+        return false;
+    }
+    bool ok = autocorrelation(x, n, maxLag, r);
+    if (ok) {
+        out[0] = 1.0;
+        double v = 1.0;
+        for (int k = 1; k <= maxLag; k++) {
+            double acc = r[k];
+            for (int j = 1; j < k; j++) { acc -= prev[j] * r[k - j]; }
+            double pk = acc / v;
+            phi[k] = pk;
+            for (int j = 1; j < k; j++) { phi[j] = prev[j] - pk * prev[k - j]; }
+            v *= 1.0 - pk * pk;
+            for (int j = 1; j <= k; j++) { prev[j] = phi[j]; }
+            out[k] = pk;
+        }
+    }
+    freeMem(r);
+    freeMem(phi);
+    freeMem(prev);
+    return ok;
+}
+
+// the Ljung-Box test of "no autocorrelation up to `lags`": stat = n (n + 2) sum r_k^2 / (n - k), df = lags - modelDf
+public TestResult ljungBox(double* x, int n, int lags, int modelDf = 0) {
+    if (x == null || n < 3 || lags < 1 || lags >= n || lags - modelDf < 1) { return badTest(); }
+    double* r = newDoubles(lags + 1);
+    if (r == null) { return badTest(); }
+    if (!autocorrelation(x, n, lags, r)) {
+        freeMem(r);
+        return badTest();
+    }
+    double q = 0.0;
+    for (int k = 1; k <= lags; k++) { q += r[k] * r[k] / (double) (n - k); }
+    q *= (double) n * (double) (n + 2);
+    freeMem(r);
+    TestResult t;
+    t.stat = q;
+    t.df = (double) (lags - modelDf);
+    t.df2 = 0.0;
+    t.pvalue = chi2Sf(q, t.df);
+    return t;
+}
+
+// ============================================================================================================================================
+//  k-means clustering
+// ============================================================================================================================================
+// The result of kmeans(): centers (k x dim, row by row), labels (n), inertia (the sum of the squared distances to the centers), the iterations of the best run.
+public class KMeans {
+    public int k;
+    public int dim;
+    public int n;
+    public int iterations;
+    public int err;
+    public double inertia;
+    public double* centers;
+    public int* labels;
+
+    public bool ok() { return err == 0 && centers != null; }
+
+    // the label of the nearest center for a new point
+    public int predict(double* point) {
+        if (!ok() || point == null) { return -1; }
+        int best = 0;
+        double bd = infValue();
+        for (int c = 0; c < k; c++) {
+            double d = 0.0;
+            for (int j = 0; j < dim; j++) {
+                double t = point[j] - centers[c * dim + j];
+                d += t * t;
+            }
+            if (d < bd) { bd = d; best = c; }
+        }
+        return best;
+    }
+
+    public void dispose() {
+        freeMem(centers);
+        freeMem(labels);
+        centers = null;
+        labels = null;
+        k = 0;
+        n = 0;
+    }
+}
+
+private double sqDist(double* a, double* b, int dim) {
+    double d = 0.0;
+    for (int j = 0; j < dim; j++) {
+        double t = a[j] - b[j];
+        d += t * t;
+    }
+    return d;
+}
+
+// one run of k-means++ seeding and Lloyd's iterations; fills centers and labels, returns the inertia (NaN when memory is short)
+private double kmeansRun(double* data, int n, int dim, int k, rng.Rng* g, int maxIter, double* centers, int* labels, int* iters) {
+    double* dist = newDoubles(n);
+    double* sums = newDoubles(k * dim);
+    int* counts = (int*) asys.alloc(k * 8 + 8);
+    if (dist == null || sums == null || counts == null) {
+        freeMem(dist);
+        freeMem(sums);
+        freeMem(counts);
+        return nanValue();
+    }
+    // k-means++: the next center is drawn with probability proportional to the squared distance to the nearest center chosen so far
+    int first = g->below(n);
+    for (int j = 0; j < dim; j++) { centers[j] = data[first * dim + j]; }
+    for (int i = 0; i < n; i++) { dist[i] = sqDist(&data[i * dim], centers, dim); }
+    for (int c = 1; c < k; c++) {
+        double total = 0.0;
+        for (int i = 0; i < n; i++) { total += dist[i]; }
+        int pick = 0;
+        if (total > 0.0) {
+            double r = g->nextDouble() * total;
+            double acc = 0.0;
+            pick = n - 1;
+            for (int i = 0; i < n; i++) {
+                acc += dist[i];
+                if (acc > r) { pick = i; break; }
+            }
+        } else {
+            pick = g->below(n);
+        }
+        for (int j = 0; j < dim; j++) { centers[c * dim + j] = data[pick * dim + j]; }
+        for (int i = 0; i < n; i++) {
+            double d = sqDist(&data[i * dim], &centers[c * dim], dim);
+            if (d < dist[i]) { dist[i] = d; }
+        }
+    }
+    for (int i = 0; i < n; i++) { labels[i] = -1; }
+    int it = 0;
+    bool changed = true;
+    while (changed && it < maxIter) {
+        changed = false;
+        for (int i = 0; i < n; i++) {
+            int best = 0;
+            double bd = infValue();
+            for (int c = 0; c < k; c++) {
+                double d = sqDist(&data[i * dim], &centers[c * dim], dim);
+                if (d < bd) { bd = d; best = c; }
+            }
+            dist[i] = bd;
+            if (labels[i] != best) { labels[i] = best; changed = true; }
+        }
+        for (int c = 0; c < k; c++) { counts[c] = 0; }
+        for (int q = 0; q < k * dim; q++) { sums[q] = 0.0; }
+        for (int i = 0; i < n; i++) {
+            counts[labels[i]]++;
+            for (int j = 0; j < dim; j++) { sums[labels[i] * dim + j] += data[i * dim + j]; }
+        }
+        for (int c = 0; c < k; c++) {
+            if (counts[c] > 0) {
+                for (int j = 0; j < dim; j++) { centers[c * dim + j] = sums[c * dim + j] / (double) counts[c]; }
+            } else {
+                // an empty cluster takes the point that is farthest from its center
+                int far = 0;
+                for (int i = 1; i < n; i++) { if (dist[i] > dist[far]) { far = i; } }
+                for (int j = 0; j < dim; j++) { centers[c * dim + j] = data[far * dim + j]; }
+                dist[far] = 0.0;
+                changed = true;
+            }
+        }
+        it++;
+    }
+    double inertia = 0.0;
+    for (int i = 0; i < n; i++) { inertia += sqDist(&data[i * dim], &centers[labels[i] * dim], dim); }
+    *iters = it;
+    freeMem(dist);
+    freeMem(sums);
+    freeMem(counts);
+    return inertia;
+}
+
+// k-means clustering of n points of `dim` coordinates (data: row by row) into k clusters: k-means++ seeding (random numbers from g) and Lloyd's iterations; the
+// best of `restarts` runs (smallest inertia) is returned. The same generator state gives the same clusters on every target.
+public KMeans kmeans(double* data, int n, int dim, int k, rng.Rng* g, int maxIter = 300, int restarts = 5) {
+    KMeans res;
+    if (data == null || g == null || n < 1 || dim < 1 || k < 1 || k > n || maxIter < 1 || restarts < 1 || n > 0x10000000 / dim) {
+        res.err = matrix.ERR_ARG;
+        return res;
+    }
+    if (!allFiniteArr(data, n * dim)) {
+        res.err = matrix.ERR_NOT_FINITE;
+        return res;
+    }
+    double* centers = newDoubles(k * dim);
+    int* labels = (int*) asys.alloc(n * 8);
+    double* bc = newDoubles(k * dim);
+    int* bl = (int*) asys.alloc(n * 8);
+    if (centers == null || labels == null || bc == null || bl == null) {
+        freeMem(centers);
+        freeMem(labels);
+        freeMem(bc);
+        freeMem(bl);
+        res.err = matrix.ERR_MEMORY;
+        return res;
+    }
+    double best = infValue();
+    int bestIt = 0;
+    bool any = false;
+    for (int r = 0; r < restarts; r++) {
+        int it = 0;
+        double in = kmeansRun(data, n, dim, k, g, maxIter, centers, labels, &it);
+        if (in != in) { continue; }
+        if (!any || in < best) {
+            any = true;
+            best = in;
+            bestIt = it;
+            for (int q = 0; q < k * dim; q++) { bc[q] = centers[q]; }
+            for (int i = 0; i < n; i++) { bl[i] = labels[i]; }
+        }
+    }
+    freeMem(centers);
+    freeMem(labels);
+    if (!any) {
+        freeMem(bc);
+        freeMem(bl);
+        res.err = matrix.ERR_MEMORY;
+        return res;
+    }
+    res.k = k;
+    res.dim = dim;
+    res.n = n;
+    res.iterations = bestIt;
+    res.inertia = best;
+    res.centers = bc;
+    res.labels = bl;
+    return res;
+}
+
+// ============================================================================================================================================
+//  Principal component analysis
+// ============================================================================================================================================
+// PCA of a data matrix (one observation per row): the principal axes are the eigenvectors of the covariance matrix (symmetric Jacobi eigen solver of the matrix
+// module), ordered by decreasing variance. The sign of an axis is chosen so that its largest component is positive. scale = true standardizes the columns first.
+public class Pca {
+    public int n;                          // observations
+    public int dim;                        // variables
+    public int k;                          // components kept
+    public int err;
+    public double* mean;                   // the column means (dim)
+    public double* scales;                 // the column scales (dim), 1 when scale = false
+    public double* variance;               // the variance along every kept component (k), divisor n - 1
+    public double* ratio;                  // the share of the total variance (k)
+    public matrix.Matrix components;       // k x dim: row i is the i-th principal axis
+
+    public Pca(matrix.Matrix* data, int keep = 0, bool scale = false) {
+        if (data == null || !data->ok()) { err = matrix.ERR_ARG; return; }
+        if (data->rows < 2 || !data->isFinite()) { err = (data->rows < 2) ? matrix.ERR_DIM : matrix.ERR_NOT_FINITE; return; }
+        n = data->rows;
+        dim = data->cols;
+        k = (keep < 1 || keep > dim) ? dim : keep;
+        mean = newDoubles(dim);
+        scales = newDoubles(dim);
+        variance = newDoubles(k);
+        ratio = newDoubles(k);
+        if (mean == null || scales == null || variance == null || ratio == null) {
+            dispose();
+            err = matrix.ERR_MEMORY;
+            return;
+        }
+        matrix.Matrix centered = data->copy();
+        if (!centered.ok()) {
+            dispose();
+            err = matrix.ERR_MEMORY;
+            return;
+        }
+        for (int j = 0; j < dim; j++) {
+            double m = 0.0;
+            for (int i = 0; i < n; i++) { m += data->d[i * dim + j]; }
+            m /= (double) n;
+            mean[j] = m;
+            double ss = 0.0;
+            for (int i = 0; i < n; i++) {
+                double d = data->d[i * dim + j] - m;
+                ss += d * d;
+            }
+            double sd = dmath.sqrt(ss / (double) (n - 1));
+            scales[j] = (scale && sd > 0.0) ? sd : 1.0;
+            for (int i = 0; i < n; i++) { centered.d[i * dim + j] = (data->d[i * dim + j] - m) / scales[j]; }
+        }
+        matrix.Matrix cov = covarianceMatrix(&centered, 1);
+        centered.dispose();
+        if (!cov.ok()) {
+            dispose();
+            err = cov.err;
+            return;
+        }
+        matrix.SymEigen e(&cov);
+        if (e.err != 0) {
+            int st = e.err;
+            e.dispose();
+            cov.dispose();
+            dispose();
+            err = st;
+            return;
+        }
+        components = matrix.zeros(k, dim);
+        if (!components.ok()) {
+            e.dispose();
+            cov.dispose();
+            dispose();
+            err = matrix.ERR_MEMORY;
+            return;
+        }
+        double total = 0.0;
+        for (int i = 0; i < dim; i++) { total += (e.values[i] > 0.0) ? e.values[i] : 0.0; }
+        for (int c = 0; c < k; c++) {
+            int src = dim - 1 - c;                     // the eigenvalues come in ascending order
+            double v = e.values[src];
+            variance[c] = (v > 0.0) ? v : 0.0;
+            ratio[c] = (total > 0.0) ? variance[c] / total : nanValue();
+            int big = 0;
+            for (int j = 1; j < dim; j++) {
+                if (absd(e.vectors.d[j * dim + src]) > absd(e.vectors.d[big * dim + src])) { big = j; }
+            }
+            double sg = (e.vectors.d[big * dim + src] < 0.0) ? -1.0 : 1.0;
+            for (int j = 0; j < dim; j++) { components.d[c * dim + j] = sg * e.vectors.d[j * dim + src]; }
+        }
+        e.dispose();
+        cov.dispose();
+    }
+
+    public bool ok() { return err == 0 && k > 0; }
+
+    // the coordinates of the observations in the principal axes: n x k
+    public matrix.Matrix transform(matrix.Matrix* data) {
+        matrix.Matrix none;
+        none.err = matrix.ERR_ARG;
+        if (!ok() || data == null || !data->ok()) { return none; }
+        if (data->cols != dim) { none.err = matrix.ERR_DIM; return none; }
+        matrix.Matrix r(data->rows, k);
+        if (!r.ok()) { return r; }
+        for (int i = 0; i < data->rows; i++) {
+            for (int c = 0; c < k; c++) {
+                double s = 0.0;
+                for (int j = 0; j < dim; j++) { s += (data->d[i * dim + j] - mean[j]) / scales[j] * components.d[c * dim + j]; }
+                r.d[i * k + c] = s;
+            }
+        }
+        return r;
+    }
+
+    // back from the principal coordinates (n x k) to the original variables (n x dim); exact when all components are kept
+    public matrix.Matrix inverseTransform(matrix.Matrix* scores) {
+        matrix.Matrix none;
+        none.err = matrix.ERR_ARG;
+        if (!ok() || scores == null || !scores->ok()) { return none; }
+        if (scores->cols != k) { none.err = matrix.ERR_DIM; return none; }
+        matrix.Matrix r(scores->rows, dim);
+        if (!r.ok()) { return r; }
+        for (int i = 0; i < scores->rows; i++) {
+            for (int j = 0; j < dim; j++) {
+                double s = 0.0;
+                for (int c = 0; c < k; c++) { s += scores->d[i * k + c] * components.d[c * dim + j]; }
+                r.d[i * dim + j] = s * scales[j] + mean[j];
+            }
+        }
+        return r;
+    }
+
+    public void dispose() {
+        freeMem(mean);
+        freeMem(scales);
+        freeMem(variance);
+        freeMem(ratio);
+        mean = null;
+        scales = null;
+        variance = null;
+        ratio = null;
+        components.dispose();
+        k = 0;
+        n = 0;
+        dim = 0;
+    }
+}

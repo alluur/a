@@ -1,0 +1,3010 @@
+// =============================================================================
+//  optim - numerical methods: roots, minima, integrals, ODEs, interpolation, polynomials, FFT, linear programming               import optim;
+//
+//  All numbers are `double` (soft float in A: identical results on every target); arrays are `double*` plus a count; nothing here is thread safe.
+//
+//  Callbacks are `func` values and carry a context pointer, because A has no closures: write an ordinary function and pass its name and a pointer to
+//  whatever data it needs (a struct of your own, or null). The callbacks have these signatures; they get and return `double` values:
+//      double f(double x, void* ctx)                                   scalar function (roots, 1-D minima, integrals, interpolation of functions)
+//      double f(double* x, int n, void* ctx)                           objective of n variables
+//      void   grad(double* x, int n, double* g, void* ctx)             its gradient (optional: null means "use central differences")
+//      void   rhs(double t, double* y, double* dydt, int n, void* ctx)       ODE   y' = rhs(t, y)
+//      void   fvec(double* x, int n, double* out, void* ctx)           n equations F(x) = 0 for newtonSystem
+//  Example (a parameter through the context):   struct P { double k; }   double decay(double x, void* c) { P* p = (P*) c; return dmath.exp(-p->k * x) - 0.5; }
+//                                               P p;  p.k = 2.0;   optim.Result r = optim.brent(decay, &p, 0.0, 5.0, 1.0e-12, 100);   // r.x = ln 2 / 2
+//
+//  Roots           bisection  brent  newton (derivative or null)  secant  findBracket  newtonSystem (n equations, numerical Jacobian, LU)
+//  Minima          goldenSection  brentMin  nelderMead  bfgs (gradient or null: central differences)  gradientDescent
+//  Derivatives     derivative  derivative5  gradientNum  jacobianNum  hessianNum
+//  Integrals       trapezoid  simpson  romberg  gaussKronrod (adaptive G7K15, finite and infinite limits)  gaussLegendre(n, x, w)  integrateSamples
+//  ODEs            rk4  Rk45 (Dormand-Prince, adaptive: step, solveTo, solveAt)
+//  Interpolation   interpLinear  Spline (natural or clamped cubic: value, derivative, integral)  Barycentric (Lagrange)  chebyshevNodes  Chebyshev (fit a function)
+//  Polynomials     polyEval polyDeriv polyIntegral polyAdd polyMul polyDivide polyFromRoots polyRoots (Aberth) polyFit
+//  FFT             fft(re, im, n, inverse) for any n (radix 2, Bluestein otherwise)  FftPlan  rfft irfft  convolve  crossCorrelate  windowFunction
+//  Linear programs linprog(c, n, A, m, b, kinds, maximize, x, &objective)  (two phase simplex)
+//  Sequences       fibonacciD lucasD catalanD bernoulliD harmonicD factorialD binomialD legendreP chebyshevT chebyshevU hermiteH laguerreL
+//
+//  Errors: every function that can fail returns a status in its result: optim.OK (0), ERR_ARG, ERR_BRACKET (no sign change), ERR_NO_CONVERGE, ERR_NAN (a callback
+//  returned NaN or infinity where a number was needed), ERR_SINGULAR, ERR_MEMORY, LP_INFEASIBLE, LP_UNBOUNDED; optim.errorText(status) names it. NaN in the input is
+//  reported (ERR_NAN / ERR_ARG), never turned into a wrong number.
+//  The algorithms, accuracy, speed and tests are described in docs/ALGO.md.
+// =============================================================================
+import asys;
+import cmath;
+import dmath;
+import matrix;
+module optim;
+
+public const OK = 0;
+public const ERR_ARG = 1;
+public const ERR_BRACKET = 2;
+public const ERR_NO_CONVERGE = 3;
+public const ERR_NAN = 4;
+public const ERR_SINGULAR = 5;
+public const ERR_MEMORY = 6;
+public const LP_INFEASIBLE = 7;
+public const LP_UNBOUNDED = 8;
+
+public const SPLINE_NATURAL = 0;
+public const SPLINE_CLAMPED = 1;
+
+public const WIN_RECT = 0;
+public const WIN_HANN = 1;
+public const WIN_HAMMING = 2;
+public const WIN_BLACKMAN = 3;
+
+public const LE = -1;                      // kinds of the rows of a linear program: a x <= b, = b, >= b
+public const EQ = 0;
+public const GE = 1;
+
+private const EPS = 2.220446049250313e-16;
+private const D_TOL = 1.0e-12;                // default tolerance of the root finders
+private const D_MINTOL = 1.0e-8;              // of the minimizers
+private const D_SYSTOL = 1.0e-10;            // of newtonSystem
+private const D_GTOL = 1.0e-6;               // gradient tolerance of bfgs and gradientDescent
+private const D_ZERO = 0.0;
+private const D_ONE = 1.0;
+private const CBRT_EPS = 6.055454452393340e-06;
+
+public char* errorText(int code) {
+    if (code == OK) { return "ok"; }
+    if (code == ERR_ARG) { return "bad argument"; }
+    if (code == ERR_BRACKET) { return "the interval does not bracket a root (no sign change)"; }
+    if (code == ERR_NO_CONVERGE) { return "no convergence within the iteration limit"; }
+    if (code == ERR_NAN) { return "the function returned NaN or infinity"; }
+    if (code == ERR_SINGULAR) { return "singular (zero derivative or singular Jacobian)"; }
+    if (code == ERR_MEMORY) { return "out of memory"; }
+    if (code == LP_INFEASIBLE) { return "the linear program is infeasible"; }
+    if (code == LP_UNBOUNDED) { return "the linear program is unbounded"; }
+    return "unknown error";
+}
+
+// ---- helpers -------------------------------------------------------------------------------------------------------------------------------
+private double nanValue() { return __dbl(0x7FF8000000000000); }
+private double infValue() { return __dbl(0x7FF0000000000000); }
+private bool finite(double v) { return ((__bits(v) >> 52) & 0x7FF) != 0x7FF; }
+private double absd(double v) { return v < 0.0 ? -v : v; }
+private void freeMem(void* p) { if (p != null) { asys.free((char*) p); } }
+private double* newDoubles(int n) { return (double*) asys.alloc((n < 1 ? 1 : n) * 8); }
+private int* newInts(int n) { return (int*) asys.alloc((n < 1 ? 1 : n) * 8); }
+
+// the callbacks return their double as the bits of an int
+private double call1(func f, double x, void* ctx) { return __dbl(f(x, ctx)); }
+private double callN(func f, double* x, int n, void* ctx) { return __dbl(f(x, n, ctx)); }
+
+// ---- results ---------------------------------------------------------------------------------------------------------------------------------
+// The result of a root finder, a minimizer or a fixed point iteration: x (the root / the minimizer), fx (the function value there), err (an estimate of the
+// error of x, or the gradient norm), iterations, evals (function evaluations) and status (OK or an ERR_ code).
+public struct Result {
+    double x;
+    double fx;
+    double err;
+    int iterations;
+    int evals;
+    int status;
+}
+
+private Result mk(double x, double fx, int it, int ev, int st) {
+    Result r;
+    r.x = x;
+    r.fx = fx;
+    r.err = 0.0;
+    r.iterations = it;
+    r.evals = ev;
+    r.status = st;
+    return r;
+}
+
+// ---- fast, exact trigonometry of rational turns ---------------------------------------------------------------------------------------------------------
+// sin and cos of 2 pi k / n by exact integer octant reduction and a Taylor series on [0, pi / 4] (about 1 ulp, a tenth of the cost of dmath.sin / dmath.cos)
+public void sincosTurns(int k, int n, double* s, double* c) {
+    if (s == null || c == null) { return; }
+    if (n <= 0) {
+        *s = nanValue();
+        *c = nanValue();
+        return;
+    }
+    k = k % n;
+    if (k < 0) { k += n; }
+    int q = (int) (((uint64) k * 4) / (uint64) n);          // quadrant 0 .. 3
+    int r = 4 * k - q * n;                                  // 0 <= r < n: the angle inside the quadrant is (pi / 2) r / n
+    double sn;
+    double cs;
+    if (2 * r <= n) {
+        sincosSmall(1.5707963267948966 * (double) r / (double) n, &sn, &cs);
+    } else {
+        sincosSmall(1.5707963267948966 * (double) (n - r) / (double) n, &cs, &sn);   // the complement angle swaps sin and cos
+    }
+    if (r == 0) {
+        sn = 0.0;
+        cs = 1.0;
+    }
+    // rotate by q quadrants
+    // (adding 0.0 turns a negative zero into +0.0: sin and cos of quarter turns are exact zeros without a sign)
+    if (q == 0) { *s = sn + 0.0; *c = cs + 0.0; }
+    else if (q == 1) { *s = cs + 0.0; *c = -sn + 0.0; }
+    else if (q == 2) { *s = -sn + 0.0; *c = -cs + 0.0; }
+    else { *s = -cs + 0.0; *c = sn + 0.0; }
+}
+
+// sin and cos for 0 <= x <= pi / 4 (+ a little)
+private void sincosSmall(double x, double* s, double* c) {
+    double x2 = x * x;
+    double cs = 1.0 + x2 * (-1.0 / 2.0 + x2 * (1.0 / 24.0 + x2 * (-1.0 / 720.0 + x2 * (1.0 / 40320.0 + x2 * (-1.0 / 3628800.0
+                + x2 * (1.0 / 479001600.0 + x2 * (-1.0 / 87178291200.0 + x2 * (1.0 / 20922789888000.0))))))));
+    double sn = x * (1.0 + x2 * (-1.0 / 6.0 + x2 * (1.0 / 120.0 + x2 * (-1.0 / 5040.0 + x2 * (1.0 / 362880.0 + x2 * (-1.0 / 39916800.0
+                + x2 * (1.0 / 6227020800.0 + x2 * (-1.0 / 1307674368000.0 + x2 * (1.0 / 355687428096000.0)))))))));
+    *s = sn;
+    *c = cs;
+}
+
+// ============================================================================================================================================
+//  Numerical differentiation
+// ============================================================================================================================================
+// the central difference (f(x + h) - f(x - h)) / 2h; h = 0 picks cbrt(eps) * max(|x|, 1), which balances rounding and truncation errors (about 1e-10 relative)
+public double derivative(func f, void* ctx, double x, double h = D_ZERO) {
+    if (f == null) { return nanValue(); }
+    if (!(h > 0.0)) { h = CBRT_EPS * ((absd(x) > 1.0) ? absd(x) : 1.0); }
+    double xp = x + h;
+    double xm = x - h;
+    h = (xp - xm) / 2.0;                                      // the step that was really taken
+    return (call1(f, xp, ctx) - call1(f, xm, ctx)) / (2.0 * h);
+}
+
+// the five point formula (error O(h^4)); h = 0 picks eps^(1/5) * max(|x|, 1)
+public double derivative5(func f, void* ctx, double x, double h = D_ZERO) {
+    if (f == null) { return nanValue(); }
+    if (!(h > 0.0)) { h = 7.4e-4 * ((absd(x) > 1.0) ? absd(x) : 1.0); }
+    double f1 = call1(f, x + h, ctx);
+    double f2 = call1(f, x - h, ctx);
+    double f3 = call1(f, x + 2.0 * h, ctx);
+    double f4 = call1(f, x - 2.0 * h, ctx);
+    return (8.0 * (f1 - f2) - (f3 - f4)) / (12.0 * h);
+}
+
+// the central difference gradient of f(x) (n variables) into g (2n evaluations)
+public void gradientNum(func f, void* ctx, double* x, int n, double* g) {
+    if (f == null || x == null || g == null || n < 1) { return; }
+    for (int i = 0; i < n; i++) {
+        double xi = x[i];
+        double h = CBRT_EPS * ((absd(xi) > 1.0) ? absd(xi) : 1.0);
+        double xp = xi + h;
+        double xm = xi - h;
+        h = (xp - xm) / 2.0;
+        x[i] = xp;
+        double fp = callN(f, x, n, ctx);
+        x[i] = xm;
+        double fm = callN(f, x, n, ctx);
+        x[i] = xi;
+        g[i] = (fp - fm) / (2.0 * h);
+    }
+}
+
+// the Jacobian (m x n, row by row) of a vector function fvec(x, n, out, ctx) with m results: forward differences
+public int jacobianNum(func fvec, void* ctx, double* x, int n, int m, double* jac) {
+    if (fvec == null || x == null || jac == null || n < 1 || m < 1) { return ERR_ARG; }
+    double* f0 = newDoubles(m);
+    double* f1 = newDoubles(m);
+    if (f0 == null || f1 == null) {
+        freeMem(f0);
+        freeMem(f1);
+        return ERR_MEMORY;
+    }
+    fvec(x, n, f0, ctx);
+    for (int j = 0; j < n; j++) {
+        double xj = x[j];
+        double h = 1.4901161193847656e-08 * ((absd(xj) > 1.0) ? absd(xj) : 1.0);
+        double xp = xj + h;
+        h = xp - xj;
+        x[j] = xp;
+        fvec(x, n, f1, ctx);
+        x[j] = xj;
+        for (int i = 0; i < m; i++) { jac[i * n + j] = (f1[i] - f0[i]) / h; }
+    }
+    freeMem(f0);
+    freeMem(f1);
+    return OK;
+}
+
+// the Hessian (n x n) of f by central differences (about 6 digits)
+public void hessianNum(func f, void* ctx, double* x, int n, double* hess) {
+    if (f == null || x == null || hess == null || n < 1) { return; }
+    double f0 = callN(f, x, n, ctx);
+    double* hs = newDoubles(n);
+    if (hs == null) { return; }
+    for (int i = 0; i < n; i++) { hs[i] = 6.0e-5 * ((absd(x[i]) > 1.0) ? absd(x[i]) : 1.0); }
+    for (int i = 0; i < n; i++) {
+        double xi = x[i];
+        x[i] = xi + hs[i];
+        double fp = callN(f, x, n, ctx);
+        x[i] = xi - hs[i];
+        double fm = callN(f, x, n, ctx);
+        x[i] = xi;
+        hess[i * n + i] = (fp - 2.0 * f0 + fm) / (hs[i] * hs[i]);
+        for (int j = i + 1; j < n; j++) {
+            double xj = x[j];
+            x[i] = xi + hs[i]; x[j] = xj + hs[j];
+            double fpp = callN(f, x, n, ctx);
+            x[i] = xi + hs[i]; x[j] = xj - hs[j];
+            double fpm = callN(f, x, n, ctx);
+            x[i] = xi - hs[i]; x[j] = xj + hs[j];
+            double fmp = callN(f, x, n, ctx);
+            x[i] = xi - hs[i]; x[j] = xj - hs[j];
+            double fmm = callN(f, x, n, ctx);
+            x[i] = xi;
+            x[j] = xj;
+            double v = (fpp - fpm - fmp + fmm) / (4.0 * hs[i] * hs[j]);
+            hess[i * n + j] = v;
+            hess[j * n + i] = v;
+        }
+    }
+    freeMem(hs);
+}
+
+// ============================================================================================================================================
+//  Root finding
+// ============================================================================================================================================
+// Looks for an interval that contains a sign change by walking away from x0 in steps that grow by a factor 1.6 (like NR's zbrac): *a and *b receive it.
+// Returns OK or ERR_BRACKET (nothing found after 60 expansions) / ERR_NAN.
+public int findBracket(func f, void* ctx, double x0, double step, double* a, double* b) {
+    if (f == null || a == null || b == null) { return ERR_ARG; }
+    if (!(step > 0.0) || !finite(x0) || !finite(step)) { return ERR_ARG; }
+    double x1 = x0;
+    double x2 = x0 + step;
+    double f1 = call1(f, x1, ctx);
+    double f2 = call1(f, x2, ctx);
+    for (int it = 0; it < 60; it++) {
+        if (f1 != f1 || f2 != f2) { return ERR_NAN; }
+        if (f1 * f2 <= 0.0 && finite(f1) && finite(f2)) {
+            *a = x1;
+            *b = x2;
+            return OK;
+        }
+        if (absd(f1) < absd(f2)) {
+            x1 += 1.6 * (x1 - x2);
+            f1 = call1(f, x1, ctx);
+        } else {
+            x2 += 1.6 * (x2 - x1);
+            f2 = call1(f, x2, ctx);
+        }
+    }
+    return ERR_BRACKET;
+}
+
+// Bisection on [a, b], f(a) and f(b) must have opposite signs (or one is 0). Stops when the interval is shorter than tol (absolute) or f is 0; always converges,
+// one binary digit per evaluation. err is the half width of the final interval.
+public Result bisection(func f, void* ctx, double a, double b, double tol = D_TOL, int maxIter = 200) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (!(tol >= 0.0) || !finite(a) || !finite(b)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double fa = call1(f, a, ctx);
+    double fb = call1(f, b, ctx);
+    int ev = 2;
+    if (fa != fa || fb != fb) { return mk(nanValue(), nanValue(), 0, ev, ERR_NAN); }
+    if (fa == 0.0) { return mk(a, fa, 0, ev, OK); }
+    if (fb == 0.0) { return mk(b, fb, 0, ev, OK); }
+    if ((fa > 0.0) == (fb > 0.0)) { return mk(nanValue(), nanValue(), 0, ev, ERR_BRACKET); }
+    if (a > b) {
+        double t = a; a = b; b = t;
+        t = fa; fa = fb; fb = t;
+    }
+    for (int it = 1; it <= maxIter; it++) {
+        double m = a + 0.5 * (b - a);
+        double fm = call1(f, m, ctx);
+        ev++;
+        if (fm != fm) { return mk(m, fm, it, ev, ERR_NAN); }
+        if (fm == 0.0 || 0.5 * (b - a) <= tol || m == a || m == b) {
+            Result r = mk(m, fm, it, ev, OK);
+            r.err = 0.5 * (b - a);
+            return r;
+        }
+        if ((fm > 0.0) == (fa > 0.0)) { a = m; fa = fm; } else { b = m; fb = fm; }
+    }
+    double m = a + 0.5 * (b - a);
+    Result r = mk(m, call1(f, m, ctx), maxIter, ev + 1, ERR_NO_CONVERGE);
+    r.err = 0.5 * (b - a);
+    return r;
+}
+
+// Brent's method (inverse quadratic interpolation, secant and bisection, with the guarantee of bisection): f(a) and f(b) must have opposite signs.
+// Converges superlinearly for smooth functions; tol is absolute (about 1e-12 is the best a double can do for roots near 1).
+public Result brent(func f, void* ctx, double a, double b, double tol = D_TOL, int maxIter = 200) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (!(tol >= 0.0) || !finite(a) || !finite(b)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double fa = call1(f, a, ctx);
+    double fb = call1(f, b, ctx);
+    int ev = 2;
+    if (fa != fa || fb != fb) { return mk(nanValue(), nanValue(), 0, ev, ERR_NAN); }
+    if (fa == 0.0) { return mk(a, fa, 0, ev, OK); }
+    if (fb == 0.0) { return mk(b, fb, 0, ev, OK); }
+    if ((fa > 0.0) == (fb > 0.0)) { return mk(nanValue(), nanValue(), 0, ev, ERR_BRACKET); }
+    double c = b;
+    double fc = fb;
+    double d = b - a;
+    double e = d;
+    for (int it = 1; it <= maxIter; it++) {
+        if ((fb > 0.0) == (fc > 0.0)) {
+            c = a;
+            fc = fa;
+            d = b - a;
+            e = d;
+        }
+        if (absd(fc) < absd(fb)) {
+            a = b;
+            b = c;
+            c = a;
+            fa = fb;
+            fb = fc;
+            fc = fa;
+        }
+        double tol1 = 2.0 * EPS * absd(b) + 0.5 * tol;
+        double xm = 0.5 * (c - b);
+        if (absd(xm) <= tol1 || fb == 0.0) {
+            Result r = mk(b, fb, it, ev, OK);
+            r.err = absd(xm);
+            return r;
+        }
+        if (absd(e) >= tol1 && absd(fa) > absd(fb)) {
+            double s = fb / fa;
+            double p;
+            double q;
+            if (a == c) {
+                p = 2.0 * xm * s;
+                q = 1.0 - s;
+            } else {
+                q = fa / fc;
+                double r = fb / fc;
+                p = s * (2.0 * xm * q * (q - r) - (b - a) * (r - 1.0));
+                q = (q - 1.0) * (r - 1.0) * (s - 1.0);
+            }
+            if (p > 0.0) { q = -q; }
+            p = absd(p);
+            double min1 = 3.0 * xm * q - absd(tol1 * q);
+            double min2 = absd(e * q);
+            if (2.0 * p < ((min1 < min2) ? min1 : min2)) {
+                e = d;
+                d = p / q;
+            } else {
+                d = xm;
+                e = d;
+            }
+        } else {
+            d = xm;
+            e = d;
+        }
+        a = b;
+        fa = fb;
+        if (absd(d) > tol1) { b += d; } else { b += (xm >= 0.0) ? absd(tol1) : -absd(tol1); }
+        fb = call1(f, b, ctx);
+        ev++;
+        if (fb != fb) { return mk(b, fb, it, ev, ERR_NAN); }
+    }
+    Result r = mk(b, fb, maxIter, ev, ERR_NO_CONVERGE);
+    r.err = absd(0.5 * (c - b));
+    return r;
+}
+
+// Newton's method x - f(x) / f'(x) from x0. df is the derivative callback  double df(double x, void* ctx)  or null for a central difference. Stops when
+// |step| <= tol * (1 + |x|). ERR_SINGULAR when the derivative is 0, ERR_NAN when the iteration leaves the numbers, ERR_NO_CONVERGE after maxIter steps.
+public Result newton(func f, func df, void* ctx, double x0, double tol = D_TOL, int maxIter = 100) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (!(tol >= 0.0) || !finite(x0)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double x = x0;
+    int ev = 0;
+    for (int it = 1; it <= maxIter; it++) {
+        double fx = call1(f, x, ctx);
+        ev++;
+        if (fx != fx || !finite(fx)) { return mk(x, fx, it, ev, ERR_NAN); }
+        if (fx == 0.0) { return mk(x, fx, it, ev, OK); }
+        double d = (df != null) ? call1(df, x, ctx) : derivative(f, ctx, x, 0.0);
+        ev += (df != null) ? 1 : 2;
+        if (d != d || !finite(d)) { return mk(x, fx, it, ev, ERR_NAN); }
+        if (d == 0.0) { return mk(x, fx, it, ev, ERR_SINGULAR); }
+        double step = fx / d;
+        x -= step;
+        if (!finite(x)) { return mk(x, fx, it, ev, ERR_NAN); }
+        if (absd(step) <= tol * (1.0 + absd(x))) {
+            Result r = mk(x, call1(f, x, ctx), it, ev + 1, OK);
+            r.err = absd(step);
+            return r;
+        }
+    }
+    return mk(x, call1(f, x, ctx), maxIter, ev + 1, ERR_NO_CONVERGE);
+}
+
+// the secant method from two starting values (no derivative, superlinear; may leave the interval, no bracketing guarantee)
+public Result secant(func f, void* ctx, double x0, double x1, double tol = D_TOL, int maxIter = 100) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (!(tol >= 0.0) || !finite(x0) || !finite(x1)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double f0 = call1(f, x0, ctx);
+    double f1 = call1(f, x1, ctx);
+    int ev = 2;
+    for (int it = 1; it <= maxIter; it++) {
+        if (f0 != f0 || f1 != f1 || !finite(f1)) { return mk(x1, f1, it, ev, ERR_NAN); }
+        if (f1 == 0.0) { return mk(x1, f1, it, ev, OK); }
+        if (f1 == f0) { return mk(x1, f1, it, ev, ERR_SINGULAR); }
+        double x2 = x1 - f1 * (x1 - x0) / (f1 - f0);
+        if (!finite(x2)) { return mk(x1, f1, it, ev, ERR_NAN); }
+        double step = x2 - x1;
+        x0 = x1;
+        f0 = f1;
+        x1 = x2;
+        f1 = call1(f, x1, ctx);
+        ev++;
+        if (absd(step) <= tol * (1.0 + absd(x1))) {
+            Result r = mk(x1, f1, it, ev, OK);
+            r.err = absd(step);
+            return r;
+        }
+    }
+    return mk(x1, f1, maxIter, ev, ERR_NO_CONVERGE);
+}
+
+// Newton's method for n equations in n unknowns F(x) = 0: fvec(x, n, out, ctx) writes the n residuals; x holds the start and receives the solution. The Jacobian is
+// built by forward differences and the step solved by LU (matrix module); the step is halved while the residual norm does not decrease. Stops when the residual
+// norm is below tol. Returns ERR_SINGULAR when the Jacobian is singular.
+public Result newtonSystem(func fvec, void* ctx, double* x, int n, double tol = D_SYSTOL, int maxIter = 100) {
+    if (fvec == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (x == null || n < 1 || !(tol >= 0.0)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double* fx = newDoubles(n);
+    double* ft = newDoubles(n);
+    double* dx = newDoubles(n);
+    double* xt = newDoubles(n);
+    matrix.Matrix jac(n, n);
+    if (fx == null || ft == null || dx == null || xt == null || !jac.ok()) {
+        freeMem(fx); freeMem(ft); freeMem(dx); freeMem(xt);
+        jac.dispose();
+        return mk(nanValue(), nanValue(), 0, 0, ERR_MEMORY);
+    }
+    int status = ERR_NO_CONVERGE;
+    int it = 0;
+    int ev = 1;
+    fvec(x, n, fx, ctx);
+    double nrm = matrix.vecNorm2(fx, n);
+    while (it < maxIter) {
+        if (nrm != nrm || !finite(nrm)) { status = ERR_NAN; break; }
+        if (nrm <= tol) { status = OK; break; }
+        jacobianNum(fvec, ctx, x, n, n, jac.d);
+        ev += n;
+        matrix.LU lu(&jac, 0.0);
+        for (int i = 0; i < n; i++) { dx[i] = -fx[i]; }
+        int st = lu.solve(dx, dx);
+        lu.dispose();
+        if (st != 0) { status = (st == matrix.ERR_NOT_FINITE) ? ERR_NAN : ERR_SINGULAR; break; }
+        double lam = 1.0;
+        bool improved = false;
+        for (int k = 0; k < 30; k++) {
+            for (int i = 0; i < n; i++) { xt[i] = x[i] + lam * dx[i]; }
+            fvec(xt, n, ft, ctx);
+            ev++;
+            double nn = matrix.vecNorm2(ft, n);
+            if (nn == nn && nn < nrm) {
+                improved = true;
+                break;
+            }
+            lam *= 0.5;
+        }
+        it++;
+        if (!improved) {
+            if (nrm <= 1.0e3 * tol) { status = OK; } else { status = ERR_NO_CONVERGE; }
+            break;
+        }
+        for (int i = 0; i < n; i++) {
+            x[i] = xt[i];
+            fx[i] = ft[i];
+        }
+        nrm = matrix.vecNorm2(fx, n);
+    }
+    if (status == ERR_NO_CONVERGE && nrm <= tol) { status = OK; }
+    Result r = mk(nanValue(), nrm, it, ev, status);
+    r.err = nrm;
+    freeMem(fx); freeMem(ft); freeMem(dx); freeMem(xt);
+    jac.dispose();
+    return r;
+}
+
+// ============================================================================================================================================
+//  Minimization of functions of one variable
+// ============================================================================================================================================
+// Golden section search for the minimum of a unimodal function on [a, b]; stops when the interval is shorter than tol. Linear convergence (0.618 per evaluation).
+public Result goldenSection(func f, void* ctx, double a, double b, double tol = D_MINTOL, int maxIter = 500) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (!(tol > 0.0) || !finite(a) || !finite(b)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (a > b) { double t = a; a = b; b = t; }
+    double gr = 0.3819660112501051;                       // 2 - phi
+    double x1 = a + gr * (b - a);
+    double x2 = b - gr * (b - a);
+    double f1 = call1(f, x1, ctx);
+    double f2 = call1(f, x2, ctx);
+    int ev = 2;
+    int it = 0;
+    while (b - a > tol && it < maxIter) {
+        if (f1 != f1 || f2 != f2) { return mk(x1, f1, it, ev, ERR_NAN); }
+        if (f1 < f2) {
+            b = x2;
+            x2 = x1;
+            f2 = f1;
+            x1 = a + gr * (b - a);
+            f1 = call1(f, x1, ctx);
+        } else {
+            a = x1;
+            x1 = x2;
+            f1 = f2;
+            x2 = b - gr * (b - a);
+            f2 = call1(f, x2, ctx);
+        }
+        ev++;
+        it++;
+    }
+    double xm = (f1 < f2) ? x1 : x2;
+    double fm = (f1 < f2) ? f1 : f2;
+    Result r = mk(xm, fm, it, ev, (b - a > tol) ? ERR_NO_CONVERGE : OK);
+    r.err = b - a;
+    return r;
+}
+
+// Brent's minimizer (golden section with parabolic interpolation) on [a, b]; tol is the absolute precision of x (about sqrt(eps) = 1.5e-8 relative is the limit
+// for a smooth minimum: the function is flat there)
+public Result brentMin(func f, void* ctx, double a, double b, double tol = D_MINTOL, int maxIter = 200) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (!(tol > 0.0) || !finite(a) || !finite(b)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (a > b) { double t = a; a = b; b = t; }
+    double cgold = 0.3819660112501051;
+    double v = a + cgold * (b - a);
+    double w = v;
+    double x = v;
+    double e = 0.0;
+    double d = 0.0;
+    double fx = call1(f, x, ctx);
+    double fv = fx;
+    double fw = fx;
+    int ev = 1;
+    for (int it = 1; it <= maxIter; it++) {
+        if (fx != fx) { return mk(x, fx, it, ev, ERR_NAN); }
+        double xm = 0.5 * (a + b);
+        double tol1 = 1.4901161193847656e-08 * absd(x) + 0.5 * tol;
+        double tol2 = 2.0 * tol1;
+        if (absd(x - xm) <= tol2 - 0.5 * (b - a)) {
+            Result r = mk(x, fx, it, ev, OK);
+            r.err = 0.5 * (b - a);
+            return r;
+        }
+        bool golden = true;
+        if (absd(e) > tol1) {
+            double r = (x - w) * (fx - fv);
+            double q = (x - v) * (fx - fw);
+            double p = (x - v) * q - (x - w) * r;
+            q = 2.0 * (q - r);
+            if (q > 0.0) { p = -p; }
+            q = absd(q);
+            double etemp = e;
+            e = d;
+            if (!(absd(p) >= absd(0.5 * q * etemp) || p <= q * (a - x) || p >= q * (b - x))) {
+                d = p / q;
+                double u = x + d;
+                if (u - a < tol2 || b - u < tol2) { d = (xm >= x) ? absd(tol1) : -absd(tol1); }
+                golden = false;
+            }
+        }
+        if (golden) {
+            e = (x >= xm) ? a - x : b - x;
+            d = cgold * e;
+        }
+        double u = (absd(d) >= tol1) ? x + d : x + ((d >= 0.0) ? absd(tol1) : -absd(tol1));
+        double fu = call1(f, u, ctx);
+        ev++;
+        if (fu != fu) { return mk(u, fu, it, ev, ERR_NAN); }
+        if (fu <= fx) {
+            if (u >= x) { a = x; } else { b = x; }
+            v = w; fv = fw;
+            w = x; fw = fx;
+            x = u; fx = fu;
+        } else {
+            if (u < x) { a = u; } else { b = u; }
+            if (fu <= fw || w == x) {
+                v = w; fv = fw;
+                w = u; fw = fu;
+            } else if (fu <= fv || v == x || v == w) {
+                v = u;
+                fv = fu;
+            }
+        }
+    }
+    Result r = mk(x, fx, maxIter, ev, ERR_NO_CONVERGE);
+    r.err = 0.5 * (b - a);
+    return r;
+}
+
+// Looks for a bracket (lo, mid, hi) with f(mid) < f(lo) and f(mid) < f(hi) downhill from a and b (parabolic extrapolation with a limit): the input of
+// goldenSection / brentMin on a function that has no known interval. Returns OK or ERR_BRACKET.
+public int bracketMin(func f, void* ctx, double a, double b, double* lo, double* mid, double* hi) {
+    if (f == null || lo == null || mid == null || hi == null) { return ERR_ARG; }
+    double gold = 1.618033988749895;
+    double fa = call1(f, a, ctx);
+    double fb = call1(f, b, ctx);
+    if (fa != fa || fb != fb) { return ERR_NAN; }
+    if (fb > fa) {
+        double t = a; a = b; b = t;
+        t = fa; fa = fb; fb = t;
+    }
+    double c = b + gold * (b - a);
+    double fc = call1(f, c, ctx);
+    for (int it = 0; it < 100; it++) {
+        if (fc != fc) { return ERR_NAN; }
+        if (fb <= fc) {
+            *lo = a;
+            *mid = b;
+            *hi = c;
+            return OK;
+        }
+        double r = (b - a) * (fb - fc);
+        double q = (b - c) * (fb - fa);
+        double den = 2.0 * ((absd(q - r) > 1.0e-30) ? ((q - r >= 0.0) ? absd(q - r) : -absd(q - r)) : 1.0e-30);
+        double u = b - ((b - c) * q - (b - a) * r) / den;
+        double ulim = b + 100.0 * (c - b);
+        double fu;
+        if ((b - u) * (u - c) > 0.0) {
+            fu = call1(f, u, ctx);
+            if (fu < fc) {
+                *lo = b;
+                *mid = u;
+                *hi = c;
+                return OK;
+            } else if (fu > fb) {
+                *lo = a;
+                *mid = b;
+                *hi = u;
+                return OK;
+            }
+            u = c + gold * (c - b);
+            fu = call1(f, u, ctx);
+        } else if ((c - u) * (u - ulim) > 0.0) {
+            fu = call1(f, u, ctx);
+            if (fu < fc) {
+                b = c;
+                c = u;
+                u = c + gold * (c - b);
+                fb = fc;
+                fc = fu;
+                fu = call1(f, u, ctx);
+            }
+        } else if ((u - ulim) * (ulim - c) >= 0.0) {
+            u = ulim;
+            fu = call1(f, u, ctx);
+        } else {
+            u = c + gold * (c - b);
+            fu = call1(f, u, ctx);
+        }
+        a = b; b = c; c = u;
+        fa = fb; fb = fc; fc = fu;
+    }
+    return ERR_BRACKET;
+}
+
+// ============================================================================================================================================
+//  Minimization of functions of several variables
+// ============================================================================================================================================
+// Nelder-Mead simplex method (no derivatives): x (n numbers) holds the start and receives the minimizer; step is the size of the initial simplex (e.g. 0.1 or
+// 1.0 for the scale of the problem; 0 uses 5 percent of each coordinate, 0.00025 for zero coordinates). Stops when both the simplex and the spread of its function
+// values are below tol (or after maxEval evaluations: ERR_NO_CONVERGE). Result.fx is the minimum found, err the final simplex size.
+public Result nelderMead(func f, void* ctx, double* x, int n, double step = D_ZERO, double tol = D_MINTOL, int maxEval = 20000) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (x == null || n < 1 || !(tol > 0.0) || step < 0.0) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    int np1 = n + 1;
+    double* sim = newDoubles(np1 * n);
+    double* fs = newDoubles(np1);
+    double* cen = newDoubles(n);
+    double* xr = newDoubles(n);
+    double* xe = newDoubles(n);
+    int* ord = newInts(np1);
+    if (sim == null || fs == null || cen == null || xr == null || xe == null || ord == null) {
+        freeMem(sim); freeMem(fs); freeMem(cen); freeMem(xr); freeMem(xe); freeMem(ord);
+        return mk(nanValue(), nanValue(), 0, 0, ERR_MEMORY);
+    }
+    for (int j = 0; j < n; j++) { sim[j] = x[j]; }
+    for (int i = 1; i < np1; i++) {
+        for (int j = 0; j < n; j++) { sim[i * n + j] = x[j]; }
+        double d = (step > 0.0) ? step : ((x[i - 1] != 0.0) ? 0.05 * x[i - 1] : 0.00025);
+        sim[i * n + (i - 1)] += d;
+    }
+    int ev = 0;
+    for (int i = 0; i < np1; i++) {
+        fs[i] = callN(f, &sim[i * n], n, ctx);
+        ev++;
+        if (fs[i] != fs[i]) {
+            freeMem(sim); freeMem(fs); freeMem(cen); freeMem(xr); freeMem(xe); freeMem(ord);
+            return mk(x[0], fs[i], 0, ev, ERR_NAN);
+        }
+    }
+    int it = 0;
+    int status = ERR_NO_CONVERGE;
+    double size = 0.0;
+    while (ev < maxEval) {
+        // order the vertices by function value (insertion sort of the index list)
+        for (int i = 0; i < np1; i++) { ord[i] = i; }
+        for (int i = 1; i < np1; i++) {
+            int v = ord[i];
+            int j = i - 1;
+            while (j >= 0 && fs[ord[j]] > fs[v]) {
+                ord[j + 1] = ord[j];
+                j--;
+            }
+            ord[j + 1] = v;
+        }
+        int best = ord[0];
+        int worst = ord[np1 - 1];
+        int second = ord[np1 - 2];
+        // convergence: the simplex and the spread of the values are small
+        size = 0.0;
+        for (int i = 1; i < np1; i++) {
+            for (int j = 0; j < n; j++) {
+                double dd = absd(sim[ord[i] * n + j] - sim[best * n + j]);
+                if (dd > size) { size = dd; }
+            }
+        }
+        double spread = absd(fs[worst] - fs[best]);
+        if (size <= tol && spread <= tol) {
+            status = OK;
+            break;
+        }
+        it++;
+        for (int j = 0; j < n; j++) {
+            double s = 0.0;
+            for (int i = 0; i < np1; i++) {
+                if (i != worst) { s += sim[i * n + j]; }
+            }
+            cen[j] = s / (double) n;
+        }
+        for (int j = 0; j < n; j++) { xr[j] = cen[j] + (cen[j] - sim[worst * n + j]); }
+        double fr = callN(f, xr, n, ctx);
+        ev++;
+        if (fr != fr) { status = ERR_NAN; break; }
+        if (fr < fs[best]) {
+            for (int j = 0; j < n; j++) { xe[j] = cen[j] + 2.0 * (cen[j] - sim[worst * n + j]); }
+            double fe = callN(f, xe, n, ctx);
+            ev++;
+            if (fe < fr) {
+                for (int j = 0; j < n; j++) { sim[worst * n + j] = xe[j]; }
+                fs[worst] = fe;
+            } else {
+                for (int j = 0; j < n; j++) { sim[worst * n + j] = xr[j]; }
+                fs[worst] = fr;
+            }
+        } else if (fr < fs[second]) {
+            for (int j = 0; j < n; j++) { sim[worst * n + j] = xr[j]; }
+            fs[worst] = fr;
+        } else {
+            bool shrink = false;
+            if (fr < fs[worst]) {
+                // outside contraction
+                for (int j = 0; j < n; j++) { xe[j] = cen[j] + 0.5 * (xr[j] - cen[j]); }
+                double fc = callN(f, xe, n, ctx);
+                ev++;
+                if (fc <= fr) {
+                    for (int j = 0; j < n; j++) { sim[worst * n + j] = xe[j]; }
+                    fs[worst] = fc;
+                } else {
+                    shrink = true;
+                }
+            } else {
+                // inside contraction
+                for (int j = 0; j < n; j++) { xe[j] = cen[j] - 0.5 * (cen[j] - sim[worst * n + j]); }
+                double fc = callN(f, xe, n, ctx);
+                ev++;
+                if (fc < fs[worst]) {
+                    for (int j = 0; j < n; j++) { sim[worst * n + j] = xe[j]; }
+                    fs[worst] = fc;
+                } else {
+                    shrink = true;
+                }
+            }
+            if (shrink) {
+                for (int i = 0; i < np1; i++) {
+                    if (i == best) { continue; }
+                    for (int j = 0; j < n; j++) { sim[i * n + j] = sim[best * n + j] + 0.5 * (sim[i * n + j] - sim[best * n + j]); }
+                    fs[i] = callN(f, &sim[i * n], n, ctx);
+                    ev++;
+                }
+            }
+        }
+    }
+    int bi = 0;
+    for (int i = 1; i < np1; i++) {
+        if (fs[i] < fs[bi]) { bi = i; }
+    }
+    for (int j = 0; j < n; j++) { x[j] = sim[bi * n + j]; }
+    Result r = mk(nanValue(), fs[bi], it, ev, status);
+    r.err = size;
+    freeMem(sim); freeMem(fs); freeMem(cen); freeMem(xr); freeMem(xe); freeMem(ord);
+    return r;
+}
+
+// the gradient: the callback grad(x, n, g, ctx) or, when it is null, central differences of f
+private void evalGrad(func f, func grad, void* ctx, double* x, int n, double* g) {
+    if (grad != null) { grad(x, n, g, ctx); } else { gradientNum(f, ctx, x, n, g); }
+}
+
+// Armijo backtracking along the direction p from x: returns the step length (0 when no decrease was found) and writes the new point and its value
+private double backtrack(func f, void* ctx, double* x, int n, double fx, double* g, double* p, double step, double* xn, double* fn, int* ev) {
+    double slope = matrix.vecDot(g, p, n);
+    if (!(slope < 0.0)) { return 0.0; }
+    double t = step;
+    for (int k = 0; k < 60; k++) {
+        for (int i = 0; i < n; i++) { xn[i] = x[i] + t * p[i]; }
+        double v = callN(f, xn, n, ctx);
+        *ev = *ev + 1;
+        if (v == v && v <= fx + 1.0e-4 * t * slope) {
+            *fn = v;
+            return t;
+        }
+        t *= 0.5;
+    }
+    return 0.0;
+}
+
+// BFGS quasi-Newton minimization: x holds the start and receives the minimizer; grad is the gradient callback  void grad(double* x, int n, double* g, void* ctx)
+// or null (central differences: costs 2n evaluations per gradient and limits the precision to about 1e-8). Stops when the largest gradient component is below
+// gtol. Result.fx is the minimum, err the gradient norm (max norm).
+public Result bfgs(func f, func grad, void* ctx, double* x, int n, double gtol = D_GTOL, int maxIter = 200) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (x == null || n < 1 || !(gtol > 0.0)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double* g = newDoubles(n);
+    double* gn = newDoubles(n);
+    double* p = newDoubles(n);
+    double* xn = newDoubles(n);
+    double* s = newDoubles(n);
+    double* y = newDoubles(n);
+    double* hy = newDoubles(n);
+    double* H = newDoubles(n * n);
+    if (g == null || gn == null || p == null || xn == null || s == null || y == null || hy == null || H == null) {
+        freeMem(g); freeMem(gn); freeMem(p); freeMem(xn); freeMem(s); freeMem(y); freeMem(hy); freeMem(H);
+        return mk(nanValue(), nanValue(), 0, 0, ERR_MEMORY);
+    }
+    int ev = 1;
+    double fx = callN(f, x, n, ctx);
+    int status = ERR_NO_CONVERGE;
+    int it = 0;
+    double gmax = 0.0;
+    if (fx != fx || !finite(fx)) { status = ERR_NAN; }
+    else {
+        evalGrad(f, grad, ctx, x, n, g);
+        ev += (grad == null) ? 2 * n : 0;
+        for (int i = 0; i < n; i++) { H[i * n + i] = 1.0; }
+        bool firstStep = true;
+        while (it < maxIter) {
+            gmax = matrix.vecNormInf(g, n);
+            if (gmax != gmax) { status = ERR_NAN; break; }
+            if (gmax <= gtol) { status = OK; break; }
+            for (int i = 0; i < n; i++) {
+                double sum = 0.0;
+                for (int j = 0; j < n; j++) { sum += H[i * n + j] * g[j]; }
+                p[i] = -sum;
+            }
+            double step = 1.0;
+            if (firstStep) {
+                double gn2 = matrix.vecNorm2(g, n);
+                step = (gn2 > 1.0) ? 1.0 / gn2 : 1.0;
+                firstStep = false;
+            }
+            double fnew = fx;
+            double t = backtrack(f, ctx, x, n, fx, g, p, step, xn, &fnew, &ev);
+            if (t == 0.0) {
+                // no descent along the quasi-Newton direction: restart with steepest descent once
+                for (int i = 0; i < n * n; i++) { H[i] = 0.0; }
+                for (int i = 0; i < n; i++) { H[i * n + i] = 1.0; p[i] = -g[i]; }
+                t = backtrack(f, ctx, x, n, fx, g, p, 1.0e-3, xn, &fnew, &ev);
+                if (t == 0.0) {
+                    status = (gmax <= 1.0e3 * gtol) ? OK : ERR_NO_CONVERGE;
+                    break;
+                }
+            }
+            for (int i = 0; i < n; i++) { s[i] = xn[i] - x[i]; }
+            evalGrad(f, grad, ctx, xn, n, gn);
+            ev += (grad == null) ? 2 * n : 0;
+            for (int i = 0; i < n; i++) { y[i] = gn[i] - g[i]; }
+            double sy = matrix.vecDot(s, y, n);
+            if (sy > 1.0e-10 * matrix.vecNorm2(s, n) * matrix.vecNorm2(y, n)) {
+                // H = (I - rho s y^T) H (I - rho y s^T) + rho s s^T
+                double rho = 1.0 / sy;
+                for (int i = 0; i < n; i++) {
+                    double sum = 0.0;
+                    for (int j = 0; j < n; j++) { sum += H[i * n + j] * y[j]; }
+                    hy[i] = sum;
+                }
+                double yhy = matrix.vecDot(y, hy, n);
+                for (int i = 0; i < n; i++) {
+                    for (int j = 0; j < n; j++) {
+                        H[i * n + j] += (1.0 + rho * yhy) * rho * s[i] * s[j] - rho * (hy[i] * s[j] + s[i] * hy[j]);
+                    }
+                }
+            }
+            for (int i = 0; i < n; i++) {
+                x[i] = xn[i];
+                g[i] = gn[i];
+            }
+            fx = fnew;
+            it++;
+        }
+        gmax = matrix.vecNormInf(g, n);
+        if (status == ERR_NO_CONVERGE && gmax <= gtol) { status = OK; }
+    }
+    Result r = mk(nanValue(), fx, it, ev, status);
+    r.err = gmax;
+    freeMem(g); freeMem(gn); freeMem(p); freeMem(xn); freeMem(s); freeMem(y); freeMem(hy); freeMem(H);
+    return r;
+}
+
+// Steepest descent with Armijo backtracking (robust and simple, but slow on narrow valleys: use bfgs for those). x holds the start and receives the result;
+// step0 is the first trial step length (the line search shrinks it); stops when the largest gradient component is below gtol.
+public Result gradientDescent(func f, func grad, void* ctx, double* x, int n, double step0 = D_ONE, double gtol = D_GTOL, int maxIter = 10000) {
+    if (f == null) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (x == null || n < 1 || !(gtol > 0.0) || !(step0 > 0.0)) { return mk(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double* g = newDoubles(n);
+    double* p = newDoubles(n);
+    double* xn = newDoubles(n);
+    if (g == null || p == null || xn == null) {
+        freeMem(g); freeMem(p); freeMem(xn);
+        return mk(nanValue(), nanValue(), 0, 0, ERR_MEMORY);
+    }
+    int ev = 1;
+    double fx = callN(f, x, n, ctx);
+    int status = ERR_NO_CONVERGE;
+    int it = 0;
+    double gmax = 0.0;
+    double lastStep = step0;
+    if (fx != fx || !finite(fx)) { status = ERR_NAN; }
+    else {
+        while (it < maxIter) {
+            evalGrad(f, grad, ctx, x, n, g);
+            ev += (grad == null) ? 2 * n : 0;
+            gmax = matrix.vecNormInf(g, n);
+            if (gmax != gmax) { status = ERR_NAN; break; }
+            if (gmax <= gtol) { status = OK; break; }
+            for (int i = 0; i < n; i++) { p[i] = -g[i]; }
+            double fnew = fx;
+            double t = backtrack(f, ctx, x, n, fx, g, p, lastStep * 2.0, xn, &fnew, &ev);
+            if (t == 0.0) {
+                status = (gmax <= 1.0e3 * gtol) ? OK : ERR_NO_CONVERGE;
+                break;
+            }
+            lastStep = t;
+            for (int i = 0; i < n; i++) { x[i] = xn[i]; }
+            fx = fnew;
+            it++;
+        }
+    }
+    Result r = mk(nanValue(), fx, it, ev, status);
+    r.err = gmax;
+    freeMem(g); freeMem(p); freeMem(xn);
+    return r;
+}
+
+// ============================================================================================================================================
+//  Numerical integration
+// ============================================================================================================================================
+// The result of an integral: value, error (an estimate of the absolute error), evals (function evaluations), intervals (subintervals used) and status.
+public struct Integral {
+    double value;
+    double error;
+    int evals;
+    int intervals;
+    int status;
+}
+
+private Integral mkInt(double v, double e, int ev, int iv, int st) {
+    Integral r;
+    r.value = v;
+    r.error = e;
+    r.evals = ev;
+    r.intervals = iv;
+    r.status = st;
+    return r;
+}
+
+// the composite trapezoid rule with n panels (error O(h^2))
+public Integral trapezoid(func f, void* ctx, double a, double b, int n) {
+    if (f == null) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (n < 1 || !finite(a) || !finite(b)) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double h = (b - a) / (double) n;
+    double s = 0.5 * (call1(f, a, ctx) + call1(f, b, ctx));
+    for (int i = 1; i < n; i++) { s += call1(f, a + (double) i * h, ctx); }
+    double v = s * h;
+    return mkInt(v, 0.0, n + 1, n, (v == v && finite(v)) ? OK : ERR_NAN);
+}
+
+// the composite Simpson rule with n panels (n is rounded up to an even number; error O(h^4))
+public Integral simpson(func f, void* ctx, double a, double b, int n) {
+    if (f == null) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (n < 1 || !finite(a) || !finite(b)) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (n % 2 == 1) { n++; }
+    double h = (b - a) / (double) n;
+    double s = call1(f, a, ctx) + call1(f, b, ctx);
+    for (int i = 1; i < n; i++) {
+        double w = (i % 2 == 1) ? 4.0 : 2.0;
+        s += w * call1(f, a + (double) i * h, ctx);
+    }
+    double v = s * h / 3.0;
+    return mkInt(v, 0.0, n + 1, n, (v == v && finite(v)) ? OK : ERR_NAN);
+}
+
+// Romberg integration: trapezoid rules with 1, 2, 4 ... 2^(maxLevels - 1) panels combined by Richardson extrapolation. Stops when two successive diagonal
+// entries differ by less than tol * (1 + |value|). Excellent for smooth functions on finite intervals.
+public Integral romberg(func f, void* ctx, double a, double b, double tol = D_TOL, int maxLevels = 20) {
+    if (f == null) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (!(tol >= 0.0) || maxLevels < 2 || maxLevels > 30 || !finite(a) || !finite(b)) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double* prev = newDoubles(maxLevels);
+    double* cur = newDoubles(maxLevels);
+    if (prev == null || cur == null) {
+        freeMem(prev);
+        freeMem(cur);
+        return mkInt(nanValue(), nanValue(), 0, 0, ERR_MEMORY);
+    }
+    double h = b - a;
+    prev[0] = 0.5 * h * (call1(f, a, ctx) + call1(f, b, ctx));
+    int ev = 2;
+    int status = ERR_NO_CONVERGE;
+    double value = prev[0];
+    double err = infValue();
+    int levels = 1;
+    for (int i = 1; i < maxLevels; i++) {
+        h *= 0.5;
+        double s = 0.0;
+        int pts = 1 << (i - 1);
+        for (int k = 0; k < pts; k++) { s += call1(f, a + (double) (2 * k + 1) * h, ctx); }
+        ev += pts;
+        cur[0] = 0.5 * prev[0] + h * s;
+        double pw = 4.0;
+        for (int j = 1; j <= i; j++) {
+            cur[j] = cur[j - 1] + (cur[j - 1] - prev[j - 1]) / (pw - 1.0);
+            pw *= 4.0;
+        }
+        levels = i + 1;
+        value = cur[i];
+        err = absd(cur[i] - prev[i - 1]);
+        if (value != value || !finite(value)) { status = ERR_NAN; break; }
+        if (i >= 2 && err <= tol * (1.0 + absd(value))) { status = OK; break; }
+        for (int j = 0; j <= i; j++) { prev[j] = cur[j]; }
+    }
+    freeMem(prev);
+    freeMem(cur);
+    return mkInt(value, err, ev, levels, status);
+}
+
+// ---- Gauss-Kronrod ---------------------------------------------------------------------------------------------------------------------------
+private double gkNodes[8] = {0.991455371120812639206854697526329, 0.949107912342758524526189684047851, 0.864864423359769072789712788640926,
+                              0.741531185599394439863864773280788, 0.586087235467691130294144838258730, 0.405845151377397166906606412076961,
+                              0.207784955007898467600689403773245, 0.0};
+private double gkWeights[8] = {0.022935322010529224963732008058970, 0.063092092629978553290700663189204, 0.104790010322250183839876322541518,
+                               0.140653259715525918745189590510238, 0.169004726639267902826583426598550, 0.190350578064785409913256402421014,
+                               0.204432940075298892414161999234649, 0.209482141084727828012999174891714};
+private double gkGauss[4] = {0.129484966168869693270611432679082, 0.279705391489276667901467771423780, 0.381830050505118944950369775488975,
+                              0.417959183673469387755102040816327};
+
+// the 15 point Kronrod rule with its embedded 7 point Gauss rule on [a, b]: returns the integral and puts an error estimate in *err and the integral of |f| in *absInt
+private double gk15(func f, void* ctx, double a, double b, double* err, double* absInt) {
+    double centr = 0.5 * (a + b);
+    double hl = 0.5 * (b - a);
+    double dh = absd(hl);
+    double fv1[7];
+    double fv2[7];
+    double fc = call1(f, centr, ctx);
+    double resg = fc * gkGauss[3];
+    double resk = fc * gkWeights[7];
+    double resabs = absd(resk);
+    for (int j = 0; j < 3; j++) {
+        int jtw = 2 * j + 1;
+        double absc = hl * gkNodes[jtw];
+        double f1 = call1(f, centr - absc, ctx);
+        double f2 = call1(f, centr + absc, ctx);
+        fv1[jtw] = f1;
+        fv2[jtw] = f2;
+        double fsum = f1 + f2;
+        resg += gkGauss[j] * fsum;
+        resk += gkWeights[jtw] * fsum;
+        resabs += gkWeights[jtw] * (absd(f1) + absd(f2));
+    }
+    for (int j = 0; j < 4; j++) {
+        int jt = 2 * j;
+        double absc = hl * gkNodes[jt];
+        double f1 = call1(f, centr - absc, ctx);
+        double f2 = call1(f, centr + absc, ctx);
+        fv1[jt] = f1;
+        fv2[jt] = f2;
+        double fsum = f1 + f2;
+        resk += gkWeights[jt] * fsum;
+        resabs += gkWeights[jt] * (absd(f1) + absd(f2));
+    }
+    double reskh = resk * 0.5;
+    double resasc = gkWeights[7] * absd(fc - reskh);
+    for (int j = 0; j < 7; j++) { resasc += gkWeights[j] * (absd(fv1[j] - reskh) + absd(fv2[j] - reskh)); }
+    double result = resk * hl;
+    resabs *= dh;
+    resasc *= dh;
+    double abserr = absd((resk - resg) * hl);
+    if (resasc != 0.0 && abserr != 0.0) {
+        double q = 200.0 * abserr / resasc;
+        double sc = (q < 1.0) ? q * dmath.sqrt(q) : 1.0;
+        abserr = resasc * sc;
+    }
+    if (resabs > 2.2250738585072014e-308 / (50.0 * EPS)) {
+        double lim = 50.0 * EPS * resabs;
+        if (lim > abserr) { abserr = lim; }
+    }
+    *err = abserr;
+    *absInt = resabs;
+    return result;
+}
+
+// the context of the transformation of an infinite range to (0, 1]
+struct InfCtx {
+    func f;
+    void* ctx;
+    double a;
+    int kind;                              // 1: [a, inf)  2: (-inf, a]  3: (-inf, inf)
+}
+
+private double infWrap(double t, void* c) {
+    InfCtx* w = (InfCtx*) c;
+    double x = (1.0 - t) / t;
+    double jac = 1.0 / (t * t);
+    if (w->kind == 1) { return call1(w->f, w->a + x, w->ctx) * jac; }
+    if (w->kind == 2) { return call1(w->f, w->a - x, w->ctx) * jac; }
+    return (call1(w->f, x, w->ctx) + call1(w->f, -x, w->ctx)) * jac;
+}
+
+// Adaptive Gauss-Kronrod quadrature (G7 / K15, the rule of QUADPACK's qag): the interval with the largest error estimate is bisected until the total error is
+// below max(absTol, relTol * |value|) or maxSub intervals exist. Handles smooth functions, integrable endpoint singularities (slowly) and infinite limits:
+// pass +-infinity (dmath.INFINITY) as a or b. NaN or infinite function values give ERR_NAN. ERR_NO_CONVERGE still returns the best estimate and its error.
+public Integral gaussKronrod(func f, void* ctx, double a, double b, double absTol = D_TOL, double relTol = D_TOL, int maxSub = 500) {
+    if (f == null) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (a != a || b != b || !(absTol >= 0.0) || !(relTol >= 0.0) || maxSub < 1 || maxSub > 100000) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    if (a == b) { return mkInt(0.0, 0.0, 0, 0, OK); }
+    double sign = 1.0;
+    if (a > b) {
+        double t = a; a = b; b = t;
+        sign = -1.0;
+    }
+    InfCtx w;
+    func fun = f;
+    void* fctx = ctx;
+    if (!finite(a) || !finite(b)) {
+        w.f = f;
+        w.ctx = ctx;
+        if (!finite(a) && !finite(b)) { w.kind = 3; w.a = 0.0; }
+        else if (finite(a)) { w.kind = 1; w.a = a; }
+        else { w.kind = 2; w.a = b; }
+        fun = infWrap;
+        fctx = &w;
+        a = 0.0;
+        b = 1.0;
+    }
+    double* lo = newDoubles(maxSub + 1);
+    double* hi = newDoubles(maxSub + 1);
+    double* res = newDoubles(maxSub + 1);
+    double* er = newDoubles(maxSub + 1);
+    if (lo == null || hi == null || res == null || er == null) {
+        freeMem(lo); freeMem(hi); freeMem(res); freeMem(er);
+        return mkInt(nanValue(), nanValue(), 0, 0, ERR_MEMORY);
+    }
+    double ai;
+    int cnt = 1;
+    lo[0] = a;
+    hi[0] = b;
+    res[0] = gk15(fun, fctx, a, b, &er[0], &ai);
+    int ev = 15;
+    int status = OK;
+    double total = res[0];
+    double errTotal = er[0];
+    if (total != total || !finite(total) || errTotal != errTotal) { status = ERR_NAN; }
+    while (status == OK && errTotal > ((absTol > relTol * absd(total)) ? absTol : relTol * absd(total))) {
+        if (cnt >= maxSub) { status = ERR_NO_CONVERGE; break; }
+        int worst = 0;
+        for (int i = 1; i < cnt; i++) {
+            if (er[i] > er[worst]) { worst = i; }
+        }
+        double mid = 0.5 * (lo[worst] + hi[worst]);
+        if (mid == lo[worst] || mid == hi[worst]) { status = ERR_NO_CONVERGE; break; }       // the interval cannot be split any more
+        double e1;
+        double e2;
+        double r1 = gk15(fun, fctx, lo[worst], mid, &e1, &ai);
+        double r2 = gk15(fun, fctx, mid, hi[worst], &e2, &ai);
+        ev += 30;
+        if (r1 != r1 || r2 != r2 || !finite(r1) || !finite(r2)) { status = ERR_NAN; break; }
+        lo[cnt] = mid;
+        hi[cnt] = hi[worst];
+        res[cnt] = r2;
+        er[cnt] = e2;
+        hi[worst] = mid;
+        res[worst] = r1;
+        er[worst] = e1;
+        cnt++;
+        total = 0.0;
+        errTotal = 0.0;
+        for (int i = 0; i < cnt; i++) {
+            total += res[i];
+            errTotal += er[i];
+        }
+    }
+    freeMem(lo); freeMem(hi); freeMem(res); freeMem(er);
+    return mkInt(sign * total, errTotal, ev, cnt, status);
+}
+
+// the n Gauss-Legendre nodes x[0..n-1] (increasing, on [-1, 1]) and weights w[0..n-1]: an n point rule is exact for polynomials of degree 2n - 1
+public int gaussLegendre(int n, double* x, double* w) {
+    if (n < 1 || n > 2000 || x == null || w == null) { return ERR_ARG; }
+    int m = (n + 1) / 2;
+    for (int i = 0; i < m; i++) {
+        double z = dmath.cos(dmath.PI * ((double) i + 0.75) / ((double) n + 0.5));
+        double pp = 1.0;
+        for (int it = 0; it < 100; it++) {
+            double p1 = 1.0;
+            double p2 = 0.0;
+            for (int j = 0; j < n; j++) {
+                double p3 = p2;
+                p2 = p1;
+                p1 = ((2.0 * (double) j + 1.0) * z * p2 - (double) j * p3) / (double) (j + 1);
+            }
+            pp = (double) n * (z * p1 - p2) / (z * z - 1.0);
+            double z1 = z;
+            z = z1 - p1 / pp;
+            if (absd(z - z1) <= 1.0e-16) { break; }
+        }
+        // one more evaluation at the converged node for the weight
+        double p1 = 1.0;
+        double p2 = 0.0;
+        for (int j = 0; j < n; j++) {
+            double p3 = p2;
+            p2 = p1;
+            p1 = ((2.0 * (double) j + 1.0) * z * p2 - (double) j * p3) / (double) (j + 1);
+        }
+        pp = (double) n * (z * p1 - p2) / (z * z - 1.0);
+        x[i] = -z;
+        x[n - 1 - i] = z;
+        double wi = 2.0 / ((1.0 - z * z) * pp * pp);
+        w[i] = wi;
+        w[n - 1 - i] = wi;
+    }
+    if (n % 2 == 1) { x[m - 1] = 0.0; }
+    return OK;
+}
+
+// the n point Gauss-Legendre rule on [a, b] (n <= 2000)
+public Integral integrateGL(func f, void* ctx, double a, double b, int n) {
+    if (f == null) { return mkInt(nanValue(), nanValue(), 0, 0, ERR_ARG); }
+    double* x = newDoubles(n);
+    double* w = newDoubles(n);
+    if (x == null || w == null || n < 1) {
+        freeMem(x);
+        freeMem(w);
+        return mkInt(nanValue(), nanValue(), 0, 0, (n < 1) ? ERR_ARG : ERR_MEMORY);
+    }
+    int st = gaussLegendre(n, x, w);
+    if (st != OK) {
+        freeMem(x);
+        freeMem(w);
+        return mkInt(nanValue(), nanValue(), 0, 0, st);
+    }
+    double c = 0.5 * (a + b);
+    double h = 0.5 * (b - a);
+    double s = 0.0;
+    for (int i = 0; i < n; i++) { s += w[i] * call1(f, c + h * x[i], ctx); }
+    freeMem(x);
+    freeMem(w);
+    double v = s * h;
+    return mkInt(v, 0.0, n, 1, (v == v && finite(v)) ? OK : ERR_NAN);
+}
+
+// the trapezoid rule for samples y[i] at the increasing positions x[i]
+public double integrateSamples(double* x, double* y, int n) {
+    if (x == null || y == null || n < 2) { return nanValue(); }
+    double s = 0.0;
+    for (int i = 0; i + 1 < n; i++) { s += 0.5 * (x[i + 1] - x[i]) * (y[i] + y[i + 1]); }
+    return s;
+}
+
+// Simpson's rule for n samples at equal spacing h (an even number of samples, which is an odd number of panels, ends with Simpson's 3/8 rule on the last three)
+public double simpsonSamples(double* y, int n, double h) {
+    if (y == null || n < 2) { return nanValue(); }
+    if (n == 2) { return 0.5 * h * (y[0] + y[1]); }
+    int panels = n - 1;
+    double s = 0.0;
+    int end = panels;
+    if (panels % 2 == 1) { end = panels - 3; }
+    for (int i = 0; i + 2 <= end; i += 2) { s += h / 3.0 * (y[i] + 4.0 * y[i + 1] + y[i + 2]); }
+    if (panels % 2 == 1) {
+        if (panels >= 3) { s += 3.0 * h / 8.0 * (y[end] + 3.0 * y[end + 1] + 3.0 * y[end + 2] + y[end + 3]); }
+    }
+    return s;
+}
+
+// ============================================================================================================================================
+//  Ordinary differential equations
+// ============================================================================================================================================
+// Classical fourth order Runge-Kutta with a fixed step: integrates y' = rhs(t, y) from t0 to t1 in `steps` steps, y0 has n entries, the final value goes to
+// yOut. traj (null or (steps + 1) * n numbers) receives the whole trajectory, row i is the state at t0 + i h.
+public int rk4(func rhs, void* ctx, int n, double t0, double* y0, double t1, int steps, double* yOut, double* traj = null) {
+    if (rhs == null) { return ERR_ARG; }
+    if (n < 1 || steps < 1 || y0 == null || yOut == null || !finite(t0) || !finite(t1)) { return ERR_ARG; }
+    double* w = newDoubles(6 * n);
+    if (w == null) { return ERR_MEMORY; }
+    double* y = w;
+    double* k1 = &w[n];
+    double* k2 = &w[2 * n];
+    double* k3 = &w[3 * n];
+    double* k4 = &w[4 * n];
+    double* tmp = &w[5 * n];
+    for (int i = 0; i < n; i++) { y[i] = y0[i]; }
+    if (traj != null) { for (int i = 0; i < n; i++) { traj[i] = y[i]; } }
+    double h = (t1 - t0) / (double) steps;
+    for (int s = 0; s < steps; s++) {
+        double t = t0 + (double) s * h;
+        rhs(t, y, k1, n, ctx);
+        for (int i = 0; i < n; i++) { tmp[i] = y[i] + 0.5 * h * k1[i]; }
+        rhs(t + 0.5 * h, tmp, k2, n, ctx);
+        for (int i = 0; i < n; i++) { tmp[i] = y[i] + 0.5 * h * k2[i]; }
+        rhs(t + 0.5 * h, tmp, k3, n, ctx);
+        for (int i = 0; i < n; i++) { tmp[i] = y[i] + h * k3[i]; }
+        rhs(t + h, tmp, k4, n, ctx);
+        for (int i = 0; i < n; i++) { y[i] += h / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]); }
+        if (traj != null) { for (int i = 0; i < n; i++) { traj[(s + 1) * n + i] = y[i]; } }
+    }
+    bool good = true;
+    for (int i = 0; i < n; i++) {
+        yOut[i] = y[i];
+        if (!finite(y[i])) { good = false; }
+    }
+    freeMem(w);
+    return good ? OK : ERR_NAN;
+}
+
+// The adaptive Dormand-Prince 5(4) method (the method of MATLAB's ode45 and SciPy's RK45) with error control: the step is accepted when the weighted RMS norm
+// of the local error estimate is below 1, with the scale atol + rtol * max(|y|, |y_new|); the next step is 0.9 * err^(-1/5) times the last (between 0.2 and 10).
+// The first step is chosen automatically (Hairer's algorithm). Usage:
+//    optim.Rk45 s(rhs, ctx, n, t0, y0, 1.0e-8, 1.0e-10);   s.solveTo(t1, 100000);   s.y[i];   s.dispose();
+public class Rk45 {
+    public int n;
+    public double t;                       // the current time
+    public double* y;                      // the current state (n numbers)
+    public double h;                       // the suggested next step
+    public int nfev;                       // function evaluations
+    public int nsteps;                     // accepted steps
+    public int nrejected;                  // rejected steps
+    public int err;                        // OK or an ERR_ code of the last operation
+    private func rhs;
+    private void* ctx;
+    private double rtol;
+    private double atol;
+    private double* w;                     // work space: y, k1 .. k7, ynew, errv, scale
+    private bool haveK1;
+
+    public Rk45(func f, void* context, int dim, double t0, double* y0, double relTol, double absTol, double h0 = D_ZERO) {
+        err = OK;
+        if (dim < 1 || y0 == null || !finite(t0) || !(relTol > 0.0) || !(absTol >= 0.0) || h0 < 0.0 || f == null) {
+            err = ERR_ARG;
+            return;
+        }
+        for (int i = 0; i < dim; i++) {
+            if (!finite(y0[i])) { err = ERR_NAN; return; }
+        }
+        w = newDoubles(11 * dim);
+        if (w == null) { err = ERR_MEMORY; return; }
+        n = dim;
+        rhs = f;
+        ctx = context;
+        rtol = relTol;
+        atol = absTol;
+        t = t0;
+        y = w;
+        for (int i = 0; i < n; i++) { y[i] = y0[i]; }
+        h = h0;
+        haveK1 = false;
+    }
+
+    public bool ok() { return err == OK && w != null; }
+
+    private double* k(int i) { return &w[(1 + i) * n]; }                 // k(0) .. k(6)
+
+    // the weighted RMS norm of v with the scale of the state x
+    private double rmsScaled(double* v, double* x1, double* x2) {
+        double s = 0.0;
+        for (int i = 0; i < n; i++) {
+            double ax = absd(x1[i]);
+            double bx = (x2 != null) ? absd(x2[i]) : 0.0;
+            double sc = atol + rtol * ((ax > bx) ? ax : bx);
+            double q = v[i] / sc;
+            s += q * q;
+        }
+        return dmath.sqrt(s / (double) n);
+    }
+
+    // chooses the first step for an integration in the direction `dir` (+1 or -1)
+    private void initialStep(double dir) {
+        double* f0 = k(0);
+        rhs(t, y, f0, n, ctx);
+        nfev++;
+        double* scale = &w[10 * n];
+        double d0 = 0.0;
+        double d1 = 0.0;
+        for (int i = 0; i < n; i++) {
+            scale[i] = atol + absd(y[i]) * rtol;
+            double q0 = y[i] / scale[i];
+            double q1 = f0[i] / scale[i];
+            d0 += q0 * q0;
+            d1 += q1 * q1;
+        }
+        d0 = dmath.sqrt(d0 / (double) n);
+        d1 = dmath.sqrt(d1 / (double) n);
+        double h0 = (d0 < 1.0e-5 || d1 < 1.0e-5) ? 1.0e-6 : 0.01 * d0 / d1;
+        double* y1 = &w[9 * n];
+        for (int i = 0; i < n; i++) { y1[i] = y[i] + dir * h0 * f0[i]; }
+        double* f1 = k(1);
+        rhs(t + dir * h0, y1, f1, n, ctx);
+        nfev++;
+        double d2 = 0.0;
+        for (int i = 0; i < n; i++) {
+            double q = (f1[i] - f0[i]) / scale[i];
+            d2 += q * q;
+        }
+        d2 = dmath.sqrt(d2 / (double) n) / h0;
+        double hh;
+        if (d1 <= 1.0e-15 && d2 <= 1.0e-15) {
+            hh = (h0 * 1.0e-3 > 1.0e-6) ? h0 * 1.0e-3 : 1.0e-6;
+        } else {
+            double m = (d1 > d2) ? d1 : d2;
+            hh = dmath.pow(0.01 / m, 0.2);
+        }
+        h = (100.0 * h0 < hh) ? 100.0 * h0 : hh;
+        haveK1 = true;
+    }
+
+    // one accepted step towards tEnd, never beyond it (the step is cut to land on tEnd). OK, ERR_NO_CONVERGE when the step size underflows, ERR_NAN when the
+    // right hand side returns NaN or infinity
+    public int step(double tEnd) {
+        if (!ok()) { return (err == OK) ? ERR_ARG : err; }
+        if (!finite(tEnd)) { err = ERR_ARG; return err; }
+        if (tEnd == t) { return OK; }
+        double dir = (tEnd > t) ? 1.0 : -1.0;
+        if (h == 0.0) {
+            initialStep(dir);
+        } else if (!haveK1) {
+            rhs(t, y, k(0), n, ctx);
+            nfev++;
+            haveK1 = true;
+        }
+        double hs = absd(h);
+        bool wasRejected = false;
+        bool sawBad = false;                             // a right hand side evaluation gave NaN or infinity during this step
+        double* ynew = &w[8 * n];
+        double* ev = &w[9 * n];
+        double* tmp = &w[10 * n];
+        for (int attempt = 0; attempt < 100; attempt++) {
+            double room = absd(tEnd - t);
+            bool clamped = false;
+            double hh = hs;
+            if (hh >= room) {
+                hh = room;
+                clamped = true;
+            }
+            if (hh < 16.0 * EPS * absd(t) || hh == 0.0) {
+                err = sawBad ? ERR_NAN : ERR_NO_CONVERGE;
+                return err;
+            }
+            double hd = dir * hh;
+            double* k1 = k(0);
+            double* k2 = k(1);
+            double* k3 = k(2);
+            double* k4 = k(3);
+            double* k5 = k(4);
+            double* k6 = k(5);
+            double* k7 = k(6);
+            for (int i = 0; i < n; i++) { tmp[i] = y[i] + hd * (1.0 / 5.0) * k1[i]; }
+            rhs(t + hd * (1.0 / 5.0), tmp, k2, n, ctx);
+            for (int i = 0; i < n; i++) { tmp[i] = y[i] + hd * (3.0 / 40.0 * k1[i] + 9.0 / 40.0 * k2[i]); }
+            rhs(t + hd * (3.0 / 10.0), tmp, k3, n, ctx);
+            for (int i = 0; i < n; i++) { tmp[i] = y[i] + hd * (44.0 / 45.0 * k1[i] - 56.0 / 15.0 * k2[i] + 32.0 / 9.0 * k3[i]); }
+            rhs(t + hd * (4.0 / 5.0), tmp, k4, n, ctx);
+            for (int i = 0; i < n; i++) {
+                tmp[i] = y[i] + hd * (19372.0 / 6561.0 * k1[i] - 25360.0 / 2187.0 * k2[i] + 64448.0 / 6561.0 * k3[i] - 212.0 / 729.0 * k4[i]);
+            }
+            rhs(t + hd * (8.0 / 9.0), tmp, k5, n, ctx);
+            for (int i = 0; i < n; i++) {
+                tmp[i] = y[i] + hd * (9017.0 / 3168.0 * k1[i] - 355.0 / 33.0 * k2[i] + 46732.0 / 5247.0 * k3[i] + 49.0 / 176.0 * k4[i]
+                                      - 5103.0 / 18656.0 * k5[i]);
+            }
+            rhs(t + hd, tmp, k6, n, ctx);
+            for (int i = 0; i < n; i++) {
+                ynew[i] = y[i] + hd * (35.0 / 384.0 * k1[i] + 500.0 / 1113.0 * k3[i] + 125.0 / 192.0 * k4[i] - 2187.0 / 6784.0 * k5[i]
+                                       + 11.0 / 84.0 * k6[i]);
+            }
+            rhs(t + hd, ynew, k7, n, ctx);
+            nfev += 6;
+            bool bad = false;
+            for (int i = 0; i < n; i++) {
+                if (!finite(ynew[i]) || !finite(k7[i])) { bad = true; }
+            }
+            if (bad) {
+                // a failed evaluation: try a much smaller step a few times before giving up
+                sawBad = true;
+                hs = hh * 0.1;
+                wasRejected = true;
+                nrejected++;
+                if (attempt >= 20) {
+                    err = ERR_NAN;
+                    return err;
+                }
+                continue;
+            }
+            for (int i = 0; i < n; i++) {
+                ev[i] = hd * (71.0 / 57600.0 * k1[i] - 71.0 / 16695.0 * k3[i] + 71.0 / 1920.0 * k4[i] - 17253.0 / 339200.0 * k5[i]
+                              + 22.0 / 525.0 * k6[i] - 1.0 / 40.0 * k7[i]);
+            }
+            double en = rmsScaled(ev, y, ynew);
+            if (en < 1.0) {
+                double fac = (en == 0.0) ? 10.0 : 0.9 * dmath.pow(en, -0.2);
+                if (fac > 10.0) { fac = 10.0; }
+                if (wasRejected && fac > 1.0) { fac = 1.0; }
+                if (clamped) {
+                    t = tEnd;
+                    double nh = hh * fac;
+                    if (nh > absd(h)) { h = nh; }
+                } else {
+                    t += hd;
+                    h = hh * fac;
+                }
+                for (int i = 0; i < n; i++) {
+                    y[i] = ynew[i];
+                    k1[i] = k7[i];                       // first same as last: the next step starts with this evaluation
+                }
+                nsteps++;
+                err = OK;
+                return OK;
+            }
+            double fr = 0.9 * dmath.pow(en, -0.2);
+            if (fr < 0.2) { fr = 0.2; }
+            hs = hh * fr;
+            wasRejected = true;
+            nrejected++;
+        }
+        err = ERR_NO_CONVERGE;
+        return err;
+    }
+
+    // integrates up to tEnd exactly; maxSteps bounds the number of accepted steps (ERR_NO_CONVERGE when exceeded)
+    public int solveTo(double tEnd, int maxSteps) {
+        int count = 0;
+        while (t != tEnd) {
+            if (count >= maxSteps) { err = ERR_NO_CONVERGE; return err; }
+            int st = step(tEnd);
+            if (st != OK) { return st; }
+            count++;
+        }
+        return OK;
+    }
+
+    // integrates through the times[0 .. count - 1] (monotone, in the direction of integration) and stores the state at each of them in out (count * n numbers)
+    public int solveAt(double* times, int count, double* out, int maxSteps) {
+        if (times == null || out == null || count < 1) { return ERR_ARG; }
+        for (int i = 0; i < count; i++) {
+            int st = solveTo(times[i], maxSteps);
+            if (st != OK) { return st; }
+            for (int j = 0; j < n; j++) { out[i * n + j] = y[j]; }
+        }
+        return OK;
+    }
+
+    public void dispose() {
+        freeMem(w);
+        w = null;
+        y = null;
+        n = 0;
+        err = ERR_ARG;
+    }
+}
+
+// ============================================================================================================================================
+//  Interpolation
+// ============================================================================================================================================
+// true when xs[0 .. n-1] is strictly increasing and finite
+private bool strictlyIncreasing(double* xs, int n) {
+    for (int i = 0; i < n; i++) {
+        if (!finite(xs[i])) { return false; }
+        if (i > 0 && !(xs[i] > xs[i - 1])) { return false; }
+    }
+    return true;
+}
+
+// the index i with xs[i] <= x < xs[i + 1] (0 for x below the first, n - 2 for x above the last): binary search
+private int findInterval(double* xs, int n, double x) {
+    int lo = 0;
+    int hi = n - 2;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (xs[mid] <= x) { lo = mid; } else { hi = mid - 1; }
+    }
+    return lo;
+}
+
+// piecewise linear interpolation through the points (xs[i], ys[i]) (xs strictly increasing, which costs O(n) to check and is not checked beyond xs[0] < xs[n - 1]); outside the range the end values are returned (like numpy.interp);
+// NaN for bad input
+public double interpLinear(double* xs, double* ys, int n, double x) {
+    if (xs == null || ys == null || n < 1 || x != x) { return nanValue(); }
+    if (n == 1) { return ys[0]; }
+    if (!(xs[0] < xs[n - 1])) { return nanValue(); }          // decreasing (or NaN) nodes: the cheap part of the check that xs is increasing
+    if (x <= xs[0]) { return ys[0]; }
+    if (x >= xs[n - 1]) { return ys[n - 1]; }
+    int i = findInterval(xs, n, x);
+    double t = (x - xs[i]) / (xs[i + 1] - xs[i]);
+    return ys[i] + t * (ys[i + 1] - ys[i]);
+}
+
+// A cubic spline through n >= 2 points with strictly increasing x: SPLINE_NATURAL (second derivative 0 at both ends) or SPLINE_CLAMPED (first derivatives d0 and
+// dn at the ends given). Outside [x0, xn-1] the cubic of the end segment continues. err is OK or ERR_ARG (not increasing, NaN, n < 2).
+public class Spline {
+    public int n;
+    public int err;
+    private double* xs;
+    private double* ca;                    // segment i: a + b dx + c dx^2 + d dx^3 with dx = x - xs[i]
+    private double* cb;
+    private double* cc;
+    private double* cd;
+
+    public Spline(double* x, double* y, int count, int bc = SPLINE_NATURAL, double d0 = D_ZERO, double dn = D_ZERO) {
+        err = OK;
+        if (x == null || y == null || count < 2 || !strictlyIncreasing(x, count) || (bc != SPLINE_NATURAL && bc != SPLINE_CLAMPED)) {
+            err = ERR_ARG;
+            return;
+        }
+        for (int i = 0; i < count; i++) {
+            if (!finite(y[i])) { err = ERR_ARG; return; }
+        }
+        if (bc == SPLINE_CLAMPED && (!finite(d0) || !finite(dn))) { err = ERR_ARG; return; }
+        int segs = count - 1;
+        xs = newDoubles(count);
+        ca = newDoubles(segs);
+        cb = newDoubles(segs);
+        cc = newDoubles(segs);
+        cd = newDoubles(segs);
+        double* mm = newDoubles(count);                // second derivatives
+        double* sub = newDoubles(count);
+        double* dia = newDoubles(count);
+        double* sup = newDoubles(count);
+        double* rhs = newDoubles(count);
+        if (xs == null || ca == null || cb == null || cc == null || cd == null || mm == null || sub == null || dia == null || sup == null || rhs == null) {
+            freeMem(mm); freeMem(sub); freeMem(dia); freeMem(sup); freeMem(rhs);
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        for (int i = 0; i < count; i++) { xs[i] = x[i]; }
+        // the tridiagonal system for the second derivatives M_i
+        for (int i = 0; i < count; i++) {
+            if (i == 0 || i == count - 1) {
+                if (bc == SPLINE_NATURAL) {
+                    dia[i] = 1.0;
+                    rhs[i] = 0.0;
+                } else if (i == 0) {
+                    double h = x[1] - x[0];
+                    dia[i] = 2.0 * h;
+                    sup[i] = h;
+                    rhs[i] = 6.0 * ((y[1] - y[0]) / h - d0);
+                } else {
+                    double h = x[count - 1] - x[count - 2];
+                    sub[i] = h;
+                    dia[i] = 2.0 * h;
+                    rhs[i] = 6.0 * (dn - (y[count - 1] - y[count - 2]) / h);
+                }
+            } else {
+                double h0 = x[i] - x[i - 1];
+                double h1 = x[i + 1] - x[i];
+                sub[i] = h0;
+                dia[i] = 2.0 * (h0 + h1);
+                sup[i] = h1;
+                rhs[i] = 6.0 * ((y[i + 1] - y[i]) / h1 - (y[i] - y[i - 1]) / h0);
+            }
+        }
+        // Thomas algorithm
+        for (int i = 1; i < count; i++) {
+            double m = sub[i] / dia[i - 1];
+            dia[i] -= m * sup[i - 1];
+            rhs[i] -= m * rhs[i - 1];
+        }
+        mm[count - 1] = rhs[count - 1] / dia[count - 1];
+        for (int i = count - 2; i >= 0; i--) { mm[i] = (rhs[i] - sup[i] * mm[i + 1]) / dia[i]; }
+        for (int i = 0; i < segs; i++) {
+            double h = x[i + 1] - x[i];
+            ca[i] = y[i];
+            cb[i] = (y[i + 1] - y[i]) / h - h * (2.0 * mm[i] + mm[i + 1]) / 6.0;
+            cc[i] = 0.5 * mm[i];
+            cd[i] = (mm[i + 1] - mm[i]) / (6.0 * h);
+        }
+        n = count;
+        freeMem(mm); freeMem(sub); freeMem(dia); freeMem(sup); freeMem(rhs);
+    }
+
+    public bool ok() { return err == OK && n >= 2; }
+
+    // the spline value
+    public double value(double x) {
+        if (!ok() || x != x) { return nanValue(); }
+        int i = findInterval(xs, n, x);
+        double dx = x - xs[i];
+        return ((cd[i] * dx + cc[i]) * dx + cb[i]) * dx + ca[i];
+    }
+
+    // the derivative of the given order (1, 2 or 3)
+    public double derivative(double x, int order = 1) {
+        if (!ok() || x != x || order < 1 || order > 3) { return nanValue(); }
+        int i = findInterval(xs, n, x);
+        double dx = x - xs[i];
+        if (order == 1) { return (3.0 * cd[i] * dx + 2.0 * cc[i]) * dx + cb[i]; }
+        if (order == 2) { return 6.0 * cd[i] * dx + 2.0 * cc[i]; }
+        return 6.0 * cd[i];
+    }
+
+    // the exact integral of the spline from a to b
+    public double integral(double a, double b) {
+        if (!ok() || a != a || b != b) { return nanValue(); }
+        if (a > b) { return -integral(b, a); }
+        double total = 0.0;
+        int i0 = findInterval(xs, n, a);
+        int i1 = findInterval(xs, n, b);
+        for (int i = i0; i <= i1; i++) {
+            double lo = (i == i0) ? a : xs[i];
+            double hi = (i == i1) ? b : xs[i + 1];
+            total += segIntegral(i, hi - xs[i]) - segIntegral(i, lo - xs[i]);
+        }
+        return total;
+    }
+
+    private double segIntegral(int i, double dx) {
+        return (((cd[i] * dx / 4.0 + cc[i] / 3.0) * dx + cb[i] / 2.0) * dx + ca[i]) * dx;
+    }
+
+    public void dispose() {
+        freeMem(xs);
+        freeMem(ca);
+        freeMem(cb);
+        freeMem(cc);
+        freeMem(cd);
+        xs = null;
+        ca = null;
+        cb = null;
+        cc = null;
+        cd = null;
+        n = 0;
+        err = ERR_ARG;
+    }
+}
+
+// Lagrange interpolation in barycentric form: O(n^2) setup, O(n) per evaluation, numerically stable for any distinct nodes (use Chebyshev nodes to avoid the
+// Runge phenomenon with many points)
+public class Barycentric {
+    public int n;
+    public int err;
+    private double* xs;
+    private double* ys;
+    private double* wt;
+
+    public Barycentric(double* x, double* y, int count) {
+        err = OK;
+        if (x == null || y == null || count < 1 || count > 0x100000) {
+            err = ERR_ARG;
+            return;
+        }
+        xs = newDoubles(count);
+        ys = newDoubles(count);
+        wt = newDoubles(count);
+        if (xs == null || ys == null || wt == null) {
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        for (int j = 0; j < count; j++) {
+            if (!finite(x[j]) || !finite(y[j])) { dispose(); err = ERR_ARG; return; }
+            xs[j] = x[j];
+            ys[j] = y[j];
+        }
+        for (int j = 0; j < count; j++) {
+            double p = 1.0;
+            for (int k = 0; k < count; k++) {
+                if (k == j) { continue; }
+                double d = xs[j] - xs[k];
+                if (d == 0.0) { dispose(); err = ERR_ARG; return; }          // equal nodes
+                p *= d;
+            }
+            wt[j] = 1.0 / p;
+        }
+        n = count;
+    }
+
+    public bool ok() { return err == OK && n >= 1; }
+
+    public double value(double x) {
+        if (!ok() || x != x) { return nanValue(); }
+        double num = 0.0;
+        double den = 0.0;
+        for (int j = 0; j < n; j++) {
+            double d = x - xs[j];
+            if (d == 0.0) { return ys[j]; }
+            double t = wt[j] / d;
+            num += t * ys[j];
+            den += t;
+        }
+        return num / den;
+    }
+
+    public void dispose() {
+        freeMem(xs);
+        freeMem(ys);
+        freeMem(wt);
+        xs = null;
+        ys = null;
+        wt = null;
+        n = 0;
+        err = ERR_ARG;
+    }
+}
+
+// the n Chebyshev nodes of the first kind on [a, b] in increasing order: x_k = (a + b) / 2 - (b - a) / 2 cos(pi (2k + 1) / (2n))
+public int chebyshevNodes(int n, double a, double b, double* out) {
+    if (n < 1 || out == null || !finite(a) || !finite(b)) { return ERR_ARG; }
+    for (int k = 0; k < n; k++) {
+        double s;
+        double c;
+        sincosTurns(2 * k + 1, 4 * n, &s, &c);                // cos(pi (2k + 1) / (2n)) = cos(2 pi (2k + 1) / (4n))
+        out[k] = 0.5 * (a + b) - 0.5 * (b - a) * c;
+    }
+    return OK;
+}
+
+// A function approximated on [a, b] by a Chebyshev series of n terms from its values at the n Chebyshev nodes: f(x) = c0 / 2 + sum c_j T_j(t) with
+// t = (2x - a - b) / (b - a). Evaluation by Clenshaw's recurrence; exact derivative and integral of the series.
+public class Chebyshev {
+    public int n;
+    public int err;
+    public double lo;
+    public double hi;
+    private double* c;
+
+    // fits the function f (callback double f(double x, void* ctx)) with n terms
+    public Chebyshev(func f, void* ctx, double a, double b, int terms) {
+        err = OK;
+        if (f == null || terms < 1 || terms > 100000 || !(a < b) || !finite(a) || !finite(b)) { err = ERR_ARG; return; }
+        c = newDoubles(terms);
+        double* fv = newDoubles(terms);
+        if (c == null || fv == null) {
+            freeMem(fv);
+            dispose();
+            err = ERR_MEMORY;
+            return;
+        }
+        // nodes t_k = cos(pi (k + 1/2) / n) for k = 0 .. n - 1 (decreasing)
+        for (int k = 0; k < terms; k++) {
+            double s;
+            double cs;
+            sincosTurns(2 * k + 1, 4 * terms, &s, &cs);
+            double t = cs;
+            fv[k] = call1(f, 0.5 * (a + b) + 0.5 * (b - a) * t, ctx);
+            if (fv[k] != fv[k] || !finite(fv[k])) { freeMem(fv); dispose(); err = ERR_NAN; return; }
+        }
+        for (int j = 0; j < terms; j++) {
+            double sum = 0.0;
+            for (int k = 0; k < terms; k++) {
+                double s;
+                double cs;
+                sincosTurns((j * (2 * k + 1)) % (4 * terms), 4 * terms, &s, &cs);
+                sum += fv[k] * cs;
+            }
+            c[j] = 2.0 * sum / (double) terms;
+        }
+        freeMem(fv);
+        n = terms;
+        lo = a;
+        hi = b;
+    }
+
+    public bool ok() { return err == OK && n >= 1; }
+
+    // the coefficient c_j
+    public double coefficient(int j) { return (ok() && j >= 0 && j < n) ? c[j] : nanValue(); }
+
+    // the value of the series at x (outside [a, b] the polynomial continues)
+    public double value(double x) {
+        if (!ok() || x != x) { return nanValue(); }
+        double t = (2.0 * x - lo - hi) / (hi - lo);
+        double b1 = 0.0;
+        double b2 = 0.0;
+        for (int j = n - 1; j >= 1; j--) {
+            double b0 = 2.0 * t * b1 - b2 + c[j];
+            b2 = b1;
+            b1 = b0;
+        }
+        return t * b1 - b2 + 0.5 * c[0];
+    }
+
+    // the derivative of the approximation at x
+    public double derivative(double x) {
+        if (!ok() || x != x) { return nanValue(); }
+        if (n == 1) { return 0.0; }
+        double* d = newDoubles(n + 2);
+        if (d == null) { return nanValue(); }
+        // d_{j-1} = d_{j+1} + 2 j c_j  (coefficients of the derivative series in t)
+        for (int j = n - 1; j >= 1; j--) { d[j - 1] = d[j + 1] + 2.0 * (double) j * c[j]; }
+        double t = (2.0 * x - lo - hi) / (hi - lo);
+        double b1 = 0.0;
+        double b2 = 0.0;
+        for (int j = n - 2; j >= 1; j--) {
+            double b0 = 2.0 * t * b1 - b2 + d[j];
+            b2 = b1;
+            b1 = b0;
+        }
+        double r = t * b1 - b2 + 0.5 * d[0];
+        freeMem(d);
+        return r * 2.0 / (hi - lo);
+    }
+
+    // the integral of the approximation over [a, b]
+    public double integral() {
+        if (!ok()) { return nanValue(); }
+        double s = c[0];
+        for (int j = 2; j < n; j += 2) { s += 2.0 * c[j] / (1.0 - (double) j * (double) j); }
+        return 0.5 * (hi - lo) * s;
+    }
+
+    public void dispose() {
+        freeMem(c);
+        c = null;
+        n = 0;
+        err = ERR_ARG;
+    }
+}
+
+// ============================================================================================================================================
+//  Polynomials (coefficients in increasing order: coef[k] belongs to x^k)
+// ============================================================================================================================================
+// Horner evaluation of coef[0] + coef[1] x + ... + coef[degree] x^degree
+public double polyEval(double* coef, int degree, double x) {
+    if (coef == null || degree < 0) { return nanValue(); }
+    double r = 0.0;
+    for (int k = degree; k >= 0; k--) { r = r * x + coef[k]; }
+    return r;
+}
+
+// the value and the derivative at x in one pass
+public void polyEvalDeriv(double* coef, int degree, double x, double* value, double* deriv) {
+    if (coef == null || degree < 0) {
+        if (value != null) { *value = nanValue(); }
+        if (deriv != null) { *deriv = nanValue(); }
+        return;
+    }
+    double p = 0.0;
+    double d = 0.0;
+    for (int k = degree; k >= 0; k--) {
+        d = d * x + p;
+        p = p * x + coef[k];
+    }
+    if (value != null) { *value = p; }
+    if (deriv != null) { *deriv = d; }
+}
+
+// the derivative: degree numbers go to out (degree 0 gives the constant 0); returns the degree of the result
+public int polyDeriv(double* coef, int degree, double* out) {
+    if (coef == null || out == null || degree < 0) { return -1; }
+    if (degree == 0) {
+        out[0] = 0.0;
+        return 0;
+    }
+    for (int k = 1; k <= degree; k++) { out[k - 1] = coef[k] * (double) k; }
+    return degree - 1;
+}
+
+// the antiderivative with the constant c0: degree + 2 numbers go to out; returns the degree of the result
+public int polyIntegral(double* coef, int degree, double* out, double c0) {
+    if (coef == null || out == null || degree < 0) { return -1; }
+    out[0] = c0;
+    for (int k = 0; k <= degree; k++) { out[k + 1] = coef[k] / (double) (k + 1); }
+    return degree + 1;
+}
+
+// a + b into out (max(da, db) + 1 numbers); returns the degree of the result
+public int polyAdd(double* a, int da, double* b, int db, double* out) {
+    if (a == null || b == null || out == null || da < 0 || db < 0) { return -1; }
+    int d = (da > db) ? da : db;
+    for (int k = 0; k <= d; k++) { out[k] = ((k <= da) ? a[k] : 0.0) + ((k <= db) ? b[k] : 0.0); }
+    return d;
+}
+
+// a * b into out (da + db + 1 numbers, must not overlap a or b); returns the degree of the result
+public int polyMul(double* a, int da, double* b, int db, double* out) {
+    if (a == null || b == null || out == null || da < 0 || db < 0) { return -1; }
+    for (int k = 0; k <= da + db; k++) { out[k] = 0.0; }
+    for (int i = 0; i <= da; i++) {
+        for (int j = 0; j <= db; j++) { out[i + j] += a[i] * b[j]; }
+    }
+    return da + db;
+}
+
+// polynomial long division num = quot * den + rem: quot gets dn - dd + 1 numbers (the quotient is 0 when dn < dd), rem gets dd numbers (the remainder has degree
+// below dd; null skips it). The leading coefficient of den must not be 0. Returns the degree of the quotient, -1 on bad arguments.
+public int polyDivide(double* num, int dn, double* den, int dd, double* quot, double* rem) {
+    if (num == null || den == null || dn < 0 || dd < 0 || den[dd] == 0.0 || !finite(den[dd])) { return -1; }
+    double* r = newDoubles(dn + 1);
+    if (r == null) { return -1; }
+    for (int k = 0; k <= dn; k++) { r[k] = num[k]; }
+    int dq = dn - dd;
+    if (dq < 0) {
+        if (quot != null) { quot[0] = 0.0; }
+        if (rem != null) { for (int k = 0; k < dd; k++) { rem[k] = (k <= dn) ? r[k] : 0.0; } }
+        freeMem(r);
+        return 0;
+    }
+    for (int k = dq; k >= 0; k--) {
+        double q = r[k + dd] / den[dd];
+        if (quot != null) { quot[k] = q; }
+        for (int j = 0; j <= dd; j++) { r[k + j] -= q * den[j]; }
+    }
+    if (rem != null) { for (int k = 0; k < dd; k++) { rem[k] = r[k]; } }
+    freeMem(r);
+    return dq;
+}
+
+// the monic polynomial with the given real roots: n + 1 numbers go to out
+public int polyFromRoots(double* roots, int n, double* out) {
+    if (roots == null || out == null || n < 0) { return ERR_ARG; }
+    out[0] = 1.0;
+    for (int k = 1; k <= n; k++) { out[k] = 0.0; }
+    int deg = 0;
+    for (int r = 0; r < n; r++) {
+        // multiply by (x - root)
+        for (int k = deg + 1; k >= 1; k--) { out[k] = out[k - 1] - roots[r] * ((k <= deg) ? out[k] : 0.0); }
+        out[0] = -roots[r] * out[0];
+        deg++;
+    }
+    return OK;
+}
+
+// all complex roots of the real polynomial (degree >= 1, leading coefficient != 0 after dropping zeros at the top): re[i] + i im[i] for i = 0 .. degree - 1,
+// sorted by real part (real parts that differ by less than 1e-10 count as equal; then by imaginary part). Aberth-Ehrlich iteration (all roots at once, cubic convergence for simple roots) followed by Newton polishing on
+// the original polynomial; zero roots are taken out first. A multiple root is found with half the digits (like every numerical method). Returns the number of
+// roots (the true degree) or a negative ERR_ code: -ERR_ARG for a zero or non-finite polynomial, -ERR_NO_CONVERGE when the iteration did not settle (re / im still hold the best estimates).
+public int polyRoots(double* coef, int degree, double* re, double* im) {
+    if (coef == null || re == null || im == null || degree < 0) { return -ERR_ARG; }
+    for (int k = 0; k <= degree; k++) {
+        if (!finite(coef[k])) { return -ERR_ARG; }
+    }
+    int top = degree;
+    while (top >= 0 && coef[top] == 0.0) { top--; }
+    if (top < 0) { return -ERR_ARG; }
+    int low = 0;
+    while (coef[low] == 0.0) { low++; }              // zero roots
+    int m = top - low;                                // degree of the polynomial without them
+    int status = OK;
+    for (int i = 0; i < low; i++) {
+        re[i] = 0.0;
+        im[i] = 0.0;
+    }
+    if (m >= 1) {
+        double* c = newDoubles(m + 1);
+        double* zr = &re[low];
+        double* zi = &im[low];
+        if (c == null) { return -ERR_MEMORY; }
+        for (int k = 0; k <= m; k++) { c[k] = coef[low + k] / coef[top]; }                // monic
+        // initial guesses on a circle of radius |c0|^(1/m) (the geometric mean of the roots), rotated by an irrational angle
+        double r0 = dmath.pow(absd(c[0]), 1.0 / (double) m);
+        double cmax = 0.0;
+        for (int k = 0; k < m; k++) { if (absd(c[k]) > cmax) { cmax = absd(c[k]); } }
+        double bound = 1.0 + cmax;                    // Cauchy: all roots lie inside this radius
+        if (!(r0 > 0.0) || r0 > bound) { r0 = 0.5 * bound; }
+        double rot_s;
+        double rot_c;
+        for (int k = 0; k < m; k++) {
+            double s;
+            double cs;
+            sincosTurns(k, m, &s, &cs);
+            rot_s = 0.479425538604203;                // sin(0.5), cos(0.5)
+            rot_c = 0.8775825618903728;
+            zr[k] = r0 * (cs * rot_c - s * rot_s);
+            zi[k] = r0 * (s * rot_c + cs * rot_s);
+        }
+        bool done = false;
+        double lastRel = 0.0;
+        for (int it = 0; it < 500 && !done; it++) {
+            done = true;
+            lastRel = 0.0;
+            for (int k = 0; k < m; k++) {
+                // p(z) and p'(z) by Horner in complex arithmetic
+                double pr = 1.0;
+                double pi = 0.0;
+                double dr = 0.0;
+                double di = 0.0;
+                for (int j = m - 1; j >= 0; j--) {
+                    double ndr = dr * zr[k] - di * zi[k] + pr;
+                    double ndi = dr * zi[k] + di * zr[k] + pi;
+                    dr = ndr;
+                    di = ndi;
+                    double npr = pr * zr[k] - pi * zi[k] + c[j];
+                    double npi = pr * zi[k] + pi * zr[k];
+                    pr = npr;
+                    pi = npi;
+                }
+                double mag = pr * pr + pi * pi;
+                if (mag == 0.0) { continue; }
+                double dm = dr * dr + di * di;
+                if (dm == 0.0) {
+                    // a stationary point: push the estimate a little
+                    zr[k] += 1.0e-8 * (1.0 + absd(zr[k]));
+                    done = false;
+                    continue;
+                }
+                // w = p / p'
+                double wr = (pr * dr + pi * di) / dm;
+                double wi = (pi * dr - pr * di) / dm;
+                // s = sum over j != k of 1 / (z_k - z_j)
+                double sr = 0.0;
+                double si = 0.0;
+                for (int j = 0; j < m; j++) {
+                    if (j == k) { continue; }
+                    double ar = zr[k] - zr[j];
+                    double ai = zi[k] - zi[j];
+                    double den = ar * ar + ai * ai;
+                    if (den == 0.0) { continue; }
+                    sr += ar / den;
+                    si -= ai / den;
+                }
+                // correction = w / (1 - w s)
+                double tr = 1.0 - (wr * sr - wi * si);
+                double ti = -(wr * si + wi * sr);
+                double td = tr * tr + ti * ti;
+                double cr = (wr * tr + wi * ti) / td;
+                double ci = (wi * tr - wr * ti) / td;
+                zr[k] -= cr;
+                zi[k] -= ci;
+                double sizeZ = dmath.hypot(zr[k], zi[k]);
+                double rel = dmath.hypot(cr, ci) / ((sizeZ > 1.0e-300) ? sizeZ : 1.0e-300);
+                if (rel > lastRel) { lastRel = rel; }
+                if (rel > 1.0e-14) { done = false; }
+            }
+        }
+        // multiple roots converge only linearly and can be found to half the digits: a last correction below 1e-3 still counts as converged (multiplicity 5 gives eps^(1/5) = 7e-4)
+        if (!done && lastRel > 1.0e-3) { status = ERR_NO_CONVERGE; }
+        // Newton polishing on the original (unscaled) polynomial, real or complex
+        for (int k = 0; k < m; k++) {
+            for (int pass = 0; pass < 3; pass++) {
+                double pr = 1.0;
+                double pi = 0.0;
+                double dr = 0.0;
+                double di = 0.0;
+                for (int j = m - 1; j >= 0; j--) {
+                    double ndr = dr * zr[k] - di * zi[k] + pr;
+                    double ndi = dr * zi[k] + di * zr[k] + pi;
+                    dr = ndr;
+                    di = ndi;
+                    double npr = pr * zr[k] - pi * zi[k] + c[j];
+                    double npi = pr * zi[k] + pi * zr[k];
+                    pr = npr;
+                    pi = npi;
+                }
+                double dm = dr * dr + di * di;
+                if (dm == 0.0) { break; }
+                double wr = (pr * dr + pi * di) / dm;
+                double wi = (pi * dr - pr * di) / dm;
+                zr[k] -= wr;
+                zi[k] -= wi;
+            }
+            // a root that is real within rounding becomes exactly real (a real Newton iteration decides)
+            if (absd(zi[k]) <= 1.0e-8 * (1.0 + absd(zr[k]))) {
+                double x = zr[k];
+                for (int pass = 0; pass < 30; pass++) {
+                    double p;
+                    double d;
+                    polyEvalDeriv(c, m, x, &p, &d);
+                    if (d == 0.0) { break; }
+                    double dx = p / d;
+                    x -= dx;
+                    if (absd(dx) <= 4.0 * EPS * absd(x)) { break; }
+                }
+                double pc = polyEvalMag(c, m, zr[k], zi[k]);
+                double px = polyEvalMag(c, m, x, 0.0);
+                if (px <= pc || absd(zi[k]) <= 1.0e-12 * (1.0 + absd(zr[k]))) {
+                    zr[k] = x;
+                    zi[k] = 0.0;
+                }
+            }
+        }
+        freeMem(c);
+    }
+    int total = low + m;
+    // sort by real part, then imaginary part (insertion sort: the number of roots is small)
+    for (int i = 1; i < total; i++) {
+        double vr = re[i];
+        double vi = im[i];
+        int j = i - 1;
+        while (j >= 0 && rootAfter(re[j], im[j], vr, vi)) {
+            re[j + 1] = re[j];
+            im[j + 1] = im[j];
+            j--;
+        }
+        re[j + 1] = vr;
+        im[j + 1] = vi;
+    }
+    return (status == OK) ? total : -status;
+}
+
+// true when the root a = (ar, ai) sorts after b: by real part, real parts that differ by less than 1e-10 (relative) count as equal and the imaginary parts decide
+// (the two roots of a conjugate pair have real parts that differ in the last digits, and must come out in the order (re, -im), (re, +im))
+private bool rootAfter(double ar, double ai, double br, double bi) {
+    double m = (absd(ar) > absd(br)) ? absd(ar) : absd(br);
+    if (absd(ar - br) > 1.0e-10 * (1.0 + m)) { return ar > br; }
+    return ai > bi;
+}
+
+// |p(x + i y)| for the monic polynomial c of degree m
+private double polyEvalMag(double* c, int m, double x, double y) {
+    double pr = 1.0;
+    double pi = 0.0;
+    for (int j = m - 1; j >= 0; j--) {
+        double npr = pr * x - pi * y + c[j];
+        double npi = pr * y + pi * x;
+        pr = npr;
+        pi = npi;
+    }
+    return dmath.hypot(pr, pi);
+}
+
+// the least squares polynomial of the given degree through n points: coefficients in increasing order go to coef (degree + 1 numbers); x is scaled internally
+// to [-1, 1] for conditioning, the QR decomposition of the matrix module does the solving (or the SVD when the points are degenerate). Returns OK or an ERR_ code.
+public int polyFit(double* x, double* y, int n, int degree, double* coef) {
+    if (x == null || y == null || coef == null || degree < 0 || n < degree + 1) { return ERR_ARG; }
+    double sc = 0.0;
+    for (int i = 0; i < n; i++) {
+        if (!finite(x[i]) || !finite(y[i])) { return ERR_NAN; }
+        if (absd(x[i]) > sc) { sc = absd(x[i]); }
+    }
+    if (sc == 0.0) { sc = 1.0; }
+    matrix.Matrix V(n, degree + 1);
+    double* c = newDoubles(degree + 1);
+    if (!V.ok() || c == null) {
+        V.dispose();
+        freeMem(c);
+        return ERR_MEMORY;
+    }
+    for (int i = 0; i < n; i++) {
+        double t = x[i] / sc;
+        double p = 1.0;
+        for (int k = 0; k <= degree; k++) {
+            V.d[i * (degree + 1) + k] = p;
+            p *= t;
+        }
+    }
+    int st = matrix.lstsq(&V, y, c, null, null);
+    if (st == matrix.OK) {
+        double pw = 1.0;
+        for (int k = 0; k <= degree; k++) {
+            coef[k] = c[k] / pw;
+            pw *= sc;
+        }
+    }
+    V.dispose();
+    freeMem(c);
+    return (st == matrix.OK) ? OK : ((st == matrix.ERR_MEMORY) ? ERR_MEMORY : ERR_SINGULAR);
+}
+
+// ============================================================================================================================================
+//  Orthogonal polynomials and special sequences
+// ============================================================================================================================================
+// Legendre polynomial P_n(x) (three term recurrence)
+public double legendreP(int n, double x) {
+    if (n < 0) { return nanValue(); }
+    double p0 = 1.0;
+    if (n == 0) { return p0; }
+    double p1 = x;
+    for (int k = 1; k < n; k++) {
+        double p2 = ((2.0 * (double) k + 1.0) * x * p1 - (double) k * p0) / (double) (k + 1);
+        p0 = p1;
+        p1 = p2;
+    }
+    return p1;
+}
+
+// Chebyshev polynomials of the first (T_n) and second kind (U_n)
+public double chebyshevT(int n, double x) {
+    if (n < 0) { return nanValue(); }
+    double t0 = 1.0;
+    if (n == 0) { return t0; }
+    double t1 = x;
+    for (int k = 1; k < n; k++) {
+        double t2 = 2.0 * x * t1 - t0;
+        t0 = t1;
+        t1 = t2;
+    }
+    return t1;
+}
+
+public double chebyshevU(int n, double x) {
+    if (n < 0) { return nanValue(); }
+    double u0 = 1.0;
+    if (n == 0) { return u0; }
+    double u1 = 2.0 * x;
+    for (int k = 1; k < n; k++) {
+        double u2 = 2.0 * x * u1 - u0;
+        u0 = u1;
+        u1 = u2;
+    }
+    return u1;
+}
+
+// the physicists' Hermite polynomial H_n(x)
+public double hermiteH(int n, double x) {
+    if (n < 0) { return nanValue(); }
+    double h0 = 1.0;
+    if (n == 0) { return h0; }
+    double h1 = 2.0 * x;
+    for (int k = 1; k < n; k++) {
+        double h2 = 2.0 * x * h1 - 2.0 * (double) k * h0;
+        h0 = h1;
+        h1 = h2;
+    }
+    return h1;
+}
+
+// the Laguerre polynomial L_n(x)
+public double laguerreL(int n, double x) {
+    if (n < 0) { return nanValue(); }
+    double l0 = 1.0;
+    if (n == 0) { return l0; }
+    double l1 = 1.0 - x;
+    for (int k = 1; k < n; k++) {
+        double l2 = ((2.0 * (double) k + 1.0 - x) * l1 - (double) k * l0) / (double) (k + 1);
+        l0 = l1;
+        l1 = l2;
+    }
+    return l1;
+}
+
+// n! as a double (exact up to 22!, infinity above 170)
+public double factorialD(int n) {
+    if (n < 0) { return nanValue(); }
+    if (n > 170) { return infValue(); }
+    double r = 1.0;
+    for (int k = 2; k <= n; k++) { r *= (double) k; }
+    return r;
+}
+
+// the binomial coefficient n over k as a double (exact while the result stays below 2^53)
+public double binomialD(int n, int k) {
+    if (n < 0 || k < 0) { return nanValue(); }
+    if (k > n) { return 0.0; }
+    if (k > n - k) { k = n - k; }
+    double r = 1.0;
+    for (int i = 1; i <= k; i++) {
+        r = r * (double) (n - k + i) / (double) i;
+        if (r == infValue()) { return r; }                  // the factors are at least 1: it can only grow, so stop at infinity (k up to 2^62 must not loop that long)
+    }
+    return dmath.floor(r + 0.5) == r || r > 4.0e15 ? r : dmath.round(r);
+}
+
+// the Fibonacci number F(n) (F(0) = 0, F(1) = 1; negative n by F(-n) = (-1)^(n+1) F(n)); infinite above n = 1476; exact up to F(78) (fast doubling)
+public double fibonacciD(int n) {
+    if (n < 0) {
+        double f = fibonacciD(-n);
+        return (n % 2 == 0) ? -f : f;
+    }
+    if (n > 1476) { return infValue(); }
+    double a = 0.0;                       // F(k)
+    double b = 1.0;                       // F(k + 1)
+    int hi = 0;
+    for (int t = n; t > 0; t >>= 1) { hi++; }
+    for (int i = hi - 1; i >= 0; i--) {
+        double c = a * (2.0 * b - a);     // F(2k)
+        double d = a * a + b * b;         // F(2k + 1)
+        if (((n >> i) & 1) == 1) { a = d; b = c + d; } else { a = c; b = d; }
+    }
+    return a;
+}
+
+// the Lucas number L(n) = F(n - 1) + F(n + 1)
+public double lucasD(int n) {
+    if (n < 0) {
+        double l = lucasD(-n);
+        return (n % 2 == 0) ? l : -l;
+    }
+    if (n > 1475) { return infValue(); }
+    if (n == 0) { return 2.0; }
+    return fibonacciD(n - 1) + fibonacciD(n + 1);
+}
+
+// the Catalan number C(n) = (2n)! / (n! (n + 1)!)
+public double catalanD(int n) {
+    if (n < 0) { return nanValue(); }
+    if (n > 520) { return infValue(); }                      // C(520) is about 1e308: the loop below stays short
+    double c = 1.0;
+    for (int k = 0; k < n; k++) { c = c * 2.0 * (double) (2 * k + 1) / (double) (k + 2); }
+    return c;
+}
+
+// the harmonic number H(n) = 1 + 1/2 + ... + 1/n (summed backwards for n <= 1000, the asymptotic series ln n + gamma + 1/2n - 1/12n^2 + 1/120n^4 above)
+public double harmonicD(int n) {
+    if (n < 0) { return nanValue(); }
+    if (n <= 1000) {
+        double s = 0.0;
+        for (int k = n; k >= 1; k--) { s += 1.0 / (double) k; }
+        return s;
+    }
+    double x = (double) n;
+    double x2 = x * x;
+    return dmath.log(x) + 0.5772156649015329 + 0.5 / x - 1.0 / (12.0 * x2) + 1.0 / (120.0 * x2 * x2);
+}
+
+// the Bernoulli number B(n) with B(1) = -1/2: from the exact fractions up to n = 30, above from B(2k) = (-1)^(k+1) 2 (2k)! zeta(2k) / (2 pi)^(2k) (about 1e-13
+// relative); odd n above 1 give 0; infinite beyond n = 260
+public double bernoulliD(int n) {
+    if (n < 0) { return nanValue(); }
+    if (n == 0) { return 1.0; }
+    if (n == 1) { return -0.5; }
+    if (n % 2 == 1) { return 0.0; }
+    if (n <= 30) {
+        double num[16] = {1.0, -1.0, 1.0, -1.0, 5.0, -691.0, 7.0, -3617.0, 43867.0, -174611.0, 854513.0, -236364091.0, 8553103.0, -23749461029.0, 8615841276005.0, 0.0};
+        double den[16] = {6.0, 30.0, 42.0, 30.0, 66.0, 2730.0, 6.0, 510.0, 798.0, 330.0, 138.0, 2730.0, 6.0, 870.0, 14322.0, 1.0};
+        return num[n / 2 - 1] / den[n / 2 - 1];
+    }
+    if (n > 260) { return infValue(); }
+    double zeta = 1.0;
+    for (int k = 2; k < 100; k++) {
+        double term = dmath.exp(-(double) n * dmath.log((double) k));
+        zeta += term;
+        if (term < 1.0e-18) { break; }
+    }
+    double lg = __dbl(::lgamma(__bits((double) n + 1.0)));
+    double mag = dmath.exp(dmath.log(2.0) + lg - (double) n * dmath.log(2.0 * dmath.PI)) * zeta;
+    return ((n / 2) % 2 == 1) ? mag : -mag;
+}
+
+// ============================================================================================================================================
+//  Fast Fourier transform
+// ============================================================================================================================================
+private bool isPow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
+
+private int nextPow2(int n) {
+    int m = 1;
+    while (m < n) { m = m * 2; }
+    return m;
+}
+
+// A plan for transforms of one length: the twiddle factors (and for lengths that are not powers of two the chirp of Bluestein's algorithm with the transform of its
+// convolution kernel) are computed once and reused. forward() computes X_k = sum x_j exp(-2 pi i j k / n), inverse() the same with exp(+...) and the factor 1 / n,
+// so inverse(forward(x)) = x. Power of two lengths use an iterative radix-2 algorithm, other lengths Bluestein's chirp-z algorithm (O(n log n) for every n).
+public class FftPlan {
+    public int n;
+    public int err;
+    private int m;                         // the length of the radix-2 transforms (n itself for powers of two, else a power of two >= 2n - 1)
+    private double* twr;                   // exp(-2 pi i k / m), k < m / 2
+    private double* twi;
+    private int* rev;                      // bit reversal permutation of length m
+    private double* chr;                   // Bluestein: chirp w_j = exp(-i pi j^2 / n), j < n
+    private double* chi;
+    private double* kr;                    // the FFT of the convolution kernel conj(w_j), length m
+    private double* ki;
+    private double* sr;                    // scratch space of length m
+    private double* si;
+
+    public FftPlan(int size) {
+        err = OK;
+        if (size < 1 || size > 0x10000000) { err = ERR_ARG; return; }
+        bool blu = !isPow2(size);
+        m = blu ? nextPow2(2 * size - 1) : size;
+        twr = newDoubles(m / 2 + 1);
+        twi = newDoubles(m / 2 + 1);
+        rev = newInts(m);
+        if (twr == null || twi == null || rev == null) { dispose(); err = ERR_MEMORY; return; }
+        for (int k = 0; k < m / 2; k++) {
+            double s;
+            double c;
+            sincosTurns(k, m, &s, &c);
+            twr[k] = c;
+            twi[k] = -s;
+        }
+        int bits = 0;
+        while ((1 << bits) < m) { bits++; }
+        for (int i = 0; i < m; i++) {
+            int r = 0;
+            for (int b = 0; b < bits; b++) {
+                if (((i >> b) & 1) == 1) { r |= 1 << (bits - 1 - b); }
+            }
+            rev[i] = r;
+        }
+        if (blu) {
+            chr = newDoubles(size);
+            chi = newDoubles(size);
+            kr = newDoubles(m);
+            ki = newDoubles(m);
+            sr = newDoubles(m);
+            si = newDoubles(m);
+            if (chr == null || chi == null || kr == null || ki == null || sr == null || si == null) { dispose(); err = ERR_MEMORY; return; }
+            int twoN = 2 * size;
+            for (int j = 0; j < size; j++) {
+                double s;
+                double c;
+                int e = (int) (((uint64) j * (uint64) j) % (uint64) twoN);          // pi j^2 / n = 2 pi (j^2 mod 2n) / 2n
+                sincosTurns(e, twoN, &s, &c);
+                chr[j] = c;
+                chi[j] = -s;
+            }
+            // the kernel conj(w_j) = (chr, -chi) at positions j and m - j
+            kr[0] = chr[0];
+            ki[0] = -chi[0];
+            for (int j = 1; j < size; j++) {
+                kr[j] = chr[j];
+                ki[j] = -chi[j];
+                kr[m - j] = chr[j];
+                ki[m - j] = -chi[j];
+            }
+            radix2(kr, ki, false);
+        }
+        n = size;
+    }
+
+    public bool ok() { return err == OK && n >= 1; }
+
+    // the radix-2 butterflies on arrays of length m (inverse = conjugate twiddles, no scaling)
+    private void radix2(double* re, double* im, bool inv) {
+        for (int i = 0; i < m; i++) {
+            int j = rev[i];
+            if (j > i) {
+                double t = re[i]; re[i] = re[j]; re[j] = t;
+                t = im[i]; im[i] = im[j]; im[j] = t;
+            }
+        }
+        for (int len = 2; len <= m; len = len * 2) {
+            int half = len / 2;
+            int stride = m / len;
+            for (int i = 0; i < m; i += len) {
+                for (int j = 0; j < half; j++) {
+                    double wr = twr[j * stride];
+                    double wi = inv ? -twi[j * stride] : twi[j * stride];
+                    int a = i + j;
+                    int b = a + half;
+                    double xr = re[b] * wr - im[b] * wi;
+                    double xi = re[b] * wi + im[b] * wr;
+                    re[b] = re[a] - xr;
+                    im[b] = im[a] - xi;
+                    re[a] += xr;
+                    im[a] += xi;
+                }
+            }
+        }
+    }
+
+    // the transform of n complex numbers given as separate real and imaginary arrays, in place; inv selects the direction
+    private int run(double* re, double* im, bool inv) {
+        if (!ok()) { return (err == OK) ? ERR_ARG : err; }
+        if (re == null || im == null) { return ERR_ARG; }
+        if (m == n) {
+            radix2(re, im, inv);
+        } else {
+            // Bluestein: X_k = w_k sum_j (x_j w_j) conj(w_{k - j}); the inverse conjugates the input and the output
+            if (inv) { for (int j = 0; j < n; j++) { im[j] = -im[j]; } }
+            for (int j = 0; j < n; j++) {
+                sr[j] = re[j] * chr[j] - im[j] * chi[j];
+                si[j] = re[j] * chi[j] + im[j] * chr[j];
+            }
+            for (int j = n; j < m; j++) {
+                sr[j] = 0.0;
+                si[j] = 0.0;
+            }
+            radix2(sr, si, false);
+            for (int j = 0; j < m; j++) {
+                double a = sr[j] * kr[j] - si[j] * ki[j];
+                double b = sr[j] * ki[j] + si[j] * kr[j];
+                sr[j] = a;
+                si[j] = b;
+            }
+            radix2(sr, si, true);
+            double inv_m = 1.0 / (double) m;
+            for (int k = 0; k < n; k++) {
+                double a = sr[k] * inv_m;
+                double b = si[k] * inv_m;
+                re[k] = a * chr[k] - b * chi[k];
+                im[k] = a * chi[k] + b * chr[k];
+            }
+            if (inv) { for (int j = 0; j < n; j++) { im[j] = -im[j]; } }
+        }
+        return OK;
+    }
+
+    public int forward(double* re, double* im) { return run(re, im, false); }
+
+    // the inverse transform including the factor 1 / n
+    public int inverse(double* re, double* im) {
+        int st = run(re, im, true);
+        if (st != OK) { return st; }
+        double s = 1.0 / (double) n;
+        for (int j = 0; j < n; j++) {
+            re[j] *= s;
+            im[j] *= s;
+        }
+        return OK;
+    }
+
+    public void dispose() {
+        freeMem(twr);
+        freeMem(twi);
+        freeMem(rev);
+        freeMem(chr);
+        freeMem(chi);
+        freeMem(kr);
+        freeMem(ki);
+        freeMem(sr);
+        freeMem(si);
+        twr = null; twi = null; rev = null; chr = null; chi = null; kr = null; ki = null; sr = null; si = null;
+        n = 0;
+        m = 0;
+        err = ERR_ARG;
+    }
+}
+
+// the discrete Fourier transform of n complex numbers (separate real and imaginary arrays) in place, any n >= 1; inverse = true gives the inverse transform
+// scaled by 1 / n. Builds a plan for every call: use FftPlan to transform many arrays of the same length.
+public int fft(double* re, double* im, int n, bool inverse = false) {
+    FftPlan p(n);
+    if (!p.ok()) {
+        int e = p.err;
+        p.dispose();
+        return e;
+    }
+    int st = inverse ? p.inverse(re, im) : p.forward(re, im);
+    p.dispose();
+    return st;
+}
+
+// the transform of n real numbers: n / 2 + 1 complex outputs (the rest follows from the symmetry X(n - k) = conj X(k))
+public int rfft(double* x, int n, double* outRe, double* outIm) {
+    if (x == null || outRe == null || outIm == null || n < 1) { return ERR_ARG; }
+    double* re = newDoubles(n);
+    double* im = newDoubles(n);
+    if (re == null || im == null) {
+        freeMem(re);
+        freeMem(im);
+        return ERR_MEMORY;
+    }
+    for (int i = 0; i < n; i++) { re[i] = x[i]; }
+    int st = fft(re, im, n, false);
+    if (st == OK) {
+        for (int k = 0; k <= n / 2; k++) {
+            outRe[k] = re[k];
+            outIm[k] = im[k];
+        }
+    }
+    freeMem(re);
+    freeMem(im);
+    return st;
+}
+
+// the inverse of rfft: n / 2 + 1 complex numbers in, n real numbers out
+public int irfft(double* inRe, double* inIm, int n, double* out) {
+    if (inRe == null || inIm == null || out == null || n < 1) { return ERR_ARG; }
+    double* re = newDoubles(n);
+    double* im = newDoubles(n);
+    if (re == null || im == null) {
+        freeMem(re);
+        freeMem(im);
+        return ERR_MEMORY;
+    }
+    for (int k = 0; k <= n / 2; k++) {
+        re[k] = inRe[k];
+        im[k] = inIm[k];
+    }
+    for (int k = 1; k < (n + 1) / 2; k++) {
+        re[n - k] = inRe[k];
+        im[n - k] = -inIm[k];
+    }
+    im[0] = 0.0;
+    if (n % 2 == 0) { im[n / 2] = 0.0; }
+    int st = fft(re, im, n, true);
+    if (st == OK) { for (int i = 0; i < n; i++) { out[i] = re[i]; } }
+    freeMem(re);
+    freeMem(im);
+    return st;
+}
+
+// the linear convolution of a (na numbers) and b (nb numbers): na + nb - 1 numbers go to out (must not overlap a or b); direct summation for short inputs, the FFT
+// (relative error about 1e-16 times the largest result times log n) for long ones
+public int convolve(double* a, int na, double* b, int nb, double* out) {
+    if (a == null || b == null || out == null || na < 1 || nb < 1) { return ERR_ARG; }
+    int small = (na < nb) ? na : nb;
+    if (small <= 32 || (double) na * (double) nb <= 20000.0) { return convolveDirect(a, na, b, nb, out); }
+    return convolveFft(a, na, b, nb, out);
+}
+
+public int convolveDirect(double* a, int na, double* b, int nb, double* out) {
+    if (a == null || b == null || out == null || na < 1 || nb < 1) { return ERR_ARG; }
+    for (int k = 0; k < na + nb - 1; k++) { out[k] = 0.0; }
+    for (int i = 0; i < na; i++) {
+        for (int j = 0; j < nb; j++) { out[i + j] += a[i] * b[j]; }
+    }
+    return OK;
+}
+
+public int convolveFft(double* a, int na, double* b, int nb, double* out) {
+    if (a == null || b == null || out == null || na < 1 || nb < 1 || na > 0x4000000 || nb > 0x4000000) { return ERR_ARG; }
+    int len = na + nb - 1;
+    int m = nextPow2(len);
+    FftPlan p(m);
+    double* ar = newDoubles(m);
+    double* ai = newDoubles(m);
+    double* br = newDoubles(m);
+    double* bi = newDoubles(m);
+    if (!p.ok() || ar == null || ai == null || br == null || bi == null) {
+        p.dispose();
+        freeMem(ar); freeMem(ai); freeMem(br); freeMem(bi);
+        return ERR_MEMORY;
+    }
+    for (int i = 0; i < na; i++) { ar[i] = a[i]; }
+    for (int i = 0; i < nb; i++) { br[i] = b[i]; }
+    p.forward(ar, ai);
+    p.forward(br, bi);
+    for (int k = 0; k < m; k++) {
+        double x = ar[k] * br[k] - ai[k] * bi[k];
+        double y = ar[k] * bi[k] + ai[k] * br[k];
+        ar[k] = x;
+        ai[k] = y;
+    }
+    p.inverse(ar, ai);
+    for (int k = 0; k < len; k++) { out[k] = ar[k]; }
+    p.dispose();
+    freeMem(ar); freeMem(ai); freeMem(br); freeMem(bi);
+    return OK;
+}
+
+// the full cross-correlation out[k] = sum_i a[i + k - (nb - 1)] b[i] for k = 0 .. na + nb - 2 (lag k - (nb - 1)): the convolution of a with the reversed b
+public int crossCorrelate(double* a, int na, double* b, int nb, double* out) {
+    if (a == null || b == null || out == null || na < 1 || nb < 1) { return ERR_ARG; }
+    double* rb = newDoubles(nb);
+    if (rb == null) { return ERR_MEMORY; }
+    for (int i = 0; i < nb; i++) { rb[i] = b[nb - 1 - i]; }
+    int st = convolve(a, na, rb, nb, out);
+    freeMem(rb);
+    return st;
+}
+
+// the sample frequencies of an n point transform with sample spacing d: 0, 1, ..., ceil(n/2) - 1, -floor(n/2), ..., -1 divided by n d (as numpy.fft.fftfreq)
+public int fftFrequencies(int n, double d, double* out) {
+    if (n < 1 || out == null || !(d > 0.0)) { return ERR_ARG; }
+    int pos = (n + 1) / 2;
+    for (int k = 0; k < n; k++) {
+        int v = (k < pos) ? k : k - n;
+        out[k] = (double) v / ((double) n * d);
+    }
+    return OK;
+}
+
+// window functions of n points (symmetric, as numpy.hanning / hamming / blackman): WIN_RECT, WIN_HANN, WIN_HAMMING, WIN_BLACKMAN
+public int windowFunction(int kind, int n, double* out) {
+    if (n < 1 || out == null || kind < WIN_RECT || kind > WIN_BLACKMAN) { return ERR_ARG; }
+    if (n == 1) {
+        out[0] = 1.0;
+        return OK;
+    }
+    for (int k = 0; k < n; k++) {
+        double s;
+        double c1;
+        double c2;
+        sincosTurns(k, n - 1, &s, &c1);                          // cos(2 pi k / (n - 1))
+        sincosTurns(2 * k, n - 1, &s, &c2);                      // cos(4 pi k / (n - 1))
+        if (kind == WIN_RECT) { out[k] = 1.0; }
+        else if (kind == WIN_HANN) { out[k] = 0.5 - 0.5 * c1; }
+        else if (kind == WIN_HAMMING) { out[k] = 0.54 - 0.46 * c1; }
+        else { out[k] = 0.42 - 0.5 * c1 + 0.08 * c2; }
+    }
+    return OK;
+}
+
+// ============================================================================================================================================
+//  Linear programming (two phase simplex method)
+// ============================================================================================================================================
+// Solves  minimize (or maximize) c.x  subject to  A x (<= | = | >=) b,  x >= 0.  A has m rows and n columns (row by row); kinds[i] is LE, EQ or GE (null: all LE);
+// x (n numbers) receives the solution and *objective the optimal value of c.x; *iterations (optional) the number of pivots. Returns OK, LP_INFEASIBLE, LP_UNBOUNDED,
+// ERR_NO_CONVERGE (iteration limit), ERR_NAN (non finite input), ERR_ARG or ERR_MEMORY. The tableau is dense (O(m (n + m)) memory); Dantzig's pricing is used and
+// Bland's rule takes over when degenerate pivots repeat, so the method cannot cycle. Tolerance 1e-9 relative to the size of the data.
+public int linprog(double* c, int n, double* A, int m, double* b, int* kinds, bool maximize, double* x, double* objective, int* iterations = null) {
+    if (c == null || x == null || objective == null || n < 1 || m < 0 || n > 100000 || m > 100000 || (m > 0 && (A == null || b == null))) { return ERR_ARG; }
+    double scale = 1.0;
+    for (int j = 0; j < n; j++) {
+        if (!finite(c[j])) { return ERR_NAN; }
+        if (absd(c[j]) > scale) { scale = absd(c[j]); }
+    }
+    for (int i = 0; i < m; i++) {
+        if (!finite(b[i])) { return ERR_NAN; }
+        if (absd(b[i]) > scale) { scale = absd(b[i]); }
+        for (int j = 0; j < n; j++) {
+            double v = A[i * n + j];
+            if (!finite(v)) { return ERR_NAN; }
+            if (absd(v) > scale) { scale = absd(v); }
+        }
+    }
+    for (int i = 0; i < m; i++) {
+        if (kinds != null && (kinds[i] < LE || kinds[i] > GE)) { return ERR_ARG; }
+    }
+    double tol = 1.0e-9 * scale;
+    // normalise: b >= 0 (a row with negative b is multiplied by -1, which swaps LE and GE), count slack / artificial columns
+    int* kd = newInts(m);
+    int* basis = newInts(m);
+    if (kd == null || basis == null) {
+        freeMem(kd);
+        freeMem(basis);
+        return ERR_MEMORY;
+    }
+    int ns = 0;
+    int na = 0;
+    for (int i = 0; i < m; i++) {
+        int k = (kinds != null) ? kinds[i] : LE;
+        if (b[i] < 0.0) { k = -k; }
+        kd[i] = k;
+        if (k == LE) { ns++; }
+        else if (k == GE) { ns++; na++; }
+        else { na++; }
+    }
+    int N = n + ns + na;                 // columns without the right hand side
+    int W = N + 1;
+    double* T = ((m + 1) > 0x10000000 / W) ? null : newDoubles((m + 1) * W);       // the tableau must stay below 2^28 numbers
+    if (T == null) {
+        freeMem(kd);
+        freeMem(basis);
+        return ERR_MEMORY;
+    }
+    int sc = n;
+    int ac = n + ns;
+    for (int i = 0; i < m; i++) {
+        double sg = (b[i] < 0.0) ? -1.0 : 1.0;
+        for (int j = 0; j < n; j++) { T[i * W + j] = sg * A[i * n + j]; }
+        T[i * W + N] = sg * b[i];
+        if (kd[i] == LE) {
+            T[i * W + sc] = 1.0;
+            basis[i] = sc;
+            sc++;
+        } else if (kd[i] == GE) {
+            T[i * W + sc] = -1.0;
+            sc++;
+            T[i * W + ac] = 1.0;
+            basis[i] = ac;
+            ac++;
+        } else {
+            T[i * W + ac] = 1.0;
+            basis[i] = ac;
+            ac++;
+        }
+    }
+    int firstArt = n + ns;
+    int pivots = 0;
+    int maxPivots = 50 * (m + N) + 1000;
+    int status = OK;
+    // phase 1: minimize the sum of the artificial variables
+    if (na > 0) {
+        double* z = &T[m * W];
+        for (int j = 0; j <= N; j++) { z[j] = 0.0; }
+        for (int i = 0; i < m; i++) {
+            if (basis[i] >= firstArt) {
+                for (int j = 0; j <= N; j++) { z[j] -= T[i * W + j]; }
+            }
+        }
+        for (int j = firstArt; j < N; j++) { z[j] = 0.0; }
+        status = simplexLoop(T, m, N, basis, N, tol, &pivots, maxPivots);
+        if (status == OK && -z[N] > 1.0e-7 * scale * (1.0 + (double) m)) { status = LP_INFEASIBLE; }
+        if (status == LP_UNBOUNDED) { status = ERR_NO_CONVERGE; }          // phase 1 is bounded below by 0
+        if (status == OK) {
+            // drive the artificial variables out of the basis
+            for (int i = 0; i < m; i++) {
+                if (basis[i] < firstArt) { continue; }
+                int pj = -1;
+                for (int j = 0; j < firstArt; j++) {
+                    if (absd(T[i * W + j]) > tol) { pj = j; break; }
+                }
+                if (pj >= 0) {
+                    pivotRow(T, m, W, i, pj);
+                    basis[i] = pj;
+                    pivots++;
+                }
+            }
+        }
+    }
+    if (status == OK) {
+        // phase 2: the real objective (maximizing c.x is minimizing -c.x), artificial columns may not enter
+        double* z = &T[m * W];
+        for (int j = 0; j <= N; j++) { z[j] = 0.0; }
+        for (int j = 0; j < n; j++) { z[j] = maximize ? -c[j] : c[j]; }
+        for (int i = 0; i < m; i++) {
+            int bj = basis[i];
+            double cb = (bj < n) ? z[bj] : 0.0;
+            if (bj < n && cb != 0.0) {
+                double f = z[bj];
+                for (int j = 0; j <= N; j++) { z[j] -= f * T[i * W + j]; }
+            }
+        }
+        status = simplexLoop(T, m, N, basis, firstArt, tol, &pivots, maxPivots);
+    }
+    if (status == OK) {
+        for (int j = 0; j < n; j++) { x[j] = 0.0; }
+        for (int i = 0; i < m; i++) {
+            if (basis[i] < n) { x[basis[i]] = (T[i * W + N] > 0.0) ? T[i * W + N] : 0.0; }
+        }
+        double v = 0.0;
+        for (int j = 0; j < n; j++) { v += c[j] * x[j]; }
+        *objective = v;
+    }
+    if (iterations != null) { *iterations = pivots; }
+    freeMem(T);
+    freeMem(kd);
+    freeMem(basis);
+    return status;
+}
+
+// pivots the tableau on row r, column c
+private void pivotRow(double* T, int m, int W, int r, int c) {
+    double pv = T[r * W + c];
+    for (int j = 0; j < W; j++) { T[r * W + j] /= pv; }
+    T[r * W + c] = 1.0;
+    for (int i = 0; i <= m; i++) {
+        if (i == r) { continue; }
+        double f = T[i * W + c];
+        if (f == 0.0) { continue; }
+        for (int j = 0; j < W; j++) { T[i * W + j] -= f * T[r * W + j]; }
+        T[i * W + c] = 0.0;
+    }
+}
+
+// iterates the simplex method on the tableau until no reduced cost is negative; only columns below `limit` may enter. Returns OK, LP_UNBOUNDED or ERR_NO_CONVERGE.
+private int simplexLoop(double* T, int m, int N, int* basis, int limit, double tol, int* pivots, int maxPivots) {
+    int W = N + 1;
+    double* z = &T[m * W];
+    int degenerate = 0;
+    while (true) {
+        if (*pivots >= maxPivots) { return ERR_NO_CONVERGE; }
+        int enter = -1;
+        bool bland = degenerate > 20;
+        double best = -tol;
+        for (int j = 0; j < limit; j++) {
+            if (z[j] < best) {
+                enter = j;
+                if (bland) { break; }
+                best = z[j];
+            }
+        }
+        if (enter < 0) { return OK; }
+        int leave = -1;
+        double bestRatio = 0.0;
+        for (int i = 0; i < m; i++) {
+            double a = T[i * W + enter];
+            if (a > tol) {
+                double ratio = T[i * W + N] / a;
+                if (leave < 0 || ratio < bestRatio - 1.0e-12 * (1.0 + absd(bestRatio)) || (absd(ratio - bestRatio) <= 1.0e-12 * (1.0 + absd(bestRatio)) && basis[i] < basis[leave])) {
+                    leave = i;
+                    bestRatio = ratio;
+                }
+            }
+        }
+        if (leave < 0) { return LP_UNBOUNDED; }
+        if (bestRatio <= 1.0e-12) { degenerate++; } else { degenerate = 0; }
+        pivotRow(T, m, W, leave, enter);
+        basis[leave] = enter;
+        *pivots = *pivots + 1;
+    }
+    return OK;
+}
