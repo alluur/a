@@ -427,7 +427,7 @@ result), `ERR_RANK`, `ERR_ARG` (null, empty or out of range argument), `ERR_NOT_
 
 A `Matrix` is a **handle**: `Matrix b = a;` copies the handle, not the numbers (use `a.copy()`); `dispose()` frees the numbers and nothing is freed behind your back. Every operation is O(size) in memory: no operation copies a matrix inside a loop
 (`mulInto`, the in place variants and `solve(b, x)` with `b` and `x` the same array allocate nothing, t468 counts the blocks). Sizes are limited to 2^28 numbers per matrix (`ERR_ARG` above, also when `rows * cols` would
-overflow); a failed allocation gives `ERR_MEMORY`, never a crash. Big blocks (above 128 KiB, a 128 x 128 matrix) are the ones to reuse on AOS (see the limitations).
+overflow); a failed allocation gives `ERR_MEMORY`, never a crash. Blocks of several hundred KiB (a matrix of about 250 x 250 doubles) get a mapping of their own on AOS, and a process may hold only about 30 of them: reuse big matrices (`mulInto`, `copyFrom`, `solve(b, x)` with your own arrays), as the library does inside its loops; t468 checks that repeated work maps no new memory.
 
 ### Algorithms and cost
 
@@ -748,5 +748,5 @@ results against hardware doubles (t469). They run on all five targets and, as th
 * `optim`: `linprog` uses a dense tableau (O(m (n + m)) memory, at most 100000 variables and rows but the tableau must stay below 2^28 numbers), `polyFit` and `Spline` need their points sorted or distinct as documented, `interpLinear` checks only
   `xs[0] < xs[n - 1]`, `legendreP(n, x)` and the other recurrences take O(n) time for a huge degree `n`. A callback that returns NaN is reported (`ERR_NAN`); an infinity is an error for integrals and ODEs but an ordinary huge number for root finders
   (a pole looks like a sign change) and minimisers.
-* On AOS the numeric tests run with exactly the same inputs as on Linux (the `algo2` boot test compares every output byte for byte); a matrix above 128 KiB is a big block there (see above): build a matrix once and reuse it, the library does the same inside its loops.
+* On AOS the numeric tests run with exactly the same inputs as on Linux (the `algo2` boot test compares every output byte for byte); a matrix of several hundred KiB (about 250 x 250 doubles) gets a mapping of its own there and a process may hold only about 30 mappings: build big matrices once and reuse them, the library does the same inside its loops (t468).
 
