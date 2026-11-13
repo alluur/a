@@ -630,6 +630,8 @@ is_type_start_impl:
     mov eax, [tk]
     cmp eax, K_INT
     je .yes
+    cmp eax, '('
+    je tuple_start_la                   ; (T1, T2) is a tuple type, (T) x a cast, (a, b) a literal
     cmp eax, K_STRUCT
     je .yes
     cmp eax, K_CLASS
@@ -735,6 +737,8 @@ parse_type:
     push rbx
     push r12
     mov eax, [tk]
+    cmp eax, '('
+    je .tuple
     cmp eax, K_STRUCT
     je .tagkw
     cmp eax, K_CLASS
@@ -817,6 +821,10 @@ parse_type:
     cmp qword [tk], T_ID
     je fatal_error_tok
     jmp fatal_error
+.tuple:
+    call parse_tuple_type               ; (int, double, char*) ...  and the token after ')' is current
+    mov rbx, rax
+    jmp .star
 .int:
     mov ebx, TY_INT
     jmp .star0
@@ -1162,6 +1170,14 @@ gen_call:
     cmp qword [tk], ')'
     je .args_done
 .arg:
+    mov rax, [r12+SYM_EXTRA]
+    test rax, rax
+    jz .arge
+    cmp ebx, [r12+SYM_NPAR]
+    jae .arge
+    mov rdi, [rax+rbx*8]
+    call tuple_expect_here              ; a tuple literal as the argument is converted to the parameter type
+.arge:
     call parse_assign
     call to_rvalue
 .argconv:
@@ -1173,6 +1189,9 @@ gen_call:
     jae .argcv
     mov rdi, [rax+rbx*8]
     call coerce_to
+    mov rax, [r12+SYM_EXTRA]
+    mov rdi, [rax+rbx*8]
+    call tuple_check
 .argcv:
     mov rax, [e_type]
     test eax, 0xFF00
@@ -1786,13 +1805,31 @@ parse_primary:
     jmp .out
 
 .paren:
+    mov r12, [tk_start]                 ; this '(' : a tuple literal here may be the whole expression that has a known tuple type
     call next_token
     call is_type_start
     test eax, eax
     jnz .cast
-    call parse_expr
+    xor r13d, r13d
+    cmp r12, [tup_expect_tok]
+    jne .pp
+    mov r13, [tup_expect]
+    mov qword [tup_expect_tok], 0
+    mov rdi, r13                        ; the first element has the type of the first field of the tuple
+    xor esi, esi
+    call tuple_field
+    mov rdi, [rax+FD_TYPE]
+    call tuple_expect_here
+.pp:
+    call parse_assign
+    cmp qword [tk], ','
+    je .tuple
     mov edi, ')'
     call expect
+    jmp .out
+.tuple:
+    mov rdi, r13                        ; (a, b, ...) : a tuple literal
+    call parse_tuple_rest
     jmp .out
 .cast:
     call parse_type
@@ -2755,6 +2792,23 @@ parse_postfix:
     call next_token
     cmp qword [tk], T_ID
     je .mb1
+    cmp qword [tk], T_NUM
+    jne .mberr
+    test dword [st_flags + rbx*4], SF_TUPLE   ; t.0  t.1 : the elements of a tuple
+    jz .mberr
+    mov rax, rbx
+    shl rax, 5
+    mov eax, [struct_tab + rax + ST_NFIELDS]
+    cmp [tk_val], rax
+    jb .tnum
+    ERR "this tuple has no element with that number"
+.tnum:
+    mov rdi, [e_type]
+    mov esi, [tk_val]
+    call tuple_field
+    mov r12, rax
+    jmp .fok
+.mberr:
     ERR "expected a member name"
 .mb1:
     mov r13, [tk_ptr]
@@ -3626,10 +3680,14 @@ parse_assign:
 .p3:
     CG push_a
     call next_token
+    mov rdi, rbx
+    call tuple_expect_here              ; t = (1, 2);  the literal is converted to the type of t
     call parse_assign
     call to_rvalue
     mov rdi, rbx
     call coerce_to
+    mov rdi, rbx
+    call tuple_check
     CG pop_b
     mov rdi, rbx
     call emit_store_type

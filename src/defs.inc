@@ -173,6 +173,7 @@
 ; per class flags (st_flags)
 %define SF_ABSTRACT     1       ; abstract class: no objects of it
 %define SF_FINAL        2       ; final class: nothing derives from it
+%define SF_TUPLE        4       ; a hidden struct made for a tuple type (src/tuple.asm)
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
 %define ST_NAME         0       ; qword

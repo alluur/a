@@ -2209,6 +2209,7 @@ init_tables:
     mov byte [binprec + '/'], 10
     mov byte [binprec + '%'], 10
     mov dword [cur_class], -1
+    mov dword [field_limit], FIELD_MAX
     ret
 
 ; choose_outname -> rax = output path (-o value or NAME-VERSION-RELEASE.EXT)
@@ -2379,6 +2380,9 @@ rel_count:      resd 1
 sym_count:      resd 1
 struct_count:   resd 1
 field_count:    resd 1
+field_limit:    resd 1                  ; the fields of tuple types are made downwards from FIELD_MAX
+tup_expect:     resq 1                  ; the tuple type that the expression starting at tup_expect_tok has to have
+tup_expect_tok: resq 1
 file_count:     resd 1
 cur_module:     resd 1
 cur_file_id:    resd 1

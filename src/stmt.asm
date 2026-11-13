@@ -113,6 +113,7 @@ emit_defers:
 
 parse_stmt:
     STACKCHK
+    mov qword [tup_expect_tok], 0       ; (a tuple expectation lives only within the statement that made it)
     mov rax, [pend_lbl_ptr]             ; the label (if any) that stands directly in front of this statement
     mov [stmt_lbl_ptr], rax
     mov eax, [pend_lbl_len]
@@ -205,6 +206,12 @@ parse_stmt:
     call lex_restore
     add rsp, 128
 .notlabel:
+    cmp qword [tk], '('
+    jne .nottuple
+    call tuple_stmt_kind                ; (a, b) = value;   (int a, int b) = value;
+    test eax, eax
+    jnz parse_tuple_stmt
+.nottuple:
     call is_var_start
     test eax, eax
     jnz parse_var_decl
@@ -388,6 +395,12 @@ parse_return:
     call next_token
     cmp qword [tk], ';'
     je .void
+    mov rax, [cur_func]
+    test rax, rax
+    jz .nx
+    mov rdi, [rax+SYM_TYPE]
+    call tuple_expect_here              ; return (a, b);  in a function that returns a tuple
+.nx:
     call parse_expr
     call to_rvalue
     mov rax, [cur_func]
@@ -395,6 +408,9 @@ parse_return:
     jz .j
     mov rdi, [rax+SYM_TYPE]
     call coerce_to                      ; int <-> double
+    mov rax, [cur_func]
+    mov rdi, [rax+SYM_TYPE]
+    call tuple_check
     mov rax, [cur_func]
     cmp qword [rax+SYM_TYPE], TY_BOOL
     jne .notbool
@@ -626,6 +642,8 @@ parse_local_decl:
     call to_rvalue
     mov rdi, rbx
     call coerce_to
+    mov rdi, rbx
+    call tuple_check
     mov edi, r14d
     mov rsi, rbx
     call store_local_typed
@@ -673,8 +691,12 @@ parse_local_decl:
     call init_local_list
     jmp .next
 .nolist:
+    mov rdi, rbx
+    call tuple_expect_here              ; (int, double) t = (1, 2);
     call parse_assign
     call to_rvalue
+    mov rdi, rbx
+    call tuple_check
     mov edi, r14d
     CG lea_local_b
     mov rdi, rbx
@@ -886,7 +908,7 @@ parse_var_decl:
     pop r13
     pop r12
     pop rbx
-    ERR "var (a, b) = ... is not available yet"
+    jmp parse_var_tuple
 
 ; ---- const declaration (global when pass 1, local inside functions) -------------
 ; const NAME = expr;   const TYPE NAME = expr;

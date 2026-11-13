@@ -27,6 +27,7 @@ section .text
 %include "float.asm"
 %include "stmt.asm"
 %include "foreach.asm"
+%include "tuple.asm"
 %include "switch.asm"
 %include "decl.asm"
 %include "pp.asm"

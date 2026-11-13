@@ -394,9 +394,30 @@ next_token:
     jmp .dec
 .decend:
     ; a '.' followed by a digit, or an exponent, makes it a floating point literal
+    ; (but not after a member access:  t.1.0  is  t . 1 . 0  for nested tuples)
     mov al, [rsi]
     cmp al, '.'
     jne .dexp
+    mov rdx, [tk_start]
+    cmp byte [rdx-1], '.'
+    jne .dotflt
+    movzx edx, byte [rdx-2]
+    cmp dl, ')'
+    je .numdone
+    cmp dl, ']'
+    je .numdone
+    cmp dl, '_'
+    je .numdone
+    cmp dl, '0'
+    jb .dotflt
+    cmp dl, '9'
+    jbe .numdone
+    or dl, 0x20
+    cmp dl, 'a'
+    jb .dotflt
+    cmp dl, 'z'
+    jbe .numdone
+.dotflt:
     movzx eax, byte [rsi+1]
     sub eax, '0'
     cmp eax, 9

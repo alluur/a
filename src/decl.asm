@@ -879,7 +879,7 @@ parse_aggregate:
 .notunion:
     ; new field entry
     mov esi, [field_count]
-    cmp esi, FIELD_MAX
+    cmp esi, [field_limit]
     jae err_toobig
     inc dword [field_count]
     mov rdi, rsi
@@ -1276,7 +1276,7 @@ inherit_base:
     mov [r10+ST_FIRST], edi
     ; copy the field entries
     lea edx, [rdi+rcx]
-    cmp edx, FIELD_MAX
+    cmp edx, [field_limit]
     jae err_toobig
     mov [field_count], edx
     mov rdx, rsi
