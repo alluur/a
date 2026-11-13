@@ -143,6 +143,11 @@ int main() {
 * **Iteration and selection:** `foreach (int x in values)` over arrays, text, ranges (`0..n`, `rev 0..n`), `(pointer, count)` and classes with
   `count()` / `get(i)`; `switch` on text (fast for hundreds of labels), `case 1, 2:` and `case 10..20:`; labeled `break outer;` / `continue outer;`.
 * **Operators:** `||=`, `&&=`, `??=` (short-circuit assignment), `^^`, `<=>`, `??`, operator overloading; `static_assert(cond, "message")`.
+* **Inference, tuples, lambdas, interpolation:** `var n = 5;` (also in `for` and `foreach`); tuples and multiple results
+  (`(int, int) divmod(int a, int b) { return (a / b, a % b); }`, `(int q, int r) = divmod(7, 2);`, `(a, b) = (b, a);`, `t.0`);
+  lambdas (`algo.sortBy(a, n, (int x, int y) => x - y)`, `x => x * 2`; no captures: pass values as parameters) and string interpolation
+  (`$"x = {x}, pi = {pi:.3f}"`) lowered to the same formatter as `printf`, which takes any number of values and prints doubles
+  exactly (`%e %f %g`, correctly rounded, also `%v` for the shortest text that reads back).
 * **Classes:** single inheritance, `virtual`, `abstract` classes and methods, `override` / `final` with signature checks, `static` fields and
   methods (`Counter.count`, `Util.square(3)`), and the run time checks `x is Dog` / `x as Dog`.
 * **No hidden runtime:** the "standard library" is written in A itself (`lib/std.a`) and
@@ -164,6 +169,9 @@ src/            the compiler (NASM assembly)
   expr.asm        types, expressions, constant expressions, calls
   stmt.asm        statements and local variables
   foreach.asm     the foreach statement
+  tuple.asm       tuples: types, literals, patterns
+  lambda.asm      lambdas
+  interp.asm      string interpolation
   switch.asm      the switch statement (integers and text)
   decl.asm        functions, classes, enums, globals, modules
   cg_x86.asm      x86-64 backend

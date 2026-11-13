@@ -1114,17 +1114,14 @@ Everything in `lib/std.a` is compiled into your program automatically; no import
 
 **Formatted output**
 
-`format(buf, max, fmt, a, b, ...)` and `printf(fmt, a, b, ...)` take up to eight values (leave out the unused ones;
-text is passed as it is). `vformat(buf, max, fmt, values, count)` takes the values as an array and returns the length the
-complete text has. The formats are those of C: flags `- 0 + space #`, width and precision (also `*`), `h hh l ll z` length
-modifiers, and the conversions `d i u x X o b c s p %` (`%b` is binary). Every value is 64 bits wide; `%u` and `%x` show
-negative numbers as unsigned 64-bit values.
+`format(buf, max, fmt, ...)`, `printf(fmt, ...)` and `$"..."` take **any number of values** (they are the `...` of the function;
+text and pointers are passed as they are, a `double` as its 64 bit pattern). `vformat(buf, max, fmt, values, count)` takes the
+values as an array and returns the length the complete text has (like `snprintf`). The full description is in
+[Text formatting](#text-formatting).
 
 ```c
-printf("%-10s|%5d|%#08x\n", "total", 1600, 255);       // total     | 1600|0x0000ff
+printf("%-10s|%5d|%#08x|%8.3f|%e\n", "total", 1600, 255, 3.14159, 31415.9);   // total     | 1600|0x0000ff|   3.142|3.141590e+04
 ```
-
-Floating point conversions (`%f %e %g %a`) are in `printfd` of the `cfloat` module.
 
 `printRepeat(ch, n)` writes a character `n` times.
 
@@ -1180,6 +1177,76 @@ Floating point conversions (`%f %e %g %a`) are in `printfd` of the `cfloat` modu
 **Process and memory**
 
 `exit(code)`, `alloc(n)` (zeroed heap memory, never freed).
+
+### Text formatting
+
+`printf`, `format`, `vformat`, `fprintf`/`sprintf`/`snprintf`/`dprintf`/`asprintf` (module `cstdio`) and the interpolated strings below all
+use one formatter, `vformat` in `lib/std.a`:
+
+    %[flags][width][.precision][length]conversion
+
+| Part | Meaning |
+|---|---|
+| flags | `-` left-justify, `0` pad with zeros, `+` always a sign, space a space for positive numbers, `#` alternate form (`0x`, `0b`, a leading `0` for octal, the decimal point and the trailing zeros of `%g`) |
+| width | digits, or `*` (the next value; a negative one means `-` and its absolute value) |
+| precision | `.digits` or `.*`: minimum digits of integers, digits after the point for `%f` `%e`, significant digits for `%g`, maximum length of `%s` |
+| length | `h` and `hh` cut an integer to 16 / 8 bits; `l ll z j t q L` are accepted and mean the 64 bits that every value has anyway |
+| `d i` | signed decimal (also `-9223372036854775808`) |
+| `u x X o b` | unsigned decimal, hex, octal, binary: a negative `int` shows its 64 bits |
+| `c s p` | a character, text (`(null)` for a null pointer, precision cuts it), a pointer as `0x...` (`(nil)` for null) |
+| `e E f F g G` | a double, **correctly rounded**: the exact decimal value of the binary number is computed with big numbers and rounded half to even, so `%.30f` of 0.1 prints the true digits, denormals, `1e300` and `5e-324` work, `-0.0` prints `-0.000000`, and `inf` / `nan` print as `inf` / `nan` (`INF` / `NAN` for the capital letters; the `0` flag does not zero-fill them, like C) |
+| `v` | a double as the **shortest text that reads back as the same number** (`0.1`, `1e+22`, `1.5e-07`, `5e-324`, `100`), fixed notation when the exponent is from -4 to 15 (like Python's `repr`), no forced `.0`; the sign, width and `-` `0` `+` space flags work, the precision is ignored. (A name of this language, not of C.) |
+| `%%` | a percent sign |
+
+A specification that is not complete or not known (`%y`, `%5.2` at the end of the text) is printed as it is. Missing values are 0
+(`(null)` for `%s`), extra values are ignored. The values are copied into an array first: up to 32 on the stack, more from the heap.
+`format` and `vformat` never write more than `max - 1` characters and always end the text with a zero.
+
+The conversions follow C. Where Python's `%` operator differs (`%#x` of 0 is `0`, not `0x0`; `%#o` is `017`, not `0o17`; `%.0d` of 0 prints nothing;
+the `0` flag does not zero-fill `inf`), C is followed. The tests compare with both: `t326_format_python` has 3400 cases whose expected output Python
+and glibc produced (`tests/gen/gen_format_test.py` writes it and can also write a big random stress test, `--stress N SEED PREFIX`).
+
+**A double in `printf` is its bit pattern.** The language passes a `double` through `...` as the 64 bits it is made of, and
+`%f %e %g %v` read them back, so `printf("%.2f", x)` is right for a `double x`. An `int` is *not* converted: `printf("%f", 3)` prints the
+number whose bits are 3 (a denormal, `0.000000`), as in C it would be undefined; write `(double) n`. And `%d` with a `double` prints its bits:
+cast to int first. (Interpolated strings know the types and convert for you.) A function that takes a `double` parameter needs no care:
+`f(x)` converts the argument to the declared type as always.
+
+**Speed.** The exact algorithm is simple, not the fastest: about 1 microsecond for `%f` of an ordinary number, 4 for `%v`, 7 for `1e300` and 28 for
+`5e-324` (a number with 1074 digits), measured on x86-64 (a plain `%d` takes 100 nanoseconds). The code is integer only (base 10^9 limbs), so it needs no
+floating point support and gives the same text on every target.
+
+### String interpolation: `$"..."`
+
+```c
+int x = 42;
+double pi = 3.14159265;
+char* name = "bob";
+println($"x = {x}, pi = {pi:.3f}, name = {name:-8}|, hex = {x:#x}, braces {{ }}");
+//      x = 42, pi = 3.142, name = bob     |, hex = 0x2a, braces { }
+char* s = $"{name} has {x * 2} items";               // any expression; nested strings are fine: {f("a")} {c ? "y" : "n"}
+```
+
+`$"text {expression} text {expression:spec} text"` is a text whose `{...}` parts are replaced by values. `{{` and `}}` are
+braces, `\n` `\t` `\"` and the other escapes work as in a string, and a `%` in the text is just a percent sign. It is **lowered to the
+library formatter**: the compiler builds the format text (`"x = %d, pi = %.3f, ..."`), pushes the values and calls `__interp`
+(in `lib/std.a`), which is `vformat` twice (measure, then fill), so `$"..."` and `format` print exactly the same characters.
+
+* **spec** is the text of a conversion without the `%`: flags, width, precision, length and, optionally, the conversion letter
+  (`{x:5}` is `%5d`, `{x:x}` is `%x`, `{pi:10.2f}` is `%10.2f`, `{name:-10}` is `%-10s`). `*` is not allowed.
+* **Without a letter the type chooses it:** `double` is `v`, `bool` prints `true` / `false`, `char` is `c`, `uint64` is `u`, other integers are `d`,
+  `char*` is `s`, other pointers and `func` are `p`. An integer with `e E f F g G v` is converted to double first (`{n:.2f}` prints `3.00` for 3),
+  a double needs one of those letters (`{d:d}` is an error), `s` and `p` need a pointer. A comparison is an `int`: `{x > 3}` prints `1`; write
+  `{x > 3 ? "yes" : "no"}`. Structs, classes, tuples and `void` cannot be formatted: use their members.
+* **Lifetime:** the result is a `char*` from `alloc`, the memory of `new`: it lives until the program ends and is never freed. That is
+  fine for messages and titles; a loop that builds millions of texts should use `format` into a buffer. (The cost of one interpolation is the
+  text plus its terminating zero: `alloc(len + 1)`.)
+* A string can have at most 253 `{...}` parts (and a call at most 253 values) on ARM64, RISC-V and LoongArch (`too many arguments in a call`: the stack
+  adjustment of the call is a 12 bit immediate there); on x86-64 and Windows there is no such limit.
+* The expression is parsed by the normal expression parser with the lexer moved inside the literal, so it can contain calls, members,
+  indexing, conditions and lambdas. It cannot span lines (the whole literal is one line) and an interpolated string is only allowed inside functions.
+* Errors: `an empty {}`, `a single } ... write }}`, `the } of an interpolated string is missing`, `bad format in an interpolated string`,
+  `cannot be put into an interpolated string`, `a double needs one of the letters e E f F g G v`.
 
 ## 12a. Networking
 
@@ -1597,7 +1664,8 @@ Typical messages: `undeclared identifier 'x'` (with `(did you mean 'y'?)` when a
 letters or the case: `undeclared identifier 'cuont' (did you mean 'count'?)`), `wrong number of arguments in call`,
 `member is private to its class 'balance'`, `access to private declaration 'helper'`,
 `undefined function 'f'`, `left side of assignment is not assignable`,
-`functions cannot return a struct by value, return a pointer`.
+`functions cannot return a struct by value, return a pointer`; for the second tier of the language see the sections on `var`,
+tuples, lambdas and `$"..."` (every message is listed there with the situation that makes it).
 The process exit code is 1; on success it is 0.
 
 ## 15. Differences from C
@@ -1612,3 +1680,5 @@ The process exit code is 1; on success it is 0.
   variadic functions (`...` with `va_arg`) exist; bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in, and units can be compiled separately and linked (`ac -c`).
 * `switch` labels must be constant expressions (like C); a switch can also be on text, a case can have several labels and `lo..hi` ranges, and duplicate labels are errors.
 * `foreach`, labeled `break` / `continue`, `static_assert`, `||=` `&&=` `??=`, abstract classes, `override`, `final`, static class members and `is` / `as` exist.
+* `var x = expr;`, tuples and multiple results (`(int, int) f()`, `(a, b) = (b, a)`), lambdas (`(a, b) => a + b`), `$"..."` interpolated strings, `printf`
+  with any number of values and exact `%f %e %g` exist.
