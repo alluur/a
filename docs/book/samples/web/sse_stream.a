@@ -1,0 +1,69 @@
+// An event stream from a hub, and a client that reconnects with Last-Event-ID
+import wshub;
+import httpx;
+import sse;
+import net;
+
+wshub.Hub* hub;
+char* history[5] = { "red", "orange", "yellow", "green", "blue" };   // event n (1..5) has the data history[n - 1]
+
+int serve() { hub->poll(0); return 0; }                              // the hub serves while the client waits (see ws_echo)
+
+// GET /events: turn the answer into an event stream, remember where the client wants to go on
+int onHttp(wshub.Hub* h, wshub.Client* c, httpx.Request* req, httpx.Response* res) {
+    if (!streq(&req->path[0], "/events")) return 0;
+    char* last = req->header("Last-Event-ID");           // sent by a client that reconnects
+    int after = last == null ? 0 : atoi(last);
+    printf("hub: stream requested, Last-Event-ID: %s\n", last == null ? "(none)" : last);
+    if (after >= 5) {                                    // nothing left: 204 tells the client to stop for good
+        res->status = 204;
+        res->setBody("", 0);
+        return 1;
+    }
+    c->user = (char*) after;                             // c->user is ours: keep the resume point for onOpen
+    sse.startResponse(res);
+    return 1;
+}
+
+// The stream is open: send the next two events.
+int onOpen(wshub.Hub* h, wshub.Client* c) {
+    if (!c->isEventStream()) return 0;
+    int after = (int) c->user;
+    for (int id = after + 1; id <= after + 2 && id <= 5; id++) {
+        char idText[8];
+        intToStr(id, &idText[0]);
+        h->sendEvent(c, "color", history[id - 1], &idText[0]);
+    }
+    return 0;
+}
+
+// A "server restart": end every event stream.
+void endStreams() {
+    int ids[8];
+    int n = hub->clientIds(&ids[0], 8);
+    for (int i = 0; i < n; i++) hub->closeId(ids[i], 1000, null);
+}
+
+int main() {
+    hub = new wshub.Hub();
+    hub->onHttp = onHttp;
+    hub->onOpen = onOpen;
+    hub->listenOn("127.0.0.1", 0, null);
+    net.setIdleHook(serve);
+
+    char url[80];
+    format(&url[0], 80, "http://127.0.0.1:%d/events", hub->port);
+    sse.Client* c = sse.connect(&url[0]);
+    c->retryMs = 20;                                     // wait this long before a reconnect (default 3000)
+    int count = 0;
+    for (;;) {
+        sse.Event* e = c->next(5000);                    // waits up to 5 s; reconnects by itself when the stream ends
+        if (e == null) break;
+        printf("client: %s \"%s\" (id %s)\n", e->event, e->data, e->id);
+        e->dispose();
+        count++;
+        if (count % 2 == 0 || count == 5) endStreams();   // the server "restarts" after every second event
+    }
+    printf("client: closed=%d, last status %d, streams opened %d\n", c->closed, c->status, c->reconnects);
+    return 0;
+}

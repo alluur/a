@@ -14,7 +14,10 @@ In this chapter:
 - **`is` and `as`**: ask an object for its class.
 
 ::: note
-These features need a compiler that has them; they are part of the compiler that this book describes, and every sample in the chapter was compiled and run (also for all nine targets, and under emulation for ARM64, RISC-V and LoongArch). Programs that do not use them are not affected. Of the new words only `foreach` is reserved: `in`, `rev`, `abstract`, `override`, `final`, `is`, `as` and `static_assert` are words only in the place where they have a meaning, and a variable may still be called `final` or `rev`.
+These features are part of the compiler that this book describes, and every sample in the chapter was compiled and run (also for all nine targets, and under emulation for ARM64, RISC-V and LoongArch). Of the new words only `foreach` is reserved: `int foreach = 1;` is the error `expected a variable name`. `in`, `abstract`, `override`, `final`, `is` and `as` are words only in the place where they have a meaning, and they may still be names of variables, fields, functions and methods. Two words have a catch:
+
+- `rev` is the reverse marker of `foreach` only while no variable, field or function called `rev` is visible. With a function `rev(char* s)` in your program (a natural name for "reverse a text"), `foreach (x in rev a)` is the confusing error `foreach needs an array, a range (a..b), text (char*) or a class with count() and get()`. Name such a function `reverse`.
+- A statement that starts with `static_assert` is always the assertion, so `static_assert = 1;` is the error `expected '('`.
 :::
 
 ## foreach
@@ -28,8 +31,8 @@ What to notice:
 - `foreach (int p in primes)` visits the elements in order. With two variables, `foreach (int i, int p in primes)`, the first one is the index.
 - `rev` in front of the subject goes backwards: `foreach (int p in rev primes)`.
 - A text gives its bytes up to the final 0, which is not visited. A `char` variable holds each byte: `a=97 b=98 c=99`.
-- A **range** is a subject too. `1..4` is **half open** (1, 2, 3), `1..=4` is **closed** (1, 2, 3, 4), and `rev 0..=3` counts down from 3 to 0. A range has only one variable, and it is empty when the end is not above the start.
-- The type of the variable may be left out: `foreach (x in primes)` gives `x` the type of the elements.
+- A **range** is a subject too. `1..4` is **half open** (1, 2, 3), `1..=4` is **closed** (1, 2, 3, 4), and `rev 0..=3` counts down from 3 to 0. A range has only one variable. `a..b` runs no round when `b <= a`; `a..=b` runs no round only when `b < a`, so `1..=1` has one round.
+- The type of the variable may be left out: `foreach (x in primes)` gives `x` the type of the elements. It is still a **new** variable: an `x` declared before the loop is not assigned and keeps its value.
 - The subject is evaluated **once**, before the first round. A function call in it runs one time.
 
 ### What can be iterated
@@ -42,7 +45,7 @@ What to notice:
 | `pointer, count`: `foreach (T x in p, n)` | `n` elements from `p` |
 | an object of a class with `count()` (or `size()`, `len()`, `length()`) and `get(i)` (or `operator[]`) | `get(0)` up to `get(n - 1)` |
 
-An array **parameter** is just a pointer, so its length is not known: the compiler tells you to use the `pointer, count` form (`foreach (T x in pointer, count)`). A `char buf[32]` has 32 elements, not the length of the text inside it.
+An array **parameter** is just a pointer, so its length is not known: the compiler tells you to use the `pointer, count` form (`foreach (T x in pointer, count)`). A `char buf[32]` has 32 elements, not the length of the text inside it: to loop over the text, go through a `char*` (`char* p = buf;` or `(char*)buf`).
 
 ### Changing the elements
 
@@ -67,7 +70,8 @@ What to notice:
 - `Squares` has only `count()` and `get()`. Nothing else is needed.
 - `collections.IntList` and `StrList` already have `size()` and `get()`, so `foreach` works with them without any change. The element type is the result type of `get`.
 - The number of elements is read **once**, before the first round. A loop body that adds elements to the list does not make the loop longer.
-- The maps and sets of `collections` have no `get(i)`, so they are not iterable with `foreach`. Walk their slots with `capacity()`, `usedAt()`, `keyAt()` and `valueAt()` (see [collections](#chap-collections-and-algorithms)).
+- The maps and sets of `collections` have no `get(i)` (the `get` of a map takes a key), and `IntQueue` and `IntHeap` have none either, so they are not iterable with `foreach`. Walk the slots of a map or a set with `capacity()`, `keyAt()` and `valueAt()` (the int versions also have `usedAt()`; in a text map an empty slot has the key `null`). The [collections chapter](#chap-collections-and-algorithms) shows the loop.
+- The ordered containers of the `ds` module (`Deque`, `RingBuffer`, `OrderedSet` and `OrderedTextSet`) have `size()` and `get(i)`, so `foreach` walks them in order; see [data structures](#chap-data-structures-strings-random).
 
 ## switch on text, lists and ranges
 
@@ -81,6 +85,7 @@ What to notice:
 - The text `built` was made at run time and still matches `"put"`, because the bytes are compared, not the addresses.
 - A **`null` text matches no label** and goes to `default`. It does not crash.
 - The value is evaluated once. Fall-through and `break` work as for numbers.
+- Only the `switch` compares text: `==` on two `char*` values still compares addresses (use `streq`). The value of the `switch` may be a `char*`, a `char` array or a `uint8*`; a `void*` is not text, cast it (`switch ((char*)p)`).
 - A switch with many text labels is fast: up to 4 labels are compared one after the other, more than that are found with a binary search over hash values, then compared byte by byte. The language reference gives 0.09 microseconds per decision for 1000 labels, against 3 microseconds for a chain of 1000 `streq` calls (figures from the reference, not measured again for this book).
 
 The number switch got new label forms too.
@@ -94,6 +99,7 @@ What to notice:
 - Labels may be of any size now. The older limit of 32 bits (`case 5000000000:` was an error) is gone, and the value `size(int64 n)` can be a 64-bit number.
 - A switch with no `default` does nothing when no label matches and execution continues after it: `when()` ends with `return "?"` for that case, which no weekday reaches.
 - **Duplicate labels are compile errors**: equal numbers, overlapping ranges and equal texts, also within one `case a, b:`. A text label in a number switch is an error too, and the other way round.
+- A switch can have at most 4096 labels (a range or a list item is one label): `too many case labels (at most 4096 in the switch statements that are open together)`.
 
 ## Labeled break and continue
 
@@ -104,10 +110,10 @@ A label in front of a loop (`while`, `do`, `for`, `foreach`) or a `switch` names
 What to notice:
 
 - `break search;` left **both** loops at once, which is what you would otherwise write with a flag variable or a `goto`.
-- `continue rows;` jumped to the next round of the outer `while`, so the `println("")` after the inner loop was skipped; the row had already ended its line.
+- `continue rows;` jumped to the next round of the outer `while`. In rows 1 to 3 the `println("")` after the inner loop was skipped, because the row had already ended its line. Row 4 filled all four columns, the inner loop ended normally, and that `println("")` ended the line.
 - In the last part `break` alone would only leave the `switch`. `break loop;` leaves the `for (;;)` loop. A `switch` cannot be continued, but a `continue` inside one belongs to the loop around it.
 - The name is looked up from the innermost statement outwards. A name that no enclosing statement has is the error `no enclosing loop or switch has the label 'outer'`.
-- A label is also a `goto` target, so a name can be used once per function.
+- A label is also a `goto` target, so a name can be used once per function (a second one is the error `duplicate label`), and a function can have at most 64 labels, the labels of loops included (`too many labels in one function (64)`).
 
 ## ||=, &&= and ??=
 
@@ -122,6 +128,7 @@ What to notice:
 - `ready &&= expensive(0) != 0` ran the right side because `ready` was true, and stored false. The next `&&=` saw false and did not evaluate its right side. `expensive` ran twice in all.
 - The target's address is computed **once**: `slots[next++] ||= 100` advanced `next` by one, not two. Only the empty slot 0 was set; slot 1 already held 7.
 - `x ||= y` is not `x = x || y`. It does not store the 0 or 1 that `||` produces: a true target stays as it is, and otherwise `y` itself is stored.
+- `??=` does the same as `||=`: a 0 counts as missing, as it does for the `??` operator, so `count ??= 10` replaces a 0 and not only a `null`. Use these operators where 0 means "not set".
 - The target has to be an integer, `bool`, enum or pointer. Doubles, structs and arrays are compile errors.
 - The ten other compound assignments (`+=`, `-=`, `<<=` and the rest) work on every integer width, on doubles (`+= -= *= /=`), on pointers (`+=` and `-=` step by the element size) and, through the operator methods, on classes.
 
@@ -142,7 +149,8 @@ e6.a:2: error: static assertion failed: the header is sent over the wire as 8 by
 ```
 
 - `Color.count` is the number of members of an enum and is a constant, so it can be used here.
-- The condition has to be a constant: `sizeof`, your own `const` values, enum members and the built-in `__ARCH` and `__OS`. The message must be a text in quotes.
+- The condition has to be a constant: `sizeof`, your own `const` values, enum members and the built-in `__ARCH` and `__OS`. The message must be a text in quotes: a `const` text is the error `static_assert: the message must be a text in quotes`.
+- Inside a class body, put an assertion about `sizeof` of that class **after the last field**. The class is not complete before that: `static_assert(sizeof(Table) == 128)` written above `int values[SLOTS];` in the sample fails, although the finished `Table` is 128 bytes.
 - A `const` cannot be declared inside a class (`const N = 4;` and `static const N = 4;` both give `unknown type`). Declare the constant at the top level, as the sample does.
 
 ## Abstract classes, override and final
@@ -154,10 +162,10 @@ An **abstract class** is a class that is not complete on its own. It declares me
 What to notice:
 
 - `abstract int area();` has no body. `virtual int sides() = 0;` is the same thing in the C++ spelling. A class with an abstract method has to be declared `abstract` as well, or the compiler says so.
-- **No object of an abstract class can exist**: `new Shape()` is a compile error, and so are a local variable, a field, a by-value parameter or a by-value result of that type. Use a **pointer** to the abstract class, as `shapes` does. A class that is not abstract has to implement every abstract method it inherits, and the error names the method that is missing.
+- **No object of an abstract class can exist**: `new Shape()` is a compile error, and so are a local variable, a field, a by-value parameter or a by-value result of that type. Use a **pointer** to the abstract class, as `shapes` does. A class that is not abstract has to implement every abstract method it inherits. The error names the method that is missing (`this class does not implement the abstract method 'sides'`), but it is reported at the first line after the class, not inside it, and it does not name the class: look above the line it shows.
 - `ratio()` is written once in `Shape` and calls the abstract methods. Each object answered with its own area and number of sides.
-- `override` before a method says "this replaces a virtual method of a base class", and the compiler **checks** it: the base class must have such a virtual method, and the result and the parameter types must be the same. Without the word, a method with the same name still overrides, but nothing is compared (see [structs and classes](#chap-structs-and-classes)). Use `override` for every new method so that a typo or a changed signature is an error.
-- `final` on a method forbids any further override. `final class Square` cannot be a base class. A class cannot be both `abstract` and `final`.
+- `override` before a method says "this replaces a virtual method of a base class", and the compiler **checks** it: the base class must have such a virtual method, and the result and the parameter types must be the same. Without the word, a method with the same name still overrides, but nothing is compared (see [structs and classes](#chap-structs-and-classes)). Write `override` on every method that is meant to replace a base class method, so that a typo or a changed signature is an error.
+- `final` on a method forbids any further override. It belongs to a method that overrides something (`override final`): `virtual final int f()` in the class that first declares `f` is the error `'final' method that overrides nothing (final is for overrides) 'f'`. `final class Square` cannot be a base class. A class cannot be both `abstract` and `final`.
 - An abstract class whose methods are all abstract is what other languages call an interface. There is only single inheritance in A.
 
 ## Static members
@@ -173,7 +181,8 @@ What to notice:
 - A static method cannot use `this`, instance fields or instance methods. It can use the static members, including private ones. It cannot be virtual, `abstract`, `override` or `final`.
 - A static field **hides a global variable of the same name** inside the class. A static field and an instance field of one class cannot have the same name.
 - You use statics with the class name, not through an object: `c->square(2)` is an error that says so.
-- `sizeof(Counter.table)` and `foreach (int v in Counter.table)` work because the length of the array is known.
+- `sizeof(Counter.table)` and `foreach (int v in Counter.table)` work because the length of the array is known. A static field takes no room in an object: `sizeof(Counter)` counts only the instance fields.
+- With separate compilation (`ac -c`), define a class that has static fields in **one** unit only. A header with such a class would define the field in every unit that includes it, and linking fails with `duplicate definition of 'Counter.made'`.
 - A `Counter a;` without parentheses would **not** have run the constructor, as explained in [structs and classes](#chap-structs-and-classes). The sample writes `Counter a();`.
 
 ## is and as
@@ -185,10 +194,10 @@ Sometimes you hold an `Animal*` and need to know whether it really is a `Dog`. `
 What to notice:
 
 - `a is Dog` is also true for a `Puppy`, because a `Puppy` is a `Dog`. `a is Puppy` is false for a plain `Dog`.
-- `a as Dog` gives `null` for the `Cat` and for the plain `Animal`, so the test `d != null` is the safe way to use the result. There is no check when you call through the result directly (`(a as Dog)->bark()`), so that is your responsibility.
+- `a as Dog` gives `null` for the `Cat` and for the plain `Animal`, so the test `d != null` is the safe way to use the result. There is no check when you call through the result directly (`(a as Dog)->tricks`), so that is your responsibility. A plain assignment `Dog* d = a;` and a cast `(Dog*)a` are not checked either: pointer types convert freely in A, and only `as` looks at the object.
 - A `null` pointer is nothing: `is` gives 0 and `as` gives `null`. The sample's `meet(null)` printed it without a crash.
 - The left side has to be a pointer to a class **with virtual methods**: the object finds its class through its vtable pointer, so a class without any virtual method has no run time class and the compiler says so (`'is' and 'as': this class has no virtual methods, so its objects do not know their class`).
-- Objects that have no vtable pointer are "not a Dog" for every class: the elements of an array of objects (`Dog dogs[2];`; make an array of pointers with `new` instead), and objects in raw memory. The same objects cannot make virtual calls either.
+- Objects that have no vtable pointer are "not a Dog" for every class: the elements of an array of objects (`Dog dogs[2];`; make an array of pointers with `new` instead), an object that is a field of another object (`class Kennel { Dog dog; }`), and objects in raw memory (`alloc`). The same objects cannot make virtual calls either.
 - With separate compilation (`ac -c`), a class that is included from a header has its own copy of the vtable in each unit. `is` and `as` still work between units, because the compiler also compares the class name.
 
 ## All together
@@ -207,6 +216,7 @@ The new checks give messages that tell you what to do. These are real messages, 
 | `case 1: ... case 1..5:` in one switch | `duplicate case label` |
 | the same text label twice in a text switch | `duplicate case label` |
 | `new Shape()` for an abstract class | `an abstract class has no objects of its own: create an object of a subclass and use a pointer to the abstract class` |
+| a concrete class that leaves an abstract method open | `this class does not implement the abstract method 'sides'` |
 | `override int f(char* x)` when the base has `f(int x)` | `the result or parameter types differ from the method that is overridden 'f'` |
 | `override int f()` of a method that is `final` | `cannot override a final method 'f'` |
 | `break outer;` with no loop called `outer` | `no enclosing loop or switch has the label 'outer'` |

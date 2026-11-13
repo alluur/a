@@ -4,6 +4,11 @@ The protocols of the web are all in the standard library, written in A: `http` f
 `websocket` for two-way messages, and `tls` for encryption, which makes `https://` work. They are built on the sockets of
 [the networking chapter](#chap-networking), so the same ideas apply: handles, time limits, checking every result.
 
+This chapter teaches the basics: the plain `http` module, and the handshake and the frames of `websocket` down to the bytes. The next
+chapter, [WebSocket, server-sent events, an HTTP toolkit and JSON-RPC](#chap-web-services), builds on it with the rest of
+`websocket` (compression, close codes, streaming, `wss://`), a server for many clients (`wshub`), event streams (`sse`), a bigger HTTP
+toolkit (`httpx`) and `jsonrpc`.
+
 In this chapter:
 
 * an HTTP client and server: requests, headers, forms, redirects, compressed bodies, files;
@@ -19,11 +24,12 @@ In this chapter:
 | save a download to a file | `http.download` |
 | answer HTTP requests | `http.serve` (fixed port) or your own accept loop with `http.readRequest` / `http.respond` |
 | serve a directory of files | `http.serveStatic`, `http.serveFile` |
-| exchange messages with a browser or a peer, in both directions, over one connection | `websocket` |
+| exchange messages with a browser or a peer, in both directions, over one connection | `websocket` (`ws://` and `wss://`) |
 | encrypt a connection of my own protocol | `tls.wrap` (client) and `tls.wrapServer` (server) |
 | serve over https | `http.serveTls`, `http.serveStaticTls` |
 | check or inspect a certificate | `x509` |
 | drive TLS from an event loop, with no sockets inside | `tls.client` / `tls.accept` and `feed` / `outData` |
+| serve many WebSocket clients from one thread, push events to browsers, call functions over JSON, or get cookies, retries, a router and middleware | `wshub`, `sse`, `jsonrpc`, `httpx`: [the next chapter](#chap-web-services) |
 
 ## HTTP
 
@@ -200,10 +206,12 @@ port; start it and try `curl "http://localhost:8080/hello?name=World"`.
 
 * Every request costs about 6 KB of memory that is never freed (`new` and `alloc` never free, and `readRequest` allocates). That is
   fine for tools and tests; for a service that runs for weeks, restart it now and then, or `fork` a child for each connection and let
-  it exit.
-* Limits of the module: methods up to 15 characters, paths and queries up to 1023, header lines up to 4095 (a longer line is read as
+  it exit. A `wshub` with an `httpx.Router` ([the next chapter](#chap-web-services)) serves HTTP for many clients at once and runs in
+  constant memory.
+* Limits of the `http` module: methods up to 15 characters, paths and queries up to 1023, header lines up to 4095 (a longer line is read as
   two), request bodies up to 64 MiB (a larger `Content-Length` gets `400`), a 15-second time limit on every read and write of a
-  client (a client that sends nothing holds up the others for that long), one request per connection, no keep-alive, no cookies, no multipart forms, no proxies, no HTTP/2. Handlers must answer
+  client (a client that sends nothing holds up the others for that long), one request per connection, no keep-alive, no cookies, no multipart forms, no proxies, no HTTP/2. (`httpx`
+  in the next chapter has keep-alive, cookies and multipart forms; proxies and HTTP/2 are not supported by either.) Handlers must answer
   with `respond` (or write the response themselves) before they return.
 * `examples/http_server.a` is a small web server and `examples/http_get.a` a command-line client with an `--insecure` switch.
 
@@ -213,12 +221,16 @@ A WebSocket starts as an ordinary HTTP request that asks to *upgrade* the connec
 at any time, over the same TCP connection, until one of them closes it. Browsers speak WebSocket, which is what makes it useful for
 live pages: a chat, a dashboard, a game.
 
-The API: `websocket.connect("ws://host:port/path")` for a client, `websocket.accept(connection, path, max)` for a server (it takes
-a `conn.Connection`), then `sendText`, `sendBinary`, `ping`, `receive` and `close` on the returned `websocket.WebSocket`.
+The API: `websocket.connect("ws://host:port/path")` for a client (`wss://` works too, see the end of this chapter),
+`websocket.accept(connection, path, max)` for a server (it takes a `conn.Connection`), then `sendText`, `sendBinary`, `ping`, `receive`
+and `close` on the returned `websocket.WebSocket`. The samples of this chapter use these short names. The module has more:
+`receiveMessage` and `closeWith(code, reason)`, fragments, compression, non-blocking use, strict checks of everything the standard
+demands, and a server for many clients; [the next chapter](#chap-web-services) covers them.
 
 ### The handshake
 
-The client sends `Upgrade: websocket` and a `Sec-WebSocket-Key` made of 16 bytes from `rand()`. The server proves that it understood by answering `101
+The client sends `Upgrade: websocket` and a `Sec-WebSocket-Key` made of 16 random bytes (from the operating system's random generator,
+so it differs on every run). The server proves that it understood by answering `101
 Switching Protocols` with `Sec-WebSocket-Accept`: the SHA-1 of the key plus a fixed GUID, in base64. `acceptKey` computes it, and
 the sample checks it with the example key from the RFC.
 
@@ -228,7 +240,7 @@ the sample checks it with the example key from the RFC.
 
 * `clientSend` and `clientFinish` are the two halves of `websocket.connect`, so a client and a server can live in one thread (the
   server's `accept` runs between the halves). `websocket.connect` itself blocks until the server has answered, so it needs a server in
-  another process or machine.
+  another process or machine, or one that runs from `net.setIdleHook` (see [the next chapter](#chap-web-services)).
 * The server learns the requested path (`/chat`). A request that is not a WebSocket upgrade is answered with `400 Bad Request`
   and `accept` returns `null`.
 
@@ -256,8 +268,9 @@ header (reserved bits set). The same `unmask` call masks and unmasks. You only n
   last argument tells text (`1`) from binary (`2`).
 * `ws->close(1000)` starts the closing handshake with the status code 1000 ("normal"). `examples/ws_echo.a` is this server as a
   stand-alone program on port 8081, which a browser can connect to with `new WebSocket("ws://localhost:8081/")`.
-* The client masks its frames with numbers from `rand()`. A program starts with the same seed every time, so call `srand(...)`
-  (`random.clockSeed()` is a good value) once at the start if you do not want the same handshake key and masks on every run.
+* The client masks its frames with a random 4-byte key per frame, and the handshake key is random too; both come from the operating
+  system's random generator, so there is nothing to seed and the bytes on the wire differ from run to run.
+* The same server and client in **one** thread, with no `fork`, is the first sample of [the next chapter](#chap-web-services).
 
 ### Messages
 
@@ -268,19 +281,26 @@ header (reserved bits set). The same `unmask` call masks and unmasks. You only n
 * `receive(buf, max, &opcode)` returns one complete message: fragments are joined for you. It returns the length, and `-1` when the
   connection closed.
 * A message longer than `max` is cut to `max` bytes and the rest is dropped. For a text message that fills the buffer exactly there
-  is no room for the terminating zero, so use the returned length.
+  is no room for the terminating zero, so use the returned length. (`receiveMessage()` of [the next chapter](#chap-web-services)
+  has neither problem: it gives you a `Message` whose `data` always ends in a 0 byte.)
 * A 70000-byte message is one call; the 8-byte length field is chosen by the library.
-* The receiver allocates whatever length a frame announces. A server that faces strangers should not rely on that: put it behind
-  a proxy that limits message size.
-* Text frames are **not** checked for valid UTF-8, and there are no extensions (no compression) and no sub-protocol negotiation.
+* The receiver does not trust the length that a frame announces. A frame over `maxFrame` or a message over `maxMessage` (16 MiB each by
+  default; `setMaxMessage(n)` lowers them) ends the connection with the close code 1009, and nothing is allocated for the announced
+  size. A server that faces strangers should still set the limits to what it needs.
+* Text messages **are** checked for valid UTF-8: an invalid byte ends the connection with the close code 1007 (the check runs while the
+  bytes arrive), and `sendText` refuses text that is not UTF-8. Compression (permessage-deflate) and sub-protocol negotiation exist too;
+  see [the next chapter](#chap-web-services).
 
 ### Ping, pong and close
 
 A *ping* asks "are you still there?" and the other side must answer with a *pong* that has the same payload. `receive` answers pings
-by itself and hides pongs, so a program only notices them if it reads the raw connection (`ws->c` is the `conn.Connection`).
+by itself and hides pongs, so the sample below, which wants to see one, reads the raw connection (`ws->c` is the `conn.Connection`). A
+program that wants pings and pongs as events sets a handler (`setHandler`); `ws->rttMs` has the round trip of the last ping that was
+answered, and `setKeepalive` sends pings by itself ([the next chapter](#chap-web-services)).
 
-Closing is a handshake as well: one side sends a close frame with a 2-byte status code, the other answers with its own. Codes: 1000 normal,
-1001 going away, 1002 protocol error, 1003 unsupported data, 4000 to 4999 for your own use.
+Closing is a handshake as well: one side sends a close frame with a 2-byte status code (and, with `closeWith`, an optional reason), the
+other answers with its own. Codes: 1000 normal, 1001 going away, 1002 protocol error, 1003 unsupported data, 1007 text that is not
+UTF-8, 1009 message too big, 4000 to 4999 for your own use. The next chapter has the whole table.
 
 {{sample http/ws_ping_close}}
 
@@ -290,12 +310,14 @@ Closing is a handshake as well: one side sends a close frame with a 2-byte statu
   opcode 10, length 0) is already waiting in the client's connection.
 * On the receiving side `receive` returns `-1` for a close frame, `closeCode` has the code the peer sent (`4001` here), and `closed`
   is true. The library answers the close frame automatically, so there is nothing more to do but stop.
-* `close(code)` waits up to 200 ms for the peer to finish; it sends **no reason text**, only the code.
+* `close(code)` waits up to one second for the peer's close frame (here nobody answers, which is why this sample takes a second to
+  end); it sends **no reason text**, only the code. `closeWith(code, reason)` also sends a reason of up to 123 bytes.
 
 ::: note
 
-`websocket.connect` accepts `ws://` only. A secure WebSocket (`wss://`) takes two layers, and the TLS section below shows how to put
-them together by hand.
+`websocket.connect` accepts `ws://` and `wss://`. A secure WebSocket takes two layers, TLS and then the WebSocket handshake on top of
+it; `connect` does both, and the TLS section below shows the same thing by hand, which is also how you would do it for a connection
+that you opened yourself. [The next chapter](#chap-web-services) uses `wss://` directly.
 
 :::
 
@@ -439,7 +461,8 @@ same idea: TLS first, then the WebSocket handshake on the encrypted connection.
 {{sample http/wss_by_hand}}
 
 **What to notice.** The WebSocket calls (`accept`, `clientSend`, `clientFinish`, `receive`, `sendText`) are the same as in the plain
-version; what is new is the TLS step before them. `websocket.connect` is not used, because it only understands `ws://`.
+version; what is new is the TLS step before them. `websocket.connect("wss://...")` does the client's half of this for you; doing it by
+hand shows the layers and works for a connection that you made yourself.
 
 ## Summary
 
@@ -449,7 +472,8 @@ version; what is new is the TLS step before them. `websocket.connect` is not use
 * A response body ends by `Content-Length`, by chunks, or by the end of the connection; the client handles all three, and unpacks
   gzip and deflate.
 * A WebSocket is an HTTP upgrade followed by frames; `receive` joins fragments and answers pings, and a close frame ends the
-  conversation with a status code. `websocket.connect` is for `ws://` only.
+  conversation with a status code. `websocket.connect` takes `ws://` and `wss://`; the module checks frames, UTF-8 and close codes
+  strictly (more in [the next chapter](#chap-web-services)).
 * TLS 1.3 is built in. `tls.wrap` and `tls.wrapServer` make an ordinary socket secure; the `net` calls on it are then encrypted.
 * A certificate must match the host name, be valid today and lead to a trusted root; `x509.addRootPem` adds your own, `x509.verifyChain`
   tells you why a chain fails, and `http.setVerify(false)` skips the check (do not make that a habit).
@@ -458,6 +482,8 @@ version; what is new is the TLS step before them. `websocket.connect` is not use
 ## Where next
 
 * [Networking](#chap-networking): the sockets, addresses and packets under all of this.
+* [WebSocket, server-sent events, an HTTP toolkit and JSON-RPC](#chap-web-services): the rest of `websocket` (close codes,
+  fragments, compression, `wss://`), a server for many clients, event streams, `httpx` and `jsonrpc`.
 * API references: [http](#api-http), [websocket](#api-websocket), [tls](#api-tls), [x509](#api-x509), [conn](#api-conn).
 * Bigger programs in `examples/`: `http_server.a`, `http_get.a`, `httpsd.a` (HTTPS server for a directory), `ws_echo.a`,
   `chat_server.a` (a plain TCP chat server built on `conn`).

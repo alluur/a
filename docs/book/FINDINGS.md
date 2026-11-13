@@ -49,11 +49,11 @@ Nothing here was fixed by the book work: `lib/` and `src/` were left alone on pu
 |---|---|
 | `netif` silently drops sockets beyond 512; its count and search functions overwrite what `parse*` loaded | NOTES-net 2, 3 |
 | `http.parseUrl` returns `true` with garbage for an IPv6 literal | NOTES-net 4 |
-| `websocket` uses an unseeded `rand()` for the handshake key and the masks, so they are identical on every run; `websocket.receive` leaves no terminating zero when a message fills the buffer and allocates whatever frame length the peer announces | NOTES-net 5, 6 |
+| ~~`websocket` uses an unseeded `rand()` for the handshake key and the masks~~ **fixed**: key and masks now come from the OS random generator (fresh mask per frame). ~~Allocates whatever frame length the peer announces~~ **fixed** (1009 close). `websocket.receive(buf, max, &op)` still leaves no terminating zero when a message fills the buffer (the new `Message.data` does) | NOTES-net 5, 6; NOTES-web |
 | `dns.buildQuery` writes into the buffer before it validates the name | NOTES-net 7 |
 | `net.recvLine` splits a line longer than the buffer into several lines; `conn.Connection.readLine` drops the rest instead; `readLine` cannot tell a time out from the end of the connection | NOTES-net 8, 9 |
 | `http.Request.query` holds 1,024 bytes but a form body can be 64 MiB: the documented `strcpy(q->query, q->body)` overflows | chapter 41 review |
-| The strict `wss://` / UTF-8 / permessage-deflate WebSocket, `wshub`, `sse`, `httpx` and `jsonrpc` of the tier-2 work are not on the branch yet, so the book describes the old `websocket` module | chapter 41 review |
+| The strict `wss://` / UTF-8 / permessage-deflate WebSocket, `wshub`, `sse`, `httpx` and `jsonrpc` are now on the branch and described in chapter 42 | NOTES-web |
 
 ## Library: GUI, display server, terminal and editor widgets
 
@@ -67,6 +67,22 @@ Nothing here was fixed by the book work: `lib/` and `src/` were left alone on pu
 | There is no way to read the port of a `wsrv.Server` / `wvnc.Vnc` / `wweb.Web` that was given port 0 | NOTES-gui2 a7 |
 | `RunPane` prints the elapsed time, `ThemeEditor.setEntry` leaves the colour picker on the old colour, `gcode.pickColor` clips at the right edge, `Table` column width includes the sort arrow, `wfb.keyFor` with AltGr on the `us` layout returns the plain character | NOTES-gui2 a8 to a12 |
 | `docs/GUI.md` says `ghtml` does not do forms (it does); `ADISPLAY=N` only means port 7000+N below 100; the `lib/gcode.a` header misplaces `RowList` and `FlatButton` | NOTES-gui2 (b) |
+
+## Found while writing the chapters of the second round
+
+| Finding | Where |
+|---|---|
+| `net.accept` on a non-blocking listener inside the idle hook hangs forever (use `net.acceptSome`); `docs/NET.md` does not warn about it | NOTES-web |
+| `wshub`: `hub->close(c, ...)` on an SSE client in the same callback as `sendEvent` delivers nothing, not even the response head | NOTES-web |
+| `jsonrpc.Client.dispose()` closes a connection given to `connectStream`, although the documentation says it stays yours; `sse.Client.reconnects` counts the first connection too | NOTES-web |
+| `hub->listen` and `conn.Listener` bind 0.0.0.0 (`conn.Listener` has no host parameter); `net.secureAttach` has 512 slots (a new, undocumented limit) | NOTES-web |
+| `lib/httpx.a` header names `httpx.cors` and `checkBearer`, which do not exist; `char* long = ...` says "expected a variable name" with no hint that `long` is reserved | NOTES-web |
+| `ds.BitSet`: a zeroed `BitSet` ignores `set()` out of range although `docs/ALGO.md` says it grows; `strx.LineDiff d();` says "this class has no constructor"; `LruCache.dispose()` also calls the eviction handler | NOTES-algo |
+| `static_assert(sizeof(ThisClass) ...)` placed before the class's last field gives contradictory answers (both `==` 16 and `!= 16` fail for a 16-byte class); put it after the last field | NOTES-lang2 |
+| A function (not only a variable or field) named `rev` turns `foreach (x in rev a)` into the error `foreach needs an array, a range ...`; "does not implement the abstract method" points at the token after the class and does not name the class | NOTES-lang2 |
+| `httpx.Router`: a `:param` or `*` value of 128 bytes or more is silently dropped but the route still runs with `param()` null (a handler that does `strlen` or `strcpy` on it crashes on a long URL); `wshub`: raising `maxClients` after `listen()` is ignored; a zeroed `websocket.Options o;` means `verify` false and all time-outs 0 | NOTES-web 6 to 8 |
+| `ds` containers passed or assigned **by value** share their buffers, and when the copy grows it frees the original's buffer; `strx.levenshtein` and `lcsLength` are documented as O(min) memory but decode both texts first (about 8 bytes per input byte) | NOTES-algo |
+| `docs/ALGO.md`: the `splitLines` + `run` example drops the no-newline flags (its patch differs from `diff -u`); `lib/strx.a` mentions `LineDiff.EQUAL` constants that do not exist; the "five targets" claim is stale; no callback signatures are given | NOTES-algo |
 
 ## What the book work verified and found *correct*
 
