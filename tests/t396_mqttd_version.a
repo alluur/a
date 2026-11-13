@@ -1,0 +1,133 @@
+// A CONNECT with a protocol level the broker does not speak (MQTT 5, 3.1, anything else) is answered with CONNACK 1 "unacceptable protocol version"
+// and the connection is closed (MQTT 3.1.1, 3.1.2.2): also a real MQTT 5 CONNECT, whose layout differs from 3.1.1 (a properties field follows the
+// keep-alive), which used to be dropped without a word. A CONNECT with another protocol NAME is not MQTT at all and gets no answer. The codec reads such a
+// packet up to the level.
+import mqtt;
+import mqttd;
+import net;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqttd.Server* srv;
+int PORT;
+char url[100];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+int raw() {
+    int h = net.connect("127.0.0.1", PORT);
+    net.setTimeout(h, 2000);
+    return h;
+}
+
+void sendHex(int h, char* hex) {
+    int n = 0;
+    char* d = bytebuf.fromHex(hex, &n);
+    net.send(h, d, n);
+    free(d);
+}
+
+// everything the broker sends until it closes the connection (or it has said what it had to say), as hex text; " closed" is appended when it closed
+char got[200];
+char* readHex(int h, int ms) {
+    int t0 = millis();
+    int lastData = 0;
+    char buf[64];
+    int n = 0;
+    bool closed = false;
+    while (millis() - t0 < ms) {
+        srv->poll(0);
+        if (!net.waitReadable(h, 5)) {
+            if (n > 0 && millis() - lastData > 100) break;
+            continue;
+        }
+        int r = net.recv(h, &buf[n], 32);
+        if (r <= 0) { closed = true; break; }
+        n = n + r;
+        lastData = millis();
+        if (n >= 32) break;
+    }
+    char* hx = bytebuf.hex(&buf[0], n);
+    format(&got[0], 200, "%s%s", hx, closed ? " closed" : "", 0, 0);
+    free(hx);
+    return &got[0];
+}
+
+bool answers(char* hexSent, char* want) {
+    int h = raw();
+    sendHex(h, hexSent);
+    char* g = readHex(h, 2000);
+    bool ok = streq(g, want);
+    if (!ok) printf("     got: '%s'  wanted: '%s'\n", g, want);
+    net.close(h);
+    return ok;
+}
+
+mqtt.Parser* ps;
+mqtt.Packet pk;
+int parseHex(char* hex) {
+    int n = 0;
+    char* r = bytebuf.fromHex(hex, &n);
+    ps->reset();
+    ps->feed(r, n);
+    int k = ps->next(&pk);
+    free(r);
+    return k;
+}
+
+int main() {
+    srv = mqttd.newServer();
+    check("the broker listens", srv->listenOn("127.0.0.1", 0, null));
+    PORT = srv->port;
+    format(&url[0], 100, "mqtt://127.0.0.1:%d", PORT, 0, 0, 0);
+    net.setIdleHook(hook);
+    srv->broker->sysIntervalMs = 0;
+    srv->net->handshakeTimeoutMs = 300;
+
+    // ---- the codec ----------------------------------------------------------------------------------------------------------------------------------------------
+    ps = mqtt.newParser(mqtt.MODE_SERVER, 1048576);
+    // 10 | length | 0004 MQTT | 05 | 02 clean | 003c keep-alive 60 | 00 no properties | 0006 v5real
+    check("a real MQTT 5 CONNECT is read up to the level: parsed, level 5", parseHex("101300044d5154540502003c00000676357265616c") == 1 && pk.type == mqtt.CONNECT && pk.level == 5 && streq(pk.protoName, "MQTT"));
+    check("an MQTT 3.1.1 CONNECT is still read completely", parseHex("101000044d5154540402003c00046d6f7371") == 1 && pk.level == 4 && pk.clean && pk.keepAlive == 60 && streq(pk.clientId, "mosq"));
+    check("MQIsdp with level 3 (MQTT 3.1) is read completely, as before", parseHex("101200064d51497364700302003c00046d6f7371") == 1 && pk.level == 3 && streq(pk.protoName, "MQIsdp") && pk.keepAlive == 60 && streq(pk.clientId, "mosq"));
+    check("another protocol name is an error (not MQTT at all)", parseHex("101000044d5154530402003c00046d6f7371") < 0);
+    check("a CONNECT that ends before the level is a length error", parseHex("100600044d515454") < 0);
+    check("a 3.1.1 CONNECT that is cut short after the level is still a length error", parseHex("100700044d51545404") < 0);
+
+    // ---- the broker -------------------------------------------------------------------------------------------------------------------------------------------
+    check("a real MQTT 5 CONNECT gets CONNACK 1 and the connection is closed", answers("101300044d5154540502003c00000676357265616c", "20020001 closed"));
+    check("... also one with properties (a session expiry interval)", answers("101800044d5154540502003c05110000003c000676357265616c", "20020001 closed"));
+    check("a CONNECT with level 3 under the name MQTT: CONNACK 1", answers("101000044d5154540302003c00046d6f7371", "20020001 closed"));
+    check("level 0: CONNACK 1", answers("101000044d5154540002003c00046d6f7371", "20020001 closed"));
+    check("level 255: CONNACK 1", answers("101000044d515454ff02003c00046d6f7371", "20020001 closed"));
+    check("a CONNECT that stops right after the level: CONNACK 1", answers("100700044d51545405", "20020001 closed"));
+    check("MQTT 3.1 (MQIsdp, level 3): CONNACK 1 as before", answers("101200064d51497364700302003c00046d6f7371", "20020001 closed"));
+    check("another protocol name: no answer, the connection is closed", answers("101000044d5154530402003c00046d6f7371", " closed"));
+    check("an MQTT 3.1.1 CONNECT is accepted: CONNACK 0, and the connection stays open", answers("101000044d5154540402003c00046d6f7371", "20020000"));
+    check("the refusals were counted", srv->broker->stats->rejected >= 6);
+
+    // a client of this library still connects (and a second one with the same id takes over as before)
+    mqtt.Options o();
+    o.clientId = "viaclient";
+    mqtt.Client* c = mqtt.connectWith(&url[0], &o);
+    check("the client module connects as before", c != null && c->subscribeWait("v/#", 0, 2000) == 0);
+    if (c != null) c->dispose();
+    srv->shutdown();
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
