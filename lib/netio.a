@@ -11,6 +11,8 @@
 //    if (l->waitReadable(100)) { int got = l->recv(buf, 4096); }     // > 0 bytes, 0 closed, -2 nothing now, -1 failed
 //    l->close();  l->dispose();                          // dispose() frees the link (a link from newLink)
 //
+//    l->openStart(host, port, 1000, false, true);  ... for (;;) { int r = l->openStep(); if (r != 0) break; }   // 1 open, -1 failed: the same, without ever waiting
+//
 //    netio.Queue q;  q.max = 65536;  q.add(bytes, n);  net.sendSome(fd, q.data(), q.pending());  q.consume(sent);
 //
 //  Everything uses malloc and free: nothing grows for ever when links and queues come and go. net.setIdleHook works: waiting
@@ -132,10 +134,18 @@ public class Link {
     private char* host;             // a copy, TLS keeps a pointer to it
     private char* rbuf;
     private bool tlsEof;
+    private int ast;                // a non-blocking open (openStart): 0 none, 1 TCP connect on its way, 2 TLS handshake on its way
+    private int adeadline;          // when the step it is in gives up (millis)
+    private int atls;               // the handshake's time budget (ms), 0: the open is plain TCP
+    private bool averify;
 
     public Link() { fd = -1; }
 
-    public bool isOpen() { return fd >= 0; }
+    // connected (and, with TLS, past the handshake); false while an openStart is still on its way
+    public bool isOpen() { return fd >= 0 && ast == 0; }
+
+    // an openStart that openStep has not finished yet
+    public bool opening() { return ast != 0; }
 
     // Connects (blocks up to timeoutMs) and, with useTls, runs the TLS 1.3 handshake (certificate checked when verify is true).
     // The socket is non-blocking afterwards.
@@ -162,6 +172,65 @@ public class Link {
             }
         }
         return true;
+    }
+
+    // Starts to connect WITHOUT waiting (a host name is looked up first: that can block for the resolver's time out, an address cannot). Call openStep()
+    // now and then (every poll turn of a server loop) until it says 1 (open) or -1 (failed; error says why). The TCP connect gets timeoutMs, a TLS
+    // handshake after it at least one second. false when the connect cannot be started at all.
+    public bool openStart(char* hostName, int port, int timeoutMs, bool useTls, bool verify) {
+        close();
+        error = null;
+        tlsEof = false;
+        int h = net.connectStart(hostName, port);
+        if (h < 0) { error = "cannot connect"; return false; }
+        fd = h;
+        net.setNoDelay(fd, true);
+        rbuf = malloc(4096);
+        if (rbuf == null) { error = "out of memory"; close(); return false; }
+        if (useTls) host = copyText(hostName);
+        atls = useTls ? (timeoutMs < 1000 ? 1000 : timeoutMs) : 0;
+        averify = verify;
+        adeadline = millis() + (timeoutMs < 1 ? 1 : timeoutMs);
+        ast = 1;
+        return true;
+    }
+
+    // 1: open, 0: on its way (call again later), -1: failed (the link is closed). Never waits.
+    public int openStep() {
+        if (ast == 0) return fd >= 0 ? 1 : -1;
+        if (ast == 1) {
+            int r = net.connectDone(fd);
+            if (r < 0) { error = "cannot connect"; close(); return -1; }
+            if (r == 0) {
+                if (millis() - adeadline > 0) { error = "the connection timed out"; close(); return -1; }
+                return 0;
+            }
+            if (atls == 0) { ast = 0; return 1; }
+            t = tls.client(host, averify);
+            secure = true;
+            ast = 2;
+            adeadline = millis() + atls;
+        }
+        // ast == 2: the handshake, as far as it goes without waiting
+        for (;;) {
+            while (tls.outLength(t) > 0) {
+                int r = net.sendSome(fd, tls.outData(t), tls.outLength(t));
+                if (r < 0) { error = "the connection failed during the TLS handshake"; close(); return -1; }
+                if (r == 0) break;
+                tls.outConsumed(t, r);
+                bytesOut = bytesOut + r;
+            }
+            if (tls.failed(t)) { char* why = t->error != null ? t->error : "TLS handshake failed"; close(); error = why; return -1; }
+            if (tls.ready(t)) { ast = 0; return 1; }
+            if (tls.closed(t)) { error = "the server closed the connection during the TLS handshake"; close(); return -1; }
+            if (millis() - adeadline > 0) { error = "TLS handshake timed out"; close(); return -1; }
+            int n = net.recvSome(fd, rbuf, 4096);
+            if (n == -2) return 0;
+            if (n <= 0) { error = "the connection ended during the TLS handshake"; close(); return -1; }
+            bytesIn = bytesIn + n;
+            tls.feed(t, rbuf, n);
+        }
+        return 0;
     }
 
     private bool handshake(int timeoutMs) {
@@ -299,6 +368,7 @@ public class Link {
         if (host != null) { free(host); host = null; }
         if (rbuf != null) { free(rbuf); rbuf = null; }
         secure = false;
+        ast = 0;
     }
 
     // close(), and the object itself is freed when it came from newLink()

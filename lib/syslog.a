@@ -20,8 +20,9 @@
 //  \ and ]) and sdParam (finds a parameter and unescapes it).
 //
 //  The sender: UDP sends one datagram per message (cut at maxDatagram, default 2048). TCP and TLS keep a connection, frame messages with octet counting (RFC 6587,
-//  default, the only framing for TLS in RFC 5425) or newline (control characters in the text are then replaced by spaces), connect lazily and without blocking the caller for longer than
-//  connectTimeoutMs (default 1000) once per retryIntervalMs (default 2000), queue what cannot be sent yet (at most maxQueueBytes / maxQueueMessages: more is dropped and counted),
+//  default, the only framing for TLS in RFC 5425) or newline (control characters in the text are then replaced by spaces), connect lazily and WITHOUT waiting (a collector that is down, or
+//  that drops the SYN, does not hold the caller up: the attempt is moved on by every send and by pump(), gives up after connectTimeoutMs (default 1000) and is repeated once per
+//  retryIntervalMs (default 2000); only the look-up of a host name can block), queue what cannot be sent yet (at most maxQueueBytes / maxQueueMessages: more is dropped and counted),
 //  send a message completely again after a reconnect (a frame cut off by a lost connection is never continued) and notice a collector that closed the connection.
 // =============================================================================
 import net;
@@ -841,14 +842,22 @@ public class Sender {
         return false;
     }
 
-    // connects when it is time to
+    // The connection is made WITHOUT waiting: this starts it when it is time to (retryIntervalMs after the last try) and moves it on every time it is called
+    // (every message, and pump() from the server loop); true when it is open. A collector that does not answer (a firewall that drops the SYN, a host
+    // that is down) costs the caller nothing: the messages wait in the queue (bounded) until the connection is made or the attempt gives up after
+    // connectTimeoutMs.
     private bool ensureLink() {
         if (link != null && link->isOpen()) return true;
-        int t = millis();
-        if (lastAttempt != 0 && t - lastAttempt < retryIntervalMs) return false;
-        lastAttempt = t;
-        if (link == null) { link = netio.newLink(); if (link == null) return false; }
-        if (!link->open(host, port, connectTimeoutMs, transport == TRANSPORT_TLS, verify)) { errors++; return false; }
+        if (link == null || !link->opening()) {
+            int t = millis();
+            if (lastAttempt != 0 && t - lastAttempt < retryIntervalMs) return false;
+            lastAttempt = t;
+            if (link == null) { link = netio.newLink(); if (link == null) return false; }
+            if (!link->openStart(host, port, connectTimeoutMs, transport == TRANSPORT_TLS, verify)) { errors++; return false; }
+        }
+        int r = link->openStep();
+        if (r < 0) { errors++; return false; }
+        if (r == 0) return false;
         if (everConnected) reconnects++;
         everConnected = true;
         sentOff = 0;
@@ -890,7 +899,7 @@ public class Sender {
             pump();
             if (qcount == 0 && (link == null || !link->hasBacklog())) return true;
             if (millis() - t0 >= timeoutMs) return false;
-            if (link != null && link->isOpen()) link->waitReadable(5); else sleepMs(5);
+            if (link != null && (link->isOpen() || link->opening())) link->waitReadable(5); else sleepMs(5);
         }
         return false;
     }
