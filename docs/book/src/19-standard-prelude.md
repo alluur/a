@@ -341,14 +341,14 @@ A looks like C, and most C knowledge carries over. This table lists what is diff
 | constructors | none | run for `Class c(args);` and `new`, **not** for `Class c;` |
 | memory | `malloc` / `free` | `new` and `alloc` never free; `malloc` / `free` from `cstdlib`; `memcpy` returns nothing |
 | modules | headers only | `module` / `import`, `a_module` / `a_import`, and `#include` |
-| function pointers | typed | type `func`, signature not checked |
+| function pointers | typed | type `func`, signature not checked; lambdas `x => x * 2` without captures |
 | struct values | by value | by value too (a hidden copy); `==` does not compare the fields |
 | default arguments | none | `int f(int a, int b = 1)` |
 | variable arguments | `va_list` | `...`, `va_arg(i)`, `va_count()` |
-| `printf` | any number of arguments, `%f` | up to 8 values, `%b` for binary, no `%f` (it is printed as the two characters `%f`; see `printfd`) |
+| `printf` | any number of arguments, `%f` | any number of values, `%b` for binary, `%f %e %g` for a `double` (exact digits), `%v` for the shortest text that reads back; no `%a` |
 | floating point | `float`, `double` in hardware | `double` (and `float` as an alias) in software, same result everywhere |
 | `switch` | integer constant labels | constant labels of any size, lists (`case 1, 2:`), ranges (`case 1..9:`), and text labels when the value is a `char*` |
-| extras | | `foreach`, labeled `break` / `continue`, `defer`, `static if`, `static_assert`, `??`, `??=`, `||=`, `&&=`, `<=>`, `xor` / `^^`, `and` / `or` / `not`, designated initializers, compound literals |
+| extras | | `foreach`, labeled `break` / `continue`, `defer`, `static if`, `static_assert`, `??`, `??=`, `||=`, `&&=`, `<=>`, `xor` / `^^`, `and` / `or` / `not`, designated initializers, compound literals, `var`, tuples `(int, int)`, lambdas, string interpolation `$"x = {x}"` |
 | preprocessor | yes | yes, a C-style one, plus `static if` and `const` for most uses |
 | separate compilation | object files and a linker | `ac -c` and linking of `.ao` files |
 

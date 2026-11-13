@@ -27,7 +27,7 @@ What to notice:
 
 ## Default parameter values
 
-A parameter can have a default value: a constant expression (a number, a character, `true`, `false`, `null`, a `const` name, an enum member, or arithmetic on them) after `=`. Parameters with defaults must come last, and a call may leave out trailing arguments that have defaults. The same works for methods and constructors, and it is how `printf` takes up to eight values.
+A parameter can have a default value: a constant expression (a number, a character, `true`, `false`, `null`, a `const` name, an enum member, or arithmetic on them) after `=`. Parameters with defaults must come last, and a call may leave out trailing arguments that have defaults. The same works for methods and constructors.
 
 {{sample lang/default_params}}
 
@@ -202,7 +202,7 @@ What to notice:
 - Functions pass parameters and results by value and may be defined in any order; there is no overloading, and prelude names cannot be redefined at the top level.
 - A parameter may have a constant default value; parameters with defaults come last.
 - Structs and classes can be passed and returned by value; use pointers for large structs or when the callee must change the original.
-- `...`, `va_count()` and `va_arg(i)` give variable argument lists; `func` holds a function pointer without a signature.
+- `...`, `va_count()` and `va_arg(i)` give variable argument lists; `func` holds a function pointer without a signature. A lambda `(int x) => x * 2` is a `func` value, and a tuple lets a function return several values: both are in [Type inference, tuples, lambdas and string interpolation](#chap-inference-tuples-lambdas-interpolation).
 - `typedef` renames a type; `static` locals keep their value; at the top level `static` means `private`.
 - `union` members share memory; initializer lists, designated initializers and compound literals build structs and arrays in place.
 - C forms such as `typedef struct`, the comma operator, `sizeof x`, integer words and function pointer declarators are accepted.

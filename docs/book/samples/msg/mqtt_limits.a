@@ -1,0 +1,88 @@
+// The broker's limits: every queue and table has a size, and what happens at the edge
+import mqtt;
+import mqttd;
+import net;
+
+mqttd.Server* broker;
+int serve() { broker->poll(0); return 0; }
+char url[80];
+
+void settle() {
+    int quiet = 0;
+    while (quiet < 10) { if (broker->poll(1) == 0) quiet++; else quiet = 0; }
+}
+
+mqtt.Client* login(char* id, bool clean) {
+    mqtt.Options o();
+    o.clientId = id;
+    o.cleanSession = clean;
+    return mqtt.connectWith(&url[0], &o);
+}
+
+int main() {
+    broker = mqttd.newServer();
+    mqttd.Broker* b = broker->broker;
+    b->sysIntervalMs = 0;
+    broker->listenOn("127.0.0.1", 0, null);
+    net.setIdleHook(serve);
+    format(&url[0], 80, "mqtt://127.0.0.1:%d", broker->port);
+
+    // maxClients: the next CONNECT is answered with "server unavailable" (CONNACK 3)
+    b->maxClients = 2;
+    mqtt.Client* a = login("a", true);
+    mqtt.Client* c = login("c", true);
+    mqtt.Client* third = login("third", true);
+    printf("maxClients 2: the third client gets %s\n", third == null ? mqtt.error() : "in");
+    a->disconnect();  a->dispose();
+    settle();
+    b->maxClients = 1000;
+
+    // maxSubsPerClient: a SUBACK with 128 (refused) for the filter that is one too many
+    b->maxSubsPerClient = 2;
+    int s1 = c->subscribeWait("t/1", 0, 2000);
+    int s2 = c->subscribeWait("t/2", 0, 2000);
+    int s3 = c->subscribeWait("t/3", 0, 2000);
+    printf("subscriptions: %d %d %d (128 = refused)\n", s1, s2, s3);
+
+    // maxQueue: what the broker keeps for an offline client with a session; the rest is dropped and counted
+    b->maxQueue = 3;
+    mqtt.Client* sleeper = login("sleeper", false);
+    sleeper->subscribeWait("job/#", 1, 2000);
+    sleeper->disconnect();  sleeper->dispose();
+    settle();
+    char text[8];
+    for (int i = 1; i <= 5; i++) {
+        format(&text[0], 8, "job %d", i);
+        c->publishWait("job/x", &text[0], strlen(&text[0]), 1, false, 2000);
+    }
+    printf("queued for the sleeper: %d, dropped: %d\n", b->sessionQueued("sleeper"), b->stats->dropped);
+    sleeper = login("sleeper", false);
+    for (int i = 0; i < 3; i++) {
+        mqtt.Message* m = sleeper->waitMessage(500);
+        printf("  %s\n", m->payload);
+    }
+    sleeper->disconnect();  sleeper->dispose();
+
+    // maxRetained: one more retained message than fits is delivered to subscribers but not kept
+    b->maxRetained = 1;
+    mqtt.Client* live = login("live", true);
+    live->subscribeWait("r/#", 0, 2000);
+    c->publishWait("r/1", "first", 5, 0, true, 2000);
+    c->publishWait("r/2", "second", 6, 0, true, 2000);
+    live->waitMessage(500)->dispose();
+    mqtt.Message* second = live->waitMessage(500);
+    printf("retained kept: %d, refused: %d, but the live subscriber still got %s\n", b->retainedCount(), b->stats->retainedRefused, second->payload);
+
+    // maxPacket: a packet over the limit ends the connection at its header. (A client that connects
+    // later gets the new value: the limit is copied into each connection when it opens.)
+    b->maxPacket = 100;
+    mqtt.Client* big = login("big", true);
+    char blob[300];
+    memset(&blob[0], 'x', 300);
+    big->publishWait("big", &blob[0], 300, 0, false, 300);
+    big->poll(100);                                           // let the client notice that the broker hung up
+    settle();
+    printf("a 300 byte message with maxPacket 100: the client is %s, malformed connections: %d\n", big->state == mqtt.ST_ONLINE ? "still online" : "disconnected", b->stats->malformed);
+    broker->shutdown();
+    return 0;
+}

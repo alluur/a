@@ -31,7 +31,7 @@ In this chapter:
 | `cstdio` | `<stdio.h>` | `FILE*`, `fopen`, `fgets`, `fprintf`, `sscanf`, `popen` |
 | `ctime` | `<time.h>` | `time`, `gmtime`, `localtime`, `mktime`, `strftime`, `strptime` |
 | `cmath` | `<math.h>` `<float.h>` | `sqrt`, `sin`, `pow`, `floor` ... on the bits of a double |
-| `cfloat` | (`strtod`, `printf` conversions) | `strtod`, `dtostr`, `printfd` with `%f %e %g %a` |
+| `cfloat` | (`strtod`, `printf` conversions) | `strtod`, `dtostr`, and `printfd`, the older printf with `%f %e %g` and also `%a` |
 | `cunistd` | `<unistd.h>` `<sys/stat.h>` `<dirent.h>` `<fcntl.h>` `<signal.h>` `<fnmatch.h>` | `open`, `stat`, `opendir`, `fork`, `signal`, `getopt` |
 | `ccomplex` | `<complex.h>` | `cmplx`, `cadd`, `cmul`, `cabs`, `cexp` ... |
 | `clocale` | `<locale.h>` | `setlocale`, `localeconv` (only the "C" locale) |
@@ -48,7 +48,7 @@ Some C functions are not in a module because every program already has them: `pr
 * One `import clib;` gives you files, `scanf`, `qsort`, dates, math, `malloc`, the environment and `system`.
 * `qsort` takes a function pointer: the type is `func`, and the comparison receives pointers to two elements as `char*`. Inside, you cast to the real type.
 * `fscanf` and friends take the *addresses* of the variables, as in C: `&amount`. Text goes in a `char` array, with no `&`.
-* The math line uses `dlit("2")` and `printfd` for a number with a fraction. The part "Floating point" below explains why.
+* The math line uses `dlit("2")` for a number with a fraction and prints it with `%f`: the C math functions work on the bits of a double. The part "Floating point" below explains it.
 
 ### What is different from C
 
@@ -56,7 +56,7 @@ Some C functions are not in a module because every program already has them: `pr
 |---|---|
 | `int` is 32 bits, `long` 64 | `int` and `long` are the same 64 bit type; `int32`, `uint32` ... when the width matters. `%d` prints a whole 64 bit value |
 | `char` is signed (usually) | `char` is an unsigned byte |
-| `printf` takes any number of arguments | `printf` and its relatives take up to **eight** values after the format; the `v...` versions (`vprintf`, `vsnprintf`) take an array of values and their count instead of a `va_list`. Your own functions can use `...` with `va_arg(i)` and `va_count()` |
+| `printf` takes any number of arguments | the same: `printf` and its relatives take any number of values after the format, and a `double` goes through `...` as its 64 bits, which `%f %e %g` read back. The `v...` versions (`vprintf`, `vsnprintf`) take an array of values and their count instead of a `va_list`. Your own functions can use `...` with `va_arg(i)` and `va_count()` |
 | `scanf` stores through pointers of the right size | every pointer target is 64 bits unless you say `%hhd` (1 byte) or `%hd` (2 bytes) |
 | `FILE*`, `stdin`, `stdout`, `stderr` | the same; the standard streams are constants. File output is buffered (4 KiB) and written at `fclose`, `fflush` and exit. `stdout` and `stderr` are not buffered |
 | `errno` is a thread local macro | `errno` is a plain global variable with the Linux numbers on every platform |
@@ -230,7 +230,7 @@ The language's own `new` and `alloc` never free memory, which suits short progra
 **What to notice.**
 
 * `srand48`, `lrand48`, `mrand48` and `drand48` give the same sequences as the C library of Linux (glibc): `srand48(2026)` starts with 894009023 there as well. That is useful when you must reproduce a sequence.
-* `drand48` returns a double as a bit pattern; print it with `printfd`.
+* `drand48` returns a double as a bit pattern; print it with `%f`.
 * `erand48` keeps its state in an array of three ints that you pass (each holds 16 bits of the 48 bit state), so several generators can run next to each other.
 * None of these is for security. For keys use `secure.bytes` (see [Cryptography](#chap-cryptography)).
 
@@ -243,9 +243,9 @@ The language's own `new` and `alloc` never free memory, which suits short progra
 **What to notice.**
 
 * The formats are those of C: flags `- 0 + space #`, width and precision (also `*`), the conversions `d i u x X o b c s p %` (`%b` is binary, which C does not have) and the length modifiers `h hh l ll z`.
-* At most eight values follow the format. A longer list goes through an array and `vprintf`, `vsnprintf` and their relatives.
+* Any number of values can follow the format (the older limit of eight is gone). `vprintf`, `vsnprintf` and their relatives take the values as an array instead.
 * `snprintf` never writes more than `size` bytes, including the zero, and returns the length of the full text. `asprintf` allocates the buffer for you (free it with `free`). `dprintf` writes to a file descriptor.
-* `printf` knows integers and text only. It does not understand `%f`, `%e` or `%g`: they come out as the characters you wrote. Numbers with a fraction are printed with `printfd` (below).
+* `printf` and its relatives also know `%f %F %e %E %g %G` and `%v` (the shortest text that reads back): the digits are exact, as [the chapter on inference, tuples, lambdas and string interpolation](#chap-inference-tuples-lambdas-interpolation) shows. `%a` is not among them; that is what `printfd` is for (below).
 
 ### Reading and writing files
 
@@ -429,7 +429,7 @@ The C library works with the **same 64 bits**, but it declares every double para
 ```a
 int x = dlit("2.5");               // text to a double, as bits
 int r = sqrt(dmul(x, x));          // functions on bit patterns: dadd dsub dmul ddiv dneg, sqrt sin pow ...
-printfd("%.3f\n", r);              // printf with %f %e %g %a: prints 2.500
+printf("%.3f\n", r);               // %f reads the 64 bits as a double: prints 2.500
 ```
 
 The two styles meet in two compiler functions: `__bits(d)` gives the 64 bits of a `double` as an `int`, and `__dbl(i)` makes a `double` from 64 bits. Neither changes a single bit; they only change what the compiler thinks the value is.
@@ -442,7 +442,7 @@ The two styles meet in two compiler functions: `__bits(d)` gives the 64 bits of 
 | square root, sine, power | `dmath.sqrt(x)`, `dmath.sin(x)`, `dmath.pow(x, y)` | `sqrt(x)`, `sin(x)`, `pow(x, y)` |
 | pi, e | `dmath.PI`, `dmath.E` | `M_PI`, `M_E` |
 | convert to an `int` | `(int) d` | `dtoi(x)` |
-| print | `printlnDouble(d)`, `doubleToFixed(d, 3)` | `printfd("%.3f", x)` |
+| print | `printlnDouble(d)`, `doubleToFixed(d, 3)`, `printf("%.3f", d)` | `printf("%.3f", x)` (`printfd` for `%a`) |
 | read from text | `parseDouble(text)` | `strtod`, `atof`, `dlit`, `sscanf` with `%lf` |
 
 ### The bridge and its traps
@@ -453,7 +453,7 @@ The compiler converts between `int` and `double` by itself wherever the declared
 
 Bit patterns and `double` values are never converted into each other by the compiler. Every crossing needs `__bits` or `__dbl`.
 
-* **A `double` goes into a C function.** The parameter is an `int`, so the value is converted to an integer, not reinterpreted: `printf("%d", 3.99)` prints 3, and `printfd("%.2f", 3.99)` prints `0.00` because it reads the integer 3 as the bits of a tiny number. `sqrt(x)` with `x = 2.0` is the square root of the number whose bits are 2, about 3.1e-162. Pass `__bits(d)`.
+* **A `double` goes into a C function.** The parameter is an `int`, so the value is converted to an integer, not reinterpreted: `printfd("%.2f", 3.99)` prints `0.00` because it reads the integer 3 as the bits of a tiny number. `sqrt(x)` with `x = 2.0` is the square root of the number whose bits are 2, about 3.1e-162. Pass `__bits(d)`. (`printf` is different, because its values are the `...` of the function: a `double` goes through as its bits. There the trap is `%d`: `printf("%d", 3.99)` prints 4616167100056621548, the bits, not 3. Write `(int) d`.)
 * **A C function result goes into a `double`.** The result is an `int`, so it is converted to the number with that value: `double y = sqrt(dlit("2"));` gives 4.6e18, the value of the bits as a whole number. Write `double y = __dbl(sqrt(dlit("2")));`.
 * **The constants of `cmath` are bit patterns.** `double x = M_PI;` converts the integer `0x400921FB54442D18` and gives 4.6e18, not 3.14159. Write `__dbl(M_PI)`, or use `dmath.PI`. The same holds for `M_E`, `INFINITY`, `NAN`, `DBL_MAX` and `DBL_EPSILON`.
 * **Comparisons compile too.** `3.5 > M_PI` compares 3.5 with 4.6e18 and is false. `dlt(a, b)` and the other `d...` functions want bits, so give them `__bits(a)`, or use `a < b`.
@@ -468,10 +468,10 @@ The next sample shows the bridge in both directions, and the mistakes.
 **What to notice.**
 
 * The wrappers `sqrtd` and `powd` are one line each: bits out, C function, bits back. If you use the C functions with typed doubles a lot, write such wrappers, or use `dmath`, which has them.
-* `printfd` takes `__bits(...)` for each `%f`. Integers, like the `3` in `3 items of`, are passed as they are.
+* `printf` takes a `double` as it is, and `%f` reads its 64 bits back: `sqrtd(x)`, `9.99` and `3 * 9.99` need no `__bits`. The result of the C function `sqrt` is already a bit pattern, and `%f` prints that as it is. Integers, like the `3` in `3 items of`, are passed as they are.
 * `sscanf("%lf", &v)` stores through a pointer to a `double` variable: the pointer is just an address, so no conversion takes place.
 * `(3 + 4) * 0.5` and `dmul(dadd(itod(3), itod(4)), dlit("0.5"))` produce the same 64 bits. The two styles are two ways to write the same arithmetic.
-* The five lines after `3.141592653589793` are the mistakes. `double wrong = M_PI;` and `double alsoWrong = sqrt(dlit("2"));` print 4.614256656552046e+18 and 4.6090478708451727e+18: the bit patterns, read as whole numbers. `printf("%d", 3.99)` shows `3`, and `printfd("%.2f", 3.99)` shows `0.00`. The last line, 3.1434555694052576e-162, is `sqrt(x)` for the double `x = 2.0`.
+* The five lines after `3.141592653589793` are the mistakes. `double wrong = M_PI;` and `double alsoWrong = sqrt(dlit("2"));` print 4.614256656552046e+18 and 4.6090478708451727e+18: the bit patterns, read as whole numbers. `printf("%d", 3.99)` shows `4616167100056621548`, the 64 bits of 3.99 (the cast `(int) 3.99` gives 3), and `printfd("%.2f", 3.99)` shows `0.00`: its parameters are `int`, so 3.99 became the integer 3. The last line, 3.1434555694052576e-162, is `sqrt(x)` for the double `x = 2.0`.
 
 The samples below use the bit pattern style, because that is the style of the C library and of the C programs that you port. When a C program says `double x = sqrt(y) * 2`, you can write the same with the `double` type and `dmath`, as the port at the end of this chapter does.
 
@@ -489,10 +489,10 @@ The samples below use the bit pattern style, because that is the style of the C 
 
 **What to notice.**
 
-* `printfd`, `sprintfd`, `snprintfd` and `fprintfd` (the last one is in `cstdio`) understand `%f %F %e %E %g %G %a %A` with the usual flags, width and precision. All other conversions work as in `printf`.
+* `printf`, `sprintf`, `snprintf` and `fprintf` understand `%f %F %e %E %g %G` (and `%v`) with the usual flags, width and precision. `printfd`, `sprintfd`, `snprintfd` and `fprintfd` (the last one is in `cstdio`) are the older functions for the same job, and the only ones that also know `%a %A`, hexadecimal floating point: `[0x1p-1]` in the sample.
 * The digits are exact: `%.30f` of 0.1 shows `0.100000000000000005551115123126`, and `%.0f` of 1e22 shows all 23 digits.
-* `%g` works as in C: it uses the `%e` style when the exponent is below -4 or not below the precision (6 by default), the `%f` style otherwise, and drops trailing zeros (`1234.57`, `1.234e-05`, `1.23457e+08` in the sample). `%a` is the exact hexadecimal form.
-* The eight value limit applies, as for `printf`: after the format come at most eight values, and the compiler rejects a longer call. Each `%f` value must be a bit pattern, `__bits(d)` for a `double` (see above).
+* `%g` works as in C: it uses the `%e` style when the exponent is below -4 or not below the precision (6 by default), the `%f` style otherwise, and drops trailing zeros (`1234.57`, `1.234e-05`, `1.23457e+08` in the sample). `%a` (`printfd` only) is the exact hexadecimal form.
+* `printfd` still takes at most eight values after the format (the compiler rejects a longer call), and each `%f` value must be a bit pattern, `__bits(d)` for a `double`, because its parameters are `int`. `printf` has neither limit.
 
 ### Mathematical functions: cmath
 
@@ -677,9 +677,8 @@ The output is character for character what `gcc` prints for the C version. These
 | `static int used` | `int used` | `static` also works (it is the same as `private`); in a program that is one unit it makes no difference |
 | `const void *a` in `compare` | `char* a`, then `Entry* x = (Entry*) a;` | `qsort` passes `char*` pointers; the cast moves into the function |
 | `qsort(table, used, sizeof table[0], compare)` | `qsort((char*) table, used, sizeof(Entry), compare)` | the array is passed as `char*` |
-| `100.0 * count / total` printed with `%5.1f` | `double percent = ...;` and `printfd(..., __bits(percent))` | the `double` type works as in C, but `printfd` takes bits |
 
-What did *not* have to change: the declarations with several names (`int len = 0, c, total = 0;`), `word[len++] = tolower(c)`, the `for (int i = 0; ...)` loops, `strncpy`, `strcmp`, `getchar`, the formats `%-10s %3d`, which `printfd` reads like `printf`.
+What did *not* have to change: the declarations with several names (`int len = 0, c, total = 0;`), `word[len++] = tolower(c)`, the `for (int i = 0; ...)` loops, `strncpy`, `strcmp`, `getchar`, the formats `%-10s %3d`, and even `%5.1f%%` with the expression `100.0 * table[i].count / total` as its value: `double` arithmetic and `printf` with `%f` work as in C.
 
 ### Step 2: a program with options and error messages
 
@@ -702,7 +701,7 @@ The third program reads numbers and prints their mean and standard deviation. In
 
 * The declarations and the loops are the C text. `sum += x`, `(v[i] - mean) * (v[i] - mean)` and `v[i] < lo` work on real `double` values.
 * `scanf("%lf", &x)` stores the 64 bits through the pointer, and `x` is a valid `double` afterwards.
-* The two places that changed are the output (`__bits(mean)` for `printfd`) and `sqrt`, which is `dmath.sqrt` for a `double`. The C library `sqrt` would take bits.
+* Only one line changed: `sqrt`, which is `dmath.sqrt` for a `double` (the C library `sqrt` would take bits). The `printf` calls with `%.3f` and `%g` are the C text.
 * Again the output equals that of the C program compiled with `gcc`.
 
 ### Step 4: the traps
@@ -715,7 +714,7 @@ The third program reads numbers and prints their mean and standard deviation. In
 * `sscanf("%d")` stores 8 bytes. The `%hhd` conversion stores one.
 * `010` is ten, not eight. Reading code that uses octal permissions (`0755`, `0644`) is the most dangerous: the program compiles and gets the wrong mode.
 * `uint32` wraps at 32 bits, `int` does not.
-* A `double` handed to `printf` is truncated to an integer.
+* `printf("%f", x)` prints a `double` as in C, but `%d` with a `double` prints its 64 bits (4614256650576692846 for 3.14159): cast to `int` first.
 * A function pointer (`func`) has no signature and no check. A call returns an `int`.
 * `malloc` returns zeroed memory, and string literals are writable.
 
@@ -724,21 +723,21 @@ The third program reads numbers and prints their mean and standard deviation. In
 1. Replace each `#include` by the `import` of the module in the table at the top of the chapter, or write `import clib;`.
 2. Change `const char*` and `const void*` to `char*`, and `NULL` to `null` (`NULL` also exists in `climits`).
 3. Cast the arguments of `qsort` and `bsearch`; read the elements through casts inside the comparison.
-4. Check every `printf` with more than eight values, and every `va_list`.
+4. Replace every `va_list` by `...` with `va_arg(i)` and `va_count()`, or by an array and one of the `v...` functions.
 5. Replace octal numbers by decimal or binary ones.
 6. Check sizes: `%d` for 64 bit `int`, `%hhd` in `scanf` for bytes, `uint32` where 32 bit wrap matters.
-7. Print doubles with `printfd(..., __bits(x))`. Pass `__bits(x)` to the C math functions and wrap their results in `__dbl(...)`, or use `dmath`, which does both for you.
+7. Print doubles with `printf`, as in C (an `int` is not converted: write `(double) n` for `%f`). Pass `__bits(x)` to the C math functions and wrap their results in `__dbl(...)`, or use `dmath`, which does both for you.
 8. Run the original and the port on the same input, and compare the output.
 
 ## Summary
 
 * `import clib;` gives all of the C library; the individual modules (`cstdio`, `cstring`, ...) show what a program depends on. The names are the C names, in the global namespace.
-* `int` is 64 bits, `char` is an unsigned byte, there are no octal literals, and `printf`-style functions take up to eight values (arrays go through the `v...` functions).
+* `int` is 64 bits, `char` is an unsigned byte, there are no octal literals, and `printf`-style functions take any number of values (the `v...` functions take an array).
 * `strtol`, `strtod` and `sscanf` tell you how much of the text they used; check it. `snprintf`, `strlcpy` and `getline` avoid overflowing buffers.
 * `qsort`, `bsearch`, `atexit` and `signal` take `func` pointers; the arguments are `char*` or `int`, and you cast inside.
 * `cunistd` has descriptors, `stat`, directories, `getopt`, `fnmatch`, `fork` and `signal`; `ctime` has `gmtime`, `mktime`, `strftime`, `strptime` and POSIX time zones.
 * `double` is a type of the language; the C math and print functions take it as a bit pattern in an `int`: `__bits(d)` and `__dbl(i)` connect the two. The compiler converts between `int` and `double` but never reinterprets bits, so `double x = M_PI;` gives 4.6e18 and `printfd("%.2f", 3.99)` prints `0.00`.
-* Porting is mostly renaming: headers become imports, `const` and `void*` become `char*`, and the output of `printf("%f")` becomes `printfd`.
+* Porting is mostly renaming: headers become imports, `const` and `void*` become `char*`, and `printf("%f")` stays `printf`: it prints a `double` as C does.
 
 ## Where next
 

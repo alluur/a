@@ -22,6 +22,7 @@ What to notice:
 - An array, a struct, a `bool` and a pointer are all zero at the start; a zero pointer is `null`.
 - `Point q = p;` copies the whole struct. `q.x = 9` changes only the copy.
 - An assignment is an expression with a value, so `int d = a = 3;` sets both. Use that sparingly.
+- `var n = 5;` lets the compiler take the type from the initializer (here `int`). It is described, with tuples such as `(int q, int r) = divmod(7, 2);`, in [Type inference, tuples, lambdas and string interpolation](#chap-inference-tuples-lambdas-interpolation).
 
 ## Constants
 

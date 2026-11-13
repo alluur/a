@@ -1,0 +1,75 @@
+// Users, passwords and who may publish or subscribe what
+import mqtt;
+import mqttd;
+import net;
+
+mqttd.Server* broker;
+int serve() { broker->poll(0); return 0; }
+int port;
+
+void tryLogin(char* who, char* userInfo) {                  // userInfo: "" or "user:password@"
+    char url[120];
+    format(&url[0], 120, "mqtt://%s127.0.0.1:%d", userInfo, port);
+    mqtt.Client* c = mqtt.connect(&url[0]);
+    printf("%-22s -> %s\n", who, c != null ? "connected" : mqtt.error());
+    if (c != null) { c->disconnect(); c->dispose(); }
+}
+
+// The ACL hook decides for every PUBLISH (op 1) and every filter of a SUBSCRIBE (op 2); 1 means yes.
+// The broker passes the client id, so ids are a handy way to tell roles apart.
+int acl(mqttd.Broker* b, char* clientId, int op, char* topic) {
+    if (op == 2) return startsWith(topic, "public/") ? 1 : 0;
+    return startsWith(clientId, "writer") ? 1 : 0;
+}
+
+// Instead of a table of users, a hook can decide: it returns a CONNACK code (0 = accept)
+int tokenOnly(mqttd.Broker* b, char* clientId, char* user, char* pass, int passLen) {
+    if (user == null) return mqtt.CONNACK_NOT_AUTHORIZED;
+    return strcmp(pass, "t0ken") == 0 ? 0 : mqtt.CONNACK_BAD_CREDENTIALS;
+}
+
+int main() {
+    broker = mqttd.newServer();
+    broker->broker->sysIntervalMs = 0;
+    broker->listenOn("127.0.0.1", 0, null);
+    port = broker->port;
+    net.setIdleHook(serve);
+    mqttd.Broker* b = broker->broker;
+
+    println("1. a table of users");
+    b->addUser("alice", "secret");
+    b->allowAnonymous = false;
+    tryLogin("alice, right password", "alice:secret@");
+    tryLogin("alice, wrong password", "alice:guess@");
+    tryLogin("nobody", "");
+    tryLogin("unknown user", "mallory:secret@");
+
+    println("\n2. a hook instead of the table");
+    b->authHook = tokenOnly;
+    tryLogin("token t0ken", "bot:t0ken@");
+    tryLogin("token other", "bot:other@");
+    b->authHook = null;                                      // back to the table ...
+    b->allowAnonymous = true;                                // ... but now strangers are welcome again, for the rest of the sample
+
+    println("\n3. the ACL");
+    b->aclHook = acl;
+    char url[80];
+    format(&url[0], 80, "mqtt://127.0.0.1:%d", port);
+    mqtt.Options o1();  o1.clientId = "reader-1";
+    mqtt.Options o2();  o2.clientId = "writer-1";
+    mqtt.Client* reader = mqtt.connectWith(&url[0], &o1);
+    mqtt.Client* writer = mqtt.connectWith(&url[0], &o2);
+    printf("reader subscribes to public/news: %d\n", reader->subscribeWait("public/news", 1, 2000));
+    printf("reader subscribes to private/x:   %d (128 = refused)\n", reader->subscribeWait("private/x", 1, 2000));
+    printf("writer subscribes to public/#:    %d\n", writer->subscribeWait("public/#", 1, 2000));
+
+    // A refused PUBLISH is still acknowledged: MQTT 3.1.1 has no way to say "no" to a publisher
+    bool acked = reader->publishWait("public/news", "from reader", 11, 1, false, 2000);
+    mqtt.Message* m = writer->waitMessage(100);
+    printf("reader publishes: acknowledged %d, delivered %d\n", acked ? 1 : 0, m == null ? 0 : 1);
+    writer->publishWait("public/news", "from writer", 11, 1, false, 2000);
+    m = reader->waitMessage(2000);
+    printf("writer publishes: delivered \"%s\"\n", m->payload);
+    broker->shutdown();
+    return 0;
+}

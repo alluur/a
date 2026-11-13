@@ -216,7 +216,7 @@ What to notice:
 
 ### Printing, parsing and inspecting
 
-`printf` from the prelude does not understand `%f` (it prints the two characters `%f` as they are). Use the double helpers: `printlnDouble(d)` and `printDouble(d)` write the **shortest text that reads back as exactly the same number**; `doubleToText(d)` returns the same text as a string; `doubleToFixed(d, n)` rounds to `n` decimals; `doubleToSci(d, n)` writes scientific notation; `parseDouble(text)` reads a number; `isNaN`, `isInf` and `isFinite` classify a value. `__bits(d)` returns the 64 raw bits of a double as an `int`, and `__dbl(i)` builds a double from 64 bits.
+`printf` prints a `double` with `%f`, `%e`, `%g` or `%v`, for example `printf("%.2f", d)` (see [Type inference, tuples, lambdas and string interpolation](#chap-inference-tuples-lambdas-interpolation)). The prelude also has double helpers: `printlnDouble(d)` and `printDouble(d)` write the **shortest text that reads back as exactly the same number**; `doubleToText(d)` returns the same text as a string; `doubleToFixed(d, n)` rounds to `n` decimals; `doubleToSci(d, n)` writes scientific notation; `parseDouble(text)` reads a number; `isNaN`, `isInf` and `isFinite` classify a value. `__bits(d)` returns the 64 raw bits of a double as an `int`, and `__dbl(i)` builds a double from 64 bits.
 
 {{sample lang/double_text}}
 
@@ -225,7 +225,7 @@ What to notice:
 - `0.1 + 0.2` prints as `0.30000000000000004`, and `2.0 / 3` as `0.6666666666666666`: those are the shortest texts that identify the numbers. Binary floating point cannot hold 0.1 exactly; every IEEE system behaves like this.
 - Division by zero gives infinity and `inf - inf` is **NaN** ("not a number"). A NaN is not equal to anything, not even itself: `nan == nan` is 0. Use `isNaN`.
 - `__bits(1.0)` is `3ff0000000000000`. Adding 1 to the bits of `1.0` gives the next larger double, `1.0000000000000002`.
-- The C library functions `printfd`, `sprintfd` and the like (module `cfloat`, which a program that uses `double` loads automatically) understand `%f %e %g %a` but take **bit patterns**, not doubles. With `double d = 2.5;`, `printfd("%.2f\n", __bits(d))` prints `2.50`, but `printfd("%.2f\n", d)` prints `0.00`: the parameters are `int`, so `d` is first converted to the integer 2 and that is read as a bit pattern (a tiny number). There is no warning.
+- With `double d = 2.5;`, `printf("%.2f\n", d)` prints `2.50`: a `double` goes through the `...` of `printf` as its 64 bits, and `%f` reads them back (`%d` would show the bits instead). The older C library functions `printfd`, `sprintfd` and the like (module `cfloat`, which a program that uses `double` loads automatically) have `int` parameters and take **bit patterns**: `printfd("%.2f\n", __bits(d))` prints `2.50`, but `printfd("%.2f\n", d)` prints `0.00`, because `d` is first converted to the integer 2 and that is read as a bit pattern (a tiny number). There is no warning. Use `printf`.
 
 ### Mathematics
 
@@ -256,7 +256,7 @@ Older parts of the C library reference describe a double as an `int` that holds 
 - `size_t` is `uint64`; `ssize_t`, `intptr_t` and `ptrdiff_t` are `int64`.
 - A cast `(type) x` truncates, extends or reinterprets; `sizeof` gives sizes in bytes at compile time.
 - Literals: `42`, `0xFF`, `0b1010`, `1_000`, `'a'`, `"text\n"`, `true`, `false`, `null`; adjacent strings are joined.
-- `double` (alias `float`) is IEEE 754 binary64, done in software: identical on every target, but not fast. Mix it with `int` freely, cast with `(int)` to truncate, print with `printlnDouble` or `doubleToFixed`, and call the maths functions as `dmath.sqrt(x)`.
+- `double` (alias `float`) is IEEE 754 binary64, done in software: identical on every target, but not fast. Mix it with `int` freely, cast with `(int)` to truncate, print with `printf("%.2f", x)`, `printlnDouble` or `doubleToFixed`, and call the maths functions as `dmath.sqrt(x)`.
 
 ## Where next
 

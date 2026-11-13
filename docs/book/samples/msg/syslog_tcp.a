@@ -1,0 +1,85 @@
+// syslog over TCP: how messages are framed, and a collector that is not there yet
+import syslog;
+import syslogd;
+import net;
+
+int TS = 1065910455;
+syslogd.Server* server;
+int serve() { server->poll(0); return 0; }
+
+void show(char* bytes, int n) {
+    for (int i = 0; i < n; i++) {
+        if (bytes[i] == 10) printf("\\n"); else printf("%c", bytes[i]);
+    }
+    println("");
+}
+
+syslog.Sender* makeSender(int port) {
+    char url[80];
+    format(&url[0], 80, "tcp://127.0.0.1:%d", port);
+    syslog.Sender* s = syslog.newSender(&url[0]);
+    s->setHostName("web1");
+    s->setApp("shop", "42");
+    s->now = TS;
+    s->fracDigits = 0;
+    return s;
+}
+
+int main() {
+    net.setIdleHook(serve);
+    server = syslogd.newServer();
+    server->collector->setClock(TS);
+    server->listenTcp(0);
+
+    // 1. What TCP carries. A plain listening socket plays the collector, so that we see the bytes.
+    int listener = net.listenOn("127.0.0.1", 0, 4);
+    syslog.Sender* s = makeSender(net.localPort(listener));
+    s->info("hello");
+    s->flush(1000);
+    int peer = net.accept(listener);
+    char buf[300];
+    int n = net.recv(peer, &buf[0], 300);
+    printf("octet counting (the default): ");
+    show(&buf[0], n);
+    s->dispose();
+    net.close(peer);
+
+    s = makeSender(net.localPort(listener));
+    s->framing = syslog.FRAMING_NEWLINE;
+    s->info("hello");
+    s->info("two\nlines");                                    // a line feed would end the frame: it becomes a blank
+    s->flush(1000);
+    peer = net.accept(listener);
+    n = net.recv(peer, &buf[0], 300);
+    printf("newline framing: ");
+    show(&buf[0], n);
+    s->dispose();
+    net.close(peer);
+    net.close(listener);
+
+    // 2. A collector that is down: the sender does not block. It keeps the messages in a queue.
+    int dead = net.listenOn("127.0.0.1", 0, 4);
+    int deadPort = net.localPort(dead);
+    net.close(dead);                                          // nobody listens on this port now
+    s = makeSender(deadPort);
+    s->connectTimeoutMs = 300;
+    for (int i = 1; i <= 5; i++) {
+        char text[40];
+        format(&text[0], 40, "event %d", i);
+        s->info(&text[0]);
+    }
+    printf("collector down: queued %d, sent %d, connection errors %d\n", s->queued(), s->sent, s->errors);
+
+    // 3. Point the sender at a collector that is up: the queue is delivered, in order
+    s->setTarget("127.0.0.1", server->tcpPort);
+    s->retryIntervalMs = 0;
+    s->flush(3000);
+    int quiet = 0;
+    while (quiet < 20) { if (server->poll(1) == 0) quiet++; else quiet = 0; }
+    syslogd.Ring* ring = server->collector->ring;
+    printf("collector up: queued %d, sent %d, the collector has %d lines\n", s->queued(), s->sent, ring->count());
+    printf("  first: %s\n  last:  %s\n", ring->line(0), ring->line(ring->count() - 1));
+    s->dispose();
+    server->shutdown();
+    return 0;
+}

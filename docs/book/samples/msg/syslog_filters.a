@@ -1,0 +1,82 @@
+// Filters and routes in a collector: who gets which message
+import syslog;
+import syslogd;
+
+int TS = 1065910455;
+syslogd.Server* server;
+
+void settle() {
+    int quiet = 0;
+    while (quiet < 20) { if (server->poll(1) == 0) quiet++; else quiet = 0; }
+}
+
+syslog.Sender* sender;
+void log(char* host, char* app, int severity, char* text) {
+    sender->setHostName(host);
+    sender->setApp(app, "1");
+    sender->send(severity, text);
+}
+
+void show(char* title, syslogd.Ring* ring) {
+    printf("%s (%d)\n", title, ring->count());
+    for (int i = 0; i < ring->count(); i++) printf("   %s\n", ring->line(i));
+}
+
+int main() {
+    server = syslogd.newServer();
+    syslogd.Collector* col = server->collector;
+    col->setClock(TS);
+    col->lineFormat = syslogd.LINE_DETAIL;                    // shows host, facility.severity and program
+    server->listenUdp(0);
+
+    // Drop first: whatever matches the drop filter is thrown away before any route sees it
+    syslogd.Filter* noisy = syslogd.newFilter();
+    noisy->host = "noisy*";                                   // a glob: * and ?
+    col->dropFilter = noisy;
+
+    // Route 1: "err and worse" from anybody. setSeverityUpTo(n) means severity n and every more severe one.
+    syslogd.Filter* problems = syslogd.newFilter();
+    problems->setSeverityUpTo(syslog.SEV_ERR);
+    syslogd.Ring* problemRing = col->addRing(problems, 100, 65536);
+
+    // Route 2: everything from the program sshd
+    syslogd.Filter* ssh = syslogd.newFilter();
+    ssh->program = "sshd";
+    syslogd.Ring* sshRing = col->addRing(ssh, 100, 65536);
+
+    // Route 3: sshd AND a regular expression over the text
+    syslogd.Filter* attacks = syslogd.newFilter();
+    attacks->program = "sshd";
+    attacks->setPattern("Failed|refused");
+    syslogd.Ring* attackRing = col->addRing(attacks, 100, 65536);
+
+    // Route 4: everything except nginx (invert turns a match around)
+    syslogd.Filter* notNginx = syslogd.newFilter();
+    notNginx->program = "nginx";
+    notNginx->invert = true;
+    syslogd.Ring* otherRing = col->addRing(notNginx, 100, 65536);
+
+    char url[80];
+    format(&url[0], 80, "udp://127.0.0.1:%d", server->udpPort);
+    sender = syslog.newSender(&url[0]);
+    sender->now = TS;
+    sender->facility = syslog.FAC_DAEMON;
+    log("web1", "sshd", syslog.SEV_INFO, "Accepted publickey for ada");
+    log("web1", "sshd", syslog.SEV_WARNING, "Failed password for root");
+    log("web1", "sshd", syslog.SEV_ERR, "Connection refused by 10.0.0.9");
+    log("web2", "nginx", syslog.SEV_ERR, "upstream timed out");
+    log("web2", "nginx", syslog.SEV_INFO, "GET / 200");
+    log("noisy1", "cron", syslog.SEV_DEBUG, "tick");
+    log("db1", "postgres", syslog.SEV_CRIT, "out of memory");
+    settle();
+
+    show("the default ring: everything that was not dropped", col->ring);
+    show("err and worse", problemRing);
+    show("program sshd", sshRing);
+    show("sshd and \"Failed|refused\"", attackRing);
+    show("not nginx", otherRing);
+    printf("received %d, dropped by the drop filter %d\n", col->stats->received, col->stats->dropped);
+    sender->dispose();
+    server->shutdown();
+    return 0;
+}

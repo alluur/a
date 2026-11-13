@@ -1,0 +1,74 @@
+// One certificate, three protocols: mqtts://, rediss:// and tls:// (syslog)
+import mqtt;
+import mqttd;
+import redis;
+import redisd;
+import syslog;
+import syslogd;
+import tls;
+import x509;
+import net;
+import testcert;                                          // a throw-away certificate, listed after the program
+
+mqttd.Server* broker;
+redisd.Server* store;
+syslogd.Server* collector;
+int serve() { broker->poll(0); store->poll(0); collector->poll(0); return 0; }
+
+int main() {
+    // The same listener calls as without TLS, with a configuration (certificate and key) instead of null
+    tls.Config* cfg = tls.loadConfig(testcert.CERT_PEM, testcert.KEY_PEM);
+    broker = mqttd.newServer();
+    broker->broker->sysIntervalMs = 0;
+    broker->listenOn("127.0.0.1", 0, cfg);
+    store = redisd.newServer();
+    store->listenOn("127.0.0.1", 0, cfg);
+    collector = syslogd.newServer();
+    collector->collector->setClock(1065910455);
+    collector->listenOn("127.0.0.1", 0, cfg);
+    net.setIdleHook(serve);
+
+    char mqttUrl[60], redisUrl[60], syslogUrl[60];
+    format(&mqttUrl[0], 60, "mqtts://127.0.0.1:%d", broker->port);
+    format(&redisUrl[0], 60, "rediss://127.0.0.1:%d", store->port);
+    format(&syslogUrl[0], 60, "tls://127.0.0.1:%d", collector->tcpPort);
+
+    // 1. Nobody trusts the throw-away certificate yet: every client refuses the server
+    x509.clearRoots();                                    // (also keeps the system's roots out of this sample)
+    printf("mqtt, untrusted:   %s\n", mqtt.connect(&mqttUrl[0]) == null ? mqtt.error() : "connected");
+    printf("redis, untrusted:  %s\n", redis.connect(&redisUrl[0]) == null ? redis.error() : "connected");
+    syslog.Sender* log = syslog.newSender(&syslogUrl[0]);
+    log->setHostName("web1");  log->setApp("shop", "1");  log->now = 1065910455;
+    log->info("never sent");
+    printf("syslog, untrusted: delivered %d, message waits in the queue (%d), errors %d\n", log->flush(300) ? 1 : 0, log->queued(), log->errors);
+    log->dispose();
+
+    // 2. Trust it: x509.addRootPem takes a certificate (or a CA) of your own
+    x509.addRootPem(testcert.CERT_PEM);
+    mqtt.Client* sub = mqtt.connect(&mqttUrl[0]);
+    mqtt.Client* pub = mqtt.connect(&mqttUrl[0]);
+    sub->subscribeWait("secure", 1, 3000);
+    pub->publishWait("secure", "hello", 5, 1, false, 3000);
+    printf("mqtt, trusted:     got \"%s\"\n", sub->waitMessage(3000)->payload);
+
+    redis.Client* c = redis.connect(&redisUrl[0]);
+    c->set("secure", "world");
+    char* v = c->get("secure");
+    printf("redis, trusted:    got \"%s\"\n", v);
+    free(v);
+
+    log = syslog.newSender(&syslogUrl[0]);
+    log->setHostName("web1");  log->setApp("shop", "1");  log->now = 1065910455;
+    log->info("encrypted line");
+    log->flush(3000);
+    int quiet = 0;
+    while (quiet < 20) { if (collector->poll(1) == 0) quiet++; else quiet = 0; }
+    printf("syslog, trusted:   %s (over TLS: %d)\n", collector->collector->ring->line(0), collector->collector->stats->tls);
+
+    // 3. A plain client on a TLS port cannot even say hello
+    char plain[60];
+    format(&plain[0], 60, "redis://127.0.0.1:%d", store->port);
+    redis.Client* p = redis.connect(&plain[0]);
+    printf("redis, plain:      %s\n", p == null ? redis.error() : (p->ping() ? "works" : "connected, but ping fails"));
+    return 0;
+}

@@ -1,0 +1,69 @@
+// Application: a cache in front of a slow function, with Redis
+import redis;
+import redisd;
+import net;
+
+redisd.Server* server;
+int serve() { server->poll(0); return 0; }
+
+int slowCalls = 0;
+int slowSquare(int n) {                                       // pretend this takes seconds
+    slowCalls++;
+    return n * n;
+}
+
+redis.Client* cache;
+
+// Ask the cache first. On a miss compute the value and keep it for 300 ms (a real cache: minutes).
+int cachedSquare(int n) {
+    char key[40];
+    format(&key[0], 40, "square:%d", n);
+    char* hit = cache->get(&key[0]);
+    if (hit != null) {
+        int v = atoi(hit);
+        free(hit);
+        cache->incr("stats:hits");                            // the counters live in Redis too: every process of the app shares them
+        return v;
+    }
+    cache->incr("stats:misses");
+    int v = slowSquare(n);
+    char text[24];
+    format(&text[0], 24, "%d", v);
+    redis.Reply* r = cache->call("SET", &key[0], &text[0], "PX", "300");     // SET key value PX milliseconds
+    r->dispose();
+    return v;
+}
+
+void stats(char* when) {
+    char* h = cache->get("stats:hits");
+    char* m = cache->get("stats:misses");
+    printf("%-34s hits %s, misses %s, slow function called %d times\n", when, h == null ? "0" : h, m == null ? "0" : m, slowCalls);
+    if (h != null) free(h);
+    if (m != null) free(m);
+}
+
+int main() {
+    server = redisd.newServer();
+    server->listenOn("127.0.0.1", 0, null);
+    net.setIdleHook(serve);
+    char url[80];
+    format(&url[0], 80, "redis://127.0.0.1:%d", server->port);
+    cache = redis.connect(&url[0]);
+
+    int asked[6];
+    asked[0] = 4; asked[1] = 4; asked[2] = 5; asked[3] = 4; asked[4] = 5; asked[5] = 5;
+    for (int i = 0; i < 6; i++) printf("square(%d) = %d\n", asked[i], cachedSquare(asked[i]));
+    stats("after six lookups of two numbers:");
+
+    sleepMs(400);                                             // the entries expire by themselves
+    printf("square(4) after 400 ms = %d\n", cachedSquare(4));
+    stats("after the entry expired:");
+
+    // Invalidation: when the source changes, delete the cached value
+    cache->del("square:4");
+    printf("square(4) after DEL = %d\n", cachedSquare(4));
+    stats("after an invalidation:");
+    cache->dispose();
+    server->shutdown();
+    return 0;
+}

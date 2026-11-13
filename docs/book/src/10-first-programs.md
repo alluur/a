@@ -55,7 +55,7 @@ What to notice:
 
 ## Formatted output with printf
 
-`printf(format, a, b, ...)` prints a template in which `%` conversions are replaced by the values that follow. It takes **up to eight values**; a ninth one is a compile error (`wrong number of arguments in call`). Text and pointers are passed as they are, and every value is a 64-bit number.
+`printf(format, a, b, ...)` prints a template in which `%` conversions are replaced by the values that follow. It takes **any number of values**. Text and pointers are passed as they are, every integer is a 64-bit number, and a `double` is passed as its 64 bits.
 
 | Conversion | Meaning |
 |---|---|
@@ -66,6 +66,8 @@ What to notice:
 | `%c` | one character |
 | `%s` | a string (`(null)` for a null pointer) |
 | `%p` | a pointer, as `0x...` (`(nil)` for null) |
+| `%f` `%e` `%g` | a `double`: fixed, scientific, or the shorter of the two (`%F` `%E` `%G` write `INF`, `NAN` and `E` in capitals) |
+| `%v` | a `double` as the shortest text that reads back as the same number |
 | `%%` | a percent sign |
 
 Between `%` and the letter you can put flags `-` (left align), `0` (pad with zeros), `+` (always a sign), a space (a space for positive numbers) and `#` (a `0x`, `0` or `0b` prefix), then a minimum width, then `.precision` (at least that many digits for numbers, at most that many characters for `%s`). A `*` takes the width or precision from the next value. The C length modifiers `h hh l ll z j t` are accepted: `h` and `hh` cut the value to 16 or 8 bits, the others change nothing.
@@ -77,7 +79,7 @@ What to notice:
 - `[%05d]` pads with zeros, `[%-5d]` pads on the right, and `%+d` forces a sign.
 - `%.3s` cuts a string to three characters, `%*d` takes its width from the argument list.
 - `%u` shows the 64 bits of `-1` as an unsigned number. Use `%d` for ordinary numbers.
-- `printf` does not format numbers with a decimal point. For `double` values see the end of [chapter 11](#chap-types-and-values).
+- `%8.3f`, `%e` and `%g` print a `double`: `printf("%.2f", 3.14159)` prints `3.14`. Do not use `%d` for a `double` (it prints the 64 bits of the number) and do not use `%f` for an `int` (write `(double) n`). The details are in [Type inference, tuples, lambdas and string interpolation](#chap-inference-tuples-lambdas-interpolation), and the end of [chapter 11](#chap-types-and-values) has more ways to print a `double`.
 
 ## Formatting into a buffer
 
@@ -243,7 +245,7 @@ What to notice:
 
 - A program starts in `main`; its return value is the exit code, and functions may be defined in any order.
 - `print`, `println`, `printInt` and friends write to standard output without buffering; `eprint` and `eprintln` write to standard error.
-- `printf` and `format` take a template with C style conversions and up to eight values; `vformat` takes an array and reports the full length.
+- `printf` and `format` take a template with C style conversions (also `%f %e %g` for a `double`) and any number of values; `vformat` takes an array and reports the full length.
 - `readLine`, `readChar`, `readAll`, `input`, `askInt` and `confirm` read standard input; `-1` or `null` means the input has ended.
 - `main(int argc, char** argv)` receives the command line; `hasArg`, `argIndex` and `argValue` search it.
 - `exit(code)` ends the program from anywhere; the shell sees the low 8 bits of the code.

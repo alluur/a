@@ -109,7 +109,7 @@ Aytict (https://aytict.fi) is a company from Rauma, Finland that builds software
 
 * A is a C-like language; its compiler `ac` writes native executables for eight targets on its own.
 * The standard library, the GUI toolkit and the editor are written in A and ship with the compiler.
-* There is no floating point type, no garbage collector and no bounds checking; know the limits before you start.
+* Floating point is done in software, and there is no garbage collector and no bounds checking; know the limits before you start.
 * Every listing in this book was compiled and run.
 
 ## Where next

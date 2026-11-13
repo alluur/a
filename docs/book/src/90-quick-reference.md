@@ -14,8 +14,9 @@ One page of facts to keep open while you write A. Everything here is explained i
 | Values | `true` `false` `null` |
 | Operators as words | `and` `or` `not` `xor` `sizeof` |
 | Low level | `asm` |
+| Newer syntax | `var` (a word only where a declaration starts) `=>` (lambda) `$"..."` (interpolated string) `(T1, T2)` (tuple) `_` (skip a tuple element) |
 
-Of the newer words only `foreach` is reserved. `in`, `rev`, `abstract`, `override`, `final`, `is`, `as` and `static_assert` mean something only in the place where they are used, and can still be names; `rev` stops working in `foreach (x in rev a)` while a variable, field or function called `rev` is visible (see [More language features](#chap-more-language-features)).
+Of the newer words only `foreach` is reserved. `var`, `in`, `rev`, `abstract`, `override`, `final`, `is`, `as` and `static_assert` mean something only in the place where they are used, and can still be names; `rev` stops working in `foreach (x in rev a)` while a variable, field or function called `rev` is visible (see [More language features](#chap-more-language-features)).
 
 ## Types
 
@@ -39,7 +40,7 @@ Of the newer words only `foreach` is reserved. `in`, `rev`, `abstract`, `overrid
 | Kind | Examples |
 |---|---|
 | Integers | `42` `1_000_000` `0xFF` `0b1010` (underscores are ignored) |
-| Characters | `'a'` `'\n'` `'\0'` `'\x41'` (type `char`) |
+| Characters | `'a'` `'\n'` `'\0'` `'\x41'` (the type is `int`: `sizeof('a')` is 8) |
 | Strings | `"hello\n"` (type `char*`, NUL terminated) |
 | Booleans and null | `true` `false` `null` |
 
@@ -90,7 +91,30 @@ Targets: `linux` `linux-arm64` `linux-riscv64` `linux-loongarch64` `windows` `an
 |---|---|
 | `print(s)` `println(s)` | text, without / with a newline |
 | `printInt(n)` `printlnInt(n)` | an integer |
-| `printf(fmt, ...)` | formatted output, up to eight values; `%d %s %c %x %u` |
+| `printf(fmt, ...)` | formatted output, any number of values; `%d %s %c %x %u %b %f %e %g %v` |
+| `$"x = {x}"` | a text with values in it: `{x:5}`, `{pi:.2f}` (see below) |
 | `exit(code)` | leave the program |
 
 More in [Your first programs](#chap-first-programs) and [the standard prelude](#chap-standard-prelude).
+
+## Inference, tuples, lambdas and interpolation on one screen
+
+| You write | Meaning |
+|---|---|
+| `var n = 5;` `var (a, b) = f();` | a local whose type is the type of the initializer; needs an initializer; locals only |
+| `(int, double) f() { return (1, 2); }` | a function that returns a tuple (2 to 16 elements, passed by value) |
+| `(int q, int r) = divmod(7, 2);` `(a, b) = (b, a);` | declare from a tuple, assign to variables that exist (a swap); `_` skips an element |
+| `t.0` `t.1` | the elements of a tuple; `==` on tuples compares addresses, not elements |
+| `x => x + 1` `(a, b) => a * b` `(int x) -> double => x * 0.5` | a lambda: a `func` value with no captures; the result is an `int` unless `->` says otherwise |
+| `(int x) => { return x; }` | a lambda with a block body |
+| `$"{x}"` `{x:5}` `{x:-5}` `{x:05}` `{x:#x}` `{pi:.2f}` | the text of a conversion without the `%`; flags, width, `.precision`, length, letter, in this order |
+| `{{` `}}` | a brace in an interpolated string |
+
+| Conversion | Prints |
+|---|---|
+| `%f` `%F` | a double with a decimal point (6 digits after it by default) |
+| `%e` `%E` | scientific notation |
+| `%g` `%G` | the shorter of the two, without trailing zeros |
+| `%v` | the shortest text that reads back as the same double (`0.1`, `1e+22`) |
+
+A `double` passes through `printf` as its 64 bits: `%f` is right, `%d` shows the bits (write `(int) d`), and `%f` with an `int` is wrong (write `(double) n`). More in [Type inference, tuples, lambdas and string interpolation](#chap-inference-tuples-lambdas-interpolation).

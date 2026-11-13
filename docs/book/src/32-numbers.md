@@ -219,7 +219,7 @@ What to notice:
 * `printlnDouble` prints the **shortest text that reads back as exactly the same number**: `0.30000000000000004` for `0.1 + 0.2`, `1e+22` for ten sextillion. `doubleToFixed(d, 3)` rounds to a number of decimals (exactly, not with a floating point trick), `doubleToSci(d, 2)` writes scientific notation and `doubleToText(d)` is the shortest form as a string.
 * `parseDouble(text)` reads a number; text without digits gives 0.
 * Overflow gives infinity, and infinity minus infinity gives NaN, which is not equal to anything, not even itself. `isInf`, `isNaN` and `isFinite` test for these.
-* `printf("%d", x)` prints integers only. `printf("%f", x)` does not format a `double`: it prints the characters `%f`. Use the helpers above, or `printfd` from the `cfloat` module (see [the C library tour](#chap-c-library-tour)).
+* `printf("%.2f", x)` prints a `double` exactly (also `%e`, `%g` and `%v`; see [Type inference, tuples, lambdas and string interpolation](#chap-inference-tuples-lambdas-interpolation)), and `%d` with a `double` prints its 64 bits: cast to `int` first. The helpers above give the same texts without a format string. (`printfd` of the `cfloat` module is the older function for bit patterns: [the C library tour](#chap-c-library-tour).)
 
 A double is 64 bits wide. `__bits(d)` returns them as an `int` and `__dbl(i)` builds a double from bits.
 
@@ -230,7 +230,7 @@ What to notice:
 * The layout is 1 sign bit, 11 exponent bits (biased by 1023) and 52 fraction bits. `1.0` is `0x3FF0000000000000`.
 * `0.1` is `0x3FB999999999999A`: the fraction repeats `9` and is rounded up at the end, which is why 0.1 cannot be exact.
 * Adding 1 to the bit pattern gives the **next larger** double: `1.0000000000000002`. The gap above 1.0 is `dmath.EPSILON`, so `1.0 + 1e-16 == 1.0`.
-* The C library of A works with the same numbers as plain `int` bit patterns (`dlit`, `dadd`, `printfd`); a `double` is the same 64 bits in a typed variable.
+* The C library of A works with the same numbers as plain `int` bit patterns (`dlit`, `dadd`, `sqrt`); a `double` is the same 64 bits in a typed variable, and `printf("%f")` prints either.
 
 ### Mathematics: `dmath`
 
