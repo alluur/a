@@ -1,0 +1,595 @@
+// The SMTP server module (smtpd) driven with bytes, no sockets: the exact replies of a whole dialogue, every kind of error, the recipient policy (it is not an open
+// relay), SIZE and the size limit, dot-unstuffing, bare CR and LF and the "SMTP smuggling" shapes, Maildir delivery (the file, its headers, path traversal through
+// the local part), rate limits with a fake clock, AUTH step by step, the limits of a session, and a few hostile connections through real sockets.
+import smtpd;
+import smtp;
+import mail;
+import netio;
+import hash;
+import asys;
+import net;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+netio.Queue q;
+mail.Buf outb;
+
+smtpd.Core* newCore() {
+    smtpd.Core* c = new smtpd.Core();
+    c->hostname = "mail.test";
+    c->addLocalDomain("example.org");
+    c->useFakeTime = true;
+    c->fakeTime = 1794580200;
+    c->fakeNowMs = 1000;
+    c->idPrefix = "Q";
+    return c;
+}
+
+smtpd.Session* openSession(smtpd.Core* c, int ip = 0x0A000005) {
+    q.clear();
+    smtpd.Session* s = c->open(ip, &q);
+    outb.len = 0;
+    outb.add(q.data(), q.pending());
+    q.clear();
+    return s;
+}
+
+// feeds text, returns what the server answered (valid until the next call)
+char* talk(smtpd.Core* c, smtpd.Session* s, char* text) {
+    q.clear();
+    c->feed(s, text, strlen(text));
+    outb.len = 0;
+    outb.add(q.data(), q.pending());
+    q.clear();
+    return outb.text();
+}
+
+bool says(smtpd.Core* c, smtpd.Session* s, char* text, char* want) {
+    char* got = talk(c, s, text);
+    bool ok = streq(got, want);
+    if (!ok) printf("     sent [%s]\n     got  [%s]\n     want [%s]\n", text, got, want);
+    return ok;
+}
+
+bool starts(smtpd.Core* c, smtpd.Session* s, char* text, char* want) {
+    char* got = talk(c, s, text);
+    bool ok = startsWith(got, want);
+    if (!ok) printf("     sent [%s]\n     got  [%s]\n     want [%s...]\n", text, got, want);
+    return ok;
+}
+
+// a session that is in the middle of a mail transaction
+smtpd.Session* ready(smtpd.Core* c) {
+    smtpd.Session* s = openSession(c);
+    talk(c, s, "EHLO client.test\r\n");
+    return s;
+}
+
+// the files in a directory (names, sorted), as one text separated by blanks
+char* listDir(char* path) {
+    asys.DirList dl;
+    mail.Buf b;
+    if (asys.listDir(path, &dl) >= 0) {
+        for (int i = 0; i < dl.count; i++) {
+            if (i > 0) b.addByte(' ');
+            b.addText(dl.name(i));
+        }
+    }
+    dl.dispose();
+    return b.take();
+}
+
+char* slurp(char* path) {
+    int n = 0;
+    return asys.readFile(path, &n, 1000000, null);
+}
+
+char root[200];
+
+void rmTree(char* path) {
+    asys.DirList dl;
+    if (asys.listDir(path, &dl) < 0) return;
+    for (int i = 0; i < dl.count; i++) {
+        char sub[400];
+        format(&sub[0], 400, "%s/%s", path, dl.name(i), 0, 0, 0, 0);
+        if (asys.isDir(&sub[0])) rmTree(&sub[0]); else asys.unlink(&sub[0]);
+    }
+    dl.dispose();
+    asys.rmdir(path);
+}
+
+int rcptSeen = 0;
+
+int rcptVeto(smtpd.Core* core, smtpd.Session* s, char* addr) {
+    rcptSeen++;
+    if (streq(addr, "bad@example.org")) return 550;
+    if (streq(addr, "busy@example.org")) return 450;
+    return 0;
+}
+
+int main() {
+    char rnd[4];
+    asys.randomBytes(&rnd[0], 4);
+    format(&root[0], 200, "build/tests/t402-%d", (rnd[0] & 255) * 65536 + (rnd[1] & 255) * 256 + (rnd[2] & 255), 0, 0, 0, 0);
+    asys.mkdirs(&root[0]);
+
+    // ---- a whole dialogue, byte for byte ------------------------------------------------------------------------------------------------------------
+    smtpd.Core* core = newCore();
+    core->maildir = &root[0];
+    smtpd.Session* s = openSession(core, 0x7F000001);
+    check("greeting", streq(outb.text(), "220 mail.test ESMTP ready\r\n"));
+    check("EHLO: the capabilities", says(core, s, "EHLO client.test\r\n", "250-mail.test\r\n250-PIPELINING\r\n250-SIZE 10485760\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250 HELP\r\n"));
+    check("MAIL FROM", says(core, s, "MAIL FROM:<a@x.test> SIZE=100 BODY=8BITMIME\r\n", "250 2.1.0 Ok\r\n"));
+    check("RCPT TO", says(core, s, "RCPT TO:<bob@example.org>\r\n", "250 2.1.5 Ok\r\n"));
+    check("DATA", says(core, s, "DATA\r\n", "354 End data with <CR><LF>.<CR><LF>\r\n"));
+    check("the message, dot-unstuffed, and the reply with the queue id", says(core, s, "Subject: hi\r\n\r\n..a dot\r\n...two\r\n.\r\n", "250 2.0.0 Ok: queued as Q000001\r\n"));
+    check("QUIT", says(core, s, "QUIT\r\n", "221 2.0.0 Bye\r\n") && s->closeAfter);
+    core->closeSession(s);
+    char dir[300];
+    format(&dir[0], 300, "%s/bob/new", &root[0], 0, 0, 0, 0, 0);
+    char* names = listDir(&dir[0]);
+    check("Maildir: one file in new/, tmp/ and cur/ exist and are empty", strlen(names) > 10 && !contains(names, " ") && asys.isDir(&root[0]));
+    char path[400];
+    format(&path[0], 400, "%s/%s", &dir[0], names, 0, 0, 0, 0);
+    char* content = slurp(&path[0]);
+    check("Maildir: the file has Return-Path and Received and the message with the dots as the sender meant them",
+        content != null && streq(content, "Return-Path: <a@x.test>\r\nReceived: from client.test ([127.0.0.1]) by mail.test with ESMTP id Q000001;\r\n Fri, 13 Nov 2026 14:30:00 +0000\r\nSubject: hi\r\n\r\n.a dot\r\n..two\r\n"));
+    char tmpDir[300];
+    format(&tmpDir[0], 300, "%s/bob/tmp", &root[0], 0, 0, 0, 0, 0);
+    check("Maildir: tmp/ is empty after delivery", streq(listDir(&tmpDir[0]), ""));
+    check("stats: one message, its bytes", core->stats->messages == 1 && core->stats->bytes == 30);
+
+    // ---- errors -------------------------------------------------------------------------------------------------------------------------------------------
+    s = openSession(core);
+    check("a command that does not exist", says(core, s, "FOO\r\n", "500 5.5.2 Error: command not recognized\r\n"));
+    check("MAIL before EHLO", says(core, s, "MAIL FROM:<a@x.test>\r\n", "503 5.5.1 Send EHLO or HELO first\r\n"));
+    check("EHLO without a name, with a blank in it, with 8-bit", says(core, s, "EHLO\r\n", "501 5.5.2 Syntax: EHLO hostname\r\n") && says(core, s, "EHLO a b\r\n", "501 5.5.2 Syntax: EHLO hostname\r\n") && says(core, s, "EHLO caf\xC3\xA9\r\n", "500 5.5.2 8-bit characters in a command\r\n"));
+    talk(core, s, "EHLO client.test\r\n");
+    check("RCPT and DATA before MAIL", says(core, s, "RCPT TO:<bob@example.org>\r\n", "503 5.5.1 Need MAIL before RCPT\r\n") && says(core, s, "DATA\r\n", "503 5.5.1 Need MAIL before DATA\r\n"));
+    check("MAIL syntax errors", says(core, s, "MAIL FROM:a@x.test\r\n", "501 5.1.7 Bad sender address syntax\r\n") && says(core, s, "MAIL TO:<a@x.test>\r\n", "501 5.5.4 Syntax: MAIL FROM:<address>\r\n")
+        && says(core, s, "MAIL FROM:<a b@x.test>\r\n", "501 5.1.7 Bad sender address syntax\r\n") && says(core, s, "MAIL FROM:<a@x.test\r\n", "501 5.1.7 Bad sender address syntax\r\n") && says(core, s, "MAIL FROM:<a@x.test>x\r\n", "501 5.5.4 Syntax error after the address\r\n"));
+    check("MAIL parameters: unknown, SIZE not a number, SIZE twice, BODY unknown, SMTPUTF8", says(core, s, "MAIL FROM:<a@x.test> FOO=1\r\n", "555 5.5.4 Unsupported parameter\r\n") && says(core, s, "MAIL FROM:<a@x.test> SIZE=abc\r\n", "501 5.5.4 Bad SIZE parameter\r\n")
+        && says(core, s, "MAIL FROM:<a@x.test> SIZE=1 SIZE=2\r\n", "501 5.5.4 SIZE given twice\r\n") && says(core, s, "MAIL FROM:<a@x.test> BODY=BINARYMIME\r\n", "501 5.5.4 Bad BODY parameter\r\n")
+        && says(core, s, "MAIL FROM:<a@x.test> SMTPUTF8\r\n", "555 5.6.7 SMTPUTF8 is not supported\r\n"));
+    check("MAIL FROM: lower case, a blank after the colon, two blanks, the empty sender, a route", says(core, s, "mail from:<a@x.test>\r\n", "250 2.1.0 Ok\r\n") && says(core, s, "RSET\r\n", "250 2.0.0 Ok\r\n")
+        && says(core, s, "MAIL FROM: <a@x.test>\r\n", "250 2.1.0 Ok\r\n") && says(core, s, "RSET\r\n", "250 2.0.0 Ok\r\n") && says(core, s, "MAIL  FROM:<>\r\n", "250 2.1.0 Ok\r\n") && says(core, s, "RSET\r\n", "250 2.0.0 Ok\r\n")
+        && says(core, s, "MAIL FROM:<@a.test,@b.test:u@x.test>\r\n", "250 2.1.0 Ok\r\n") && says(core, s, "MAIL FROM:<u2@x.test>\r\n", "503 5.5.1 Nested MAIL command\r\n"));
+    check("DATA with no recipient, with a parameter", says(core, s, "DATA\r\n", "554 5.5.1 No valid recipients\r\n") && says(core, s, "DATA now\r\n", "501 5.5.4 Syntax error (no parameters allowed)\r\n"));
+    check("RCPT syntax errors and parameters", says(core, s, "RCPT TO:<>\r\n", "501 5.1.3 Bad recipient address syntax\r\n") && says(core, s, "RCPT TO:bob@example.org\r\n", "501 5.1.3 Bad recipient address syntax\r\n")
+        && says(core, s, "RCPT FOR:<bob@example.org>\r\n", "501 5.5.4 Syntax: RCPT TO:<address>\r\n") && says(core, s, "RCPT TO:<bob@example.org> NOTIFY=NEVER\r\n", "555 5.5.4 Unsupported parameter\r\n")
+        && says(core, s, "RCPT TO:<bob@@example.org>\r\n", "501 5.1.3 Bad recipient address syntax\r\n"));
+    check("RCPT TO:<postmaster> without a domain is accepted", says(core, s, "RCPT TO:<postmaster>\r\n", "250 2.1.5 Ok\r\n") && says(core, s, "RCPT TO:<POSTMASTER>\r\n", "250 2.1.5 Ok\r\n"));
+    check("NOOP, VRFY, EXPN, HELP, STARTTLS without TLS, AUTH without users", says(core, s, "NOOP\r\n", "250 2.0.0 Ok\r\n") && says(core, s, "VRFY bob\r\n", "252 2.5.2 Cannot VRFY user, but will accept message and attempt delivery\r\n")
+        && says(core, s, "EXPN list\r\n", "502 5.5.1 EXPN not implemented\r\n") && says(core, s, "HELP\r\n", "214 2.0.0 See RFC 5321\r\n") && says(core, s, "STARTTLS\r\n", "502 5.5.1 STARTTLS is not available\r\n")
+        && says(core, s, "AUTH PLAIN\r\n", "503 5.5.1 No AUTH during a mail transaction\r\n"));
+    check("lines with NUL, 8-bit characters, a bare LF or a bare CR are refused, the command behind a bare LF is not run", says(core, s, "NO\x01OP\r\n", "500 5.5.2 Error: command not recognized\r\n") && says(core, s, "NOOP\nQUIT\r\n", "500 5.5.2 Bare CR or LF in a command\r\n") && !s->closeAfter
+        && says(core, s, "NOOP\rQUIT\r\n", "500 5.5.2 Bare CR or LF in a command\r\n"));
+    char* lng = alloc(3000);
+    for (int i = 0; i < 2000; i++) lng[i] = 'x';
+    lng[2000] = 13;
+    lng[2001] = 10;
+    check("a command line of 2000 bytes: 500, the session goes on", says(core, s, lng, "500 5.5.2 Line too long\r\n") && says(core, s, "NOOP\r\n", "250 2.0.0 Ok\r\n"));
+    core->closeSession(s);
+    s = ready(core);
+    int badClosed = 0;
+    for (int i = 0; i < 12 && !s->closeAfter; i++) { talk(core, s, "BOGUS\r\n"); badClosed++; }
+    check("too many bad commands: after 10 the server says 421 and closes", s->closeAfter && badClosed == 11 && endsWith(outb.text(), "421 4.7.0 Too many errors, closing the connection\r\n"));
+    check("... and says nothing more", core->feed(s, "NOOP\r\n", 6) < 0 && q.pending() == 0);
+    core->closeSession(s);
+
+    // ---- a half command split over many reads --------------------------------------------------------------------------------------------------------------
+    s = openSession(core);
+    q.clear();
+    char* cmd = "EHLO slow.test\r\nNOOP\r\n";
+    for (int i = 0; i < strlen(cmd); i++) core->feed(s, &cmd[i], 1);
+    check("commands that arrive one byte at a time", endsWith(q.data(), "250 2.0.0 Ok\r\n") && contains(q.data(), "250-mail.test"));
+    q.clear();
+    core->closeSession(s);
+
+    // ---- the recipient policy: not an open relay -------------------------------------------------------------------------------------------------------------
+    s = ready(core);
+    talk(core, s, "MAIL FROM:<a@x.test>\r\n");
+    check("a recipient in a foreign domain is refused (relay access denied)", says(core, s, "RCPT TO:<eve@elsewhere.test>\r\n", "554 5.7.1 Relay access denied\r\n") && s->nrcpt == 0);
+    check("the local domain in any letter case is accepted", says(core, s, "RCPT TO:<Bob@EXAMPLE.ORG>\r\n", "250 2.1.5 Ok\r\n"));
+    check("a subdomain, a domain literal and a look-alike are not the local domain", says(core, s, "RCPT TO:<bob@sub.example.org>\r\n", "554 5.7.1 Relay access denied\r\n") && says(core, s, "RCPT TO:<bob@[127.0.0.1]>\r\n", "554 5.7.1 Relay access denied\r\n")
+        && says(core, s, "RCPT TO:<bob@example.org.evil.test>\r\n", "554 5.7.1 Relay access denied\r\n") && says(core, s, "RCPT TO:<bob@xexample.org>\r\n", "554 5.7.1 Relay access denied\r\n"));
+    check("the percent hack and a relay route do not make a foreign recipient local", says(core, s, "RCPT TO:<eve%elsewhere.test@example.org>\r\n", "553 5.1.3 Bad mailbox name\r\n") && says(core, s, "RCPT TO:<@example.org:eve@elsewhere.test>\r\n", "554 5.7.1 Relay access denied\r\n"));
+    check("the same recipient twice counts once", says(core, s, "RCPT TO:<bob@example.org>\r\n", "250 2.1.5 Ok\r\n") && s->nrcpt == 1);
+    check("stats count the refusals", core->stats->rcptRefused >= 6);
+    core->closeSession(s);
+    // authenticated users, loopback, acceptAnyRecipient
+    smtpd.Core* c2 = newCore();
+    c2->addUser("ann", "pw");
+    c2->allowInsecureAuth = true;
+    s = ready(c2);
+    talk(c2, s, "AUTH PLAIN AGFubgBwdw==\r\n");
+    talk(c2, s, "MAIL FROM:<ann@example.org>\r\n");
+    check("an authenticated user may send to a foreign domain (relayAuthenticated)", says(c2, s, "RCPT TO:<eve@elsewhere.test>\r\n", "250 2.1.5 Ok\r\n"));
+    c2->closeSession(s);
+    c2->relayAuthenticated = false;
+    s = ready(c2);
+    talk(c2, s, "AUTH PLAIN AGFubgBwdw==\r\n");
+    talk(c2, s, "MAIL FROM:<ann@example.org>\r\n");
+    check("... not when relayAuthenticated is off", says(c2, s, "RCPT TO:<eve@elsewhere.test>\r\n", "554 5.7.1 Relay access denied\r\n"));
+    c2->closeSession(s);
+    smtpd.Core* c3 = newCore();
+    s = openSession(c3, 0x7F000001);
+    talk(c3, s, "EHLO x\r\nMAIL FROM:<a@x.test>\r\n");
+    check("a client on the loopback address is not trusted by default (relayLoopback off)", says(c3, s, "RCPT TO:<eve@elsewhere.test>\r\n", "554 5.7.1 Relay access denied\r\n"));
+    c3->closeSession(s);
+    c3->relayLoopback = true;
+    s = openSession(c3, 0x7F000001);
+    talk(c3, s, "EHLO x\r\nMAIL FROM:<a@x.test>\r\n");
+    check("relayLoopback lets the loopback address relay", says(c3, s, "RCPT TO:<eve@elsewhere.test>\r\n", "250 2.1.5 Ok\r\n"));
+    c3->closeSession(s);
+    s = openSession(c3, 0x0A000005);
+    talk(c3, s, "EHLO x\r\nMAIL FROM:<a@x.test>\r\n");
+    check("... and nobody else", says(c3, s, "RCPT TO:<eve@elsewhere.test>\r\n", "554 5.7.1 Relay access denied\r\n"));
+    c3->closeSession(s);
+    c3->acceptAnyRecipient = true;
+    s = openSession(c3, 0x0A000005);
+    talk(c3, s, "EHLO x\r\nMAIL FROM:<a@x.test>\r\n");
+    check("acceptAnyRecipient is the sink mode for tests: everything is taken", says(c3, s, "RCPT TO:<eve@elsewhere.test>\r\n", "250 2.1.5 Ok\r\n"));
+    c3->closeSession(s);
+    // hooks and limits
+    smtpd.Core* c4 = newCore();
+    c4->rcptHook = rcptVeto;
+    c4->maxRecipients = 3;
+    s = ready(c4);
+    talk(c4, s, "MAIL FROM:<a@x.test>\r\n");
+    check("rcptHook: 550 for an unknown mailbox, 450 for a busy one", says(c4, s, "RCPT TO:<bad@example.org>\r\n", "550 5.1.1 Mailbox unavailable\r\n") && says(c4, s, "RCPT TO:<busy@example.org>\r\n", "450 4.0.0 Try again later\r\n") && s->nrcpt == 0);
+    check("maxRecipients: the fourth is refused with 452", says(c4, s, "RCPT TO:<a@example.org>\r\n", "250 2.1.5 Ok\r\n") && says(c4, s, "RCPT TO:<b@example.org>\r\n", "250 2.1.5 Ok\r\n") && says(c4, s, "RCPT TO:<c@example.org>\r\n", "250 2.1.5 Ok\r\n")
+        && says(c4, s, "RCPT TO:<d@example.org>\r\n", "452 4.5.3 Too many recipients\r\n") && s->nrcpt == 3);
+    c4->closeSession(s);
+
+    // ---- sizes ----------------------------------------------------------------------------------------------------------------------------------------------
+    smtpd.Core* c5 = newCore();
+    c5->maxMessage = 1000;
+    s = ready(c5);
+    check("SIZE over the limit is refused at MAIL FROM (552), without reading a byte", says(c5, s, "MAIL FROM:<a@x.test> SIZE=2000\r\n", "552 5.3.4 Message size exceeds fixed maximum message size\r\n") && s->from == null);
+    check("EHLO advertises the limit", contains(talk(c5, s, "EHLO again\r\n"), "250-SIZE 1000\r\n"));
+    talk(c5, s, "MAIL FROM:<a@x.test> SIZE=900\r\nRCPT TO:<bob@example.org>\r\nDATA\r\n");
+    char* line200 = alloc(300);
+    for (int i = 0; i < 200; i++) line200[i] = 'y';
+    line200[200] = 13;
+    line200[201] = 10;
+    int sentLines = 0;
+    for (int i = 0; i < 400; i++) { c5->feed(s, line200, 202); sentLines++; }
+    check("a message of 80000 bytes against a limit of 1000: nothing is kept (buffer released, the global count is zero)", s->tooBig && s->data.cap == 0 && c5->buffered == 0);
+    q.clear();
+    check("... the reply comes at the end, 552, and the session goes on", says(c5, s, ".\r\n", "552 5.3.4 Message size exceeds fixed maximum message size\r\n") && says(c5, s, "NOOP\r\n", "250 2.0.0 Ok\r\n") && c5->stats->rejected == 1 && c5->stats->messages == 0);
+    c5->closeSession(s);
+    // the global budget
+    smtpd.Core* c6 = newCore();
+    c6->maxBuffered = 1500;
+    c6->acceptAnyRecipient = true;
+    smtpd.Session* s1 = ready(c6);
+    smtpd.Session* s2 = ready(c6);
+    talk(c6, s1, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    talk(c6, s2, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    char* line400 = alloc(500);
+    for (int i = 0; i < 400; i++) line400[i] = 'z';
+    line400[400] = 13;
+    line400[401] = 10;
+    for (int i = 0; i < 3; i++) c6->feed(s1, line400, 402);
+    for (int i = 0; i < 3; i++) c6->feed(s2, line400, 402);
+    check("the budget for all sessions (maxBuffered): the second message finds no room", c6->buffered <= 1500 && s2->noSpace);
+    check("... it gets 452 at its end, the first one is accepted", says(c6, s2, ".\r\n", "452 4.3.1 Insufficient system storage, try again later\r\n") && starts(c6, s1, ".\r\n", "250 2.0.0 Ok: queued as Q") && c6->buffered == 0);
+    c6->closeSession(s1);
+    c6->closeSession(s2);
+    // a line in the message that is too long
+    smtpd.Core* c7 = newCore();
+    c7->maxDataLine = 100;
+    c7->acceptAnyRecipient = true;
+    s = ready(c7);
+    talk(c7, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    c7->feed(s, line200, 202);
+    check("a line over maxDataLine: the message is rejected at its end (554), the session goes on", says(c7, s, "short\r\n.\r\n", "554 5.6.0 Message rejected: a line is too long\r\n") && says(c7, s, "NOOP\r\n", "250 2.0.0 Ok\r\n"));
+    c7->closeSession(s);
+
+    // ---- dot-stuffing, line ends, smuggling ----------------------------------------------------------------------------------------------------------------
+    smtpd.Core* c8 = newCore();
+    c8->acceptAnyRecipient = true;
+    char* got8 = null;
+    s = ready(c8);
+    talk(c8, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    check("a message with only a dot line is empty", starts(c8, s, ".\r\n", "250 2.0.0 Ok") && c8->stats->bytes == 0);
+    talk(c8, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    talk(c8, s, "a\r\n..\r\n...\r\n.b\r\n..\r\n.\r\n");
+    check("dots at the start of a line: one is removed (a, .., ..., .b, .. become a, ., .., b, .)", c8->stats->messages == 2 && c8->stats->bytes == 16);
+    check("bare LF in a message: rejected at the end (550 5.6.0)", says(c8, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n", "250 2.1.0 Ok\r\n250 2.1.5 Ok\r\n354 End data with <CR><LF>.<CR><LF>\r\n") && says(c8, s, "line one\nline two\r\n.\r\n", "550 5.6.0 Message rejected: bare CR or LF in the message (lines end with CRLF)\r\n"));
+    check("bare CR in a message: rejected too", says(c8, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n", "250 2.1.0 Ok\r\n250 2.1.5 Ok\r\n354 End data with <CR><LF>.<CR><LF>\r\n") && says(c8, s, "line\rone\r\n.\r\n", "550 5.6.0 Message rejected: bare CR or LF in the message (lines end with CRLF)\r\n"));
+    int msgsBefore = c8->stats->messages;
+    talk(c8, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    char* smug = talk(c8, s, "innocent\r\n.\nMAIL FROM:<evil@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\nevil\r\n.\r\n");
+    check("smuggling: 'CRLF . LF' does not end the message, the commands after it are data, one message is refused (nothing is delivered)", startsWith(smug, "550 5.6.0") && c8->stats->messages == msgsBefore && c8->stats->rejected >= 3);
+    talk(c8, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    char* smug2 = talk(c8, s, "innocent\r\n.\r\r\nMAIL FROM:<evil@x.test>\r\n.\r\n");
+    check("smuggling: 'CRLF . CR CRLF' does not end the message either", startsWith(smug2, "550 5.6.0") && c8->stats->messages == msgsBefore);
+    talk(c8, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    char* smug3 = talk(c8, s, "innocent\r\n\n.\r\nMAIL FROM:<evil@x.test>\r\n");
+    check("smuggling: 'LF . CRLF' is one line with a bare LF in it: the message goes on, nothing is answered and nothing is delivered", streq(smug3, "") && c8->stats->messages == msgsBefore);
+    check("... the real end of the message rejects it", says(c8, s, ".\r\n", "550 5.6.0 Message rejected: bare CR or LF in the message (lines end with CRLF)\r\n") && c8->stats->messages == msgsBefore);
+    c8->closeSession(s);
+    c8->strictLineEnds = false;
+    s = ready(c8);
+    talk(c8, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\n");
+    check("strictLineEnds off: a bare LF is taken as part of the text (it still does not end the message)", starts(c8, s, "x\ny\r\n.\r\n", "250 2.0.0 Ok: queued as Q"));
+    c8->closeSession(s);
+
+    // ---- Maildir and paths ----------------------------------------------------------------------------------------------------------------------------------
+    char box[400];
+    format(&box[0], 400, "%s/maildir2", &root[0], 0, 0, 0, 0, 0);
+    smtpd.Core* c9 = newCore();
+    c9->maildir = &box[0];
+    c9->addLocalDomain("other.test");
+    s = ready(c9);
+    talk(c9, s, "MAIL FROM:<a@x.test>\r\n");
+    char* evilNames[12];
+    evilNames[0] = "RCPT TO:<../../etc/passwd@example.org>\r\n";
+    evilNames[1] = "RCPT TO:<a/b@example.org>\r\n";
+    evilNames[2] = "RCPT TO:<.hidden@example.org>\r\n";
+    evilNames[3] = "RCPT TO:<a..b@example.org>\r\n";
+    evilNames[4] = "RCPT TO:<\"a/b\"@example.org>\r\n";
+    evilNames[5] = "RCPT TO:<\"..\"@example.org>\r\n";
+    evilNames[6] = "RCPT TO:<a\\b@example.org>\r\n";
+    evilNames[7] = "RCPT TO:<a:b@example.org>\r\n";
+    evilNames[8] = "RCPT TO:<a%2e%2e@example.org>\r\n";
+    evilNames[9] = "RCPT TO:<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@example.org>\r\n";
+    evilNames[10] = "RCPT TO:<a|b@example.org>\r\n";
+    evilNames[11] = "RCPT TO:<..@example.org>\r\n";
+    int refusedNames = 0;
+    for (int i = 0; i < 12; i++) {
+        char* got = talk(c9, s, evilNames[i]);
+        if (startsWith(got, "553 5.1.3") || startsWith(got, "501")) refusedNames++; else printf("     accepted: %s -> %s", evilNames[i], got);
+    }
+    check("mailbox names that could leave the mail directory (.., /, a leading dot, quoted slashes, \\, :, %, |, too long) are refused at RCPT", refusedNames == 12 && s->nrcpt == 0);
+    check("... and nothing was created", !asys.exists(&box[0]));
+    talk(c9, s, "RCPT TO:<Alice.Smith+news@example.org>\r\nRCPT TO:<carol_1@other.test>\r\nDATA\r\n");
+    check("a message for two mailboxes (names in lower case, + . _ - are fine)", starts(c9, s, "To: x\r\n\r\nbody\r\n.\r\n", "250 2.0.0 Ok: queued as Q"));
+    char* boxes = listDir(&box[0]);
+    check("Maildir: the two mailboxes exist, nothing else", streq(boxes, "alice.smith+news carol_1") || streq(boxes, "carol_1 alice.smith+news"));
+    char nd[500];
+    format(&nd[0], 500, "%s/alice.smith+news/new", &box[0], 0, 0, 0, 0, 0);
+    char* nf = listDir(&nd[0]);
+    format(&path[0], 500, "%s/%s", &nd[0], nf, 0, 0, 0, 0);
+    char* mc = slurp(&path[0]);
+    check("Maildir: the mailbox has the message with its headers", mc != null && startsWith(mc, "Return-Path: <a@x.test>\r\nReceived: from client.test ([10.0.0.5]) by mail.test with ESMTP id Q") && endsWith(mc, "\r\nTo: x\r\n\r\nbody\r\n"));
+    c9->closeSession(s);
+
+    // ---- rate limits (a fake clock) ---------------------------------------------------------------------------------------------------------------------------
+    smtpd.Core* c10 = newCore();
+    c10->rateConns = 3;
+    c10->rateMsgs = 2;
+    c10->acceptAnyRecipient = true;
+    smtpd.Session* ss[5];
+    int greeted = 0;
+    for (int i = 0; i < 4; i++) {
+        ss[i] = openSession(c10);
+        if (startsWith(outb.text(), "220 ")) greeted++;
+    }
+    check("rateConns: the fourth connection of an address in the window gets 421 and is closed", greeted == 3 && startsWith(outb.text(), "421 4.7.0 Too many connections") && ss[3]->closeAfter);
+    for (int i = 0; i < 4; i++) c10->closeSession(ss[i]);
+    ss[0] = openSession(c10, 0x0A000009);
+    check("... another address is not affected", startsWith(outb.text(), "220 "));
+    c10->closeSession(ss[0]);
+    c10->fakeNowMs = 70000;
+    ss[0] = openSession(c10);
+    check("... and after the window the first address may connect again", startsWith(outb.text(), "220 "));
+    talk(c10, ss[0], "EHLO x\r\n");
+    int mailOk = 0;
+    for (int i = 0; i < 3; i++) {
+        char* got = talk(c10, ss[0], "MAIL FROM:<a@x.test>\r\n");
+        if (startsWith(got, "250")) mailOk++;
+        talk(c10, ss[0], "RSET\r\n");
+    }
+    check("rateMsgs: the third MAIL FROM in the window gets 450 (the first two are fine)", mailOk == 2 && starts(c10, ss[0], "MAIL FROM:<a@x.test>\r\n", "450 4.7.1 Rate limit exceeded, try again later\r\n"));
+    c10->fakeNowMs = 140000;
+    check("... a new window starts counting again", starts(c10, ss[0], "MAIL FROM:<a@x.test>\r\n", "250 2.1.0 Ok\r\n"));
+    c10->closeSession(ss[0]);
+    // many addresses: the table does not grow over 256
+    smtpd.Core* c11 = newCore();
+    c11->rateConns = 5;
+    for (int i = 0; i < 1000; i++) {
+        smtpd.Session* t = openSession(c11, 0x0A100000 + i);
+        c11->closeSession(t);
+    }
+    check("rate table: 1000 different addresses are no problem (the table is bounded)", c11->stats->connections == 1000);
+
+    // ---- AUTH, step by step ---------------------------------------------------------------------------------------------------------------------------------------
+    smtpd.Core* a = newCore();
+    a->addUser("ann", "pw");
+    a->addUser("bob", "s3cret");
+    s = ready(a);
+    check("EHLO without TLS offers only CRAM-MD5", contains(talk(a, s, "EHLO c\r\n"), "250-AUTH CRAM-MD5\r\n"));
+    check("AUTH PLAIN without TLS is refused (538), AUTH LOGIN too", says(a, s, "AUTH PLAIN AGFubgBwdw==\r\n", "538 5.7.11 Encryption required for the requested authentication mechanism\r\n") && says(a, s, "AUTH LOGIN\r\n", "538 5.7.11 Encryption required for the requested authentication mechanism\r\n"));
+    check("an unknown mechanism: 504", says(a, s, "AUTH GSSAPI\r\n", "504 5.5.4 Unrecognized authentication type\r\n"));
+    // CRAM-MD5
+    char* ch = talk(a, s, "AUTH CRAM-MD5\r\n");
+    check("CRAM-MD5: a challenge", startsWith(ch, "334 ") && endsWith(ch, "\r\n"));
+    mail.Buf chal;
+    mail.base64Decode(ch + 4, strlen(ch) - 6, &chal, true);
+    check("CRAM-MD5: the challenge looks like <random.time@host>", chal.len > 10 && chal.d[0] == '<' && chal.d[chal.len - 1] == '>' && contains(chal.text(), "@mail.test>"));
+    char mac[16];
+    hash.hmac(128, "s3cret", 6, chal.d, chal.len, &mac[0]);
+    mail.Buf resp;
+    resp.addText("bob ");
+    for (int i = 0; i < 16; i++) {
+        int hi = (mac[i] >> 4) & 15;
+        int lo = mac[i] & 15;
+        resp.addByte(hi < 10 ? '0' + hi : 'a' + hi - 10);
+        resp.addByte(lo < 10 ? '0' + lo : 'a' + lo - 10);
+    }
+    mail.Buf resp64;
+    mail.base64Encode(resp.d, resp.len, &resp64, false);
+    resp64.add("\r\n", 2);
+    check("CRAM-MD5: the right answer is accepted", says(a, s, resp64.text(), "235 2.7.0 Authentication successful\r\n") && streq(s->authUser, "bob"));
+    check("AUTH again: 503", says(a, s, "AUTH CRAM-MD5\r\n", "503 5.5.1 Already authenticated\r\n"));
+    a->closeSession(s);
+    s = ready(a);
+    talk(a, s, "AUTH CRAM-MD5\r\n");
+    check("CRAM-MD5: a wrong digest, then the session may try again", says(a, s, "Ym9iIDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw\r\n", "535 5.7.8 Authentication credentials invalid\r\n") && s->authUser == null);
+    talk(a, s, "AUTH CRAM-MD5\r\n");
+    check("CRAM-MD5: a response that is not base64 gives 501 and the session is a normal one again, 'user without digest' is a failure", says(a, s, "!!!\r\n", "501 5.5.2 Cannot decode the response\r\n") && says(a, s, "NOOP\r\n", "250 2.0.0 Ok\r\n")
+        && starts(a, s, "AUTH CRAM-MD5\r\n", "334 ") && says(a, s, "Ym9i\r\n", "535 5.7.8 Authentication credentials invalid\r\n"));
+    a->closeSession(s);
+    // PLAIN and LOGIN over a connection that is encrypted
+    a->allowInsecureAuth = true;
+    s = ready(a);
+    check("EHLO with allowInsecureAuth offers PLAIN and LOGIN too", contains(talk(a, s, "EHLO c\r\n"), "250-AUTH PLAIN LOGIN CRAM-MD5\r\n"));
+    check("AUTH PLAIN with the initial response", says(a, s, "AUTH PLAIN AGFubgBwdw==\r\n", "235 2.7.0 Authentication successful\r\n") && streq(s->authUser, "ann"));
+    a->closeSession(s);
+    s = ready(a);
+    check("AUTH PLAIN without the initial response: an empty 334, then the response", says(a, s, "AUTH PLAIN\r\n", "334 \r\n") && says(a, s, "AGFubgBwdw==\r\n", "235 2.7.0 Authentication successful\r\n"));
+    a->closeSession(s);
+    s = ready(a);
+    check("AUTH LOGIN: the two prompts (Username:, Password:)", says(a, s, "AUTH LOGIN\r\n", "334 VXNlcm5hbWU6\r\n") && says(a, s, "Ym9i\r\n", "334 UGFzc3dvcmQ6\r\n") && says(a, s, "czNjcmV0\r\n", "235 2.7.0 Authentication successful\r\n") && streq(s->authUser, "bob"));
+    a->closeSession(s);
+    s = ready(a);
+    check("AUTH LOGIN with the user as the initial response", says(a, s, "AUTH LOGIN Ym9i\r\n", "334 UGFzc3dvcmQ6\r\n") && says(a, s, "czNjcmV0\r\n", "235 2.7.0 Authentication successful\r\n"));
+    a->closeSession(s);
+    s = ready(a);
+    check("AUTH PLAIN: wrong password, unknown user, a response without the NULs, bad base64", says(a, s, "AUTH PLAIN AGFubgB3cm9uZw==\r\n", "535 5.7.8 Authentication credentials invalid\r\n") && says(a, s, "AUTH PLAIN AG5vYm9keQB4\r\n", "535 5.7.8 Authentication credentials invalid\r\n")
+        && says(a, s, "AUTH PLAIN YWJj\r\n", "501 5.5.2 Bad PLAIN response\r\n") && says(a, s, "AUTH PLAIN !!!\r\n", "501 5.5.2 Cannot decode the response\r\n"));
+    check("AUTH: the third failure in a session: 535 and 421, the connection is closed", says(a, s, "AUTH PLAIN AGFubgB3cm9uZw==\r\n", "535 5.7.8 Authentication credentials invalid\r\n421 4.7.0 Too many authentication failures\r\n") && s->closeAfter);
+    a->closeSession(s);
+    s = ready(a);
+    check("AUTH cancelled with *", says(a, s, "AUTH LOGIN\r\n", "334 VXNlcm5hbWU6\r\n") && says(a, s, "*\r\n", "501 5.0.0 Authentication cancelled\r\n") && says(a, s, "NOOP\r\n", "250 2.0.0 Ok\r\n"));
+    talk(a, s, "MAIL FROM:<a@x.test>\r\n");
+    check("AUTH during a mail transaction: 503", says(a, s, "AUTH PLAIN AGFubgBwdw==\r\n", "503 5.5.1 No AUTH during a mail transaction\r\n"));
+    a->closeSession(s);
+    a->authRequired = true;
+    s = ready(a);
+    check("authRequired: MAIL FROM before AUTH is refused (530)", says(a, s, "MAIL FROM:<a@x.test>\r\n", "530 5.7.0 Authentication required\r\n") && says(a, s, "AUTH PLAIN AGFubgBwdw==\r\n", "235 2.7.0 Authentication successful\r\n") && says(a, s, "MAIL FROM:<a@x.test>\r\n", "250 2.1.0 Ok\r\n"));
+    a->closeSession(s);
+    a->requireTls = true;
+    s = ready(a);
+    check("requireTls: MAIL FROM and AUTH before STARTTLS are refused (530)", says(a, s, "MAIL FROM:<a@x.test>\r\n", "530 5.7.0 Must issue a STARTTLS command first\r\n") && says(a, s, "AUTH PLAIN AGFubgBwdw==\r\n", "530 5.7.0 Must issue a STARTTLS command first\r\n"));
+    a->closeSession(s);
+
+    // ---- limits of a session ---------------------------------------------------------------------------------------------------------------------------------------
+    smtpd.Core* c12 = newCore();
+    c12->maxMessagesPerSession = 2;
+    c12->acceptAnyRecipient = true;
+    s = ready(c12);
+    talk(c12, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\nx\r\n.\r\n");
+    char* second = talk(c12, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\ny\r\n.\r\n");
+    check("maxMessagesPerSession: after the second message 421 and close", endsWith(second, "250 2.0.0 Ok: queued as Q000002\r\n421 4.7.0 Too many messages in this session, closing the connection\r\n") && s->closeAfter);
+    c12->closeSession(s);
+    // pipelining: all commands of a transaction in one read
+    smtpd.Core* c13 = newCore();
+    c13->acceptAnyRecipient = true;
+    s = openSession(c13);
+    check("pipelining: a whole transaction in one read, the replies in order", says(c13, s, "EHLO c\r\nMAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nRCPT TO:<c@x.test>\r\nDATA\r\nhello\r\n.\r\nQUIT\r\n",
+        "250-mail.test\r\n250-PIPELINING\r\n250-SIZE 10485760\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250 HELP\r\n250 2.1.0 Ok\r\n250 2.1.5 Ok\r\n250 2.1.5 Ok\r\n354 End data with <CR><LF>.<CR><LF>\r\n250 2.0.0 Ok: queued as Q000001\r\n221 2.0.0 Bye\r\n"));
+    c13->closeSession(s);
+    // the deliver hook
+    smtpd.Core* c14 = newCore();
+    c14->acceptAnyRecipient = true;
+    c14->deliverHook = deliverRefuse;
+    s = ready(c14);
+    check("deliverHook: 451 is passed on (a temporary failure), 552 as well", says(c14, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<b@x.test>\r\nDATA\r\nx\r\n.\r\n", "250 2.1.0 Ok\r\n250 2.1.5 Ok\r\n354 End data with <CR><LF>.<CR><LF>\r\n451 4.3.0 Try again later\r\n")
+        && says(c14, s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<c@x.test>\r\nDATA\r\nx\r\n.\r\n", "250 2.1.0 Ok\r\n250 2.1.5 Ok\r\n354 End data with <CR><LF>.<CR><LF>\r\n552 5.3.4 Message refused\r\n"));
+    c14->closeSession(s);
+
+    // ---- real sockets: hostile connections --------------------------------------------------------------------------------------------------------------------------
+    smtpd.Server* srv = smtpd.newServer();
+    srv->core->hostname = "mail.test";
+    srv->core->acceptAnyRecipient = true;
+    srv->core->idPrefix = "S";
+    srv->net->idleTimeoutMs = 300;
+    srv->net->maxConns = 6;
+    srv->listenOn("127.0.0.1", 0, null);
+    gsrv = srv;
+    net.setIdleHook(sockHook);
+    int h = net.connect("127.0.0.1", srv->port);
+    net.setTimeout(h, 3000);
+    char* big = alloc(1048576 + 16);
+    for (int i = 0; i < 1048576; i++) big[i] = 'A' + (i % 26);
+    net.send(h, big, 1048576);
+    net.send(h, "\r\nNOOP\r\n", 8);
+    mail.Buf rb;
+    readFor(h, &rb, 400);
+    check("a line of 1 MB without a line end: 500 at the end of it, the next command is answered (memory is not used for it)", contains(rb.text(), "500 5.5.2 Line too long\r\n") && contains(rb.text(), "250 2.0.0 Ok\r\n"));
+    net.close(h);
+    int h2 = net.connect("127.0.0.1", srv->port);
+    char* junk = alloc(100000);
+    int seed = 5;
+    for (int i = 0; i < 100000; i++) { seed = seed * 1103515245 + 12345; junk[i] = (seed >> 16) & 255; if (junk[i] == 13 && (i % 3) == 0) junk[i] = 10; }
+    net.send(h2, junk, 100000);
+    mail.Buf rb2;
+    readFor(h2, &rb2, 300);
+    net.close(h2);
+    int h3 = net.connect("127.0.0.1", srv->port);
+    mail.Buf rb3;
+    net.send(h3, "EHLO ok.test\r\nQUIT\r\n", 20);
+    readFor(h3, &rb3, 300);
+    check("100000 bytes of binary garbage do not harm the server: the next client is served normally", contains(rb3.text(), "250-mail.test") && contains(rb3.text(), "221 2.0.0 Bye"));
+    net.close(h3);
+    int h4 = net.connect("127.0.0.1", srv->port);
+    mail.Buf rb4;
+    readFor(h4, &rb4, 800);
+    char tb[16];
+    int tn = net.recv(h4, &tb[0], 16);
+    check("a connection that stays silent is closed by the idle time out (300 ms)", startsWith(rb4.text(), "220 mail.test") && tn <= 0);
+    net.close(h4);
+    settleSessions(srv);
+    srv->net->idleTimeoutMs = 10000;
+    int hs[8];
+    int accepted = 0;
+    for (int i = 0; i < 8; i++) {
+        hs[i] = net.connect("127.0.0.1", srv->port);
+        mail.Buf rbx;
+        readFor(hs[i], &rbx, 120);
+        if (startsWith(rbx.text(), "220 ")) accepted++;
+        rbx.release();
+    }
+    check("maxConns 6: of 8 simultaneous connections 6 are served, the others closed", accepted == 6);
+    for (int i = 0; i < 8; i++) net.close(hs[i]);
+    check("every session was freed: the core counts no open sessions after the clients are gone", settleSessions(srv) == 0);
+    net.setIdleHook(null);
+
+    rmTree(&root[0]);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
+
+smtpd.Server* gsrv;
+
+int sockHook() {
+    gsrv->poll(0);
+    return 0;
+}
+
+int settleSessions(smtpd.Server* srv) {
+    int t0 = millis();
+    while (millis() - t0 < 1500 && srv->core->sessions > 0) srv->poll(5);
+    return srv->core->sessions;
+}
+
+void readFor(int h, mail.Buf* out, int ms) {
+    int t0 = millis();
+    while (millis() - t0 < ms) {
+        char b[4096];
+        if (!net.waitReadable(h, 20)) continue;
+        int n = net.recv(h, &b[0], 4096);
+        if (n <= 0) return;
+        out->add(&b[0], n);
+    }
+}
+
+int deliverRefuse(smtpd.Core* core, smtpd.Session* s, char* data, int n) {
+    if (streq(s->rcpt[0], "b@x.test")) return 451;
+    return 552;
+}

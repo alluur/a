@@ -1,0 +1,214 @@
+// Memory of the mail modules: what a mail server and a mail client do again and again must not use up memory. The heap position (what `new`, alloc and strdup consume,
+// which is never given back) must stay exactly where it is after a warm-up while sessions are opened, used and closed (all the commands, AUTH, DATA, Maildir delivery, the
+// rate table, refused recipients, messages that are too big), while clients connect, send, fail and quit, while the line parser and the reply reader take garbage, and
+// while hostile connections come and go. (TLS handshakes are not part of this: their big number arithmetic keeps about 20 KB each, see docs/NET.md.)
+import smtp;
+import smtpd;
+import mail;
+import netline;
+import netio;
+import net;
+import asys;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+smtpd.Server* srv;
+char root[200];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+void rmTree(char* path) {
+    asys.DirList dl;
+    if (asys.listDir(path, &dl) < 0) return;
+    for (int i = 0; i < dl.count; i++) {
+        char sub[400];
+        format(&sub[0], 400, "%s/%s", path, dl.name(i), 0, 0, 0, 0);
+        if (asys.isDir(&sub[0])) rmTree(&sub[0]); else asys.unlink(&sub[0]);
+    }
+    dl.dispose();
+    asys.rmdir(path);
+}
+
+int rcptNo(smtpd.Core* c, smtpd.Session* s, char* a) { return streq(a, "no@example.org") ? 550 : 0; }
+
+char* CHUNK;
+
+// one round of everything on the server core, without sockets
+void coreRound(smtpd.Core* core, int r) {
+    netio.Queue q;
+    smtpd.Session* s = core->open(0x0A000000 + (r % 7), &q);
+    core->feed(s, "EHLO client.test\r\nNOOP\r\nVRFY x\r\nHELP\r\nBOGUS\r\n", 43);
+    core->feed(s, "AUTH PLAIN AGFubgBwdw==\r\n", 25);
+    core->feed(s, "MAIL FROM:<a@x.test> SIZE=100\r\nRCPT TO:<bob@example.org>\r\nRCPT TO:<Carol.X@example.org>\r\nRCPT TO:<no@example.org>\r\nRCPT TO:<eve@elsewhere.test>\r\nRCPT TO:<a/b@example.org>\r\n", 163);
+    core->feed(s, "DATA\r\nSubject: x\r\n\r\n..dot\r\nbody\r\n.\r\n", 37);
+    core->feed(s, "MAIL FROM:<a@x.test> SIZE=99999999\r\nMAIL FROM:<a@x.test>\r\nRCPT TO:<bob@example.org>\r\nDATA\r\nbad\nline\r\n.\r\nRSET\r\n", 100);
+    core->feed(s, "AUTH LOGIN\r\nYW5u\r\ncHc=\r\nAUTH LOGIN\r\n*\r\nAUTH CRAM-MD5\r\nYWJj\r\n", 53);
+    core->feed(s, "MAIL FROM:<a@x.test>\r\nRCPT TO:<bob@example.org>\r\nDATA\r\n", 54);
+    for (int i = 0; i < 12; i++) core->feed(s, CHUNK, 1000);
+    core->feed(s, ".\r\nQUIT\r\n", 9);
+    core->closeSession(s);
+    // a session that is cut off in the middle of a message
+    s = core->open(0x0A000009, &q);
+    core->feed(s, "EHLO x\r\nMAIL FROM:<a@x.test>\r\nRCPT TO:<bob@example.org>\r\nDATA\r\nhalf a message", 70);
+    core->closeSession(s);
+    q.release();
+}
+
+smtp.Options* opts() {
+    smtp.Options* o = smtp.newOptions();
+    o->heloName = "client.test";
+    o->startTls = smtp.STARTTLS_NEVER;
+    o->record = true;
+    o->commandTimeoutMs = 3000;
+    o->greetingTimeoutMs = 3000;
+    o->dataEndTimeoutMs = 3000;
+    o->username = "ann";
+    o->password = "pw";
+    return o;
+}
+
+// one round of clients against the server on sockets
+void clientRound(int r) {
+    smtp.Options* o = opts();
+    smtp.Client* c = smtp.newClient("127.0.0.1", srv->port, o);
+    char* rc[3];
+    rc[0] = "bob@example.org";
+    rc[1] = "eve@elsewhere.test";
+    rc[2] = "carol@example.org";
+    if (c->connect()) {
+        smtp.Result* res = c->send("ann@example.net", &rc[0], 3, "Subject: m\n\n.dot\nbody\n", 21);
+        free((char*) res);
+        mail.Message* m = mail.newMessage();
+        m->from("ann@example.org");
+        m->to("bob@example.org");
+        m->subject("x");
+        m->text("hello\n");
+        res = c->sendMessage(m);
+        free((char*) res);
+        m->dispose();
+        c->noop();
+        c->quit();
+    }
+    c->dispose();
+    free((char*) o);
+    // a client that fails to authenticate, one that refuses (bad address), one that goes away without QUIT
+    o = opts();
+    o->password = "wrong";
+    c = smtp.newClient("127.0.0.1", srv->port, o);
+    c->connect();
+    c->dispose();
+    free((char*) o);
+    o = opts();
+    o->username = null;
+    c = smtp.newClient("127.0.0.1", srv->port, o);
+    c->connect();
+    rc[0] = "not an address";
+    smtp.Result* res2 = c->send("a@b.test", &rc[0], 1, "x\n", 2);
+    free((char*) res2);
+    c->dispose();
+    free((char*) o);
+    char url[100];
+    format(&url[0], 100, "smtp://ann:pw@127.0.0.1:%d", srv->port, 0, 0, 0, 0, 0);
+    smtp.Options* uo = opts();
+    uo->username = null;
+    uo->password = null;
+    uo->startTls = smtp.STARTTLS_IF_OFFERED;
+    smtp.Client* uc = smtp.connectWith(&url[0], uo);                 // refused: credentials need STARTTLS and the server has none
+    if (uc != null) uc->dispose();
+    free((char*) uo);
+}
+
+int main() {
+    char rnd[4];
+    asys.randomBytes(&rnd[0], 4);
+    format(&root[0], 200, "build/tests/t403-%d", (rnd[0] & 255) * 65536 + (rnd[1] & 255) * 256 + (rnd[2] & 255), 0, 0, 0, 0);
+    asys.mkdirs(&root[0]);
+    srv = smtpd.newServer();
+    srv->core->hostname = "mail.test";
+    srv->core->addLocalDomain("example.org");
+    srv->core->addUser("ann", "pw");
+    srv->core->allowInsecureAuth = true;
+    srv->core->maildir = &root[0];
+    srv->core->rcptHook = rcptNo;
+    srv->core->rateConns = 100000;
+    srv->core->rateMsgs = 100000;
+    srv->core->maxMessage = 8000;
+    srv->listenOn("127.0.0.1", 0, null);
+    net.setIdleHook(hook);
+
+    // ---- the core ------------------------------------------------------------------------------------------------------------------------------------
+    smtpd.Core* core = srv->core;
+    CHUNK = alloc(1100);
+    for (int i = 0; i < 1000; i++) CHUNK[i] = 'x';
+    CHUNK[998] = 13;
+    CHUNK[999] = 10;
+    for (int r = 0; r < 8; r++) coreRound(core, r);
+    int h0 = __heap_pos;
+    for (int r = 0; r < 20; r++) coreRound(core, r);
+    check("the server core: 20 rounds of sessions with every command, Maildir delivery, refusals, a message that is too big, cut off sessions: the heap did not move", __heap_pos == h0);
+    if (__heap_pos != h0) printf("     the heap grew by %d bytes\n", __heap_pos - h0);
+    check("... and nothing is left open or buffered", core->sessions == 0 && core->buffered == 0);
+
+    // ---- clients and server on sockets ---------------------------------------------------------------------------------------------------------------------
+    for (int r = 0; r < 5; r++) clientRound(r);
+    int h1 = __heap_pos;
+    for (int r = 0; r < 15; r++) clientRound(r);
+    check("clients against the server on sockets: connect, AUTH, send with partial failures, sendMessage, failures, URLs: the heap did not move", __heap_pos == h1);
+    if (__heap_pos != h1) printf("     the heap grew by %d bytes\n", __heap_pos - h1);
+    int t0 = millis();
+    while (millis() - t0 < 1500 && srv->core->sessions > 0) srv->poll(5);
+    check("... every session of the server was freed", srv->core->sessions == 0 && srv->core->buffered == 0);
+
+    // ---- the line parser and reply reader ---------------------------------------------------------------------------------------------------------------------
+    netline.Lines* ln = new netline.Lines();
+    ln->maxLine = 50;
+    char line[64];
+    char* junk = alloc(5000);
+    int seed = 3;
+    for (int r = 0; r < 4; r++) {
+        for (int i = 0; i < 5000; i++) { seed = seed * 1103515245 + 12345; int v = (seed >> 16) & 255; junk[i] = (v % 40 == 0) ? 13 : ((v % 41 == 0) ? 10 : v); }
+        ln->clear();
+        ln->feed(junk, 5000);
+        while (ln->next(&line[0], 50) != -1) { }
+    }
+    int h2 = __heap_pos;
+    for (int r = 0; r < 50; r++) {
+        for (int i = 0; i < 5000; i++) { seed = seed * 1103515245 + 12345; int v = (seed >> 16) & 255; junk[i] = (v % 40 == 0) ? 13 : ((v % 41 == 0) ? 10 : v); }
+        ln->clear();
+        ln->feed(junk, 5000);
+        while (ln->next(&line[0], 50) != -1) { }
+    }
+    ln->release();
+    check("the line parser on 250 KB of garbage: the heap did not move", __heap_pos == h2);
+    int h3 = 0;
+    for (int r = 0; r < 54; r++) {
+        if (r == 4) h3 = __heap_pos;
+        mail.Message* m = mail.newMessage();
+        m->from("a@x.test");
+        m->to("b@y.test");
+        m->attach("f.bin", "application/octet-stream", junk, 3000);
+        m->text("t");
+        int n = 0;
+        char* w = m->build(&n);
+        free(w);
+        m->dispose();
+    }
+    check("building messages with attachments: the heap did not move", __heap_pos == h3);
+
+    net.setIdleHook(null);
+    rmTree(&root[0]);
+    printf("%d failed\n", fails);
+    return fails == 0 ? 0 : 1;
+}
