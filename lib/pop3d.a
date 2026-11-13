@@ -1,0 +1,684 @@
+// =============================================================================
+//  pop3d - a small POP3 server for a Maildir, for tests and for AOS (RFC 1939, 2449 CAPA, 2595 STLS, UIDL, TOP, APOP)                import pop3d;
+//
+//    pop3d.Server* s = pop3d.newServer();
+//    s->addUser("ann", "secret", "/var/mail/ann");                 // the Maildir of the user (new/ and cur/): what smtpd.maildir delivers into /var/mail/<name>
+//    s->tlsConfig = tls.loadConfig(certPem, keyPem);               // STLS is offered; s->listenTls(995, cfg) is TLS from the start
+//    s->listen(1110);  s->run();                                   // or for (;;) s->poll(50)
+//
+//  Commands: USER, PASS, APOP, STAT, LIST, UIDL, RETR, TOP, DELE, RSET, NOOP, QUIT, CAPA, STLS. At the login the files of new/ and cur/ are listed (at most maxMessages, 1000; a file whose
+//  name has a character outside 0x21 to 0x7E or is longer than 70 characters is skipped: the name is the UIDL) and their size as it goes over the wire (CRLF line ends) is counted.
+//  RETR sends the message in blocks of 32 KiB as the connection takes them (the output queue never holds more than a few blocks: a message of any size is no problem), with CRLF
+//  line ends, every line that starts with "." stuffed and a CRLF at the end. DELE only marks; QUIT deletes the marked files (a connection that breaks deletes nothing). The Maildir
+//  is not locked: two sessions for one user at once see the same files (the second to quit finds some already gone and says nothing).
+//
+//  Security: the password is checked without an early exit; a user that does not exist looks like a wrong password; maxLoginFailures (3) then -ERR and a close; requireTls refuses
+//  USER, PASS and APOP before STLS; APOP needs the password in plain text on the server (it is in the table), so it is only offered when apop is set (default off); a message number that
+//  is not a number, 0, too big or deleted is -ERR; lines over 512 bytes are -ERR; idleTimeoutMs (10 minutes, the RFC's minimum). The names of the files come from the directory, never
+//  from the client.
+// =============================================================================
+import netline;
+import netsrv;
+import netio;
+import tls;
+import hash;
+import asys;
+import datetime;
+import cstdlib;
+import cstring;
+module pop3d;
+
+const ST_AUTH_USER = 0;             // waiting for USER or APOP
+const ST_AUTH_PASS = 1;
+const ST_TRANS = 2;
+
+private class Account {
+    public char* name;
+    public char* pass;
+    public char* dir;
+}
+
+private class Msg {
+    public char* name;              // the file name = the UIDL
+    public char* sub;               // "new" or "cur"
+    public int size;                // octets on the wire
+    public bool deleted;
+}
+
+public class Session {
+    public int id;
+    public netsrv.Conn* conn;
+    public netline.Lines lines;
+    public int state;
+    public char* user;
+    public Account* acct;
+    public char* stamp;             // the time stamp of the greeting
+    public Msg** msgs;
+    public int nmsgs;
+    public int failures;
+    public bool tlsOn;
+    public bool wantTls;
+    public bool closeAfter;
+    public int lastCmd;
+    public int fd;                  // the message that RETR sends
+    public bool lineStart;
+    public bool lineEmpty;          // nothing but a CR so far in this line (a line that stays so is the empty line behind the header)
+    public bool lastCr;
+    public int topLines;            // TOP: lines of the body still to send (-1: RETR, no limit)
+    public bool inBody;
+    public bool streaming;
+}
+
+private char* copyText(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+public class Server {
+    public netsrv.Server* net;
+    public int port;
+    public char* hostname;
+    public tls.Config* tlsConfig;
+    public bool requireTls;
+    public bool apop;
+    public int maxMessages;
+    public int maxLoginFailures;
+    public int maxLine;
+    public int idleTimeoutMs;
+    public int sessions;
+    public int retrieved;
+    public int deleted;
+    public int logins;
+
+    private Account* accounts[32];
+    private int naccounts;
+    private Session* slist[400];
+    private int nslist;
+    private int nextId;
+    private char* chunk;
+
+    public Server() {
+        hostname = "pop3d";
+        maxMessages = 1000;
+        maxLoginFailures = 3;
+        maxLine = 512;
+        idleTimeoutMs = 600000;
+        nextId = 1;
+        net = new netsrv.Server();
+        net->user = (char*) this;
+        net->onOpen = popOpen;
+        net->onData = popData;
+        net->onClose = popClose;
+        net->onTick = popTick;
+        net->onResume = popResume;
+        net->maxConns = 200;
+        net->idleTimeoutMs = 0;
+        net->handshakeTimeoutMs = 10000;
+    }
+
+    public bool addUser(char* name, char* pass, char* dir) {
+        if (naccounts >= 32 || name == null || pass == null || dir == null) return false;
+        Account* a = (Account*) malloc(sizeof(Account));
+        if (a == null) return false;
+        a->name = copyText(name);
+        a->pass = copyText(pass);
+        a->dir = copyText(dir);
+        accounts[naccounts] = a;
+        naccounts++;
+        return true;
+    }
+
+    public bool listen(int p) {
+        bool ok = net->listen(p);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenTls(int p, tls.Config* cfg) {
+        bool ok = net->listenTls(p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenOn(char* host, int p, tls.Config* cfg) {
+        bool ok = net->listenOn(host, p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public int poll(int ms) { return net->poll(ms); }
+    public void run() { net->run(); }
+    public void stop() { net->stop(); }
+
+    public void shutdown() {
+        net->shutdown();
+        for (int i = 0; i < naccounts; i++) { free(accounts[i]->name); free(accounts[i]->pass); free(accounts[i]->dir); free((char*) accounts[i]); }
+        naccounts = 0;
+        if (chunk != null) { free(chunk); chunk = null; }
+    }
+
+    private void say(Session* s, char* text) {
+        char line[600];
+        int n = format(&line[0], 600, "%s\r\n", text, 0, 0, 0, 0, 0);
+        if (n > 598) { n = 598; line[598] = 13; line[599] = 10; }
+        s->conn->out.add(&line[0], n);
+    }
+
+    private void ok(Session* s, char* text) {
+        char line[600];
+        format(&line[0], 600, "+OK %s", text, 0, 0, 0, 0, 0);
+        say(s, &line[0]);
+    }
+
+    private void err(Session* s, char* text) {
+        char line[600];
+        format(&line[0], 600, "-ERR %s", text, 0, 0, 0, 0, 0);
+        say(s, &line[0]);
+    }
+
+    public Session* find(int id) {
+        for (int i = 0; i < nslist; i++) {
+            if (slist[i]->id == id) return slist[i];
+        }
+        return null;
+    }
+
+    public Session* openSession(netsrv.Conn* c) {
+        if (nslist >= 400) return null;
+        Session* s = (Session*) malloc(sizeof(Session));
+        if (s == null) return null;
+        s->id = nextId;
+        nextId++;
+        s->conn = c;
+        s->lines.maxLine = maxLine;
+        s->lines.maxBuffer = 65536 + maxLine;
+        s->fd = -1;
+        s->tlsOn = c->secure;
+        s->lastCmd = millis();
+        slist[nslist] = s;
+        nslist++;
+        sessions++;
+        char g[300];
+        if (apop) {
+            char rnd[4];
+            asys.randomBytes(&rnd[0], 4);
+            char st[120];
+            format(&st[0], 120, "<%d.%d@%s>", (rnd[0] & 255) * 256 + (rnd[1] & 255), datetime.now(), hostname, 0, 0, 0);
+            s->stamp = copyText(&st[0]);
+            format(&g[0], 300, "+OK POP3 server ready %s\r\n", &st[0], 0, 0, 0, 0, 0);
+        } else {
+            format(&g[0], 300, "+OK POP3 server ready\r\n", 0, 0, 0, 0, 0, 0);
+        }
+        c->out.addText(&g[0]);
+        return s;
+    }
+
+    private void freeMsgs(Session* s) {
+        for (int i = 0; i < s->nmsgs; i++) {
+            free(s->msgs[i]->name);
+            free((char*) s->msgs[i]);
+        }
+        if (s->msgs != null) free((char*) s->msgs);
+        s->msgs = null;
+        s->nmsgs = 0;
+    }
+
+    public void freeSession(Session* s) {
+        if (s->fd >= 0) { asys.fileClose(s->fd); s->fd = -1; }
+        freeMsgs(s);
+        for (int i = 0; i < nslist; i++) {
+            if (slist[i] == s) { nslist--; slist[i] = slist[nslist]; slist[nslist] = null; break; }
+        }
+        if (s->user != null) free(s->user);
+        if (s->stamp != null) free(s->stamp);
+        s->lines.release();
+        sessions--;
+        free((char*) s);
+    }
+
+    public void tlsStarted(Session* s) {
+        s->tlsOn = true;
+        s->wantTls = false;
+        s->state = ST_AUTH_USER;
+        if (s->user != null) { free(s->user); s->user = null; }
+        s->lines.clear();
+    }
+
+    // ---- input ----------------------------------------------------------------------------------------------------------------------------------
+    public int feed(Session* s, char* bytes, int n) {
+        if (s->closeAfter) return -1;
+        if (!s->lines.feed(bytes, n)) { err(s, "input buffer overflow"); s->closeAfter = true; return -1; }
+        char* line = malloc(maxLine + 4);
+        if (line == null) { s->closeAfter = true; return -1; }
+        for (;;) {
+            if (s->closeAfter || s->streaming) break;                 // while a message is sent the next command waits (its bytes stay in the line parser)
+            int k = s->lines.next(line, maxLine);
+            if (k == -1) break;
+            if (k == -2) { err(s, "line too long"); continue; }
+            command(s, line, k);
+            if (s->wantTls) {
+                if (s->lines.pending() > 0) { s->wantTls = false; s->closeAfter = true; }
+                break;
+            }
+        }
+        free(line);
+        return s->closeAfter ? -1 : 0;
+    }
+
+    private bool verb(char* cmd, char* name) {
+        int i = 0;
+        while (name[i] != 0) {
+            if (toUpper(cmd[i] & 255) != name[i]) return false;
+            i++;
+        }
+        return cmd[i] == 0 || cmd[i] == ' ';
+    }
+
+    // the message number in the argument (after the verb) and the rest; -1 for "no such message"
+    private int number(Session* s, char* arg, char** rest) {
+        while (*arg == ' ') arg++;
+        int v = 0;
+        int d = 0;
+        while (*arg >= '0' && *arg <= '9' && d < 9) { v = v * 10 + (*arg - '0'); arg++; d++; }
+        if (rest != null) *rest = arg;
+        if (d == 0 || (*arg != 0 && *arg != ' ')) return -1;
+        if (v < 1 || v > s->nmsgs || s->msgs[v - 1]->deleted) return -1;
+        return v;
+    }
+
+    private void command(Session* s, char* line, int n) {
+        s->lastCmd = millis();
+        if (s->lines.bare) { err(s, "bare CR or LF"); return; }
+        for (int i = 0; i < n; i++) {
+            if (line[i] == 0) { err(s, "NUL in a command"); return; }
+        }
+        if (verb(line, "QUIT")) { cmdQuit(s); return; }
+        if (verb(line, "CAPA")) { cmdCapa(s); return; }
+        if (verb(line, "NOOP")) { ok(s, ""); return; }
+        if (verb(line, "STLS")) { cmdStls(s); return; }
+        if (s->state != ST_TRANS) {
+            if (verb(line, "USER")) { cmdUser(s, line, n); return; }
+            if (verb(line, "PASS")) { cmdPass(s, line, n); return; }
+            if (verb(line, "APOP")) { cmdApop(s, line, n); return; }
+            err(s, "log in first");
+            return;
+        }
+        if (verb(line, "STAT")) { cmdStat(s); return; }
+        if (verb(line, "LIST")) { cmdList(s, line, false); return; }
+        if (verb(line, "UIDL")) { cmdList(s, line, true); return; }
+        if (verb(line, "RETR")) { cmdRetr(s, line, -1); return; }
+        if (verb(line, "TOP")) { cmdRetr(s, line, 0); return; }
+        if (verb(line, "DELE")) { cmdDele(s, line); return; }
+        if (verb(line, "RSET")) { for (int i = 0; i < s->nmsgs; i++) s->msgs[i]->deleted = false; ok(s, "maildrop reset"); return; }
+        err(s, "unknown command");
+    }
+
+    private void cmdCapa(Session* s) {
+        netio.Queue* o = &s->conn->out;
+        o->addText("+OK capabilities follow\r\nUSER\r\nTOP\r\nUIDL\r\nRESP-CODES\r\nPIPELINING\r\n");
+        if (tlsConfig != null && !s->tlsOn) o->addText("STLS\r\n");
+        o->addText("IMPLEMENTATION pop3d\r\n.\r\n");
+    }
+
+    private void cmdStls(Session* s) {
+        if (tlsConfig == null || s->tlsOn) { err(s, "TLS is not available"); return; }
+        if (s->state != ST_AUTH_USER) { err(s, "STLS only before the login"); return; }
+        ok(s, "begin TLS negotiation");
+        s->wantTls = true;
+    }
+
+    private bool tlsOk(Session* s) { return !requireTls || s->tlsOn; }
+
+    private void cmdUser(Session* s, char* line, int n) {
+        if (!tlsOk(s)) { err(s, "login only after STLS"); return; }
+        if (n < 6) { err(s, "USER needs a name"); return; }
+        if (s->user != null) free(s->user);
+        s->user = copyText(&line[5]);
+        s->state = ST_AUTH_PASS;
+        ok(s, "send PASS");
+    }
+
+    private Account* findAccount(char* name) {
+        for (int i = 0; i < naccounts; i++) {
+            if (streq(accounts[i]->name, name)) return accounts[i];
+        }
+        return null;
+    }
+
+    private void loginFailed(Session* s) {
+        s->state = ST_AUTH_USER;
+        if (s->user != null) { free(s->user); s->user = null; }
+        s->failures++;
+        err(s, "authentication failed");
+        if (s->failures >= maxLoginFailures) {
+            err(s, "too many failures");
+            s->closeAfter = true;
+        }
+    }
+
+    private void cmdPass(Session* s, char* line, int n) {
+        if (s->state != ST_AUTH_PASS || s->user == null) { err(s, "USER first"); return; }
+        if (!tlsOk(s)) { err(s, "login only after STLS"); return; }
+        Account* a = findAccount(s->user);
+        char* pw = n > 5 ? &line[5] : "";
+        int la = strlen(pw);
+        char* want = a == null ? "" : a->pass;
+        int lb = strlen(want);
+        int diff = la ^ lb;
+        int m = la < lb ? la : lb;
+        for (int i = 0; i < m; i++) diff = diff | ((pw[i] ^ want[i]) & 255);
+        if (a == null || diff != 0) { loginFailed(s); return; }
+        startSession(s, a);
+    }
+
+    private void cmdApop(Session* s, char* line, int n) {
+        if (!apop || s->stamp == null) { err(s, "APOP is not available"); return; }
+        if (!tlsOk(s)) { err(s, "login only after STLS"); return; }
+        // APOP name digest
+        char name[100];
+        int k = 0;
+        int i = 5;
+        while (i < n && line[i] != ' ' && k < 99) { name[k] = line[i]; k++; i++; }
+        name[k] = 0;
+        while (i < n && line[i] == ' ') i++;
+        char* digest = &line[i];
+        Account* a = findAccount(&name[0]);
+        bool good = false;
+        if (a != null && n - i == 32) {
+            int sl = strlen(s->stamp);
+            int pl = strlen(a->pass);
+            char* m = malloc(sl + pl + 1);
+            memcpy(m, s->stamp, sl);
+            memcpy(&m[sl], a->pass, pl);
+            char raw[16];
+            hash.md5Raw(m, sl + pl, &raw[0]);
+            free(m);
+            int diff = 0;
+            for (int j = 0; j < 16; j++) {
+                int hi = (raw[j] >> 4) & 15;
+                int lo = raw[j] & 15;
+                int c1 = hi < 10 ? '0' + hi : 'a' + hi - 10;
+                int c2 = lo < 10 ? '0' + lo : 'a' + lo - 10;
+                diff = diff | ((c1 ^ (digest[j * 2] | 32)) & 255) | ((c2 ^ (digest[j * 2 + 1] | 32)) & 255);
+            }
+            good = diff == 0;
+        }
+        if (!good) { loginFailed(s); return; }
+        startSession(s, a);
+    }
+
+    // after the login: the Maildir is listed
+    private void startSession(Session* s, Account* a) {
+        s->acct = a;
+        s->state = ST_TRANS;
+        logins++;
+        if (s->user != null) { free(s->user); s->user = null; }
+        s->msgs = (Msg**) malloc((maxMessages + 1) * 8);
+        if (s->msgs == null) { err(s, "out of memory"); s->closeAfter = true; return; }
+        char* subs[2];
+        subs[0] = "new";
+        subs[1] = "cur";
+        for (int d = 0; d < 2 && s->nmsgs < maxMessages; d++) {
+            char dir[500];
+            format(&dir[0], 500, "%s/%s", a->dir, subs[d], 0, 0, 0, 0);
+            asys.DirList dl;
+            if (asys.listDir(&dir[0], &dl) < 0) continue;
+            dl.sort(false, false);
+            for (int i = 0; i < dl.count && s->nmsgs < maxMessages; i++) {
+                char* nm = dl.name(i);
+                int nl = strlen(nm);
+                bool good = nl >= 1 && nl <= 70 && nm[0] != '.';
+                for (int k = 0; k < nl && good; k++) { if ((nm[k] & 255) < 33 || (nm[k] & 255) > 126) good = false; }
+                if (!good) continue;
+                char full[700];
+                format(&full[0], 700, "%s/%s", &dir[0], nm, 0, 0, 0, 0);
+                asys.Stat st;
+                if (asys.lstat(&full[0], &st) < 0 || !st.isFile()) continue;
+                Msg* m = (Msg*) malloc(sizeof(Msg));
+                if (m == null) break;
+                m->name = copyText(nm);
+                m->sub = subs[d];
+                m->size = wireSize(&full[0], st.size);
+                s->msgs[s->nmsgs] = m;
+                s->nmsgs++;
+            }
+            dl.dispose();
+        }
+        char t[100];
+        int total = 0;
+        for (int i = 0; i < s->nmsgs; i++) total = total + s->msgs[i]->size;
+        format(&t[0], 100, "%d messages (%d octets)", s->nmsgs, total, 0, 0, 0, 0);
+        ok(s, &t[0]);
+    }
+
+    // the size of a file as it is sent: every line end is CRLF, the last line ends with one (counted by reading the file)
+    private int wireSize(char* path, int rawSize) {
+        int fd = asys.fileOpen(path, asys.F_READ | asys.F_NOFOLLOW, 0);
+        if (fd < 0) return rawSize;
+        if (chunk == null) chunk = malloc(65536 + 64);
+        int total = 0;
+        bool lastCr = false;
+        bool atStart = true;
+        int last = 10;
+        for (;;) {
+            int n = asys.fileRead(fd, chunk, 32768);
+            if (n <= 0) break;
+            for (int i = 0; i < n; i++) {
+                int c = chunk[i] & 255;
+                if (c == 10 && !lastCr) total++;                       // an LF without CR becomes CRLF: one more
+                total++;
+                lastCr = c == 13;
+                last = c;
+            }
+        }
+        asys.fileClose(fd);
+        if (total > 0 && last != 10) total = total + 2;                // the CRLF that ends the last line
+        return total;
+    }
+
+    private void cmdStat(Session* s) {
+        int cnt = 0;
+        int oct = 0;
+        for (int i = 0; i < s->nmsgs; i++) {
+            if (!s->msgs[i]->deleted) { cnt++; oct = oct + s->msgs[i]->size; }
+        }
+        char t[60];
+        format(&t[0], 60, "%d %d", cnt, oct, 0, 0, 0, 0);
+        ok(s, &t[0]);
+    }
+
+    private void cmdList(Session* s, char* line, bool uidl) {
+        char* rest = null;
+        char* arg = &line[4];
+        while (*arg == ' ') arg++;
+        if (*arg != 0) {
+            int v = number(s, arg, &rest);
+            if (v < 0 || *rest != 0) { err(s, "no such message"); return; }
+            char t[120];
+            if (uidl) format(&t[0], 120, "%d %s", v, s->msgs[v - 1]->name, 0, 0, 0, 0);
+            else format(&t[0], 120, "%d %d", v, s->msgs[v - 1]->size, 0, 0, 0, 0);
+            ok(s, &t[0]);
+            return;
+        }
+        netio.Queue* o = &s->conn->out;
+        o->addText("+OK\r\n");
+        for (int i = 0; i < s->nmsgs; i++) {
+            if (s->msgs[i]->deleted) continue;
+            char t[120];
+            int k;
+            if (uidl) k = format(&t[0], 120, "%d %s\r\n", i + 1, s->msgs[i]->name, 0, 0, 0, 0);
+            else k = format(&t[0], 120, "%d %d\r\n", i + 1, s->msgs[i]->size, 0, 0, 0, 0);
+            o->add(&t[0], k);
+        }
+        o->addText(".\r\n");
+    }
+
+    private void cmdDele(Session* s, char* line) {
+        int v = number(s, &line[4], null);
+        if (v < 0) { err(s, "no such message"); return; }
+        s->msgs[v - 1]->deleted = true;
+        ok(s, "message deleted");
+    }
+
+    private void cmdQuit(Session* s) {
+        if (s->state == ST_TRANS) {
+            // the update state: the marked files go
+            int gone = 0;
+            for (int i = 0; i < s->nmsgs; i++) {
+                if (!s->msgs[i]->deleted) continue;
+                char full[700];
+                format(&full[0], 700, "%s/%s/%s", s->acct->dir, s->msgs[i]->sub, s->msgs[i]->name, 0, 0, 0);
+                if (asys.unlink(&full[0]) >= 0) gone++;
+            }
+            deleted = deleted + gone;
+        }
+        ok(s, "bye");
+        s->closeAfter = true;
+    }
+
+    // ---- RETR and TOP: streamed ----------------------------------------------------------------------------------------------------------------------------------------
+    // what: -1 RETR, 0 TOP (the number of lines follows the message number)
+    private void cmdRetr(Session* s, char* line, int what) {
+        char* rest = null;
+        int v = number(s, &line[what < 0 ? 4 : 3], &rest);
+        if (v < 0) { err(s, "no such message"); return; }
+        int lines = -1;
+        if (what == 0) {
+            while (*rest == ' ') rest++;
+            int l = 0;
+            int d = 0;
+            while (*rest >= '0' && *rest <= '9' && d < 9) { l = l * 10 + (*rest - '0'); rest++; d++; }
+            if (d == 0 || *rest != 0) { err(s, "TOP needs a number of lines"); return; }
+            lines = l;
+        } else {
+            if (*rest != 0) { err(s, "too many arguments"); return; }
+        }
+        Msg* m = s->msgs[v - 1];
+        char full[700];
+        format(&full[0], 700, "%s/%s/%s", s->acct->dir, m->sub, m->name, 0, 0, 0);
+        int fd = asys.fileOpen(&full[0], asys.F_READ | asys.F_NOFOLLOW, 0);
+        if (fd < 0) { err(s, "the message cannot be read"); return; }
+        s->fd = fd;
+        s->lineStart = true;
+        s->lineEmpty = true;
+        s->lastCr = false;
+        s->inBody = false;
+        s->topLines = lines;
+        s->streaming = true;
+        ok(s, what < 0 ? "message follows" : "top of message follows");
+        if (what < 0) retrieved++;
+        pumpMessage(s);
+    }
+
+    // queues the next block of the message; when the output is above a few blocks the session is paused until it drains
+    public void pumpMessage(Session* s) {
+        if (s->fd < 0) return;
+        if (chunk == null) chunk = malloc(65536 + 64);
+        netio.Queue* o = &s->conn->out;
+        for (int round = 0; round < 2; round++) {
+            int n = asys.fileRead(s->fd, chunk, 16384);
+            if (n < 0) n = 0;
+            bool done = n == 0;
+            // canonical lines, dot-stuffing, the end of the TOP limit
+            for (int i = 0; i < n && !done; i++) {
+                int c = chunk[i] & 255;
+                if (s->topLines >= 0 && s->inBody && s->topLines == 0) { done = true; break; }
+                if (c == 10 && !s->lastCr) o->addByte(13);
+                if (s->lineStart && c == '.') o->addByte('.');
+                o->addByte(c);
+                s->lastCr = c == 13;
+                s->lineStart = c == 10;
+                if (c == 10) {
+                    if (s->topLines >= 0 && s->inBody) s->topLines--;
+                    if (s->lineEmpty && !s->inBody) s->inBody = true;       // the empty line: the body starts
+                    s->lineEmpty = true;
+                } else if (c != 13) {
+                    s->lineEmpty = false;
+                }
+            }
+            if (done) {
+                if (!s->lineStart) o->addText("\r\n");
+                o->addText(".\r\n");
+                asys.fileClose(s->fd);
+                s->fd = -1;
+                s->streaming = false;
+                // the commands that came while the message was sent
+                char* line = malloc(maxLine + 4);
+                if (line != null) {
+                    for (;;) {
+                        if (s->closeAfter || s->streaming) break;
+                        int k = s->lines.next(line, maxLine);
+                        if (k == -1) break;
+                        if (k == -2) { err(s, "line too long"); continue; }
+                        command(s, line, k);
+                    }
+                    free(line);
+                }
+                return;
+            }
+            if (o->pending() > 65536) break;
+        }
+        net->pause(s->conn, 16384);
+    }
+
+    public void tick(int now) {
+        for (int i = 0; i < nslist; i++) {
+            Session* s = slist[i];
+            if (s->closeAfter || idleTimeoutMs <= 0) continue;
+            if (!s->streaming && now - s->lastCmd > idleTimeoutMs) {
+                err(s, "idle time out");
+                s->closeAfter = true;
+                net->close(s->conn);
+            }
+        }
+    }
+}
+
+private int popOpen(netsrv.Server* ns, netsrv.Conn* c) {
+    Server* sv = (Server*) ns->user;
+    Session* s = sv->openSession(c);
+    if (s == null) return -1;
+    c->user = (char*) s;
+    return 0;
+}
+
+private int popData(netsrv.Server* ns, netsrv.Conn* c, char* data, int n) {
+    Server* sv = (Server*) ns->user;
+    Session* s = (Session*) c->user;
+    if (s == null) return -1;
+    int r = sv->feed(s, data, n);
+    if (s->wantTls) {
+        if (!ns->startTls(c, sv->tlsConfig)) { s->wantTls = false; return -1; }
+        sv->tlsStarted(s);
+    }
+    return r;
+}
+
+private int popResume(netsrv.Server* ns, netsrv.Conn* c) {
+    Server* sv = (Server*) ns->user;
+    Session* s = (Session*) c->user;
+    if (s == null) return 0;
+    if (s->streaming) sv->pumpMessage(s);
+    else {
+        // commands that arrived while the message was sent
+        sv->feed(s, "", 0);
+    }
+    if (s->closeAfter) ns->close(c);
+    return 0;
+}
+
+private int popClose(netsrv.Server* ns, netsrv.Conn* c) {
+    Server* sv = (Server*) ns->user;
+    Session* s = (Session*) c->user;
+    if (s == null) return 0;
+    c->user = null;
+    sv->freeSession(s);
+    return 0;
+}
+
+private int popTick(netsrv.Server* ns, int now) {
+    Server* sv = (Server*) ns->user;
+    sv->tick(now);
+    return 0;
+}
+
+public Server* newServer() { return new Server(); }

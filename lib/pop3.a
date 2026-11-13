@@ -1,0 +1,480 @@
+// =============================================================================
+//  pop3 - a POP3 client (RFC 1939, 2449 CAPA, 2595 STLS)                                                              import pop3;
+//
+//    pop3.Client* c = pop3.connect("pop3://ann:secret@mail.example.org");         // pop3s:// = TLS from the start (995); null: pop3.error() says why
+//    int count = c->count();                                                       // STAT: how many messages (c->octets: their size together)
+//    for (int i = 1; i <= count; i++) {
+//        int size = c->size(i);                                                    // LIST i
+//        char uid[80];  c->uidl(i, &uid[0], 80);                                   // UIDL i: a name that stays the same for this message
+//        int n;  char* msg = c->retr(i, &n);                                       // the whole message (CRLF line ends, dots un-stuffed), a heap string
+//        char* head = c->top(i, 5, &n);                                            // the header and the first 5 lines of the body
+//        c->dele(i);                                                               // marked; it goes when QUIT is sent
+//    }
+//    c->quit();  c->dispose();                                                     // QUIT commits the deletions (a connection that just goes away commits nothing)
+//
+//  Connecting: greeting (+OK), CAPA, STLS when the server offers it and the options ask (opt->startTls: STARTTLS_NEVER / IF_OFFERED (default) / REQUIRED; plain text that follows the
+//  +OK of STLS makes the connection fail), then APOP when the greeting has a time stamp (opt->useApop, default off; the password is not sent), else USER and PASS. **A password is never
+//  sent in the clear** when the connection is not encrypted unless opt->allowPlainLogin is set (default false; the URL form with a password therefore needs TLS: use APOP or the option).
+//
+//  Limits: a message over opt->maxMessage (64 MiB; the transfer is stopped and the connection closed: the rest of the message cannot be skipped cheaply), a reply line over 8 KiB, a listing
+//  over 100000 lines. Time outs: connectTimeoutMs, commandTimeoutMs (a command and its first line), dataTimeoutMs (each line of a multi-line answer, so a slow server cannot hold the
+//  client for ever on one message but a big message is no problem). Message numbers are checked (1 to count). Lines are checked for CR, LF and NUL before they are sent.
+// =============================================================================
+import netline;
+import netio;
+import hash;
+import cstdlib;
+import cstring;
+module pop3;
+
+public const STARTTLS_NEVER = 0;
+public const STARTTLS_IF_OFFERED = 1;
+public const STARTTLS_REQUIRED = 2;
+
+private char lastErr[200];
+
+private void setErr(char* s) {
+    int n = strlen(s);
+    if (n > 190) n = 190;
+    memcpy(&lastErr[0], s, n);
+    lastErr[n] = 0;
+}
+
+public char* error() { return &lastErr[0]; }
+
+private char* copyText(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+public class Options {
+    public char* username;
+    public char* password;
+    public bool useTls;                 // TLS from the start (port 995)
+    public int startTls;                // STLS: STARTTLS_NEVER, STARTTLS_IF_OFFERED (default), STARTTLS_REQUIRED
+    public bool useApop;                // log in with APOP when the greeting has a time stamp
+    public bool allowPlainLogin;        // send USER / PASS on a connection that is not encrypted
+    public bool verify;                 // check the server certificate (default true)
+    public bool record;
+    public int connectTimeoutMs;
+    public int commandTimeoutMs;
+    public int dataTimeoutMs;
+    public int maxMessage;
+
+    public Options() { init(); }
+
+    public void init() {
+        startTls = STARTTLS_IF_OFFERED;
+        verify = true;
+        connectTimeoutMs = 10000;
+        commandTimeoutMs = 30000;
+        dataTimeoutMs = 30000;
+        maxMessage = 67108864;
+    }
+}
+
+public Options* newOptions() {
+    Options* o = (Options*) malloc(sizeof(Options));
+    if (o != null) o->init();
+    return o;
+}
+
+public class Client {
+    public netline.Conn* conn;
+    public Options* opt;
+    public char* error;
+    public bool secure;
+    public bool loggedIn;
+    public bool broken;
+    public bool hasStls;
+    public bool hasUidl;
+    public bool hasTop;
+    public int octets;                  // from STAT
+    public int total;                   // messages at the last STAT
+    public bool heap;
+    public char* status;                // the text of the last "+OK" or "-ERR" line (valid until the next command)
+
+    private char* host;
+    private int port;
+    private bool ownsOpt;
+    private bool ownsCreds;
+    private char* stamp;                // the time stamp of the greeting (<...>) for APOP
+    private char line[8200];
+
+    public bool isOpen() { return conn != null && conn->isOpen() && !broken; }
+    public char* transcript() { return conn == null ? "" : conn->transcript(); }
+
+    private bool fail(char* why) {
+        error = why;
+        setErr(why);
+        return false;
+    }
+
+    private void breakConn() {
+        broken = true;
+        if (conn != null) conn->close();
+    }
+
+    // reads the status line: true for +OK, false for -ERR (error = the text) or a failure (the connection is closed)
+    private bool readStatus(int timeoutMs) {
+        int n = conn->readLine(&line[0], 8192, timeoutMs);
+        if (n < 0) { error = conn->error; breakConn(); return false; }
+        if (n >= 3 && memcmp(&line[0], "+OK", 3) == 0 && (n == 3 || line[3] == ' ')) {
+            status = n > 4 ? &line[4] : &line[3];
+            return true;
+        }
+        if (n >= 4 && memcmp(&line[0], "-ERR", 4) == 0) {
+            error = n > 5 ? &line[5] : "the server said -ERR";
+            status = error;
+            setErr(error);
+            return false;
+        }
+        error = "a reply that is neither +OK nor -ERR";
+        setErr(error);
+        breakConn();
+        return false;
+    }
+
+    private bool command(char* text) {
+        if (!isOpen()) { error = "not connected"; return false; }
+        if (!conn->writeLine(text, opt->commandTimeoutMs, null)) { error = conn->error; breakConn(); return false; }
+        return readStatus(opt->commandTimeoutMs);
+    }
+
+    // a command with a secret in it: the transcript shows `shown`
+    private bool secretCommand(char* text, char* shown) {
+        if (!isOpen()) { error = "not connected"; return false; }
+        if (!conn->writeLine(text, opt->commandTimeoutMs, shown)) { error = conn->error; breakConn(); return false; }
+        return readStatus(opt->commandTimeoutMs);
+    }
+
+    // Reads the lines of a multi-line answer into out (dots un-stuffed, CRLF after every line) until the line ".". maxBytes limits the data (more: false, closed).
+    private bool readBody(netio.Queue* out, int maxBytes, int maxLines) {
+        int lines = 0;
+        for (;;) {
+            int n = conn->readLine(&line[0], 8192, opt->dataTimeoutMs);
+            if (n < 0) { error = n == netline.E_TOO_LONG ? "a line that is too long in the answer" : conn->error; breakConn(); return false; }
+            if (n == 1 && line[0] == '.') return true;
+            int from = (n > 0 && line[0] == '.') ? 1 : 0;
+            lines++;
+            if (lines > maxLines || out->pending() + (n - from) + 2 > maxBytes) { error = "the answer is bigger than the limit"; setErr(error); breakConn(); return false; }
+            out->add(&line[from], n - from);
+            out->add("\r\n", 2);
+        }
+        return false;
+    }
+
+    public bool connect() {
+        broken = false;
+        secure = false;
+        loggedIn = false;
+        if (conn != null) { conn->dispose(); conn = null; }
+        conn = netline.open(host, port, opt->connectTimeoutMs, opt->useTls, opt->verify);
+        if (conn == null) return fail(netline.lastError());
+        conn->recording = opt->record;
+        secure = opt->useTls;
+        if (!readStatus(opt->commandTimeoutMs)) { char* why = error; breakConn(); return fail(why); }
+        // the time stamp for APOP: <...@...> in the greeting
+        if (stamp != null) { free(stamp); stamp = null; }
+        char* lt = strchr(status, '<');
+        if (lt != null) {
+            char* gt = strchr(lt, '>');
+            if (gt != null && gt > lt + 2) {
+                int sl = gt - lt + 1;
+                stamp = malloc(sl + 1);
+                memcpy(stamp, lt, sl);
+                stamp[sl] = 0;
+            }
+        }
+        capa();
+        bool needTls = opt->startTls == STARTTLS_REQUIRED && !secure;
+        if (!secure && opt->startTls != STARTTLS_NEVER && hasStls) {
+            if (!command("STLS")) {
+                if (needTls) { breakConn(); return fail("the server refused STLS"); }
+            } else {
+                if (!conn->startTls(host, opt->verify, opt->connectTimeoutMs)) { char* why = conn->error; breakConn(); return fail(why); }
+                secure = true;
+                capa();
+            }
+        } else if (needTls) {
+            breakConn();
+            return fail("the server does not offer STLS (and it is required)");
+        }
+        if (opt->username != null && opt->password != null) {
+            if (!login()) { char* why = error; breakConn(); return fail(why); }
+        }
+        return true;
+    }
+
+    private void capa() {
+        hasStls = false; hasUidl = false; hasTop = false;
+        if (!command("CAPA")) return;
+        netio.Queue q;
+        q.max = 8192;
+        if (!readBody(&q, 8192, 100)) { q.release(); return; }
+        q.reserve(1);
+        char* d = q.data();
+        d[q.pending()] = 0;
+        if (contains(d, "STLS\r\n")) hasStls = true;
+        if (contains(d, "UIDL\r\n")) hasUidl = true;
+        if (contains(d, "TOP\r\n")) hasTop = true;
+        q.release();
+    }
+
+    private bool login() {
+        if (!netline.isLineSafe(opt->username) || !netline.isLineSafe(opt->password)) return fail("the user name and the password must not contain CR or LF");
+        if (opt->useApop && stamp != null) {
+            // MD5 of the time stamp and the password, in hexadecimal: the password is not sent
+            int sl = strlen(stamp);
+            int pl = strlen(opt->password);
+            char* m = malloc(sl + pl + 1);
+            memcpy(m, stamp, sl);
+            memcpy(&m[sl], opt->password, pl);
+            char raw[16];
+            hash.md5Raw(m, sl + pl, &raw[0]);
+            free(m);
+            char hex[40];
+            for (int i = 0; i < 16; i++) {
+                int hi = (raw[i] >> 4) & 15;
+                int lo = raw[i] & 15;
+                hex[i * 2] = hi < 10 ? '0' + hi : 'a' + hi - 10;
+                hex[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+            }
+            hex[32] = 0;
+            char cmd[400];
+            format(&cmd[0], 400, "APOP %s %s", opt->username, &hex[0], 0, 0, 0, 0);
+            if (!secretCommand(&cmd[0], "APOP ****")) return false;
+            loggedIn = true;
+            return true;
+        }
+        if (!secure && !opt->allowPlainLogin) return fail("no TLS: the password is not sent in the clear (use APOP, STLS, pop3s or allowPlainLogin)");
+        char cmd[400];
+        format(&cmd[0], 400, "USER %s", opt->username, 0, 0, 0, 0, 0);
+        if (!command(&cmd[0])) return false;
+        format(&cmd[0], 400, "PASS %s", opt->password, 0, 0, 0, 0, 0);
+        if (!secretCommand(&cmd[0], "PASS ****")) return false;
+        loggedIn = true;
+        return true;
+    }
+
+    // the number of messages in the maildrop (STAT); -1 on failure. octets gets their size.
+    public int count() {
+        if (!command("STAT")) return -1;
+        int a = 0;
+        int n = 0;
+        char* s = status;
+        while (s[a] >= '0' && s[a] <= '9' && a < 12) { n = n * 10 + (s[a] - '0'); a++; }
+        if (a == 0) { fail("a STAT reply that cannot be read"); return -1; }
+        total = n;
+        while (s[a] == ' ') a++;
+        int o = 0;
+        int b = 0;
+        while (s[a + b] >= '0' && s[a + b] <= '9' && b < 15) { o = o * 10 + (s[a + b] - '0'); b++; }
+        octets = o;
+        return n;
+    }
+
+    private bool numberOk(int n) {
+        if (n < 1 || n > 1000000) { fail("a message number out of range"); return false; }
+        return true;
+    }
+
+    // the size of message n in octets (LIST n), -1 on failure
+    public int size(int n) {
+        if (!numberOk(n)) return -1;
+        char cmd[40];
+        format(&cmd[0], 40, "LIST %d", n, 0, 0, 0, 0, 0);
+        if (!command(&cmd[0])) return -1;
+        char* s = status;
+        int a = 0;
+        while (s[a] >= '0' && s[a] <= '9') a++;
+        while (s[a] == ' ') a++;
+        int v = 0;
+        int d = 0;
+        while (s[a] >= '0' && s[a] <= '9' && d < 15) { v = v * 10 + (s[a] - '0'); a++; d++; }
+        return d > 0 ? v : -1;
+    }
+
+    // the unique id of message n (UIDL n) into out; false when the server has no UIDL or the message is gone
+    public bool uidl(int n, char* out, int max) {
+        if (!numberOk(n)) return false;
+        char cmd[40];
+        format(&cmd[0], 40, "UIDL %d", n, 0, 0, 0, 0, 0);
+        if (!command(&cmd[0])) return false;
+        char* s = status;
+        int a = 0;
+        while (s[a] >= '0' && s[a] <= '9') a++;
+        while (s[a] == ' ') a++;
+        int k = 0;
+        while (s[a] > 32 && k < max - 1 && k < 70) { out[k] = s[a]; k++; a++; }
+        out[k] = 0;
+        return k > 0;
+    }
+
+    // message n, whole (a heap string with a 0 byte behind it; CRLF line ends; dots un-stuffed), its length in *len; null on failure
+    public char* retr(int n, int* len) {
+        if (!numberOk(n)) return null;
+        char cmd[40];
+        format(&cmd[0], 40, "RETR %d", n, 0, 0, 0, 0, 0);
+        return multi(&cmd[0], len, opt->maxMessage);
+    }
+
+    // the header and the first `lines` lines of the body of message n (TOP)
+    public char* top(int n, int lines, int* len) {
+        if (!numberOk(n) || lines < 0 || lines > 1000000) { fail("bad arguments for TOP"); return null; }
+        char cmd[60];
+        format(&cmd[0], 60, "TOP %d %d", n, lines, 0, 0, 0, 0);
+        return multi(&cmd[0], len, opt->maxMessage);
+    }
+
+    private char* multi(char* cmd, int* len, int maxBytes) {
+        if (!command(cmd)) return null;
+        netio.Queue q;
+        q.max = 0;
+        if (!readBody(&q, maxBytes, 100000000)) { q.release(); return null; }
+        int n = q.pending();
+        char* r = malloc(n + 1);
+        if (r == null) { q.release(); fail("out of memory"); return null; }
+        if (n > 0) memcpy(r, q.data(), n);
+        r[n] = 0;
+        q.release();
+        if (len != null) *len = n;
+        return r;
+    }
+
+    public bool dele(int n) {
+        if (!numberOk(n)) return false;
+        char cmd[40];
+        format(&cmd[0], 40, "DELE %d", n, 0, 0, 0, 0, 0);
+        return command(&cmd[0]);
+    }
+
+    public bool reset() { return command("RSET"); }
+    public bool noop() { return command("NOOP"); }
+
+    // QUIT: the server commits the deletions; true when it said +OK. The connection is closed.
+    public bool quit() {
+        bool ok = false;
+        if (isOpen()) ok = command("QUIT");
+        broken = true;
+        if (conn != null) conn->close();
+        return ok;
+    }
+
+    public void dispose() {
+        if (conn != null) { conn->dispose(); conn = null; }
+        if (host != null) free(host);
+        if (stamp != null) free(stamp);
+        if (ownsCreds && opt != null) {
+            if (opt->username != null) free(opt->username);
+            if (opt->password != null) free(opt->password);
+        }
+        if (ownsOpt && opt != null) free((char*) opt);
+        if (heap) { heap = false; free((char*) this); }
+    }
+
+    public void setHost(char* h, int p) {
+        if (host != null) free(host);
+        host = copyText(h);
+        port = p;
+    }
+
+    public void setOwns(bool options, bool creds) {
+        ownsOpt = options;
+        ownsCreds = creds;
+    }
+}
+
+public Client* newClient(char* host, int port, Options* options) {
+    Client* c = (Client*) malloc(sizeof(Client));
+    if (c == null) return null;
+    c->heap = true;
+    Options* mine = (Options*) malloc(sizeof(Options));
+    if (mine == null) { free((char*) c); return null; }
+    if (options != null) memcpy((char*) mine, (char*) options, sizeof(Options)); else mine->init();
+    c->opt = mine;
+    c->setOwns(true, false);
+    c->setHost(host, port);
+    return c;
+}
+
+private int hexv(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+private char* urlDecode(char* s, int n) {
+    char* r = malloc(n + 1);
+    if (r == null) return null;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2 < n) {
+            int a = hexv(s[i + 1]);
+            int b = hexv(s[i + 2]);
+            if (a >= 0 && b >= 0) { r[k] = a * 16 + b; k++; i = i + 2; continue; }
+        }
+        r[k] = s[i];
+        k++;
+    }
+    r[k] = 0;
+    return r;
+}
+
+// Connects to "pop3://[user[:password]@]host[:port]" (port 110) or "pop3s://..." (TLS from the start, port 995). A user name and a password may be percent encoded.
+public Client* connectWith(char* url, Options* options) {
+    bool secure = false;
+    int i = 0;
+    if (startsWith(url, "pop3s://")) { secure = true; i = 8; }
+    else if (startsWith(url, "pop3://")) i = 7;
+    else { setErr("the URL must start with pop3:// or pop3s://"); return null; }
+    int at = -1;
+    for (int k = i; url[k] != 0 && url[k] != '/'; k++) { if (url[k] == '@') at = k; }
+    char* user = null;
+    char* pass = null;
+    if (at >= 0) {
+        int colon = -1;
+        for (int k = i; k < at; k++) { if (url[k] == ':') { colon = k; break; } }
+        int ue = colon >= 0 ? colon : at;
+        user = urlDecode(&url[i], ue - i);
+        if (colon >= 0) pass = urlDecode(&url[colon + 1], at - colon - 1);
+        i = at + 1;
+    }
+    char hostBuf[256];
+    int hl = 0;
+    while (url[i] != 0 && url[i] != ':' && url[i] != '/') {
+        if (hl >= 255) { setErr("host name too long"); return null; }
+        hostBuf[hl] = url[i];
+        hl++;
+        i++;
+    }
+    hostBuf[hl] = 0;
+    if (hl == 0) { setErr("no host in the URL"); return null; }
+    int port = 0;
+    if (url[i] == ':') {
+        i++;
+        while (isDigit(url[i])) { port = port * 10 + (url[i] - '0'); if (port > 65535) { setErr("bad port"); return null; } i++; }
+        if (port == 0) { setErr("bad port"); return null; }
+    }
+    if (port == 0) port = secure ? 995 : 110;
+    Client* c = newClient(&hostBuf[0], port, options);
+    if (c == null) { setErr("out of memory"); return null; }
+    if (secure) c->opt->useTls = true;
+    if (user != null) {
+        c->opt->username = user;
+        c->opt->password = pass == null ? copyText("") : pass;
+        c->setOwns(true, true);
+        if (!secure && (options == null || options->startTls == STARTTLS_IF_OFFERED)) c->opt->startTls = STARTTLS_REQUIRED;
+    }
+    if (!c->connect()) {
+        setErr(c->error != null ? c->error : "cannot connect");
+        c->dispose();
+        return null;
+    }
+    return c;
+}
+
+public Client* connect(char* url) { return connectWith(url, null); }
