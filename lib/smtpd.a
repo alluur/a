@@ -1,0 +1,1122 @@
+// =============================================================================
+//  smtpd - a small SMTP server: a mailbox sink for tests and for AOS (RFC 5321, 3207, 4954, 1870, 6152, 2920, 2034)          import smtpd;
+//
+//    smtpd.Server* s = smtpd.newServer();
+//    s->core->hostname = "mail.example.org";
+//    s->core->addLocalDomain("example.org");                    // mail for @example.org is accepted, everything else is refused ("relay access denied")
+//    s->core->addUser("ann", "secret");                         // AUTH PLAIN / LOGIN / CRAM-MD5; an authenticated user may send anywhere (relayAuthenticated)
+//    s->core->maildir = "/var/mail";                            // delivery: /var/mail/<local part>/new/<unique name> (Maildir: written in tmp/, then renamed)
+//    s->core->tlsConfig = tls.loadConfig(certPem, keyPem);      // STARTTLS is offered; s->listenTls(465, cfg) is TLS from the start
+//    if (!s->listen(2525)) { ... }                              // port 0 picks a free one (s->port)
+//    s->run();                                                  // or: for (;;) { s->poll(50); ... }
+//
+//  NOT AN OPEN RELAY. A recipient is accepted when (1) its domain is one of the local domains, or (2) the session has authenticated and relayAuthenticated is on (the
+//  default), or (3) the client is on the loopback address and relayLoopback is on (off by default), or (4) acceptAnyRecipient is on (off: a sink for tests that takes
+//  everything; the name says what it is). Otherwise: 550 5.7.1 relay access denied. rcptHook may refuse more (an unknown mailbox: return 550). requireTls refuses MAIL FROM and
+//  AUTH before STARTTLS (530 5.7.0), authRequired refuses MAIL FROM before AUTH. PLAIN and LOGIN are only offered on TLS unless allowInsecureAuth (CRAM-MD5 always).
+//
+//  Delivery: deliverHook(core, session, data, len) returns 0 (accepted: 250) or an SMTP code (451 tempfail, 552 ...); without a hook and with `maildir` set every recipient
+//  gets the message in a Maildir of its own, with Return-Path and Received headers added. The name of a mailbox is made from the local part: lower case, only
+//  a-z 0-9 . _ + - (no leading dot, no "..", at most 50 characters); a recipient whose name is not like that is refused at RCPT (553 5.1.3), nothing from the network
+//  is ever used as a path as it is.
+//
+//  Limits (all settable): maxMessage (SIZE, 10 MiB: a message over it is read and thrown away, 552, nothing is buffered beyond), maxRecipients (100, 452 over), maxLine (command
+//  lines, 1024: 500), maxDataLine (8192: a longer line in a message rejects the message), maxBadCommands (10 in a session: 421), maxMessagesPerSession (100: 421), maxAuthFailures (3),
+//  maxBuffered (64 MiB of message data held by all sessions together: 452 4.3.1), rateMsgs / rateConns per address in rateWindowMs (450 / 421 over; 0: off), and in the network layer
+//  s->net: maxConns, maxPerIp, idleTimeoutMs (default 2 minutes), handshakeTimeoutMs, maxOut.
+//
+//  Lines end only with CRLF. A bare LF or CR in a command is an error (500 5.5.2), in a message it rejects the message (550 5.6.0) unless strictLineEnds is off:
+//  servers that accept "LF.CRLF" or "CRLF.LF" as the end of a message are the ones that "SMTP smuggling" attacks. Plain bytes that follow STARTTLS in the same TCP read
+//  are never executed: the connection is closed (CVE-2011-0411 and its relatives).
+//
+//  The core has no sockets: core->open(ip, outQueue), core->feed(session, bytes, n), core->closeSession(session): the tests drive it with bytes. core->fakeTime / fakeNowMs give it a clock.
+// =============================================================================
+import netline;
+import netsrv;
+import netio;
+import tls;
+import mail;
+import hash;
+import asys;
+import datetime;
+import cstdlib;
+import cstring;
+module smtpd;
+
+public const ST_CMD = 0;
+public const ST_DATA = 1;
+public const ST_AUTH_PLAIN = 2;
+public const ST_AUTH_LOGIN_USER = 3;
+public const ST_AUTH_LOGIN_PASS = 4;
+public const ST_AUTH_CRAM = 5;
+
+public const MAX_USERS = 32;
+public const MAX_DOMAINS = 16;
+public const MAX_RATE = 256;
+
+private class User {
+    public char* name;
+    public char* pass;
+}
+
+private class Rate {
+    public int ip;
+    public int start;           // when the window of this entry began
+    public int conns;
+    public int msgs;
+}
+
+public class Stats {
+    public int connections;
+    public int messages;        // accepted and delivered
+    public int bytes;
+    public int rcptRefused;
+    public int rejected;        // messages refused (size, line ends, hook)
+    public int badCommands;
+    public int authOk;
+    public int authFailed;
+    public int rateLimited;
+    public int tlsStarted;
+}
+
+public class Session {
+    public netio.Queue* out;
+    public int ip;                  // the peer (host order)
+    public int state;
+    public char* helo;              // the name from EHLO / HELO (heap) or null
+    public bool esmtp;              // EHLO was used
+    public char* from;              // the sender of the transaction ("" for <>), null: no MAIL yet
+    public char** rcpt;             // the recipients (heap strings)
+    public int nrcpt;
+    public char* authUser;          // the user that authenticated (heap) or null
+    public bool tls;                // the connection is encrypted
+    public bool wantStartTls;       // set by STARTTLS: the layer that owns the socket must switch to TLS (and call core->tlsStarted)
+    public bool closeAfter;         // QUIT, or a fatal error: close when the output is sent
+    public int declaredSize;        // SIZE= of MAIL FROM
+    public bool body8;
+    public int messages;            // messages accepted in this session
+    public int bad;                 // commands that were not understood
+    public int authFails;
+    public char* user;              // for the owner of the session
+    public netline.Lines lines;
+    public mail.Buf data;           // the message so far
+    public int dataSize;            // bytes received (also what was not kept)
+    public bool tooBig;
+    public bool bareLine;
+    public bool longLine;
+    public char* received;          // the Received header of this transaction (heap, set while a message is delivered)
+    public char* queueId;           // the id of the message that is delivered (heap, valid in the hooks)
+
+    public char* challenge;         // CRAM-MD5
+    public char* pendingUser;       // LOGIN
+}
+
+private char* copyText(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+private void setStr(char** field, char* v) {
+    if (*field != null) free(*field);
+    *field = v == null ? null : copyText(v);
+}
+
+public class Core {
+    public char* hostname;
+    public int maxMessage;
+    public int maxRecipients;
+    public int maxLine;
+    public int maxDataLine;
+    public int maxBadCommands;
+    public int maxMessagesPerSession;
+    public int maxAuthFailures;
+    public int maxBuffered;
+    public bool requireTls;
+    public bool allowInsecureAuth;
+    public bool authRequired;
+    public bool strictLineEnds;
+    public bool acceptAnyRecipient;
+    public bool relayAuthenticated;
+    public bool relayLoopback;
+    public int rateMsgs;
+    public int rateConns;
+    public int rateWindowMs;
+    public char* maildir;
+    public tls.Config* tlsConfig;           // STARTTLS is offered when this is set (and the connection is not encrypted already)
+    public func rcptHook;                   // int rcptHook(core, session, address): 0 accept, else the reply code (550, 450 ...)
+    public func deliverHook;                // int deliverHook(core, session, data, len): 0 accepted, else the reply code
+    public func authHook;                   // int authHook(core, session, user, password): 1 accept, 0 refuse (instead of the table of addUser)
+    public char* user;                      // yours
+    public Stats* stats;
+    public bool useFakeTime;                // tests: fakeTime is the clock for dates (unix seconds), fakeNowMs for the rate limits, ids are idPrefix + a counter
+    public int fakeTime;
+    public int fakeNowMs;
+    public char* idPrefix;                  // not null: queue ids are idPrefix and a counter (tests); else random
+    public int buffered;                    // bytes of message data held now
+    public int sessions;
+
+    private User** users;
+    private int nusers;
+    private char* domains[16];
+    private int ndomains;
+    private Rate* rates[256];
+    private int nrates;
+    private int idCounter;
+
+    public Core() {
+        hostname = "localhost";
+        maxMessage = 10485760;
+        maxRecipients = 100;
+        maxLine = 1024;
+        maxDataLine = 8192;
+        maxBadCommands = 10;
+        maxMessagesPerSession = 100;
+        maxAuthFailures = 3;
+        maxBuffered = 67108864;
+        strictLineEnds = true;
+        relayAuthenticated = true;
+        rateWindowMs = 60000;
+        stats = new Stats();
+    }
+
+    public bool addUser(char* name, char* pass) {
+        if (nusers >= MAX_USERS || name == null || pass == null) return false;
+        if (users == null) users = (User**) malloc(MAX_USERS * 8);
+        if (users == null) return false;
+        User* u = (User*) malloc(sizeof(User));
+        if (u == null) return false;
+        u->name = copyText(name);
+        u->pass = copyText(pass);
+        users[nusers] = u;
+        nusers++;
+        return true;
+    }
+
+    public bool addLocalDomain(char* d) {
+        if (ndomains >= MAX_DOMAINS || d == null || strlen(d) == 0) return false;
+        char* c = copyText(d);
+        for (int i = 0; c[i] != 0; i++) c[i] = toLower(c[i]);
+        domains[ndomains] = c;
+        ndomains++;
+        return true;
+    }
+
+    private int nowMs() { return useFakeTime ? fakeNowMs : millis(); }
+    private int clock() { return useFakeTime ? fakeTime : datetime.now(); }
+
+    private User* findUser(char* name) {
+        for (int i = 0; i < nusers; i++) {
+            if (streq(users[i]->name, name)) return users[i];
+        }
+        return null;
+    }
+
+    private bool isLocalDomain(char* d) {
+        for (int i = 0; i < ndomains; i++) {
+            if (streqi(domains[i], d)) return true;
+        }
+        return false;
+    }
+
+    // ---- rate limits -----------------------------------------------------------------------------------------------------------------------------
+    private Rate* rateFor(int ip) {
+        int now = nowMs();
+        for (int i = 0; i < nrates; i++) {
+            if (rates[i]->ip == ip) {
+                if (now - rates[i]->start >= rateWindowMs || now < rates[i]->start) { rates[i]->start = now; rates[i]->conns = 0; rates[i]->msgs = 0; }
+                return rates[i];
+            }
+        }
+        Rate* r = null;
+        if (nrates >= MAX_RATE) {
+            // the entry with the oldest window goes
+            int oldest = 0;
+            for (int i = 1; i < nrates; i++) { if (rates[i]->start < rates[oldest]->start) oldest = i; }
+            r = rates[oldest];
+        } else {
+            r = (Rate*) malloc(sizeof(Rate));
+            if (r == null) return null;
+            rates[nrates] = r;
+            nrates++;
+        }
+        r->ip = ip;
+        r->start = now;
+        r->conns = 0;
+        r->msgs = 0;
+        return r;
+    }
+
+    // ---- sessions --------------------------------------------------------------------------------------------------------------------------------
+    // A new session for a connection from ip; the replies go into out. The greeting is queued (220, or 421 when the address is over its rate limit). secure: the connection is
+    // encrypted already (a TLS listener).
+    public Session* open(int ip, netio.Queue* out, bool secure = false) {
+        Session* s = (Session*) malloc(sizeof(Session));
+        if (s == null) return null;
+        s->out = out;
+        s->ip = ip;
+        s->tls = secure;
+        s->lines.maxLine = maxLine;
+        s->lines.maxBuffer = maxLine + maxDataLine + 65536;
+        s->rcpt = (char**) malloc((maxRecipients + 1) * 8);
+        if (s->rcpt == null) { free((char*) s); return null; }
+        sessions++;
+        stats->connections++;
+        if (rateConns > 0) {
+            Rate* r = rateFor(ip);
+            if (r != null) {
+                r->conns++;
+                if (r->conns > rateConns) {
+                    stats->rateLimited++;
+                    say(s, 421, "4.7.0", "Too many connections from your address, try again later");
+                    s->closeAfter = true;
+                    return s;
+                }
+            }
+        }
+        char g[300];
+        format(&g[0], 300, "%s ESMTP ready", hostname, 0, 0, 0, 0, 0);
+        say(s, 220, null, &g[0]);
+        return s;
+    }
+
+    private void resetTransaction(Session* s) {
+        if (s->from != null) { free(s->from); s->from = null; }
+        for (int i = 0; i < s->nrcpt; i++) free(s->rcpt[i]);
+        s->nrcpt = 0;
+        s->declaredSize = 0;
+        s->body8 = false;
+        buffer(s, 0);
+        s->data.release();
+        s->dataSize = 0;
+        s->tooBig = false;
+        s->bareLine = false;
+        s->longLine = false;
+        if (s->received != null) { free(s->received); s->received = null; }
+        if (s->queueId != null) { free(s->queueId); s->queueId = null; }
+        s->state = ST_CMD;
+    }
+
+    // accounts the bytes held by a session: s->data.len becomes `now` as far as the global budget is concerned
+    private bool buffer(Session* s, int add) {
+        if (add == 0) { buffered = buffered - s->data.len; if (buffered < 0) buffered = 0; return true; }
+        if (buffered + add > maxBuffered) return false;
+        buffered = buffered + add;
+        return true;
+    }
+
+    // frees a session (the connection is gone)
+    public void closeSession(Session* s) {
+        resetTransaction(s);
+        for (int i = 0; i < s->nrcpt; i++) free(s->rcpt[i]);
+        if (s->helo != null) free(s->helo);
+        if (s->authUser != null) free(s->authUser);
+        if (s->challenge != null) free(s->challenge);
+        if (s->pendingUser != null) free(s->pendingUser);
+        s->lines.release();
+        free((char*) s->rcpt);
+        sessions--;
+        free((char*) s);
+    }
+
+    // called by the layer that owns the socket after the switch to TLS: the session starts again as RFC 3207 says (the greeting, the name from EHLO and the authentication are forgotten)
+    public void tlsStarted(Session* s) {
+        stats->tlsStarted++;
+        s->tls = true;
+        s->wantStartTls = false;
+        resetTransaction(s);
+        if (s->helo != null) { free(s->helo); s->helo = null; }
+        s->esmtp = false;
+        if (s->authUser != null) { free(s->authUser); s->authUser = null; }
+        s->lines.clear();
+    }
+
+    // ---- replies ---------------------------------------------------------------------------------------------------------------------------------
+    // "250 2.1.0 text": the code, the enhanced status code (null: none) and the text
+    private void say(Session* s, int code, char* status, char* text) {
+        char line[600];
+        int n;
+        if (status != null) n = format(&line[0], 600, "%d %s %s\r\n", code, status, text, 0, 0, 0);
+        else n = format(&line[0], 600, "%d %s\r\n", code, text, 0, 0, 0, 0);
+        if (n > 598) n = 598;
+        s->out->add(&line[0], n);
+    }
+
+    // a reply for a code that a hook returned
+    private void sayCode(Session* s, int code, char* defaultText) {
+        char* st = code >= 500 ? "5.0.0" : "4.0.0";
+        if (code == 550) st = "5.1.1";
+        if (code == 552) st = "5.3.4";
+        if (code == 451) st = "4.3.0";
+        if (code == 452) st = "4.3.1";
+        if (code == 554) st = "5.7.1";
+        say(s, code, st, defaultText);
+    }
+
+    private bool isKeyword(char* line, int n, char* kw) {
+        int k = strlen(kw);
+        if (n < k) return false;
+        for (int i = 0; i < k; i++) {
+            if (toUpper(line[i] & 255) != kw[i]) return false;
+        }
+        return n == k || line[k] == ' ';
+    }
+
+    // ---- the input -------------------------------------------------------------------------------------------------------------------------------
+    // Takes bytes from the peer: every complete line is handled, the replies are queued in the session's output. Returns < 0 when the connection must be closed (after the output).
+    public int feed(Session* s, char* bytes, int n) {
+        if (s->closeAfter) return -1;
+        if (!s->lines.feed(bytes, n)) {
+            say(s, 421, "4.7.0", "Input buffer overflow, closing the connection");
+            s->closeAfter = true;
+            return -1;
+        }
+        char* line = malloc((maxLine > maxDataLine ? maxLine : maxDataLine) + 4);
+        if (line == null) { s->closeAfter = true; return -1; }
+        for (;;) {
+            if (s->closeAfter) break;
+            int lim = s->state == ST_DATA ? maxDataLine : maxLine;
+            s->lines.maxLine = lim;
+            int k = s->lines.next(line, lim);
+            if (k == -1) break;
+            if (k == -2) {
+                if (s->state == ST_DATA) { s->longLine = true; s->dataSize = s->dataSize + lim; checkSize(s); }
+                else { say(s, 500, "5.5.2", "Line too long"); countBad(s); }
+                continue;
+            }
+            if (s->state == ST_DATA) {
+                dataLine(s, line, k);
+            } else if (s->state != ST_CMD) {
+                authLine(s, line, k);
+            } else {
+                command(s, line, k);
+            }
+            if (s->wantStartTls) {
+                // STARTTLS: whatever follows in the same read is plain text that must not be run (an attack): the connection is closed
+                if (s->lines.pending() > 0) { s->wantStartTls = false; s->closeAfter = true; }
+                break;
+            }
+        }
+        free(line);
+        return s->closeAfter ? -1 : 0;
+    }
+
+    private void countBad(Session* s) {
+        s->bad++;
+        stats->badCommands++;
+        if (s->bad > maxBadCommands) {
+            say(s, 421, "4.7.0", "Too many errors, closing the connection");
+            s->closeAfter = true;
+        }
+    }
+
+    private void checkSize(Session* s) {
+        if (s->dataSize > maxMessage && !s->tooBig) {
+            s->tooBig = true;
+            buffer(s, 0);
+            s->data.release();                      // nothing more is kept: the rest of the message is read and thrown away
+        }
+    }
+
+    // a line of the message
+    private void dataLine(Session* s, char* line, int n) {
+        if (n == 1 && line[0] == '.') {
+            endOfData(s);
+            return;
+        }
+        if (s->lines.bare && strictLineEnds) s->bareLine = true;
+        int from = 0;
+        if (n > 0 && line[0] == '.') from = 1;                          // dot-unstuffing
+        s->dataSize = s->dataSize + (n - from) + 2;
+        checkSize(s);
+        if (s->tooBig) return;
+        if (!buffer(s, (n - from) + 2)) {
+            s->tooBig = true;
+            buffer(s, 0);
+            s->data.release();
+            return;
+        }
+        s->data.add(&line[from], n - from);
+        s->data.add("\r\n", 2);
+    }
+
+    // the Received header of the transaction: "Received: from helo ([ip]) by host with ESMTP[S][A] id X; date"
+    private char* receivedHeader(Session* s) {
+        mail.Buf v;
+        v.addText("from ");
+        v.addText(s->helo == null ? "unknown" : s->helo);
+        char ipt[40];
+        format(&ipt[0], 40, " ([%d.%d.%d.%d]) by ", (s->ip >> 24) & 255, (s->ip >> 16) & 255, (s->ip >> 8) & 255, s->ip & 255, 0, 0);
+        v.addText(&ipt[0]);
+        v.addText(hostname);
+        v.addText(s->esmtp ? " with ESMTP" : " with SMTP");
+        if (s->tls) v.addByte('S');
+        if (s->authUser != null) v.addByte('A');
+        v.addText(" id ");
+        v.addText(s->queueId == null ? "-" : s->queueId);
+        v.addText("; ");
+        char date[64];
+        mail.formatDate(clock(), 0, &date[0], 64);
+        v.addText(&date[0]);
+        mail.Buf h;
+        mail.foldHeader(&h, "Received", v.d == null ? "" : v.d, v.len);
+        v.release();
+        return h.take();
+    }
+
+    private char* newQueueId() {
+        char b[40];
+        if (idPrefix != null) {
+            idCounter++;
+            format(&b[0], 40, "%s%06d", idPrefix, idCounter, 0, 0, 0, 0);
+            return copyText(&b[0]);
+        }
+        char rnd[6];
+        asys.randomBytes(&rnd[0], 6);
+        for (int i = 0; i < 6; i++) {
+            int hi = (rnd[i] >> 4) & 15;
+            int lo = rnd[i] & 15;
+            b[i * 2] = hi < 10 ? '0' + hi : 'a' + hi - 10;
+            b[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+        }
+        b[12] = 0;
+        return copyText(&b[0]);
+    }
+
+    // the dot that ends the message
+    private void endOfData(Session* s) {
+        s->state = ST_CMD;
+        if (s->tooBig) {
+            stats->rejected++;
+            say(s, 552, "5.3.4", "Message size exceeds fixed maximum message size");
+        } else if (s->longLine) {
+            stats->rejected++;
+            say(s, 554, "5.6.0", "Message rejected: a line is too long");
+        } else if (s->bareLine) {
+            stats->rejected++;
+            say(s, 550, "5.6.0", "Message rejected: bare CR or LF in the message (lines end with CRLF)");
+        } else {
+            s->queueId = newQueueId();
+            s->received = receivedHeader(s);
+            int code = 0;
+            if (deliverHook != null) code = deliverHook(this, s, s->data.d == null ? "" : s->data.d, s->data.len);
+            else if (maildir != null) code = deliverMaildir(s);
+            if (code == 0) {
+                stats->messages++;
+                stats->bytes = stats->bytes + s->data.len;
+                s->messages++;
+                char t[80];
+                format(&t[0], 80, "Ok: queued as %s", s->queueId, 0, 0, 0, 0, 0);
+                say(s, 250, "2.0.0", &t[0]);
+            } else {
+                stats->rejected++;
+                sayCode(s, code, code >= 500 ? "Message refused" : "Try again later");
+            }
+        }
+        resetTransaction(s);
+        if (s->messages >= maxMessagesPerSession) {
+            say(s, 421, "4.7.0", "Too many messages in this session, closing the connection");
+            s->closeAfter = true;
+        }
+    }
+
+    // ---- Maildir ----------------------------------------------------------------------------------------------------------------------------------
+    // The name of the mailbox for an address: the local part in lower case, a-z 0-9 . _ + - only, no leading dot, no "..", 1 to 50 characters. null when it is not like that.
+    public char* mailboxName(char* addr) {
+        int at = -1;
+        int n = strlen(addr);
+        for (int i = n - 1; i >= 0; i--) { if (addr[i] == '@') { at = i; break; } }
+        int len = at < 0 ? n : at;
+        if (len < 1 || len > 50 || addr[0] == '.') return null;
+        char* r = malloc(len + 1);
+        if (r == null) return null;
+        for (int i = 0; i < len; i++) {
+            int c = toLower(addr[i] & 255);
+            bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '+' || c == '-';
+            if (!ok || (c == '.' && i > 0 && r[i - 1] == '.')) { free(r); return null; }
+            r[i] = c;
+        }
+        r[len] = 0;
+        return r;
+    }
+
+    // Maildir delivery: tmp/<name> is written and renamed to new/<name> for every recipient; 0 on success, 451 when something failed (what was written for the others stays)
+    private int deliverMaildir(Session* s) {
+        mail.Buf head;
+        head.addText("Return-Path: <");
+        head.addText(s->from == null ? "" : s->from);
+        head.addText(">\r\n");
+        head.addText(s->received == null ? "" : s->received);
+        int result = 0;
+        for (int i = 0; i < s->nrcpt && result == 0; i++) {
+            char* box = mailboxName(s->rcpt[i]);
+            if (box == null) { result = 451; break; }
+            char dir[300];
+            format(&dir[0], 300, "%s/%s", maildir, box, 0, 0, 0, 0);
+            free(box);
+            char sub[330];
+            format(&sub[0], 330, "%s/tmp", &dir[0], 0, 0, 0, 0, 0);
+            asys.mkdirs(&sub[0]);
+            format(&sub[0], 330, "%s/new", &dir[0], 0, 0, 0, 0, 0);
+            asys.mkdirs(&sub[0]);
+            format(&sub[0], 330, "%s/cur", &dir[0], 0, 0, 0, 0, 0);
+            asys.mkdirs(&sub[0]);
+            char rnd[6];
+            asys.randomBytes(&rnd[0], 6);
+            char uniq[60];
+            char hx[16];
+            for (int k = 0; k < 6; k++) {
+                int hi = (rnd[k] >> 4) & 15;
+                int lo = rnd[k] & 15;
+                hx[k * 2] = hi < 10 ? '0' + hi : 'a' + hi - 10;
+                hx[k * 2 + 1] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+            }
+            hx[12] = 0;
+            format(&uniq[0], 60, "%d.%s.%s", clock(), &hx[0], s->queueId == null ? "m" : s->queueId, 0, 0, 0);
+            char tmpPath[400];
+            char newPath[400];
+            format(&tmpPath[0], 400, "%s/tmp/%s", &dir[0], &uniq[0], 0, 0, 0);
+            format(&newPath[0], 400, "%s/new/%s", &dir[0], &uniq[0], 0, 0, 0);
+            int fd = asys.fileOpen(&tmpPath[0], asys.F_WRITE | asys.F_CREATE | asys.F_EXCL, 384);
+            if (fd < 0) { result = 451; break; }
+            bool ok = asys.fileWrite(fd, head.d == null ? "" : head.d, head.len) == head.len;
+            int off = 0;
+            while (ok && off < s->data.len) {
+                int chunk = s->data.len - off > 65536 ? 65536 : s->data.len - off;
+                int w = asys.fileWrite(fd, &s->data.d[off], chunk);
+                if (w != chunk) ok = false;
+                off = off + chunk;
+            }
+            asys.fileClose(fd);
+            if (!ok || asys.rename(&tmpPath[0], &newPath[0]) < 0) {
+                asys.unlink(&tmpPath[0]);
+                result = 451;
+            }
+        }
+        head.release();
+        return result;
+    }
+
+    // ---- commands ----------------------------------------------------------------------------------------------------------------------------------
+    // the address in "<...>" at s[i...]: copied into out; the index behind the ">" (or -1). A route "@a,@b:" in front is dropped. "<>" gives an empty address.
+    private int parsePath(char* s, int i, int n, char* out, int max) {
+        while (i < n && s[i] == ' ') i++;
+        if (i >= n || s[i] != '<') return -1;
+        i++;
+        int k = 0;
+        bool inq = false;
+        int routeEnd = -1;
+        if (i < n && s[i] == '@') {
+            int j = i;
+            while (j < n && s[j] != ':' && s[j] != '>') j++;
+            if (j < n && s[j] == ':') routeEnd = j + 1;
+        }
+        if (routeEnd >= 0) i = routeEnd;
+        while (i < n) {
+            int c = s[i] & 255;
+            if (inq) {
+                if (c == '\\' && i + 1 < n) { if (k + 2 >= max) return -1; out[k] = c; k++; i++; c = s[i] & 255; }
+                else if (c == '"') inq = false;
+            } else if (c == '"') {
+                inq = true;
+            } else if (c == '>') {
+                out[k] = 0;
+                return i + 1;
+            }
+            if (c < 33 && !inq) return -1;
+            if (c >= 127 || c == 0) return -1;
+            if (k + 1 >= max) return -1;
+            out[k] = c;
+            k++;
+            i++;
+        }
+        return -1;
+    }
+
+    private void command(Session* s, char* line, int n) {
+        for (int i = 0; i < n; i++) {
+            if (line[i] == 0) { say(s, 500, "5.5.2", "NUL in a command"); countBad(s); return; }
+            if ((line[i] & 255) >= 128) { say(s, 500, "5.5.2", "8-bit characters in a command"); countBad(s); return; }
+        }
+        if (s->lines.bare) { say(s, 500, "5.5.2", "Bare CR or LF in a command"); countBad(s); return; }
+        if (isKeyword(line, n, "EHLO") || isKeyword(line, n, "HELO")) { cmdHello(s, line, n, toUpper(line[0]) == 'H'); return; }
+        if (isKeyword(line, n, "MAIL")) { cmdMail(s, line, n); return; }
+        if (isKeyword(line, n, "RCPT")) { cmdRcpt(s, line, n); return; }
+        if (isKeyword(line, n, "DATA")) { cmdData(s, line, n); return; }
+        if (isKeyword(line, n, "RSET")) { resetTransaction(s); say(s, 250, "2.0.0", "Ok"); return; }
+        if (isKeyword(line, n, "NOOP")) { say(s, 250, "2.0.0", "Ok"); return; }
+        if (isKeyword(line, n, "QUIT")) { say(s, 221, "2.0.0", "Bye"); s->closeAfter = true; return; }
+        if (isKeyword(line, n, "VRFY")) { say(s, 252, "2.5.2", "Cannot VRFY user, but will accept message and attempt delivery"); return; }
+        if (isKeyword(line, n, "EXPN")) { say(s, 502, "5.5.1", "EXPN not implemented"); return; }
+        if (isKeyword(line, n, "HELP")) { say(s, 214, "2.0.0", "See RFC 5321"); return; }
+        if (isKeyword(line, n, "STARTTLS")) { cmdStartTls(s, line, n); return; }
+        if (isKeyword(line, n, "AUTH")) { cmdAuth(s, line, n); return; }
+        say(s, 500, "5.5.2", "Error: command not recognized");
+        countBad(s);
+    }
+
+    private void cmdHello(Session* s, char* line, int n, bool helo) {
+        int i = 4;
+        while (i < n && line[i] == ' ') i++;
+        int len = n - i;
+        bool ok = len > 0 && len <= 255;
+        for (int k = i; k < n && ok; k++) {
+            int c = line[k] & 255;
+            if (c <= 32 || c >= 127) ok = false;
+        }
+        if (!ok) { say(s, 501, "5.5.2", "Syntax: EHLO hostname"); countBad(s); return; }
+        resetTransaction(s);
+        if (s->helo != null) free(s->helo);
+        s->helo = malloc(len + 1);
+        memcpy(s->helo, &line[i], len);
+        s->helo[len] = 0;
+        s->esmtp = !helo;
+        if (helo) {
+            say(s, 250, null, hostname);
+            return;
+        }
+        char l[600];
+        int k = format(&l[0], 600, "250-%s\r\n", hostname, 0, 0, 0, 0, 0);
+        s->out->add(&l[0], k);
+        s->out->addText("250-PIPELINING\r\n");
+        k = format(&l[0], 600, "250-SIZE %d\r\n", maxMessage, 0, 0, 0, 0, 0);
+        s->out->add(&l[0], k);
+        s->out->addText("250-8BITMIME\r\n");
+        s->out->addText("250-ENHANCEDSTATUSCODES\r\n");
+        if (tlsConfig != null && !s->tls) s->out->addText("250-STARTTLS\r\n");
+        bool plainOk = s->tls || allowInsecureAuth;
+        if (nusers > 0 || authHook != null) {
+            if (plainOk) s->out->addText("250-AUTH PLAIN LOGIN CRAM-MD5\r\n");
+            else s->out->addText("250-AUTH CRAM-MD5\r\n");
+        }
+        s->out->addText("250 HELP\r\n");
+    }
+
+    private void cmdStartTls(Session* s, char* line, int n) {
+        if (tlsConfig == null || s->tls) { say(s, 502, "5.5.1", "STARTTLS is not available"); return; }
+        if (n > 8) { say(s, 501, "5.5.4", "Syntax error (no parameters allowed)"); return; }
+        if (s->helo == null) { say(s, 503, "5.5.1", "Send EHLO first"); return; }
+        if (s->from != null) { say(s, 503, "5.5.1", "Not in the middle of a mail transaction"); return; }
+        say(s, 220, "2.0.0", "Ready to start TLS");
+        s->wantStartTls = true;
+    }
+
+    // the parameters after the path: NAME=value pairs separated by blanks. Returns false (and the reply is queued) when one is not supported.
+    private bool mailParams(Session* s, char* line, int i, int n) {
+        bool sawSize = false;
+        bool sawBody = false;
+        while (i < n) {
+            while (i < n && line[i] == ' ') i++;
+            if (i >= n) break;
+            int a = i;
+            while (i < n && line[i] != ' ') i++;
+            char p[80];
+            int pl = i - a;
+            if (pl > 78) { say(s, 555, "5.5.4", "Parameter too long"); return false; }
+            for (int k = 0; k < pl; k++) p[k] = toUpper(line[a + k]);
+            p[pl] = 0;
+            if (startsWith(&p[0], "SIZE=")) {
+                if (sawSize) { say(s, 501, "5.5.4", "SIZE given twice"); return false; }
+                sawSize = true;
+                int v = 0;
+                int dg = 0;
+                for (int k = 5; p[k] != 0; k++) {
+                    if (p[k] < '0' || p[k] > '9' || dg > 11) { v = -1; break; }
+                    v = v * 10 + (p[k] - '0');
+                    dg++;
+                }
+                if (v < 0 || dg == 0) { say(s, 501, "5.5.4", "Bad SIZE parameter"); return false; }
+                s->declaredSize = v;
+                if (v > maxMessage) { say(s, 552, "5.3.4", "Message size exceeds fixed maximum message size"); return false; }
+            } else if (startsWith(&p[0], "BODY=")) {
+                if (sawBody) { say(s, 501, "5.5.4", "BODY given twice"); return false; }
+                sawBody = true;
+                if (streq(&p[5], "8BITMIME")) s->body8 = true;
+                else if (!streq(&p[5], "7BIT")) { say(s, 501, "5.5.4", "Bad BODY parameter"); return false; }
+            } else if (startsWith(&p[0], "AUTH=")) {
+                // the identity that the sender authenticated as: ignored
+            } else if (startsWith(&p[0], "SMTPUTF8")) {
+                say(s, 555, "5.6.7", "SMTPUTF8 is not supported");
+                return false;
+            } else {
+                say(s, 555, "5.5.4", "Unsupported parameter");
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private void cmdMail(Session* s, char* line, int n) {
+        if (s->helo == null) { say(s, 503, "5.5.1", "Send EHLO or HELO first"); return; }
+        if (s->from != null) { say(s, 503, "5.5.1", "Nested MAIL command"); return; }
+        if (requireTls && !s->tls) { say(s, 530, "5.7.0", "Must issue a STARTTLS command first"); return; }
+        if (authRequired && s->authUser == null) { say(s, 530, "5.7.0", "Authentication required"); return; }
+        int i = 4;
+        while (i < n && line[i] == ' ') i++;
+        if (n - i < 5 || toUpper(line[i]) != 'F' || toUpper(line[i + 1]) != 'R' || toUpper(line[i + 2]) != 'O' || toUpper(line[i + 3]) != 'M' || line[i + 4] != ':') {
+            say(s, 501, "5.5.4", "Syntax: MAIL FROM:<address>");
+            return;
+        }
+        char addr[300];
+        int e = parsePath(line, i + 5, n, &addr[0], 300);
+        if (e < 0) { say(s, 501, "5.1.7", "Bad sender address syntax"); return; }
+        if (e < n && line[e] != ' ') { say(s, 501, "5.5.4", "Syntax error after the address"); return; }
+        if (addr[0] != 0 && !mail.validAddress(&addr[0], strlen(&addr[0]))) { say(s, 501, "5.1.7", "Bad sender address syntax"); return; }
+        s->declaredSize = 0;
+        s->body8 = false;
+        if (!mailParams(s, line, e, n)) { s->declaredSize = 0; return; }
+        if (rateMsgs > 0) {
+            Rate* r = rateFor(s->ip);
+            if (r != null) {
+                r->msgs++;
+                if (r->msgs > rateMsgs) {
+                    stats->rateLimited++;
+                    say(s, 450, "4.7.1", "Rate limit exceeded, try again later");
+                    return;
+                }
+            }
+        }
+        s->from = copyText(&addr[0]);
+        say(s, 250, "2.1.0", "Ok");
+    }
+
+    private bool relayAllowed(Session* s, char* domain) {
+        if (acceptAnyRecipient) return true;
+        if (s->authUser != null && relayAuthenticated) return true;
+        if (relayLoopback && ((s->ip >> 24) & 255) == 127) return true;
+        if (domain != null && isLocalDomain(domain)) return true;
+        return false;
+    }
+
+    private void cmdRcpt(Session* s, char* line, int n) {
+        if (s->from == null) { say(s, 503, "5.5.1", "Need MAIL before RCPT"); return; }
+        int i = 4;
+        while (i < n && line[i] == ' ') i++;
+        if (n - i < 3 || toUpper(line[i]) != 'T' || toUpper(line[i + 1]) != 'O' || line[i + 2] != ':') {
+            say(s, 501, "5.5.4", "Syntax: RCPT TO:<address>");
+            return;
+        }
+        char addr[300];
+        int e = parsePath(line, i + 3, n, &addr[0], 300);
+        if (e < 0 || addr[0] == 0) { say(s, 501, "5.1.3", "Bad recipient address syntax"); return; }
+        if (e < n && line[e] != ' ') { say(s, 501, "5.5.4", "Syntax error after the address"); return; }
+        // "postmaster" without a domain is always accepted (RFC 5321 4.5.1)
+        bool postmaster = streqi(&addr[0], "postmaster");
+        char* domain = null;
+        if (!postmaster) {
+            if (!mail.validAddress(&addr[0], strlen(&addr[0]))) { say(s, 501, "5.1.3", "Bad recipient address syntax"); return; }
+            for (int k = strlen(&addr[0]) - 1; k >= 0; k--) { if (addr[k] == '@') { domain = &addr[k + 1]; break; } }
+        }
+        // parameters: none are supported for RCPT
+        int p = e;
+        while (p < n && line[p] == ' ') p++;
+        if (p < n) { say(s, 555, "5.5.4", "Unsupported parameter"); return; }
+        if (s->nrcpt >= maxRecipients) { say(s, 452, "4.5.3", "Too many recipients"); return; }
+        if (!postmaster && !relayAllowed(s, domain)) {
+            stats->rcptRefused++;
+            say(s, 554, "5.7.1", "Relay access denied");
+            return;
+        }
+        if (maildir != null && deliverHook == null) {
+            char* box = mailboxName(postmaster ? "postmaster" : &addr[0]);
+            if (box == null) { stats->rcptRefused++; say(s, 553, "5.1.3", "Bad mailbox name"); return; }
+            free(box);
+        }
+        if (rcptHook != null) {
+            int code = rcptHook(this, s, &addr[0]);
+            if (code != 0) {
+                stats->rcptRefused++;
+                sayCode(s, code, code >= 500 ? "Mailbox unavailable" : "Try again later");
+                return;
+            }
+        }
+        for (int k = 0; k < s->nrcpt; k++) {
+            if (streqi(s->rcpt[k], &addr[0])) { say(s, 250, "2.1.5", "Ok"); return; }        // the same recipient again
+        }
+        s->rcpt[s->nrcpt] = copyText(&addr[0]);
+        s->nrcpt++;
+        say(s, 250, "2.1.5", "Ok");
+    }
+
+    private void cmdData(Session* s, char* line, int n) {
+        if (n > 4) { say(s, 501, "5.5.4", "Syntax error (no parameters allowed)"); return; }
+        if (s->from == null) { say(s, 503, "5.5.1", "Need MAIL before DATA"); return; }
+        if (s->nrcpt == 0) { say(s, 554, "5.5.1", "No valid recipients"); return; }
+        if (buffered >= maxBuffered) { say(s, 452, "4.3.1", "Insufficient system storage, try again later"); return; }
+        s->state = ST_DATA;
+        s->dataSize = 0;
+        s->tooBig = false;
+        s->bareLine = false;
+        s->longLine = false;
+        say(s, 354, null, "End data with <CR><LF>.<CR><LF>");
+    }
+
+    // ---- AUTH ---------------------------------------------------------------------------------------------------------------------------------------
+    private bool checkLogin(Session* s, char* user, char* pass) {
+        if (authHook != null) return authHook(this, s, user, pass) != 0;
+        User* u = findUser(user);
+        char* want = u == null ? "" : u->pass;
+        int a = strlen(pass);
+        int b = strlen(want);
+        // the same work whether the user exists or not, and no early exit on the first difference
+        int diff = a ^ b;
+        int m = a < b ? a : b;
+        for (int i = 0; i < m; i++) diff = diff | ((pass[i] ^ want[i]) & 255);
+        return u != null && diff == 0;
+    }
+
+    private void authDone(Session* s, bool ok, char* user) {
+        s->state = ST_CMD;
+        if (ok) {
+            if (s->authUser != null) free(s->authUser);
+            s->authUser = copyText(user);                           // before the pending user (which `user` may be) is freed
+        }
+        if (s->challenge != null) { free(s->challenge); s->challenge = null; }
+        if (s->pendingUser != null) { free(s->pendingUser); s->pendingUser = null; }
+        if (ok) {
+            stats->authOk++;
+            say(s, 235, "2.7.0", "Authentication successful");
+        } else {
+            stats->authFailed++;
+            s->authFails++;
+            say(s, 535, "5.7.8", "Authentication credentials invalid");
+            if (s->authFails >= maxAuthFailures) {
+                say(s, 421, "4.7.0", "Too many authentication failures");
+                s->closeAfter = true;
+            }
+        }
+    }
+
+    // a base64 text from the client into out (a heap buffer); false when it is not base64
+    private bool b64in(char* text, int n, mail.Buf* out) {
+        if (n == 1 && text[0] == '=') return true;                       // an empty response
+        return mail.base64Decode(text, n, out, true);
+    }
+
+    private void cmdAuth(Session* s, char* line, int n) {
+        if (s->helo == null) { say(s, 503, "5.5.1", "Send EHLO first"); return; }
+        if (!s->esmtp) { say(s, 503, "5.5.1", "AUTH needs EHLO"); return; }
+        if (s->authUser != null) { say(s, 503, "5.5.1", "Already authenticated"); return; }
+        if (s->from != null) { say(s, 503, "5.5.1", "No AUTH during a mail transaction"); return; }
+        if (nusers == 0 && authHook == null) { say(s, 502, "5.5.1", "Authentication is not available"); return; }
+        if (requireTls && !s->tls) { say(s, 530, "5.7.0", "Must issue a STARTTLS command first"); return; }
+        int i = 4;
+        while (i < n && line[i] == ' ') i++;
+        int a = i;
+        while (i < n && line[i] != ' ') i++;
+        char mech[20];
+        int ml = i - a;
+        if (ml == 0 || ml > 18) { say(s, 501, "5.5.4", "Syntax: AUTH mechanism"); return; }
+        for (int k = 0; k < ml; k++) mech[k] = toUpper(line[a + k]);
+        mech[ml] = 0;
+        while (i < n && line[i] == ' ') i++;
+        int ir = i;                                                    // the initial response (if any)
+        int irl = n - i;
+        bool plainOk = s->tls || allowInsecureAuth;
+        if (streq(&mech[0], "PLAIN")) {
+            if (!plainOk) { say(s, 538, "5.7.11", "Encryption required for the requested authentication mechanism"); return; }
+            if (irl <= 0) { s->state = ST_AUTH_PLAIN; s->out->addText("334 \r\n"); return; }
+            plainResponse(s, &line[ir], irl);
+        } else if (streq(&mech[0], "LOGIN")) {
+            if (!plainOk) { say(s, 538, "5.7.11", "Encryption required for the requested authentication mechanism"); return; }
+            if (irl > 0) {
+                mail.Buf u;
+                if (!b64in(&line[ir], irl, &u)) { u.release(); say(s, 501, "5.5.2", "Cannot decode the response"); return; }
+                s->pendingUser = u.take();
+                s->state = ST_AUTH_LOGIN_PASS;
+                s->out->addText("334 UGFzc3dvcmQ6\r\n");
+            } else {
+                s->state = ST_AUTH_LOGIN_USER;
+                s->out->addText("334 VXNlcm5hbWU6\r\n");
+            }
+        } else if (streq(&mech[0], "CRAM-MD5")) {
+            if (irl > 0) { say(s, 501, "5.5.4", "CRAM-MD5 takes no initial response"); return; }
+            char rnd[6];
+            asys.randomBytes(&rnd[0], 6);
+            char ch[200];
+            int cn = format(&ch[0], 200, "<%d%d%d.%d@%s>", rnd[0] & 255, rnd[1] & 255, rnd[2] & 255, clock(), hostname, 0);
+            if (s->challenge != null) free(s->challenge);
+            s->challenge = copyText(&ch[0]);
+            mail.Buf b;
+            mail.base64Encode(&ch[0], cn, &b, false);
+            s->out->addText("334 ");
+            s->out->add(b.d, b.len);
+            s->out->add("\r\n", 2);
+            b.release();
+            s->state = ST_AUTH_CRAM;
+        } else {
+            say(s, 504, "5.5.4", "Unrecognized authentication type");
+        }
+    }
+
+    private void plainResponse(Session* s, char* text, int n) {
+        mail.Buf b;
+        if (!b64in(text, n, &b)) { b.release(); s->state = ST_CMD; say(s, 501, "5.5.2", "Cannot decode the response"); return; }
+        // authzid NUL authcid NUL password
+        int z1 = -1;
+        int z2 = -1;
+        for (int i = 0; i < b.len; i++) {
+            if (b.d[i] == 0) { if (z1 < 0) z1 = i; else if (z2 < 0) z2 = i; else { z1 = -2; break; } }
+        }
+        if (z1 < 0 || z2 < 0) { b.release(); s->state = ST_CMD; say(s, 501, "5.5.2", "Bad PLAIN response"); return; }
+        char* user = copyN2(&b.d[z1 + 1], z2 - z1 - 1);
+        char* pass = copyN2(&b.d[z2 + 1], b.len - z2 - 1);
+        bool ok = checkLogin(s, user, pass);
+        authDone(s, ok, user);
+        free(user);
+        free(pass);
+        b.release();
+    }
+
+    private char* copyN2(char* p, int n) {
+        char* r = malloc(n + 1);
+        if (r == null) return null;
+        if (n > 0) memcpy(r, p, n);
+        r[n] = 0;
+        return r;
+    }
+
+    // a line while the client is in the middle of AUTH
+    private void authLine(Session* s, char* line, int n) {
+        if (n == 1 && line[0] == '*') {
+            s->state = ST_CMD;
+            if (s->challenge != null) { free(s->challenge); s->challenge = null; }
+            if (s->pendingUser != null) { free(s->pendingUser); s->pendingUser = null; }
+            say(s, 501, "5.0.0", "Authentication cancelled");
+            return;
+        }
+        if (s->state == ST_AUTH_PLAIN) {
+            plainResponse(s, line, n);
+        } else if (s->state == ST_AUTH_LOGIN_USER) {
+            mail.Buf u;
+            if (!b64in(line, n, &u)) { u.release(); s->state = ST_CMD; say(s, 501, "5.5.2", "Cannot decode the response"); return; }
+            s->pendingUser = u.take();
+            s->state = ST_AUTH_LOGIN_PASS;
+            s->out->addText("334 UGFzc3dvcmQ6\r\n");
+        } else if (s->state == ST_AUTH_LOGIN_PASS) {
+            mail.Buf p;
+            if (!b64in(line, n, &p)) { p.release(); s->state = ST_CMD; say(s, 501, "5.5.2", "Cannot decode the response"); return; }
+            char* pass = p.take();
+            bool ok = pass != null && s->pendingUser != null && checkLogin(s, s->pendingUser, pass);
+            char* name = s->pendingUser == null ? "" : s->pendingUser;
+            authDone(s, ok, name);
+            if (pass != null) free(pass);
+        } else if (s->state == ST_AUTH_CRAM) {
+            mail.Buf r;
+            if (!b64in(line, n, &r)) { r.release(); s->state = ST_CMD; say(s, 501, "5.5.2", "Cannot decode the response"); return; }
+            // "user hexdigest"
+            int sp = -1;
+            for (int i = r.len - 1; i >= 0; i--) { if (r.d[i] == ' ') { sp = i; break; } }
+            bool ok = false;
+            char* user = null;
+            if (sp > 0 && r.len - sp - 1 == 32) {
+                user = copyN2(r.d, sp);
+                User* u = findUser(user);
+                if (u != null && s->challenge != null) {
+                    char mac[16];
+                    hash.hmac(128, u->pass, strlen(u->pass), s->challenge, strlen(s->challenge), &mac[0]);
+                    char hex[40];
+                    for (int k = 0; k < 16; k++) {
+                        int hi = (mac[k] >> 4) & 15;
+                        int lo = mac[k] & 15;
+                        hex[k * 2] = hi < 10 ? '0' + hi : 'a' + hi - 10;
+                        hex[k * 2 + 1] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+                    }
+                    int diff = 0;
+                    for (int k = 0; k < 32; k++) diff = diff | ((hex[k] ^ r.d[sp + 1 + k]) & 255);
+                    ok = diff == 0;
+                }
+            }
+            authDone(s, ok, user == null ? "" : user);
+            if (user != null) free(user);
+            r.release();
+        }
+    }
+
+    // ---- the end of the program --------------------------------------------------------------------------------------------------------------------
+    public void dispose() {
+        for (int i = 0; i < nusers; i++) { free(users[i]->name); free(users[i]->pass); free((char*) users[i]); }
+        if (users != null) free((char*) users);
+        for (int i = 0; i < ndomains; i++) free(domains[i]);
+        for (int i = 0; i < nrates; i++) free((char*) rates[i]);
+        nusers = 0;
+        ndomains = 0;
+        nrates = 0;
+        users = null;
+    }
+}
+
+// ---- the server on sockets --------------------------------------------------------------------------------------------------------------
+public class Server {
+    public Core* core;
+    public netsrv.Server* net;
+    public int port;
+
+    public Server() {
+        core = new Core();
+        net = new netsrv.Server();
+        net->user = (char*) this;
+        net->onOpen = srvOpen;
+        net->onData = srvData;
+        net->onClose = srvClose;
+        net->maxConns = 200;
+        net->maxPerIp = 0;
+        net->idleTimeoutMs = 120000;
+        net->handshakeTimeoutMs = 10000;
+    }
+
+    public bool listen(int p) {
+        bool ok = net->listen(p);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenTls(int p, tls.Config* cfg) {
+        bool ok = net->listenTls(p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenOn(char* host, int p, tls.Config* cfg) {
+        bool ok = net->listenOn(host, p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public int poll(int ms) { return net->poll(ms); }
+    public void run() { net->run(); }
+    public void stop() { net->stop(); }
+    public void dropClients() { net->killAll(); }
+    public void shutdown() { net->shutdown(); core->dispose(); }
+}
+
+private int srvOpen(netsrv.Server* ns, netsrv.Conn* c) {
+    Server* sv = (Server*) ns->user;
+    Session* s = sv->core->open(c->ip, &c->out, c->secure);
+    if (s == null) return -1;
+    s->user = (char*) c;
+    c->user = (char*) s;
+    if (s->closeAfter) ns->close(c);
+    return 0;
+}
+
+private int srvData(netsrv.Server* ns, netsrv.Conn* c, char* data, int n) {
+    Server* sv = (Server*) ns->user;
+    Session* s = (Session*) c->user;
+    if (s == null) return -1;
+    int r = sv->core->feed(s, data, n);
+    if (s->wantStartTls) {
+        if (!ns->startTls(c, sv->core->tlsConfig)) { s->wantStartTls = false; return -1; }
+        sv->core->tlsStarted(s);                     // the switch happens when the "220 Ready" is sent: the session starts clean now
+    }
+    return r;
+}
+
+private int srvClose(netsrv.Server* ns, netsrv.Conn* c) {
+    Server* sv = (Server*) ns->user;
+    Session* s = (Session*) c->user;
+    if (s == null) return 0;
+    c->user = null;
+    sv->core->closeSession(s);
+    return 0;
+}
+
+public Server* newServer() { return new Server(); }

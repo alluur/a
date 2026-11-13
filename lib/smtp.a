@@ -1,0 +1,782 @@
+// =============================================================================
+//  smtp - an SMTP client (RFC 5321, 3207, 4954, 1870, 6152, 2920, 2034)                                            import smtp;
+//
+//    smtp.Client* c = smtp.connect("smtp://user:secret@mail.example.org:587");       // smtps:// = TLS from the start (465); null: smtp.error() says why
+//    char* rcpts[2];  rcpts[0] = "bob@example.org";  rcpts[1] = "carol@example.org";
+//    smtp.Result* r = c->send("ann@example.org", &rcpts[0], 2, data, len);           // the message (CRLF or LF line ends): dot-stuffing is done here
+//    if (r->ok) println("accepted: ");  println(r->text);                              // r->code, r->status (2001005 = 2.0.0 style), r->rcptCode[i] for every recipient
+//    c->sendMessage(message);                                                          // a mail.Message: built, From and recipients taken from it
+//    c->quit();  c->dispose();
+//
+//  Connecting: greeting (220), EHLO (HELO when the server does not know EHLO), STARTTLS when the server offers it and the options ask for it (the capabilities
+//  are read again afterwards, as RFC 3207 says; plain text that the server sent after its "go ahead" makes the connection fail), AUTH with CRAM-MD5, PLAIN or LOGIN.
+//  **Credentials are never sent without TLS** unless allowPlainAuth is set (CRAM-MD5 does not send the password, so it is allowed on a plain connection); when credentials are
+//  given the default is startTls = STARTTLS_REQUIRED: a server (or a man in the middle) that does not offer STARTTLS makes connect() fail instead of letting the password go
+//  out in the clear.
+//
+//  Sending: MAIL FROM (with SIZE and BODY=8BITMIME when the server offers them: a message that is too big for the advertised SIZE is not sent, a message with 8-bit bytes
+//  needs 8BITMIME), RCPT TO for every recipient (a recipient that is refused does not stop the others: the Result has every code, and `accepted` and `rejected`; with
+//  allOrNothing a single refusal cancels the message), DATA with dot-stuffing and canonical line ends (a bare LF or CR is sent as CRLF, the message always ends with CRLF),
+//  the end "." and its reply. With PIPELINING offered and options->pipelining the commands go out together. Every step has its own time out (connectTimeoutMs, commandTimeoutMs,
+//  dataTimeoutMs for each block of the message, dataEndTimeoutMs for the reply after the message). After a time out or a lost connection the client is closed (isOpen() is false).
+//
+//  Every line that goes out is checked for CR, LF and NUL (no command injection through an address or a name); addresses must be valid (mail.validAddress).
+//  c->conn->recording = true (before connect: options->record) keeps a transcript of every line, c->transcript().
+// =============================================================================
+import netline;
+import mail;
+import hash;
+import cstdlib;
+import cstring;
+module smtp;
+
+public const STARTTLS_NEVER = 0;
+public const STARTTLS_IF_OFFERED = 1;
+public const STARTTLS_REQUIRED = 2;
+
+public const AUTH_PLAIN = 1;
+public const AUTH_LOGIN = 2;
+public const AUTH_CRAM_MD5 = 4;
+
+public const MAX_RECIPIENTS = 1000;
+
+private char lastErr[200];
+
+private void setErr(char* s) {
+    int n = strlen(s);
+    if (n > 190) n = 190;
+    memcpy(&lastErr[0], s, n);
+    lastErr[n] = 0;
+}
+
+public char* error() { return &lastErr[0]; }
+
+public class Options {
+    public char* heloName;              // the name we give in EHLO (default "localhost"; use the name of the machine)
+    public bool useTls;                 // TLS from the start (port 465)
+    public int startTls;                // STARTTLS_NEVER, STARTTLS_IF_OFFERED (default), STARTTLS_REQUIRED
+    public bool verify;                 // check the server certificate (default true)
+    public char* username;
+    public char* password;
+    public int authMethods;             // the mechanisms that may be used: AUTH_PLAIN | AUTH_LOGIN | AUTH_CRAM_MD5 (default all)
+    public bool allowPlainAuth;         // send PLAIN and LOGIN credentials on a connection without TLS (default false)
+    public bool pipelining;             // use PIPELINING when the server offers it (default false)
+    public bool allOrNothing;           // one refused recipient cancels the message (default false: the others get it)
+    public bool record;                 // keep a transcript
+    public int connectTimeoutMs;        // TCP connect and TLS handshake (default 10000)
+    public int greetingTimeoutMs;       // the 220 greeting (default 30000)
+    public int commandTimeoutMs;        // every command and its reply (default 30000)
+    public int dataTimeoutMs;           // each block of the message (default 60000)
+    public int dataEndTimeoutMs;        // the reply after the end of the message (default 60000)
+    public int maxMessage;              // the largest message we send (default 64 MiB)
+
+    public Options() { init(); }
+
+    public void init() {
+        heloName = "localhost";
+        startTls = STARTTLS_IF_OFFERED;
+        verify = true;
+        authMethods = AUTH_PLAIN | AUTH_LOGIN | AUTH_CRAM_MD5;
+        connectTimeoutMs = 10000;
+        greetingTimeoutMs = 30000;
+        commandTimeoutMs = 30000;
+        dataTimeoutMs = 60000;
+        dataEndTimeoutMs = 60000;
+        maxMessage = 67108864;
+    }
+}
+
+public Options* newOptions() {
+    Options* o = (Options*) malloc(sizeof(Options));
+    if (o != null) o->init();
+    return o;
+}
+
+// what happened to a message
+public class Result {
+    public bool ok;                     // the server accepted the message (for the recipients in `accepted`)
+    public int code;                    // the reply code that decided: the reply to the end of the data, or the command that failed (0: a failure of our own or of the connection)
+    public int status;                  // the enhanced status code of that reply as class * 1000000 + subject * 1000 + detail (2000000 for 2.0.0), 0 when there was none
+    public int accepted;                // recipients that the server took
+    public int rejected;                // recipients that were refused
+    public int count;                   // recipients in all (rcptCode has this many entries)
+    public int rcptCode[1000];          // the reply code for each recipient (250 accepted; 4xx try later; 5xx never; 0: the command was not answered)
+    public int rcptStatus[1000];
+    public bool temporary;              // the failure is one that is worth a retry (4xx or a lost connection)
+    public char text[300];              // the text of that reply, or what went wrong
+
+    public char* why() { return &text[0]; }
+
+    public void setText(char* s) {
+        int n = strlen(s);
+        if (n > 298) n = 298;
+        memcpy(&text[0], s, n);
+        text[n] = 0;
+    }
+}
+
+private int digitsOf(char* s) {
+    int v = 0;
+    for (int i = 0; s[i] != 0; i++) {
+        if (s[i] < '0' || s[i] > '9') return -1;
+        v = v * 10 + (s[i] - '0');
+        if (v > 1000000000) return -1;
+    }
+    return v;
+}
+
+public class Client {
+    public netline.Conn* conn;
+    public Options* opt;
+    public char* error;                 // the last problem (a constant text or a copy in lastReply)
+    public bool secure;                 // TLS is active
+    public bool authenticated;
+    public char* serverName;            // the host name the server gave in its greeting (copy)
+    public bool hasStartTls;            // what the last EHLO said
+    public bool has8bit;
+    public bool hasPipelining;
+    public bool hasEnhanced;
+    public bool hasSize;                // the server advertised SIZE (with or without a limit)
+    public int sizeLimit;               // the SIZE the server advertised (0: none, or no limit stated)
+    public int authMask;                // AUTH_ bits of the mechanisms the server offered
+    public netline.Reply reply;         // the last reply
+    public bool broken;                 // the connection is gone or in an unknown state
+    public bool heap;
+    public int messages;                // messages accepted so far
+
+    private char* host;
+    private int port;
+    private bool ownsOpt;
+    private bool inTransaction;
+    public bool ownsCreds;                  // username and password are heap copies that dispose() frees
+
+    public bool isOpen() { return conn != null && conn->isOpen() && !broken; }
+
+    // the transcript, when options->record was set ("C: " and "S: " lines)
+    public char* transcript() { return conn == null ? "" : conn->transcript(); }
+
+    private bool fail(char* why) {
+        error = why;
+        setErr(why);
+        return false;
+    }
+
+    private void breakConn() {
+        broken = true;
+        if (conn != null) conn->close();
+    }
+
+    // sends a command line and reads the reply: its code, or a negative netline code (the connection is closed then)
+    private int command(char* line, int timeoutMs, char* noteAs = null) {
+        if (!isOpen()) { error = "not connected"; return netline.E_EOF; }
+        if (!conn->writeLine(line, timeoutMs, noteAs)) {
+            error = conn->error;
+            breakConn();
+            return netline.E_FAILED;
+        }
+        return readReply(timeoutMs);
+    }
+
+    private int readReply(int timeoutMs) {
+        int code = conn->readReply(&reply, netline.STYLE_SMTP, timeoutMs);
+        if (code < 0) {
+            error = conn->error;
+            breakConn();
+            return code;
+        }
+        if (code == 421) {
+            // the server is closing the connection (RFC 5321 3.8)
+            error = "the server closed the connection (421)";
+            breakConn();
+        }
+        return code;
+    }
+
+    // the text of the last reply for an error message
+    public char* lastReply() { return reply.text(); }
+
+    private void parseEhlo() {
+        hasStartTls = false;
+        has8bit = false;
+        hasPipelining = false;
+        hasEnhanced = false;
+        hasSize = false;
+        sizeLimit = 0;
+        authMask = 0;
+        char line[512];
+        for (int i = 1; i < reply.lines; i++) {         // the first line is the greeting of the server
+            if (!reply.line(i, &line[0], 512)) break;
+            // the keyword in upper case
+            int k = 0;
+            char kw[40];
+            while (line[k] != 0 && line[k] != ' ' && k < 39) { kw[k] = toUpper(line[k]); k++; }
+            kw[k] = 0;
+            if (streq(&kw[0], "STARTTLS")) hasStartTls = true;
+            else if (streq(&kw[0], "8BITMIME")) has8bit = true;
+            else if (streq(&kw[0], "PIPELINING")) hasPipelining = true;
+            else if (streq(&kw[0], "ENHANCEDSTATUSCODES")) hasEnhanced = true;
+            else if (streq(&kw[0], "SIZE")) {
+                hasSize = true;
+                if (line[k] == ' ') {
+                    int v = digitsOf(&line[k + 1]);
+                    if (v > 0) sizeLimit = v;
+                }
+            } else if (streq(&kw[0], "AUTH") || startsWith(&kw[0], "AUTH=")) {
+                // "AUTH PLAIN LOGIN CRAM-MD5" (and the old "AUTH=PLAIN LOGIN")
+                char words[500];
+                int wn = 0;
+                for (int q = startsWith(&kw[0], "AUTH=") ? 5 : 4; line[q] != 0 && wn < 498; q++) { words[wn] = toUpper(line[q]); wn++; }
+                words[wn] = 0;
+                if (contains(&words[0], "PLAIN")) authMask = authMask | AUTH_PLAIN;
+                if (contains(&words[0], "LOGIN")) authMask = authMask | AUTH_LOGIN;
+                if (contains(&words[0], "CRAM-MD5")) authMask = authMask | AUTH_CRAM_MD5;
+            }
+        }
+    }
+
+    // EHLO, and HELO when EHLO is not known. true when the server accepted one of them (capabilities are set from EHLO)
+    private bool hello() {
+        char cmd[300];
+        if (!mail.isAscii(opt->heloName, strlen(opt->heloName)) || !netline.isLineSafe(opt->heloName) || strlen(opt->heloName) > 200 || strlen(opt->heloName) == 0) return fail("a bad name for EHLO");
+        format(&cmd[0], 300, "EHLO %s", opt->heloName, 0, 0, 0, 0, 0);
+        int code = command(&cmd[0], opt->commandTimeoutMs);
+        if (code < 0) return false;
+        if (code == 250) { parseEhlo(); return true; }
+        if (code == 500 || code == 501 || code == 502 || code == 503 || code == 504 || code == 550) {
+            format(&cmd[0], 300, "HELO %s", opt->heloName, 0, 0, 0, 0, 0);
+            code = command(&cmd[0], opt->commandTimeoutMs);
+            if (code < 0) return false;
+            hasStartTls = false; has8bit = false; hasPipelining = false; hasEnhanced = false; hasSize = false; sizeLimit = 0; authMask = 0;
+            if (code == 250) return true;
+        }
+        return fail("the server refused EHLO and HELO");
+    }
+
+    // Connects to the host: TCP (and TLS when options->useTls), greeting, EHLO, STARTTLS, AUTH. false: error says why (the client is closed).
+    public bool connect() {
+        broken = false;
+        authenticated = false;
+        secure = false;
+        if (conn != null) { conn->dispose(); conn = null; }
+        conn = netline.open(host, port, opt->connectTimeoutMs, opt->useTls, opt->verify);
+        if (conn == null) return fail(netline.lastError());
+        conn->recording = opt->record;
+        secure = opt->useTls;
+        // the greeting
+        int code = conn->readReply(&reply, netline.STYLE_SMTP, opt->greetingTimeoutMs);
+        if (code < 0) { breakConn(); return fail(conn->error); }
+        if (code != 220) { breakConn(); return fail(code == 554 ? "the server refused the connection (554)" : "the greeting is not 220"); }
+        char first[200];
+        reply.line(0, &first[0], 200);
+        int sp = 0;
+        while (first[sp] != 0 && first[sp] != ' ') sp++;
+        first[sp] = 0;
+        if (serverName != null) free(serverName);
+        serverName = copyText(&first[0]);
+        if (!hello()) { breakConn(); return false; }
+        // STARTTLS
+        bool wantTls = !secure && opt->startTls != STARTTLS_NEVER;
+        bool needTls = opt->startTls == STARTTLS_REQUIRED && !secure;
+        if (wantTls && hasStartTls) {
+            code = command("STARTTLS", opt->commandTimeoutMs);
+            if (code < 0) return fail(error);
+            if (code != 220) {
+                if (needTls) { breakConn(); return fail("the server refused STARTTLS"); }
+            } else {
+                if (!conn->startTls(host, opt->verify, opt->connectTimeoutMs)) { char* why = conn->error; breakConn(); return fail(why); }
+                secure = true;
+                if (!hello()) { breakConn(); return false; }
+            }
+        } else if (needTls) {
+            breakConn();
+            return fail("the server does not offer STARTTLS (and it is required)");
+        }
+        if (opt->username != null && opt->password != null) {
+            if (!authenticate()) { breakConn(); return false; }
+        }
+        return true;
+    }
+
+    // the mechanism to use: CRAM-MD5 first (the password is not sent), then PLAIN, then LOGIN; PLAIN and LOGIN only on TLS (or with allowPlainAuth)
+    private bool authenticate() {
+        char* user = opt->username;
+        char* pass = opt->password;
+        int usable = authMask & opt->authMethods;
+        if (!secure && !opt->allowPlainAuth) usable = usable & AUTH_CRAM_MD5;
+        if (usable == 0) {
+            if (authMask == 0) return fail("the server offers no authentication");
+            if (!secure && !opt->allowPlainAuth && (authMask & opt->authMethods & (AUTH_PLAIN | AUTH_LOGIN)) != 0) return fail("no TLS: the password is not sent in the clear (allowPlainAuth)");
+            return fail("no authentication method that both sides know");
+        }
+        int ul = strlen(user);
+        int pl = strlen(pass);
+        if (usable & AUTH_CRAM_MD5) {
+            int code = command("AUTH CRAM-MD5", opt->commandTimeoutMs);
+            if (code < 0) return false;
+            if (code != 334) return fail("AUTH CRAM-MD5 was refused");
+            mail.Buf challenge;
+            char* ct = reply.text();
+            if (!mail.base64Decode(ct, strlen(ct), &challenge, true) || challenge.len == 0 || challenge.len > 512) { challenge.release(); breakConn(); return fail("a bad CRAM-MD5 challenge"); }
+            char mac[16];
+            hash.hmac(128, pass, pl, challenge.d, challenge.len, &mac[0]);
+            challenge.release();
+            mail.Buf resp;
+            resp.addText(user);
+            resp.addByte(' ');
+            for (int i = 0; i < 16; i++) {
+                int hi = (mac[i] >> 4) & 15;
+                int lo = mac[i] & 15;
+                resp.addByte(hi < 10 ? '0' + hi : 'a' + hi - 10);
+                resp.addByte(lo < 10 ? '0' + lo : 'a' + lo - 10);
+            }
+            mail.Buf b64;
+            mail.base64Encode(resp.d, resp.len, &b64, false);
+            resp.release();
+            code = command(b64.text(), opt->commandTimeoutMs, "****");
+            b64.release();
+            if (code < 0) return false;
+            if (code != 235) return fail("authentication failed");
+            authenticated = true;
+            return true;
+        }
+        if (usable & AUTH_PLAIN) {
+            for (int i = 0; i < ul; i++) { if (user[i] == 0) return fail("bad user name"); }
+            mail.Buf blob;
+            blob.addByte(0);
+            blob.add(user, ul);
+            blob.addByte(0);
+            blob.add(pass, pl);
+            mail.Buf b64;
+            mail.base64Encode(blob.d, blob.len, &b64, false);
+            blob.release();
+            mail.Buf line;
+            line.addText("AUTH PLAIN ");
+            line.add(b64.d, b64.len);
+            b64.release();
+            int code = command(line.text(), opt->commandTimeoutMs, "AUTH PLAIN ****");
+            line.release();
+            if (code < 0) return false;
+            if (code != 235) return fail("authentication failed");
+            authenticated = true;
+            return true;
+        }
+        // LOGIN
+        int code = command("AUTH LOGIN", opt->commandTimeoutMs);
+        if (code < 0) return false;
+        if (code != 334) return fail("AUTH LOGIN was refused");
+        mail.Buf u64;
+        mail.base64Encode(user, ul, &u64, false);
+        code = command(u64.text(), opt->commandTimeoutMs, "****");
+        u64.release();
+        if (code < 0) return false;
+        if (code != 334) return fail("authentication failed");
+        mail.Buf p64;
+        mail.base64Encode(pass, pl, &p64, false);
+        code = command(p64.text(), opt->commandTimeoutMs, "****");
+        p64.release();
+        if (code < 0) return false;
+        if (code != 235) return fail("authentication failed");
+        authenticated = true;
+        return true;
+    }
+
+    // the Result for a failure: the code and text of the last reply
+    private void failResult(Result* r, int code) {
+        r->ok = false;
+        r->code = code > 0 ? code : 0;
+        r->status = reply.status;
+        r->temporary = code > 0 ? (code >= 400 && code < 500) : true;
+        if (code > 0) {
+            r->setText(reply.text());
+        } else {
+            r->setText(error != null ? error : "failed");
+        }
+    }
+
+    // a command with an address: MAIL FROM:<a> and RCPT TO:<a>
+    private bool pathOk(char* a) {
+        int n = strlen(a);
+        if (n == 0) return false;                                       // the empty sender is handled by the caller
+        return mail.validAddress(a, n);
+    }
+
+    // sends the message. from: the sender address ("" or null: the empty sender <> of a bounce); rcpts: n addresses; data: the message (any line ends, len bytes). Returns a Result
+    // that is yours to free (free((char*) r)): never null. See the header of this file for what happens.
+    public Result* send(char* from, char** rcpts, int n, char* data, int len) {
+        Result* r = (Result*) malloc(sizeof(Result));
+        if (r == null) return null;
+        r->count = n < MAX_RECIPIENTS ? n : MAX_RECIPIENTS;
+        if (!isOpen()) { error = "not connected"; failResult(r, 0); return r; }
+        if (n < 1 || n > MAX_RECIPIENTS) { error = "between 1 and 1000 recipients"; failResult(r, 0); r->temporary = false; return r; }
+        if (len < 0 || len > opt->maxMessage) { error = "the message is too big for this client"; failResult(r, 0); r->temporary = false; return r; }
+        bool emptyFrom = from == null || from[0] == 0;
+        if (!emptyFrom && !pathOk(from)) { error = "the sender address is not valid"; failResult(r, 0); r->temporary = false; return r; }
+        for (int i = 0; i < n; i++) {
+            r->rcptCode[i] = 0;
+            if (rcpts[i] == null || !pathOk(rcpts[i])) { error = "a recipient address is not valid"; failResult(r, 0); r->temporary = false; return r; }
+        }
+        bool high = false;
+        for (int i = 0; i < len; i++) {
+            if (data[i] == 0) { error = "a NUL byte cannot be sent by SMTP"; failResult(r, 0); r->temporary = false; return r; }
+            if ((data[i] & 128) != 0) high = true;
+        }
+        if (high && !has8bit) { error = "the message has 8-bit data and the server does not offer 8BITMIME"; failResult(r, 0); r->temporary = false; return r; }
+        // the size as it will be sent: CRLF line ends, a CRLF at the end
+        int wire = canonicalSize(data, len);
+        if (sizeLimit > 0 && wire > sizeLimit) { error = "the message is bigger than the SIZE the server accepts"; failResult(r, 0); r->temporary = false; r->code = 552; return r; }
+        // the commands
+        mail.Buf mailCmd;
+        mailCmd.addText("MAIL FROM:<");
+        if (!emptyFrom) mailCmd.addText(from);
+        mailCmd.addByte('>');
+        if (hasSize) {
+            char tmp[40];
+            format(&tmp[0], 40, " SIZE=%d", wire, 0, 0, 0, 0, 0);
+            mailCmd.addText(&tmp[0]);
+        }
+        if (high) mailCmd.addText(" BODY=8BITMIME");
+        bool pipe = opt->pipelining && hasPipelining;
+        int t = opt->commandTimeoutMs;
+        inTransaction = true;
+        int code;
+        if (pipe) {
+            // MAIL, every RCPT and DATA in one write, then the replies in order
+            mail.Buf burst;
+            burst.addText(mailCmd.text());
+            burst.add("\r\n", 2);
+            conn->noteSent(mailCmd.text());
+            for (int i = 0; i < n; i++) {
+                char one[700];
+                format(&one[0], 700, "RCPT TO:<%s>", rcpts[i], 0, 0, 0, 0, 0);
+                burst.addText(&one[0]);
+                burst.add("\r\n", 2);
+                conn->noteSent(&one[0]);
+            }
+            burst.add("DATA\r\n", 6);
+            conn->noteSent("DATA");
+            bool sent = conn->write(burst.d, burst.len, t);
+            burst.release();
+            mailCmd.release();
+            if (!sent) { error = conn->error; breakConn(); failResult(r, 0); return r; }
+            code = readReply(t);
+            if (code < 0) { failResult(r, code); return r; }
+            bool mailOk = code == 250;
+            int mailCode = code;
+            int mailStatus = reply.status;
+            for (int i = 0; i < n; i++) {
+                code = readReply(t);
+                if (code < 0) { failResult(r, code); return r; }
+                r->rcptCode[i] = code;
+                r->rcptStatus[i] = reply.status;
+                if (code == 250 || code == 251) r->accepted++; else r->rejected++;
+            }
+            code = readReply(t);
+            if (code < 0) { failResult(r, code); return r; }
+            if (!mailOk) {
+                // MAIL was refused: the later replies are 503s
+                r->accepted = 0;
+                r->rejected = n;
+                inTransaction = false;
+                reply.clear();
+                r->code = mailCode;
+                r->status = mailStatus;
+                r->temporary = mailCode >= 400 && mailCode < 500;
+                r->setText("MAIL FROM was refused");
+                command("RSET", t);
+                return r;
+            }
+            if (r->accepted == 0 || (opt->allOrNothing && r->rejected > 0)) {
+                // no data: the server said 354 only if it had a recipient; leave the transaction
+                if (code == 354) {
+                    // we are in the data phase: end the empty message with a line that fails to be one? An empty DATA ends with "." and is then rejected: use RSET after a bare "."
+                    conn->write(".\r\n", 3, t);
+                    readReply(t);
+                }
+                int rc = 0;
+                for (int i = 0; i < n; i++) { if (r->rcptCode[i] != 250 && r->rcptCode[i] != 251) { rc = r->rcptCode[i]; break; } }
+                failResult(r, rc);
+                r->setText(r->accepted == 0 ? "no recipient was accepted" : "a recipient was refused (allOrNothing)");
+                inTransaction = false;
+                if (isOpen()) command("RSET", t);
+                return r;
+            }
+            if (code != 354) {
+                failResult(r, code);
+                inTransaction = false;
+                if (isOpen()) command("RSET", t);
+                return r;
+            }
+        } else {
+            code = command(mailCmd.text(), t);
+            mailCmd.release();
+            if (code < 0) { failResult(r, code); return r; }
+            if (code != 250) {
+                failResult(r, code);
+                inTransaction = false;
+                return r;
+            }
+            for (int i = 0; i < n; i++) {
+                char one[700];
+                format(&one[0], 700, "RCPT TO:<%s>", rcpts[i], 0, 0, 0, 0, 0);
+                code = command(&one[0], t);
+                if (code < 0) { failResult(r, code); return r; }
+                r->rcptCode[i] = code;
+                r->rcptStatus[i] = reply.status;
+                if (code == 250 || code == 251) r->accepted++; else r->rejected++;
+            }
+            if (r->accepted == 0 || (opt->allOrNothing && r->rejected > 0)) {
+                int rc = 0;
+                for (int i = 0; i < n; i++) { if (r->rcptCode[i] != 250 && r->rcptCode[i] != 251) { rc = r->rcptCode[i]; break; } }
+                failResult(r, rc);
+                r->setText(r->accepted == 0 ? "no recipient was accepted" : "a recipient was refused (allOrNothing)");
+                inTransaction = false;
+                command("RSET", t);
+                return r;
+            }
+            code = command("DATA", t);
+            if (code < 0) { failResult(r, code); return r; }
+            if (code != 354) {
+                failResult(r, code);
+                inTransaction = false;
+                command("RSET", t);
+                return r;
+            }
+        }
+        // the message
+        if (!sendData(data, len)) {
+            failResult(r, 0);
+            return r;
+        }
+        code = readReply(opt->dataEndTimeoutMs);
+        inTransaction = false;
+        if (code < 0) { failResult(r, code); return r; }
+        r->code = code;
+        r->status = reply.status;
+        r->setText(reply.text());
+        if (code == 250) {
+            r->ok = true;
+            messages++;
+        } else {
+            r->temporary = code >= 400 && code < 500;
+        }
+        return r;
+    }
+
+    // how many bytes the message has on the wire: CRLF line ends, a CRLF at the end (dot-stuffing not counted: RFC 1870)
+    private int canonicalSize(char* d, int n) {
+        int total = 0;
+        bool lineStart = true;
+        for (int i = 0; i < n; i++) {
+            int c = d[i] & 255;
+            if (c == 13) {
+                total = total + 2;
+                if (i + 1 < n && d[i + 1] == 10) i++;
+                lineStart = true;
+            } else if (c == 10) {
+                total = total + 2;
+                lineStart = true;
+            } else {
+                total++;
+                lineStart = false;
+            }
+        }
+        if (!lineStart) total = total + 2;
+        return total;
+    }
+
+    // writes the data: canonical line ends, dots at the start of a line doubled, a CRLF at the end, then the ".\r\n". false when the connection fails (it is closed then).
+    private bool sendData(char* d, int n) {
+        int chunk = 8192;
+        char* out = malloc(chunk * 3 + 16);
+        if (out == null) { error = "out of memory"; breakConn(); return false; }
+        bool lineStart = true;
+        bool pendingCr = false;
+        int pos = 0;
+        while (pos < n) {
+            int take = n - pos < chunk ? n - pos : chunk;
+            int o = 0;
+            for (int i = 0; i < take; i++) {
+                int c = d[pos + i] & 255;
+                if (pendingCr) {
+                    pendingCr = false;
+                    out[o] = 13; out[o + 1] = 10; o = o + 2;
+                    lineStart = true;
+                    if (c == 10) continue;
+                }
+                if (c == 13) { pendingCr = true; continue; }
+                if (c == 10) { out[o] = 13; out[o + 1] = 10; o = o + 2; lineStart = true; continue; }
+                if (lineStart && c == '.') { out[o] = '.'; o++; }
+                out[o] = c;
+                o++;
+                lineStart = false;
+            }
+            pos = pos + take;
+            if (o > 0 && !conn->write(out, o, opt->dataTimeoutMs)) { free(out); error = conn->error; breakConn(); return false; }
+        }
+        int o = 0;
+        if (pendingCr) { out[o] = 13; out[o + 1] = 10; o = o + 2; lineStart = true; }
+        if (!lineStart) { out[o] = 13; out[o + 1] = 10; o = o + 2; }
+        out[o] = '.'; out[o + 1] = 13; out[o + 2] = 10; o = o + 3;
+        bool ok = conn->write(out, o, opt->dataTimeoutMs);
+        free(out);
+        if (!ok) { error = conn->error; breakConn(); return false; }
+        char note[60];
+        format(&note[0], 60, "<message data, %d bytes>", n, 0, 0, 0, 0, 0);
+        conn->noteSent(&note[0]);
+        conn->noteSent(".");
+        return true;
+    }
+
+    // builds the message and sends it: the sender is the first From address, the recipients are To, Cc and Bcc (Bcc is not in the message). A message with 8-bit parts is
+    // only built that way when the server offers 8BITMIME. null when the message cannot be built (error()).
+    public Result* sendMessage(mail.Message* m) {
+        m->allow8bit = has8bit;
+        int len = 0;
+        char* wire = m->build(&len);
+        if (wire == null) { error = "the message cannot be built"; return null; }
+        mail.AddressList* rc = m->recipients();
+        char** list = (char**) malloc((rc->count + 1) * 8);
+        for (int i = 0; i < rc->count; i++) list[i] = rc->items[i]->addr;
+        Result* r = send(m->sender(), list, rc->count, wire, len);
+        free((char*) list);
+        rc->dispose();
+        free(wire);
+        return r;
+    }
+
+    // RSET: forgets the transaction that is open. true when the server said 250.
+    public bool reset() { return command("RSET", opt->commandTimeoutMs) == 250; }
+
+    // NOOP: true when the connection is alive and the server said 250
+    public bool noop() { return command("NOOP", opt->commandTimeoutMs) == 250; }
+
+    // QUIT and close. The connection is closed even when the server does not answer.
+    public void quit() {
+        if (isOpen()) command("QUIT", 5000);
+        broken = true;
+        if (conn != null) conn->close();
+    }
+
+    public void dispose() {
+        if (conn != null) { conn->dispose(); conn = null; }
+        reply.release();
+        if (host != null) free(host);
+        if (serverName != null) free(serverName);
+        if (ownsCreds && opt != null) {
+            if (opt->username != null) free(opt->username);
+            if (opt->password != null && opt->password[0] != 0) free(opt->password);
+        }
+        if (ownsOpt && opt != null) free((char*) opt);
+        if (heap) { heap = false; free((char*) this); }
+    }
+
+    public void setHost(char* h, int p) {
+        if (host != null) free(host);
+        host = copyText(h);
+        port = p;
+    }
+
+    public void setOwnsOptions(bool v) { ownsOpt = v; }
+}
+
+private char* copyText(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+// a client for host:port (nothing is connected yet: call connect()); the client works on its own copy of the options (null: the defaults)
+public Client* newClient(char* host, int port, Options* options) {
+    Client* c = (Client*) malloc(sizeof(Client));
+    if (c == null) return null;
+    c->heap = true;
+    Options* mine = (Options*) malloc(sizeof(Options));
+    if (mine == null) { free((char*) c); return null; }
+    if (options != null) memcpy((char*) mine, (char*) options, sizeof(Options)); else mine->init();
+    c->opt = mine;
+    c->setOwnsOptions(true);
+    c->setHost(host, port);
+    return c;
+}
+
+// percent decoding of a URL part (user name and password)
+private char* urlDecode(char* s, int n) {
+    char* r = malloc(n + 1);
+    if (r == null) return null;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2 < n) {
+            int a = hexv(s[i + 1]);
+            int b = hexv(s[i + 2]);
+            if (a >= 0 && b >= 0) { r[k] = a * 16 + b; k++; i = i + 2; continue; }
+        }
+        r[k] = s[i];
+        k++;
+    }
+    r[k] = 0;
+    return r;
+}
+
+private int hexv(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Connects to "smtp://[user[:password]@]host[:port]" (port 25; with credentials STARTTLS is required) or "smtps://..." (TLS from the start, port 465). A user name and a
+// password may be percent encoded. null on failure: smtp.error().
+public Client* connectWith(char* url, Options* options) {
+    bool secure = false;
+    int i = 0;
+    if (startsWith(url, "smtps://")) { secure = true; i = 8; }
+    else if (startsWith(url, "smtp://")) i = 7;
+    else { setErr("the URL must start with smtp:// or smtps://"); return null; }
+    int at = -1;
+    for (int k = i; url[k] != 0 && url[k] != '/'; k++) { if (url[k] == '@') at = k; }
+    char* user = null;
+    char* pass = null;
+    if (at >= 0) {
+        int colon = -1;
+        for (int k = i; k < at; k++) { if (url[k] == ':') { colon = k; break; } }
+        int ue = colon >= 0 ? colon : at;
+        user = urlDecode(&url[i], ue - i);
+        if (colon >= 0) pass = urlDecode(&url[colon + 1], at - colon - 1);
+        i = at + 1;
+    }
+    char hostBuf[256];
+    int hl = 0;
+    while (url[i] != 0 && url[i] != ':' && url[i] != '/') {
+        if (hl >= 255) { setErr("host name too long"); return null; }
+        hostBuf[hl] = url[i];
+        hl++;
+        i++;
+    }
+    hostBuf[hl] = 0;
+    if (hl == 0) { setErr("no host in the URL"); return null; }
+    int port = 0;
+    if (url[i] == ':') {
+        i++;
+        while (isDigit(url[i])) { port = port * 10 + (url[i] - '0'); if (port > 65535) { setErr("bad port"); return null; } i++; }
+        if (port == 0) { setErr("bad port"); return null; }
+    }
+    if (port == 0) port = secure ? 465 : 25;
+    Client* c = newClient(&hostBuf[0], port, options);
+    if (c == null) { setErr("out of memory"); return null; }
+    if (secure) c->opt->useTls = true;
+    if (user != null) {
+        c->opt->username = user;
+        c->opt->password = pass == null ? "" : pass;
+        c->ownsCreds = true;
+        if (options == null || options->startTls == STARTTLS_IF_OFFERED) { if (!secure) c->opt->startTls = STARTTLS_REQUIRED; }
+    }
+    if (!c->connect()) {
+        setErr(c->error != null ? c->error : "cannot connect");
+        c->dispose();
+        return null;
+    }
+    return c;
+}
+
+public Client* connect(char* url) { return connectWith(url, null); }

@@ -1,0 +1,622 @@
+// The SMTP client against a scripted server (a raw socket that answers with the lines of a script), so that every byte the client sends can be compared with what the RFC
+// says: the commands, dot-stuffing at the edges (also across the 8192 byte blocks the client works in), canonical line ends, SIZE and BODY=8BITMIME, pipelining, partial
+// failures of the recipients, time outs, a connection that is cut in every phase, replies that are broken, injection through addresses, URLs and the reuse of a connection.
+import smtp;
+import mail;
+import netline;
+import net;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// ---- the scripted server -------------------------------------------------------------------------------------------------------------------------
+int lsn = -1;
+int conn = -1;
+int PORT = 0;
+mail.Buf rx;                    // every byte the client sent
+mail.Buf unit;                  // the command line (or the data) that has not been answered yet
+bool inData = false;
+char* script[24];
+int nscript = 0;
+int spos = 0;
+int accepted = 0;
+bool closedByPeer = false;
+int lineCount = 0;
+
+void sendRaw(char* text) {
+    int n = strlen(text);
+    int off = 0;
+    int t0 = millis();
+    while (off < n && millis() - t0 < 2000) {
+        int r = net.sendSome(conn, &text[off], n - off);
+        if (r < 0) return;
+        off = off + r;
+    }
+}
+
+// the next scripted answer
+void answer() {
+    if (spos >= nscript) return;
+    char* a = script[spos];
+    spos++;
+    if (streq(a, "<CLOSE>")) { net.rawClose(conn); conn = -1; return; }
+    if (streq(a, "<SILENT>")) return;
+    sendRaw(a);
+}
+
+int fakeHook() {
+    if (lsn < 0) return 0;
+    if (conn < 0) {
+        int c = net.acceptSome(lsn);
+        if (c >= 0) {
+            conn = c;
+            net.setNonBlocking(conn, true);
+            accepted++;
+            answer();
+        }
+        return 0;
+    }
+    char buf[4096];
+    int n = net.recvSome(conn, &buf[0], 4096);
+    if (n == 0) { closedByPeer = true; net.rawClose(conn); conn = -1; return 0; }
+    if (n < 0) return 0;
+    rx.add(&buf[0], n);
+    for (int i = 0; i < n; i++) {
+        unit.addByte(buf[i]);
+        if (buf[i] == 10) {
+            if (inData) {
+                // the data ends with a line that is only "." CRLF
+                if (unit.len >= 3 && unit.d[unit.len - 3] == '.' && unit.d[unit.len - 2] == 13 && (unit.len == 3 || unit.d[unit.len - 4] == 10)) {
+                    inData = false;
+                    unit.len = 0;
+                    answer();
+                }
+            } else {
+                lineCount++;
+                bool isData = unit.len >= 6 && memcmp(unit.d, "DATA\r\n", 6) == 0;
+                unit.len = 0;
+                answer();
+                if (isData && spos > 0 && startsWith(script[spos - 1], "354")) inData = true;
+            }
+        }
+    }
+    return 0;
+}
+
+void fakeStart() {
+    lsn = net.listenOn("127.0.0.1", 0, 4);
+    PORT = net.localPort(lsn);
+    net.setNonBlocking(lsn, true);
+}
+
+void fakeReset() {
+    if (conn >= 0) { net.rawClose(conn); conn = -1; }
+    rx.len = 0;
+    unit.len = 0;
+    inData = false;
+    nscript = 0;
+    spos = 0;
+    accepted = 0;
+    closedByPeer = false;
+    lineCount = 0;
+}
+
+void say(char* a, char* b = null, char* c = null, char* d = null, char* e = null, char* f = null, char* g = null, char* h = null, char* i = null, char* j = null, char* k = null, char* l = null) {
+    nscript = 0;
+    char* all[12];
+    all[0] = a; all[1] = b; all[2] = c; all[3] = d; all[4] = e; all[5] = f; all[6] = g; all[7] = h; all[8] = i; all[9] = j; all[10] = k; all[11] = l;
+    for (int x = 0; x < 12; x++) {
+        if (all[x] != null) { script[nscript] = all[x]; nscript++; }
+    }
+}
+
+// lets the fake server run for a moment (the client is not waiting for anything)
+void settle() {
+    for (int i = 0; i < 20; i++) { fakeHook(); sleepMs(1); }
+}
+
+// what the client has sent, as a string
+char* sent() { return rx.text(); }
+
+bool sentIs(char* want) {
+    bool ok = rx.len == strlen(want) && memcmp(rx.text(), want, rx.len) == 0;
+    if (!ok) {
+        int i = 0;
+        while (i < rx.len && i < strlen(want) && rx.d[i] == want[i]) i++;
+        printf("     the client sent %d bytes, expected %d, they differ at byte %d: [%s]\n", rx.len, (int) strlen(want), i, &rx.text()[i > 30 ? i - 30 : 0]);
+    }
+    return ok;
+}
+
+smtp.Client* open(smtp.Options* o) {
+    smtp.Client* c = smtp.newClient("127.0.0.1", PORT, o);
+    return c;
+}
+
+smtp.Options* opts() {
+    smtp.Options* o = smtp.newOptions();
+    o->heloName = "client.test";
+    o->startTls = smtp.STARTTLS_NEVER;
+    o->record = true;
+    o->commandTimeoutMs = 2000;
+    o->greetingTimeoutMs = 2000;
+    o->dataEndTimeoutMs = 2000;
+    o->dataTimeoutMs = 2000;
+    return o;
+}
+
+char* EHLO_PLAIN = "250-mail.test greets you\r\n250 SIZE 100000\r\n";
+
+int main() {
+    fakeStart();
+    net.setIdleHook(fakeHook);
+    char* rcpts[10];
+
+    // ---- one message, byte for byte --------------------------------------------------------------------------------------------------------------------
+    fakeReset();
+    say("220 mail.test ESMTP\r\n", EHLO_PLAIN, "250 2.1.0 Ok\r\n", "250 2.1.5 Ok\r\n", "354 go\r\n", "250 2.0.0 Ok: queued as ABC\r\n", "221 bye\r\n");
+    smtp.Options* o = opts();
+    smtp.Client* c = open(o);
+    check("connect: greeting, EHLO, no STARTTLS asked for", c->connect() && c->isOpen() && !c->secure && streq(c->serverName, "mail.test") && c->sizeLimit == 100000);
+    rcpts[0] = "bob@y.test";
+    smtp.Result* r = c->send("a@x.test", &rcpts[0], 1, "line1\n.leading dot\n..two dots\n\nlast without newline", 51);
+    check("one message: accepted, code, enhanced status, text", r->ok && r->code == 250 && r->status == 2000000 && r->accepted == 1 && r->rejected == 0 && !r->temporary && streq(r->why(), "2.0.0 Ok: queued as ABC"));
+    free((char*) r);
+    c->quit();
+    check("one message: the bytes (CRLF line ends, dots doubled, CRLF added at the end)", sentIs("EHLO client.test\r\nMAIL FROM:<a@x.test> SIZE=57\r\nRCPT TO:<bob@y.test>\r\nDATA\r\n"
+        "line1\r\n..leading dot\r\n...two dots\r\n\r\nlast without newline\r\n.\r\nQUIT\r\n"));
+    check("transcript: lines of both sides, the data is not copied into it", streq(c->transcript(), "S: 220 mail.test ESMTP\nC: EHLO client.test\nS: 250-mail.test greets you\nS: 250 SIZE 100000\nC: MAIL FROM:<a@x.test> SIZE=57\nS: 250 2.1.0 Ok\n"
+        "C: RCPT TO:<bob@y.test>\nS: 250 2.1.5 Ok\nC: DATA\nS: 354 go\nC: <message data, 51 bytes>\nC: .\nS: 250 2.0.0 Ok: queued as ABC\nC: QUIT\nS: 221 bye\n"));
+    c->dispose();
+
+    // ---- line ends and dots at the edges -----------------------------------------------------------------------------------------------------------------
+    char* cases[10];
+    char* wants[10];
+    int lens[10];
+    cases[0] = "a\rb\r\nc\n"; lens[0] = 7; wants[0] = "a\r\nb\r\nc\r\n";
+    cases[1] = ""; lens[1] = 0; wants[1] = "";
+    cases[2] = "abc\r"; lens[2] = 4; wants[2] = "abc\r\n";
+    cases[3] = "abc\n."; lens[3] = 5; wants[3] = "abc\r\n..\r\n";
+    cases[4] = "."; lens[4] = 1; wants[4] = "..\r\n";
+    cases[5] = "\n\n"; lens[5] = 2; wants[5] = "\r\n\r\n";
+    cases[6] = ".\r\n.\r\n.x\n"; lens[6] = 9; wants[6] = "..\r\n..\r\n..x\r\n";
+    cases[7] = "x\r\r\ny"; lens[7] = 5; wants[7] = "x\r\n\r\ny\r\n";
+    cases[8] = "end with a dot line\r\n.\r\n"; lens[8] = 23; wants[8] = "end with a dot line\r\n..\r\n";
+    cases[9] = "\r"; lens[9] = 1; wants[9] = "\r\n";
+    int edgeOk = 0;
+    for (int i = 0; i < 10; i++) {
+        fakeReset();
+        say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n", "221 bye\r\n");
+        o = opts();
+        c = open(o);
+        c->connect();
+        rcpts[0] = "b@y.test";
+        r = c->send("a@x.test", &rcpts[0], 1, cases[i], lens[i]);
+        bool good = r->ok;
+        free((char*) r);
+        c->quit();
+        mail.Buf want;
+        want.addText("EHLO client.test\r\nMAIL FROM:<a@x.test>\r\nRCPT TO:<b@y.test>\r\nDATA\r\n");
+        want.addText(wants[i]);
+        want.addText(".\r\nQUIT\r\n");
+        if (good && rx.len == want.len && memcmp(rx.text(), want.d, rx.len) == 0) edgeOk++; else printf("     case %d: got [%s]\n", i, rx.text());
+        want.release();
+        c->dispose();
+    }
+    check("data edges: CR, CRLF, LF, lone CR at the end, empty data, a dot at the start of every line, a dot line at the end (10 cases)", edgeOk == 10);
+
+    // blocks of 8192: a CR at the end of one block and the LF at the start of the next, a dot at the start of a line after a block
+    int sizes[4];
+    sizes[0] = 8191; sizes[1] = 8192; sizes[2] = 8190; sizes[3] = 16383;
+    int blockOk = 0;
+    for (int k = 0; k < 4; k++) {
+        int pre = sizes[k];
+        char* big = alloc(pre + 20);
+        for (int i = 0; i < pre; i++) big[i] = 'x';
+        big[pre] = '\r';
+        big[pre + 1] = '\n';
+        big[pre + 2] = '.';
+        big[pre + 3] = 'y';
+        big[pre + 4] = '\n';
+        fakeReset();
+        say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n", "221 bye\r\n");
+        o = opts();
+        c = open(o);
+        c->connect();
+        rcpts[0] = "b@y.test";
+        r = c->send("a@x.test", &rcpts[0], 1, big, pre + 5);
+        bool good = r->ok;
+        free((char*) r);
+        c->quit();
+        mail.Buf want;
+        want.addText("EHLO client.test\r\nMAIL FROM:<a@x.test>\r\nRCPT TO:<b@y.test>\r\nDATA\r\n");
+        want.add(big, pre);
+        want.addText("\r\n..y\r\n.\r\nQUIT\r\n");
+        if (good && rx.len == want.len && memcmp(rx.text(), want.d, rx.len) == 0) blockOk++; else printf("     block case %d failed (%d vs %d)\n", k, rx.len, want.len);
+        want.release();
+        c->dispose();
+    }
+    check("data edges: a CR/LF pair split by the 8192 byte block boundary and a dot behind it (4 sizes)", blockOk == 4);
+
+    // ---- SIZE, 8BITMIME ---------------------------------------------------------------------------------------------------------------------------------
+    fakeReset();
+    say("220 mail.test\r\n", "250-mail.test\r\n250 SIZE 100\r\n", "250 ok\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    char* msg200 = alloc(300);
+    for (int i = 0; i < 200; i++) msg200[i] = 'z';
+    rcpts[0] = "b@y.test";
+    r = c->send("a@x.test", &rcpts[0], 1, msg200, 200);
+    check("SIZE: a message over the advertised size is not sent (552, no MAIL FROM)", !r->ok && r->code == 552 && !r->temporary && !contains(sent(), "MAIL FROM") && c->isOpen());
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250-mail.test\r\n250 SIZE 0\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("a@x.test", &rcpts[0], 1, msg200, 200);
+    check("SIZE 0 means no limit stated", r->ok && contains(sent(), "SIZE=202"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250-mail.test\r\n250-SIZE 1000\r\n250 8BITMIME\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("a@x.test", &rcpts[0], 1, "caf\xC3\xA9\n", 6);
+    check("8BITMIME: 8-bit data goes with BODY=8BITMIME and the size", r->ok && contains(sent(), "MAIL FROM:<a@x.test> SIZE=7 BODY=8BITMIME\r\n") && contains(sent(), "caf\xC3\xA9\r\n.\r\n"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("a@x.test", &rcpts[0], 1, "caf\xC3\xA9\n", 6);
+    check("8-bit data to a server without 8BITMIME is refused before anything is sent", !r->ok && r->code == 0 && !r->temporary && startsWith(r->why(), "the message has 8-bit data") && !contains(sent(), "MAIL"));
+    free((char*) r);
+    r = c->send("a@x.test", &rcpts[0], 1, "a\x00" "b", 3);
+    check("a NUL byte is refused", !r->ok && startsWith(r->why(), "a NUL byte") && !contains(sent(), "MAIL"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("", &rcpts[0], 1, "x\n", 2);
+    check("the empty sender is MAIL FROM:<> (no SIZE when the server states none)", r->ok && contains(sent(), "MAIL FROM:<>\r\n"));
+    free((char*) r);
+    c->dispose();
+
+    // ---- partial failures ---------------------------------------------------------------------------------------------------------------------------------
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 2.1.5 ok\r\n", "550 5.1.1 no such user\r\n", "452 4.5.3 too many\r\n", "250 2.1.5 ok\r\n", "354 go\r\n", "250 2.0.0 queued\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    rcpts[0] = "a1@y.test"; rcpts[1] = "a2@y.test"; rcpts[2] = "a3@y.test"; rcpts[3] = "a4@y.test";
+    r = c->send("s@x.test", &rcpts[0], 4, "hi\n", 3);
+    check("partial failure: two recipients taken, one refused for good, one for now; the message goes to the two", r->ok && r->accepted == 2 && r->rejected == 2 && r->count == 4
+        && r->rcptCode[0] == 250 && r->rcptCode[1] == 550 && r->rcptCode[2] == 452 && r->rcptCode[3] == 250 && r->rcptStatus[1] == 5001001 && r->rcptStatus[2] == 4005003);
+    check("partial failure: all four RCPT commands were sent, then DATA", contains(sent(), "RCPT TO:<a1@y.test>\r\nRCPT TO:<a2@y.test>\r\nRCPT TO:<a3@y.test>\r\nRCPT TO:<a4@y.test>\r\nDATA\r\nhi\r\n.\r\n"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "550 5.7.1 denied\r\n", "250 ok\r\n");
+    o = opts();
+    o->allOrNothing = true;
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 2, "hi\n", 3);
+    check("allOrNothing: one refusal cancels the message, RSET is sent, no DATA", !r->ok && r->accepted == 1 && r->rejected == 1 && r->code == 550 && !r->temporary && contains(sent(), "RSET\r\n") && !contains(sent(), "DATA"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "550 no\r\n", "550 no\r\n", "250 ok\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 2, "hi\n", 3);
+    check("every recipient refused: no DATA, RSET, the code of the refusal", !r->ok && r->accepted == 0 && r->rejected == 2 && r->code == 550 && contains(sent(), "RSET\r\n") && !contains(sent(), "DATA") && c->isOpen());
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "553 5.1.8 sender not allowed\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 1, "hi\n", 3);
+    check("MAIL FROM refused: the Result says so and no RCPT is sent", !r->ok && r->code == 553 && r->status == 5001008 && !contains(sent(), "RCPT") && c->isOpen());
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "554 5.6.0 message rejected as spam\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 1, "spam\n", 5);
+    check("the message is refused after DATA (554): not ok, permanent, the text of the server", !r->ok && r->code == 554 && !r->temporary && streq(r->why(), "5.6.0 message rejected as spam") && r->accepted == 1);
+    free((char*) r);
+    r = c->send("s@x.test", &rcpts[0], 1, "ham\n", 4);
+    check("... and the connection is used for the next message (a transaction ends with the reply)", r->ok && c->messages == 1);
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "451 4.3.0 try later\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 1, "x\n", 2);
+    check("451 after the data: a temporary failure", !r->ok && r->code == 451 && r->temporary && r->status == 4003000);
+    free((char*) r);
+    c->dispose();
+
+    // ---- connections that go away, silence, broken replies -----------------------------------------------------------------------------------------------
+    int phaseOk = 0;
+    for (int phase = 0; phase < 6; phase++) {
+        fakeReset();
+        // phase 0: gone after EHLO, 1: after MAIL, 2: after RCPT, 3: after DATA, 4: inside the data (the "." gets no answer), 5: silent after MAIL
+        if (phase == 0) say("220 mail.test\r\n", "250 mail.test\r\n", "<CLOSE>");
+        if (phase == 1) say("220 mail.test\r\n", "250 mail.test\r\n", "<CLOSE>");
+        if (phase == 2) say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "<CLOSE>");
+        if (phase == 3) say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "<CLOSE>");
+        if (phase == 4) say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "<CLOSE>");
+        if (phase == 5) say("220 mail.test\r\n", "250 mail.test\r\n", "<SILENT>");
+        o = opts();
+        o->commandTimeoutMs = 300;
+        o->dataEndTimeoutMs = 300;
+        c = open(o);
+        c->connect();
+        r = c->send("s@x.test", &rcpts[0], 1, "x\n", 2);
+        bool good = !r->ok && r->temporary && !c->isOpen() && r->code == 0 && r->accepted <= 1;
+        if (phase == 5) good = good && contains(r->why(), "time out");
+        if (good) phaseOk++; else printf("     phase %d: ok=%d temp=%d open=%d code=%d [%s]\n", phase, r->ok, r->temporary, c->isOpen(), r->code, r->why());
+        free((char*) r);
+        c->dispose();
+    }
+    check("a connection that is cut or silent in six phases: not ok, temporary, the client is closed, nothing hangs", phaseOk == 6);
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "421 4.3.2 shutting down\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 1, "x\n", 2);
+    check("421 in the middle: the server is closing, the client closes too, temporary", !r->ok && r->temporary && !c->isOpen());
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("554 no service for you\r\n");
+    o = opts();
+    c = open(o);
+    check("greeting 554: connect fails with a clear text", !c->connect() && contains(c->error, "554"));
+    c->dispose();
+    fakeReset();
+    say("hello there\r\n");
+    o = opts();
+    c = open(o);
+    check("a greeting without a code fails", !c->connect() && contains(c->error, "three digit code"));
+    c->dispose();
+    fakeReset();
+    say("220-first line\r\n220-second line\r\n220 last line\r\n", "250 mail.test\r\n");
+    o = opts();
+    c = open(o);
+    check("a greeting of several lines is read", c->connect() && streq(c->serverName, "first"));
+    c->dispose();
+    fakeReset();
+    say("220-first\r\n250 other code\r\n");
+    o = opts();
+    c = open(o);
+    check("a continuation line with another code is a protocol error", !c->connect() && contains(c->error, "another code"));
+    c->dispose();
+    fakeReset();
+    mail.Buf manyLines;
+    manyLines.addText("220 mail.test\r\n");
+    say("220 mail.test\r\n");
+    mail.Buf flood;
+    for (int i = 0; i < 1500; i++) flood.addText("250-filler\r\n");
+    flood.addText("250 end\r\n");
+    script[1] = flood.text();
+    nscript = 2;
+    o = opts();
+    c = open(o);
+    check("a reply with 1500 lines is refused (the limit is 1000), memory stays bounded", !c->connect() && contains(c->error, "too long"));
+    c->dispose();
+    flood.release();
+    manyLines.release();
+    fakeReset();
+    mail.Buf longLine;
+    for (int i = 0; i < 20000; i++) longLine.addByte('x');
+    longLine.addText("\r\n");
+    say("220 mail.test\r\n");
+    mail.Buf longReply;
+    longReply.addText("250 ");
+    longReply.add(longLine.d, longLine.len);
+    script[1] = longReply.text();
+    nscript = 2;
+    o = opts();
+    c = open(o);
+    check("a reply line of 20000 bytes is refused", !c->connect() && contains(c->error, "line too long"));
+    c->dispose();
+    longLine.release();
+    longReply.release();
+    fakeReset();
+    say("220 mail.test\r\n", "502 EHLO not implemented\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 1, "x\n", 2);
+    check("EHLO refused: HELO is tried, and the message goes through without SIZE", r->ok && contains(sent(), "EHLO client.test\r\nHELO client.test\r\nMAIL FROM:<s@x.test>\r\n"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "500 what\r\n", "500 what\r\n");
+    o = opts();
+    c = open(o);
+    check("EHLO and HELO both refused: connect fails", !c->connect());
+    c->dispose();
+
+    // ---- pipelining ----------------------------------------------------------------------------------------------------------------------------------------
+    fakeReset();
+    say("220 mail.test\r\n", "250-mail.test\r\n250-PIPELINING\r\n250 ENHANCEDSTATUSCODES\r\n", "250 2.1.0 ok\r\n", "250 2.1.5 ok\r\n", "550 5.1.1 no\r\n", "354 go\r\n", "250 2.0.0 queued\r\n");
+    o = opts();
+    o->pipelining = true;
+    c = open(o);
+    c->connect();
+    rcpts[0] = "a1@y.test"; rcpts[1] = "a2@y.test";
+    r = c->send("s@x.test", &rcpts[0], 2, "hi\n", 3);
+    check("pipelining: MAIL, the RCPTs and DATA go out together (all C: lines before the first answer), partial failure still works", r->ok && r->accepted == 1 && r->rcptCode[1] == 550
+        && startsWith(c->transcript() + 0, "S: 220 mail.test\nC: EHLO client.test\nS: 250-mail.test\nS: 250-PIPELINING\nS: 250 ENHANCEDSTATUSCODES\nC: MAIL FROM:<s@x.test>\nC: RCPT TO:<a1@y.test>\nC: RCPT TO:<a2@y.test>\nC: DATA\nS: 250 2.1.0 ok\n"));
+    check("pipelining: the bytes", sentIs("EHLO client.test\r\nMAIL FROM:<s@x.test>\r\nRCPT TO:<a1@y.test>\r\nRCPT TO:<a2@y.test>\r\nDATA\r\nhi\r\n.\r\n"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250-mail.test\r\n250 PIPELINING\r\n", "553 5.1.8 no\r\n", "503 5.5.1 bad sequence\r\n", "503 5.5.1 bad sequence\r\n", "250 ok\r\n");
+    o = opts();
+    o->pipelining = true;
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 1, "hi\n", 3);
+    check("pipelining: MAIL refused, the 503s that follow are read, the result is the refusal of MAIL", !r->ok && r->code == 553 && r->accepted == 0 && c->isOpen());
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250-mail.test\r\n250 PIPELINING\r\n", "250 ok\r\n", "550 no\r\n", "554 5.5.1 no valid recipients\r\n", "250 ok\r\n");
+    o = opts();
+    o->pipelining = true;
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 1, "hi\n", 3);
+    check("pipelining: every recipient refused: DATA is answered 554, no data goes out", !r->ok && r->accepted == 0 && r->rejected == 1 && c->isOpen() && !contains(sent(), "hi\r\n"));
+    free((char*) r);
+    c->dispose();
+
+    // ---- injection and bad input --------------------------------------------------------------------------------------------------------------------------
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    char* evil[8];
+    evil[0] = "a@x.test>\r\nRCPT TO:<spy@evil.test";
+    evil[1] = "a@x.test\r\n";
+    evil[2] = "a b@x.test";
+    evil[3] = "a@x.test\nDATA";
+    evil[4] = "<a@x.test>";
+    evil[5] = "";
+    evil[6] = "a@@x.test";
+    evil[7] = "a@x.test ";
+    int refusedOk = 0;
+    for (int i = 0; i < 8; i++) {
+        rcpts[0] = evil[i];
+        r = c->send("s@x.test", &rcpts[0], 1, "x\n", 2);
+        if (!r->ok && !r->temporary && startsWith(r->why(), "a recipient address is not valid")) refusedOk++; else printf("     evil %d: [%s]\n", i, r->why());
+        free((char*) r);
+    }
+    check("recipient addresses with CR, LF, blanks, brackets, NUL or nothing are refused before anything is sent", refusedOk == 8 && sentIs("EHLO client.test\r\n"));
+    rcpts[0] = "ok@y.test";
+    r = c->send("s@x.test>\r\nRCPT TO:<spy@evil.test", &rcpts[0], 1, "x\n", 2);
+    check("a sender address with CR LF is refused", !r->ok && startsWith(r->why(), "the sender address is not valid") && sentIs("EHLO client.test\r\n"));
+    free((char*) r);
+    r = c->send("s@x.test", &rcpts[0], 0, "x\n", 2);
+    check("no recipients: refused", !r->ok && startsWith(r->why(), "between 1 and 1000") && sentIs("EHLO client.test\r\n"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n");
+    o = opts();
+    o->heloName = "evil.test\r\nMAIL FROM:<x@y.z>";
+    c = open(o);
+    check("a name for EHLO with CR LF is refused", !c->connect() && contains(c->error, "bad name for EHLO") && !contains(sent(), "MAIL"));
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    rcpts[0] = "ok@y.test";
+    r = c->send("s@x.test", &rcpts[0], 1, "x\n", 99999999999);
+    check("a length that is not possible is refused", !r->ok && startsWith(r->why(), "the message is too big for this client"));
+    free((char*) r);
+    c->dispose();
+
+    // ---- one connection, several messages; sendMessage; URLs --------------------------------------------------------------------------------------------------
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued 1\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued 2\r\n", "250 ok\r\n", "221 bye\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    r = c->send("s@x.test", &rcpts[0], 1, "one\n", 4);
+    bool first = r->ok;
+    free((char*) r);
+    r = c->send("s@x.test", &rcpts[0], 1, "two\n", 4);
+    bool second = r->ok;
+    free((char*) r);
+    check("two messages on one connection, NOOP, then QUIT", first && second && c->messages == 2 && c->noop() && sentIs("EHLO client.test\r\nMAIL FROM:<s@x.test>\r\nRCPT TO:<ok@y.test>\r\nDATA\r\none\r\n.\r\nMAIL FROM:<s@x.test>\r\nRCPT TO:<ok@y.test>\r\nDATA\r\ntwo\r\n.\r\nNOOP\r\n"));
+    c->quit();
+    check("after quit the client is closed, a send fails cleanly", !c->isOpen());
+    r = c->send("s@x.test", &rcpts[0], 1, "three\n", 6);
+    check("send on a closed client: not ok, temporary, no crash", !r->ok && r->temporary && streq(r->why(), "not connected"));
+    free((char*) r);
+    c->dispose();
+    fakeReset();
+    say("220 mail.test\r\n", "250 mail.test\r\n", "250 ok\r\n", "250 ok\r\n", "250 ok\r\n", "250 ok\r\n", "354 go\r\n", "250 queued\r\n");
+    o = opts();
+    c = open(o);
+    c->connect();
+    mail.Message* m = mail.newMessage();
+    m->from("Ann <ann@x.test>");
+    m->to("Bob <bob@y.test>");
+    m->cc("carol@y.test");
+    m->bcc("secret@y.test");
+    m->subject("Hi");
+    m->text("body\n");
+    m->setDate(1794580200, 0);
+    m->setMessageId("<m1@x.test>");
+    r = c->sendMessage(m);
+    check("sendMessage: sender and recipients from the message, Bcc only in the envelope", r != null && r->ok && r->accepted == 3 && contains(sent(), "MAIL FROM:<ann@x.test>") && contains(sent(), "RCPT TO:<secret@y.test>\r\n") && contains(sent(), "RCPT TO:<carol@y.test>\r\n")
+        && contains(sent(), "Subject: Hi\r\n") && !contains(sent(), "Bcc:") && contains(sent(), "\r\nbody\r\n.\r\n"));
+    free((char*) r);
+    m->dispose();
+    c->dispose();
+    check("URLs: other schemes, no host and bad ports are refused", smtp.connect("http://x") == null && startsWith(smtp.error(), "the URL must start with") && smtp.connect("smtp://") == null && streq(smtp.error(), "no host in the URL")
+        && smtp.connect("smtp://127.0.0.1:0") == null && smtp.connect("smtp://127.0.0.1:99999") == null && streq(smtp.error(), "bad port"));
+    int deadL = net.listen(0, 4);
+    int deadP = net.localPort(deadL);
+    net.close(deadL);
+    char durl[100];
+    format(&durl[0], 100, "smtp://127.0.0.1:%d", deadP, 0, 0, 0, 0, 0);
+    check("nothing listens there: no client, a reason", smtp.connect(&durl[0]) == null && strlen(smtp.error()) > 0);
+    // credentials in the URL: percent decoding, plain auth refused without TLS
+    fakeReset();
+    say("220 mail.test\r\n", "250-mail.test\r\n250 AUTH PLAIN LOGIN\r\n");
+    char aurl[100];
+    format(&aurl[0], 100, "smtp://us%%40er:p%%3Ass@127.0.0.1:%d", PORT, 0, 0, 0, 0, 0);
+    smtp.Options* ao = opts();
+    ao->startTls = smtp.STARTTLS_IF_OFFERED;
+    smtp.Client* ac = smtp.connectWith(&aurl[0], ao);
+    check("URL with credentials: STARTTLS is required, a server without it is refused and the password never goes out", ac == null && contains(smtp.error(), "STARTTLS") && !contains(sent(), "AUTH") && !contains(sent(), "p:ss"));
+    fakeReset();
+    say("220 mail.test\r\n", "250-mail.test\r\n250 AUTH PLAIN LOGIN\r\n");
+    o = opts();
+    o->username = "user";
+    o->password = "pass";
+    c = open(o);
+    check("PLAIN and LOGIN are not sent on a plain connection (allowPlainAuth is off)", !c->connect() && contains(c->error, "no TLS") && !contains(sent(), "AUTH"));
+    c->dispose();
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
