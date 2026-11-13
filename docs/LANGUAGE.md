@@ -529,7 +529,7 @@ var u = (1, "two", 3.5);                // a tuple literal; its type is (int, ch
 * **Patterns:** `(T a, T b) = value;`, `var (a, b) = value;` and `(x, y) = value;` need a tuple with the same number of elements; `_`
   skips one. The variables are created after the value is computed (the initializer cannot see them). The assignment form pushes the
   addresses of the targets first, copies the value into a temporary, then assigns from left to right: `(i, i) = (1, 2)` leaves 2,
-  `(v[i], i) = (5, 2)` uses the old `i` for the first target. Patterns are statements (also `for (var (a, b) = f(); ...)`), they cannot be nested
+  `(v[i], i) = (5, 2)` uses the old `i` for the first target. Patterns are statements (also the first and the third part of a `for` head: `for (var (a, b) = (0, 1); a < 100; (a, b) = (b, a + b))`), they cannot be nested
   (`((a, b), c) = ...` is an error, assign the inner tuple to a variable first) and each side has to match: the value of another tuple type is an error
   (`tuple types do not match`).
 * **Errors:** `(int, void)` (`a tuple element cannot be void`), 17 elements, `t.2` on a pair (`this tuple has no element with that number`), a pattern with the
