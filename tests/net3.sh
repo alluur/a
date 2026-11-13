@@ -1,5 +1,6 @@
 #!/bin/bash
-# Interoperability of smtpd, ftpd and pop3d with independent clients (Linux; needs python3 for smtplib, ftplib, poplib, email; curl is used when it is installed).
+# Interoperability of smtpd, ftpd and pop3d with independent clients (Linux; needs python3 for smtplib, ftplib (also FTP_TLS), poplib, email; curl and openssl are used when installed: FTPS needs both a certificate and a client).
+# Also the A FTP client against a Python FTPS server (tests/net3_ftps_mock.py) in the order of vsftpd: 150 first, the TLS handshake of the data connection after it.
 # And of the mail module with Python's email package (parse and build, both ways).
 # Not part of `make test`. Usage: tests/net3.sh, from the root of the repository (the paths are relative to it).
 cd "$(dirname "$0")/.."
