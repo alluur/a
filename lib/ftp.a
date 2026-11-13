@@ -829,36 +829,31 @@ public class Client {
     public int activeListener;
     private bool activePending;
 
-    // makes the data connection ready: passive: connected now (returns the link); active: the listener is open and the server knows where to connect (the link
-    // comes from acceptData after the transfer command). null when it fails (error says why).
-    private netio.Link* openData() {
+    // Makes the data connection ready. Passive: the TCP connection is made now and its socket is returned (the TLS handshake of a protected data connection comes after the
+    // transfer command: a server that takes the connection when the command arrives cannot answer a ClientHello earlier). Active: the listener is open and the server knows where to
+    // connect (the connection comes from acceptData after the transfer command), -1 with activePending set. -1 and no activePending when it fails (error says why).
+    private int openData() {
         activePending = false;
         if (opt->passive) {
             int dport = -1;
             if (opt->useEpsv && !epsvBroken) {
                 int c = command("EPSV");
-                if (c < 0) return null;
+                if (c < 0) return -1;
                 if (c == 229) dport = parseEpsv(reply.text());
                 else if (c == 500 || c == 501 || c == 502 || c == 522 || c == 504) epsvBroken = true;
-                else { replyFail("EPSV failed"); return null; }
-                if (c == 229 && dport < 0) { fail("a reply to EPSV that cannot be read"); return null; }
+                else { replyFail("EPSV failed"); return -1; }
+                if (c == 229 && dport < 0) { fail("a reply to EPSV that cannot be read"); return -1; }
             }
             if (dport < 0) {
                 int c = command("PASV");
-                if (c < 0) return null;
-                if (c != 227) { replyFail("PASV failed"); return null; }
+                if (c < 0) return -1;
+                if (c != 227) { replyFail("PASV failed"); return -1; }
                 dport = parsePasv(reply.text(), null);
-                if (dport < 0) { fail("a reply to PASV that cannot be read"); return null; }
+                if (dport < 0) { fail("a reply to PASV that cannot be read"); return -1; }
             }
-            netio.Link* l = netio.newLink();
-            if (l == null) { fail("out of memory"); return null; }
-            if (!l->open(host, dport, opt->connectTimeoutMs, dataProtected, opt->verify)) {
-                char* why = l->error != null ? l->error : "cannot open the data connection";
-                l->dispose();
-                fail(why);
-                return null;
-            }
-            return l;
+            int sock = net.connectTimeout(host, dport, opt->connectTimeoutMs);
+            if (sock < 0) { fail("cannot open the data connection"); return -1; }
+            return sock;
         }
         // active: a listener on the local address of the control connection
         int lip = net.localIp(conn->link->fd);
@@ -866,7 +861,7 @@ public class Client {
         format(&ipText[0], 24, "%d.%d.%d.%d", (lip >> 24) & 255, (lip >> 16) & 255, (lip >> 8) & 255, lip & 255, 0, 0);
         char* announce = opt->activeAddress != null ? opt->activeAddress : &ipText[0];
         activeListener = net.listenOn(&ipText[0], 0, 1);
-        if (activeListener < 0) { fail("cannot listen for the data connection"); return null; }
+        if (activeListener < 0) { fail("cannot listen for the data connection"); return -1; }
         int lport = net.localPort(activeListener);
         char cmd[100];
         int c = 0;
@@ -874,10 +869,10 @@ public class Client {
         if (opt->useEprt && !eprtBroken) {
             format(&cmd[0], 100, "EPRT |1|%s|%d|", announce, lport, 0, 0, 0);
             c = command(&cmd[0]);
-            if (c < 0) { net.close(activeListener); activeListener = -1; return null; }
+            if (c < 0) { net.close(activeListener); activeListener = -1; return -1; }
             if (c == 200) done = true;
             else if (c == 500 || c == 501 || c == 502 || c == 522 || c == 504) eprtBroken = true;
-            else { net.close(activeListener); activeListener = -1; replyFail("EPRT failed"); return null; }
+            else { net.close(activeListener); activeListener = -1; replyFail("EPRT failed"); return -1; }
         }
         if (!done) {
             int a0 = 0; int a1 = 0; int a2 = 0; int a3 = 0;
@@ -886,16 +881,59 @@ public class Client {
             a0 = (ai >> 24) & 255; a1 = (ai >> 16) & 255; a2 = (ai >> 8) & 255; a3 = ai & 255;
             format(&cmd[0], 100, "PORT %d,%d,%d,%d,%d,%d", a0, a1, a2, a3, lport / 256, lport % 256);
             c = command(&cmd[0]);
-            if (c < 0) { net.close(activeListener); activeListener = -1; return null; }
-            if (c != 200) { net.close(activeListener); activeListener = -1; replyFail("PORT failed"); return null; }
+            if (c < 0) { net.close(activeListener); activeListener = -1; return -1; }
+            if (c != 200) { net.close(activeListener); activeListener = -1; replyFail("PORT failed"); return -1; }
         }
         activePending = true;
-        return null;
+        return -1;
     }
 
-    // Active mode: waits for the server to connect (only the address of the server is accepted) and makes the link. While it waits it also looks at the control connection: a reply
-    // there (a refusal such as 550, or the preliminary 150 that some servers send first) is read; *prelim tells that the 1xx reply has been read. With TLS the server does not
-    // send 150 before the handshake of the data connection is over, so the connection must be accepted before the reply is waited for.
+    // The TCP connection of a data transfer is there (sock) and the transfer command has been sent: makes the link, and with protected data (PROT P) runs the TLS handshake as
+    // the client (RFC 4217: the client is the TLS client on every data connection, whoever made the TCP connection). The handshake starts at once and does not wait for the preliminary
+    // reply: servers that send the 150 first and handshake after it (vsftpd, ProFTPD, FileZilla Server, ftpd), and servers that handshake first, both work. While the handshake runs
+    // the control connection is looked at: a reply there (a refusal such as 550) ends the wait with its text; *prelim tells that the 1xx reply was read, *consumed that the reply that
+    // ended the transfer was read. null when it fails (error says why; the socket is closed).
+    private netio.Link* upgradeData(int sock, bool* prelim, bool* consumed) {
+        netio.Link* l = netio.newLink();
+        if (l == null) { net.rawClose(sock); fail("out of memory"); return null; }
+        if (!l->adopt(sock, dataProtected ? 1 : 0, host, opt->verify, null, opt->connectTimeoutMs)) {
+            char* why = l->error != null ? l->error : "cannot use the data connection";
+            l->dispose();
+            fail(why);
+            return null;
+        }
+        if (!dataProtected) return l;
+        for (;;) {
+            int r = l->openStep();
+            if (r > 0) return l;
+            if (r < 0) {
+                char* why = l->error != null ? l->error : "TLS on the data connection failed";
+                l->dispose();
+                // The server ended the data connection before the handshake could finish: often because it refused the command (it closes the passive listener, and the connection
+                // that waits there, as soon as it says 550). Its reply is the better reason, and it is on its way (or is there already).
+                if (!*prelim && strstr(why, "during the TLS handshake") != null && (conn->buffered() > 0 || conn->link->waitReadable(300))) {
+                    int c = readReply();
+                    if (c < 0) { *consumed = true; return null; }
+                    if (c / 100 != 1) { *consumed = true; replyFail("the transfer was refused"); return null; }
+                    *prelim = true;
+                }
+                fail(why);
+                return null;
+            }
+            if (!*prelim && (conn->buffered() > 0 || conn->link->waitReadable(0))) {
+                int c = readReply();
+                if (c < 0) { l->dispose(); *consumed = true; return null; }
+                if (c / 100 != 1) { l->dispose(); *consumed = true; replyFail("the transfer was refused"); return null; }
+                *prelim = true;
+                continue;
+            }
+            net.rawWaitReadable(l->fd, 10);
+        }
+        return l;
+    }
+
+    // Active mode: waits for the server to connect (only the address of the server is accepted) and makes the link (upgradeData). While it waits it also looks at the control
+    // connection: a reply there (a refusal such as 550, or the preliminary 150) is read; *prelim tells that the 1xx reply has been read.
     private netio.Link* acceptData(bool* prelim, bool* consumed) {
         int t0 = millis();
         netio.Link* l = null;
@@ -916,11 +954,11 @@ public class Client {
             int pip = 0;
             net.peer(s, &pip, null);
             if (pip != peerIp) { net.rawClose(s); continue; }        // not the server: a connection of someone else is dropped
-            l = netio.newLink();
-            if (l == null) { net.rawClose(s); break; }
-            if (!l->adopt(s, dataProtected ? 1 : 0, host, opt->verify, null, opt->connectTimeoutMs)) { char* why = l->error; l->dispose(); fail(why != null ? why : "data connection"); l = null; break; }
-            if (dataProtected && !l->finish(opt->connectTimeoutMs)) { char* why = l->error; l->dispose(); fail(why != null ? why : "TLS on the data connection failed"); l = null; }
-            break;
+            net.close(activeListener);
+            activeListener = -1;
+            activePending = false;
+            l = upgradeData(s, prelim, consumed);
+            return l;
         }
         net.close(activeListener);
         activeListener = -1;
@@ -935,6 +973,23 @@ public class Client {
         activePending = false;
     }
 
+    // after a failed data connection: the replies of the server to the transfer command (a 1xx that was not read yet, then the final one) are read, so that the control connection is
+    // in step again; the code of the final one is in `code`
+    private void readFinal() {
+        for (int k = 0; k < 3; k++) {
+            int c = readReply();
+            if (c < 0 || c / 100 != 1) return;
+        }
+    }
+
+    // The data connection broke by itself (not because this side stopped it): the reason is often in the reply of the server (552 the file is too big, 451 a disk error, 426 ...),
+    // which is read now. When it is an error reply it becomes the error text ("the transfer failed: 552 ..."); else `why` stays.
+    private void dataBroke(char* why) {
+        readFinal();
+        if (isOpen() && code >= 400) replyFail("the transfer failed");
+        else error = why;
+    }
+
     // Starts a transfer: the data connection, the command (with REST when an offset is set), the preliminary reply. Returns the open data link, or null (error says why).
     private netio.Link* startTransfer(char* verb, char* path, int offset) {
         if (!isOpen()) { error = "not connected"; return null; }
@@ -942,37 +997,34 @@ public class Client {
         if (path != null && strlen(path) > 1000) { fail("the path is too long"); return null; }
         lastErr[0] = 0;
         restart = 0;
-        netio.Link* l = openData();
-        if (l == null && !activePending) return null;
+        int sock = openData();
+        if (sock < 0 && !activePending) return null;
         if (offset > 0) {
-            if (!rest(offset)) { if (l != null) l->dispose(); closeActive(); return null; }
+            if (!rest(offset)) { if (sock >= 0) net.rawClose(sock); closeActive(); return null; }
         }
         char cmd[1100];
         if (path != null && path[0] != 0) format(&cmd[0], 1100, "%s %s", verb, path, 0, 0, 0, 0);
         else format(&cmd[0], 1100, "%s", verb, 0, 0, 0, 0, 0, 0);
-        if (activePending) {
-            if (!conn->writeLine(&cmd[0], opt->commandTimeoutMs)) { error = conn->error; breakConn(); closeActive(); return null; }
-            bool prelim = false;
-            bool consumed = false;
-            l = acceptData(&prelim, &consumed);
-            if (l == null) {
-                if (isOpen() && !consumed) { char* why = error; readReply(); error = why; }
-                return null;
-            }
-            if (!prelim) {
-                int c2 = readReply();
-                if (c2 < 0) { l->dispose(); return null; }
-                if (c2 / 100 != 1) { l->dispose(); replyFail("the transfer was refused"); return null; }
-            }
-            return l;
-        }
-        int c = command(&cmd[0]);
-        if (c < 0) { if (l != null) l->dispose(); closeActive(); return null; }
-        if (c / 100 != 1) {
-            if (l != null) l->dispose();
+        if (!conn->writeLine(&cmd[0], opt->commandTimeoutMs)) {
+            error = conn->error;
+            breakConn();
+            if (sock >= 0) net.rawClose(sock);
             closeActive();
-            replyFail("the transfer was refused");
             return null;
+        }
+        bool prelim = false;
+        bool consumed = false;
+        netio.Link* l = null;
+        if (activePending) l = acceptData(&prelim, &consumed);
+        else l = upgradeData(sock, &prelim, &consumed);
+        if (l == null) {
+            if (isOpen() && !consumed) { char* why = error; readFinal(); error = why; }
+            return null;
+        }
+        if (!prelim) {
+            int c2 = readReply();
+            if (c2 < 0) { l->dispose(); return null; }
+            if (c2 / 100 != 1) { l->dispose(); replyFail("the transfer was refused"); return null; }
         }
         return l;
     }
@@ -997,6 +1049,7 @@ public class Client {
         char* buf = malloc(16384);
         if (buf == null) { l->dispose(); fail("out of memory"); breakConn(); return false; }
         bool ok = true;
+        bool broke = false;
         bool pendingCr = false;
         char* conv = text ? malloc(16400) : null;
         int t0 = millis();
@@ -1006,7 +1059,7 @@ public class Client {
                 if (!l->waitReadable(100) && millis() - t0 > opt->dataTimeoutMs) { error = "the data connection was silent for too long"; ok = false; break; }
                 continue;
             }
-            if (n < 0) { error = "the data connection failed"; ok = false; break; }
+            if (n < 0) { error = "the data connection failed"; ok = false; broke = true; break; }
             if (n == 0) break;
             t0 = millis();
             char* p = buf;
@@ -1036,7 +1089,8 @@ public class Client {
         if (!ok) {
             // the server is told by the closed connection; its reply (426) is read to keep the control connection in step
             char* why = error;
-            readReply();
+            if (broke) { dataBroke(why); return false; }
+            readFinal();
             error = why;
             return false;
         }
@@ -1165,6 +1219,7 @@ public class Client {
         char* out = malloc(16384 * 2 + 8);
         if (buf == null || out == null) { l->dispose(); if (buf != null) free(buf); if (out != null) free(out); fail("out of memory"); breakConn(); return false; }
         bool ok = true;
+        bool broke = false;
         bool text = !binary;
         bool lastCr = false;
         for (;;) {
@@ -1189,7 +1244,7 @@ public class Client {
             int t0 = millis();
             while (off < pn) {
                 int w = l->send(&p[off], pn - off);
-                if (w < 0) { error = "the data connection failed"; ok = false; break; }
+                if (w < 0) { error = "the data connection failed"; ok = false; broke = true; break; }
                 if (w == 0) {
                     net.waitWritable(l->fd, 100);
                     if (millis() - t0 > opt->dataTimeoutMs) { error = "the data connection was silent for too long"; ok = false; break; }
@@ -1208,7 +1263,13 @@ public class Client {
             while (l->hasBacklog() && millis() - t0 < opt->dataTimeoutMs) { l->flush(); net.waitWritable(l->fd, 50); }
         }
         l->dispose();
-        if (!ok) { char* why = error; readReply(); error = why; return false; }
+        if (!ok) {
+            char* why = error;
+            if (broke) { dataBroke(why); return false; }
+            readFinal();
+            error = why;
+            return false;
+        }
         return finishTransfer(true);
     }
 

@@ -116,6 +116,7 @@ public class Session {
     public int lastMove;                // the last time a byte moved
     public int op;
     public bool opPending;              // the command is waiting for the data connection
+    public bool sent150;                // the preliminary reply (150) of the waiting or running transfer has been sent
     public int fd;                      // the file of the transfer
     public int fileSize;
     public int offsetNow;
@@ -539,7 +540,7 @@ public class Server {
         bool hasArg = i < n;
         if (streq(&verb[0], "")) { say(s, 500, "Unknown command."); return; }
         // what a transfer in progress allows
-        if (s->dstate == DS_BUSY && !(streq(&verb[0], "ABOR") || streq(&verb[0], "STAT") || streq(&verb[0], "NOOP") || streq(&verb[0], "QUIT"))) {
+        if ((s->dstate == DS_BUSY || s->opPending) && !(streq(&verb[0], "ABOR") || streq(&verb[0], "STAT") || streq(&verb[0], "NOOP") || streq(&verb[0], "QUIT"))) {
             say(s, 425, "A transfer is in progress.");
             return;
         }
@@ -1024,6 +1025,7 @@ public class Server {
         s->fd = -1;
         s->op = OP_NONE;
         s->opPending = false;
+        s->sent150 = false;
         s->dstate = DS_NONE;
         s->buf.release();
         s->buf.max = maxList;
@@ -1234,7 +1236,8 @@ public class Server {
         if (op != OP_LIST) s->buf.clear();
         s->lastMove = millis();
         if (s->dstate == DS_READY) { beginTransfer(s); return; }
-        if (s->dstate == DS_LISTEN || s->dstate == DS_CONNECTING || s->dstate == DS_HANDSHAKE) { s->opPending = true; s->dataSince = millis(); return; }
+        if (s->dstate == DS_HANDSHAKE) { s->opPending = true; s->dataSince = millis(); announce(s); return; }       // the TCP connection is there: 150 now, the handshake goes on behind it
+        if (s->dstate == DS_LISTEN || s->dstate == DS_CONNECTING) { s->opPending = true; s->dataSince = millis(); return; }
         if (s->dstate == DS_ACTIVE) {
             s->opPending = true;
             if (!connectActive(s)) { failOp(s, 425, "Cannot open the data connection."); }
@@ -1268,19 +1271,44 @@ public class Server {
         s->link = l;
         s->connFd = -1;
         if (mode == 2) {
+            // PROT P. The order of the other FTPS servers (vsftpd, ProFTPD, FileZilla Server) and of the clients that follow them (Python's ftplib, Java, lftp): the data connection
+            // is accepted, the 150 goes out as soon as the transfer command has been seen, and only then does the client start the TLS handshake (it waits for the 150 first).
+            // A client that starts the handshake at once (curl) is served too: the handshake runs whenever its bytes arrive, before or after the command.
             s->dstate = DS_HANDSHAKE;
             s->dataSince = millis();
-            watchFd(s, l->fd, EV_READ | EV_WRITE);
+            if (s->opPending) announce(s);
             stepHandshake(s);
         } else {
             dataUp(s);
         }
     }
 
+    // the preliminary reply of the transfer whose command is waiting for the data connection (once)
+    private void announce(Session* s) {
+        if (s->sent150 || !s->opPending) return;
+        s->sent150 = true;
+        say150(s);
+    }
+
+    private void say150(Session* s) {
+        char t[200];
+        if (s->op == OP_RETR) {
+            format(&t[0], 200, "Opening %s mode data connection (%d bytes).", s->binary ? "BINARY" : "ASCII", s->fileSize - s->offsetNow, 0, 0, 0);
+        } else if (s->op == OP_LIST) {
+            format(&t[0], 200, "Here comes the directory listing.", 0, 0, 0, 0, 0, 0);
+        } else {
+            format(&t[0], 200, "Ok to send data (%s mode).", s->binary ? "BINARY" : "ASCII", 0, 0, 0, 0);
+        }
+        say(s, 150, &t[0]);
+    }
+
+    // a step of the TLS handshake of the data connection: the socket is watched for reading, and for writing only while handshake bytes wait to leave
+    // (a server that waits for the ClientHello must not spin on a socket that is always writable)
     private void stepHandshake(Session* s) {
         int r = s->link->openStep();
         if (r < 0) { failOp(s, 425, "TLS handshake of the data connection failed."); return; }
-        if (r > 0) dataUp(s);
+        if (r > 0) { dataUp(s); return; }
+        watchFd(s, s->link->fd, s->link->hasBacklog() ? EV_READ | EV_WRITE : EV_READ);
     }
 
     // the data connection is ready
@@ -1295,25 +1323,20 @@ public class Server {
         s->opPending = false;
         s->dstate = DS_BUSY;
         s->lastMove = millis();
-        char t[200];
-        if (s->op == OP_RETR) {
-            format(&t[0], 200, "Opening %s mode data connection (%d bytes).", s->binary ? "BINARY" : "ASCII", s->fileSize - s->offsetNow, 0, 0, 0);
-        } else if (s->op == OP_LIST) {
-            format(&t[0], 200, "Here comes the directory listing.", 0, 0, 0, 0, 0, 0);
-        } else {
-            format(&t[0], 200, "Ok to send data (%s mode).", s->binary ? "BINARY" : "ASCII", 0, 0, 0, 0);
+        if (!s->sent150) {
+            s->sent150 = true;
+            say150(s);
         }
-        say(s, 150, &t[0]);
         watchFd(s, s->link->fd, s->op == OP_STOR || s->op == OP_APPE ? EV_READ : EV_READ | EV_WRITE);
         pump(s);
     }
 
     // a transfer or the set-up of the data connection failed: the reply, everything given up
+    // (a data connection that fails while no transfer command waits for it ends silently: a reply nobody asked for would be taken for the answer to the next command)
     private void failOp(Session* s, int code, char* text) {
-        bool wasBusy = s->dstate == DS_BUSY;
+        bool asked = s->opPending || s->dstate == DS_BUSY;
         dataClose(s, true);
-        say(s, code, text);
-        if (wasBusy) { }
+        if (asked) say(s, code, text);
     }
 
     private void finishOp(Session* s, char* text) {
@@ -1322,6 +1345,7 @@ public class Server {
         if (s->link != null) { s->link->dispose(); s->link = null; }
         if (s->fd >= 0) { asys.fileClose(s->fd); s->fd = -1; }
         s->op = OP_NONE;
+        s->sent150 = false;
         s->dstate = DS_NONE;
         s->buf.release();
         s->buf.max = maxList;

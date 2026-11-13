@@ -12,6 +12,9 @@ import ftp;
 import ftpd;
 import asys;
 import net;
+import netio;
+import netsrv;
+import netline;
 import tls;
 import x509;
 import mail;
@@ -32,8 +35,11 @@ void check(char* name, bool ok) {
 ftpd.Server* srv;
 char root[200];
 
+netsrv.Server* scr;                      // the scripted server below (null: not running)
+
 int hook() {
     srv->poll(0);
+    if (scr != null) scr->poll(0);
     return 0;
 }
 
@@ -75,6 +81,358 @@ ftp.Options* opts() {
     o->commandTimeoutMs = 8000;
     o->dataTimeoutMs = 8000;
     o->connectTimeoutMs = 8000;
+    return o;
+}
+
+
+// ---- a client that does what Python's ftplib, Java and lftp do, written by hand (netio.Link for the control and the data connections) ----------------------------------------
+netio.Link* ctl;
+mail.Buf ctlBuf;
+
+// a reply is complete: the text ends with a line "ddd text" (a final line)
+bool replyComplete(mail.Buf* b) {
+    if (b->len < 6 || b->d[b->len - 1] != 10) return false;
+    int e = b->len - 2;
+    int st = e;
+    while (st > 0 && b->d[st - 1] != 10) st--;
+    return b->d[st] >= '0' && b->d[st] <= '9' && b->d[st + 1] >= '0' && b->d[st + 1] <= '9' && b->d[st + 2] >= '0' && b->d[st + 2] <= '9' && b->d[st + 3] == ' ';
+}
+
+// the next reply of the control connection ("" when nothing came in ms)
+char* ctlReply(int ms) {
+    int t0 = millis();
+    ctlBuf.len = 0;
+    while (millis() - t0 < ms) {
+        if (!ctl->waitReadable(30)) continue;
+        char tmp[1024];
+        int n = ctl->recv(&tmp[0], 1024);
+        if (n == -2) continue;
+        if (n <= 0) break;
+        ctlBuf.add(&tmp[0], n);
+        if (replyComplete(&ctlBuf)) {
+            if (!ctl->waitReadable(3)) break;                        // everything that came together is one answer
+        }
+    }
+    char* r = ctlBuf.take() ?? "";
+    return r;
+}
+
+void ctlSend(char* line) {
+    char l[300];
+    int n = format(&l[0], 300, "%s\r\n", line, 0, 0, 0, 0, 0);
+    ctl->sendAll(&l[0], n, 3000);
+}
+
+char* ctlCmd(char* line, int ms = 2000) {
+    ctlSend(line);
+    return ctlReply(ms);
+}
+
+// connects, AUTH TLS, login, PBSZ 0, PROT P, TYPE I (the control connection is a netio.Link: the sequence of the commands is ours)
+bool ctlOpen(int port) {
+    ctl = netio.newLink();
+    if (!ctl->open("127.0.0.1", port, 3000, false, false)) return false;
+    char* g = ctlReply(2000);
+    if (!startsWith(g, "220")) return false;
+    if (!startsWith(ctlCmd("AUTH TLS"), "234")) return false;
+    if (!ctl->startTls("127.0.0.1", true, 3000)) return false;
+    return startsWith(ctlCmd("USER ann"), "331") && startsWith(ctlCmd("PASS secret"), "230") && startsWith(ctlCmd("PBSZ 0"), "200") && startsWith(ctlCmd("PROT P"), "200") && startsWith(ctlCmd("TYPE I"), "200");
+}
+
+void ctlClose() {
+    if (ctl != null) { ctl->dispose(); ctl = null; }
+}
+
+// EPSV and the TCP connection to the port (what ftplib does before it sends the transfer command); -1 when it fails
+int passiveSocket() {
+    char* r = ctlCmd("EPSV");
+    char* p = strstr(r, "(|||");
+    if (!startsWith(r, "229") || p == null) return -1;
+    int port = ftp.parseEpsv(p);
+    int d = net.connect("127.0.0.1", port);
+    net.setTimeout(d, 3000);
+    return d;
+}
+
+// the TLS handshake of a data connection as the client, and everything the server sends up to the end of the data
+char* dataHandshakeAndRead(int sock, int* n, bool alreadyHandshaking = false) {
+    netio.Link* dl = netio.newLink();
+    *n = -1;
+    if (!dl->adopt(sock, 1, "127.0.0.1", true, null, 3000)) { dl->dispose(); return null; }
+    if (!dl->finish(4000)) { dl->dispose(); return null; }
+    mail.Buf b;
+    int t0 = millis();
+    for (;;) {
+        char tmp[2048];
+        int k = dl->recv(&tmp[0], 2048);
+        if (k == -2) { if (!dl->waitReadable(50) && millis() - t0 > 4000) break; continue; }
+        if (k <= 0) break;
+        b.add(&tmp[0], k);
+    }
+    dl->dispose();
+    *n = b.len;
+    return b.take() ?? "";
+}
+
+// ---- a scripted FTPS server in the order of vsftpd / ProFTPD / FileZilla Server: the data connection is taken when the transfer command arrives, 150 is sent FIRST and the TLS handshake of the
+// data connection comes after it (sHandshakeFirst: the other order, handshake and then 150) --------------------------------------------------------------------------------------------------
+netsrv.Conn* sc;
+netline.Lines sl;
+tls.Config* scfg;
+int sLfd = -1;                           // the passive listener
+int sDfd = -1;                           // the data socket (accepted or connected)
+netio.Link* sDl;                         // its TLS link
+int sState;                              // 0 idle, 1 waiting for the data connection, 2 handshake, 3 receiving (STOR)
+bool sActive;
+int sActIp;
+int sActPort;
+char sVerb[8];
+char sArg[100];
+bool sHandshakeFirst;
+bool sRefuseStor;                        // STOR: the handshake is done, then the data connection is closed at once and 552 is the answer (a server that refuses the upload)
+bool sWantTls;
+char* sStored;
+int sStoredLen;
+int sCommands;                           // how many transfer commands were seen
+
+void sSay(char* t) {
+    char l[300];
+    int n = format(&l[0], 300, "%s\r\n", t, 0, 0, 0, 0, 0);
+    sc->out.add(&l[0], n);
+}
+
+void sDataEnd() {
+    if (sDl != null) { sDl->dispose(); sDl = null; }
+    else if (sDfd >= 0) net.rawClose(sDfd);
+    if (sDfd >= 0) scr->unwatch(sDfd);
+    sDfd = -1;
+    sState = 0;
+}
+
+void sListenerClose() {
+    if (sLfd >= 0) { scr->unwatch(sLfd); net.close(sLfd); sLfd = -1; }
+}
+
+void sTransferBody() {
+    // the handshake is over
+    if (sHandshakeFirst) sSay("150 Here it comes.");
+    if (streq(&sVerb[0], "STOR") && sRefuseStor) {
+        sDataEnd();
+        sSay("552 The file is bigger than the limit.");
+        return;
+    }
+    if (streq(&sVerb[0], "STOR")) {
+        sState = 3;
+        scr->watch(sDfd, net.READABLE, 2);
+        return;
+    }
+    char* body = "hello from the scripted server\n";
+    if (streq(&sVerb[0], "LIST")) body = "-rw-r--r--   1 ftp      ftp            31 Jan  1  2020 hello.txt\r\n";
+    int n = strlen(body);
+    int off = 0;
+    while (off < n) {
+        int w = sDl->send(&body[off], n - off);
+        if (w < 0) break;
+        off = off + w;
+        if (w == 0) break;
+    }
+    sDl->flush();
+    sDataEnd();                                  // the goodbye of TLS and the close
+    sSay("226 Transfer complete.");
+}
+
+void sStep() {
+    int r = sDl->openStep();
+    if (r < 0) { sDataEnd(); sSay("425 TLS handshake failed."); return; }
+    if (r == 0) { scr->watch(sDfd, net.READABLE, 2); return; }
+    sTransferBody();
+}
+
+void sProceed() {
+    if (!sHandshakeFirst) sSay("150 Opening BINARY mode data connection.");
+    sDl = netio.newLink();
+    if (!sDl->adopt(sDfd, 2, null, false, scfg, 5000)) { sDl->dispose(); sDl = null; sDfd = -1; sSay("425 no data connection."); sState = 0; return; }
+    sState = 2;
+    sStep();
+}
+
+void sBegin() {
+    sCommands++;
+    if (streq(&sArg[0], "missing") || streq(&sArg[0], "/missing")) {
+        sListenerClose();
+        sSay("550 No such file.");
+        return;
+    }
+    if (sActive) {
+        char ip[24];
+        format(&ip[0], 24, "%d.%d.%d.%d", (sActIp >> 24) & 255, (sActIp >> 16) & 255, (sActIp >> 8) & 255, sActIp & 255, 0, 0);
+        sDfd = net.connect(&ip[0], sActPort);
+        if (sDfd < 0) { sSay("425 Cannot connect."); return; }
+        sProceed();
+        return;
+    }
+    if (sDfd >= 0) { sProceed(); return; }
+    sState = 1;                                  // the client has not connected yet: the connection starts it
+}
+
+void sLine(char* line) {
+    char v[8];
+    int i = 0;
+    while (line[i] != 0 && line[i] != ' ' && i < 7) { v[i] = line[i]; i++; }
+    v[i] = 0;
+    char* arg = line[i] == ' ' ? &line[i + 1] : "";
+    if (streq(&v[0], "AUTH")) { sSay("234 Go ahead."); sWantTls = true; }
+    else if (streq(&v[0], "USER")) sSay("331 Password?");
+    else if (streq(&v[0], "PASS")) sSay("230 Logged in.");
+    else if (streq(&v[0], "PBSZ") || streq(&v[0], "PROT") || streq(&v[0], "TYPE") || streq(&v[0], "REST")) sSay("200 OK.");
+    else if (streq(&v[0], "FEAT")) sc->out.addText("211-Features:\r\n AUTH TLS\r\n PBSZ\r\n PROT\r\n211 End\r\n");
+    else if (streq(&v[0], "NOOP")) sSay("200 NOOP ok.");
+    else if (streq(&v[0], "QUIT")) sSay("221 Bye.");
+    else if (streq(&v[0], "EPSV") || streq(&v[0], "PASV")) {
+        sListenerClose();
+        sActive = false;
+        sLfd = net.listenOn("127.0.0.1", 0, 1);
+        net.setNonBlocking(sLfd, true);
+        int pt = net.localPort(sLfd);
+        scr->watch(sLfd, net.READABLE, 1);
+        char t[100];
+        if (streq(&v[0], "EPSV")) format(&t[0], 100, "229 Entering Extended Passive Mode (|||%d|)", pt, 0, 0, 0, 0, 0);
+        else format(&t[0], 100, "227 Entering Passive Mode (127,0,0,1,%d,%d)", pt / 256, pt % 256, 0, 0, 0);
+        sSay(&t[0]);
+    }
+    else if (streq(&v[0], "EPRT") || streq(&v[0], "PORT")) {
+        sActive = true;
+        sActIp = 0x7F000001;
+        int port = 0;
+        if (streq(&v[0], "EPRT")) {
+            // |1|127.0.0.1|port|: the port is the 4th field
+            int field = 0;
+            for (int k = 0; arg[k] != 0; k++) {
+                if (arg[k] == '|') { field++; continue; }
+                if (field == 3 && arg[k] >= '0' && arg[k] <= '9') port = port * 10 + (arg[k] - '0');
+            }
+        } else {
+            int commas = 0;
+            int hi = 0;
+            int lo = 0;
+            for (int k = 0; arg[k] != 0; k++) {
+                if (arg[k] == ',') { commas++; continue; }
+                if (commas == 4 && arg[k] >= '0' && arg[k] <= '9') hi = hi * 10 + (arg[k] - '0');
+                if (commas == 5 && arg[k] >= '0' && arg[k] <= '9') lo = lo * 10 + (arg[k] - '0');
+            }
+            port = hi * 256 + lo;
+        }
+        sActPort = port;
+        sSay("200 Command okay.");
+    }
+    else if (streq(&v[0], "RETR") || streq(&v[0], "STOR") || streq(&v[0], "LIST") || streq(&v[0], "NLST")) {
+        strcpy(&sVerb[0], &v[0]);
+        int al = strlen(arg);
+        if (al > 99) al = 99;
+        memcpy(&sArg[0], arg, al);
+        sArg[al] = 0;
+        sBegin();
+    }
+    else sSay("502 Not implemented.");
+}
+
+int sOpen(netsrv.Server* ns, netsrv.Conn* c) {
+    sc = c;
+    sl.maxLine = 400;                            // (the constructor of a global is not run)
+    sl.maxBuffer = 65536;
+    sl.clear();
+    sSay("220 scripted FTPS server");
+    return 0;
+}
+
+int sData(netsrv.Server* ns, netsrv.Conn* c, char* data, int n) {
+    sl.feed(data, n);
+    char line[400];
+    for (;;) {
+        int k = sl.next(&line[0], 390);
+        if (k == -1) break;
+        if (k < 0) continue;
+        sLine(&line[0]);
+        if (sWantTls) break;
+    }
+    if (sWantTls) {
+        sWantTls = false;
+        ns->startTls(c, scfg);
+        sl.clear();
+    }
+    return 0;
+}
+
+int sClose(netsrv.Server* ns, netsrv.Conn* c) {
+    sDataEnd();
+    sListenerClose();
+    sc = null;
+    return 0;
+}
+
+int sWatch(netsrv.Server* ns, int tag, int fd, int revents) {
+    if (tag == 1) {
+        int sock = net.acceptSome(sLfd);
+        if (sock < 0) return 0;
+        sListenerClose();
+        sDfd = sock;
+        net.setNonBlocking(sDfd, true);
+        if (sState == 1) sProceed();
+        return 0;
+    }
+    if (sDl == null) return 0;
+    if (sState == 2) { sStep(); return 0; }
+    if (sState == 3) {
+        char tmp[4096];
+        for (int round = 0; round < 16; round++) {
+            int k = sDl->recv(&tmp[0], 4096);
+            if (k == -2) return 0;
+            if (k <= 0) {
+                sDataEnd();
+                sSay(k == 0 ? "226 Transfer complete." : "426 The data connection failed.");
+                return 0;
+            }
+            char* nb = alloc(sStoredLen + k + 1);
+            if (sStoredLen > 0) memcpy(nb, sStored, sStoredLen);
+            memcpy(&nb[sStoredLen], &tmp[0], k);
+            sStored = nb;
+            sStoredLen = sStoredLen + k;
+        }
+    }
+    return 0;
+}
+
+void scrStart(bool handshakeFirst) {
+    scr = new netsrv.Server();
+    scr->onOpen = sOpen;
+    scr->onData = sData;
+    scr->onClose = sClose;
+    scr->onWatch = sWatch;
+    scr->handshakeTimeoutMs = 4000;
+    scr->listenOn("127.0.0.1", 0, null);
+    sHandshakeFirst = handshakeFirst;
+    sStored = null;
+    sStoredLen = 0;
+    sCommands = 0;
+    sActive = false;
+    sRefuseStor = false;
+}
+
+void scrStop() {
+    scr->shutdown();
+    scr = null;
+}
+
+ftp.Options* scrOpts(bool passive) {
+    ftp.Options* o = ftp.newOptions();
+    o->username = "ann";
+    o->password = "secret";
+    o->authTls = ftp.STARTTLS_REQUIRED;
+    o->passive = passive;
+    o->record = true;
+    o->commandTimeoutMs = 6000;
+    o->dataTimeoutMs = 6000;
+    o->connectTimeoutMs = 6000;
     return o;
 }
 
@@ -230,9 +588,164 @@ int main() {
     c->connect();
     c->dataProtected = false;                    // the client now opens data connections in the clear while the server expects TLS
     c->opt->commandTimeoutMs = 500;
+    c->opt->dataTimeoutMs = 500;
+    srv->dataTimeoutMs = 300;                    // the server waits for a ClientHello that never comes (it has said 150 already): 425 after this
     d = c->retrieveAll("small.txt", &n, 1000);
     check("a data connection in the clear where TLS is expected: the transfer fails (nothing is delivered in the clear)", d == null);
     c->dispose();
+
+    // ---- the order of the other FTPS programs (the review found that the first version only worked with itself) -------------------------------------------------------------------
+    // ftpd against a client that does what Python's ftplib does: connect the data socket, send the command, WAIT for the 150, and only then start the TLS handshake
+    scfg = good;
+    srv->dataTimeoutMs = 3000;
+    check("ftplib order: the control connection (AUTH TLS, login, PROT P) of a hand-made client", ctlOpen(srv->port));
+    int d1 = passiveSocket();
+    ctlSend("RETR small.txt");
+    char* r150 = ctlReply(2000);
+    check("ftplib order, passive RETR: the 150 comes BEFORE the client starts the handshake (it was sent after the handshake: a deadlock)", startsWith(r150, "150 ") && d1 >= 0);
+    int dn = 0;
+    char* dd = dataHandshakeAndRead(d1, &dn);
+    check("... then the handshake works and the data arrives", dd != null && dn == 5 && memcmp(dd, "tiny\n", 5) == 0);
+    check("... and the 226 follows", startsWith(ctlReply(2000), "226 "));
+    d1 = passiveSocket();
+    ctlSend("LIST");
+    check("ftplib order, passive LIST: 150 first", startsWith(ctlReply(2000), "150 "));
+    dd = dataHandshakeAndRead(d1, &dn);
+    check("... the listing arrives and the 226 follows", dd != null && contains(dd, "small.txt") && contains(dd, "data.bin") && startsWith(ctlReply(2000), "226 "));
+    d1 = passiveSocket();
+    ctlSend("STOR order.bin");
+    check("ftplib order, passive STOR: 150 first", startsWith(ctlReply(2000), "150 "));
+    netio.Link* ul = netio.newLink();
+    bool upOk = ul->adopt(d1, 1, "127.0.0.1", true, null, 3000) && ul->finish(4000) && ul->sendAll(up, 70000, 4000);
+    ul->dispose();
+    char* r226 = ctlReply(3000);
+    format(&fp[0], 300, "%s/order.bin", &root[0], 0, 0, 0, 0, 0);
+    int on = 0;
+    char* od = asys.readFile(&fp[0], &on, 10000000, null);
+    check("... the upload (70000 bytes) is whole and confirmed (226)", upOk && startsWith(r226, "226 ") && od != null && on == 70000 && memcmp(od, up, 70000) == 0);
+    // active mode: the client listens, sends the command, reads the 150 (it has not accepted yet), then accepts and handshakes
+    int lf = net.listenOn("127.0.0.1", 0, 1);
+    char eprt[100];
+    format(&eprt[0], 100, "EPRT |1|127.0.0.1|%d|", net.localPort(lf), 0, 0, 0, 0, 0);
+    check("ftplib order, active: EPRT", startsWith(ctlCmd(&eprt[0]), "200 "));
+    ctlSend("RETR small.txt");
+    char* ra = ctlReply(2000);
+    check("ftplib order, active RETR: the 150 comes before the client accepts the connection", startsWith(ra, "150 "));
+    int as = -1;
+    if (net.waitReadable(lf, 3000)) as = net.acceptSome(lf);
+    dd = as >= 0 ? dataHandshakeAndRead(as, &dn) : null;
+    check("... accept, handshake, data, 226", dd != null && dn == 5 && memcmp(dd, "tiny\n", 5) == 0 && startsWith(ctlReply(2000), "226 "));
+    net.close(lf);
+    // curl order: the handshake first, the command after it
+    d1 = passiveSocket();
+    netio.Link* cl = netio.newLink();
+    bool hsFirst = cl->adopt(d1, 1, "127.0.0.1", true, null, 3000) && cl->finish(4000);
+    check("curl order: the handshake of a data connection is served before any transfer command was sent", hsFirst);
+    ctlSend("RETR small.txt");
+    char* rc = ctlReply(2000);
+    mail.Buf cb;
+    int ct0 = millis();
+    while (millis() - ct0 < 3000) {
+        char tmp[100];
+        int k = cl->recv(&tmp[0], 100);
+        if (k == -2) { cl->waitReadable(50); continue; }
+        if (k <= 0) break;
+        cb.add(&tmp[0], k);
+    }
+    cl->dispose();
+    check("... then 150, the data and 226", startsWith(rc, "150 ") && cb.len == 5 && memcmp(cb.d, "tiny\n", 5) == 0 && (contains(rc, "\r\n226 ") || startsWith(ctlReply(2000), "226 ")));
+    // the ClientHello and the command back to back (what ftp.a does): the 150 and the handshake cross each other
+    d1 = passiveSocket();
+    netio.Link* bl = netio.newLink();
+    bl->adopt(d1, 1, "127.0.0.1", true, null, 3000);
+    bl->openStep();                                  // the ClientHello leaves
+    ctlSend("RETR small.txt");
+    bool bok = bl->finish(4000);
+    char* rb = ctlReply(2000);
+    cb.len = 0;
+    ct0 = millis();
+    while (bok && millis() - ct0 < 3000) {
+        char tmp[100];
+        int k = bl->recv(&tmp[0], 100);
+        if (k == -2) { bl->waitReadable(50); continue; }
+        if (k <= 0) break;
+        cb.add(&tmp[0], k);
+    }
+    bl->dispose();
+    check("ClientHello first, command right behind it: works too", bok && startsWith(rb, "150 ") && cb.len == 5 && (contains(rb, "\r\n226 ") || startsWith(ctlReply(2000), "226 ")));
+    // garbage instead of a ClientHello before any command: the data connection is dropped, and NO reply nobody asked for is sent
+    d1 = passiveSocket();
+    net.send(d1, "this is not a TLS record at all\r\n", 33);
+    net.waitReadable(d1, 600);                      // the server closes it
+    char tmp3[64];
+    int gk = net.waitReadable(d1, 100) ? net.recv(d1, &tmp3[0], 64) : 0;
+    net.close(d1);
+    char* rn = ctlCmd("NOOP", 1000);
+    check("garbage on a data connection before the command: it is closed, the next reply is the answer to the next command (no stray 425)", streq(rn, "200 NOOP ok.\r\n") && gk <= 0);
+    check("... and a transfer command now needs a new PASV (425)", startsWith(ctlCmd("RETR small.txt"), "425 "));
+    // a client that connects, reads the 150 and never handshakes: 425 after the time limit, the session goes on
+    srv->dataTimeoutMs = 300;
+    d1 = passiveSocket();
+    ctlSend("RETR small.txt");
+    check("a client that never starts the handshake: 150 first", startsWith(ctlReply(1000), "150 "));
+    char* rt = ctlReply(2500);
+    check("... then 425 after dataTimeoutMs (the data connection is closed), and the control connection goes on", startsWith(rt, "425 ") && startsWith(ctlCmd("NOOP"), "200 "));
+    net.close(d1);
+    // a second transfer command while the first one waits for its data connection: refused, the first goes on (no second file is opened)
+    d1 = passiveSocket();
+    ctlSend("RETR small.txt");
+    check("a transfer command while another waits for the handshake: 425", startsWith(ctlReply(1000), "150 ") && startsWith(ctlCmd("RETR data.bin"), "425 "));
+    net.close(d1);
+    ctlReply(1000);
+    srv->dataTimeoutMs = 3000;
+    ctlSend("QUIT");
+    ctlReply(1000);
+    ctlClose();
+
+    // ---- the client against a scripted server in the order of vsftpd (150, then the handshake), and in the other order ---------------------------------------------------------------
+    for (int order = 0; order < 2; order++) {
+        for (int act = 0; act < 2; act++) {
+            scrStart(order == 1);
+            ftp.Client* sc1 = ftp.newClient("127.0.0.1", scr->port, scrOpts(act == 0));
+            int tt0 = millis();
+            bool conn1 = sc1->connect();
+            if (!conn1) printf("     connect error: %s\n", sc1->error);
+            int gn = 0;
+            char* gd = conn1 ? sc1->retrieveAll("hello.txt", &gn, 100000) : null;
+            char label[200];
+            format(&label[0], 200, "scripted server, %s, %s: connect, download", order == 0 ? "150 first (vsftpd order)" : "handshake first", act == 0 ? "passive" : "active", 0, 0, 0, 0);
+            check(&label[0], conn1 && gd != null && gn == 31 && streq(gd, "hello from the scripted server\n"));
+            if (gd == null && conn1) printf("     error: %s\n", sc1->error);
+            netio.Queue lq;
+            bool lok = conn1 && sc1->list("", &lq);
+            format(&label[0], 200, "scripted server, %s, %s: a listing", order == 0 ? "150 first" : "handshake first", act == 0 ? "passive" : "active", 0, 0, 0, 0);
+            check(&label[0], lok && contains(lq.data(), "hello.txt"));
+            lq.release();
+            char* upd = "uploaded through the scripted server\n";
+            bool sok = conn1 && sc1->store("put.txt", upd, strlen(upd));
+            format(&label[0], 200, "scripted server, %s, %s: an upload", order == 0 ? "150 first" : "handshake first", act == 0 ? "passive" : "active", 0, 0, 0, 0);
+            check(&label[0], sok && sStoredLen == strlen(upd) && memcmp(sStored, upd, sStoredLen) == 0);
+            if (!sok && conn1) printf("     error: %s\n", sc1->error);
+            int tt1 = millis();
+            format(&label[0], 200, "scripted server, %s, %s: refusal (550 on RETR) is reported at once, the connection goes on, and nothing waited for a timeout", order == 0 ? "150 first" : "handshake first", act == 0 ? "passive" : "active", 0, 0, 0, 0);
+            char* gm = conn1 ? sc1->retrieveAll("missing", &gn, 100000) : null;
+            int tt2 = millis();
+            check(&label[0], conn1 && gm == null && contains(sc1->error, "550") && sc1->noop() && tt2 - tt1 < 3000);
+            check("... and a download after the refusal works", conn1 && sc1->retrieveAll("hello.txt", &gn, 100000) != null);
+            // the server refuses an upload and closes the data connection while the client is still sending: the client reports the reason of the server (552), not only
+            // "the data connection failed" (on a host with small socket buffers the send fails before the reply is read; this makes it so on every host)
+            sRefuseStor = true;
+            char* bigUp = pattern(400000, 3);
+            bool refused = conn1 && !sc1->store("big.bin", bigUp, 400000);
+            format(&label[0], 200, "scripted server, %s, %s: an upload that is refused (the data connection is closed under the client): the error is the reply of the server (552)", order == 0 ? "150 first" : "handshake first", act == 0 ? "passive" : "active", 0, 0, 0, 0);
+            check(&label[0], refused && contains(sc1->error, "552") && contains(sc1->error, "bigger than the limit"));
+            if (refused && !contains(sc1->error, "552")) printf("     error: %s\n", sc1->error);
+            check("... and the control connection is in step (NOOP, a download)", conn1 && sc1->noop() && sc1->retrieveAll("hello.txt", &gn, 100000) != null);
+            sc1->dispose();
+            scrStop();
+        }
+    }
+
     int t0 = millis();
     while (millis() - t0 < 1500 && srv->sessions > 0) srv->poll(5);
     check("every session was freed", srv->sessions == 0 && srv->net->watchCount() == 0);
