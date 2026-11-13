@@ -1,0 +1,616 @@
+// matrix, stats, optim: problems with a planted solution (the answer is known by construction) and cross checks between independent methods, on random data of realistic sizes:
+// LU, Cholesky, QR and the SVD against known solutions, eigenvalues of Q diag(d) Q^T, sparse against dense, conjugate gradient against LU, regression against the normal equations,
+// PCA of data with a known covariance, k-means on planted clusters, quadrature rules against each other, ODE solvers against closed forms, interpolation methods against each other,
+// FFT against the definition, roots of polynomials built from known roots, minimisers against each other, linear programs against their duals. Every line prints a verdict (1 = the
+// check holds); the tolerances are set about two orders of magnitude above what the methods achieve.
+import cstdio;
+import asys;
+import matrix;
+import stats;
+import optim;
+import rng;
+import dmath;
+
+int seed = 20240229;
+int lcg() {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return seed;
+}
+double rnd() { return ((double) (lcg() % 2000001) - 1000000.0) / 1000000.0; }          // uniform in [-1, 1]
+double rndPos() { return (double) (lcg() % 1000000 + 1) / 1000000.0; }                // in (0, 1]
+
+
+double maxErr(double* a, double* b, int n) {
+    double m = 0.0;
+    for (int i = 0; i < n; i++) { double e = dmath.fabs(a[i] - b[i]); if (e > m || e != e) { m = e; } }
+    return m;
+}
+
+void verdict(char* label, bool ok) { printf("%s: %d\n", label, ok ? 1 : 0); }
+
+matrix.Matrix randomMatrix(int r, int c) {
+    matrix.Matrix m(r, c);
+    for (int i = 0; i < r * c; i++) { m.d[i] = rnd(); }
+    return m;
+}
+
+// an orthogonal matrix: the Q of the QR decomposition of a random matrix
+matrix.Matrix randomOrthogonal(int n) {
+    matrix.Matrix a = randomMatrix(n, n);
+    matrix.QR f(&a);
+    matrix.Matrix q = f.q(false);
+    f.dispose();
+    a.dispose();
+    return q;
+}
+
+double residualNorm(matrix.Matrix* a, double* x, double* b) {
+    double* r = (double*) asys.alloc(a->rows * 8);
+    a->mulVec(x, r);
+    for (int i = 0; i < a->rows; i++) { r[i] -= b[i]; }
+    double v = matrix.vecNormInf(r, a->rows);
+    asys.free((char*) r);
+    return v;
+}
+
+double sphere(double* x, int n, void* c) { double s = 0.0; for (int i = 0; i < n; i++) { s += (x[i] - (double) (i + 1)) * (x[i] - (double) (i + 1)) * (1.0 + (double) i); } return s; }
+double fexpsin(double x, void* c) { return dmath.exp(dmath.sin(x)); }
+double fsmooth(double x, void* c) { return 1.0 / (1.0 + x * x) + dmath.sin(3.0 * x); }
+void osc(double t, double* y, double* dy, int n, void* c) { dy[0] = y[1]; dy[1] = -y[0]; }
+void fsys(double* x, int n, double* out, void* c) { out[0] = x[0] * x[0] + x[1] * x[1] - 5.0; out[1] = x[0] * x[1] - 2.0; }
+
+int main() {
+    int base = asys.memInUse();
+
+    // ---- LU: random systems of growing size, planted integer solution
+    {
+        int sizes[6] = {1, 2, 5, 12, 30, 70};
+        for (int s = 0; s < 6; s++) {
+            int n = sizes[s];
+            matrix.Matrix a = randomMatrix(n, n);
+            for (int i = 0; i < n; i++) { a.d[i * n + i] += 2.0; }                 // keeps the condition number moderate
+            double* x = (double*) asys.alloc(n * 8);
+            double* b = (double*) asys.alloc(n * 8);
+            double* got = (double*) asys.alloc(n * 8);
+            for (int i = 0; i < n; i++) { x[i] = (double) (lcg() % 21 - 10); }
+            a.mulVec(x, b);
+            matrix.LU f(&a);
+            int st = f.solve(b, got);
+            char name[80];
+            sprintf(name, "LU n = %d: planted solution recovered to 1e-9, rcond above 1e-6", n);
+            verdict(name, st == matrix.OK && maxErr(x, got, n) < 1.0e-9 && f.rcond() > 1.0e-6);
+            // the same through the transposed system and the inverse
+            double* bt = (double*) asys.alloc(n * 8);
+            a.mulVecT(x, bt);
+            double* gt = (double*) asys.alloc(n * 8);
+            sprintf(name, "LU n = %d: solveTranspose recovers it too", n);
+            verdict(name, f.solveTranspose(bt, gt) == matrix.OK && maxErr(x, gt, n) < 1.0e-9);
+            if (n <= 30) {
+                matrix.Matrix inv = f.inverse();
+                matrix.Matrix prod = a.mul(&inv);
+                matrix.Matrix id = matrix.identity(n);
+                matrix.Matrix diff = prod.sub(&id);
+                sprintf(name, "LU n = %d: A * inverse(A) = I to 1e-10", n);
+                verdict(name, diff.normMax() < 1.0e-10);
+                inv.dispose(); prod.dispose(); id.dispose(); diff.dispose();
+            }
+            f.dispose();
+            a.dispose();
+            asys.free((char*) x); asys.free((char*) b); asys.free((char*) got); asys.free((char*) bt); asys.free((char*) gt);
+        }
+    }
+
+    // ---- Cholesky against LU, log determinant, solution of a symmetric positive definite system
+    {
+        int n = 36;
+        matrix.Matrix b = randomMatrix(n, n);
+        matrix.Matrix bt = b.transpose();
+        matrix.Matrix a = bt.mul(&b);
+        for (int i = 0; i < n; i++) { a.d[i * n + i] += (double) n; }
+        double* x = (double*) asys.alloc(n * 8);
+        double* rhs = (double*) asys.alloc(n * 8);
+        double* x1 = (double*) asys.alloc(n * 8);
+        double* x2 = (double*) asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) { x[i] = rnd() * 5.0; }
+        a.mulVec(x, rhs);
+        matrix.Cholesky ch(&a);
+        matrix.LU lu(&a);
+        verdict("Cholesky n = 36: factorization ok", ch.ok());
+        verdict("Cholesky: planted solution recovered to 1e-10", ch.solve(rhs, x1) == matrix.OK && maxErr(x, x1, n) < 1.0e-10);
+        verdict("LU and Cholesky agree to 1e-10", lu.solve(rhs, x2) == matrix.OK && maxErr(x1, x2, n) < 1.0e-10);
+        int sg = 0;
+        double ld = lu.logAbsDet(&sg);
+        verdict("log det from Cholesky = log |det| from LU (1e-9), sign +", dmath.fabs(ch.logDet() - ld) < 1.0e-9 && sg == 1);
+        matrix.Matrix l = ch.l.copy();
+        matrix.Matrix lt = l.transpose();
+        matrix.Matrix llt = l.mul(&lt);
+        matrix.Matrix d = llt.sub(&a);
+        verdict("L L^T = A to 1e-10", d.normMax() < 1.0e-10);
+        l.dispose(); lt.dispose(); llt.dispose(); d.dispose();
+        ch.dispose(); lu.dispose(); a.dispose(); b.dispose(); bt.dispose();
+        asys.free((char*) x); asys.free((char*) rhs); asys.free((char*) x1); asys.free((char*) x2);
+    }
+
+    // ---- QR least squares: consistent and inconsistent systems, rank deficient systems
+    {
+        int m = 60;
+        int n = 12;
+        matrix.Matrix a = randomMatrix(m, n);
+        double* x = (double*) asys.alloc(n * 8);
+        double* b = (double*) asys.alloc(m * 8);
+        double* got = (double*) asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) { x[i] = (double) (i - 5); }
+        a.mulVec(x, b);
+        double resid = -1.0;
+        matrix.QR f(&a);
+        verdict("QR 60 x 12, consistent system: planted solution to 1e-10, zero residual", f.solveLS(b, got, &resid) == matrix.OK && maxErr(x, got, n) < 1.0e-10 && resid < 1.0e-11);
+        // inconsistent: add a vector orthogonal to the range of A (made by projecting a random vector)
+        double* noise = (double*) asys.alloc(m * 8);
+        for (int i = 0; i < m; i++) { noise[i] = rnd(); }
+        double* proj = (double*) asys.alloc(m * 8);
+        for (int i = 0; i < m; i++) { proj[i] = noise[i]; }
+        // the residual of the least squares fit of the noise is the part of it that is orthogonal to the range
+        double* coef = (double*) asys.alloc(n * 8);
+        f.solveLS(noise, coef, null);
+        double* fitted = (double*) asys.alloc(m * 8);
+        a.mulVec(coef, fitted);
+        for (int i = 0; i < m; i++) { proj[i] = noise[i] - fitted[i]; }
+        double* b2 = (double*) asys.alloc(m * 8);
+        for (int i = 0; i < m; i++) { b2[i] = b[i] + proj[i]; }
+        double resid2 = -1.0;
+        verdict("QR with an orthogonal component in b: the solution is unchanged (1e-10), the residual norm is that of the component", f.solveLS(b2, got, &resid2) == matrix.OK && maxErr(x, got, n) < 1.0e-10 && dmath.fabs(resid2 - matrix.vecNorm2(proj, m)) < 1.0e-10);
+        // normal equations: A^T (A x - b) = 0 at the least squares solution of a random b
+        double* rb = (double*) asys.alloc(m * 8);
+        for (int i = 0; i < m; i++) { rb[i] = rnd(); }
+        f.solveLS(rb, got, null);
+        double* r = (double*) asys.alloc(m * 8);
+        a.mulVec(got, r);
+        for (int i = 0; i < m; i++) { r[i] -= rb[i]; }
+        double* g = (double*) asys.alloc(n * 8);
+        a.mulVecT(r, g);
+        verdict("least squares solution of a random b satisfies the normal equations A^T r = 0 (1e-12)", matrix.vecNormInf(g, n) < 1.0e-12);
+        // lstsq on a matrix with a duplicated column: the minimum norm solution has equal weights on the twins
+        matrix.Matrix dup = a.copy();
+        for (int i = 0; i < m; i++) { dup.d[i * n + 7] = dup.d[i * n + 3]; }
+        double* xd = (double*) asys.alloc(n * 8);
+        int rk = 0;
+        double res = 0.0;
+        int st = matrix.lstsq(&dup, rb, xd, &res, &rk);
+        verdict("lstsq with a duplicated column: rank 11, equal weights on the twins, same fit as the SVD", st == matrix.OK && rk == n - 1 && dmath.fabs(xd[3] - xd[7]) < 1.0e-12);
+        matrix.SVD sv(&dup);
+        double* xs = (double*) asys.alloc(n * 8);
+        sv.solve(rb, xs, matrix.AUTO);
+        verdict("the SVD minimum norm solution agrees with lstsq (1e-10)", maxErr(xd, xs, n) < 1.0e-10);
+        sv.dispose();
+        dup.dispose();
+        f.dispose();
+        a.dispose();
+        asys.free((char*) x); asys.free((char*) b); asys.free((char*) got); asys.free((char*) noise); asys.free((char*) proj); asys.free((char*) coef);
+        asys.free((char*) fitted); asys.free((char*) b2); asys.free((char*) rb); asys.free((char*) r); asys.free((char*) g); asys.free((char*) xd); asys.free((char*) xs);
+    }
+
+    // ---- eigenvalues of Q diag(d) Q^T and singular values of U diag(s) V^T with the planted values
+    {
+        int n = 22;
+        matrix.Matrix q = randomOrthogonal(n);
+        double d[22];
+        for (int i = 0; i < n; i++) { d[i] = (double) (i * 3 - 20) + 0.5 * (double) (i % 3); }          // distinct values from -20 to 43.5
+        matrix.Matrix dd = matrix.diagonal(d, n);
+        matrix.Matrix qd = q.mul(&dd);
+        matrix.Matrix qt = q.transpose();
+        matrix.Matrix a = qd.mul(&qt);
+        for (int i = 0; i < n; i++) { for (int j = i + 1; j < n; j++) { double v = 0.5 * (a.d[i * n + j] + a.d[j * n + i]); a.d[i * n + j] = v; a.d[j * n + i] = v; } }
+        matrix.SymEigen e(&a, true);
+        double sorted[22];
+        for (int i = 0; i < n; i++) { sorted[i] = d[i]; }
+        for (int i = 0; i < n; i++) { for (int j = i + 1; j < n; j++) { if (sorted[j] < sorted[i]) { double t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t; } } }
+        verdict("SymEigen of Q diag(d) Q^T (n = 22): the planted eigenvalues to 1e-12", e.ok() && maxErr(e.values, sorted, n) < 1.0e-12);
+        verdict("eigenvector residual below 1e-11 and the vectors are orthonormal", e.maxResidual(&a) < 1.0e-11);
+        matrix.Matrix vt = e.vectors.transpose();
+        matrix.Matrix vv = vt.mul(&e.vectors);
+        matrix.Matrix id = matrix.identity(n);
+        matrix.Matrix df = vv.sub(&id);
+        verdict("V^T V = I to 1e-13", df.normMax() < 1.0e-13);
+        vt.dispose(); vv.dispose(); id.dispose(); df.dispose(); e.dispose();
+        a.dispose(); qt.dispose(); qd.dispose(); dd.dispose(); q.dispose();
+
+        int m = 28;
+        int k = 18;
+        matrix.Matrix u0 = randomMatrix(m, k);
+        matrix.QR fu(&u0);
+        matrix.Matrix u = fu.q(false);                                                                   // 28 x 18 with orthonormal columns
+        matrix.Matrix v = randomOrthogonal(k);
+        double s[18];
+        for (int i = 0; i < k; i++) { s[i] = 10.0 * dmath.pow(0.7, (double) i); }                       // 10 down to about 0.03
+        matrix.Matrix sd = matrix.diagonal(s, k);
+        matrix.Matrix us = u.mul(&sd);
+        matrix.Matrix vtr = v.transpose();
+        matrix.Matrix am = us.mul(&vtr);
+        matrix.SVD sv(&am);
+        double rel = 0.0;
+        for (int i = 0; i < k; i++) { double r = dmath.fabs(sv.s[i] - s[i]) / s[i]; if (r > rel) { rel = r; } }
+        verdict("SVD of U diag(s) V^T (28 x 18): singular values to 1e-13 relative", sv.ok() && rel < 1.0e-13);
+        matrix.Matrix rec = sv.reconstruct();
+        matrix.Matrix dr = rec.sub(&am);
+        verdict("U S V^T reproduces the matrix to 1e-13", dr.normMax() < 1.0e-13);
+        verdict("rank 18, 2-norm condition number 10 / (10 * 0.7^17) within 1e-10 relative", sv.rank(matrix.AUTO) == k && dmath.fabs(sv.cond() / (1.0 / dmath.pow(0.7, 17.0)) - 1.0) < 1.0e-10);
+        matrix.Matrix pi = sv.pinv(matrix.AUTO);
+        matrix.Matrix pa = pi.mul(&am);
+        matrix.Matrix i18 = matrix.identity(k);
+        matrix.Matrix dp = pa.sub(&i18);
+        verdict("pinv(A) A = I for a matrix of full column rank (1e-12)", dp.normMax() < 1.0e-12);
+        sv.dispose(); rec.dispose(); dr.dispose(); pi.dispose(); pa.dispose(); i18.dispose(); dp.dispose();
+        am.dispose(); vtr.dispose(); us.dispose(); sd.dispose(); v.dispose(); u.dispose(); fu.dispose(); u0.dispose();
+    }
+
+    // ---- sparse against dense, conjugate gradient against LU
+    {
+        int n = 120;
+        matrix.CooBuilder cb(n, n);
+        matrix.Matrix dense = matrix.zeros(n, n);
+        for (int i = 0; i < n; i++) {
+            double rowSum = 0.0;
+            for (int t = 0; t < 4; t++) {
+                int j = lcg() % n;
+                if (j == i) { continue; }
+                double v = rnd();
+                // symmetric positive definite: add the entry and its mirror, then make the diagonal dominant
+                cb.add(i, j, v); cb.add(j, i, v);
+                dense.d[i * n + j] += v; dense.d[j * n + i] += v;
+            }
+        }
+        for (int i = 0; i < n; i++) {
+            double rowSum = 0.0;
+            for (int j = 0; j < n; j++) { if (j != i) { rowSum += dmath.fabs(dense.d[i * n + j]); } }
+            cb.add(i, i, rowSum + 1.0);
+            dense.d[i * n + i] += rowSum + 1.0;
+        }
+        matrix.CsrMatrix sp = cb.build();
+        double* x = (double*) asys.alloc(n * 8);
+        double* y1 = (double*) asys.alloc(n * 8);
+        double* y2 = (double*) asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) { x[i] = rnd(); }
+        sp.mulVec(x, y1);
+        dense.mulVec(x, y2);
+        verdict("CSR mulVec = dense mulVec (1e-12)", maxErr(y1, y2, n) < 1.0e-12);
+        sp.mulVecT(x, y1);
+        dense.mulVecT(x, y2);
+        verdict("CSR mulVecT = dense mulVecT (1e-12)", maxErr(y1, y2, n) < 1.0e-12);
+        matrix.CsrMatrix sq = sp.mul(&sp);
+        matrix.Matrix dsq = dense.mul(&dense);
+        matrix.Matrix sqd = sq.toDense();
+        matrix.Matrix dd = sqd.sub(&dsq);
+        verdict("CSR * CSR = dense * dense (1e-11)", dd.normMax() < 1.0e-11);
+        matrix.CsrMatrix tr = sp.transpose();
+        matrix.Matrix trd = tr.toDense();
+        matrix.Matrix dt = trd.sub(&dense);
+        verdict("the matrix is symmetric: transpose = itself", dt.normMax() == 0.0);
+        double* b = (double*) asys.alloc(n * 8);
+        double* xc = (double*) asys.alloc(n * 8);
+        double* xl = (double*) asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) { b[i] = rnd(); xc[i] = 0.0; }
+        int iters = 0;
+        int cst = matrix.cg(&sp, b, xc, 500, 1.0e-12, &iters, true);
+        matrix.LU f(&dense);
+        f.solve(b, xl);
+        verdict("cg converges within 120 iterations (the matrix is diagonally dominant) and agrees with LU to 1e-9", cst == matrix.OK && iters <= 120 && maxErr(xc, xl, n) < 1.0e-9);
+        for (int i = 0; i < n; i++) { xc[i] = 0.0; }
+        int cst2 = matrix.cg(&sp, b, xc, 500, 1.0e-12, &iters, false);
+        verdict("cg without the preconditioner reaches the same solution (1e-9)", cst2 == matrix.OK && maxErr(xc, xl, n) < 1.0e-9);
+        f.dispose(); sp.dispose(); sq.dispose(); tr.dispose(); cb.dispose(); dense.dispose(); dsq.dispose(); sqd.dispose(); dd.dispose(); trd.dispose(); dt.dispose();
+        asys.free((char*) x); asys.free((char*) y1); asys.free((char*) y2); asys.free((char*) b); asys.free((char*) xc); asys.free((char*) xl);
+    }
+
+    // ---- stats: regression against the normal equations and against planted coefficients, PCA of data with a known covariance
+    {
+        int n = 120;
+        int p = 4;
+        matrix.Matrix X = randomMatrix(n, p);
+        double beta[5] = {2.0, -1.5, 0.25, 4.0, -3.0};                // intercept and four slopes
+        double* y = (double*) asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) {
+            double v = beta[0];
+            for (int j = 0; j < p; j++) { v += beta[j + 1] * X.d[i * p + j]; }
+            y[i] = v;
+        }
+        stats.Regression r = stats.olsFit(&X, y, true, null);
+        double maxd = 0.0;
+        for (int j = 0; j < 5; j++) { double e = dmath.fabs(r.coef[j] - beta[j]); if (e > maxd) { maxd = e; } }
+        verdict("olsFit of noise free data: planted coefficients to 1e-11, R^2 = 1, residuals 0", r.ok() && maxd < 1.0e-11 && dmath.fabs(r.r2 - 1.0) < 1.0e-12 && matrix.vecNormInf(r.residuals, n) < 1.0e-11);
+        r.dispose();
+        // with noise: the coefficients are the solution of the normal equations (solved by Cholesky of X^T X)
+        double* yn = (double*) asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) { yn[i] = y[i] + 0.3 * rnd(); }
+        stats.Regression rn = stats.olsFit(&X, yn, true, null);
+        matrix.Matrix xa(n, p + 1);
+        for (int i = 0; i < n; i++) { xa.d[i * (p + 1)] = 1.0; for (int j = 0; j < p; j++) { xa.d[i * (p + 1) + j + 1] = X.d[i * p + j]; } }
+        matrix.Matrix xt = xa.transpose();
+        matrix.Matrix xtx = xt.mul(&xa);
+        double* xty = (double*) asys.alloc((p + 1) * 8);
+        xt.mulVec(yn, xty);
+        double* bn = (double*) asys.alloc((p + 1) * 8);
+        matrix.Cholesky ch(&xtx);
+        ch.solve(xty, bn);
+        verdict("olsFit with noise = the solution of the normal equations (1e-10)", rn.ok() && ch.ok() && maxErr(rn.coef, bn, p + 1) < 1.0e-10);
+        double sse = 0.0;
+        for (int i = 0; i < n; i++) { sse += rn.residuals[i] * rn.residuals[i]; }
+        verdict("sse = sum of squared residuals, sigma = sqrt(sse / (n - p - 1)), 0 < R^2 < 1", dmath.fabs(sse - rn.sse) < 1.0e-10 && dmath.fabs(rn.sigma - dmath.sqrt(sse / (double) (n - p - 1))) < 1.0e-12 && rn.r2 > 0.0 && rn.r2 < 1.0);
+        verdict("the four planted slopes are significant (p < 1e-4), the F test too", rn.pvalue[1] < 1.0e-4 && rn.pvalue[2] < 1.0e-4 && rn.pvalue[3] < 1.0e-4 && rn.pvalue[4] < 1.0e-4 && rn.fpvalue < 1.0e-10);
+        ch.dispose(); rn.dispose(); xa.dispose(); xt.dispose(); xtx.dispose();
+        asys.free((char*) yn); asys.free((char*) xty); asys.free((char*) bn);
+
+        // polynomial fit: stats.polyFit and optim.polyFit both recover a planted polynomial from exact data
+        double px[40];
+        double py[40];
+        double pc[6] = {1.0, -2.0, 0.5, 0.25, -0.125, 0.0625};
+        for (int i = 0; i < 40; i++) { px[i] = -2.0 + 4.0 * (double) i / 39.0; py[i] = stats.polyEval(pc, 5, px[i]); }
+        stats.Regression pr = stats.polyFit(px, py, 40, 5);
+        double oc[6];
+        int ost = optim.polyFit(px, py, 40, 5, oc);
+        verdict("polyFit (stats) and polyFit (optim) recover the planted quintic to 1e-10", pr.ok() && ost == optim.OK && maxErr(pr.coef, pc, 6) < 1.0e-10 && maxErr(oc, pc, 6) < 1.0e-10);
+        pr.dispose();
+        asys.free((char*) y);
+        X.dispose();
+
+        // PCA: columns of Z are exactly centered and orthonormal (QR of a random matrix), scaled to sample variance 1; X = Z L^T with L = Q diag(sqrt(d)) has the covariance Q diag(d) Q^T
+        int nn = 80;
+        int dim = 4;
+        matrix.Matrix z0 = randomMatrix(nn, dim);
+        for (int j = 0; j < dim; j++) {
+            double mean = 0.0;
+            for (int i = 0; i < nn; i++) { mean += z0.d[i * dim + j]; }
+            mean /= (double) nn;
+            for (int i = 0; i < nn; i++) { z0.d[i * dim + j] -= mean; }
+        }
+        matrix.QR fz(&z0);
+        matrix.Matrix z = fz.q(false);                                  // nn x dim, orthonormal columns; still centered? (the span of centered columns contains no constants)
+        for (int i = 0; i < nn * dim; i++) { z.d[i] *= dmath.sqrt((double) (nn - 1)); }
+        matrix.Matrix qo = randomOrthogonal(dim);
+        double dv[4] = {9.0, 4.0, 1.0, 0.25};
+        matrix.Matrix lt = matrix.zeros(dim, dim);
+        for (int i = 0; i < dim; i++) { for (int j = 0; j < dim; j++) { lt.d[j * dim + i] = qo.d[i * dim + j] * dmath.sqrt(dv[j]); } }   // L^T where L(i, j) = Q(i, j) sqrt(d_j)
+        matrix.Matrix xdata = z.mul(&lt);
+        stats.Pca pca(&xdata, 0, false);
+        verdict("Pca of data with the planted covariance: variances 9, 4, 1, 0.25 to 1e-10", pca.ok() && dmath.fabs(pca.variance[0] - 9.0) < 1.0e-10 && dmath.fabs(pca.variance[1] - 4.0) < 1.0e-10 && dmath.fabs(pca.variance[2] - 1.0) < 1.0e-10 && dmath.fabs(pca.variance[3] - 0.25) < 1.0e-10);
+        bool axes = true;
+        for (int c = 0; c < dim; c++) {
+            double dot = 0.0;
+            for (int j = 0; j < dim; j++) { dot += pca.components.d[c * dim + j] * qo.d[j * dim + c]; }
+            if (dmath.fabs(dmath.fabs(dot) - 1.0) > 1.0e-10) { axes = false; }
+        }
+        verdict("the principal axes are the columns of Q (up to sign, 1e-10)", axes);
+        verdict("the ratios add up to 1", dmath.fabs(pca.ratio[0] + pca.ratio[1] + pca.ratio[2] + pca.ratio[3] - 1.0) < 1.0e-12);
+        matrix.Matrix scores = pca.transform(&xdata);
+        matrix.Matrix back = pca.inverseTransform(&scores);
+        matrix.Matrix dback = back.sub(&xdata);
+        verdict("inverseTransform(transform(X)) = X when all components are kept (1e-12)", dback.normMax() < 1.0e-12);
+        pca.dispose(); scores.dispose(); back.dispose(); dback.dispose(); xdata.dispose(); lt.dispose(); qo.dispose(); z.dispose(); fz.dispose(); z0.dispose();
+    }
+
+    // ---- stats: summary statistics against each other, ranks and invariances, k-means on planted clusters
+    {
+        int n = 800;
+        double* x = (double*) asys.alloc(n * 8);
+        double* y = (double*) asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) { x[i] = 1.0e6 + rnd() * 3.0; y[i] = 0.8 * rnd(); }
+        stats.Welford w;
+        w.addAll(x, n);
+        verdict("Welford = two pass mean and variance for data with a huge offset (relative 1e-13)", dmath.fabs(w.mean() / stats.mean(x, n) - 1.0) < 1.0e-13 && dmath.fabs(w.variance(1) / stats.variance(x, n, 1) - 1.0) < 1.0e-9);
+        stats.Welford w1;
+        stats.Welford w2;
+        w1.addAll(x, 300);
+        w2.addAll(&x[300], 500);
+        w1.merge(&w2);
+        verdict("Welford.merge of two parts = the whole (variance to 1e-9 relative, mean 1e-13)", dmath.fabs(w1.variance(1) / w.variance(1) - 1.0) < 1.0e-9 && dmath.fabs(w1.mean() / w.mean() - 1.0) < 1.0e-13 && w1.count == n);
+        double* xe = (double*) asys.alloc(200 * 8);
+        for (int i = 0; i < 200; i++) { xe[i] = dmath.exp(0.5 * rnd()); }
+        double* xl = (double*) asys.alloc(200 * 8);
+        for (int i = 0; i < 200; i++) { xl[i] = dmath.log(xe[i]); }
+        verdict("spearman(exp(u), y) = spearman(u, y) and kendall too (exactly)", stats.spearman(xe, y, 200) == stats.spearman(xl, y, 200) && stats.kendall(xe, y, 200) == stats.kendall(xl, y, 200));
+        double q[3] = {0.1, 0.5, 0.9};
+        double qs[3];
+        stats.quantiles(x, n, q, 3, qs, 7);
+        verdict("quantiles(...) = quantile(...) for each probability, median = quantile(0.5)", qs[0] == stats.quantile(x, n, 0.1, 7) && qs[1] == stats.median(x, n) && qs[2] == stats.quantile(x, n, 0.9, 7));
+        // the sorted array has the quantiles at exact positions
+        double* sorted = (double*) asys.alloc(n * 8);
+        for (int i = 0; i < n; i++) { sorted[i] = x[i]; }
+        stats.sortDoubles(sorted, n);
+        bool inc = true;
+        for (int i = 1; i < n; i++) { if (sorted[i] < sorted[i - 1]) { inc = false; } }
+        verdict("sortDoubles sorts 800 numbers", inc && sorted[0] == stats.minimum(x, n) && sorted[n - 1] == stats.maximum(x, n));
+        // k-means: three blobs of 40 points around well separated centers
+        double centers[6] = {0.0, 0.0, 10.0, 0.0, 5.0, 9.0};
+        double pts[240];
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < 40; i++) {
+                pts[(c * 40 + i) * 2] = centers[c * 2] + 0.8 * rnd();
+                pts[(c * 40 + i) * 2 + 1] = centers[c * 2 + 1] + 0.8 * rnd();
+            }
+        }
+        rng.Xoshiro256 g(7);
+        stats.KMeans km = stats.kmeans(pts, 120, 2, 3, &g, 100, 5);
+        bool pure = km.ok();
+        for (int c = 0; c < 3 && pure; c++) {
+            for (int i = 1; i < 40; i++) { if (km.labels[c * 40 + i] != km.labels[c * 40]) { pure = false; } }
+        }
+        verdict("kmeans finds the three planted clusters (every blob has one label, three different labels)", pure && km.labels[0] != km.labels[40] && km.labels[0] != km.labels[80] && km.labels[40] != km.labels[80]);
+        double ctr = 0.0;
+        for (int c = 0; c < 3; c++) {
+            int lab = km.labels[c * 40];
+            ctr += dmath.fabs(km.centers[lab * 2] - centers[c * 2]) + dmath.fabs(km.centers[lab * 2 + 1] - centers[c * 2 + 1]);
+        }
+        verdict("the centers are within 0.4 of the planted ones", ctr < 3.0 * 0.8);
+        verdict("predict(point) agrees with the labels", km.predict(&pts[0]) == km.labels[0] && km.predict(&pts[200]) == km.labels[100]);
+        km.dispose();
+        asys.free((char*) x); asys.free((char*) y); asys.free((char*) xe); asys.free((char*) xl); asys.free((char*) sorted);
+    }
+
+    // ---- optim: quadrature rules, ODEs, interpolation
+    {
+        optim.Integral a = optim.gaussKronrod(fexpsin, null, 0.0, 2.0, 1.0e-13, 1.0e-13, 200);
+        optim.Integral b = optim.romberg(fexpsin, null, 0.0, 2.0, 1.0e-13, 20);
+        optim.Integral c = optim.integrateGL(fexpsin, null, 0.0, 2.0, 24);
+        optim.Integral s = optim.simpson(fexpsin, null, 0.0, 2.0, 2000);
+        verdict("exp(sin x) on [0, 2]: Gauss-Kronrod = Romberg = Gauss-Legendre(24) to 1e-12, Simpson(2000) to 1e-11", a.status == optim.OK && dmath.fabs(a.value - b.value) < 1.0e-12 && dmath.fabs(a.value - c.value) < 1.0e-12 && dmath.fabs(a.value - s.value) < 1.0e-11);
+        optim.Integral i1 = optim.gaussKronrod(fsmooth, null, -3.0, 5.0, 1.0e-12, 1.0e-12, 200);
+        optim.Integral i2 = optim.romberg(fsmooth, null, -3.0, 5.0, 1.0e-12, 22);
+        double exact = dmath.atan(5.0) + dmath.atan(3.0) - (dmath.cos(15.0) - dmath.cos(-9.0)) / 3.0;            // integral of 1 / (1 + x^2) + sin(3 x)
+        verdict("1 / (1 + x^2) + sin 3x on [-3, 5]: both rules reach the closed form to 1e-11", dmath.fabs(i1.value - exact) < 1.0e-11 && dmath.fabs(i2.value - exact) < 1.0e-11);
+        // a sampled version: the trapezoid and Simpson rules on 2001 samples
+        double xs[2001];
+        double ys[2001];
+        for (int i = 0; i <= 2000; i++) { xs[i] = -3.0 + 8.0 * (double) i / 2000.0; ys[i] = fsmooth(xs[i], null); }
+        verdict("integrateSamples and simpsonSamples on 2001 samples (1e-5 and 1e-9)", dmath.fabs(optim.integrateSamples(xs, ys, 2001) - exact) < 1.0e-5 && dmath.fabs(optim.simpsonSamples(ys, 2001, 8.0 / 2000.0) - exact) < 1.0e-9);
+        // harmonic oscillator: y(t) = (cos t, -sin t)
+        double y0[2] = {1.0, 0.0};
+        double yo[2];
+        optim.Rk45 rk(osc, null, 2, 0.0, y0, 1.0e-11, 1.0e-13, 0.0);
+        rk.solveTo(20.0, 100000);
+        verdict("Rk45 on the oscillator up to t = 20: |error| < 1e-8", rk.ok() && dmath.fabs(rk.y[0] - dmath.cos(20.0)) < 1.0e-8 && dmath.fabs(rk.y[1] + dmath.sin(20.0)) < 1.0e-8);
+        rk.dispose();
+        optim.rk4(osc, null, 2, 0.0, y0, 6.0, 120, yo, null);
+        double e1 = dmath.fabs(yo[0] - dmath.cos(6.0));
+        optim.rk4(osc, null, 2, 0.0, y0, 6.0, 240, yo, null);
+        double e2 = dmath.fabs(yo[0] - dmath.cos(6.0));
+        verdict("rk4 is of order 4: halving the step divides the error by about 16 (between 12 and 20)", e1 / e2 > 12.0 && e1 / e2 < 20.0);
+        // interpolation: a spline, the barycentric Lagrange polynomial on Chebyshev nodes and a Chebyshev series agree with the function
+        double nodes[16];
+        double vals[16];
+        optim.chebyshevNodes(16, -1.0, 2.0, nodes);
+        for (int i = 0; i < 16; i++) { vals[i] = dmath.exp(nodes[i] * 0.7) * dmath.cos(nodes[i]); }
+        optim.Barycentric bc(nodes, vals, 16);
+        double sx[41];
+        double sy[41];
+        for (int i = 0; i < 41; i++) { sx[i] = -1.0 + 3.0 * (double) i / 40.0; sy[i] = dmath.exp(sx[i] * 0.7) * dmath.cos(sx[i]); }
+        optim.Spline sp(sx, sy, 41, optim.SPLINE_NATURAL, 0.0, 0.0);
+        double worstB = 0.0;
+        double worstS = 0.0;
+        for (int i = 0; i < 300; i++) {
+            double t = -0.95 + 2.9 * (double) i / 299.0;
+            double f = dmath.exp(t * 0.7) * dmath.cos(t);
+            double eb = dmath.fabs(bc.value(t) - f);
+            double es = dmath.fabs(sp.value(t) - f);
+            if (eb > worstB) { worstB = eb; }
+            if (es > worstS && t > -0.8 && t < 1.8) { worstS = es; }
+        }
+        verdict("Lagrange interpolation on 16 Chebyshev nodes reproduces exp(0.7 t) cos t to 1e-10 on [-1, 2]", worstB < 1.0e-10);
+        verdict("a natural cubic spline with 41 knots does so to 1e-4 in the interior", worstS < 1.0e-4);
+        bc.dispose();
+        sp.dispose();
+    }
+
+    // ---- FFT against the definition and against the other algorithm, polynomial roots, systems of equations, minimisers
+    {
+        int lens[6] = {16, 12, 17, 30, 64, 97};
+        for (int li = 0; li < 6; li++) {
+            int n = lens[li];
+            double* re = (double*) asys.alloc(n * 8);
+            double* im = (double*) asys.alloc(n * 8);
+            double* wr = (double*) asys.alloc(n * 8);
+            double* wi = (double*) asys.alloc(n * 8);
+            for (int i = 0; i < n; i++) { re[i] = rnd(); im[i] = rnd(); wr[i] = re[i]; wi[i] = im[i]; }
+            optim.fft(re, im, n, false);
+            double worst = 0.0;
+            double* tc = (double*) asys.alloc(n * 8);                            // cos and sin of -2 pi k / n from dmath (not from optim), computed once
+            double* ts = (double*) asys.alloc(n * 8);
+            for (int k = 0; k < n; k++) { double ang = -2.0 * dmath.PI * (double) k / (double) n; tc[k] = dmath.cos(ang); ts[k] = dmath.sin(ang); }
+            for (int k = 0; k < n; k++) {
+                double sr = 0.0;
+                double si = 0.0;
+                for (int j = 0; j < n; j++) {
+                    double cc = tc[(j * k) % n];
+                    double ss = ts[(j * k) % n];
+                    sr += wr[j] * cc - wi[j] * ss;
+                    si += wr[j] * ss + wi[j] * cc;
+                }
+                double e = dmath.fabs(sr - re[k]) + dmath.fabs(si - im[k]);
+                if (e > worst) { worst = e; }
+            }
+            char name[80];
+            sprintf(name, "fft of %d random complex numbers = the O(n^2) definition to 1e-11", n);
+            verdict(name, worst < 1.0e-11);
+            optim.fft(re, im, n, true);
+            sprintf(name, "ifft(fft(x)) = x for n = %d (1e-13)", n);
+            verdict(name, maxErr(re, wr, n) < 1.0e-13 && maxErr(im, wi, n) < 1.0e-13);
+            asys.free((char*) re); asys.free((char*) im); asys.free((char*) wr); asys.free((char*) wi); asys.free((char*) tc); asys.free((char*) ts);
+        }
+        // Bluestein against radix 2: the transform of x padded with zeros to 128 is NOT the transform of length 100, but a signal that repeats with period 100 only makes sense for 100: use the circular
+        // convolution theorem instead: conv via fft of length 100 (Bluestein) equals the direct circular sum
+        int n = 100;
+        double ca[100];
+        double cb[100];
+        for (int i = 0; i < n; i++) { ca[i] = rnd(); cb[i] = rnd(); }
+        double ra[100]; double ia[100]; double rb[100]; double ib[100];
+        for (int i = 0; i < n; i++) { ra[i] = ca[i]; ia[i] = 0.0; rb[i] = cb[i]; ib[i] = 0.0; }
+        optim.fft(ra, ia, n, false);
+        optim.fft(rb, ib, n, false);
+        for (int i = 0; i < n; i++) { double r = ra[i] * rb[i] - ia[i] * ib[i]; double m = ra[i] * ib[i] + ia[i] * rb[i]; ra[i] = r; ia[i] = m; }
+        optim.fft(ra, ia, n, true);
+        double worstc = 0.0;
+        for (int k = 0; k < n; k++) {
+            double sum = 0.0;
+            for (int j = 0; j < n; j++) { sum += ca[j] * cb[(k - j + n) % n]; }
+            if (dmath.fabs(sum - ra[k]) > worstc) { worstc = dmath.fabs(sum - ra[k]); }
+        }
+        verdict("the circular convolution theorem holds for n = 100 (Bluestein): 1e-12", worstc < 1.0e-12);
+
+        // roots of a polynomial built from known roots
+        double roots[8] = {-3.0, -1.5, -0.25, 0.5, 1.0, 2.0, 2.75, 4.0};
+        double coef[9];
+        optim.polyFromRoots(roots, 8, coef);
+        double re[8];
+        double im[8];
+        int cnt = optim.polyRoots(coef, 8, re, im);
+        double worstr = 0.0;
+        for (int i = 0; i < 8; i++) { if (dmath.fabs(re[i] - roots[i]) > worstr) { worstr = dmath.fabs(re[i] - roots[i]); } if (dmath.fabs(im[i]) > worstr) { worstr = dmath.fabs(im[i]); } }
+        verdict("polyRoots recovers the eight roots of a degree 8 polynomial built from them to 1e-9 (sorted)", cnt == 8 && worstr < 1.0e-9);
+        // newtonSystem: x^2 + y^2 = 5, x y = 2 has the solutions (1, 2), (2, 1), (-1, -2), (-2, -1)
+        double sol[2] = {0.9, 2.2};
+        optim.Result ns = optim.newtonSystem(fsys, null, sol, 2, 1.0e-12, 50);
+        verdict("newtonSystem from (0.9, 2.2) finds (1, 2) to 1e-8", ns.status == optim.OK && dmath.fabs(sol[0] - 1.0) < 1.0e-8 && dmath.fabs(sol[1] - 2.0) < 1.0e-8);
+        // three minimisers on a convex quadratic with minimum (1, 2, 3, 4)
+        double m1[4] = {0.0, 0.0, 0.0, 0.0};
+        double m2[4] = {0.0, 0.0, 0.0, 0.0};
+        double m3[4] = {0.0, 0.0, 0.0, 0.0};
+        optim.Result r1 = optim.nelderMead(sphere, null, m1, 4, 1.0, 1.0e-12, 20000);
+        optim.Result r2 = optim.bfgs(sphere, null, null, m2, 4, 1.0e-8, 200);
+        optim.Result r3 = optim.gradientDescent(sphere, null, null, m3, 4, 0.1, 1.0e-7, 20000);
+        double want[4] = {1.0, 2.0, 3.0, 4.0};
+        verdict("nelderMead, bfgs (numerical gradient) and gradientDescent all find the minimum (1, 2, 3, 4)", maxErr(m1, want, 4) < 1.0e-4 && maxErr(m2, want, 4) < 1.0e-5 && maxErr(m3, want, 4) < 1.0e-4);
+    }
+
+    // ---- linear programs against their duals: max c.x s.t. A x <= b, x >= 0 and min b.y s.t. A^T y >= c, y >= 0 have the same optimum (strong duality)
+    {
+        int ok = 0;
+        int total = 0;
+        for (int trial = 0; trial < 12; trial++) {
+            int n = 3 + trial % 4;
+            int m = 4 + trial % 3;
+            double* c = (double*) asys.alloc(n * 8);
+            double* A = (double*) asys.alloc(m * n * 8);
+            double* b = (double*) asys.alloc(m * 8);
+            double* x = (double*) asys.alloc(n * 8);
+            for (int j = 0; j < n; j++) { c[j] = rndPos() * 5.0; }
+            for (int i = 0; i < m; i++) { b[i] = 1.0 + rndPos() * 9.0; for (int j = 0; j < n; j++) { A[i * n + j] = rndPos() * 3.0 + 0.1; } }
+            int* kinds = (int*) asys.alloc(m * 8);
+            for (int i = 0; i < m; i++) { kinds[i] = optim.LE; }
+            double primal = 0.0;
+            int s1 = optim.linprog(c, n, A, m, b, kinds, true, x, &primal, null);
+            // dual: variables y (m), constraints A^T y >= c (n rows), minimise b.y
+            double* At = (double*) asys.alloc(n * m * 8);
+            for (int i = 0; i < m; i++) { for (int j = 0; j < n; j++) { At[j * m + i] = A[i * n + j]; } }
+            int* dk = (int*) asys.alloc(n * 8);
+            for (int j = 0; j < n; j++) { dk[j] = optim.GE; }
+            double* y = (double*) asys.alloc(m * 8);
+            double dual = 0.0;
+            int s2 = optim.linprog(b, m, At, n, c, dk, false, y, &dual, null);
+            total++;
+            if (s1 == optim.OK && s2 == optim.OK && dmath.fabs(primal - dual) < 1.0e-7 * (1.0 + dmath.fabs(primal))) { ok++; }
+            asys.free((char*) c); asys.free((char*) A); asys.free((char*) b); asys.free((char*) x); asys.free((char*) kinds); asys.free((char*) At); asys.free((char*) dk); asys.free((char*) y);
+        }
+        printf("linear programs: %d of %d random primal / dual pairs have equal optima (1e-7)\n", ok, total);
+    }
+
+    printf("memory leaked: %d\n", asys.memInUse() - base);
+    return 0;
+}

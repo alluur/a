@@ -1,0 +1,324 @@
+// matrix, stats, optim: memory behaviour. (1) Every class gives back all its memory on dispose() (asys.memInUse() and memBlocks() return to their starting values) after typical work
+// and after failures. (2) The big blocks (above 128 KiB) are REUSED: the tests run with asys.setKeepBigBlocks(1), which makes the allocator behave as it does on AOS and Windows
+// (freed big blocks stay in the free lists and are never unmapped; on AOS a mapping is never reused for another size and a process may hold only about 25 of them), and every workload
+// is repeated: after a warm-up round the number of bytes mapped from the system (asys.memMapped()) must not grow in the later rounds. A library that kept a new big block per call
+// (a leak, or a block size that depends on the call count) would exhaust the address space of an AOS process. (3) The in place operations allocate nothing at all.
+import cstdio;
+import asys;
+import matrix;
+import stats;
+import optim;
+import rng;
+import dmath;
+
+int seed = 777;
+int lcg() {
+    seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF;
+    return seed;
+}
+double rnd() { return ((double) (lcg() % 2000001) - 1000000.0) / 1000000.0; }
+
+double* randomArray(int n) {
+    double* a = (double*) asys.alloc(n * 8);
+    for (int i = 0; i < n; i++) { a[i] = rnd(); }
+    return a;
+}
+
+double sink = 0.0;
+
+// ---- the workloads: each does a typical job with blocks above 128 KiB and gives everything back
+void workLu() {
+    int n = 100;                                         // 100 x 100 doubles = 80 KB
+    matrix.Matrix a(n, n);
+    for (int i = 0; i < n * n; i++) { a.d[i] = rnd(); }
+    for (int i = 0; i < n; i++) { a.d[i * n + i] += 4.0; }
+    double* b = randomArray(n);
+    double* x = randomArray(n);
+    matrix.LU f(&a);
+    f.solve(b, x);
+    sink += f.det() + f.rcond() + x[0];
+    f.dispose();
+    matrix.Matrix c = a.copy();
+    sink += c.normFro();
+    c.dispose();
+    asys.free((char*) b);
+    asys.free((char*) x);
+    a.dispose();
+}
+
+void workMatrixProducts() {
+    int m = 3000;                                        // 3000 x 6 = 144 KB
+    matrix.Matrix a(m, 6);
+    for (int i = 0; i < m * 6; i++) { a.d[i] = rnd(); }
+    matrix.Matrix at = a.transpose();
+    matrix.Matrix g = at.mul(&a);                        // the 6 x 6 Gram matrix
+    matrix.Matrix big = a.mul(&g);                       // 3000 x 6 again
+    matrix.Matrix s = big.add(&a);
+    sink += s.normFro() + g.trace();
+    matrix.Cholesky ch(&g);
+    sink += ch.logDet();
+    ch.dispose();
+    s.dispose();
+    big.dispose();
+    g.dispose();
+    at.dispose();
+    a.dispose();
+}
+
+void workQrSvd() {
+    int m = 1000;                                        // 1000 x 4 = 32 KB
+    matrix.Matrix a(m, 4);
+    for (int i = 0; i < m * 4; i++) { a.d[i] = rnd(); }
+    double* b = randomArray(m);
+    double x[4];
+    double resid = 0.0;
+    matrix.lstsq(&a, b, x, &resid, null);
+    matrix.QR f(&a);
+    matrix.Matrix q = f.q(false);
+    sink += q.normFro() + resid;
+    q.dispose();
+    f.dispose();
+    matrix.SVD sv(&a);
+    sink += sv.s[0];
+    sv.dispose();
+    asys.free((char*) b);
+    a.dispose();
+}
+
+void workSparse() {
+    int n = 4000;                                        // a tridiagonal matrix: 12000 entries, 96 KB of values
+    matrix.CooBuilder cb(n, n);
+    for (int i = 0; i < n; i++) {
+        cb.add(i, i, 4.0);
+        if (i > 0) { cb.add(i, i - 1, -1.0); }
+        if (i + 1 < n) { cb.add(i, i + 1, -1.0); }
+    }
+    matrix.CsrMatrix a = cb.build();
+    cb.dispose();
+    double* x = randomArray(n);
+    double* y = randomArray(n);
+    a.mulVec(x, y);
+    double* sol = (double*) asys.alloc(n * 8);
+    int iters = 0;
+    matrix.cg(&a, y, sol, 8, 1.0e-3, &iters, true);
+    sink += sol[0] + (double) iters;
+    matrix.CsrMatrix t = a.transpose();
+    matrix.CsrMatrix s = a.addScaled(1.0, &t);
+    sink += (double) s.nnz;
+    s.dispose();
+    t.dispose();
+    a.dispose();
+    asys.free((char*) x);
+    asys.free((char*) y);
+    asys.free((char*) sol);
+}
+
+void workStats() {
+    int n = 3000;                                        // 24 KB
+    double* x = randomArray(n);
+    double* y = randomArray(n);
+    double* o = (double*) asys.alloc(n * 8);
+    sink += stats.median(x, n) + stats.mad(x, n) + stats.iqr(x, n, 7) + stats.mode(x, n);
+    sink += stats.quantile(x, n, 0.9, 7);
+    double ps[3] = {0.1, 0.5, 0.9};
+    double qs[3];
+    stats.quantiles(x, n, ps, 3, qs, 7);
+    stats.ranks(x, n, o);
+    sink += stats.spearman(x, y, n);
+    stats.Histogram h = stats.histogramAuto(x, n, stats.FD, 0);
+    sink += (double) h.count(0);
+    h.dispose();
+    sink += stats.kendall(x, y, 300);
+    stats.Welford w;
+    w.addAll(x, n);
+    sink += w.variance(1);
+    stats.movingAverage(x, n, 50, o);
+    stats.zscores(x, n, o, 1);
+    asys.free((char*) x);
+    asys.free((char*) y);
+    asys.free((char*) o);
+}
+
+void workRegressionPca() {
+    int n = 1000;                                        // 1000 x 4 = 32 KB
+    matrix.Matrix X(n, 4);
+    for (int i = 0; i < n * 4; i++) { X.d[i] = rnd(); }
+    double* y = randomArray(n);
+    stats.Regression r = stats.olsFit(&X, y, true, null);
+    sink += r.r2;
+    r.dispose();
+    stats.Pca p(&X, 2, false);
+    matrix.Matrix sc = p.transform(&X);
+    sink += sc.normFro() + p.variance[0];
+    sc.dispose();
+    p.dispose();
+    matrix.Matrix cov = stats.covarianceMatrix(&X, 1);
+    sink += cov.trace();
+    cov.dispose();
+    asys.free((char*) y);
+    X.dispose();
+}
+
+void workKmeans() {
+    int n = 3000;                                        // 3000 points
+    double* pts = randomArray(n * 2);
+    rng.Xoshiro256 g(5);
+    stats.KMeans km = stats.kmeans(pts, n, 2, 3, &g, 6, 1);
+    sink += km.inertia;
+    km.dispose();
+    asys.free((char*) pts);
+}
+
+void workFft() {
+    int n = 2048;                                        // the arrays are 16 KB each
+    double* re = randomArray(n);
+    double* im = randomArray(n);
+    optim.FftPlan plan(n);
+    plan.forward(re, im);
+    plan.inverse(re, im);
+    sink += re[0] + im[1];
+    plan.dispose();
+    asys.free((char*) re);
+    asys.free((char*) im);
+}
+
+void workHistogramPoly() {
+    stats.Histogram h(40000, 0.0, 1.0);                 // 320 KB of counters
+    for (int i = 0; i < 1000; i++) { h.add(0.5 + 0.0001 * (double) (i % 7)); }
+    sink += (double) h.modeBin();
+    h.dispose();
+    int n = 3000;                                        // a least squares polynomial through 3000 points
+    double* x = randomArray(n);
+    double* y = randomArray(n);
+    double c[4];
+    optim.polyFit(x, y, n, 3, c);
+    sink += c[0];
+    stats.Regression r = stats.polyFit(x, y, n, 2);
+    sink += r.coef[0];
+    r.dispose();
+    asys.free((char*) x);
+    asys.free((char*) y);
+}
+
+// the only workload with blocks above 512 KB (the limit of the chunk allocator in the AOS mode of asys): O(size) operations on a 100 x 800 matrix (640 KB)
+void workBigBlocks() {
+    matrix.Matrix a(100, 800);
+    for (int i = 0; i < 80000; i++) { a.d[i] = rnd(); }
+    matrix.Matrix b = a.transpose();
+    matrix.Matrix c = a.scaled(2.0);
+    matrix.Matrix e = c.sub(&a);
+    double* x = randomArray(800);
+    double* y = randomArray(100);
+    a.mulVec(x, y);
+    sink += b.normFro() + e.trace() + y[0];
+    asys.free((char*) x);
+    asys.free((char*) y);
+    e.dispose();
+    c.dispose();
+    b.dispose();
+    a.dispose();
+}
+
+void work(int which) {
+    if (which == 0) { workLu(); }
+    if (which == 1) { workMatrixProducts(); }
+    if (which == 2) { workQrSvd(); }
+    if (which == 3) { workSparse(); }
+    if (which == 4) { workStats(); }
+    if (which == 5) { workRegressionPca(); }
+    if (which == 6) { workKmeans(); }
+    if (which == 7) { workFft(); }
+    if (which == 8) { workHistogramPoly(); }
+    if (which == 9) { workBigBlocks(); }
+}
+
+int main() {
+    asys.setKeepBigBlocks(1);                           // behave like AOS: freed big blocks are kept for reuse, never unmapped
+    printf("keeps big blocks: %d\n", asys.keepsBigBlocks());
+    int base = asys.memInUse();
+    int baseBlocks = asys.memBlocks();
+    char* names[10] = {"LU of a 100 x 100 matrix, solve, det, rcond, copy", "3000 x 6 products, transposes, Cholesky", "QR, lstsq and SVD of a 1000 x 4 matrix", "CSR tridiagonal 4000 x 4000: build, mulVec, cg, transpose, add",
+                      "3000 numbers: median, mad, iqr, mode, quantiles, ranks, spearman, histogramAuto, movingAverage, zscores", "olsFit, Pca and covarianceMatrix of 1000 x 4", "kmeans of 3000 points", "FftPlan of 2048 points", "Histogram of 40000 bins, polyFit through 3000 points",
+                       "a 100 x 800 matrix (640 KB): transpose, scaled, sub, mulVec"};
+    for (int w = 0; w < 10; w++) {
+        int t0 = millis();
+        work(w);
+        int mapped = asys.memMapped();
+        work(w);
+        printf("%s: no new memory mapped in the second round: %d, everything given back: %d\n", names[w], asys.memMapped() == mapped, asys.memInUse() == base && asys.memBlocks() == baseBlocks);
+    }
+
+    // the in place operations allocate nothing: no block appears (a transient block would show in memMapped when it is a new size class; here every size is warm already)
+    {
+        int n = 100;
+        matrix.Matrix a(n, n);
+        matrix.Matrix b(n, n);
+        matrix.Matrix c(n, n);
+        for (int i = 0; i < n * n; i++) { a.d[i] = rnd(); b.d[i] = rnd(); }
+        double* x = randomArray(n);
+        double* y = randomArray(n);
+        int blocks0 = asys.memBlocks();
+        int used0 = asys.memInUse();
+        int mapped0 = asys.memMapped();
+        a.addInPlace(&b);
+        a.subInPlace(&b);
+        a.axpyInPlace(0.5, &b);
+        a.scaleInPlace(2.0);
+        a.transposeInPlace();
+        a.mulInto(&b, &c);
+        a.mulVec(x, y);
+        a.mulVecT(x, y);
+        sink += a.trace() + a.norm1() + a.normInf() + a.normFro() + a.normMax() + c.get(1, 1);
+        a.fill(1.0);
+        a.setIdentity();
+        a.copyFrom(&b);
+        printf("in place operations: blocks %d, bytes %d, mapped %d (all unchanged: %d)\n", asys.memBlocks() - blocks0, asys.memInUse() - used0, asys.memMapped() - mapped0,
+               asys.memBlocks() == blocks0 && asys.memInUse() == used0 && asys.memMapped() == mapped0);
+        asys.free((char*) x);
+        asys.free((char*) y);
+        a.dispose();
+        b.dispose();
+        c.dispose();
+    }
+
+    // the failing paths give everything back too: singular and indefinite matrices, invalid arguments, NaN input
+    {
+        int n = 60;
+        matrix.Matrix a(n, n);                           // all zero: singular
+        matrix.Matrix b(n, n);
+        for (int i = 0; i < n * n; i++) { b.d[i] = rnd(); }
+        b.d[17] = dmath.nan();
+        int mine = asys.memInUse();
+        int mineBlocks = asys.memBlocks();
+        for (int r = 0; r < 20; r++) {
+            matrix.LU f(&a);
+            matrix.Cholesky c(&a);
+            matrix.LU g(&b);
+            matrix.SVD s(&b);
+            matrix.QR q(&b);
+            matrix.SymEigen e(&b, true);
+            matrix.Matrix inv = a.inverse();
+            matrix.Matrix sol = a.solve(&b);
+            stats.Pca p(&b, 2, false);
+            stats.Regression reg = stats.olsFit(&b, b.d, true, null);
+            f.dispose(); c.dispose(); g.dispose(); s.dispose(); q.dispose(); e.dispose(); inv.dispose(); sol.dispose(); p.dispose(); reg.dispose();
+        }
+        printf("20 rounds of failing factorizations: everything given back: %d\n", asys.memInUse() == mine && asys.memBlocks() == mineBlocks);
+        a.dispose();
+        b.dispose();
+    }
+
+    // memory that is not there: a matrix that asks for more than the process can map reports ERR_MEMORY and leaves nothing behind (the limit of the library is 2^28 numbers, the
+    // allocator may refuse earlier on a small machine)
+    {
+        matrix.Matrix huge(12000, 12000);                // 1.07 GB: either allocated (zeroed pages are not touched) or refused with ERR_MEMORY
+        bool right = huge.ok() || huge.err == matrix.ERR_MEMORY;
+        huge.dispose();
+        printf("a 1 GB matrix is either allocated or refused with ERR_MEMORY, never a crash: %d\n", right);
+        printf("everything given back: %d\n", asys.memInUse() == base && asys.memBlocks() == baseBlocks);
+    }
+
+    asys.setKeepBigBlocks(0);
+    if (sink == 12345.678) { printf("never\n"); }
+    return 0;
+}
