@@ -68,7 +68,7 @@ out.append('v - 2 w 10: ' + ' '.join(g(x) for x in s))
 out.append('nnz of the sum %d' % sum(1 for x in s if x != 0))
 y = [1.0 + 3.0 * w.get(i, 0.0) for i in range(10)]
 out.append('y + 3 w 10: ' + ' '.join(g(x) for x in y))
-out.append('dot with a different dimension is NaN 1, addScaled gives null 1')
+out.append('dot with a different dimension is NaN 1, addScaled is refused 1')
 
 # ---- builder
 d = {(2, 3): 5.0, (0, 4): 3.0, (2, 0): -2.0, (3, 1): 7.0, (1, 2): 0.0, (0, 0): 4.0}
