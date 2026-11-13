@@ -1,0 +1,235 @@
+// Memory of the syslog modules: whatever a sender or a collector does again and again over months must not use up memory. The heap position (what `new`, alloc and
+// strdup consume, which is never given back) must stay exactly where it is after a warm-up while senders come and go (UDP, TCP with both framings, a collector that
+// is down), while a collector takes in messages (good, malformed, too big), fills and rotates files, pushes into rings, forwards, and while hostile TCP connections
+// come and go; and while the parsers and builders run. (TLS handshakes are not part of this: see docs/NET.md.)
+// The files go into a directory of its own below build/tests/ (relative path: run it from the root of the repository, tests/run.sh does; the directory is removed at the end).
+import syslog;
+import syslogd;
+import net;
+import os;
+import asys;
+
+// A directory of its own for every run (random name): two runs at the same time in one checkout, or a run that died half way, cannot disturb each other.
+char dirName[100];
+void initDir(char* tag) {
+    char rb[8];
+    asys.randomBytes(&rb[0], 8);
+    int v = 0;
+    for (int i = 0; i < 6; i++) v = v * 256 + (rb[i] & 255);
+    format(&dirName[0], 100, "build/tests/%s_%d", tag, v, 0, 0);
+}
+char* P(char* name) {
+    char* r = alloc(160);
+    format(r, 160, "%s/%s", &dirName[0], name, 0, 0);
+    return r;
+}
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+syslogd.Server* srv;
+syslogd.Server* srv2;
+int TS = 1065910455;
+char url[100];
+
+int hook() {
+    srv->poll(0);
+    srv2->poll(0);
+    return 0;
+}
+
+void settle() {
+    for (int i = 0; i < 20; i++) { srv->poll(0); srv2->poll(0); }
+}
+
+void opUdp() {
+    format(&url[0], 100, "udp://127.0.0.1:%d", srv->udpPort, 0, 0, 0);
+    syslog.Sender* s = syslog.newSender(&url[0]);
+    s->setApp("memtest", "1");
+    s->setHostName("memhost");
+    s->now = TS;
+    s->info("a UDP message");
+    s->format = syslog.FORMAT_3164;
+    s->error("another one");
+    s->sendFull(syslog.FAC_AUTH, syslog.SEV_WARNING, "ID1", "[m@1 k=\"v\"]", "with data", 9);
+    s->dispose();
+    settle();
+}
+
+void opTcp() {
+    format(&url[0], 100, "tcp://127.0.0.1:%d", srv->tcpPort, 0, 0, 0);
+    syslog.Sender* s = syslog.newSender(&url[0]);
+    s->setApp("memtest", null);
+    s->now = TS;
+    for (int i = 0; i < 20; i++) s->info("octet counted");
+    s->flush(1000);
+    s->framing = syslog.FRAMING_NEWLINE;
+    for (int i = 0; i < 20; i++) s->info("newline\nframed");
+    s->flush(1000);
+    s->dispose();
+    settle();
+}
+
+void opDeadCollector() {
+    int dead = net.listen(0, 4);
+    int port = net.localPort(dead);
+    net.close(dead);
+    format(&url[0], 100, "tcp://127.0.0.1:%d", port, 0, 0, 0);
+    syslog.Sender* s = syslog.newSender(&url[0]);
+    s->connectTimeoutMs = 100;
+    s->retryIntervalMs = 0;
+    for (int i = 0; i < 5; i++) s->info("nobody listens");
+    s->flush(50);
+    s->dispose();
+}
+
+void opIngest() {
+    syslogd.Collector* c = srv->collector;
+    char* good = "<165>1 2003-10-11T22:14:15.003Z h app 77 ID1 [m@1 k=\"v\"] a message";
+    char* old = "<34>Oct 11 22:14:15 h su: old style";
+    for (int i = 0; i < 20; i++) {
+        c->ingest(good, strlen(good), 0x7F000001, syslog.TRANSPORT_UDP);
+        c->ingest(old, strlen(old), 0x7F000001, syslog.TRANSPORT_TCP);
+        c->ingest("no priority", 11, 0, syslog.TRANSPORT_UDP);
+        c->ingest("<999>bad", 8, 0, syslog.TRANSPORT_UDP);
+        c->ingest("<34>1 2003-13-11T22:14:15Z h a p m - x", 38, 0, syslog.TRANSPORT_UDP);
+    }
+}
+
+void opFiles() {
+    syslogd.Collector* c = srv2->collector;
+    for (int i = 0; i < 30; i++) {
+        char* m = "<14>Oct 11 22:14:15 h app: a line for the rotating file, long enough to rotate often";
+        c->ingest(m, strlen(m), 0x7F000001, syslog.TRANSPORT_UDP);
+    }
+    c->closeFiles();
+}
+
+void opForward() {
+    syslogd.Collector* c = srv->collector;
+    char* m = "<14>Oct 11 22:14:15 h fwd: forwarded";
+    for (int i = 0; i < 10; i++) c->ingest(m, strlen(m), 0x7F000001, syslog.TRANSPORT_UDP);
+    c->flushForwards(500);
+    settle();
+}
+
+void opHostile() {
+    int h = net.connect("127.0.0.1", srv->tcpPort);
+    net.send(h, "99999999 junk", 13);
+    for (int i = 0; i < 10; i++) { srv->poll(0); srv2->poll(0); }
+    net.close(h);
+    h = net.connect("127.0.0.1", srv->tcpPort);
+    net.send(h, "<14>a line without an end", 25);
+    for (int i = 0; i < 10; i++) { srv->poll(0); srv2->poll(0); }
+    net.close(h);
+    h = net.connect("127.0.0.1", srv->tcpPort);
+    net.send(h, "38 <14>Oct 11 22:14:15 h app: octet frame", 41);
+    char junk[100];
+    for (int i = 0; i < 100; i++) junk[i] = i * 37;
+    net.send(h, &junk[0], 100);
+    for (int i = 0; i < 10; i++) { srv->poll(0); srv2->poll(0); }
+    net.close(h);
+    settle();
+}
+
+void opParsers() {
+    char buf[2048];
+    syslog.Message m;
+    char sd[200];
+    int sl = 0;
+    char* names[2];
+    char* values[2];
+    names[0] = "a"; values[0] = "x\"y]z";
+    names[1] = "b"; values[1] = "two";
+    syslog.buildSd(&sd[0], 200, &sl, "m@1", &names[0], &values[0], 2);
+    int n = syslog.build5424(&buf[0], 2048, 4, 3, TS, 123456, "host", "app", "12", "ID", &sd[0], "text", 4, true, 6);
+    syslog.parse(&buf[0], n, &m, TS);
+    char val[40];
+    syslog.sdParam(m.sd, m.sdLen, "m@1", "a", &val[0], 40);
+    n = syslog.build3164(&buf[0], 2048, 4, 3, TS, "host", "tag", 5, "text", 4);
+    syslog.parse(&buf[0], n, &m, TS);
+    syslog.formatTime5424(&val[0], TS, 0, 3);
+    int u = 0; int us = 0; int tz = 0;
+    syslog.parseTime5424("2003-10-11T22:14:15.003+02:00", 28, &u, &us, &tz);
+    syslogd.FrameParser* fp = (syslogd.FrameParser*) malloc(sizeof(syslogd.FrameParser));
+    fp->heap = true;
+    fp->maxFrame = 1000;
+    char* stream = "13 <14>x: hello !<14>y: line\n";
+    fp->feed(srv->collector, stream, strlen(stream), 0, syslog.TRANSPORT_TCP);
+    fp->feed(srv->collector, "20 <14>cut", 10, 0, syslog.TRANSPORT_TCP);          // an unfinished frame
+    fp->dispose();
+}
+
+void run(char* name, func f) {
+    for (int i = 0; i < 14; i++) f();                   // (a ring turns over its whole content before its blocks are all of the sizes that the lines need)
+    settle();
+    int h0 = __heap_pos;
+    for (int i = 0; i < 10; i++) f();
+    settle();
+    char t[160];
+    format(&t[0], 160, "%s: 10 operations leave the heap where it was", name, 0, 0, 0);
+    bool ok = __heap_pos == h0;
+    check(&t[0], ok);
+    if (!ok) printf("     the heap grew by %d bytes\n", __heap_pos - h0);
+}
+
+int main() {
+    initDir("sl389");
+    makeDir(&dirName[0]);
+    fileDelete(P("m.log"));
+    fileDelete(P("m.log.1"));
+    fileDelete(P("m.log.2"));
+    srv = syslogd.newServer();
+    srv->collector->setClock(TS);
+    srv->listenUdp(0);
+    srv->listenTcp(0);
+    srv2 = syslogd.newServer();
+    srv2->collector->setClock(TS);
+    srv2->listenUdp(0);
+    srv2->listenTcp(0);
+    srv2->collector->addFile(null, P("m.log"), 500, 2);
+    // the first collector forwards to the second over TCP
+    format(&url[0], 100, "tcp://127.0.0.1:%d", srv2->tcpPort, 0, 0, 0);
+    syslogd.Filter* fwdOnly = syslogd.newFilter();
+    fwdOnly->program = "fwd";
+    srv->collector->addForward(fwdOnly, &url[0]);
+    srv->collector->ring->capacity = 12;
+    srv->collector->ring->maxBytes = 800;
+    srv2->collector->ring->capacity = 12;
+    srv2->collector->ring->maxBytes = 800;
+    // the rings are filled first: while a ring is still filling up it keeps every line, which is not a leak
+    for (int i = 0; i < 300; i++) {
+        char* m = "<14>Oct 11 22:14:15 h app: a line to fill the ring up to its capacity";
+        srv->collector->ingest(m, strlen(m), 0x7F000001, syslog.TRANSPORT_UDP);
+        srv2->collector->ingest(m, strlen(m), 0x7F000001, syslog.TRANSPORT_UDP);
+    }
+    net.setIdleHook(hook);
+    run("UDP senders", opUdp);
+    run("TCP senders (octet counting and newline framing)", opTcp);
+    run("a sender whose collector is down", opDeadCollector);
+    run("the collector takes in good, old style, no-priority and malformed messages", opIngest);
+    run("a file that rotates", opFiles);
+    run("forwarding from one collector to another", opForward);
+    run("hostile TCP connections", opHostile);
+    run("parsers, builders, structured data and frames", opParsers);
+    net.setIdleHook(null);
+    check("the second collector received what was forwarded and what was written to its file", srv2->collector->stats->received > 100 && os.fileSize(P("m.log")) > 0 && os.fileSize(P("m.log")) <= 500);
+    check("the first collector's ring stayed within its limits", srv->collector->ring->count() <= 12 && srv->collector->ring->byteCount() <= 800);
+    check("no client connection is left (the forwarding connection of the first collector stays)", srv->net->count() == 0 && srv2->net->count() <= 1);
+    printf("failures: %d\n", fails);
+    srv->shutdown();
+    srv2->shutdown();
+    fileDelete(P("m.log"));
+    fileDelete(P("m.log.1"));
+    fileDelete(P("m.log.2"));
+    asys.rmdir(&dirName[0]);
+    return fails;
+}

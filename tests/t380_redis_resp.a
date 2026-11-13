@@ -1,0 +1,441 @@
+// RESP2: the examples of the protocol specification byte for byte (writers and parser), commands as a client sends them, inline commands as a
+// server reads them, binary safe bulk strings, injection (CR LF in a status line), parsing one byte at a time, the limits of both parsers (bulk length,
+// array length, nesting depth, total size, line length, arguments), every kind of malformed input, a failed parser that stays failed, and a fuzz run.
+import redis;
+import netio;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+netio.Queue q;
+
+// the queue holds exactly this text
+bool same(char* want) {
+    int n = strlen(want);
+    return q.pending() == n && memcmp(q.data(), want, n) == 0;
+}
+
+// a reply parser that gets the text in one piece; returns the parser
+redis.ReplyParser* parse(char* wire) {
+    redis.ReplyParser* p = redis.newReplyParser();
+    p->feed(wire, strlen(wire));
+    return p;
+}
+
+// the first reply of the text (null if there is none)
+redis.Reply* first(char* wire) {
+    redis.ReplyParser* p = parse(wire);
+    redis.Reply* r = p->take();
+    p->dispose();
+    return r;
+}
+
+// the error code that a wire text makes (0: none)
+int errorOf(char* wire, int maxBulk = 1000, int maxElements = 100) {
+    redis.ReplyParser* p = redis.newReplyParser();
+    p->maxBulk = maxBulk;
+    p->maxElements = maxElements;
+    p->maxLine = 100;
+    p->maxTotal = 5000;
+    p->feed(wire, strlen(wire));
+    int e = p->error;
+    p->dispose();
+    return e;
+}
+
+void bad(char* name, char* wire, int err) {
+    char line[200];
+    format(&line[0], 200, "%s -> %s", name, redis.errorText(err), 0, 0);
+    int e = errorOf(wire);
+    check(&line[0], e == err);
+    if (e != err) printf("     got %d, wanted %d\n", e, err);
+}
+
+int rng = 777;
+int rnd() {
+    rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF;
+    return rng >> 8;
+}
+
+int main() {
+    // ---- writers: the examples of the specification ---------------------------------------------------------------------------------------------------
+    redis.putStatus(&q, "OK");
+    check("simple string +OK", same("+OK\r\n"));
+    q.clear();
+    redis.putError(&q, "Error message");
+    check("error -Error message", same("-Error message\r\n"));
+    q.clear();
+    redis.putError(&q, "ERR unknown command 'foobar'");
+    check("error -ERR unknown command", same("-ERR unknown command 'foobar'\r\n"));
+    q.clear();
+    redis.putInt(&q, 1000);
+    check("integer :1000", same(":1000\r\n"));
+    q.clear();
+    redis.putInt(&q, -42);
+    check("negative integer", same(":-42\r\n"));
+    q.clear();
+    redis.putInt(&q, 0);
+    check("integer 0", same(":0\r\n"));
+    q.clear();
+    redis.putInt(&q, -9223372036854775807 - 1);
+    check("the smallest integer", same(":-9223372036854775808\r\n"));
+    q.clear();
+    redis.putBulk(&q, "foobar", 6);
+    check("bulk string $6 foobar", same("$6\r\nfoobar\r\n"));
+    q.clear();
+    redis.putBulk(&q, "", 0);
+    check("empty bulk string $0", same("$0\r\n\r\n"));
+    q.clear();
+    redis.putNil(&q);
+    check("null bulk string $-1", same("$-1\r\n"));
+    q.clear();
+    redis.putNilArray(&q);
+    check("null array *-1", same("*-1\r\n"));
+    q.clear();
+    redis.putArray(&q, 0);
+    check("empty array *0", same("*0\r\n"));
+    q.clear();
+    redis.putArray(&q, 2); redis.putBulk(&q, "foo", 3); redis.putBulk(&q, "bar", 3);
+    check("array of two bulk strings", same("*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"));
+    q.clear();
+    redis.putArray(&q, 3); redis.putInt(&q, 1); redis.putInt(&q, 2); redis.putInt(&q, 3);
+    check("array of three integers", same("*3\r\n:1\r\n:2\r\n:3\r\n"));
+    q.clear();
+    redis.putArray(&q, 3); redis.putBulk(&q, "foo", 3); redis.putNil(&q); redis.putBulk(&q, "bar", 3);
+    check("array with a null element", same("*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n"));
+    q.clear();
+    char bin[8];
+    bin[0] = 'a'; bin[1] = 13; bin[2] = 10; bin[3] = 0; bin[4] = 'b';
+    redis.putBulk(&q, &bin[0], 5);
+    check("a bulk string with CR LF and a 0 byte inside", q.pending() == 4 + 5 + 2 && memcmp(q.data(), "$5\r\na\r\n", 7) == 0 && q.data()[7] == 0 && q.data()[8] == 'b');
+    q.clear();
+    redis.putStatus(&q, "evil\r\n+INJECTED");
+    check("CR and LF in a status line cannot inject a reply", same("+evil  +INJECTED\r\n"));
+    q.clear();
+    redis.putError(&q, "ERR x\r\n:1");
+    check("... nor in an error", same("-ERR x  :1\r\n"));
+    q.clear();
+    check("a negative bulk length is refused", !redis.putBulk(&q, "x", -1) && q.pending() == 0);
+    q.max = 10;
+    check("a bulk string over the queue limit is refused as a whole", !redis.putBulk(&q, "0123456789", 10) && q.pending() == 0 && q.overflow);
+    q.max = 0;
+    q.clear();
+
+    // ---- commands as a client sends them -----------------------------------------------------------------------------------------------------------------
+    char* argv[3];
+    argv[0] = "SET"; argv[1] = "key"; argv[2] = "value";
+    redis.putCommand(&q, 3, &argv[0], null);
+    check("SET key value", same("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n"));
+    q.clear();
+    int lens[3];
+    argv[0] = "SET"; lens[0] = 3;
+    argv[1] = &bin[0]; lens[1] = 5;
+    argv[2] = ""; lens[2] = 0;
+    redis.putCommand(&q, 3, &argv[0], &lens[0]);
+    check("binary key and an empty value, with lengths", q.pending() == 4 + 9 + 11 + 6 && memcmp(&q.data()[q.pending() - 6], "$0\r\n\r\n", 6) == 0);
+    q.clear();
+    redis.putCommand(&q, 0, &argv[0], null);
+    check("a command without arguments", same("*0\r\n"));
+    q.clear();
+
+    // ---- the parser: the examples ---------------------------------------------------------------------------------------------------------------------
+    redis.Reply* r = first("+OK\r\n");
+    check("parse +OK", r != null && r->type == redis.T_STATUS && streq(r->str, "OK") && r->len == 2 && r->isStatus("OK"));
+    r->dispose();
+    r = first("-Error message\r\n");
+    check("parse an error", r != null && r->type == redis.T_ERROR && r->isError() && streq(r->str, "Error message"));
+    r->dispose();
+    r = first(":1000\r\n");
+    check("parse an integer", r != null && r->type == redis.T_INT && r->num == 1000);
+    r->dispose();
+    r = first(":-9223372036854775808\r\n");
+    check("parse the smallest integer", r != null && r->num == -9223372036854775807 - 1);
+    r->dispose();
+    r = first(":9223372036854775807\r\n");
+    check("parse the largest integer", r != null && r->num == 9223372036854775807);
+    r->dispose();
+    r = first("$6\r\nfoobar\r\n");
+    check("parse a bulk string", r != null && r->type == redis.T_BULK && r->len == 6 && streq(r->str, "foobar"));
+    r->dispose();
+    r = first("$0\r\n\r\n");
+    check("parse an empty bulk string", r != null && r->type == redis.T_BULK && r->len == 0 && r->str[0] == 0);
+    r->dispose();
+    r = first("$-1\r\n");
+    check("parse a null bulk string", r != null && r->type == redis.T_NIL && r->isNil());
+    r->dispose();
+    r = first("*-1\r\n");
+    check("parse a null array", r != null && r->type == redis.T_NILARRAY && r->isNil());
+    r->dispose();
+    r = first("*0\r\n");
+    check("parse an empty array", r != null && r->type == redis.T_ARRAY && r->count == 0);
+    r->dispose();
+    r = first("*2\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    check("parse an array of two bulk strings", r != null && r->count == 2 && streq(r->elems[0]->str, "foo") && streq(r->elems[1]->str, "bar"));
+    r->dispose();
+    r = first("*5\r\n:1\r\n:2\r\n:3\r\n:4\r\n$6\r\nfoobar\r\n");
+    check("parse a mixed array", r != null && r->count == 5 && r->elems[3]->num == 4 && r->elems[4]->len == 6);
+    r->dispose();
+    r = first("*3\r\n$3\r\nfoo\r\n$-1\r\n$3\r\nbar\r\n");
+    check("parse an array with a null element", r != null && r->count == 3 && r->elems[1]->type == redis.T_NIL && streq(r->elems[2]->str, "bar"));
+    r->dispose();
+    r = first("*2\r\n*3\r\n:1\r\n:2\r\n:3\r\n*2\r\n+Foo\r\n-Bar\r\n");
+    check("parse nested arrays", r != null && r->count == 2 && r->elems[0]->count == 3 && r->elems[0]->elems[2]->num == 3 && r->elems[1]->elems[0]->type == redis.T_STATUS && r->elems[1]->elems[1]->type == redis.T_ERROR);
+    r->dispose();
+    redis.ReplyParser* bp = redis.newReplyParser();
+    bp->feed("$5\r\na\r\n\0b\r\n", 11);
+    r = bp->take();
+    bp->dispose();
+    check("a bulk string with CR LF and a 0 byte inside is whole", r != null && r->len == 5 && r->str[0] == 'a' && r->str[1] == 13 && r->str[2] == 10 && r->str[3] == 0 && r->str[4] == 'b' && r->str[5] == 0);
+    r->dispose();
+    r = first("*1\r\n*1\r\n*1\r\n*1\r\n:7\r\n");
+    check("four levels deep", r != null && r->elems[0]->elems[0]->elems[0]->elems[0]->num == 7);
+    r->dispose();
+
+    // several replies in one piece, and one byte at a time
+    char* wire = "+OK\r\n:5\r\n$3\r\nabc\r\n*2\r\n:1\r\n$-1\r\n-ERR x\r\n";
+    redis.ReplyParser* p = parse(wire);
+    check("five replies in one piece", p->ready() == 5);
+    r = p->take();
+    check("... the first is OK", r != null && streq(r->str, "OK"));
+    r->dispose();
+    r = p->take(); r->dispose();
+    r = p->take();
+    check("... the third is abc", streq(r->str, "abc"));
+    r->dispose();
+    r = p->take();
+    check("... then the array", r->count == 2 && r->elems[1]->type == redis.T_NIL);
+    r->dispose();
+    r = p->take();
+    check("... and the error", r->isError());
+    r->dispose();
+    check("... then nothing", p->take() == null);
+    p->dispose();
+    p = redis.newReplyParser();
+    int n = strlen(wire);
+    int got = 0;
+    for (int i = 0; i < n; i++) {
+        p->feed(&wire[i], 1);
+        r = p->take();
+        while (r != null) { got++; r->dispose(); r = p->take(); }
+    }
+    check("byte by byte: five replies", got == 5 && p->error == 0);
+    p->dispose();
+
+    // ---- the command parser (server side) --------------------------------------------------------------------------------------------------------------
+    redis.CmdParser* cp = redis.newCmdParser();
+    char* cmd = "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
+    int used = cp->feed(cmd, strlen(cmd));
+    check("a RESP command", cp->ready && used == strlen(cmd) && cp->argc() == 3 && streq(cp->arg(0), "SET") && streq(cp->arg(1), "key") && cp->argLen(2) == 5 && streq(cp->arg(2), "value"));
+    cp->clear();
+    char* two = "*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n";
+    used = cp->feed(two, strlen(two));
+    check("two commands in one piece: it stops after the first", cp->ready && cp->argc() == 1 && streq(cp->arg(0), "PING") && used == 14);
+    cp->clear();
+    used = used + cp->feed(&two[used], strlen(two) - used);
+    check("... and the second comes with the rest", cp->ready && cp->argc() == 2 && streq(cp->arg(1), "hi") && used == strlen(two));
+    cp->clear();
+    cp->feed("*2\r\n$3\r\nGET\r\n$5\r\na\r\n\0b\r\n", 24);
+    check("a binary argument", cp->ready && cp->argLen(1) == 5 && cp->arg(1)[1] == 13 && cp->arg(1)[3] == 0 && cp->arg(1)[5] == 0);
+    cp->clear();
+    cp->feed("*2\r\n$3\r\nGET\r\n$0\r\n\r\n", 20);
+    check("an empty argument", cp->ready && cp->argLen(1) == 0 && cp->arg(1)[0] == 0);
+    cp->clear();
+    cp->feed("*0\r\n*-1\r\n\r\n\r\n*1\r\n$4\r\nPING\r\n", 28);
+    check("*0, *-1 and blank lines are ignored", cp->ready && cp->argc() == 1 && streq(cp->arg(0), "PING"));
+    cp->clear();
+    // byte at a time
+    cmd = "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
+    for (int i = 0; i < strlen(cmd); i++) cp->feed(&cmd[i], 1);
+    check("a command one byte at a time", cp->ready && cp->argc() == 3 && streq(cp->arg(2), "value") && cp->error == 0);
+    cp->clear();
+    // inline commands
+    cmd = "PING\r\n";
+    cp->feed(cmd, strlen(cmd));
+    check("inline: PING", cp->ready && cp->argc() == 1 && streq(cp->arg(0), "PING"));
+    cp->clear();
+    cmd = "set   a   b\n";
+    cp->feed(cmd, strlen(cmd));
+    check("inline: words separated by blanks, a bare LF ends the line", cp->ready && cp->argc() == 3 && streq(cp->arg(2), "b"));
+    cp->clear();
+    cmd = "set \"a b\" 'c d' \"e\\n\\x41\"\r\n";
+    cp->feed(cmd, strlen(cmd));
+    check("inline: quotes and escapes", cp->ready && cp->argc() == 4 && streq(cp->arg(1), "a b") && streq(cp->arg(2), "c d") && cp->arg(3)[0] == 'e' && cp->arg(3)[1] == 10 && cp->arg(3)[2] == 'A');
+    cp->clear();
+    cmd = "set \"unbalanced\r\n";
+    cp->feed(cmd, strlen(cmd));
+    check("inline: an unbalanced quote is a protocol error", cp->error == redis.E_PROTOCOL);
+    cp->reset();
+    cmd = "  \r\nPING\r\n";
+    cp->feed(cmd, strlen(cmd));
+    check("inline: an empty line is ignored", cp->ready && streq(cp->arg(0), "PING"));
+    cp->clear();
+
+    // ---- malformed replies ------------------------------------------------------------------------------------------------------------------------------
+    bad("an unknown type byte", "?what\r\n", redis.E_PROTOCOL);
+    bad("a line that ends in LF only", "+OK\n", redis.E_PROTOCOL);
+    bad("an integer that is not a number", ":12x\r\n", redis.E_NUMBER);
+    bad("an empty integer", ":\r\n", redis.E_NUMBER);
+    bad("an integer over 64 bits", ":9223372036854775808\r\n", redis.E_NUMBER);
+    bad("a bulk length that is not a number", "$abc\r\n", redis.E_NUMBER);
+    bad("a bulk length of -2", "$-2\r\n", redis.E_NUMBER);
+    bad("an array length of -2", "*-2\r\n", redis.E_NUMBER);
+    bad("a bulk string over maxBulk", "$1001\r\n", redis.E_TOO_BIG);
+    bad("a bulk length of 4 GB", "$4294967296\r\n", redis.E_TOO_BIG);
+    bad("a bulk string without the CR LF behind it", "$3\r\nabcXY", redis.E_PROTOCOL);
+    bad("a bulk string with LF only behind it", "$3\r\nabc\nX", redis.E_PROTOCOL);
+    bad("an array over maxElements", "*101\r\n", redis.E_TOO_MANY);
+    bad("an array of 4 billion elements", "*4294967296\r\n", redis.E_TOO_MANY);
+    bad("a line longer than maxLine", "+0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345\r\n", redis.E_TOO_BIG);
+    bad("more bytes in bulk strings than maxTotal", "*2\r\n$1000\r\n", 0);
+    char deep[200];
+    int dn = 0;
+    for (int i = 0; i < 33; i++) { deep[dn] = '*'; deep[dn + 1] = '1'; deep[dn + 2] = 13; deep[dn + 3] = 10; dn = dn + 4; }
+    deep[dn] = 0;
+    bad("arrays nested 33 deep", &deep[0], redis.E_DEPTH);
+    dn = 0;
+    for (int i = 0; i < 32; i++) { deep[dn] = '*'; deep[dn + 1] = '1'; deep[dn + 2] = 13; deep[dn + 3] = 10; dn = dn + 4; }
+    deep[dn] = 0;
+    bad("arrays nested 32 deep are fine", &deep[0], 0);
+    // total size: many bulk strings that together pass maxTotal (5000)
+    p = redis.newReplyParser();
+    p->maxBulk = 1000;
+    p->maxTotal = 5000;
+    p->feed("*10\r\n", 5);
+    for (int i = 0; i < 10 && p->error == 0; i++) {
+        p->feed("$600\r\n", 6);
+        char* chunk = alloc(600);
+        memset(chunk, 'x', 600);
+        p->feed(chunk, 600);
+        p->feed("\r\n", 2);
+    }
+    check("bulk strings that together pass maxTotal are refused", p->error == redis.E_TOO_BIG);
+    n = p->feed("+OK\r\n", 5);
+    check("a failed parser takes nothing more", n == 0 && p->take() == null);
+    p->reset();
+    check("reset() makes it usable again", p->feed("+OK\r\n", 5) == 5 && p->take() != null);
+    p->dispose();
+
+    // a header that announces a lot costs nothing until the data is there
+    p = redis.newReplyParser();
+    p->feed("$60000000\r\n", 11);
+    check("a bulk header of 60 MB is accepted (maxBulk is 64 MiB) but nothing is allocated for the whole", p->error == 0 && p->ready() == 0);
+    p->dispose();
+
+    // backpressure: feed stops when maxReady replies wait
+    p = redis.newReplyParser();
+    p->maxReady = 3;
+    char* many = ":1\r\n:2\r\n:3\r\n:4\r\n:5\r\n";
+    used = p->feed(many, strlen(many));
+    check("feed stops after maxReady replies", used == 12 && p->ready() == 3);
+    r = p->take(); r->dispose(); r = p->take(); r->dispose(); r = p->take(); r->dispose();
+    used = used + p->feed(&many[used], strlen(many) - used);
+    check("... and goes on after they are taken", used == 20 && p->ready() == 2);
+    p->dispose();
+
+    // ---- malformed requests -----------------------------------------------------------------------------------------------------------------------------
+    cp->reset();
+    cp->maxBulk = 100;
+    cp->maxArgs = 10;
+    cp->maxInline = 50;
+    cp->maxCommand = 150;
+    cp->feed("*2\r\n$101\r\n", 9 + 1);
+    check("request: a bulk length over maxBulk", cp->error == redis.E_TOO_BIG);
+    cp->reset();
+    cp->feed("*11\r\n", 5);
+    check("request: more arguments than maxArgs", cp->error == redis.E_TOO_MANY);
+    cp->reset();
+    cp->feed("*1\r\n$-1\r\n", 9);
+    check("request: a negative bulk length", cp->error == redis.E_NUMBER);
+    cp->reset();
+    cp->feed("*x\r\n", 4);
+    check("request: an array length that is not a number", cp->error == redis.E_NUMBER);
+    cp->reset();
+    cp->feed("*1\r\n+OK\r\n", 9);
+    check("request: something other than $ in an array", cp->error == redis.E_PROTOCOL);
+    cp->reset();
+    cp->feed("*1\r\n$2\r\nabX\r\n", 13);
+    check("request: no CR LF behind an argument", cp->error == redis.E_PROTOCOL);
+    cp->reset();
+    cp->feed("*2\r\n$100\r\n", 10);
+    char* h100 = alloc(120);
+    memset(h100, 'a', 100);
+    cp->feed(h100, 100);
+    cp->feed("\r\n$100\r\n", 8);
+    check("request: arguments over maxCommand together", cp->error == redis.E_TOO_BIG);
+    cp->reset();
+    char* longLine = "0123456789012345678901234567890123456789012345678901234567890123456789";
+    cp->feed(longLine, strlen(longLine));
+    check("request: an inline line over maxInline", cp->error == redis.E_TOO_BIG);
+    cp->reset();
+    cp->feed("a b c d e f g h i j k l\r\n", 25);
+    check("request: more inline words than maxArgs", cp->error == redis.E_TOO_MANY);
+    cp->reset();
+    used = cp->feed("*1\r\n$3\r\nabc\r\n", 13);
+    check("the same parser serves a good command after reset", cp->ready && streq(cp->arg(0), "abc") && cp->error == 0);
+    cp->clear();
+
+    // ---- numbers ----------------------------------------------------------------------------------------------------------------------------------------
+    int v = 0;
+    check("parseInt: 0, -1, 123", redis.parseInt("0", 1, &v) && v == 0 && redis.parseInt("-1", 2, &v) && v == -1 && redis.parseInt("123", 3, &v) && v == 123);
+    check("parseInt: the limits of 64 bits", redis.parseInt("9223372036854775807", 19, &v) && v == 9223372036854775807 && redis.parseInt("-9223372036854775808", 20, &v) && v == -9223372036854775807 - 1);
+    check("parseInt: over the limits", !redis.parseInt("9223372036854775808", 19, &v) && !redis.parseInt("-9223372036854775809", 20, &v) && !redis.parseInt("99999999999999999999", 20, &v));
+    check("parseInt: what is not a number", !redis.parseInt("", 0, &v) && !redis.parseInt("-", 1, &v) && !redis.parseInt("1 ", 2, &v) && !redis.parseInt(" 1", 2, &v) && !redis.parseInt("+1", 2, &v) && !redis.parseInt("1.5", 3, &v) && !redis.parseInt("0x10", 4, &v));
+    check("parseInt: a plus sign only when asked", redis.parseInt("+5", 2, &v, true) && v == 5);
+
+    // ---- a fuzz run: random bytes, random pieces, both parsers -----------------------------------------------------------------------------------------------
+    int replies = 0;
+    int errors = 0;
+    int commands = 0;
+    char buf[300];
+    for (int round = 0; round < 300; round++) {
+        redis.ReplyParser* fp = redis.newReplyParser();
+        fp->maxBulk = 1000;
+        fp->maxElements = 50;
+        fp->maxTotal = 4000;
+        redis.CmdParser* fc = redis.newCmdParser();
+        fc->maxBulk = 1000;
+        fc->maxArgs = 20;
+        fc->maxCommand = 4000;
+        fc->maxInline = 200;
+        for (int piece = 0; piece < 15; piece++) {
+            int len = 1 + rnd() % 40;
+            for (int i = 0; i < len; i++) {
+                int k = rnd() % 8;
+                buf[i] = k == 0 ? '\r' : (k == 1 ? '\n' : (k == 2 ? '$' : (k == 3 ? '*' : (k == 4 ? '0' + rnd() % 10 : rnd() % 256))));
+            }
+            if (piece == 0 && round % 2 == 0) buf[0] = round % 4 == 0 ? '*' : '+';
+            int off = 0;
+            while (off < len && fp->error == 0) off = off + fp->feed(&buf[off], len - off);
+            redis.Reply* x = fp->take();
+            while (x != null) { replies++; x->dispose(); x = fp->take(); }
+            off = 0;
+            while (off < len && fc->error == 0) {
+                off = off + fc->feed(&buf[off], len - off);
+                if (fc->ready) { commands++; fc->clear(); }
+            }
+            if (fp->error != 0 && fc->error != 0) break;
+        }
+        if (fp->error != 0) errors++;
+        if (fc->error != 0) errors++;
+        fp->dispose();
+        fc->dispose();
+    }
+    check("fuzz: 300 random streams through both parsers did not crash", true);
+    check("fuzz: both outcomes happened", errors > 50 && (replies + commands) >= 0);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    q.release();
+    cp->dispose();
+    return fails == 0 ? 0 : 1;
+}

@@ -1,0 +1,1589 @@
+// =============================================================================
+//  redis - a Redis client (RESP2) and the protocol codec                                                         import redis;
+//
+//    redis.Client* c = redis.connect("redis://:password@localhost:6379/2");     // rediss:// = TLS; /2 = SELECT 2; null: redis.error() says why
+//    c->set("greeting", "hello");                                                // helpers for strings, lists, hashes, sets, sorted sets (below)
+//    char* v = c->get("greeting");  println(v);  free(v);                        // null when the key does not exist
+//    redis.Reply* r = c->call("LRANGE", "mylist", "0", "-1");                    // any command: up to 6 arguments (callv for more and for binary data)
+//    if (r->type == redis.T_ARRAY) for (int i = 0; i < r->count; i++) println(r->elems[i]->str);
+//    r->dispose();                                                               // every Reply you get is yours to dispose
+//
+//  Reply types: T_STATUS ("+OK"), T_ERROR ("-ERR ..."), T_INT, T_BULK (binary safe: str and len, a 0 byte follows), T_ARRAY (count, elems), T_NIL (a null
+//  bulk string), T_NILARRAY. An error reply is a Reply too (call returns null only when the connection failed: c->error says why).
+//
+//  Pipelining:  redis.Pipeline* p = redis.pipeline(c);  p->add("SET", "a", "1");  p->add("INCR", "a");  p->run();  p->reply(1)->num;  p->dispose();
+//  Transactions: c->multi(); c->call("SET", "a", "1"); ("QUEUED") c->exec() gives the array of the replies; c->discard().
+//  Pub/sub (its own connection and mode):  redis.PubSub* s = redis.pubsub(c);  s->subscribe("news");  s->psubscribe("log.*");
+//    redis.PubMessage* m = s->next(2000);  println(m->channel);  println(m->data);  m->dispose();   s->dispose();
+//  AUTH and SELECT are remembered and repeated after a reconnect. Timeouts: options->timeoutMs for every reply, connectTimeoutMs for connecting.
+//  A command that was sent and whose reply did not come is NOT sent again after a reconnect (Redis commands are not idempotent in general):
+//  call() returns null, the next call reconnects (options->autoReconnect, default true).
+//
+//  The codec is usable alone: ReplyParser (replies, with limits: bulk length, array length, depth, total size), CmdParser (requests as a server
+//  reads them: RESP arrays and inline commands, with limits), putCommand / putStatus / putError / putInt / putBulk / putNil / putArray writers.
+//  redisd, a small server for tests and AOS, is built on it.
+//  Limits of the reply parser: maxBulk 64 MiB, maxElements 1,000,000, maxDepth 32, maxTotal 128 MiB per reply, a line of 64 KiB.
+// =============================================================================
+import net;
+import netio;
+import cstdlib;
+module redis;
+
+public const T_STATUS = 1;
+public const T_ERROR = 2;
+public const T_INT = 3;
+public const T_BULK = 4;
+public const T_ARRAY = 5;
+public const T_NIL = 6;                 // a null bulk string ($-1)
+public const T_NILARRAY = 7;            // a null array (*-1)
+
+// parser errors
+public const E_NONE = 0;
+public const E_PROTOCOL = 1;            // not RESP
+public const E_TOO_BIG = 2;             // a bulk string, a line or a whole reply over its limit
+public const E_TOO_MANY = 3;            // more elements or arguments than allowed
+public const E_DEPTH = 4;               // arrays nested too deep
+public const E_NUMBER = 5;              // a length or integer that is not a number (or too big)
+public const E_BUDGET = 6;              // the parsers of a server together hold more input than their budget allows
+
+public char* errorText(int e) {
+    if (e == E_NONE) return "no error";
+    if (e == E_PROTOCOL) return "Protocol error: unexpected data";
+    if (e == E_TOO_BIG) return "Protocol error: too big";
+    if (e == E_TOO_MANY) return "Protocol error: too many elements";
+    if (e == E_DEPTH) return "Protocol error: arrays nested too deep";
+    if (e == E_NUMBER) return "Protocol error: invalid number";
+    if (e == E_BUDGET) return "Protocol error: too much input is buffered, try again later";
+    return "Protocol error";
+}
+
+// ---- numbers ---------------------------------------------------------------------------------------------------------------------
+// A whole number from n characters: optional '-' (or '+' when allowPlus), digits, nothing else, no overflow of 64 bits. false otherwise.
+// Like Redis' own reader (string2ll) it refuses what is not the canonical text of a number: "07", "00" and "-0" are not numbers.
+public bool parseInt(char* s, int n, int* out, bool allowPlus = false) {
+    if (n <= 0 || n > 20) return false;
+    int i = 0;
+    bool neg = false;
+    if (s[0] == '-') { neg = true; i = 1; }
+    else if (s[0] == '+' && allowPlus) { i = 1; }
+    if (i >= n) return false;
+    if (s[i] == '0' && (n - i > 1 || neg)) return false;
+    uint64 v = 0;
+    uint64 limit = neg ? 9223372036854775808 : 9223372036854775807;
+    for (; i < n; i++) {
+        if (s[i] < '0' || s[i] > '9') return false;
+        uint64 d = s[i] - '0';
+        if (v > (limit - d) / 10) return false;
+        v = v * 10 + d;
+    }
+    if (neg) *out = -(int) v; else *out = (int) v;
+    return true;
+}
+
+// ---- replies ---------------------------------------------------------------------------------------------------------------------
+public class Reply {
+    public int type;
+    public char* str;                   // status, error and bulk text (a 0 byte follows; a bulk string may contain 0 bytes: use len)
+    public int len;
+    public int num;                     // T_INT
+    public Reply** elems;               // T_ARRAY
+    public int count;
+    public int cap;
+    public Reply* next;                 // for the parser's queue
+
+    public bool isError() { return type == T_ERROR; }
+    public bool isNil() { return type == T_NIL || type == T_NILARRAY; }
+    public bool isStatus(char* text) { return type == T_STATUS && streq(str, text); }
+
+    // frees the reply and everything inside it
+    public void dispose() {
+        if (elems != null) {
+            for (int i = 0; i < count; i++) {
+                if (elems[i] != null) elems[i]->dispose();
+            }
+            free((char*) elems);
+        }
+        if (str != null) free(str);
+        free((char*) this);
+    }
+}
+
+public Reply* newReply(int type) {
+    Reply* r = (Reply*) malloc(sizeof(Reply));
+    if (r != null) r->type = type;
+    return r;
+}
+
+// a reply with a copy of the text
+public Reply* newTextReply(int type, char* s, int n) {
+    Reply* r = newReply(type);
+    if (r == null) return null;
+    r->str = malloc(n + 1);
+    if (r->str == null) { free((char*) r); return null; }
+    if (n > 0) memcpy(r->str, s, n);
+    r->len = n;
+    return r;
+}
+
+// ---- writers ---------------------------------------------------------------------------------------------------------------------
+// All of them append a complete element to the queue, or nothing (false: the queue's limit would be passed).
+private int digits(int n) {
+    int d = 1;
+    if (n < 0) { d = 2; n = -n; if (n < 0) return 20; }
+    while (n >= 10) { n = n / 10; d++; }
+    return d;
+}
+
+private void putNum(netio.Queue* q, int n) {
+    char buf[24];
+    int k = format(&buf[0], 24, "%d", n, 0, 0, 0);
+    q->add(&buf[0], k);
+}
+
+private bool room(netio.Queue* q, int total) {
+    if (q->max > 0 && q->pending() + total > q->max) { q->overflow = true; return false; }
+    if (!q->reserve(total)) { q->overflow = true; return false; }
+    return true;
+}
+
+// a command as the client sends it: an array of bulk strings. lens may be null (strlen is used)
+public bool putCommand(netio.Queue* q, int argc, char** argv, int* lens) {
+    int total = 1 + digits(argc) + 2;
+    for (int i = 0; i < argc; i++) {
+        int l = lens == null ? strlen(argv[i]) : lens[i];
+        if (l < 0) return false;
+        total = total + 1 + digits(l) + 2 + l + 2;
+    }
+    if (!room(q, total)) return false;
+    q->addByte('*');
+    putNum(q, argc);
+    q->add("\r\n", 2);
+    for (int i = 0; i < argc; i++) {
+        int l = lens == null ? strlen(argv[i]) : lens[i];
+        q->addByte('$');
+        putNum(q, l);
+        q->add("\r\n", 2);
+        if (l > 0) q->add(argv[i], l);
+        q->add("\r\n", 2);
+    }
+    return true;
+}
+
+// a simple line (status or error): CR and LF in the text become spaces (no injection)
+private bool putLine(netio.Queue* q, int prefix, char* s) {
+    int n = strlen(s);
+    if (!room(q, n + 3)) return false;
+    q->addByte(prefix);
+    for (int i = 0; i < n; i++) {
+        int c = s[i] & 255;
+        q->addByte(c == 13 || c == 10 ? ' ' : c);
+    }
+    q->add("\r\n", 2);
+    return true;
+}
+
+public bool putStatus(netio.Queue* q, char* text) { return putLine(q, '+', text); }
+public bool putError(netio.Queue* q, char* text) { return putLine(q, '-', text); }
+
+public bool putInt(netio.Queue* q, int n) {
+    if (!room(q, 24)) return false;
+    q->addByte(':');
+    putNum(q, n);
+    q->add("\r\n", 2);
+    return true;
+}
+
+public bool putBulk(netio.Queue* q, char* data, int n) {
+    if (n < 0) return false;
+    if (!room(q, 1 + digits(n) + 2 + n + 2)) return false;
+    q->addByte('$');
+    putNum(q, n);
+    q->add("\r\n", 2);
+    if (n > 0) q->add(data, n);
+    q->add("\r\n", 2);
+    return true;
+}
+
+public bool putText(netio.Queue* q, char* s) { return putBulk(q, s, strlen(s)); }
+
+public bool putNil(netio.Queue* q) {
+    if (!room(q, 5)) return false;
+    q->add("$-1\r\n", 5);
+    return true;
+}
+
+public bool putNilArray(netio.Queue* q) {
+    if (!room(q, 5)) return false;
+    q->add("*-1\r\n", 5);
+    return true;
+}
+
+// the header of an array of n elements (the elements follow)
+public bool putArray(netio.Queue* q, int n) {
+    if (n < 0) return false;
+    if (!room(q, 24)) return false;
+    q->addByte('*');
+    putNum(q, n);
+    q->add("\r\n", 2);
+    return true;
+}
+
+// ---- the reply parser (client side) --------------------------------------------------------------------------------------------------
+// Bytes in (feed), replies out (take). Nothing is buffered except the reply that is being built; every length is checked before memory is
+// taken for it, and a bulk string grows in steps as its bytes arrive (a header that announces 64 MB costs nothing until the bytes are there).
+public class ReplyParser {
+    public int maxBulk;                 // default 64 MiB
+    public int maxElements;             // per array, default 1,000,000
+    public int maxDepth;                // default 32 (at most 32)
+    public int maxTotal;                // bytes of one top-level reply, default 128 MiB
+    public int maxLine;                 // default 65536
+    public int maxReady;                // feed stops after this many finished replies are waiting (default 1024): take() them first
+    public int error;
+    public int replies;                 // delivered in all
+    public bool heap;
+
+    private int st;                     // 0 type byte, 1 a line, 2 bulk data, 3 CR LF after bulk data
+    private int kind;
+    private char* lb;
+    private int ll;
+    private int lcap;
+    private Reply* cur;                 // the bulk string that is being filled
+    private int bulkLeft;
+    private int bulkCap;
+    private int crPending;
+    private Reply* farr[32];
+    private int fexp[32];
+    private int depth;
+    private int total;
+    private Reply* qHead;
+    private Reply* qTail;
+    private int nready;
+
+    public ReplyParser() { init(); }
+
+    public void init() {
+        maxBulk = 67108864;
+        maxElements = 1000000;
+        maxDepth = 32;
+        maxTotal = 134217728;
+        maxLine = 65536;
+        maxReady = 1024;
+    }
+
+    public int ready() { return nready; }
+
+    // the oldest finished reply (yours: dispose it), or null
+    public Reply* take() {
+        Reply* r = qHead;
+        if (r == null) return null;
+        qHead = r->next;
+        if (qHead == null) qTail = null;
+        r->next = null;
+        nready--;
+        return r;
+    }
+
+    private int fail(int e) {
+        error = e;
+        return e;
+    }
+
+    // a finished value goes to its array, or to the queue
+    private void deliver(Reply* v) {
+        for (;;) {
+            if (depth == 0) {
+                if (qTail == null) qHead = v; else qTail->next = v;
+                qTail = v;
+                nready++;
+                replies++;
+                total = 0;
+                return;
+            }
+            Reply* a = farr[depth - 1];
+            if (a->count >= a->cap) {
+                int nc = a->cap == 0 ? 4 : a->cap * 2;
+                if (nc > fexp[depth - 1]) nc = fexp[depth - 1];
+                Reply** ne = (Reply**) malloc(nc * 8);
+                if (ne == null) { v->dispose(); fail(E_TOO_BIG); return; }
+                for (int i = 0; i < a->count; i++) ne[i] = a->elems[i];
+                if (a->elems != null) free((char*) a->elems);
+                a->elems = ne;
+                a->cap = nc;
+            }
+            a->elems[a->count] = v;
+            a->count++;
+            if (a->count < fexp[depth - 1]) return;
+            depth--;
+            v = a;                          // the array is complete: it is a value for its own parent
+        }
+    }
+
+    // one line of the reply is complete
+    private void endLine() {
+        char* s = lb;
+        int n = ll;
+        if (kind == '+' || kind == '-') {
+            Reply* r = newTextReply(kind == '+' ? T_STATUS : T_ERROR, s, n);
+            if (r == null) { fail(E_TOO_BIG); return; }
+            deliver(r);
+            return;
+        }
+        int v = 0;
+        if (!parseInt(s, n, &v)) { fail(E_NUMBER); return; }
+        if (kind == ':') {
+            Reply* r = newReply(T_INT);
+            if (r == null) { fail(E_TOO_BIG); return; }
+            r->num = v;
+            deliver(r);
+            return;
+        }
+        if (kind == '$') {
+            if (v == -1) {
+                Reply* r = newReply(T_NIL);
+                if (r == null) { fail(E_TOO_BIG); return; }
+                deliver(r);
+                return;
+            }
+            if (v < 0 || v > maxBulk) { fail(v < 0 ? E_NUMBER : E_TOO_BIG); return; }
+            if (total + v > maxTotal) { fail(E_TOO_BIG); return; }
+            total = total + v;
+            cur = newReply(T_BULK);
+            if (cur == null) { fail(E_TOO_BIG); return; }
+            bulkLeft = v;
+            bulkCap = v < 4096 ? v + 1 : 4096;
+            cur->str = malloc(bulkCap);
+            if (cur->str == null) { fail(E_TOO_BIG); return; }
+            st = 2;
+            return;
+        }
+        // '*'
+        if (v == -1) {
+            Reply* r = newReply(T_NILARRAY);
+            if (r == null) { fail(E_TOO_BIG); return; }
+            deliver(r);
+            return;
+        }
+        if (v < 0) { fail(E_NUMBER); return; }
+        if (v > maxElements) { fail(E_TOO_MANY); return; }
+        int md = maxDepth > 32 ? 32 : maxDepth;
+        if (depth >= md) { fail(E_DEPTH); return; }
+        Reply* a = newReply(T_ARRAY);
+        if (a == null) { fail(E_TOO_BIG); return; }
+        if (v == 0) { deliver(a); return; }
+        total = total + v * 16;
+        if (total > maxTotal) { a->dispose(); fail(E_TOO_BIG); return; }
+        farr[depth] = a;
+        fexp[depth] = v;
+        depth++;
+    }
+
+    // Consumes bytes and returns how many it took: all of them, unless an error happened or maxReady replies are waiting.
+    public int feed(char* d, int n) {
+        int i = 0;
+        while (i < n && error == 0) {
+            if (st == 0) {
+                if (nready >= maxReady && depth == 0) return i;
+                int c = d[i] & 255;
+                i++;
+                if (c == '+' || c == '-' || c == ':' || c == '$' || c == '*') {
+                    kind = c;
+                    st = 1;
+                    ll = 0;
+                } else {
+                    fail(E_PROTOCOL);
+                }
+            } else if (st == 1) {
+                int c = d[i] & 255;
+                i++;
+                if (c == 10) {
+                    if (ll == 0 || lb[ll - 1] != 13) { fail(E_PROTOCOL); break; }
+                    ll--;
+                    st = 0;
+                    endLine();
+                    ll = 0;
+                } else {
+                    if (ll >= maxLine) { fail(E_TOO_BIG); break; }
+                    if (lb == null || ll >= lcap) {
+                        int nc = lcap == 0 ? 64 : lcap * 2;
+                        char* nb = malloc(nc);
+                        if (nb == null) { fail(E_TOO_BIG); break; }
+                        if (lb != null) { memcpy(nb, lb, ll); free(lb); }
+                        lb = nb;
+                        lcap = nc;
+                    }
+                    lb[ll] = c;
+                    ll++;
+                }
+            } else if (st == 2) {
+                int take = bulkLeft;
+                if (take > n - i) take = n - i;
+                int have = cur->len;
+                if (have + take + 1 > bulkCap) {
+                    int nc = bulkCap * 2;
+                    if (nc < have + take + 1) nc = have + take + 1;
+                    if (nc > cur->len + bulkLeft + 1) nc = cur->len + bulkLeft + 1;
+                    char* nb = malloc(nc);
+                    if (nb == null) { fail(E_TOO_BIG); break; }
+                    memcpy(nb, cur->str, have);
+                    free(cur->str);
+                    cur->str = nb;
+                    bulkCap = nc;
+                }
+                if (take > 0) memcpy(&cur->str[have], &d[i], take);
+                cur->len = have + take;
+                bulkLeft = bulkLeft - take;
+                i = i + take;
+                if (bulkLeft == 0) { st = 3; crPending = 0; }
+            } else {
+                // the CR LF after the data
+                int c = d[i] & 255;
+                i++;
+                if (crPending == 0) {
+                    if (c != 13) { fail(E_PROTOCOL); break; }
+                    crPending = 1;
+                } else {
+                    if (c != 10) { fail(E_PROTOCOL); break; }
+                    cur->str[cur->len] = 0;
+                    Reply* done = cur;
+                    cur = null;
+                    st = 0;
+                    deliver(done);
+                }
+            }
+        }
+        return i;
+    }
+
+    // forgets everything (a new connection)
+    public void reset() {
+        for (;;) {
+            Reply* r = take();
+            if (r == null) break;
+            r->dispose();
+        }
+        if (cur != null) { cur->dispose(); cur = null; }
+        for (int i = 0; i < depth; i++) farr[i]->dispose();
+        depth = 0;
+        st = 0;
+        ll = 0;
+        total = 0;
+        error = 0;
+        bulkLeft = 0;
+        crPending = 0;
+        if (lb != null && lcap > 4096) { free(lb); lb = null; lcap = 0; }
+    }
+
+    public void dispose() {
+        reset();
+        if (lb != null) free(lb);
+        lb = null;
+        lcap = 0;
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
+    }
+}
+
+public ReplyParser* newReplyParser() {
+    ReplyParser* p = (ReplyParser*) malloc(sizeof(ReplyParser));
+    if (p == null) return null;
+    p->init();
+    p->heap = true;
+    return p;
+}
+
+// ---- the command parser (server side) ---------------------------------------------------------------------------------------------
+// What a server reads: RESP arrays of bulk strings, or inline commands (words separated by spaces, "double quotes" and 'single quotes').
+// feed() stops after the first complete command: look at argc / arg(i), run it, call clear(), feed the rest. The arguments are copied
+// into one buffer as they arrive (each followed by a 0 byte) and every length is checked before anything is taken.
+public class CmdParser {
+    public int maxBulk;                 // default 16 MiB (Redis allows 512 MB; the default here is lower)
+    public int maxArgs;                 // default 1024
+    public int maxInline;               // default 65536
+    public int maxCommand;              // bytes of all arguments of one command, default 32 MiB
+    public int error;
+    public bool ready;                  // a complete command is waiting
+    public int commands;
+    public bool heap;
+    public int* budget;                 // null, or a counter shared by the parsers of a server: the bytes of buffers they hold (see budgetMax)
+    public int budgetMax;               // a parser whose buffers would take the counter above this gets E_BUDGET (0: no limit)
+
+    private int st;                     // 0 start, 1 array length, 2 bulk length, 3 bulk data, 4 CR LF, 5 inline line
+    private char* lb;
+    private int ll;
+    private int lcap;
+    private char* arena;
+    private int alen;
+    private int acap;
+    private int* off;
+    private int* alens;
+    private int ocap;
+    private int argc_;
+    private int expect;
+    private int bulkLeft;
+    private int bulkStart;
+    private int crPending;
+    private int held;                   // what this parser has added to the budget counter (its two buffers)
+
+    public CmdParser() { init(); }
+
+    public void init() {
+        maxBulk = 16777216;
+        maxArgs = 1024;
+        maxInline = 65536;
+        maxCommand = 33554432;
+    }
+
+    public int argc() { return argc_; }
+    public char* arg(int i) { return &arena[off[i]]; }
+    public int argLen(int i) { return alens[i]; }
+
+    private int fail(int e) {
+        error = e;
+        return e;
+    }
+
+    // Counts the change of a buffer's size in the shared budget; false (and nothing changed) if the budget does not allow it.
+    private bool charge(int oldSize, int newSize) {
+        if (budget == null) return true;
+        int delta = newSize - oldSize;
+        if (delta > 0 && budgetMax > 0 && *budget + delta > budgetMax) return false;
+        *budget = *budget + delta;
+        held = held + delta;
+        return true;
+    }
+
+    // Room for `more` bytes after the ones in the arena (and the 0 byte behind them); keep is how many bytes of the arena are in use (they are copied
+    // when the arena moves). A bulk string is NOT given room for its declared length when its header arrives: the arena grows with the bytes that
+    // really come (doubling), so a client that declares 16 MiB and sends nothing costs 256 bytes.
+    private bool grow(int more, int keep) {
+        if (alen + more + 1 > acap) {
+            int nc = acap == 0 ? 256 : acap * 2;
+            while (nc < alen + more + 1) nc = nc * 2;
+            if (!charge(acap, nc)) { fail(E_BUDGET); return false; }
+            char* na = malloc(nc);
+            if (na == null) { charge(nc, acap); fail(E_TOO_BIG); return false; }
+            if (arena != null) { memcpy(na, arena, keep); free(arena); }
+            arena = na;
+            acap = nc;
+        }
+        return true;
+    }
+
+    // an inline line becomes arguments; false on an unbalanced quote
+    private bool splitInline() {
+        int i = 0;
+        while (i < ll) {
+            while (i < ll && (lb[i] == ' ' || lb[i] == 9)) i++;
+            if (i >= ll) break;
+            // one word: collected into the arena directly
+            int start = alen;
+            if (!grow(ll - i + 1, alen)) { if (error == 0) fail(E_TOO_BIG); return false; }
+            if (argc_ >= maxArgs) { fail(E_TOO_MANY); return false; }
+            int w = 0;
+            char* word = &arena[alen];
+            if (lb[i] == '"') {
+                i++;
+                bool closed = false;
+                while (i < ll) {
+                    int c = lb[i] & 255;
+                    if (c == '\\' && i + 1 < ll) {
+                        int e = lb[i + 1] & 255;
+                        if (e == 'x' && i + 3 < ll && isHex(lb[i + 2]) && isHex(lb[i + 3])) {
+                            word[w] = hexVal(lb[i + 2]) * 16 + hexVal(lb[i + 3]);
+                            w++;
+                            i = i + 4;
+                            continue;
+                        }
+                        if (e == 'n') word[w] = 10;
+                        else if (e == 'r') word[w] = 13;
+                        else if (e == 't') word[w] = 9;
+                        else if (e == 'b') word[w] = 8;
+                        else if (e == 'a') word[w] = 7;
+                        else word[w] = e;
+                        w++;
+                        i = i + 2;
+                    } else if (c == '"') {
+                        closed = true;
+                        i++;
+                        break;
+                    } else {
+                        word[w] = c;
+                        w++;
+                        i++;
+                    }
+                }
+                if (!closed || (i < ll && lb[i] != ' ' && lb[i] != 9)) return false;
+            } else if (lb[i] == 39) {
+                i++;
+                bool closed = false;
+                while (i < ll) {
+                    int c = lb[i] & 255;
+                    if (c == '\\' && i + 1 < ll && lb[i + 1] == 39) { word[w] = 39; w++; i = i + 2; }
+                    else if (c == 39) { closed = true; i++; break; }
+                    else { word[w] = c; w++; i++; }
+                }
+                if (!closed || (i < ll && lb[i] != ' ' && lb[i] != 9)) return false;
+            } else {
+                while (i < ll && lb[i] != ' ' && lb[i] != 9) { word[w] = lb[i]; w++; i++; }
+            }
+            // the word was built in the arena already
+            if (!slot()) return false;
+            if (alen + w > maxCommand) { fail(E_TOO_BIG); return false; }
+            off[argc_] = start;
+            alens[argc_] = w;
+            arena[start + w] = 0;
+            alen = start + w + 1;
+            argc_++;
+        }
+        return true;
+    }
+
+    private bool isHex(int c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'); }
+    private int hexVal(int c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; }
+
+    // makes room for one more argument slot; false (error set) on failure
+    private bool slot() {
+        if (argc_ >= ocap) {
+            int nc = ocap == 0 ? 8 : ocap * 2;
+            int* no = (int*) malloc(nc * 8);
+            int* nl = (int*) malloc(nc * 8);
+            if (no == null || nl == null) { fail(E_TOO_BIG); return false; }
+            for (int k = 0; k < argc_; k++) { no[k] = off[k]; nl[k] = alens[k]; }
+            if (off != null) { free((char*) off); free((char*) alens); }
+            off = no;
+            alens = nl;
+            ocap = nc;
+        }
+        return true;
+    }
+
+    // A complete line (without CR LF) is in lb[0..ll): st 1 is "*count", st 6 is "$length", st 5 is an inline command
+    private void endLine() {
+        if (st == 5) {
+            if (!splitInline()) {
+                if (error == 0) fail(E_PROTOCOL);
+                return;
+            }
+            if (argc_ == 0) { st = 0; return; }       // an empty line: ignored
+            st = 0;
+            ready = true;
+            commands++;
+            return;
+        }
+        int v = 0;
+        if (!parseInt(lb, ll, &v)) { fail(E_NUMBER); return; }
+        if (st == 1) {
+            if (v <= 0) { st = 0; return; }            // *0 and *-1 are ignored, as Redis does
+            if (v > maxArgs) { fail(E_TOO_MANY); return; }
+            expect = v;
+            st = 2;
+            return;
+        }
+        // st == 6
+        if (v < 0 || v > maxBulk) { fail(v < 0 ? E_NUMBER : E_TOO_BIG); return; }
+        if (alen + v > maxCommand) { fail(E_TOO_BIG); return; }
+        if (!grow(0, alen) || !slot()) { if (error == 0) fail(E_TOO_BIG); return; }      // room for the data comes with the data (feed)
+        bulkStart = alen;
+        bulkLeft = v;
+        off[argc_] = alen;
+        alens[argc_] = v;
+        if (v == 0) { st = 4; crPending = 0; } else { st = 3; }
+    }
+
+    // Consumes bytes up to the end of the first complete command and returns how many it took (all of them if no command is complete yet).
+    public int feed(char* d, int n) {
+        int i = 0;
+        while (i < n && error == 0 && !ready) {
+            if (st == 3) {
+                int take = bulkLeft;
+                if (take > n - i) take = n - i;
+                int done = alens[argc_] - bulkLeft;
+                if (take > 0 && !grow(done + take, bulkStart + done)) break;
+                if (take > 0) memcpy(&arena[bulkStart + done], &d[i], take);
+                bulkLeft = bulkLeft - take;
+                i = i + take;
+                if (bulkLeft == 0) { st = 4; crPending = 0; }
+                continue;
+            }
+            int c = d[i] & 255;
+            i++;
+            if (st == 0) {
+                if (c == '*') { st = 1; ll = 0; argc_ = 0; alen = 0; continue; }
+                if (c == 13 || c == 10) continue;             // blank lines between commands
+                st = 5;                                       // an inline command: this is its first character
+                ll = 0;
+                argc_ = 0;
+                alen = 0;
+            } else if (st == 2) {
+                if (c != '$') { fail(E_PROTOCOL); break; }
+                st = 6;
+                ll = 0;
+                continue;
+            } else if (st == 4) {
+                if (crPending == 0) {
+                    if (c != 13) { fail(E_PROTOCOL); break; }
+                    crPending = 1;
+                } else {
+                    if (c != 10) { fail(E_PROTOCOL); break; }
+                    arena[bulkStart + alens[argc_]] = 0;
+                    alen = bulkStart + alens[argc_] + 1;
+                    argc_++;
+                    if (argc_ >= expect) {
+                        st = 0;
+                        ready = true;
+                        commands++;
+                    } else {
+                        st = 2;
+                    }
+                }
+                continue;
+            }
+            // a line (st 1, 5, 6)
+            if (c == 10) {
+                if (st == 5) {
+                    if (ll > 0 && lb[ll - 1] == 13) ll--;
+                } else {
+                    if (ll == 0 || lb[ll - 1] != 13) { fail(E_PROTOCOL); break; }
+                    ll--;
+                }
+                endLine();
+                ll = 0;
+            } else {
+                if (ll >= maxInline) { fail(E_TOO_BIG); break; }
+                if (lb == null || ll >= lcap) {
+                    int nc = lcap == 0 ? 128 : lcap * 2;
+                    if (!charge(lcap, nc)) { fail(E_BUDGET); break; }
+                    char* nb = malloc(nc);
+                    if (nb == null) { charge(nc, lcap); fail(E_TOO_BIG); break; }
+                    if (lb != null) { memcpy(nb, lb, ll); free(lb); }
+                    lb = nb;
+                    lcap = nc;
+                }
+                lb[ll] = c;
+                ll++;
+            }
+        }
+        return i;
+    }
+
+    // the command was handled: ready for the next one
+    public void clear() {
+        ready = false;
+        argc_ = 0;
+        alen = 0;
+        if (acap > 65536) { charge(acap, 0); free(arena); arena = null; acap = 0; }
+    }
+
+    public void reset() {
+        clear();
+        st = 0;
+        ll = 0;
+        error = 0;
+        bulkLeft = 0;
+        if (lb != null && lcap > 4096) { charge(lcap, 0); free(lb); lb = null; lcap = 0; }
+    }
+
+    public void dispose() {
+        if (lb != null) free(lb);
+        if (arena != null) free(arena);
+        if (off != null) { free((char*) off); free((char*) alens); }
+        if (budget != null) { *budget = *budget - held; held = 0; }
+        lb = null; arena = null; off = null; alens = null; lcap = 0; acap = 0; ocap = 0;
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
+    }
+}
+
+public CmdParser* newCmdParser() {
+    CmdParser* p = (CmdParser*) malloc(sizeof(CmdParser));
+    if (p == null) return null;
+    p->init();
+    p->heap = true;
+    return p;
+}
+
+// ---- the client ------------------------------------------------------------------------------------------------------------------
+private char lastErr[200];
+private void setLast(char* s) {
+    int n = strlen(s);
+    if (n > 199) n = 199;
+    memcpy(&lastErr[0], s, n);
+    lastErr[n] = 0;
+}
+// why the last connect() failed
+public char* error() { return &lastErr[0]; }
+
+private char* copyOf(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+public class Options {
+    public char* username;              // AUTH username password (Redis 6 ACL); null: AUTH password
+    public char* password;              // null: no AUTH
+    public int db;                      // SELECT after connecting (default 0)
+    public bool useTls;
+    public bool verify;                 // check the server's certificate (default true)
+    public int connectTimeoutMs;        // default 5000
+    public int timeoutMs;               // for every reply, default 5000; 0 waits for ever
+    public bool autoReconnect;          // default true: a call on a closed connection connects again (AUTH and SELECT are repeated)
+    public int maxBulk;                 // the largest bulk string accepted in a reply, default 64 MiB
+    public int maxOut;                  // the largest request (a command or a pipeline) in bytes, default 64 MiB
+
+    public Options() { init(); }
+
+    public void init() {
+        verify = true;
+        connectTimeoutMs = 5000;
+        timeoutMs = 5000;
+        autoReconnect = true;
+        maxBulk = 67108864;
+        maxOut = 67108864;
+    }
+}
+
+public class Client {
+    public Options* options;
+    public bool ownsOptions;
+    public bool heap;
+    public char* error;                 // the last problem (a constant text or the text of an error reply)
+    public int commands;                // commands sent
+    public int reconnects;              // connections made after the first
+    public bool inMulti;                // MULTI was sent and EXEC / DISCARD not yet
+
+    private char* host;
+    private int port;
+    private netio.Link* link;
+    private ReplyParser* parser;
+    private netio.Queue out;
+    private char* rbuf;
+    private int rpos;
+    private int rlen;
+    private bool everConnected;
+    private char* ownUser;
+    private char* ownPass;
+    private char errBuf[200];
+    private bool soft;
+
+    public Client() { init(); }
+    public void init() { error = ""; }
+
+    public bool isConnected() { return link != null && link->isOpen(); }
+
+    public void setHost(char* h, int p) {
+        if (host != null) free(host);
+        host = copyOf(h);
+        port = p;
+    }
+
+    public void setCredentials(char* user, char* pass) {
+        if (ownUser != null) free(ownUser);
+        if (ownPass != null) free(ownPass);
+        ownUser = user == null ? null : copyOf(user);
+        ownPass = pass == null ? null : copyOf(pass);
+        options->username = ownUser;
+        options->password = ownPass;
+    }
+
+    // closes the connection (the next call connects again when autoReconnect is on)
+    public void close() {
+        if (link != null) link->close();
+        if (parser != null) parser->reset();
+        rpos = 0;
+        rlen = 0;
+        inMulti = false;
+    }
+
+    private void fail(char* why) {
+        error = why;
+        close();
+    }
+
+    // Connects now (blocks up to connectTimeoutMs for the TCP connection, again for TLS); runs AUTH and SELECT. false: error says why.
+    public bool connect() {
+        if (host == null) { error = "no host"; return false; }
+        if (link == null) {
+            link = netio.newLink();
+            if (link == null) { error = "out of memory"; return false; }
+        }
+        if (link->isOpen()) return true;
+        if (parser == null) {
+            parser = newReplyParser();
+            if (parser == null) { error = "out of memory"; return false; }
+        }
+        parser->maxBulk = options->maxBulk;
+        parser->reset();
+        out.max = options->maxOut;
+        out.clear();
+        if (!link->open(host, port, options->connectTimeoutMs, options->useTls, options->verify)) {
+            error = link->error;
+            return false;
+        }
+        if (rbuf == null) rbuf = malloc(16384);
+        rpos = 0;
+        rlen = 0;
+        inMulti = false;
+        if (everConnected) reconnects++;
+        everConnected = true;
+        if (options->password != null) {
+            Reply* r = null;
+            if (options->username != null) r = rawCall3("AUTH", options->username, options->password);
+            else r = rawCall3("AUTH", options->password, null);
+            if (r == null) return false;
+            bool ok = r->isStatus("OK");
+            if (!ok) { setErrorFrom(r); }
+            r->dispose();
+            if (!ok) { close(); return false; }
+        }
+        if (options->db != 0) {
+            char num[24];
+            format(&num[0], 24, "%d", options->db, 0, 0, 0);
+            Reply* r = rawCall3("SELECT", &num[0], null);
+            if (r == null) return false;
+            bool ok = r->isStatus("OK");
+            if (!ok) { setErrorFrom(r); }
+            r->dispose();
+            if (!ok) { close(); return false; }
+        }
+        return true;
+    }
+
+    private Reply* rawCall3(char* a, char* b, char* c) {
+        char* argv[3];
+        argv[0] = a;
+        int n = 1;
+        if (b != null) { argv[1] = b; n = 2; }
+        if (c != null) { argv[2] = c; n = 3; }
+        out.clear();
+        if (!putCommand(&out, n, &argv[0], null)) { fail("command too large"); return null; }
+        if (!link->sendAll(out.data(), out.pending(), options->timeoutMs > 0 ? options->timeoutMs : 60000)) { fail("the connection failed"); return null; }
+        out.clear();
+        commands++;
+        return readReply();
+    }
+
+    private void setErrorFrom(Reply* r) {
+        if (r->type == T_ERROR && r->str != null) {
+            int n = r->len > 190 ? 190 : r->len;
+            memcpy(&errBuf[0], r->str, n);
+            errBuf[n] = 0;
+            error = &errBuf[0];
+        }
+    }
+    // reads one reply (waits at most timeoutMs); null: the connection failed or timed out (the connection is closed then)
+    private Reply* readReply() {
+        int limit = options->timeoutMs;
+        int t0 = millis();
+        for (;;) {
+            Reply* r = parser->take();
+            if (r != null) return r;
+            if (parser->error != 0) { char* why = errorText(parser->error); fail(why); return null; }
+            if (rpos < rlen) {
+                int used = parser->feed(&rbuf[rpos], rlen - rpos);
+                rpos = rpos + used;
+                continue;
+            }
+            rpos = 0;
+            rlen = 0;
+            int left = limit > 0 ? limit - (millis() - t0) : 1000;
+            if (limit > 0 && left <= 0) {
+                if (soft) return null;                  // a read that may time out (pub/sub): the connection stays
+                fail("timed out waiting for the reply");
+                return null;
+            }
+            if (!link->waitReadable(left > 100 || limit == 0 ? 100 : left)) continue;
+            int n = link->recv(rbuf, 16384);
+            if (n == -2) continue;
+            if (n == 0) { fail("the server closed the connection"); return null; }
+            if (n < 0) { fail("the connection failed"); return null; }
+            rlen = n;
+        }
+        return null;
+    }
+
+    // ---- commands ----------------------------------------------------------------------------------------------------------------------------
+    // One command with argc arguments (lens may be null: strlen; give the lengths for binary data). The reply is yours (dispose it); null when
+    // the connection failed or timed out (error says why). An error reply of the server is returned as a Reply of type T_ERROR.
+    public Reply* callv(int argc, char** argv, int* lens) {
+        if (!isConnected()) {
+            if (!options->autoReconnect && everConnected) { error = "not connected"; return null; }
+            if (!connect()) return null;
+        }
+        out.clear();
+        if (!putCommand(&out, argc, argv, lens)) { error = "the command is too large"; out.clear(); return null; }
+        if (!link->sendAll(out.data(), out.pending(), options->timeoutMs > 0 ? options->timeoutMs : 60000)) { fail("the connection failed"); return null; }
+        out.clear();
+        out.shrink(65536);
+        commands++;
+        Reply* r = readReply();
+        if (r != null && r->type == T_ERROR) setErrorFrom(r);
+        return r;
+    }
+
+    // call("SET", "key", "value"): up to six text arguments
+    public Reply* call(char* a, char* b = null, char* c = null, char* d = null, char* e = null, char* f = null) {
+        char* argv[6];
+        argv[0] = a;
+        int n = 1;
+        if (b != null) { argv[n] = b; n++; if (c != null) { argv[n] = c; n++; if (d != null) { argv[n] = d; n++; if (e != null) { argv[n] = e; n++; if (f != null) { argv[n] = f; n++; } } } } }
+        return callv(n, &argv[0], null);
+    }
+
+    // the integer of a reply (the reply is disposed): fallback for anything else
+    private int intOf(Reply* r, int fallback) {
+        if (r == null) return fallback;
+        int v = fallback;
+        if (r->type == T_INT) v = r->num;
+        r->dispose();
+        return v;
+    }
+
+    private bool okOf(Reply* r) {
+        if (r == null) return false;
+        bool ok = r->type == T_STATUS;
+        r->dispose();
+        return ok;
+    }
+
+    // the text of a bulk reply as a new heap string (free it), null for nil and for anything else; *len gets the length
+    private char* textOf(Reply* r, int* len) {
+        if (r == null) return null;
+        char* s = null;
+        if (r->type == T_BULK) {
+            s = malloc(r->len + 1);
+            if (s != null) { memcpy(s, r->str, r->len); if (len != null) *len = r->len; }
+        }
+        r->dispose();
+        return s;
+    }
+
+    public bool ping() { return okOf(call("PING")); }
+    public bool select(int db) {
+        char num[24];
+        format(&num[0], 24, "%d", db, 0, 0, 0);
+        bool ok = okOf(call("SELECT", &num[0]));
+        if (ok) options->db = db;
+        return ok;
+    }
+    public bool auth(char* password) {
+        bool ok = okOf(call("AUTH", password));
+        if (ok) { if (ownPass != null) free(ownPass); ownPass = copyOf(password); options->password = ownPass; }
+        return ok;
+    }
+
+    // ---- strings ------------------------------------------------------------------------------------------------------------------------------
+    public bool set(char* key, char* value) { return okOf(call("SET", key, value)); }
+    public bool setEx(char* key, char* value, int seconds) {
+        char num[24];
+        format(&num[0], 24, "%d", seconds, 0, 0, 0);
+        return okOf(call("SET", key, value, "EX", &num[0]));
+    }
+    // binary values
+    public bool setBin(char* key, char* data, int n) {
+        char* argv[3];
+        int lens[3];
+        argv[0] = "SET"; lens[0] = 3;
+        argv[1] = key; lens[1] = strlen(key);
+        argv[2] = data; lens[2] = n;
+        return okOf(callv(3, &argv[0], &lens[0]));
+    }
+    // the value as a new heap string (free it); null if the key does not exist
+    public char* get(char* key) { return textOf(call("GET", key), null); }
+    public char* getBin(char* key, int* len) { return textOf(call("GET", key), len); }
+    public int incr(char* key) { return intOf(call("INCR", key), -1); }
+    public int decr(char* key) { return intOf(call("DECR", key), -1); }
+    public int incrBy(char* key, int by) {
+        char num[24];
+        format(&num[0], 24, "%d", by, 0, 0, 0);
+        return intOf(call("INCRBY", key, &num[0]), -1);
+    }
+    public int append(char* key, char* text) { return intOf(call("APPEND", key, text), -1); }
+    public int strLength(char* key) { return intOf(call("STRLEN", key), -1); }
+    public int del(char* key) { return intOf(call("DEL", key), -1); }
+    public int exists(char* key) { return intOf(call("EXISTS", key), -1); }
+    public bool expire(char* key, int seconds) {
+        char num[24];
+        format(&num[0], 24, "%d", seconds, 0, 0, 0);
+        return intOf(call("EXPIRE", key, &num[0]), 0) == 1;
+    }
+    // seconds to live, -1 no expiry, -2 no such key
+    public int ttl(char* key) { return intOf(call("TTL", key), -3); }
+    public Reply* keys(char* pattern) { return call("KEYS", pattern); }
+    public Reply* mget(char* a, char* b = null, char* c = null, char* d = null, char* e = null) { return call("MGET", a, b, c, d, e); }
+    public bool mset(char* k1, char* v1, char* k2 = null, char* v2 = null) {
+        if (k2 == null) return okOf(call("MSET", k1, v1));
+        return okOf(call("MSET", k1, v1, k2, v2));
+    }
+    public int dbsize() { return intOf(call("DBSIZE"), -1); }
+    public bool flushAll() { return okOf(call("FLUSHALL")); }
+    public char* info() { return textOf(call("INFO"), null); }
+    public char* echo(char* text) { return textOf(call("ECHO", text), null); }
+    public int publish(char* channel, char* message) { return intOf(call("PUBLISH", channel, message), -1); }
+
+    // ---- lists --------------------------------------------------------------------------------------------------------------------------------
+    public int lpush(char* key, char* value) { return intOf(call("LPUSH", key, value), -1); }
+    public int rpush(char* key, char* value) { return intOf(call("RPUSH", key, value), -1); }
+    public char* lpop(char* key) { return textOf(call("LPOP", key), null); }
+    public char* rpop(char* key) { return textOf(call("RPOP", key), null); }
+    public int llen(char* key) { return intOf(call("LLEN", key), -1); }
+    public Reply* lrange(char* key, int start, int stop) {
+        char a[24];
+        char b[24];
+        format(&a[0], 24, "%d", start, 0, 0, 0);
+        format(&b[0], 24, "%d", stop, 0, 0, 0);
+        return call("LRANGE", key, &a[0], &b[0]);
+    }
+
+    // ---- hashes -------------------------------------------------------------------------------------------------------------------------------
+    public int hset(char* key, char* field, char* value) { return intOf(call("HSET", key, field, value), -1); }
+    public char* hget(char* key, char* field) { return textOf(call("HGET", key, field), null); }
+    public Reply* hgetall(char* key) { return call("HGETALL", key); }
+    public int hdel(char* key, char* field) { return intOf(call("HDEL", key, field), -1); }
+
+    // ---- sets ---------------------------------------------------------------------------------------------------------------------------------
+    public int sadd(char* key, char* member) { return intOf(call("SADD", key, member), -1); }
+    public int srem(char* key, char* member) { return intOf(call("SREM", key, member), -1); }
+    public Reply* smembers(char* key) { return call("SMEMBERS", key); }
+    public bool sismember(char* key, char* member) { return intOf(call("SISMEMBER", key, member), 0) == 1; }
+
+    // ---- sorted sets: the score is given as text ("1.5", "-inf") ------------------------------------------------------------------------------------------
+    public int zadd(char* key, char* score, char* member) { return intOf(call("ZADD", key, score, member), -1); }
+    public Reply* zrange(char* key, int start, int stop, bool withScores) {
+        char a[24];
+        char b[24];
+        format(&a[0], 24, "%d", start, 0, 0, 0);
+        format(&b[0], 24, "%d", stop, 0, 0, 0);
+        if (withScores) return call("ZRANGE", key, &a[0], &b[0], "WITHSCORES");
+        return call("ZRANGE", key, &a[0], &b[0]);
+    }
+    // the score as text (free it), null if there is none
+    public char* zscore(char* key, char* member) { return textOf(call("ZSCORE", key, member), null); }
+    public int zrem(char* key, char* member) { return intOf(call("ZREM", key, member), -1); }
+    public int zcard(char* key) { return intOf(call("ZCARD", key), -1); }
+
+    // ---- transactions ----------------------------------------------------------------------------------------------------------------------
+    // MULTI: the commands that follow are queued by the server (call returns "QUEUED" for each) until exec() or discard()
+    public bool multi() {
+        bool ok = okOf(call("MULTI"));
+        if (ok) inMulti = true;
+        return ok;
+    }
+    // EXEC: the array with the reply of every queued command (yours: dispose it), or an error reply / null
+    public Reply* exec() {
+        Reply* r = call("EXEC");
+        inMulti = false;
+        return r;
+    }
+    public bool discard() {
+        bool ok = okOf(call("DISCARD"));
+        inMulti = false;
+        return ok;
+    }
+
+    // frees everything; the object too when it came from newClient / connect
+    public void dispose() {
+        if (link != null) { link->dispose(); link = null; }
+        if (parser != null) { parser->dispose(); parser = null; }
+        out.release();
+        if (rbuf != null) { free(rbuf); rbuf = null; }
+        if (host != null) { free(host); host = null; }
+        if (ownUser != null) { free(ownUser); ownUser = null; }
+        if (ownPass != null) { free(ownPass); ownPass = null; }
+        if (ownsOptions && options != null) { free((char*) options); options = null; ownsOptions = false; }
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
+    }
+
+    // internals for Pipeline and PubSub
+    public netio.Link* linkOf() { return link; }
+    public netio.Queue* queue() { return &out; }
+    public Reply* readOne() { return readReply(); }
+    // one reply within ms; null on time out WITHOUT closing the connection (pub/sub waits like that)
+    public Reply* readOneWithin(int ms) {
+        int saved = options->timeoutMs;
+        options->timeoutMs = ms > 0 ? ms : 1;
+        soft = true;
+        Reply* r = readReply();
+        soft = false;
+        options->timeoutMs = saved;
+        return r;
+    }
+    public void failWith(char* why) { fail(why); }
+    public char* hostName() { return host; }
+    public int hostPort() { return port; }
+}
+
+// A Client made with malloc (dispose() frees it completely). options == null: the defaults; `options` stays yours otherwise.
+public Client* newClient(char* host, int port, Options* options) {
+    Client* c = (Client*) malloc(sizeof(Client));
+    if (c == null) return null;
+    c->init();
+    c->heap = true;
+    if (options == null) {
+        options = (Options*) malloc(sizeof(Options));
+        if (options == null) { free((char*) c); return null; }
+        options->init();
+        c->ownsOptions = true;
+    }
+    c->options = options;
+    c->setHost(host, port);
+    return c;
+}
+
+// redis://[[user]:password@]host[:port][/db]   or rediss:// (TLS, verified). No percent-decoding. Connects; null on failure (error() says why).
+public Client* connect(char* url) { return connectWith(url, null); }
+
+public Client* connectWith(char* url, Options* options) {
+    char hostBuf[256];
+    char userBuf[128];
+    char passBuf[256];
+    int port = 6379;
+    bool secure = false;
+    int i = 0;
+    if (startsWith(url, "rediss://")) { secure = true; i = 9; }
+    else if (startsWith(url, "redis://")) i = 8;
+    else { setLast("the URL must start with redis:// or rediss://"); return null; }
+    int at = -1;
+    for (int k = i; url[k] != 0 && url[k] != '/'; k++) { if (url[k] == '@') at = k; }
+    userBuf[0] = 0;
+    passBuf[0] = 0;
+    bool hasUser = false;
+    bool hasPass = false;
+    if (at >= 0) {
+        int colon = -1;
+        for (int k = i; k < at; k++) { if (url[k] == ':') { colon = k; break; } }
+        int ue = colon >= 0 ? colon : at;
+        if (ue - i > 127 || (colon >= 0 && at - colon - 1 > 255)) { setLast("user name or password too long"); return null; }
+        if (ue > i) { memcpy(&userBuf[0], &url[i], ue - i); userBuf[ue - i] = 0; hasUser = true; }
+        if (colon >= 0) { memcpy(&passBuf[0], &url[colon + 1], at - colon - 1); passBuf[at - colon - 1] = 0; hasPass = true; }
+        else { memcpy(&passBuf[0], &url[i], at - i); passBuf[at - i] = 0; hasPass = true; hasUser = false; userBuf[0] = 0; }
+        i = at + 1;
+    }
+    int hl = 0;
+    while (url[i] != 0 && url[i] != ':' && url[i] != '/') {
+        if (hl >= 255) { setLast("host name too long"); return null; }
+        hostBuf[hl] = url[i];
+        hl++;
+        i++;
+    }
+    hostBuf[hl] = 0;
+    if (hl == 0) { setLast("no host in the URL"); return null; }
+    if (url[i] == ':') {
+        i++;
+        port = 0;
+        while (isDigit(url[i])) {
+            port = port * 10 + (url[i] - '0');
+            if (port > 65535) { setLast("bad port"); return null; }
+            i++;
+        }
+        if (port == 0) { setLast("bad port"); return null; }
+    }
+    int db = 0;
+    if (url[i] == '/') {
+        i++;
+        if (url[i] != 0) {
+            while (isDigit(url[i])) { db = db * 10 + (url[i] - '0'); if (db > 1000000) { setLast("bad database number"); return null; } i++; }
+            if (url[i] != 0) { setLast("bad database number"); return null; }
+        }
+    }
+    Options* mine = (Options*) malloc(sizeof(Options));
+    if (mine == null) { setLast("out of memory"); return null; }
+    if (options != null) memcpy((char*) mine, (char*) options, sizeof(Options)); else mine->init();
+    Client* c = newClient(&hostBuf[0], port, mine);
+    if (c == null) { free((char*) mine); setLast("out of memory"); return null; }
+    c->ownsOptions = true;
+    if (secure) mine->useTls = true;
+    if (db != 0) mine->db = db;
+    if (hasPass) c->setCredentials(hasUser ? &userBuf[0] : null, &passBuf[0]);
+    if (!c->connect()) {
+        char* why = c->error;
+        setLast(why);
+        c->dispose();
+        return null;
+    }
+    return c;
+}
+
+// ---- pipelining ------------------------------------------------------------------------------------------------------------------
+// Many commands in one write, then all the replies: p->add(...) as often as you like, p->run(), p->reply(i). Memory: the commands are queued
+// (up to options->maxOut bytes), every reply is kept until dispose().
+public class Pipeline {
+    public Client* c;
+    public int count;                   // commands added
+    public int got;                     // replies received
+    public bool heap;
+    private netio.Queue q;
+    private Reply** replies;
+    private int rcap;
+
+    public bool add(char* a, char* b = null, char* c2 = null, char* d = null, char* e = null, char* f = null) {
+        char* argv[6];
+        argv[0] = a;
+        int n = 1;
+        if (b != null) { argv[n] = b; n++; if (c2 != null) { argv[n] = c2; n++; if (d != null) { argv[n] = d; n++; if (e != null) { argv[n] = e; n++; if (f != null) { argv[n] = f; n++; } } } } }
+        return addv(n, &argv[0], null);
+    }
+
+    public bool addv(int argc, char** argv, int* lens) {
+        q.max = c->options->maxOut;
+        if (!putCommand(&q, argc, argv, lens)) return false;
+        count++;
+        return true;
+    }
+
+    // sends everything and reads the replies. false when the connection failed or timed out (reply(i) is null for the replies that did not come)
+    public bool run() {
+        if (count == 0) return true;
+        if (!c->isConnected() && !c->connect()) return false;
+        if (count > rcap) {
+            Reply** nr = (Reply**) malloc(count * 8);
+            if (nr == null) return false;
+            for (int i = 0; i < got; i++) nr[i] = replies[i];
+            if (replies != null) free((char*) replies);
+            replies = nr;
+            rcap = count;
+        }
+        int to = c->options->timeoutMs > 0 ? c->options->timeoutMs : 60000;
+        if (!c->linkOf()->sendAll(q.data(), q.pending(), to * 4)) { c->failWith("the connection failed"); return false; }
+        q.clear();
+        q.shrink(65536);
+        while (got < count) {
+            Reply* r = c->readOne();
+            if (r == null) return false;
+            replies[got] = r;
+            got++;
+        }
+        return true;
+    }
+
+    // the i-th reply (not yours: dispose() frees it), null if it did not come
+    public Reply* reply(int i) { return (i >= 0 && i < got) ? replies[i] : null; }
+
+    // forgets the commands and the replies for the next round
+    public void reset() {
+        for (int i = 0; i < got; i++) { if (replies[i] != null) replies[i]->dispose(); replies[i] = null; }
+        got = 0;
+        count = 0;
+        q.clear();
+    }
+
+    public void dispose() {
+        reset();
+        if (replies != null) free((char*) replies);
+        replies = null;
+        rcap = 0;
+        q.release();
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
+    }
+}
+
+public Pipeline* pipeline(Client* c) {
+    Pipeline* p = (Pipeline*) malloc(sizeof(Pipeline));
+    if (p == null) return null;
+    p->c = c;
+    p->heap = true;
+    return p;
+}
+
+// ---- publish / subscribe -----------------------------------------------------------------------------------------------------------
+// In RESP2 a connection that subscribed can do nothing else, so a PubSub has a connection of its own (made from the client's settings: host, TLS,
+// AUTH). subscribe() / psubscribe() send the command at once; next() waits for a message and also reads the confirmations. A lost connection is made again by
+// next() (when options->autoReconnect is on) and every channel and pattern is subscribed again.
+public class PubMessage {
+    public char* channel;
+    public char* pattern;               // null for a plain channel message
+    public char* data;
+    public int len;
+
+    public void dispose() { free((char*) this); }
+}
+
+private PubMessage* newPubMessage(char* pattern, char* channel, char* data, int n) {
+    int pl = pattern == null ? 0 : strlen(pattern) + 1;
+    int cl = strlen(channel) + 1;
+    PubMessage* m = (PubMessage*) malloc(sizeof(PubMessage) + pl + cl + n + 1);
+    if (m == null) return null;
+    char* base = (char*) m;
+    int at = sizeof(PubMessage);
+    m->channel = &base[at];
+    memcpy(m->channel, channel, cl);
+    at = at + cl;
+    if (pattern != null) { m->pattern = &base[at]; memcpy(m->pattern, pattern, pl); at = at + pl; }
+    m->data = &base[at];
+    if (n > 0) memcpy(m->data, data, n);
+    m->len = n;
+    return m;
+}
+
+public class PubSub {
+    public Client* c;                   // the connection of its own
+    public int channels;                // channels and patterns the server counts for this connection
+    public char* error;
+    public bool heap;
+    private char* chans[64];
+    private char* pats[64];
+    private int nchans;
+    private int npats;
+
+    private bool ensure() {
+        if (c->isConnected()) return true;
+        if (!c->connect()) { error = c->error; return false; }
+        // after a new connection everything is subscribed again
+        for (int i = 0; i < nchans; i++) { if (!send1("SUBSCRIBE", chans[i])) return false; }
+        for (int i = 0; i < npats; i++) { if (!send1("PSUBSCRIBE", pats[i])) return false; }
+        return true;
+    }
+
+    private bool send1(char* cmd, char* arg) {
+        char* argv[2];
+        argv[0] = cmd;
+        int n = 1;
+        if (arg != null) { argv[1] = arg; n = 2; }
+        netio.Queue* q = c->queue();
+        q->clear();
+        if (!putCommand(q, n, &argv[0], null)) { error = "command too large"; return false; }
+        int to = c->options->timeoutMs > 0 ? c->options->timeoutMs : 60000;
+        if (!c->linkOf()->sendAll(q->data(), q->pending(), to)) { c->failWith("the connection failed"); error = c->error; return false; }
+        q->clear();
+        return true;
+    }
+
+    private int indexOf(char** list, int n, char* s) {
+        for (int i = 0; i < n; i++) { if (streq(list[i], s)) return i; }
+        return -1;
+    }
+
+    // subscribes to a channel (up to 64 per PubSub); the confirmation arrives through next()
+    public bool subscribe(char* channel) {
+        if (indexOf(&chans[0], nchans, channel) < 0) {
+            if (nchans >= 64) { error = "too many channels"; return false; }
+            chans[nchans] = copyOf(channel);
+            nchans++;
+        }
+        if (!ensure()) return false;
+        return send1("SUBSCRIBE", channel);
+    }
+
+    // a glob pattern: * ? [abc]
+    public bool psubscribe(char* pattern) {
+        if (indexOf(&pats[0], npats, pattern) < 0) {
+            if (npats >= 64) { error = "too many patterns"; return false; }
+            pats[npats] = copyOf(pattern);
+            npats++;
+        }
+        if (!ensure()) return false;
+        return send1("PSUBSCRIBE", pattern);
+    }
+
+    // unsubscribes from one channel, or from all of them (null)
+    public bool unsubscribe(char* channel) {
+        if (channel == null) {
+            for (int i = 0; i < nchans; i++) free(chans[i]);
+            nchans = 0;
+        } else {
+            int i = indexOf(&chans[0], nchans, channel);
+            if (i >= 0) { free(chans[i]); for (int j = i; j + 1 < nchans; j++) chans[j] = chans[j + 1]; nchans--; }
+        }
+        if (!c->isConnected()) return true;
+        return send1("UNSUBSCRIBE", channel);
+    }
+
+    public bool punsubscribe(char* pattern) {
+        if (pattern == null) {
+            for (int i = 0; i < npats; i++) free(pats[i]);
+            npats = 0;
+        } else {
+            int i = indexOf(&pats[0], npats, pattern);
+            if (i >= 0) { free(pats[i]); for (int j = i; j + 1 < npats; j++) pats[j] = pats[j + 1]; npats--; }
+        }
+        if (!c->isConnected()) return true;
+        return send1("PUNSUBSCRIBE", pattern);
+    }
+
+    public bool ping() {
+        if (!ensure()) return false;
+        return send1("PING", null);
+    }
+
+    // The next message, waiting up to timeoutMs (0: only what is there). null: nothing came (error is set when the connection is gone).
+    // Confirmations (subscribe, unsubscribe, pong) are read away; `channels` follows them.
+    public PubMessage* next(int timeoutMs) {
+        int t0 = millis();
+        for (;;) {
+            if (!ensure()) {
+                if (timeoutMs <= 0 || millis() - t0 >= timeoutMs) return null;
+                sleepMs(10);
+                continue;
+            }
+            int left = timeoutMs - (millis() - t0);
+            Reply* r = c->readOneWithin(left < 0 ? 0 : left);
+            if (r == null) {
+                if (!c->isConnected()) {
+                    error = c->error;
+                    if (!c->options->autoReconnect) return null;
+                    if (timeoutMs <= 0 || millis() - t0 >= timeoutMs) return null;
+                    sleepMs(10);
+                    continue;
+                }
+                return null;                                    // time out
+            }
+            PubMessage* m = null;
+            if (r->type == T_ARRAY && r->count >= 3 && r->elems[0]->type == T_BULK) {
+                char* kind = r->elems[0]->str;
+                if (streq(kind, "message") && r->count == 3 && r->elems[1]->type == T_BULK && r->elems[2]->type == T_BULK) {
+                    m = newPubMessage(null, r->elems[1]->str, r->elems[2]->str, r->elems[2]->len);
+                } else if (streq(kind, "pmessage") && r->count == 4 && r->elems[1]->type == T_BULK && r->elems[2]->type == T_BULK && r->elems[3]->type == T_BULK) {
+                    m = newPubMessage(r->elems[1]->str, r->elems[2]->str, r->elems[3]->str, r->elems[3]->len);
+                } else if (r->elems[2]->type == T_INT) {
+                    channels = r->elems[2]->num;                // subscribe / unsubscribe / psubscribe / punsubscribe
+                }
+            }
+            r->dispose();
+            if (m != null) return m;
+            if (timeoutMs <= 0 && !c->isConnected()) return null;
+        }
+        return null;
+    }
+
+    public void dispose() {
+        for (int i = 0; i < nchans; i++) free(chans[i]);
+        for (int i = 0; i < npats; i++) free(pats[i]);
+        nchans = 0;
+        npats = 0;
+        c->dispose();
+        c = null;
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
+    }
+}
+
+// A PubSub on a connection of its own, with the settings of this client (it connects when you subscribe). dispose() frees both.
+public PubSub* pubsub(Client* from) {
+    PubSub* ps = (PubSub*) malloc(sizeof(PubSub));
+    if (ps == null) return null;
+    Options* o = (Options*) malloc(sizeof(Options));
+    if (o == null) { free((char*) ps); return null; }
+    memcpy((char*) o, (char*) from->options, sizeof(Options));
+    o->db = 0;
+    Client* c = newClient(from->hostName(), from->hostPort(), o);
+    if (c == null) { free((char*) o); free((char*) ps); return null; }
+    c->ownsOptions = true;
+    if (o->password != null) c->setCredentials(o->username, o->password);
+    ps->c = c;
+    ps->heap = true;
+    ps->error = "";
+    return ps;
+}

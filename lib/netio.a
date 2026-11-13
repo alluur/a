@@ -1,0 +1,391 @@
+// =============================================================================
+//  netio - the byte queue and the non-blocking client link under mqtt, redis and syslog                       import netio;
+//
+//  Queue is a first-in first-out byte buffer with an optional size limit (what a protocol has queued for sending).
+//  Link is one client connection, plain or TLS, that never blocks once it is open: the TLS session is the state machine of the
+//  `tls` module (no blocking handshake hooks), so a program that watches many connections with its own loop can use it.
+//
+//    netio.Link* l = netio.newLink();
+//    if (!l->open("broker.example.org", 8883, 5000, true, true)) println(l->error);   // TCP connect (blocks up to 5 s) and TLS handshake
+//    l->send(data, n);                                   // bytes taken (0: the socket is full right now), -1: the connection failed
+//    if (l->waitReadable(100)) { int got = l->recv(buf, 4096); }     // > 0 bytes, 0 closed, -2 nothing now, -1 failed
+//    l->close();  l->dispose();                          // dispose() frees the link (a link from newLink)
+//
+//    l->openStart(host, port, 1000, false, true);  ... for (;;) { int r = l->openStep(); if (r != 0) break; }   // 1 open, -1 failed: the same, without ever waiting
+//
+//    netio.Queue q;  q.max = 65536;  q.add(bytes, n);  net.sendSome(fd, q.data(), q.pending());  q.consume(sent);
+//
+//  Everything uses malloc and free: nothing grows for ever when links and queues come and go. net.setIdleHook works: waiting
+//  here runs the hook, so one thread can play both ends of a connection in a test.
+// =============================================================================
+import net;
+import tls;
+import cstdlib;
+module netio;
+
+// ---- a byte queue ----------------------------------------------------------------------------------------------------------------
+public class Queue {
+    public char* d;
+    public int pos;                 // the first byte that is still queued
+    public int len;                 // one past the last
+    public int cap;
+    public int max;                 // 0: no limit; else add() fails when more than this many bytes would be queued
+    public bool overflow;           // set when add() refused
+
+    public int pending() { return len - pos; }
+    public char* data() { return d == null ? "" : &d[pos]; }
+
+    // room for `more` more bytes: moves the queued bytes down or makes the buffer bigger
+    public bool reserve(int more) {
+        if (more < 0) return false;
+        if (pos == len) { pos = 0; len = 0; }
+        if (d != null && len + more <= cap) return true;
+        int need = (len - pos) + more;
+        if (d != null && pos > 0 && need <= cap) {
+            memcpy(d, &d[pos], len - pos);              // forward copy: the areas overlap but the target is below
+            len = len - pos;
+            pos = 0;
+            return true;
+        }
+        int nc = cap < 256 ? 256 : cap;
+        while (nc < need) {
+            nc = nc * 2;
+            if (nc <= 0) return false;
+        }
+        char* nd = malloc(nc);
+        if (nd == null) return false;
+        if (d != null) {
+            memcpy(nd, &d[pos], len - pos);
+            free(d);
+        }
+        len = len - pos;
+        pos = 0;
+        d = nd;
+        cap = nc;
+        return true;
+    }
+
+    public bool add(char* p, int n) {
+        if (n < 0) return false;
+        if (max > 0 && (len - pos) + n > max) { overflow = true; return false; }
+        if (!reserve(n)) { overflow = true; return false; }
+        memcpy(&d[len], p, n);
+        len = len + n;
+        return true;
+    }
+
+    public bool addByte(int b) {
+        if (max > 0 && (len - pos) + 1 > max) { overflow = true; return false; }
+        if (!reserve(1)) { overflow = true; return false; }
+        d[len] = b;
+        len++;
+        return true;
+    }
+
+    public bool addText(char* s) { return add(s, strlen(s)); }
+
+    // drops the first n queued bytes (what has been sent)
+    public void consume(int n) {
+        if (n >= len - pos) { pos = 0; len = 0; return; }
+        if (n > 0) pos = pos + n;
+    }
+
+    public void clear() { pos = 0; len = 0; overflow = false; }
+
+    // gives a big, empty buffer back (keeps one of up to `keep` bytes)
+    public void shrink(int keep) {
+        if (pos == len && cap > keep && d != null) {
+            free(d);
+            d = null;
+            cap = 0;
+            pos = 0;
+            len = 0;
+        }
+    }
+
+    // frees the buffer; the queue can be used again afterwards
+    public void release() {
+        if (d != null) free(d);
+        d = null;
+        cap = 0;
+        pos = 0;
+        len = 0;
+        overflow = false;
+    }
+}
+
+private char* copyText(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+// ---- the client link -------------------------------------------------------------------------------------------------------------
+public class Link {
+    public int fd;                  // -1 when closed
+    public bool secure;             // TLS
+    public char* error;             // why the last open() failed (a constant text or the TLS error; valid until the next open)
+    public int bytesIn;
+    public int bytesOut;
+    public bool heap;               // made by newLink(): dispose() frees the object
+
+    private tls.Tls* t;
+    private char* host;             // a copy, TLS keeps a pointer to it
+    private char* rbuf;
+    private bool tlsEof;
+    private int ast;                // a non-blocking open (openStart): 0 none, 1 TCP connect on its way, 2 TLS handshake on its way
+    private int adeadline;          // when the step it is in gives up (millis)
+    private int atls;               // the handshake's time budget (ms), 0: the open is plain TCP
+    private bool averify;
+
+    public Link() { fd = -1; }
+
+    // connected (and, with TLS, past the handshake); false while an openStart is still on its way
+    public bool isOpen() { return fd >= 0 && ast == 0; }
+
+    // an openStart that openStep has not finished yet
+    public bool opening() { return ast != 0; }
+
+    // Connects (blocks up to timeoutMs) and, with useTls, runs the TLS 1.3 handshake (certificate checked when verify is true).
+    // The socket is non-blocking afterwards.
+    public bool open(char* hostName, int port, int timeoutMs, bool useTls, bool verify) {
+        close();
+        error = null;
+        tlsEof = false;
+        int h = net.connectTimeout(hostName, port, timeoutMs);
+        if (h < 0) { error = "cannot connect"; return false; }
+        fd = h;
+        net.setNoDelay(fd, true);
+        net.setNonBlocking(fd, true);
+        rbuf = malloc(4096);
+        if (rbuf == null) { error = "out of memory"; close(); return false; }
+        if (useTls) {
+            host = copyText(hostName);
+            t = tls.client(host, verify);
+            secure = true;
+            if (!handshake(timeoutMs < 1000 ? 1000 : timeoutMs)) {
+                char* why = error;
+                close();
+                error = why;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Starts to connect WITHOUT waiting (a host name is looked up first: that can block for the resolver's time out, an address cannot). Call openStep()
+    // now and then (every poll turn of a server loop) until it says 1 (open) or -1 (failed; error says why). The TCP connect gets timeoutMs, a TLS
+    // handshake after it at least one second. false when the connect cannot be started at all.
+    public bool openStart(char* hostName, int port, int timeoutMs, bool useTls, bool verify) {
+        close();
+        error = null;
+        tlsEof = false;
+        int h = net.connectStart(hostName, port);
+        if (h < 0) { error = "cannot connect"; return false; }
+        fd = h;
+        net.setNoDelay(fd, true);
+        rbuf = malloc(4096);
+        if (rbuf == null) { error = "out of memory"; close(); return false; }
+        if (useTls) host = copyText(hostName);
+        atls = useTls ? (timeoutMs < 1000 ? 1000 : timeoutMs) : 0;
+        averify = verify;
+        adeadline = millis() + (timeoutMs < 1 ? 1 : timeoutMs);
+        ast = 1;
+        return true;
+    }
+
+    // 1: open, 0: on its way (call again later), -1: failed (the link is closed). Never waits.
+    public int openStep() {
+        if (ast == 0) return fd >= 0 ? 1 : -1;
+        if (ast == 1) {
+            int r = net.connectDone(fd);
+            if (r < 0) { error = "cannot connect"; close(); return -1; }
+            if (r == 0) {
+                if (millis() - adeadline > 0) { error = "the connection timed out"; close(); return -1; }
+                return 0;
+            }
+            if (atls == 0) { ast = 0; return 1; }
+            t = tls.client(host, averify);
+            secure = true;
+            ast = 2;
+            adeadline = millis() + atls;
+        }
+        // ast == 2: the handshake, as far as it goes without waiting
+        for (;;) {
+            while (tls.outLength(t) > 0) {
+                int r = net.sendSome(fd, tls.outData(t), tls.outLength(t));
+                if (r < 0) { error = "the connection failed during the TLS handshake"; close(); return -1; }
+                if (r == 0) break;
+                tls.outConsumed(t, r);
+                bytesOut = bytesOut + r;
+            }
+            if (tls.failed(t)) { char* why = t->error != null ? t->error : "TLS handshake failed"; close(); error = why; return -1; }
+            if (tls.ready(t)) { ast = 0; return 1; }
+            if (tls.closed(t)) { error = "the server closed the connection during the TLS handshake"; close(); return -1; }
+            if (millis() - adeadline > 0) { error = "TLS handshake timed out"; close(); return -1; }
+            int n = net.recvSome(fd, rbuf, 4096);
+            if (n == -2) return 0;
+            if (n <= 0) { error = "the connection ended during the TLS handshake"; close(); return -1; }
+            bytesIn = bytesIn + n;
+            tls.feed(t, rbuf, n);
+        }
+        return 0;
+    }
+
+    private bool handshake(int timeoutMs) {
+        int t0 = millis();
+        for (;;) {
+            while (tls.outLength(t) > 0) {
+                int r = net.sendSome(fd, tls.outData(t), tls.outLength(t));
+                if (r < 0) { error = "the connection failed during the TLS handshake"; return false; }
+                if (r == 0) {
+                    if (millis() - t0 > timeoutMs) { error = "TLS handshake timed out"; return false; }
+                    net.waitWritable(fd, 10);
+                } else {
+                    tls.outConsumed(t, r);
+                    bytesOut = bytesOut + r;
+                }
+            }
+            if (tls.failed(t)) { error = t->error != null ? t->error : "TLS handshake failed"; return false; }
+            if (tls.ready(t)) return true;
+            if (tls.closed(t)) { error = "the server closed the connection during the TLS handshake"; return false; }
+            int left = timeoutMs - (millis() - t0);
+            if (left <= 0) { error = "TLS handshake timed out"; return false; }
+            if (!net.rawWaitReadable(fd, left > 50 ? 50 : left)) continue;
+            int n = net.recvSome(fd, rbuf, 4096);
+            if (n == -2) continue;
+            if (n <= 0) { error = "the connection ended during the TLS handshake"; return false; }
+            bytesIn = bytesIn + n;
+            tls.feed(t, rbuf, n);
+        }
+    }
+
+    // sends what the TLS session has queued; false if the connection failed
+    private bool pushTls() {
+        while (tls.outLength(t) > 0) {
+            int r = net.sendSome(fd, tls.outData(t), tls.outLength(t));
+            if (r < 0) return false;
+            if (r == 0) return true;
+            tls.outConsumed(t, r);
+            bytesOut = bytesOut + r;
+        }
+        return true;
+    }
+
+    // true while encrypted bytes wait for the socket (poll for writing, or call send / flush again soon)
+    public bool hasBacklog() {
+        return secure && t != null && tls.outLength(t) > 0;
+    }
+
+    // tries to send the backlog of a TLS link; false if the connection failed
+    public bool flush() {
+        if (fd < 0) return false;
+        if (secure) return pushTls();
+        return true;
+    }
+
+    // Takes up to n bytes: returns how many were taken (0: the socket is full, try again later; never more than n), -1: failed.
+    public int send(char* data, int n) {
+        if (fd < 0) return -1;
+        if (n <= 0) return 0;
+        if (secure) {
+            if (!pushTls()) return -1;
+            if (tls.outLength(t) > 32768) return 0;
+            int take = n > 16384 ? 16384 : n;
+            if (!tls.write(t, data, take)) return -1;
+            if (!pushTls()) return -1;
+            return take;
+        }
+        int r = net.sendSome(fd, data, n);
+        if (r > 0) bytesOut = bytesOut + r;
+        return r;
+    }
+
+    // Blocking helper for simple senders: all n bytes within timeoutMs, else false (the link is closed on a failure).
+    public bool sendAll(char* data, int n, int timeoutMs) {
+        int t0 = millis();
+        int off = 0;
+        while (off < n) {
+            int r = send(&data[off], n - off);
+            if (r < 0) { close(); return false; }
+            off = off + r;
+            if (r == 0) {
+                if (millis() - t0 > timeoutMs) return false;
+                net.waitWritable(fd, 10);
+            }
+        }
+        for (;;) {
+            if (!flush()) { close(); return false; }
+            if (!hasBacklog()) return true;
+            if (millis() - t0 > timeoutMs) return false;
+            net.waitWritable(fd, 10);
+        }
+    }
+
+    // true when recv() would return something other than -2 (also with decrypted bytes waiting)
+    public bool waitReadable(int ms) {
+        if (fd < 0) return true;
+        if (secure && (tls.available(t) > 0 || tlsEof)) return true;
+        return net.rawWaitReadable(fd, ms);
+    }
+
+    // Up to max bytes: > 0 data, 0 the other side closed, -2 nothing right now, -1 the connection failed. Never blocks.
+    public int recv(char* buf, int max) {
+        if (fd < 0) return 0;
+        if (!secure) {
+            int r = net.recvSome(fd, buf, max);
+            if (r > 0) bytesIn = bytesIn + r;
+            return r;
+        }
+        for (int round = 0; round < 8; round++) {
+            if (tls.available(t) > 0) return tls.readApp(t, buf, max);
+            if (tlsEof) return 0;
+            int n = net.recvSome(fd, rbuf, 4096);
+            if (n == -2) return -2;
+            if (n < 0) return -1;
+            if (n == 0) { tlsEof = true; continue; }
+            bytesIn = bytesIn + n;
+            tls.feed(t, rbuf, n);
+            if (tls.failed(t)) { pushTls(); return -1; }
+            if (tls.closed(t)) tlsEof = true;
+            if (!pushTls()) return -1;
+        }
+        return -2;
+    }
+
+    // Closes the connection (a TLS link says goodbye first). The Link can be opened again.
+    public void close() {
+        if (fd >= 0) {
+            if (secure && t != null && tls.ready(t)) {
+                tls.shutdown(t);
+                pushTls();
+            }
+            net.rawClose(fd);
+            fd = -1;
+        }
+        if (t != null) { tls.release(t); t = null; }
+        if (host != null) { free(host); host = null; }
+        if (rbuf != null) { free(rbuf); rbuf = null; }
+        secure = false;
+        ast = 0;
+    }
+
+    // close(), and the object itself is freed when it came from newLink()
+    public void dispose() {
+        close();
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+}
+
+// a Link that dispose() frees completely
+public Link* newLink() {
+    Link* l = (Link*) malloc(sizeof(Link));
+    if (l == null) return null;
+    l->fd = -1;
+    l->heap = true;
+    return l;
+}

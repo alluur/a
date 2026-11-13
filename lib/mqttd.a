@@ -1,0 +1,1505 @@
+// =============================================================================
+//  mqttd - an MQTT 3.1.1 broker for tests, for AOS and for small installations                                import mqttd;
+//
+//    mqttd.Server* s = mqttd.newServer();
+//    s->broker->addUser("alice", "secret");  s->broker->allowAnonymous = false;       // user names and passwords (or authHook)
+//    if (!s->listen(1883)) { ... }                                                   // s->listenTls(8883, tls.loadConfig(certPem, keyPem)); port 0: a free one (s->port)
+//    s->run();                                                                       // or for (;;) { s->poll(50); }
+//
+//  Many clients from one poll loop (netsrv), nothing blocks. What it does: CONNECT / CONNACK with clean or persistent sessions (client id,
+//  session present, a second connection with the same id takes over, but only for the same user: bindSessions), will messages (sent when a client
+//  vanishes, keep-alive runs out or the protocol is broken; not after DISCONNECT; held to the ACL, the ban on $ topics and the topic limits at CONNECT:
+//  CONNACK 5 otherwise), user name and password, PUBLISH with QoS 0, 1 and 2 in both directions (the full PUBACK / PUBREC /
+//  PUBREL / PUBCOMP state machine, DUP, re-sending after a reconnect), retained messages (an empty payload removes one), SUBSCRIBE and UNSUBSCRIBE
+//  with the filters + and # (SUBACK 0x80 for refused ones), a topic tree with wildcard matching, $-topics that wildcards do not reach,
+//  overlapping subscriptions (one copy with the highest QoS), $SYS/broker/clients/connected and more, keep-alive supervision (1.5 times the interval).
+//
+//  Limits (all settable on the broker): maxClients (1000), maxPacket (1 MiB), maxInflight (20 per client), maxQueue / maxQueueBytes (per client; the
+//  messages of a client that is slow or offline; more are dropped and counted), maxQueuedTotal, maxOut (bytes waiting for one socket; a client over
+//  it is cut off), maxSubsPerClient, maxSubscriptions, maxRetained and maxRetainedBytes (a retained message that does not fit is delivered but not kept),
+//  maxSessions (offline persistent sessions; the oldest of the same user go first), maxLevels (topic levels), connectTimeoutMs (a connection must send
+//  CONNECT), sessionExpirySec. Malformed packets close the connection. The retained messages of a SUBSCRIBE are all delivered, as the window and the
+//  output queue allow. A listener with TLS grows by about 20 KB of never-freed heap per handshake (the tls module): see docs/NET.md.
+//
+//  The broker core (mqttd.Broker) has no sockets: open(), feed(peer, bytes, n), the output queue peer->out, tick(nowMs), closed(peer). The tests
+//  drive it directly (with lost packets) and mqttd.Server connects it to netsrv.
+//  Not supported: MQTT 5 and the old 3.1 (a CONNECT with a protocol level other than 4, a real MQTT 5 CONNECT too, is answered with CONNACK 1 and the connection is closed), bridges, persistence on disk, shared subscriptions.
+// =============================================================================
+import mqtt;
+import netio;
+import netsrv;
+import tls;
+import cstdlib;
+module mqttd;
+
+private const W_QUEUED = 0;
+private const W_ACK = 1;                // QoS 1: PUBLISH sent
+private const W_REC = 2;                // QoS 2: PUBLISH sent
+private const W_COMP = 3;               // QoS 2: PUBREL sent
+
+// ---- shared messages ---------------------------------------------------------------------------------------------------------------
+class Msg {
+    public int refs;
+    public char* topic;
+    public char* payload;
+    public int len;
+}
+
+class QItem {
+    public Msg* m;
+    public int qos;
+    public int pid;
+    public int state;
+    public bool retain;
+    public QItem* next;
+}
+
+class Session {
+    public char* id;
+    public char* peer;                  // the Peer (null while offline)
+    public bool clean;
+    public char** sf;                   // subscribed filters and their QoS
+    public int* sq;
+    public int nsub;
+    public int subCap;
+    public QItem** infl;
+    public int ninfl;
+    public int inflCap;
+    public QItem* qHead;
+    public QItem* qTail;
+    public int qCount;
+    public int qBytes;
+    public int nextPid;
+    public char* in2;                   // QoS 2 packets received and not yet released (a bit per identifier)
+    public Msg* will;
+    public int willQos;
+    public bool willRetain;
+    public int mark;
+    public int tmpQos;
+    public int disconnectedAt;
+    public char* username;
+    public char** rTopics;              // retained messages that SUBSCRIBE found and that are still to be sent (the topics: the message is looked up when it is sent)
+    public int* rQos;                   // the granted QoS of the subscription each came from
+    public int rPos;
+    public int rCount;
+    public int rCap;
+    public int rBytes;                  // what the backlog costs (counted in the broker's queued bytes)
+}
+
+class Node {
+    public char* name;
+    public Node* parent;
+    public Node** kids;
+    public int nkids;
+    public int kidCap;
+    public Session** ss;                // subscribers of this exact filter
+    public int* sq;
+    public int ns;
+    public int sCap;
+    public Msg* retained;
+    public int retQos;
+}
+
+public class Peer {
+    public Session* session;
+    public netio.Queue* out;            // what the transport sends; the broker only appends
+    public netio.Queue ownOut;
+    public mqtt.Parser* parser;
+    public char* cookie;                // for the transport (the netsrv connection)
+    public int id;
+    public int openedAt;
+    public int lastRx;
+    public int keepMs;                  // 1.5 times the keep-alive interval, 0: none
+    public bool connected;              // CONNECT was accepted
+    public bool wantClose;              // the transport should close the connection (after sending the output)
+    public bool closeNow;               // ... without waiting for the output
+    public bool detached;
+    public bool doomed;                 // kick() was called
+    public bool sawDisconnect;
+}
+
+public class Stats {
+    public int connects;
+    public int rejected;                // CONNECT refused (CONNACK with a code)
+    public int takeovers;
+    public int messagesIn;              // PUBLISH packets from clients
+    public int messagesOut;             // PUBLISH packets to clients
+    public int dropped;                 // messages that were not delivered because a queue was full
+    public int malformed;               // connections closed for a malformed packet or a protocol violation
+    public int timeouts;                // keep-alive and CONNECT time outs
+    public int evicted;                 // clients cut off because their output queue overflowed
+    public int retainedRefused;         // retained messages that were not stored because maxRetained or maxRetainedBytes was reached (they are still delivered)
+    public int liveMsgs;                // messages in memory (for leak checks)
+    public int liveItems;
+}
+
+public class Broker {
+    public func closeHook;              // closeHook(broker, peer, now): the peer's connection should be closed (peer->closeNow tells how)
+    public func authHook;               // int authHook(broker, clientId, username, password, passwordLength): a CONNACK code (0 accepts); username is null without one
+    public func aclHook;                // int aclHook(broker, clientId, op, topic): 1 allows. op 1: publish, 2: subscribe (topic is the filter)
+    public char* user;
+    public Stats* stats;
+
+    public bool allowAnonymous;         // default true
+    public int maxClients;              // connected clients, default 1000
+    public int maxPacket;               // default 1 MiB
+    public int maxInflight;             // QoS 1/2 messages in flight to one client, default 20 (at most 256)
+    public int maxQueue;                // messages queued for one client, default 1000
+    public int maxQueueBytes;           // their payload bytes, default 1 MiB
+    public int maxQueuedTotal;          // queued payload bytes of all clients, default 32 MiB
+    public int maxOut;                  // bytes waiting for one client's socket, default 4 MiB
+    public int maxSubsPerClient;        // default 200
+    public int maxSubscriptions;        // all clients, default 20000
+    public int maxRetained;             // retained messages, default 10000 ($ topics of the broker do not count)
+    public int maxRetainedBytes;        // what they cost together (payload, topic, tree nodes), default 16 MiB
+    public bool bindSessions;           // default true: a stored session can only be resumed or taken over by a connection with the same user name (else CONNACK 5)
+    public int maxSessions;             // persistent sessions of offline clients, default 1000
+    public int maxLevels;               // topic levels, default 64
+    public int maxTopicLength;          // default 1024
+    public int maxClientIdLength;       // default 256
+    public int connectTimeoutMs;        // a connection must send CONNECT within this time, default 10000
+    public int sessionExpirySec;        // offline persistent sessions are dropped after this long, 0: never (default)
+    public int sysIntervalMs;           // $SYS statistics every this many ms (default 10000), 0: no $SYS topics
+    public int connected;               // clients that are connected now
+    public int now;
+
+    private Node* root;
+    private Session** sess;
+    private int nsess;
+    private int sessCap;
+    private Peer** peers;
+    private int npeers;
+    private int peerCap;
+    private int nextPeerId;
+    private int seq;
+    private mqtt.Packet* pk;
+    private Session** fan;
+    private int nfan;
+    private int fanCap;
+    private char** userNames;
+    private char** userPass;
+    private int nusers;
+    private int totalSubs;
+    private int nRetained;
+    private int retBytes;
+    private int queuedTotal;
+    private int autoId;
+    private int startedAt;
+    private int lastSys;
+    private int lastScan;
+    private int lastSysConn;
+    private int lastSysTotal;
+    private int sysSentMs;
+
+    public Broker() {
+        allowAnonymous = true;
+        maxClients = 1000;
+        maxPacket = 1048576;
+        maxInflight = 20;
+        maxQueue = 1000;
+        maxQueueBytes = 1048576;
+        maxQueuedTotal = 33554432;
+        maxOut = 4194304;
+        maxSubsPerClient = 200;
+        maxSubscriptions = 20000;
+        maxRetained = 10000;
+        maxRetainedBytes = 16777216;
+        bindSessions = true;
+        maxSessions = 1000;
+        maxLevels = 64;
+        maxTopicLength = 1024;
+        maxClientIdLength = 256;
+        connectTimeoutMs = 10000;
+        sysIntervalMs = 10000;
+        stats = new Stats();
+        root = newNode("", 0, null);
+        nextPeerId = 1;
+        pk = (mqtt.Packet*) malloc(sizeof(mqtt.Packet));
+        now = millis();
+        startedAt = now;
+        lastSys = now;
+        lastScan = now;
+        lastSysConn = -1;
+        lastSysTotal = -1;
+    }
+
+    // Sets the clock and the baselines of the timers (the constructor uses millis()). Tests with a fake clock call it first.
+    public void setClock(int nowMs) {
+        now = nowMs;
+        startedAt = nowMs;
+        lastSys = nowMs;
+        lastScan = nowMs;
+    }
+
+    // ---- users --------------------------------------------------------------------------------------------------------------------------------
+    public bool addUser(char* name, char* password) {
+        if (nusers >= 1000) return false;
+        if (userNames == null) {
+            userNames = (char**) malloc(8000);
+            userPass = (char**) malloc(8000);
+        }
+        for (int i = 0; i < nusers; i++) {
+            if (streq(userNames[i], name)) {
+                free(userPass[i]);
+                userPass[i] = copy(password);
+                return true;
+            }
+        }
+        userNames[nusers] = copy(name);
+        userPass[nusers] = copy(password);
+        nusers++;
+        return true;
+    }
+
+    private bool sameBytes(char* a, int an, char* b, int bn) {
+        int diff = an ^ bn;
+        int n = an < bn ? an : bn;
+        for (int i = 0; i < n; i++) diff = diff | (a[i] ^ b[i]);
+        return diff == 0;
+    }
+
+    // ---- nodes ---------------------------------------------------------------------------------------------------------------------------------
+    private Node* newNode(char* name, int len, Node* parent) {
+        Node* n = (Node*) malloc(sizeof(Node));
+        n->name = malloc(len + 1);
+        memcpy(n->name, name, len);
+        n->parent = parent;
+        return n;
+    }
+
+    private int cmpLevel(Node* k, char* name, int len) {
+        for (int i = 0; i < len; i++) {
+            int a = k->name[i] & 255;
+            int b = name[i] & 255;
+            if (a != b) return a - b;
+        }
+        return k->name[len] == 0 ? 0 : 1;
+    }
+
+    // the position of the child with that name, or -(insert position) - 1
+    private int findKid(Node* n, char* name, int len) {
+        int lo = 0;
+        int hi = n->nkids - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int c = cmpLevel(n->kids[mid], name, len);
+            if (c == 0) return mid;
+            if (c < 0) lo = mid + 1; else hi = mid - 1;
+        }
+        return -lo - 1;
+    }
+
+    private Node* kid(Node* n, char* name, int len) {
+        int i = findKid(n, name, len);
+        return i >= 0 ? n->kids[i] : null;
+    }
+
+    private Node* kidCreate(Node* n, char* name, int len) {
+        int i = findKid(n, name, len);
+        if (i >= 0) return n->kids[i];
+        int at = -i - 1;
+        if (n->nkids >= n->kidCap) {
+            int nc = n->kidCap == 0 ? 4 : n->kidCap * 2;
+            Node** nk = (Node**) malloc(nc * 8);
+            for (int k = 0; k < n->nkids; k++) nk[k] = n->kids[k];
+            if (n->kids != null) free((char*) n->kids);
+            n->kids = nk;
+            n->kidCap = nc;
+        }
+        for (int k = n->nkids; k > at; k--) n->kids[k] = n->kids[k - 1];
+        Node* c = newNode(name, len, n);
+        n->kids[at] = c;
+        n->nkids++;
+        return c;
+    }
+
+    private void removeKid(Node* parent, Node* c) {
+        for (int i = 0; i < parent->nkids; i++) {
+            if (parent->kids[i] == c) {
+                for (int j = i; j + 1 < parent->nkids; j++) parent->kids[j] = parent->kids[j + 1];
+                parent->nkids--;
+                parent->kids[parent->nkids] = null;
+                break;
+            }
+        }
+        free(c->name);
+        if (c->kids != null) free((char*) c->kids);
+        if (c->ss != null) { free((char*) c->ss); free((char*) c->sq); }
+        free((char*) c);
+    }
+
+    // removes a node that has become empty, and its parents that are empty too
+    private void prune(Node* n) {
+        while (n != root && n->ns == 0 && n->nkids == 0 && n->retained == null) {
+            Node* p = n->parent;
+            removeKid(p, n);
+            n = p;
+        }
+    }
+
+    // the node for a topic name or filter; create: make the missing ones
+    private Node* nodeFor(char* t, bool create) {
+        Node* n = root;
+        int pos = 0;
+        for (;;) {
+            int e = pos;
+            while (t[e] != 0 && t[e] != '/') e++;
+            Node* c = create ? kidCreate(n, &t[pos], e - pos) : kid(n, &t[pos], e - pos);
+            if (c == null) return null;
+            n = c;
+            if (t[e] == 0) return n;
+            pos = e + 1;
+        }
+        return n;
+    }
+
+    private int levels(char* t) {
+        int n = 1;
+        for (int i = 0; t[i] != 0; i++) { if (t[i] == '/') n++; }
+        return n;
+    }
+
+    // ---- messages ------------------------------------------------------------------------------------------------------------------------------
+    private Msg* newMsg(char* topic, char* payload, int len, int qos) {
+        int tl = strlen(topic);
+        Msg* m = (Msg*) malloc(sizeof(Msg) + tl + 1 + len + 1);
+        if (m == null) return null;
+        char* base = (char*) m;
+        m->refs = 1;
+        m->topic = &base[sizeof(Msg)];
+        memcpy(m->topic, topic, tl);
+        m->payload = &base[sizeof(Msg) + tl + 1];
+        if (len > 0) memcpy(m->payload, payload, len);
+        m->len = len;
+        stats->liveMsgs++;
+        return m;
+    }
+
+    private void unref(Msg* m) {
+        if (m == null) return;
+        m->refs--;
+        if (m->refs <= 0) {
+            stats->liveMsgs--;
+            free((char*) m);
+        }
+    }
+
+    private QItem* newItem(Msg* m, int qos, bool retain) {
+        QItem* it = (QItem*) malloc(sizeof(QItem));
+        if (it == null) return null;
+        it->m = m;
+        m->refs++;
+        it->qos = qos;
+        it->retain = retain;
+        stats->liveItems++;
+        return it;
+    }
+
+    private void freeItem(QItem* it) {
+        if (it->m != null) {
+            if (it->state == W_QUEUED) { queuedTotal = queuedTotal - it->m->len; }
+            unref(it->m);
+        }
+        stats->liveItems--;
+        free((char*) it);
+    }
+
+    // ---- sessions ------------------------------------------------------------------------------------------------------------------------------
+    // position of the session with this id, or -(insert position) - 1
+    private int findSess(char* id) {
+        int lo = 0;
+        int hi = nsess - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            int c = strcmp(sess[mid]->id, id);
+            if (c == 0) return mid;
+            if (c < 0) lo = mid + 1; else hi = mid - 1;
+        }
+        return -lo - 1;
+    }
+
+    public int sessionCount() { return nsess; }
+
+    private Session* addSess(char* id, int at) {
+        if (nsess >= sessCap) {
+            int nc = sessCap == 0 ? 16 : sessCap * 2;
+            Session** ns = (Session**) malloc(nc * 8);
+            for (int i = 0; i < nsess; i++) ns[i] = sess[i];
+            if (sess != null) free((char*) sess);
+            sess = ns;
+            sessCap = nc;
+        }
+        for (int i = nsess; i > at; i--) sess[i] = sess[i - 1];
+        Session* s = (Session*) malloc(sizeof(Session));
+        s->id = copy(id);
+        s->nextPid = 1;
+        sess[at] = s;
+        nsess++;
+        return s;
+    }
+
+    private int offlineCount() {
+        int n = 0;
+        for (int i = 0; i < nsess; i++) { if (sess[i]->peer == null) n++; }
+        return n;
+    }
+
+    // frees a session: its subscriptions, queue, messages in flight and will
+    private void destroySession(Session* s) {
+        for (int i = 0; i < s->nsub; i++) {
+            Node* n = nodeFor(s->sf[i], false);
+            if (n != null) removeSub(n, s);
+            if (n != null) prune(n);
+            free(s->sf[i]);
+            totalSubs--;
+        }
+        if (s->sf != null) { free((char*) s->sf); free((char*) s->sq); }
+        for (int i = 0; i < s->ninfl; i++) freeItem(s->infl[i]);
+        if (s->infl != null) free((char*) s->infl);
+        QItem* it = s->qHead;
+        while (it != null) {
+            QItem* nx = it->next;
+            s->qBytes = s->qBytes - it->m->len;
+            freeItem(it);
+            it = nx;
+        }
+        unref(s->will);
+        freeBacklog(s);
+        if (s->in2 != null) free(s->in2);
+        int at = findSess(s->id);
+        if (at >= 0) {
+            for (int i = at; i + 1 < nsess; i++) sess[i] = sess[i + 1];
+            nsess--;
+            sess[nsess] = null;
+        }
+        free(s->id);
+        if (s->username != null) free(s->username);
+        free((char*) s);
+    }
+
+    private void removeSub(Node* n, Session* s) {
+        for (int i = 0; i < n->ns; i++) {
+            if (n->ss[i] == s) {
+                for (int j = i; j + 1 < n->ns; j++) { n->ss[j] = n->ss[j + 1]; n->sq[j] = n->sq[j + 1]; }
+                n->ns--;
+                return;
+            }
+        }
+    }
+
+    private bool sameUser(char* a, char* b) {
+        if (a == null || b == null) return a == b;
+        return streq(a, b);
+    }
+
+    // makes room for an offline persistent session: the one that the same user (user name) has left for longest is dropped, and only if that user has none
+    // the one that has been gone longest of all (so that one user's sessions do not push out the sessions of the others as long as it has some of its own)
+    private void evictOldestOffline(char* username) {
+        Session* oldest = null;
+        Session* oldestOwn = null;
+        for (int i = 0; i < nsess; i++) {
+            Session* s = sess[i];
+            if (s->peer != null) continue;
+            if (oldest == null || s->disconnectedAt < oldest->disconnectedAt) oldest = s;
+            if (sameUser(s->username, username) && (oldestOwn == null || s->disconnectedAt < oldestOwn->disconnectedAt)) oldestOwn = s;
+        }
+        if (oldestOwn != null) oldest = oldestOwn;
+        if (oldest != null) destroySession(oldest);
+    }
+
+    // ---- peers ---------------------------------------------------------------------------------------------------------------------------------
+    // A new connection. null when maxClients is reached (the transport closes the connection).
+    public Peer* open(int nowMs) {
+        now = nowMs;
+        if (npeers >= maxClients + 16) return null;
+        Peer* p = (Peer*) malloc(sizeof(Peer));
+        if (p == null) return null;
+        p->parser = mqtt.newParser(mqtt.MODE_SERVER, maxPacket);
+        if (p->parser == null) { free((char*) p); return null; }
+        p->out = &p->ownOut;
+        p->ownOut.max = maxOut;
+        p->id = nextPeerId;
+        nextPeerId++;
+        p->openedAt = now;
+        p->lastRx = now;
+        if (npeers >= peerCap) {
+            int nc = peerCap == 0 ? 16 : peerCap * 2;
+            Peer** np = (Peer**) malloc(nc * 8);
+            for (int i = 0; i < npeers; i++) np[i] = peers[i];
+            if (peers != null) free((char*) peers);
+            peers = np;
+            peerCap = nc;
+        }
+        peers[npeers] = p;
+        npeers++;
+        return p;
+    }
+
+    public int peerCount() { return npeers; }
+
+    // the transport has closed the connection (also after a close that the broker asked for): releases the peer
+    public void closed(Peer* p) {
+        if (!p->detached) detach(p, false);
+        for (int i = 0; i < npeers; i++) {
+            if (peers[i] == p) {
+                peers[i] = peers[npeers - 1];
+                npeers--;
+                peers[npeers] = null;
+                break;
+            }
+        }
+        p->parser->dispose();
+        p->ownOut.release();
+        free((char*) p);
+    }
+
+    private void requestClose(Peer* p, bool immediate) {
+        p->wantClose = true;
+        if (immediate) p->closeNow = true;
+        if (closeHook != null) closeHook(this, p, now);
+    }
+
+    // The connection ends: the session lets go of the peer (a clean session is destroyed, a persistent one stays), the will is sent unless graceful
+    private void detach(Peer* p, bool graceful) {
+        if (p->detached) return;
+        p->detached = true;
+        Session* s = p->session;
+        if (s == null) return;
+        p->session = null;
+        if (p->connected) {
+            connected--;
+        }
+        s->peer = null;
+        s->disconnectedAt = now;
+        freeBacklog(s);                     // retained messages that were not sent yet are not sent after a reconnect (subscribe again)
+        if (graceful || p->sawDisconnect) {
+            unref(s->will);
+            s->will = null;
+        } else if (s->will != null) {
+            Msg* w = s->will;
+            s->will = null;
+            routeMsg(w, s->willQos, s->willRetain, null);
+            unref(w);
+        }
+        if (s->clean) {
+            destroySession(s);
+        } else {
+            // messages in flight stay (they are sent again with DUP when the client is back); QoS 0 is not kept
+        }
+        sysClients();
+    }
+
+    // An unrecoverable problem: the connection is to be dropped. The session lets go of it (and the will is sent) at the next safe point, sweep(),
+    // because kick() may be called while messages are being delivered to a list of sessions.
+    private void kick(Peer* p, bool immediate) {
+        p->doomed = true;
+        requestClose(p, immediate);
+    }
+
+    private void sweep() {
+        for (int round = 0; round < 8; round++) {
+            bool any = false;
+            for (int i = 0; i < npeers; i++) {
+                Peer* p = peers[i];
+                if (p->doomed && !p->detached) {
+                    detach(p, false);
+                    any = true;
+                    break;                  // detach may have changed the list
+                }
+            }
+            if (!any) return;
+        }
+    }
+
+    // ---- bytes in -----------------------------------------------------------------------------------------------------------------------------
+    // Bytes from the client. 0: fine; < 0: the connection is to be closed (peer->wantClose is set, the transport also gets closeHook)
+    public int feed(Peer* p, char* data, int n) {
+        if (p->wantClose) return -1;
+        if (!p->parser->feed(data, n)) {
+            stats->malformed++;
+            kick(p, true);
+            sweep();
+            return -1;
+        }
+        p->lastRx = now;
+        int result = 0;
+        for (;;) {
+            int r = p->parser->next(pk);
+            if (r == 0) break;
+            if (r < 0) {
+                stats->malformed++;
+                kick(p, true);
+                result = -1;
+                break;
+            }
+            if (!handle(p, pk)) { result = -1; break; }
+        }
+        sweep();
+        return result;
+    }
+
+    private bool handle(Peer* p, mqtt.Packet* k) {
+        int t = k->type;
+        if (p->doomed) return false;
+        if (!p->connected) {
+            if (t != mqtt.CONNECT || p->session != null) { stats->malformed++; kick(p, true); return false; }
+            return onConnect(p, k);
+        }
+        if (t == mqtt.CONNECT) { stats->malformed++; kick(p, true); return false; }       // a second CONNECT
+        if (t == mqtt.PUBLISH) return onPublish(p, k);
+        if (t == mqtt.PUBACK) { ackItem(p, k->pid, W_ACK); return true; }
+        if (t == mqtt.PUBREC) { recItem(p, k->pid); return true; }
+        if (t == mqtt.PUBCOMP) { ackItem(p, k->pid, W_COMP); return true; }
+        if (t == mqtt.PUBREL) {
+            Session* s = p->session;
+            if (s->in2 != null) s->in2[k->pid >> 3] = s->in2[k->pid >> 3] & ~(1 << (k->pid & 7));
+            return reply(p, mqtt.putAck(p->out, mqtt.PUBCOMP, k->pid));
+        }
+        if (t == mqtt.SUBSCRIBE) return onSubscribe(p, k);
+        if (t == mqtt.UNSUBSCRIBE) return onUnsubscribe(p, k);
+        if (t == mqtt.PINGREQ) return reply(p, mqtt.putEmpty(p->out, mqtt.PINGRESP));
+        if (t == mqtt.DISCONNECT) {
+            p->sawDisconnect = true;
+            detach(p, true);
+            requestClose(p, false);
+            return false;
+        }
+        stats->malformed++;
+        kick(p, true);
+        return false;
+    }
+
+    // false (and the client is cut off) when a packet could not be queued for it
+    private bool reply(Peer* p, bool ok) {
+        if (ok) return true;
+        stats->evicted++;
+        kick(p, true);
+        return false;
+    }
+
+    private bool onConnect(Peer* p, mqtt.Packet* k) {
+        if (k->level != 4 || k->protoName[3] != 'T') {
+            stats->rejected++;
+            mqtt.putConnack(p->out, false, mqtt.CONNACK_BAD_VERSION);
+            requestClose(p, false);
+            p->detached = true;
+            return false;
+        }
+        char* id = k->clientId;
+        char autoName[32];
+        if (k->clientIdLen == 0) {
+            if (!k->clean) return refuse(p, mqtt.CONNACK_ID_REJECTED);
+            autoId++;
+            format(&autoName[0], 32, "auto-%d-%d", now & 0xFFFFFF, autoId, 0, 0);
+            id = &autoName[0];
+        }
+        if (k->clientIdLen > maxClientIdLength) return refuse(p, mqtt.CONNACK_ID_REJECTED);
+        // credentials
+        int code = 0;
+        if (authHook != null) {
+            code = authHook(this, id, k->hasUser ? k->username : null, k->hasPass ? k->password : null, k->passwordLen);
+        } else if (nusers > 0 || !allowAnonymous) {
+            code = k->hasUser ? mqtt.CONNACK_BAD_CREDENTIALS : (allowAnonymous ? 0 : mqtt.CONNACK_NOT_AUTHORIZED);
+            if (k->hasUser) {
+                for (int i = 0; i < nusers; i++) {
+                    if (streq(userNames[i], k->username) && sameBytes(userPass[i], strlen(userPass[i]), k->hasPass ? k->password : "", k->hasPass ? k->passwordLen : 0)) { code = 0; break; }
+                }
+            }
+        }
+        if (code != 0) return refuse(p, code);
+        // A will is a PUBLISH that the broker makes later: it is held to the same rules as a PUBLISH now (otherwise a will would be a way round the ACL, round
+        // the ban on $ topics and round the topic limits)
+        if (k->hasWill) {
+            bool wok = strlen(k->willTopic) <= maxTopicLength && levels(k->willTopic) <= maxLevels && k->willTopic[0] != '$';
+            if (wok && aclHook != null) wok = aclHook(this, id, 1, k->willTopic) != 0;
+            if (!wok) return refuse(p, mqtt.CONNACK_NOT_AUTHORIZED);
+        }
+        int at = findSess(id);
+        Session* s = at >= 0 ? sess[at] : null;
+        // a stored session belongs to the user that made it: another user does not get its subscriptions and queued messages (and does not throw it out)
+        if (s != null && bindSessions && !sameUser(s->username, k->hasUser ? k->username : null)) return refuse(p, mqtt.CONNACK_NOT_AUTHORIZED);
+        if (s != null && s->peer != null) {
+            // the same client id connects again: the old connection is dropped (its will is sent)
+            Peer* old = (Peer*) s->peer;
+            stats->takeovers++;
+            old->sawDisconnect = false;
+            detach(old, false);
+            requestClose(old, true);
+            at = findSess(id);
+            s = at >= 0 ? sess[at] : null;
+        }
+        if (connected >= maxClients) return refuse(p, mqtt.CONNACK_UNAVAILABLE);
+        bool present = false;
+        if (s != null && k->clean) {
+            destroySession(s);
+            s = null;
+        }
+        if (s != null) {
+            present = true;
+        } else {
+            if (!k->clean && offlineCount() >= maxSessions) evictOldestOffline(k->hasUser ? k->username : null);
+            at = findSess(id);
+            s = addSess(id, -at - 1);
+        }
+        s->clean = k->clean;
+        s->peer = (char*) p;
+        p->session = s;
+        p->connected = true;
+        p->keepMs = k->keepAlive * 1500;
+        unref(s->will);
+        s->will = null;
+        if (k->hasWill) {
+            s->will = newMsg(k->willTopic, k->willPayload, k->willLen, k->willQos);
+            s->willQos = k->willQos;
+            s->willRetain = k->willRetain;
+        }
+        if (s->username != null) { free(s->username); s->username = null; }
+        if (k->hasUser) s->username = copy(k->username);
+        connected++;
+        stats->connects++;
+        if (!reply(p, mqtt.putConnack(p->out, present, 0))) return false;
+        // what is still in flight from before is sent again
+        for (int i = 0; i < s->ninfl; i++) {
+            QItem* it = s->infl[i];
+            if (it->state == W_COMP) {
+                if (!reply(p, mqtt.putAck(p->out, mqtt.PUBREL, it->pid))) return false;
+            } else if (it->m != null) {
+                if (!reply(p, mqtt.putPublish(p->out, it->m->topic, it->m->payload, it->m->len, it->qos, it->retain, true, it->pid))) return false;
+                stats->messagesOut++;
+            }
+        }
+        pumpSession(s);
+        sysClients();
+        return true;
+    }
+
+    private bool refuse(Peer* p, int code) {
+        stats->rejected++;
+        mqtt.putConnack(p->out, false, code);
+        p->detached = true;
+        requestClose(p, false);
+        return false;
+    }
+
+    // ---- PUBLISH from a client -------------------------------------------------------------------------------------------------------------------
+    private bool onPublish(Peer* p, mqtt.Packet* k) {
+        Session* s = p->session;
+        stats->messagesIn++;
+        bool allowed = k->topicLen <= maxTopicLength && levels(k->topic) <= maxLevels && k->topic[0] != '$';
+        if (allowed && aclHook != null) allowed = aclHook(this, s->id, 1, k->topic) != 0;
+        if (k->qos == 2) {
+            if (s->in2 == null) s->in2 = malloc(8192);
+            int bit = 1 << (k->pid & 7);
+            bool seen = (s->in2[k->pid >> 3] & bit) != 0;
+            if (!seen) {
+                s->in2[k->pid >> 3] = s->in2[k->pid >> 3] | bit;
+                if (allowed) publishFrom(s, k);
+                else stats->dropped++;
+            }
+            return reply(p, mqtt.putAck(p->out, mqtt.PUBREC, k->pid));
+        }
+        if (allowed) publishFrom(s, k); else stats->dropped++;
+        if (k->qos == 1) return reply(p, mqtt.putAck(p->out, mqtt.PUBACK, k->pid));
+        return true;
+    }
+
+    private void publishFrom(Session* s, mqtt.Packet* k) {
+        Msg* m = newMsg(k->topic, k->payload, k->payloadLen, k->qos);
+        if (m == null) { stats->dropped++; return; }
+        routeMsg(m, k->qos, k->retain, s);
+        unref(m);
+    }
+
+    // A message from the broker itself or the will of a client: public so that programs can publish into the broker
+    public void publish(char* topic, char* payload, int len, int qos, bool retain) {
+        Msg* m = newMsg(topic, payload, len, qos);
+        if (m == null) return;
+        routeMsg(m, qos, retain, null);
+        unref(m);
+    }
+
+    // stores a retained message and hands the message to every matching subscriber
+    private void routeMsg(Msg* m, int qos, bool retain, Session* from) {
+        if (retain) setRetained(m, qos);
+        seq++;
+        nfan = 0;
+        matchNode(root, m->topic, 0, true);
+        for (int i = 0; i < nfan; i++) {
+            Session* s = fan[i];
+            int q = qos < s->tmpQos ? qos : s->tmpQos;
+            deliver(s, m, q, false);
+        }
+    }
+
+    // what a retained message costs: payload, topic, and the tree nodes of its topic (counted as if no node were shared: pessimistic)
+    private int retCost(Msg* m) {
+        return m->len + strlen(m->topic) + 96 + 160 * levels(m->topic);
+    }
+
+    private void removeRetained(Node* n) {
+        retBytes = retBytes - retCost(n->retained);
+        unref(n->retained);
+        n->retained = null;
+        nRetained--;
+        prune(n);
+    }
+
+    private void setRetained(Msg* m, int qos) {
+        Node* n = nodeFor(m->topic, false);
+        bool own = m->topic[0] == '$';          // the broker's own topics (statistics): a few fixed messages, not limited
+        if (m->len == 0) {
+            if (n != null && n->retained != null) removeRetained(n);
+            return;
+        }
+        if (levels(m->topic) > maxLevels) return;
+        int cost = retCost(m);
+        int oldCost = (n != null && n->retained != null) ? retCost(n->retained) : 0;
+        bool isNew = n == null || n->retained == null;
+        if (!own && ((isNew && nRetained >= maxRetained) || retBytes - oldCost + cost > maxRetainedBytes)) {
+            // not stored. A value that is already there would be out of date now: it goes (no retained message is better than a wrong one)
+            stats->retainedRefused++;
+            stats->dropped++;
+            if (!isNew) removeRetained(n);
+            return;
+        }
+        if (isNew) {
+            n = nodeFor(m->topic, true);
+            nRetained++;
+        } else {
+            unref(n->retained);
+            retBytes = retBytes - oldCost;
+        }
+        m->refs++;
+        n->retained = m;
+        n->retQos = qos;
+        retBytes = retBytes + cost;
+    }
+
+    private void addFan(Session* s, int qos) {
+        if (s->mark != seq) {
+            s->mark = seq;
+            s->tmpQos = qos;
+            if (nfan >= fanCap) {
+                int nc = fanCap == 0 ? 32 : fanCap * 2;
+                Session** nf = (Session**) malloc(nc * 8);
+                for (int i = 0; i < nfan; i++) nf[i] = fan[i];
+                if (fan != null) free((char*) fan);
+                fan = nf;
+                fanCap = nc;
+            }
+            fan[nfan] = s;
+            nfan++;
+        } else if (qos > s->tmpQos) {
+            s->tmpQos = qos;
+        }
+    }
+
+    private void collect(Node* n) {
+        for (int i = 0; i < n->ns; i++) addFan(n->ss[i], n->sq[i]);
+    }
+
+    // the subscribers whose filters match the topic: the tree is walked level by level
+    private void matchNode(Node* n, char* t, int pos, bool first) {
+        bool dollar = first && t[0] == '$';
+        if (!dollar) {
+            Node* h = kid(n, "#", 1);
+            if (h != null) collect(h);
+        }
+        int e = pos;
+        while (t[e] != 0 && t[e] != '/') e++;
+        bool last = t[e] == 0;
+        Node* c = kid(n, &t[pos], e - pos);
+        if (c != null) {
+            if (last) {
+                collect(c);
+                Node* h2 = kid(c, "#", 1);
+                if (h2 != null) collect(h2);
+            } else {
+                matchNode(c, t, e + 1, false);
+            }
+        }
+        if (!dollar) {
+            Node* pl = kid(n, "+", 1);
+            if (pl != null) {
+                if (last) {
+                    collect(pl);
+                    Node* h3 = kid(pl, "#", 1);
+                    if (h3 != null) collect(h3);
+                } else {
+                    matchNode(pl, t, e + 1, false);
+                }
+            }
+        }
+    }
+
+    // ---- delivery --------------------------------------------------------------------------------------------------------------------------------
+    private void deliver(Session* s, Msg* m, int qos, bool retain) {
+        Peer* p = (Peer*) s->peer;
+        if (p == null) {
+            // offline: only persistent sessions keep QoS 1 and 2 messages
+            if (qos == 0 || s->clean) return;
+            enqueue(s, m, qos, retain);
+            return;
+        }
+        if (qos == 0) {
+            if (p->out->pending() + m->len + 64 > maxOut / 2) { stats->dropped++; return; }
+            if (mqtt.putPublish(p->out, m->topic, m->payload, m->len, 0, retain, false, 0)) stats->messagesOut++;
+            else stats->dropped++;
+            return;
+        }
+        if (!enqueue(s, m, qos, retain)) return;
+        pumpSession(s);
+    }
+
+    // queues a QoS 1 or 2 message for a client (false: dropped because a limit is reached)
+    private bool enqueue(Session* s, Msg* m, int qos, bool retain) {
+        if (s->qCount >= maxQueue || s->qBytes + m->len > maxQueueBytes || queuedTotal + m->len > maxQueuedTotal) {
+            stats->dropped++;
+            return false;
+        }
+        QItem* it = newItem(m, qos, retain);
+        if (it == null) { stats->dropped++; return false; }
+        if (s->qTail == null) s->qHead = it; else s->qTail->next = it;
+        s->qTail = it;
+        s->qCount++;
+        s->qBytes = s->qBytes + m->len;
+        queuedTotal = queuedTotal + m->len;
+        return true;
+    }
+
+    private int allocPid(Session* s) {
+        for (int k = 0; k < 65535; k++) {
+            int pid = s->nextPid;
+            s->nextPid++;
+            if (s->nextPid > 65535) s->nextPid = 1;
+            bool used = false;
+            for (int i = 0; i < s->ninfl; i++) { if (s->infl[i]->pid == pid) { used = true; break; } }
+            if (!used) return pid;
+        }
+        return 0;
+    }
+
+    // Starts the delivery of a QoS 1 / 2 item: a packet identifier, the PUBLISH, the item goes to the in-flight list. false: nothing was started
+    // (no free identifier, or the client could not take the packet and was cut off)
+    private bool launch(Session* s, Peer* p, QItem* it) {
+        int pid = allocPid(s);
+        if (pid == 0) return false;
+        if (!mqtt.putPublish(p->out, it->m->topic, it->m->payload, it->m->len, it->qos, it->retain, false, pid)) {
+            stats->evicted++;
+            kick(p, true);
+            return false;
+        }
+        it->pid = pid;
+        it->state = it->qos == 1 ? W_ACK : W_REC;
+        if (s->ninfl >= s->inflCap) {
+            int nc = s->inflCap == 0 ? 8 : s->inflCap * 2;
+            QItem** ni = (QItem**) malloc(nc * 8);
+            for (int i = 0; i < s->ninfl; i++) ni[i] = s->infl[i];
+            if (s->infl != null) free((char*) s->infl);
+            s->infl = ni;
+            s->inflCap = nc;
+        }
+        s->infl[s->ninfl] = it;
+        s->ninfl++;
+        stats->messagesOut++;
+        return true;
+    }
+
+    // sends the retained messages that wait for the client, then the queued QoS 1 / 2 messages, while the window and the client's output queue have room
+    private void pumpSession(Session* s) {
+        Peer* p = (Peer*) s->peer;
+        if (p == null) return;
+        int win = maxInflight;
+        if (win > 256) win = 256;
+        if (win < 1) win = 1;
+        pumpRetained(s, p, win);
+        while (s->qHead != null && s->ninfl < win && p->out->pending() < maxOut / 2) {
+            QItem* it = s->qHead;
+            if (!launch(s, p, it)) return;
+            s->qHead = it->next;
+            if (s->qHead == null) s->qTail = null;
+            it->next = null;
+            s->qCount--;
+            s->qBytes = s->qBytes - it->m->len;
+            queuedTotal = queuedTotal - it->m->len;
+        }
+    }
+
+    // ---- retained messages that wait for a client -----------------------------------------------------------------------------------------------------------
+    // SUBSCRIBE finds the retained messages of the new filters and puts their topics on a list; they are sent as the client's window and output queue have room
+    // (not through the client's queue limits: the spec wants every matching retained message, however many there are). The message itself is looked up when it
+    // is sent: a retained message that was removed or replaced in the meantime is not sent / is sent in its new form.
+    private int backlogCost(char* topic) { return strlen(topic) + 1 + 16; }
+
+    private void queueRetained(Session* s, Node* n, int subQos) {
+        if (n->retained == null) return;
+        char* topic = n->retained->topic;
+        int cost = backlogCost(topic);
+        if (s->rCount - s->rPos >= maxRetained || queuedTotal + cost > maxQueuedTotal) {
+            stats->dropped++;
+            return;
+        }
+        if (s->rCount >= s->rCap) {
+            int live = s->rCount - s->rPos;
+            if (s->rPos > 0 && live < s->rCap) {
+                for (int i = 0; i < live; i++) { s->rTopics[i] = s->rTopics[s->rPos + i]; s->rQos[i] = s->rQos[s->rPos + i]; }
+                s->rPos = 0;
+                s->rCount = live;
+            } else {
+                int nc = s->rCap == 0 ? 16 : s->rCap * 2;
+                char** nt = (char**) malloc(nc * 8);
+                int* nq = (int*) malloc(nc * 8);
+                if (nt == null || nq == null) {
+                    if (nt != null) free((char*) nt);
+                    if (nq != null) free((char*) nq);
+                    stats->dropped++;
+                    return;
+                }
+                for (int i = 0; i < live; i++) { nt[i] = s->rTopics[s->rPos + i]; nq[i] = s->rQos[s->rPos + i]; }
+                if (s->rTopics != null) { free((char*) s->rTopics); free((char*) s->rQos); }
+                s->rTopics = nt;
+                s->rQos = nq;
+                s->rCap = nc;
+                s->rPos = 0;
+                s->rCount = live;
+            }
+        }
+        char* t = copy(topic);
+        if (t == null) { stats->dropped++; return; }
+        s->rTopics[s->rCount] = t;
+        s->rQos[s->rCount] = subQos;
+        s->rCount++;
+        s->rBytes = s->rBytes + cost;
+        queuedTotal = queuedTotal + cost;
+    }
+
+    private void popRetained(Session* s) {
+        int cost = backlogCost(s->rTopics[s->rPos]);
+        free(s->rTopics[s->rPos]);
+        s->rTopics[s->rPos] = null;
+        s->rBytes = s->rBytes - cost;
+        queuedTotal = queuedTotal - cost;
+        s->rPos++;
+        if (s->rPos >= s->rCount) freeBacklog(s);
+    }
+
+    private void freeBacklog(Session* s) {
+        if (s->rTopics == null) return;
+        for (int i = s->rPos; i < s->rCount; i++) free(s->rTopics[i]);
+        queuedTotal = queuedTotal - s->rBytes;
+        free((char*) s->rTopics);
+        free((char*) s->rQos);
+        s->rTopics = null;
+        s->rQos = null;
+        s->rBytes = 0;
+        s->rPos = 0;
+        s->rCount = 0;
+        s->rCap = 0;
+    }
+
+    private void pumpRetained(Session* s, Peer* p, int win) {
+        while (s->rPos < s->rCount && !p->doomed) {
+            if (p->out->pending() >= maxOut / 2) return;
+            Node* n = nodeFor(s->rTopics[s->rPos], false);
+            Msg* m = n == null ? null : n->retained;
+            if (m == null) { popRetained(s); continue; }                   // removed meanwhile
+            int q = n->retQos < s->rQos[s->rPos] ? n->retQos : s->rQos[s->rPos];
+            if (q == 0) {
+                if (!mqtt.putPublish(p->out, m->topic, m->payload, m->len, 0, true, false, 0)) {
+                    stats->evicted++;
+                    kick(p, true);
+                    return;
+                }
+                stats->messagesOut++;
+                popRetained(s);
+                continue;
+            }
+            if (s->ninfl >= win) return;
+            QItem* it = newItem(m, q, true);
+            if (it == null) { stats->dropped++; popRetained(s); continue; }
+            if (!launch(s, p, it)) {
+                it->state = W_ACK;                                          // never queued: freeItem must not take it off the queue's byte count
+                freeItem(it);
+                return;
+            }
+            popRetained(s);
+        }
+    }
+
+    private int inflIndex(Session* s, int pid) {
+        for (int i = 0; i < s->ninfl; i++) { if (s->infl[i]->pid == pid) return i; }
+        return -1;
+    }
+
+    // PUBACK (state W_ACK) or PUBCOMP (W_COMP): the message is done
+    private void ackItem(Peer* p, int pid, int wantState) {
+        Session* s = p->session;
+        int i = inflIndex(s, pid);
+        if (i < 0 || s->infl[i]->state != wantState) return;
+        QItem* it = s->infl[i];
+        for (int j = i; j + 1 < s->ninfl; j++) s->infl[j] = s->infl[j + 1];
+        s->ninfl--;
+        s->infl[s->ninfl] = null;
+        // a finished item does not count as queued: freeItem looks at the state only for queued ones
+        freeItem(it);
+        pumpSession(s);
+    }
+
+    private void recItem(Peer* p, int pid) {
+        Session* s = p->session;
+        int i = inflIndex(s, pid);
+        if (i < 0) return;
+        QItem* it = s->infl[i];
+        if (it->state != W_REC && it->state != W_COMP) return;
+        if (it->m != null) { unref(it->m); it->m = null; }          // the message is not needed any more (only the PUBREL is)
+        it->state = W_COMP;
+        reply(p, mqtt.putAck(p->out, mqtt.PUBREL, pid));
+    }
+
+    // ---- SUBSCRIBE / UNSUBSCRIBE -----------------------------------------------------------------------------------------------------------------
+    private int sessionSub(Session* s, char* filter) {
+        for (int i = 0; i < s->nsub; i++) { if (streq(s->sf[i], filter)) return i; }
+        return -1;
+    }
+
+    private bool onSubscribe(Peer* p, mqtt.Packet* k) {
+        Session* s = p->session;
+        int codes[128];
+        for (int i = 0; i < k->nfilters; i++) {
+            char* f = k->filters[i];
+            int want = k->fqos[i];
+            codes[i] = mqtt.SUBACK_FAILURE;
+            if (strlen(f) > maxTopicLength || levels(f) > maxLevels) continue;
+            if (aclHook != null && aclHook(this, s->id, 2, f) == 0) continue;
+            int si = sessionSub(s, f);
+            if (si >= 0) {
+                s->sq[si] = want;
+                Node* n = nodeFor(f, false);
+                for (int j = 0; j < n->ns; j++) { if (n->ss[j] == s) n->sq[j] = want; }
+                codes[i] = want;
+                continue;
+            }
+            if (s->nsub >= maxSubsPerClient || totalSubs >= maxSubscriptions) continue;
+            Node* n = nodeFor(f, true);
+            if (n->ns >= n->sCap) {
+                int nc = n->sCap == 0 ? 4 : n->sCap * 2;
+                Session** nss = (Session**) malloc(nc * 8);
+                int* nsq = (int*) malloc(nc * 8);
+                for (int j = 0; j < n->ns; j++) { nss[j] = n->ss[j]; nsq[j] = n->sq[j]; }
+                if (n->ss != null) { free((char*) n->ss); free((char*) n->sq); }
+                n->ss = nss;
+                n->sq = nsq;
+                n->sCap = nc;
+            }
+            n->ss[n->ns] = s;
+            n->sq[n->ns] = want;
+            n->ns++;
+            if (s->nsub >= s->subCap) {
+                int nc = s->subCap == 0 ? 4 : s->subCap * 2;
+                char** nf = (char**) malloc(nc * 8);
+                int* nq = (int*) malloc(nc * 8);
+                for (int j = 0; j < s->nsub; j++) { nf[j] = s->sf[j]; nq[j] = s->sq[j]; }
+                if (s->sf != null) { free((char*) s->sf); free((char*) s->sq); }
+                s->sf = nf;
+                s->sq = nq;
+                s->subCap = nc;
+            }
+            s->sf[s->nsub] = copy(f);
+            s->sq[s->nsub] = want;
+            s->nsub++;
+            totalSubs++;
+            codes[i] = want;
+        }
+        if (!reply(p, mqtt.putSuback(p->out, k->pid, &codes[0], k->nfilters))) return false;
+        // retained messages for the new subscriptions
+        for (int i = 0; i < k->nfilters; i++) {
+            if (codes[i] != mqtt.SUBACK_FAILURE) sendRetained(s, k->filters[i], codes[i]);
+        }
+        pumpSession(s);
+        return p->wantClose ? false : true;
+    }
+
+    // lists the retained messages that match a filter for delivery (retain flag set), with the subscription's QoS as the limit
+    private void sendRetained(Session* s, char* filter, int subQos) {
+        retMatch(s, root, filter, 0, true, subQos);
+    }
+
+    private void retEmit(Session* s, Node* n, int subQos) {
+        queueRetained(s, n, subQos);
+    }
+
+    private void retAll(Session* s, Node* n, int subQos, bool skipDollar) {
+        for (int i = 0; i < n->nkids; i++) {
+            Node* c = n->kids[i];
+            if (skipDollar && c->name[0] == '$') continue;
+            retEmit(s, c, subQos);
+            retAll(s, c, subQos, false);
+        }
+    }
+
+    private void retMatch(Session* s, Node* n, char* f, int pos, bool first, int subQos) {
+        int e = pos;
+        while (f[e] != 0 && f[e] != '/') e++;
+        bool last = f[e] == 0;
+        int len = e - pos;
+        if (len == 1 && f[pos] == '#') {
+            if (n != root) retEmit(s, n, subQos);
+            retAll(s, n, subQos, first);
+            return;
+        }
+        if (len == 1 && f[pos] == '+') {
+            for (int i = 0; i < n->nkids; i++) {
+                Node* c = n->kids[i];
+                if (first && c->name[0] == '$') continue;
+                if (last) retEmit(s, c, subQos); else retMatch(s, c, f, e + 1, false, subQos);
+            }
+            return;
+        }
+        Node* c = kid(n, &f[pos], len);
+        if (c == null) return;
+        if (last) retEmit(s, c, subQos); else retMatch(s, c, f, e + 1, false, subQos);
+    }
+
+    private bool onUnsubscribe(Peer* p, mqtt.Packet* k) {
+        Session* s = p->session;
+        for (int i = 0; i < k->nfilters; i++) {
+            int si = sessionSub(s, k->filters[i]);
+            if (si < 0) continue;
+            Node* n = nodeFor(k->filters[i], false);
+            if (n != null) {
+                removeSub(n, s);
+                prune(n);
+            }
+            free(s->sf[si]);
+            for (int j = si; j + 1 < s->nsub; j++) { s->sf[j] = s->sf[j + 1]; s->sq[j] = s->sq[j + 1]; }
+            s->nsub--;
+            totalSubs--;
+        }
+        return reply(p, mqtt.putAck(p->out, mqtt.UNSUBACK, k->pid));
+    }
+
+    // ---- timers ----------------------------------------------------------------------------------------------------------------------------------
+    // Keep-alive supervision, CONNECT time outs, session expiry and the $SYS statistics. Call it from your loop (Server.poll does).
+    public void tick(int nowMs) {
+        now = nowMs;
+        if (now - lastScan >= 20 || now < lastScan) {
+            lastScan = now;
+            for (int i = 0; i < npeers; i++) {
+                Peer* p = peers[i];
+                if (p->wantClose || p->detached) continue;
+                if (!p->connected) {
+                    if (now - p->openedAt > connectTimeoutMs) { stats->timeouts++; kick(p, true); }
+                } else if (p->keepMs > 0 && now - p->lastRx > p->keepMs) {
+                    stats->timeouts++;
+                    kick(p, true);
+                }
+            }
+            for (int i = 0; i < nsess; i++) {
+                if ((sess[i]->qHead != null || sess[i]->rPos < sess[i]->rCount) && sess[i]->peer != null) pumpSession(sess[i]);
+            }
+            sweep();
+            if (sessionExpirySec > 0) {
+                int i = 0;
+                while (i < nsess) {
+                    Session* s = sess[i];
+                    if (s->peer == null && now - s->disconnectedAt > sessionExpirySec * 1000) { destroySession(s); sysClients(); } else i++;
+                }
+            }
+        }
+        if (sysIntervalMs > 0 && now - lastSys >= sysIntervalMs) {
+            lastSys = now;
+            publishSys();
+        }
+    }
+
+    // ---- $SYS ------------------------------------------------------------------------------------------------------------------------------------
+    private void sysNum(char* topic, int v) {
+        char buf[24];
+        int n = format(&buf[0], 24, "%d", v, 0, 0, 0);
+        publish(topic, &buf[0], n, 0, true);
+    }
+
+    // the numbers of connected and known clients: published at once when they change
+    private void sysClients() {
+        if (sysIntervalMs <= 0) return;
+        if (connected != lastSysConn) {
+            lastSysConn = connected;
+            sysNum("$SYS/broker/clients/connected", connected);
+        }
+        if (nsess != lastSysTotal) {
+            lastSysTotal = nsess;
+            sysNum("$SYS/broker/clients/total", nsess);
+            sysNum("$SYS/broker/clients/disconnected", nsess - connected);
+        }
+    }
+
+    // publishes every statistic as a retained message
+    public void publishSys() {
+        if (sysIntervalMs <= 0) return;
+        lastSysConn = connected;
+        lastSysTotal = nsess;
+        sysNum("$SYS/broker/clients/connected", connected);
+        sysNum("$SYS/broker/clients/total", nsess);
+        sysNum("$SYS/broker/clients/disconnected", nsess - connected);
+        sysNum("$SYS/broker/messages/received", stats->messagesIn);
+        sysNum("$SYS/broker/messages/sent", stats->messagesOut);
+        sysNum("$SYS/broker/messages/dropped", stats->dropped);
+        sysNum("$SYS/broker/subscriptions/count", totalSubs);
+        sysNum("$SYS/broker/retained messages/count", nRetained);
+        sysNum("$SYS/broker/uptime", (now - startedAt) / 1000);
+        publish("$SYS/broker/version", "mqttd 1", 7, 0, true);
+    }
+
+    // drops every connection at once (the wills are sent, clean sessions go): for tests and for a restart
+    public void dropAll() {
+        for (int i = 0; i < npeers; i++) kick(peers[i], true);
+        sweep();
+    }
+
+    // the largest number of bytes that wait for one connection's socket (for monitoring and tests)
+    public int maxPeerOutput() {
+        int m = 0;
+        for (int i = 0; i < npeers; i++) {
+            int n = peers[i]->out->pending();
+            if (n > m) m = n;
+        }
+        return m;
+    }
+
+    public int subscriptionCount() { return totalSubs; }
+    public int retainedCount() { return nRetained; }
+    public int retainedBytes() { return retBytes; }
+    public int queuedBytes() { return queuedTotal; }
+
+    // does a session with this id exist (connected or offline)? Its queued / in-flight counts are for tests and monitoring
+    public bool hasSession(char* id) { return findSess(id) >= 0; }
+    public int sessionQueued(char* id) { int i = findSess(id); return i < 0 ? -1 : sess[i]->qCount; }
+    public int sessionInflight(char* id) { int i = findSess(id); return i < 0 ? -1 : sess[i]->ninfl; }
+
+    // frees everything (the broker is not usable afterwards)
+    public void dispose() {
+        while (npeers > 0) closed(peers[npeers - 1]);
+        while (nsess > 0) destroySession(sess[nsess - 1]);
+        freeTree(root);
+        root = null;
+        if (sess != null) free((char*) sess);
+        if (peers != null) free((char*) peers);
+        if (fan != null) free((char*) fan);
+        if (pk != null) free((char*) pk);
+        for (int i = 0; i < nusers; i++) { free(userNames[i]); free(userPass[i]); }
+        if (userNames != null) { free((char*) userNames); free((char*) userPass); }
+        sess = null; peers = null; fan = null; pk = null; userNames = null; userPass = null; nusers = 0;
+        nsess = 0; npeers = 0; nRetained = 0; retBytes = 0;
+    }
+
+    private void freeTree(Node* n) {
+        for (int i = 0; i < n->nkids; i++) freeTree(n->kids[i]);
+        if (n->retained != null) unref(n->retained);
+        free(n->name);
+        if (n->kids != null) free((char*) n->kids);
+        if (n->ss != null) { free((char*) n->ss); free((char*) n->sq); }
+        free((char*) n);
+    }
+}
+
+private char* copy(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+// ---- the server: the broker on sockets -----------------------------------------------------------------------------------------------
+public class Server {
+    public Broker* broker;
+    public netsrv.Server* net;
+    public int port;                    // the port of the first listener
+
+    public Server() {
+        broker = new Broker();
+        net = new netsrv.Server();
+        net->user = (char*) this;
+        net->onOpen = srvOpen;
+        net->onData = srvData;
+        net->onClose = srvClose;
+        net->onTick = srvTick;
+        broker->closeHook = srvKick;
+        broker->user = (char*) this;
+        net->handshakeTimeoutMs = 5000;
+    }
+
+    public bool listen(int p) {
+        bool ok = net->listen(p);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenTls(int p, tls.Config* cfg) {
+        bool ok = net->listenTls(p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+    public bool listenOn(char* host, int p, tls.Config* cfg) {
+        bool ok = net->listenOn(host, p, cfg);
+        if (ok && port == 0) port = net->port;
+        return ok;
+    }
+
+    public int poll(int ms) { return net->poll(ms); }
+    public void run() { net->run(); }
+    public void stop() { net->stop(); }
+    public int clients() { return broker->connected; }
+    public void dropClients() { broker->dropAll(); }
+
+    // drops every connection and frees the broker
+    public void shutdown() {
+        net->shutdown();
+        broker->dispose();
+    }
+}
+
+private int srvOpen(netsrv.Server* s, netsrv.Conn* c) {
+    Server* sv = (Server*) s->user;
+    Broker* b = sv->broker;
+    Peer* p = b->open(millis());
+    if (p == null) return -1;
+    p->out = &c->out;
+    c->out.max = b->maxOut;                              // the broker's setting is the limit of the connection's queue
+    p->cookie = (char*) c;
+    c->user = (char*) p;
+    return 0;
+}
+
+private int srvData(netsrv.Server* s, netsrv.Conn* c, char* data, int n) {
+    Server* sv = (Server*) s->user;
+    Peer* p = (Peer*) c->user;
+    if (p == null) return -1;
+    sv->broker->now = millis();
+    return sv->broker->feed(p, data, n);
+}
+
+private int srvClose(netsrv.Server* s, netsrv.Conn* c) {
+    Server* sv = (Server*) s->user;
+    Peer* p = (Peer*) c->user;
+    if (p == null) return 0;
+    c->user = null;
+    sv->broker->now = millis();
+    sv->broker->closed(p);
+    return 0;
+}
+
+private int srvTick(netsrv.Server* s, int now) {
+    Server* sv = (Server*) s->user;
+    sv->broker->tick(now);
+    return 0;
+}
+
+private int srvKick(Broker* b, Peer* p, int now) {
+    Server* sv = (Server*) b->user;
+    netsrv.Conn* c = (netsrv.Conn*) p->cookie;
+    if (c == null) return 0;
+    if (p->closeNow) sv->net->kill(c); else sv->net->close(c);
+    return 0;
+}
+
+// a Server made with malloc is not needed: servers live as long as the program
+public Server* newServer() { return new Server(); }

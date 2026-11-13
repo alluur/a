@@ -1,0 +1,1820 @@
+// =============================================================================
+//  mqtt - MQTT 3.1.1 client and packet codec                                                                import mqtt;
+//
+//  A client that talks to any MQTT 3.1.1 broker (or to mqttd, the broker module): CONNECT with clean or persistent session,
+//  will, user name and password, TLS; PUBLISH with QoS 0, 1 and 2 (the PUBACK / PUBREC / PUBREL / PUBCOMP state machine, DUP and
+//  re-sending after a reconnect, retained messages); SUBSCRIBE / UNSUBSCRIBE with the filters + and #; keep-alive pings; automatic
+//  reconnect with resubscribe. Two ways to use it: a non-blocking one (poll) and a simple blocking one (publishWait, waitMessage).
+//
+//    mqtt.Client* c = mqtt.connect("mqtt://user:secret@broker.example.org:1883/");       // mqtts:// = TLS; null: mqtt.error()
+//    c->subscribeWait("sensors/+/temp", 1, 3000);                                          // the granted QoS (0..2), 0x80 refused, -1 time out
+//    c->publishWait("sensors/kitchen/temp", "21.5", 4, 1, false, 3000);                    // QoS 1: returns when the PUBACK is there
+//    mqtt.Message* m = c->waitMessage(5000);                                               // null on time out
+//    if (m != null) { println(m->topic); println(m->payload); m->dispose(); }
+//    c->disconnect();  c->dispose();
+//
+//    // non-blocking: your own loop
+//    mqtt.Options* o = new mqtt.Options();  o->clientId = "logger";  o->cleanSession = false;  o->autoReconnect = true;
+//    mqtt.Client* c = mqtt.newClient("localhost", 1883, o);
+//    c->onMessage = handler;                          // handler(client, topic, payload, length, qos, retain): payload valid during the call (+ a 0 byte)
+//    c->connect();  for (;;) { c->poll(100);  ...  }  // poll never waits longer than asked (a reconnect attempt may block up to connectTimeoutMs)
+//
+//  The codec (Parser, Packet, the put... functions, topicMatches) is usable alone: mqttd is built on it, and the tests check it byte for byte.
+//  Not supported: MQTT 5, the old 3.1 (MQIsdp) as a client, WebSocket transport. Memory: everything is malloc / free, messages are
+//  freed with dispose(), queues have limits (maxQueued, maxIncoming, maxOut, maxPacket); more incoming messages than maxIncoming are dropped and counted.
+// =============================================================================
+import net;
+import netio;
+import asys;
+import cstdlib;
+module mqtt;
+
+public const CONNECT = 1;
+public const CONNACK = 2;
+public const PUBLISH = 3;
+public const PUBACK = 4;
+public const PUBREC = 5;
+public const PUBREL = 6;
+public const PUBCOMP = 7;
+public const SUBSCRIBE = 8;
+public const SUBACK = 9;
+public const UNSUBSCRIBE = 10;
+public const UNSUBACK = 11;
+public const PINGREQ = 12;
+public const PINGRESP = 13;
+public const DISCONNECT = 14;
+
+// CONNACK return codes
+public const CONNACK_ACCEPTED = 0;
+public const CONNACK_BAD_VERSION = 1;
+public const CONNACK_ID_REJECTED = 2;
+public const CONNACK_UNAVAILABLE = 3;
+public const CONNACK_BAD_CREDENTIALS = 4;
+public const CONNACK_NOT_AUTHORIZED = 5;
+public const SUBACK_FAILURE = 128;
+
+public const MAX_FILTERS = 128;             // topic filters in one SUBSCRIBE / UNSUBSCRIBE (more is a protocol error for this module)
+public const MAX_REMAINING = 268435455;
+
+// parser errors
+public const E_NONE = 0;
+public const E_TYPE = 1;                    // reserved packet type, or one that must not travel in this direction
+public const E_FLAGS = 2;                   // wrong fixed header flags
+public const E_LENGTH = 3;                  // remaining length malformed, or inconsistent with the content
+public const E_TOO_BIG = 4;                 // larger than maxPacket
+public const E_UTF8 = 5;                    // a string that is not valid UTF-8 (or has a NUL)
+public const E_TOPIC = 6;                   // an invalid topic name or filter
+public const E_QOS = 7;                     // QoS 3, or an invalid requested QoS
+public const E_PACKET_ID = 8;               // packet identifier 0
+public const E_PROTOCOL = 9;                // bad protocol name, connect flags, return code ...
+public const E_BUFFER = 10;                 // more bytes were fed than the parser takes
+
+public const MODE_SERVER = 1;               // the parser reads what a client sends (a broker)
+public const MODE_CLIENT = 2;               // the parser reads what a broker sends
+
+public char* errorText(int e) {
+    if (e == E_NONE) return "no error";
+    if (e == E_TYPE) return "a packet type that is not allowed here";
+    if (e == E_FLAGS) return "wrong fixed header flags";
+    if (e == E_LENGTH) return "malformed length";
+    if (e == E_TOO_BIG) return "packet too large";
+    if (e == E_UTF8) return "a string that is not valid UTF-8";
+    if (e == E_TOPIC) return "invalid topic";
+    if (e == E_QOS) return "invalid QoS";
+    if (e == E_PACKET_ID) return "packet identifier 0";
+    if (e == E_PROTOCOL) return "protocol violation";
+    if (e == E_BUFFER) return "too many bytes fed at once";
+    return "unknown error";
+}
+
+public char* typeName(int t) {
+    if (t == CONNECT) return "CONNECT";
+    if (t == CONNACK) return "CONNACK";
+    if (t == PUBLISH) return "PUBLISH";
+    if (t == PUBACK) return "PUBACK";
+    if (t == PUBREC) return "PUBREC";
+    if (t == PUBREL) return "PUBREL";
+    if (t == PUBCOMP) return "PUBCOMP";
+    if (t == SUBSCRIBE) return "SUBSCRIBE";
+    if (t == SUBACK) return "SUBACK";
+    if (t == UNSUBSCRIBE) return "UNSUBSCRIBE";
+    if (t == UNSUBACK) return "UNSUBACK";
+    if (t == PINGREQ) return "PINGREQ";
+    if (t == PINGRESP) return "PINGRESP";
+    if (t == DISCONNECT) return "DISCONNECT";
+    return "?";
+}
+
+// ---- UTF-8 and topics ------------------------------------------------------------------------------------------------------------
+// Well formed UTF-8 as MQTT wants it: no overlong forms, no surrogates (U+D800..U+DFFF), nothing above U+10FFFF and no NUL (U+0000).
+public bool validUtf8(char* s, int n) {
+    int i = 0;
+    while (i < n) {
+        int c = s[i] & 255;
+        if (c == 0) return false;
+        if (c < 0x80) { i++; continue; }
+        int extra = 0;
+        int cp = 0;
+        int min = 0;
+        if (c >= 0xC2 && c <= 0xDF) { extra = 1; cp = c & 0x1F; min = 0x80; }
+        else if (c >= 0xE0 && c <= 0xEF) { extra = 2; cp = c & 0x0F; min = 0x800; }
+        else if (c >= 0xF0 && c <= 0xF4) { extra = 3; cp = c & 0x07; min = 0x10000; }
+        else return false;
+        if (i + extra >= n) return false;
+        for (int k = 1; k <= extra; k++) {
+            int cc = s[i + k] & 255;
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        if (cp < min || cp > 0x10FFFF) return false;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;
+        i = i + extra + 1;
+    }
+    return true;
+}
+
+// a topic name (what PUBLISH carries): not empty, valid UTF-8, no wildcards
+public bool validTopicName(char* s, int n) {
+    if (n <= 0 || n > 65535) return false;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '+' || s[i] == '#') return false;
+    }
+    return validUtf8(s, n);
+}
+
+// 0, or the parser error for a topic name that is not valid
+private int topicNameError(char* s, int n) {
+    if (n <= 0) return E_TOPIC;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '+' || s[i] == '#') return E_TOPIC;
+    }
+    return validUtf8(s, n) ? 0 : E_UTF8;
+}
+
+// a topic filter (what SUBSCRIBE carries): not empty, '#' only as the last level, '+' only as a whole level
+public bool validTopicFilter(char* s, int n) {
+    if (n <= 0 || n > 65535) return false;
+    if (!validUtf8(s, n)) return false;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '#') {
+            if (i != n - 1) return false;
+            if (i > 0 && s[i - 1] != '/') return false;
+        } else if (s[i] == '+') {
+            if (i > 0 && s[i - 1] != '/') return false;
+            if (i + 1 < n && s[i + 1] != '/') return false;
+        }
+    }
+    return true;
+}
+
+// Does the filter match the topic? Both are NUL terminated texts (a valid filter and a valid topic name).
+// '+' is one level, '#' the rest (and the parent level: "a/#" matches "a"); topics that start with '$' are not matched by a filter that starts with '#' or '+'.
+public bool topicMatches(char* filter, char* topic) {
+    if (topic[0] == '$' && (filter[0] == '#' || filter[0] == '+')) return false;
+    int f = 0;
+    int t = 0;
+    for (;;) {
+        if (filter[f] == '#') return true;
+        if (filter[f] == '+') {
+            while (topic[t] != 0 && topic[t] != '/') t++;
+            f++;
+        } else {
+            while (filter[f] != 0 && filter[f] != '/' && topic[t] != 0 && topic[t] != '/') {
+                if (filter[f] != topic[t]) return false;
+                f++;
+                t++;
+            }
+            if ((filter[f] != 0 && filter[f] != '/') || (topic[t] != 0 && topic[t] != '/')) return false;
+        }
+        if (filter[f] == 0) return topic[t] == 0;
+        if (topic[t] == 0) return filter[f] == '/' && filter[f + 1] == '#' && filter[f + 2] == 0;
+        f++;
+        t++;
+    }
+}
+
+// ---- a packet --------------------------------------------------------------------------------------------------------------------
+// What the parser produces and what put... / encode read. The pointers of a parsed packet point into the parser's buffer and are
+// valid until the next call of feed() or next(); strings are NUL terminated (payloads are not: use payloadLen).
+public class Packet {
+    public int type;
+    public int flags;
+    public int length;                  // the remaining length of the packet
+    public int pid;                     // packet identifier (PUBLISH QoS > 0, PUBACK ... UNSUBACK)
+    // PUBLISH
+    public char* topic;
+    public int topicLen;
+    public char* payload;
+    public int payloadLen;
+    public int qos;
+    public bool dup;
+    public bool retain;
+    // CONNECT
+    public char* protoName;
+    public int level;
+    public bool clean;
+    public int keepAlive;
+    public char* clientId;
+    public int clientIdLen;
+    public bool hasWill;
+    public char* willTopic;
+    public char* willPayload;
+    public int willLen;
+    public int willQos;
+    public bool willRetain;
+    public bool hasUser;
+    public char* username;
+    public bool hasPass;
+    public char* password;
+    public int passwordLen;
+    // CONNACK
+    public bool sessionPresent;
+    public int returnCode;
+    // SUBSCRIBE / UNSUBSCRIBE: the filters and the requested QoS; SUBACK: the return codes (in fqos)
+    public int nfilters;
+    public char* filters[128];
+    public int fqos[128];
+    public int error;
+
+    public void reset() { memset((char*) this, 0, sizeof(Packet)); }
+}
+
+// ---- writing packets -------------------------------------------------------------------------------------------------------------
+// Each function appends one complete packet to the queue, or nothing at all (false: the queue's limit would be passed, or an argument is too big).
+private int lenBytes(int n) {
+    if (n < 128) return 1;
+    if (n < 16384) return 2;
+    if (n < 2097152) return 3;
+    return 4;
+}
+
+// room for `total` bytes, or false (and the overflow flag) without touching the queue
+private bool prepare(netio.Queue* q, int total) {
+    if (q->max > 0 && q->pending() + total > q->max) { q->overflow = true; return false; }
+    if (!q->reserve(total)) { q->overflow = true; return false; }
+    return true;
+}
+
+private void putHead(netio.Queue* q, int type, int flags, int rem) {
+    q->addByte((type << 4) | (flags & 15));
+    int n = rem;
+    for (int i = 0; i < 4; i++) {
+        int b = n % 128;
+        n = n / 128;
+        if (n > 0) b = b | 128;
+        q->addByte(b);
+        if (n == 0) break;
+    }
+}
+
+private void putStr(netio.Queue* q, char* s, int n) {
+    q->addByte(n >> 8);
+    q->addByte(n & 255);
+    if (n > 0) q->add(s, n);
+}
+
+// the remaining length as it goes on the wire: 1 to 4 bytes; returns how many bytes it wrote (0 when n is too large)
+public int encodeLength(int n, char* out) {
+    if (n < 0 || n > MAX_REMAINING) return 0;
+    int k = 0;
+    for (;;) {
+        int b = n % 128;
+        n = n / 128;
+        if (n > 0) b = b | 128;
+        out[k] = b;
+        k++;
+        if (n == 0) return k;
+    }
+}
+
+public bool putConnect(netio.Queue* q, Packet* p) {
+    int idLen = p->clientId == null ? 0 : strlen(p->clientId);
+    int rem = 10 + 2 + idLen;
+    int flags = 0;
+    if (p->clean) flags = flags | 2;
+    int wtl = 0;
+    if (p->hasWill) {
+        if (p->willTopic == null || p->willQos < 0 || p->willQos > 2) return false;
+        wtl = strlen(p->willTopic);
+        if (wtl > 65535 || p->willLen < 0 || p->willLen > 65535) return false;
+        rem = rem + 2 + wtl + 2 + p->willLen;
+        flags = flags | 4 | (p->willQos << 3);
+        if (p->willRetain) flags = flags | 32;
+    }
+    int ul = 0;
+    int pl = 0;
+    if (p->hasUser) {
+        ul = strlen(p->username);
+        if (ul > 65535) return false;
+        rem = rem + 2 + ul;
+        flags = flags | 128;
+    }
+    if (p->hasPass) {
+        if (!p->hasUser) return false;                      // a password needs a user name
+        pl = p->passwordLen;
+        if (pl > 65535) return false;
+        rem = rem + 2 + pl;
+        flags = flags | 64;
+    }
+    if (idLen > 65535) return false;
+    if (!prepare(q, 1 + lenBytes(rem) + rem)) return false;
+    putHead(q, CONNECT, 0, rem);
+    putStr(q, "MQTT", 4);
+    q->addByte(4);
+    q->addByte(flags);
+    q->addByte(p->keepAlive >> 8);
+    q->addByte(p->keepAlive & 255);
+    putStr(q, p->clientId == null ? "" : p->clientId, idLen);
+    if (p->hasWill) {
+        putStr(q, p->willTopic, wtl);
+        putStr(q, p->willPayload, p->willLen);
+    }
+    if (p->hasUser) putStr(q, p->username, ul);
+    if (p->hasPass) putStr(q, p->password, pl);
+    return true;
+}
+
+public bool putConnack(netio.Queue* q, bool sessionPresent, int code) {
+    if (!prepare(q, 4)) return false;
+    q->addByte(0x20);
+    q->addByte(2);
+    q->addByte(sessionPresent ? 1 : 0);
+    q->addByte(code);
+    return true;
+}
+
+// topicLen: strlen(topic) is used when it is negative
+public bool putPublish(netio.Queue* q, char* topic, char* payload, int payloadLen, int qos, bool retain, bool dup, int pid) {
+    int tl = strlen(topic);
+    if (tl == 0 || tl > 65535 || qos < 0 || qos > 2 || payloadLen < 0) return false;
+    if (qos > 0 && (pid < 1 || pid > 65535)) return false;
+    int rem = 2 + tl + (qos > 0 ? 2 : 0) + payloadLen;
+    if (rem > MAX_REMAINING || rem < payloadLen) return false;
+    if (!prepare(q, 1 + lenBytes(rem) + rem)) return false;
+    int fl = (qos << 1) | (retain ? 1 : 0) | (dup && qos > 0 ? 8 : 0);
+    putHead(q, PUBLISH, fl, rem);
+    putStr(q, topic, tl);
+    if (qos > 0) { q->addByte(pid >> 8); q->addByte(pid & 255); }
+    if (payloadLen > 0) q->add(payload, payloadLen);
+    return true;
+}
+
+// PUBACK, PUBREC, PUBREL (flags 2 as the specification says), PUBCOMP, UNSUBACK
+public bool putAck(netio.Queue* q, int type, int pid) {
+    if (pid < 1 || pid > 65535) return false;
+    if (type != PUBACK && type != PUBREC && type != PUBREL && type != PUBCOMP && type != UNSUBACK) return false;
+    if (!prepare(q, 4)) return false;
+    putHead(q, type, type == PUBREL ? 2 : 0, 2);
+    q->addByte(pid >> 8);
+    q->addByte(pid & 255);
+    return true;
+}
+
+// PINGREQ, PINGRESP or DISCONNECT
+public bool putEmpty(netio.Queue* q, int type) {
+    if (type != PINGREQ && type != PINGRESP && type != DISCONNECT) return false;
+    if (!prepare(q, 2)) return false;
+    putHead(q, type, 0, 0);
+    return true;
+}
+
+// SUBSCRIBE: n filters (NUL terminated texts) with their requested QoS
+public bool putSubscribe(netio.Queue* q, int pid, char** filters, int* qos, int n) {
+    if (pid < 1 || pid > 65535 || n < 1 || n > MAX_FILTERS) return false;
+    int rem = 2;
+    for (int i = 0; i < n; i++) {
+        int fl = strlen(filters[i]);
+        if (fl == 0 || fl > 65535 || qos[i] < 0 || qos[i] > 2) return false;
+        rem = rem + 2 + fl + 1;
+    }
+    if (rem > MAX_REMAINING) return false;
+    if (!prepare(q, 1 + lenBytes(rem) + rem)) return false;
+    putHead(q, SUBSCRIBE, 2, rem);
+    q->addByte(pid >> 8);
+    q->addByte(pid & 255);
+    for (int i = 0; i < n; i++) {
+        putStr(q, filters[i], strlen(filters[i]));
+        q->addByte(qos[i]);
+    }
+    return true;
+}
+
+public bool putUnsubscribe(netio.Queue* q, int pid, char** filters, int n) {
+    if (pid < 1 || pid > 65535 || n < 1 || n > MAX_FILTERS) return false;
+    int rem = 2;
+    for (int i = 0; i < n; i++) {
+        int fl = strlen(filters[i]);
+        if (fl == 0 || fl > 65535) return false;
+        rem = rem + 2 + fl;
+    }
+    if (rem > MAX_REMAINING) return false;
+    if (!prepare(q, 1 + lenBytes(rem) + rem)) return false;
+    putHead(q, UNSUBSCRIBE, 2, rem);
+    q->addByte(pid >> 8);
+    q->addByte(pid & 255);
+    for (int i = 0; i < n; i++) putStr(q, filters[i], strlen(filters[i]));
+    return true;
+}
+
+// SUBACK with one return code per filter (0, 1, 2 or 128)
+public bool putSuback(netio.Queue* q, int pid, int* codes, int n) {
+    if (pid < 1 || pid > 65535 || n < 1 || n > MAX_FILTERS) return false;
+    int rem = 2 + n;
+    if (!prepare(q, 1 + lenBytes(rem) + rem)) return false;
+    putHead(q, SUBACK, 0, rem);
+    q->addByte(pid >> 8);
+    q->addByte(pid & 255);
+    for (int i = 0; i < n; i++) q->addByte(codes[i]);
+    return true;
+}
+
+// ---- the parser ------------------------------------------------------------------------------------------------------------------
+// Bytes in (feed), packets out (next). Never trusts the input: the remaining length is checked against maxPacket before anything is
+// buffered, every string is checked, every inconsistency is an error (error, errorText). After an error the parser stays failed.
+public class Parser {
+    public int mode;                    // MODE_SERVER or MODE_CLIENT
+    public int maxPacket;               // largest remaining length accepted (default 1 MiB)
+    public int error;
+    public int packets;                 // packets delivered
+    public bool heap;                   // made by newParser(): dispose() frees the object too
+    private netio.Queue q;
+    private int cur;                    // bytes of the delivered packet that are released at the next call
+
+    public Parser(int m = 1, int maxPkt = 1048576) {
+        mode = m;
+        maxPacket = maxPkt;
+    }
+
+    public int buffered() { return q.pending() - cur; }
+
+    private void release() {
+        if (cur > 0) {
+            q.consume(cur);
+            cur = 0;
+        }
+    }
+
+    // Appends received bytes. false when the parser has failed (or when more is fed than it takes: feed in pieces of at most about
+    // 16 KB and call next() until it returns 0 in between).
+    public bool feed(char* data, int n) {
+        release();
+        if (error != 0) return false;
+        if (n < 0 || q.pending() + n > maxPacket + 16384 + 16) {
+            error = E_BUFFER;
+            return false;
+        }
+        if (!q.add(data, n) || !q.reserve(1)) { error = E_BUFFER; return false; }
+        return true;
+    }
+
+    // 1: a packet is in p, 0: more bytes are needed, -1: malformed (p->error, errorText)
+    public int next(Packet* p) {
+        release();
+        if (error != 0) { p->error = error; return -1; }
+        int avail = q.pending();
+        if (avail < 1) {
+            q.shrink(65536);
+            return 0;
+        }
+        char* d = q.data();
+        int type = (d[0] >> 4) & 15;
+        int flags = d[0] & 15;
+        // the type and the flags are judged as soon as they are there: garbage ends the connection early
+        int e = checkHead(type, flags);
+        if (e != 0) return fail(p, e);
+        int rem = 0;
+        int mult = 1;
+        int i = 1;
+        for (;;) {
+            if (i >= avail) return 0;
+            int b = d[i] & 255;
+            rem = rem + (b & 127) * mult;
+            i++;
+            if ((b & 128) == 0) break;
+            mult = mult * 128;
+            if (i > 4) return fail(p, E_LENGTH);
+        }
+        if (rem > maxPacket) return fail(p, E_TOO_BIG);
+        if (avail < i + rem) return 0;
+        p->reset();
+        p->type = type;
+        p->flags = flags;
+        p->length = rem;
+        e = decode(p, &d[i], rem);
+        cur = i + rem;
+        if (e != 0) return fail(p, e);
+        packets++;
+        return 1;
+    }
+
+    private int fail(Packet* p, int e) {
+        error = e;
+        p->error = e;
+        return -1;
+    }
+
+    private int checkHead(int type, int flags) {
+        if (type < 1 || type > 14) return E_TYPE;
+        if (mode == MODE_SERVER) {
+            if (type == CONNACK || type == SUBACK || type == UNSUBACK || type == PINGRESP) return E_TYPE;
+        } else {
+            if (type == CONNECT || type == SUBSCRIBE || type == UNSUBSCRIBE || type == PINGREQ || type == DISCONNECT) return E_TYPE;
+        }
+        if (type == PUBLISH) {
+            if (((flags >> 1) & 3) == 3) return E_QOS;
+            if ((flags & 8) != 0 && ((flags >> 1) & 3) == 0) return E_FLAGS;           // DUP on a QoS 0 message
+            return 0;
+        }
+        if (type == PUBREL || type == SUBSCRIBE || type == UNSUBSCRIBE) return flags == 2 ? 0 : E_FLAGS;
+        return flags == 0 ? 0 : E_FLAGS;
+    }
+
+    // one length prefixed string, NUL terminated by moving it down one byte (the two length bytes leave room)
+    private char* takeStr(char* b, int* pos, int end, int* outLen) {
+        int p = *pos;
+        if (p + 2 > end) return null;
+        int n = ((b[p] & 255) << 8) | (b[p + 1] & 255);
+        if (p + 2 + n > end) return null;
+        if (n > 0) memcpy(&b[p + 1], &b[p + 2], n);
+        b[p + 1 + n] = 0;
+        *pos = p + 2 + n;
+        *outLen = n;
+        return &b[p + 1];
+    }
+
+    private int decode(Packet* p, char* b, int rem) {
+        int type = p->type;
+        int pos = 0;
+        int n = 0;
+        int e = 0;
+        if (type == PUBLISH) {
+            p->qos = (p->flags >> 1) & 3;
+            p->dup = (p->flags & 8) != 0;
+            p->retain = (p->flags & 1) != 0;
+            p->topic = takeStr(b, &pos, rem, &n);
+            if (p->topic == null) return E_LENGTH;
+            p->topicLen = n;
+            e = topicNameError(p->topic, n);
+            if (e != 0) return e;
+            if (p->qos > 0) {
+                if (pos + 2 > rem) return E_LENGTH;
+                p->pid = ((b[pos] & 255) << 8) | (b[pos + 1] & 255);
+                pos = pos + 2;
+                if (p->pid == 0) return E_PACKET_ID;
+            }
+            p->payload = &b[pos];
+            p->payloadLen = rem - pos;
+            return 0;
+        }
+        if (type == PUBACK || type == PUBREC || type == PUBREL || type == PUBCOMP || type == UNSUBACK) {
+            if (rem != 2) return E_LENGTH;
+            p->pid = ((b[0] & 255) << 8) | (b[1] & 255);
+            return p->pid == 0 ? E_PACKET_ID : 0;
+        }
+        if (type == PINGREQ || type == PINGRESP || type == DISCONNECT) return rem == 0 ? 0 : E_LENGTH;
+        if (type == CONNACK) {
+            if (rem != 2) return E_LENGTH;
+            if ((b[0] & 0xFE) != 0) return E_PROTOCOL;
+            p->sessionPresent = (b[0] & 1) != 0;
+            p->returnCode = b[1] & 255;
+            if (p->returnCode > 5) return E_PROTOCOL;
+            if (p->returnCode != 0 && p->sessionPresent) return E_PROTOCOL;
+            return 0;
+        }
+        if (type == SUBSCRIBE || type == UNSUBSCRIBE) {
+            if (rem < 2) return E_LENGTH;
+            p->pid = ((b[0] & 255) << 8) | (b[1] & 255);
+            if (p->pid == 0) return E_PACKET_ID;
+            pos = 2;
+            while (pos < rem) {
+                if (p->nfilters >= MAX_FILTERS) return E_LENGTH;
+                char* f = takeStr(b, &pos, rem, &n);
+                if (f == null) return E_LENGTH;
+                if (!validTopicFilter(f, n)) return n > 0 && !validUtf8(f, n) ? E_UTF8 : E_TOPIC;
+                p->filters[p->nfilters] = f;
+                if (type == SUBSCRIBE) {
+                    if (pos >= rem) return E_LENGTH;
+                    int rq = b[pos] & 255;
+                    pos++;
+                    if (rq > 2) return E_QOS;
+                    p->fqos[p->nfilters] = rq;
+                }
+                p->nfilters++;
+            }
+            return p->nfilters == 0 ? E_LENGTH : 0;
+        }
+        if (type == SUBACK) {
+            if (rem < 3) return E_LENGTH;
+            p->pid = ((b[0] & 255) << 8) | (b[1] & 255);
+            if (p->pid == 0) return E_PACKET_ID;
+            if (rem - 2 > MAX_FILTERS) return E_LENGTH;
+            for (int i = 2; i < rem; i++) {
+                int c = b[i] & 255;
+                if (c > 2 && c != 128) return E_PROTOCOL;
+                p->fqos[p->nfilters] = c;
+                p->nfilters++;
+            }
+            return 0;
+        }
+        // CONNECT
+        p->protoName = takeStr(b, &pos, rem, &n);
+        if (p->protoName == null) return E_LENGTH;
+        bool v4 = n == 4 && streq(p->protoName, "MQTT");
+        bool v3 = n == 6 && streq(p->protoName, "MQIsdp");
+        if (!v4 && !v3) return E_PROTOCOL;
+        if (pos + 1 > rem) return E_LENGTH;
+        p->level = b[pos] & 255;
+        // Another protocol level (MQTT 5 has a properties field after the keep-alive, so the rest of the packet cannot be read as 3.1.1): the packet
+        // counts as parsed up to here, only name and level are set, and a broker answers it with CONNACK 1 (MQTT 3.1.1, 3.1.2.2) and closes.
+        if (!((v4 && p->level == 4) || (v3 && p->level == 3))) return 0;
+        if (pos + 4 > rem) return E_LENGTH;
+        int cf = b[pos + 1] & 255;
+        p->keepAlive = ((b[pos + 2] & 255) << 8) | (b[pos + 3] & 255);
+        pos = pos + 4;
+        if ((cf & 1) != 0) return E_PROTOCOL;
+        p->clean = (cf & 2) != 0;
+        p->hasWill = (cf & 4) != 0;
+        p->willQos = (cf >> 3) & 3;
+        p->willRetain = (cf & 32) != 0;
+        p->hasPass = (cf & 64) != 0;
+        p->hasUser = (cf & 128) != 0;
+        if (!p->hasWill && (p->willQos != 0 || p->willRetain)) return E_PROTOCOL;
+        if (p->willQos == 3) return E_QOS;
+        if (p->hasPass && !p->hasUser) return E_PROTOCOL;
+        p->clientId = takeStr(b, &pos, rem, &n);
+        if (p->clientId == null) return E_LENGTH;
+        p->clientIdLen = n;
+        if (!validUtf8(p->clientId, n)) return E_UTF8;
+        if (p->hasWill) {
+            p->willTopic = takeStr(b, &pos, rem, &n);
+            if (p->willTopic == null) return E_LENGTH;
+            e = topicNameError(p->willTopic, n);
+            if (e != 0) return e;
+            p->willPayload = takeStr(b, &pos, rem, &n);
+            if (p->willPayload == null) return E_LENGTH;
+            p->willLen = n;
+        }
+        if (p->hasUser) {
+            p->username = takeStr(b, &pos, rem, &n);
+            if (p->username == null) return E_LENGTH;
+            if (!validUtf8(p->username, n)) return E_UTF8;
+        }
+        if (p->hasPass) {
+            p->password = takeStr(b, &pos, rem, &n);
+            if (p->password == null) return E_LENGTH;
+            p->passwordLen = n;
+        }
+        if (pos != rem) return E_LENGTH;
+        return 0;
+    }
+
+    // forgets everything (a new connection)
+    public void reset() {
+        q.release();
+        cur = 0;
+        error = 0;
+    }
+
+    // frees the buffer; the object too when it came from newParser()
+    public void dispose() {
+        q.release();
+        cur = 0;
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+}
+
+// a Parser that dispose() frees completely (a server makes one per connection)
+public Parser* newParser(int mode, int maxPacket) {
+    Parser* p = (Parser*) malloc(sizeof(Parser));
+    if (p == null) return null;
+    p->mode = mode;
+    p->maxPacket = maxPacket;
+    p->heap = true;
+    return p;
+}
+
+// ---- messages --------------------------------------------------------------------------------------------------------------------
+// One block of memory holds the object, the topic and the payload (a 0 byte follows each, the payload may still contain 0 bytes).
+public class Message {
+    public char* topic;
+    public char* payload;
+    public int payloadLen;
+    public int qos;
+    public bool retain;
+    public bool dup;
+    public Message* next;
+    // used by the client for what it sends
+    public int pid;
+    public int state;
+    public int token;
+
+    // frees the message
+    public void dispose() { free(this); }
+}
+
+private Message* newMessage(char* topic, char* payload, int n, int qos, bool retain, bool dup) {
+    int tl = strlen(topic);
+    Message* m = (Message*) malloc(sizeof(Message) + tl + 1 + n + 1);
+    if (m == null) return null;
+    char* base = (char*) m;
+    m->topic = &base[sizeof(Message)];
+    memcpy(m->topic, topic, tl);
+    m->payload = &base[sizeof(Message) + tl + 1];
+    if (n > 0) memcpy(m->payload, payload, n);
+    m->payloadLen = n;
+    m->qos = qos;
+    m->retain = retain;
+    m->dup = dup;
+    return m;
+}
+
+// ---- the client ------------------------------------------------------------------------------------------------------------------
+public const ST_CLOSED = 0;         // not connected and not trying (never connected, disconnect() was called, or the broker refused us)
+public const ST_OFFLINE = 1;        // the connection was lost (or could not be made); with autoReconnect another try is planned
+public const ST_CONNECTING = 2;     // CONNECT is sent, CONNACK is awaited
+public const ST_ONLINE = 3;
+
+private const MS_QUEUED = 0;
+private const MS_WAIT_ACK = 1;      // QoS 1: PUBLISH sent, PUBACK awaited
+private const MS_WAIT_REC = 2;      // QoS 2: PUBLISH sent, PUBREC awaited
+private const MS_WAIT_COMP = 3;     // QoS 2: PUBREL sent, PUBCOMP awaited
+private const MAX_SUBS = 256;
+private const MAX_PENDING_OPS = 16;
+private const MAX_INFLIGHT = 1024;
+
+private char lastErr[200];
+private void setLast(char* s) {
+    int n = strlen(s);
+    if (n > 199) n = 199;
+    memcpy(&lastErr[0], s, n);
+    lastErr[n] = 0;
+}
+// why the last connect() / mqtt.connect() failed
+public char* error() { return &lastErr[0]; }
+
+public char* connackText(int code) {
+    if (code == 0) return "accepted";
+    if (code == 1) return "the broker does not support MQTT 3.1.1";
+    if (code == 2) return "client identifier rejected";
+    if (code == 3) return "broker unavailable";
+    if (code == 4) return "bad user name or password";
+    if (code == 5) return "not authorized";
+    return "unknown CONNACK code";
+}
+
+public class Options {
+    public char* clientId;              // null or "": a random one is made (needs cleanSession)
+    public bool cleanSession;           // default true: the broker forgets us when we disconnect. false: it keeps subscriptions and QoS 1/2 messages for clientId
+    public int keepAliveSec;            // default 60, 0: no keep-alive
+    public char* username;
+    public char* password;
+    public int passwordLen;             // -1: strlen(password)
+    public char* willTopic;             // set it to have a will message
+    public char* willPayload;
+    public int willLen;                 // -1: strlen(willPayload)
+    public int willQos;
+    public bool willRetain;
+    public bool useTls;
+    public bool verify;                 // check the broker's certificate (default true)
+    public int connectTimeoutMs;        // TCP connect, TLS handshake and CONNACK, each (default 5000)
+    public int maxPacket;               // the largest packet that is accepted or sent (default 1 MiB)
+    public int maxInflight;             // QoS 1 and 2 messages that wait for an acknowledgement at the same time (default 20, at most 1024)
+    public int maxQueued;               // messages waiting to be sent (offline, or over the window), default 1000
+    public int maxQueuedBytes;          // their payload bytes, default 8 MiB
+    public int maxIncoming;             // received messages waiting for next() (not used with onMessage), default 1000: more are dropped and counted
+    public int maxOut;                  // bytes waiting for the socket, default 4 MiB
+    public bool autoReconnect;          // default false
+    public int reconnectMinMs;          // the pause before the first retry (default 500); it doubles up to reconnectMaxMs (default 30000)
+    public int reconnectMaxMs;
+
+    public Options() { init(); }
+
+    public void init() {
+        cleanSession = true;
+        keepAliveSec = 60;
+        passwordLen = -1;
+        willLen = -1;
+        verify = true;
+        connectTimeoutMs = 5000;
+        maxPacket = 1048576;
+        maxInflight = 20;
+        maxQueued = 1000;
+        maxQueuedBytes = 8388608;
+        maxIncoming = 1000;
+        maxOut = 4194304;
+        reconnectMinMs = 500;
+        reconnectMaxMs = 30000;
+    }
+}
+
+public class PendOp {
+    public int pid;
+    public int kind;                    // 1 SUBSCRIBE, 2 UNSUBSCRIBE, 0 free
+    public int n;
+    public char** filters;              // copies
+    public int code;                    // the first return code (SUBACK) when done
+    public bool done;
+    public bool waited;                 // a blocking call looks at it
+}
+
+public class Client {
+    public func onMessage;              // int onMessage(client, topic, payload, length, qos, retain): the payload is valid during the call (and has a 0 byte after it)
+    public func onConnect;              // onConnect(client, sessionPresent): the broker accepted the connection (also after a reconnect)
+    public func onDisconnect;           // onDisconnect(client, willRetry): an established connection was lost
+    public func onPublished;            // onPublished(client, token): a message is complete (QoS 0: queued for the socket; QoS 1: PUBACK; QoS 2: PUBCOMP)
+    public char* user;
+    public Options* options;
+    public bool ownsOptions;
+    public bool heap;
+    public int state;
+    public char* error;                 // the last problem (a constant text)
+    public int returnCode;              // the last CONNACK code
+    public bool sessionPresent;
+    public int received;                // messages received (also the dropped ones)
+    public int published;               // messages complete
+    public int dropped;                 // received messages dropped because maxIncoming was reached
+    public int reconnects;              // connection attempts after the first
+    public int now;                     // the clock (ms): set by poll(); a program that feeds the engine itself sets it with tick(now)
+
+    private char* host;
+    private int port;
+    private netio.Link* link;
+    private Parser* parser;
+    private Packet* pk;
+    private netio.Queue out;
+    private char* rbuf;
+    private int lastTx;
+    private int lastRx;
+    private int pingAt;
+    private bool pingOut;
+    private int connectAt;
+    private int nextPid;
+    private int nextToken;
+    private Message* infl[1024];
+    private int ninfl;
+    private Message** pq;
+    private int pqCap;
+    private int pqHead;
+    private int pqCount;
+    private int pqBytes;
+    private Message* inHead;
+    private Message* inTail;
+    private int inCount;
+    private char* subs[256];
+    private int subQos[256];
+    private bool subAcked[256];            // the broker confirmed it on this session
+    private int nsubs;
+    private char* in2;                  // QoS 2 packet identifiers received and not yet released (a bit each)
+    private PendOp ops[16];
+    private bool wantOnline;
+    private bool noRetry;
+    private int backoff;
+    private int nextAttempt;
+    private char genId[24];
+    private char* ownUser;
+    private char* ownPass;
+
+    public Client() { init(); }
+
+    public void init() {
+        state = ST_CLOSED;
+        error = "";
+        nextPid = 1;
+    }
+
+    // ---- the engine: no sockets, no clock (tests and programs with their own transport use this part) ------------------------------------------
+    public int outPending() { return out.pending(); }
+    public char* outData() { return out.data(); }
+    public void outConsumed(int n) {
+        if (n > 0) lastTx = now;
+        out.consume(n);
+    }
+
+    private char* clientIdToUse() {
+        Options* o = options;
+        if (o->clientId != null && o->clientId[0] != 0) return o->clientId;
+        if (genId[0] == 0) {
+            char r[8];
+            asysRandom(&r[0], 8);
+            memcpy(&genId[0], "amqtt-", 6);
+            char* hx = "0123456789abcdef";
+            for (int i = 0; i < 8; i++) genId[6 + i] = hx[r[i] & 15];
+            genId[14] = 0;
+        }
+        return &genId[0];
+    }
+
+    // The transport is up: queues CONNECT. (connect() and poll() do this for you.)
+    public bool begin(int nowMs) {
+        now = nowMs;
+        Options* o = options;
+        if (parser == null) {
+            parser = newParser(MODE_CLIENT, o->maxPacket);
+            pk = (Packet*) malloc(sizeof(Packet));
+            if (parser == null || pk == null) { error = "out of memory"; return false; }
+        }
+        parser->reset();
+        parser->maxPacket = o->maxPacket;
+        out.clear();
+        out.max = o->maxOut;
+        pingOut = false;
+        lastTx = now;
+        lastRx = now;
+        connectAt = now;
+        if (!o->cleanSession && (o->clientId == null || o->clientId[0] == 0)) {
+            error = "a persistent session (cleanSession false) needs a clientId";
+            return false;
+        }
+        Packet p;
+        p.reset();
+        p.clientId = clientIdToUse();
+        p.clean = o->cleanSession;
+        p.keepAlive = o->keepAliveSec;
+        if (o->willTopic != null) {
+            p.hasWill = true;
+            p.willTopic = o->willTopic;
+            p.willPayload = o->willPayload == null ? "" : o->willPayload;
+            p.willLen = o->willLen >= 0 ? o->willLen : (o->willPayload == null ? 0 : strlen(o->willPayload));
+            p.willQos = o->willQos;
+            p.willRetain = o->willRetain;
+        }
+        if (o->username != null) {
+            p.hasUser = true;
+            p.username = o->username;
+            if (o->password != null) {
+                p.hasPass = true;
+                p.password = o->password;
+                p.passwordLen = o->passwordLen >= 0 ? o->passwordLen : strlen(o->password);
+            }
+        }
+        if (!putConnect(&out, &p)) { error = "CONNECT does not fit (will, user name or password too long)"; return false; }
+        state = ST_CONNECTING;
+        returnCode = -1;
+        wantOnline = true;
+        noRetry = false;
+        return true;
+    }
+
+    // Bytes that came from the broker. false: the connection must be dropped (error says why).
+    public bool feed(char* data, int n) {
+        if (state != ST_CONNECTING && state != ST_ONLINE) return false;
+        if (!parser->feed(data, n)) { error = errorText(parser->error); return false; }
+        lastRx = now;
+        for (;;) {
+            int r = parser->next(pk);
+            if (r == 0) return true;
+            if (r < 0) { error = errorText(pk->error); return false; }
+            if (!handle(pk)) return false;
+            if (state != ST_CONNECTING && state != ST_ONLINE) return false;
+        }
+        return true;
+    }
+
+    // Timers: keep-alive pings, a missing CONNACK or PINGRESP. false: the connection is dead (error says why).
+    public bool tick(int nowMs) {
+        now = nowMs;
+        if (state == ST_CONNECTING) {
+            if (now - connectAt > options->connectTimeoutMs) { error = "the broker did not answer CONNECT"; return false; }
+            return true;
+        }
+        if (state != ST_ONLINE) return true;
+        int ka = options->keepAliveSec * 1000;
+        if (ka > 0) {
+            if (pingOut) {
+                if (now - pingAt > ka) { error = "keep-alive: no answer to PINGREQ"; return false; }
+            } else if (now - lastTx >= ka * 3 / 4) {
+                if (!putEmpty(&out, PINGREQ)) { error = "output queue full"; return false; }
+                pingOut = true;
+                pingAt = now;
+            }
+        }
+        return true;
+    }
+
+    // The transport went down: the engine keeps its session state (messages in flight, subscriptions) for the next begin().
+    public void lost(char* reason) {
+        bool was = state == ST_ONLINE;
+        if (state == ST_CLOSED) return;
+        error = reason;
+        out.clear();
+        pingOut = false;
+        failOps();
+        if (parser != null) parser->reset();
+        state = ST_OFFLINE;
+        if (noRetry || !options->autoReconnect || !wantOnline) {
+            if (noRetry) { state = ST_CLOSED; wantOnline = false; }
+        } else {
+            nextAttempt = now + backoff;
+            backoff = backoff * 2;
+            if (backoff > options->reconnectMaxMs) backoff = options->reconnectMaxMs;
+        }
+        if (was && onDisconnect != null) onDisconnect(this, (options->autoReconnect && wantOnline && !noRetry) ? 1 : 0);
+    }
+
+    // ---- handling packets ------------------------------------------------------------------------------------------------------------------------
+    private bool handle(Packet* p) {
+        int t = p->type;
+        if (state == ST_CONNECTING) {
+            if (t != CONNACK) { error = "the broker answered CONNECT with something else"; return false; }
+            return onConnack(p);
+        }
+        pingOut = false;
+        if (t == PUBLISH) return onPublish(p);
+        if (t == PUBACK) {
+            Message* m = findInfl(p->pid);
+            if (m != null && m->state == MS_WAIT_ACK) { removeInfl(m); complete(m); m->dispose(); pump(); }
+            return true;
+        }
+        if (t == PUBREC) {
+            Message* m = findInfl(p->pid);
+            if (m != null && (m->state == MS_WAIT_REC || m->state == MS_WAIT_COMP)) {
+                m->state = MS_WAIT_COMP;
+                if (!putAck(&out, PUBREL, m->pid)) { error = "output queue full"; return false; }
+            }
+            return true;
+        }
+        if (t == PUBREL) {
+            if (in2 != null) in2[p->pid >> 3] = in2[p->pid >> 3] & ~(1 << (p->pid & 7));
+            if (!putAck(&out, PUBCOMP, p->pid)) { error = "output queue full"; return false; }
+            return true;
+        }
+        if (t == PUBCOMP) {
+            Message* m = findInfl(p->pid);
+            if (m != null && m->state == MS_WAIT_COMP) { removeInfl(m); complete(m); m->dispose(); pump(); }
+            return true;
+        }
+        if (t == SUBACK || t == UNSUBACK) return onSuback(p);
+        if (t == PINGRESP) return true;
+        error = "unexpected packet";
+        return false;
+    }
+
+    private bool onConnack(Packet* p) {
+        returnCode = p->returnCode;
+        if (p->returnCode != 0) {
+            error = connackText(p->returnCode);
+            noRetry = p->returnCode != CONNACK_UNAVAILABLE;
+            return false;
+        }
+        state = ST_ONLINE;
+        sessionPresent = p->sessionPresent;
+        backoff = options->reconnectMinMs;
+        if (options->cleanSession || !sessionPresent) {
+            // the broker remembers nothing: what was not acknowledged goes again as a new message, QoS 2 messages that reached PUBREC count as delivered
+            requeueInflight();
+            if (in2 != null) memset(in2, 0, 8192);
+        } else {
+            // the broker keeps the session: re-send with DUP, and PUBREL for the messages that reached PUBREC
+            for (int i = 0; i < ninfl; i++) {
+                Message* m = infl[i];
+                if (m->state == MS_WAIT_COMP) {
+                    if (!putAck(&out, PUBREL, m->pid)) { error = "output queue full"; return false; }
+                } else {
+                    if (!putPublish(&out, m->topic, m->payload, m->payloadLen, m->qos, m->retain, true, m->pid)) { error = "output queue full"; return false; }
+                }
+            }
+        }
+        if (options->cleanSession || !sessionPresent) {
+            for (int i = 0; i < nsubs; i++) subAcked[i] = false;
+        }
+        resubscribe();
+        pump();
+        if (onConnect != null) onConnect(this, sessionPresent ? 1 : 0);
+        return true;
+    }
+
+    private bool onPublish(Packet* p) {
+        received++;
+        if (p->qos == 2) {
+            if (in2 == null) {
+                in2 = malloc(8192);
+                if (in2 == null) { error = "out of memory"; return false; }
+            }
+            int bit = 1 << (p->pid & 7);
+            bool seen = (in2[p->pid >> 3] & bit) != 0;
+            if (!seen) {
+                in2[p->pid >> 3] = in2[p->pid >> 3] | bit;
+                deliver(p);
+            }
+            if (!putAck(&out, PUBREC, p->pid)) { error = "output queue full"; return false; }
+            return true;
+        }
+        deliver(p);
+        if (p->qos == 1) {
+            if (!putAck(&out, PUBACK, p->pid)) { error = "output queue full"; return false; }
+        }
+        return true;
+    }
+
+    private void deliver(Packet* p) {
+        if (onMessage != null) {
+            char* end = &p->payload[p->payloadLen];
+            char saved = end[0];
+            end[0] = 0;                                         // the parser keeps a spare byte after the data
+            onMessage(this, p->topic, p->payload, p->payloadLen, p->qos, p->retain ? 1 : 0);
+            end[0] = saved;
+            return;
+        }
+        if (inCount >= options->maxIncoming) { dropped++; return; }
+        Message* m = newMessage(p->topic, p->payload, p->payloadLen, p->qos, p->retain, p->dup);
+        if (m == null) { dropped++; return; }
+        if (inTail == null) inHead = m; else inTail->next = m;
+        inTail = m;
+        inCount++;
+    }
+
+    // ---- sent messages ---------------------------------------------------------------------------------------------------------------------------
+    private Message* findInfl(int pid) {
+        for (int i = 0; i < ninfl; i++) {
+            if (infl[i]->pid == pid) return infl[i];
+        }
+        return null;
+    }
+
+    private void removeInfl(Message* m) {
+        for (int i = 0; i < ninfl; i++) {
+            if (infl[i] == m) {
+                for (int j = i; j + 1 < ninfl; j++) infl[j] = infl[j + 1];
+                ninfl--;
+                infl[ninfl] = null;
+                return;
+            }
+        }
+    }
+
+    private void complete(Message* m) {
+        published++;
+        if (onPublished != null) onPublished(this, m->token);
+    }
+
+    private int allocPid() {
+        for (int k = 0; k < 65535; k++) {
+            int pid = nextPid;
+            nextPid++;
+            if (nextPid > 65535) nextPid = 1;
+            if (findInfl(pid) == null) return pid;
+        }
+        return 0;
+    }
+
+    private bool pqPush(Message* m, bool front) {
+        if (pqCount >= pqCap) {
+            int nc = pqCap == 0 ? 16 : pqCap * 2;
+            Message** np = (Message**) malloc(nc * 8);
+            if (np == null) return false;
+            for (int i = 0; i < pqCount; i++) np[i] = pq[(pqHead + i) % pqCap];
+            if (pq != null) free((char*) pq);
+            pq = np;
+            pqCap = nc;
+            pqHead = 0;
+        }
+        if (front) {
+            pqHead = (pqHead + pqCap - 1) % pqCap;
+            pq[pqHead] = m;
+        } else {
+            pq[(pqHead + pqCount) % pqCap] = m;
+        }
+        pqCount++;
+        pqBytes = pqBytes + m->payloadLen;
+        return true;
+    }
+
+    private Message* pqPop() {
+        Message* m = pq[pqHead];
+        pq[pqHead] = null;
+        pqHead = (pqHead + 1) % pqCap;
+        pqCount--;
+        pqBytes = pqBytes - m->payloadLen;
+        if (pqCount == 0 && pqCap > 64) {
+            free((char*) pq);
+            pq = null;
+            pqCap = 0;
+            pqHead = 0;
+        }
+        return m;
+    }
+
+    // after a connection that the broker does not remember: not acknowledged messages are sent again from the start of the queue
+    private void requeueInflight() {
+        for (int i = ninfl - 1; i >= 0; i--) {
+            Message* m = infl[i];
+            if (m->state == MS_WAIT_COMP) {
+                complete(m);
+                m->dispose();
+            } else {
+                m->state = MS_QUEUED;
+                m->pid = 0;
+                if (!pqPush(m, true)) { dropped++; m->dispose(); }
+            }
+            infl[i] = null;
+        }
+        ninfl = 0;
+    }
+
+    // moves queued messages to the socket while the window and the output queue allow
+    private void pump() {
+        if (state != ST_ONLINE) return;
+        while (pqCount > 0 && out.pending() < 65536) {
+            Message* m = pq[pqHead];
+            if (m->qos == 0) {
+                pqPop();
+                if (!putPublish(&out, m->topic, m->payload, m->payloadLen, 0, m->retain, false, 0)) dropped++;
+                else complete(m);
+                m->dispose();
+                continue;
+            }
+            int win = options->maxInflight;
+            if (win > MAX_INFLIGHT) win = MAX_INFLIGHT;
+            if (win < 1) win = 1;
+            if (ninfl >= win) break;
+            int pid = allocPid();
+            if (pid == 0) break;
+            if (!putPublish(&out, m->topic, m->payload, m->payloadLen, m->qos, m->retain, false, pid)) {
+                pqPop();
+                dropped++;
+                m->dispose();
+                continue;
+            }
+            pqPop();
+            m->pid = pid;
+            m->state = m->qos == 1 ? MS_WAIT_ACK : MS_WAIT_REC;
+            infl[ninfl] = m;
+            ninfl++;
+        }
+    }
+
+    // Queues a message for sending (QoS 0, 1 or 2). Returns a token (> 0, see onPublished), or -1 (error says why).
+    // Messages wait in a queue while the client is offline or the window is full (maxQueued messages, maxQueuedBytes).
+    public int publish(char* topic, char* payload, int n, int qos, bool retain) {
+        if (qos < 0 || qos > 2 || n < 0) { error = "invalid QoS or length"; return -1; }
+        int tl = strlen(topic);
+        if (!validTopicName(topic, tl)) { error = "invalid topic name"; return -1; }
+        if (n + tl + 8 > options->maxPacket) { error = "message larger than maxPacket"; return -1; }
+        if (state == ST_CLOSED) { error = "not connected"; return -1; }
+        if (pqCount >= options->maxQueued || pqBytes + n > options->maxQueuedBytes) { error = "send queue full"; return -1; }
+        Message* m = newMessage(topic, payload, n, qos, retain, false);
+        if (m == null) { error = "out of memory"; return -1; }
+        nextToken++;
+        if (nextToken <= 0) nextToken = 1;
+        m->token = nextToken;
+        if (!pqPush(m, false)) { m->dispose(); error = "out of memory"; return -1; }
+        pump();
+        return m->token;
+    }
+
+    public int publishText(char* topic, char* text, int qos, bool retain) {
+        return publish(topic, text, strlen(text), qos, retain);
+    }
+
+    // is the message with this token still waiting (queued, or in flight)?
+    public bool isPending(int token) {
+        for (int i = 0; i < pqCount; i++) {
+            if (pq[(pqHead + i) % pqCap]->token == token) return true;
+        }
+        for (int i = 0; i < ninfl; i++) {
+            if (infl[i]->token == token) return true;
+        }
+        return false;
+    }
+
+    public int queued() { return pqCount; }
+    public int inflight() { return ninfl; }
+    public int waiting() { return inCount; }
+
+    // ---- subscriptions -------------------------------------------------------------------------------------------------------------------------
+    private PendOp* newOp(int kind, char** filters, int n) {
+        for (int i = 0; i < MAX_PENDING_OPS; i++) {
+            if (ops[i].kind == 0) {
+                PendOp* o = &ops[i];
+                o->filters = (char**) malloc(n * 8);
+                if (o->filters == null) return null;
+                for (int k = 0; k < n; k++) o->filters[k] = copyOf(filters[k]);
+                o->kind = kind;
+                o->n = n;
+                o->done = false;
+                o->waited = false;
+                o->code = -1;
+                return o;
+            }
+        }
+        return null;
+    }
+
+    private void freeOp(PendOp* o) {
+        if (o->filters != null) {
+            for (int k = 0; k < o->n; k++) free(o->filters[k]);
+            free((char*) o->filters);
+        }
+        o->filters = null;
+        o->kind = 0;
+        o->pid = 0;
+    }
+
+    private PendOp* opByPid(int pid) {
+        for (int i = 0; i < MAX_PENDING_OPS; i++) {
+            if (ops[i].kind != 0 && ops[i].pid == pid) return &ops[i];
+        }
+        return null;
+    }
+
+    // the connection went down: waiting blocking calls are told, the rest is forgotten
+    private void failOps() {
+        for (int i = 0; i < MAX_PENDING_OPS; i++) {
+            if (ops[i].kind == 0) continue;
+            if (ops[i].waited) { ops[i].done = true; ops[i].code = -1; }
+            else freeOp(&ops[i]);
+        }
+    }
+
+    private int subIndex(char* filter) {
+        for (int i = 0; i < nsubs; i++) {
+            if (streq(subs[i], filter)) return i;
+        }
+        return -1;
+    }
+
+    private void dropSub(int i) {
+        free(subs[i]);
+        for (int j = i; j + 1 < nsubs; j++) { subs[j] = subs[j + 1]; subQos[j] = subQos[j + 1]; subAcked[j] = subAcked[j + 1]; }
+        nsubs--;
+        subs[nsubs] = null;
+    }
+
+    private bool onSuback(Packet* p) {
+        PendOp* o = opByPid(p->pid);
+        if (o == null) return true;
+        if (p->type == SUBACK && p->nfilters != o->n) { error = "SUBACK with the wrong number of codes"; return false; }
+        if (o->kind == 1) {
+            for (int i = 0; i < o->n; i++) {
+                int si = subIndex(o->filters[i]);
+                if (si < 0) continue;
+                if (p->fqos[i] == SUBACK_FAILURE) dropSub(si);
+                else subAcked[si] = true;
+            }
+            o->code = p->fqos[0];
+        } else {
+            o->code = 0;
+        }
+        if (o->waited) o->done = true; else freeOp(o);
+        return true;
+    }
+
+    // SUBSCRIBE for the filters (at most 128). Returns the packet identifier (> 0) or -1. The filters are remembered and subscribed again after a reconnect.
+    public int subscribeMany(char** filters, int* qos, int n) {
+        if (n < 1 || n > MAX_FILTERS) { error = "1 to 128 filters"; return -1; }
+        for (int i = 0; i < n; i++) {
+            if (!validTopicFilter(filters[i], strlen(filters[i]))) { error = "invalid topic filter"; return -1; }
+            if (qos[i] < 0 || qos[i] > 2) { error = "invalid QoS"; return -1; }
+        }
+        if (state == ST_CLOSED) { error = "not connected"; return -1; }
+        for (int i = 0; i < n; i++) {
+            int si = subIndex(filters[i]);
+            if (si < 0 && nsubs >= MAX_SUBS) { error = "too many subscriptions"; return -1; }
+        }
+        for (int i = 0; i < n; i++) {
+            int si = subIndex(filters[i]);
+            if (si >= 0) {
+                subQos[si] = qos[i];
+                subAcked[si] = false;
+            } else {
+                subs[nsubs] = copyOf(filters[i]);
+                subQos[nsubs] = qos[i];
+                subAcked[nsubs] = false;
+                nsubs++;
+            }
+        }
+        if (state != ST_ONLINE) return 0;                       // sent when the connection is (back) up: the filters are remembered
+        return sendSubscribe(filters, qos, n);
+    }
+
+    public int subscribe(char* filter, int qos) {
+        char* f[1];
+        int q[1];
+        f[0] = filter;
+        q[0] = qos;
+        return subscribeMany(&f[0], &q[0], 1);
+    }
+
+    private int sendSubscribe(char** filters, int* qos, int n) {
+        PendOp* o = newOp(1, filters, n);
+        if (o == null) { error = "too many requests in flight"; return -1; }
+        int pid = allocOpPid();
+        o->pid = pid;
+        if (!putSubscribe(&out, pid, filters, qos, n)) { freeOp(o); error = "output queue full"; return -1; }
+        return pid;
+    }
+
+    private int allocOpPid() {
+        // subscribe packet identifiers share the space with PUBLISH identifiers: take one that nothing uses
+        for (int k = 0; k < 65535; k++) {
+            int pid = nextPid;
+            nextPid++;
+            if (nextPid > 65535) nextPid = 1;
+            if (findInfl(pid) == null && opByPid(pid) == null) return pid;
+        }
+        return 1;
+    }
+
+    // SUBSCRIBE for every filter the broker does not know on this session (all of them after a connection with a new session)
+    private void resubscribe() {
+        int i = 0;
+        while (i < nsubs) {
+            char* f[32];
+            int q[32];
+            int n = 0;
+            while (i < nsubs && n < 32) {
+                if (!subAcked[i]) { f[n] = subs[i]; q[n] = subQos[i]; n++; }
+                i++;
+            }
+            if (n > 0) sendSubscribe(&f[0], &q[0], n);
+        }
+    }
+
+    public int unsubscribe(char* filter) {
+        if (!validTopicFilter(filter, strlen(filter))) { error = "invalid topic filter"; return -1; }
+        if (state == ST_CLOSED) { error = "not connected"; return -1; }
+        int si = subIndex(filter);
+        if (si >= 0) dropSub(si);
+        if (state != ST_ONLINE) return 0;
+        char* f[1];
+        f[0] = filter;
+        PendOp* o = newOp(2, &f[0], 1);
+        if (o == null) { error = "too many requests in flight"; return -1; }
+        int pid = allocOpPid();
+        o->pid = pid;
+        if (!putUnsubscribe(&out, pid, &f[0], 1)) { freeOp(o); error = "output queue full"; return -1; }
+        return pid;
+    }
+
+    // ---- received messages ---------------------------------------------------------------------------------------------------------------------
+    // The next received message (you free it with dispose()), or null. Does no I/O: poll() reads the socket.
+    public Message* next() {
+        Message* m = inHead;
+        if (m == null) return null;
+        inHead = m->next;
+        if (inHead == null) inTail = null;
+        m->next = null;
+        inCount--;
+        return m;
+    }
+
+    // ---- the transport ---------------------------------------------------------------------------------------------------------------------------
+    // Connects (blocks up to connectTimeoutMs for the TCP connection, again for TLS and again for the CONNACK). True when the broker accepted us.
+    // On failure error / returnCode say why; with autoReconnect another try is planned (poll makes it).
+    public bool connect() {
+        if (host == null) { error = "no host"; return false; }
+        wantOnline = true;
+        if (backoff == 0) backoff = options->reconnectMinMs;
+        if (state == ST_ONLINE) return true;
+        now = millis();
+        if (!openAndBegin()) {
+            state = ST_OFFLINE;
+            if (options->autoReconnect) { nextAttempt = millis() + backoff; backoff = backoff * 2; if (backoff > options->reconnectMaxMs) backoff = options->reconnectMaxMs; }
+            setLast(error);
+            return false;
+        }
+        int t0 = millis();
+        while (state == ST_CONNECTING) {
+            if (millis() - t0 > options->connectTimeoutMs + 200) { drop("the broker did not answer CONNECT"); break; }
+            step(50);
+        }
+        if (state != ST_ONLINE) { setLast(error); return false; }
+        return true;
+    }
+
+    private bool openAndBegin() {
+        if (link == null) {
+            link = netio.newLink();
+            if (link == null) { error = "out of memory"; return false; }
+        }
+        if (!link->open(host, port, options->connectTimeoutMs, options->useTls, options->verify)) {
+            error = link->error;
+            return false;
+        }
+        if (rbuf == null) rbuf = malloc(4096);
+        if (!begin(millis())) { link->close(); return false; }
+        return true;
+    }
+
+    private void drop(char* reason) {
+        if (link != null) link->close();
+        lost(reason);
+    }
+
+    // sends what is queued; false if the connection failed
+    private bool pumpOut() {
+        while (out.pending() > 0) {
+            int r = link->send(out.data(), out.pending());
+            if (r < 0) return false;
+            if (r == 0) break;
+            outConsumed(r);
+        }
+        if (!link->flush()) return false;
+        return true;
+    }
+
+    // One round: waits at most ms for the socket, reads, runs the timers, sends. Returns the number of packets that arrived.
+    private int step(int ms) {
+        now = millis();
+        if (state == ST_OFFLINE || state == ST_CLOSED) {
+            if (state == ST_OFFLINE && options->autoReconnect && wantOnline && now >= nextAttempt) {
+                reconnects++;
+                if (openAndBegin()) {
+                    // CONNECT is queued
+                } else {
+                    state = ST_OFFLINE;
+                    nextAttempt = now + backoff;
+                    backoff = backoff * 2;
+                    if (backoff > options->reconnectMaxMs) backoff = options->reconnectMaxMs;
+                }
+            } else {
+                int w = ms;
+                if (state == ST_OFFLINE && options->autoReconnect && wantOnline && nextAttempt - now < w) w = nextAttempt - now;
+                if (w > 0) sleepMs(w > 10 ? 10 : w);
+                return 0;
+            }
+        }
+        if (link == null || !link->isOpen()) return 0;
+        if (!pumpOut()) { drop("the connection failed"); return 0; }
+        int before = parser->packets;
+        bool readable = link->waitReadable(ms);
+        now = millis();
+        if (readable) {
+            for (int round = 0; round < 8; round++) {
+                int n = link->recv(rbuf, 4096);
+                if (n == -2) break;
+                if (n == 0) { drop("the broker closed the connection"); return parser->packets - before; }
+                if (n < 0) { drop("the connection failed"); return 0; }
+                if (!feed(rbuf, n)) {
+                    char* why = error;
+                    drop(why);
+                    return parser->packets - before;
+                }
+                if (n < 4096) break;
+            }
+        }
+        if (!tick(now)) { char* why = error; drop(why); return parser->packets - before; }
+        if (state == ST_ONLINE) pump();
+        if (!pumpOut()) { drop("the connection failed"); }
+        return parser->packets - before;
+    }
+
+    // Serves the connection for at most ms milliseconds (it returns earlier when packets arrived): reads, answers, pings, reconnects.
+    // Returns the number of packets that arrived. Never blocks beyond ms, except that a reconnect attempt blocks while it connects.
+    public int poll(int ms) {
+        int t0 = millis();
+        int total = 0;
+        for (;;) {
+            int left = ms - (millis() - t0);
+            if (left < 0) left = 0;
+            total = total + step(left);
+            if (total > 0 || millis() - t0 >= ms) break;
+        }
+        return total;
+    }
+
+    // ---- blocking helpers ------------------------------------------------------------------------------------------------------------------
+    // Waits until nothing queued is left (everything is handed to the socket and acknowledged). false on time out or when the client is closed.
+    public bool flushAll(int timeoutMs) {
+        int t0 = millis();
+        for (;;) {
+            if (pqCount == 0 && ninfl == 0 && out.pending() == 0 && (link == null || !link->hasBacklog())) return true;
+            if (state == ST_CLOSED) return false;
+            if (millis() - t0 >= timeoutMs) return false;
+            step(20);
+        }
+        return false;
+    }
+
+    // publish() and wait until the message is complete: QoS 0 handed to the socket, QoS 1 PUBACK, QoS 2 PUBCOMP
+    public bool publishWait(char* topic, char* payload, int n, int qos, bool retain, int timeoutMs) {
+        int token = publish(topic, payload, n, qos, retain);
+        if (token < 0) return false;
+        int t0 = millis();
+        for (;;) {
+            if (!isPending(token) && out.pending() == 0 && (link == null || !link->hasBacklog())) return true;
+            if (state == ST_CLOSED) return false;
+            if (millis() - t0 >= timeoutMs) return false;
+            step(20);
+        }
+        return false;
+    }
+
+    // subscribe and wait for the SUBACK: the granted QoS (0..2), 128 if the broker refused the filter, -1 on time out or error
+    public int subscribeWait(char* filter, int qos, int timeoutMs) {
+        int pid = subscribe(filter, qos);
+        if (pid < 0) return -1;
+        return waitOp(pid, timeoutMs);
+    }
+
+    public int unsubscribeWait(char* filter, int timeoutMs) {
+        int pid = unsubscribe(filter);
+        if (pid < 0) return -1;
+        return waitOp(pid, timeoutMs);
+    }
+
+    private int waitOp(int pid, int timeoutMs) {
+        if (pid == 0) { error = "not connected: the subscription is sent when the connection is back"; return -1; }
+        PendOp* o = opByPid(pid);
+        if (o == null) return -1;
+        o->waited = true;
+        int t0 = millis();
+        while (!o->done) {
+            if (state == ST_CLOSED || millis() - t0 >= timeoutMs) break;
+            step(20);
+            o = opByPid(pid);
+            if (o == null) return -1;
+        }
+        int code = o->done ? o->code : -1;
+        if (o->done) freeOp(o); else o->waited = false;
+        return code;
+    }
+
+    // The next message, waiting up to timeoutMs for it (the connection is served meanwhile). null on time out or when the client is closed.
+    public Message* waitMessage(int timeoutMs) {
+        int t0 = millis();
+        for (;;) {
+            Message* m = next();
+            if (m != null) return m;
+            if (state == ST_CLOSED) return null;
+            int left = timeoutMs - (millis() - t0);
+            if (left <= 0) return null;
+            step(left > 50 ? 50 : left);
+        }
+        return null;
+    }
+
+    // Sends DISCONNECT (the broker then drops the will message) and closes. No reconnect follows.
+    public void disconnect() {
+        wantOnline = false;
+        if (state == ST_ONLINE && link != null && link->isOpen()) {
+            out.clear();
+            putEmpty(&out, DISCONNECT);
+            link->sendAll(out.data(), out.pending(), 1000);
+            out.clear();
+        }
+        if (link != null) link->close();
+        failOps();
+        state = ST_CLOSED;
+        if (parser != null) parser->reset();
+    }
+
+    // Frees everything (messages not yet sent are lost). The pointer is invalid afterwards for a client from newClient().
+    public void dispose() {
+        if (link != null) { link->dispose(); link = null; }
+        if (parser != null) { parser->dispose(); parser = null; }
+        if (pk != null) { free((char*) pk); pk = null; }
+        if (rbuf != null) { free(rbuf); rbuf = null; }
+        out.release();
+        for (int i = 0; i < ninfl; i++) { infl[i]->dispose(); infl[i] = null; }
+        ninfl = 0;
+        while (pqCount > 0) { Message* m = pqPop(); m->dispose(); }
+        if (pq != null) { free((char*) pq); pq = null; pqCap = 0; }
+        Message* m = inHead;
+        while (m != null) { Message* nx = m->next; m->dispose(); m = nx; }
+        inHead = null; inTail = null; inCount = 0;
+        for (int i = 0; i < nsubs; i++) { free(subs[i]); subs[i] = null; }
+        nsubs = 0;
+        for (int i = 0; i < MAX_PENDING_OPS; i++) { if (ops[i].kind != 0) freeOp(&ops[i]); }
+        if (in2 != null) { free(in2); in2 = null; }
+        if (host != null) { free(host); host = null; }
+        if (ownUser != null) { free(ownUser); ownUser = null; }
+        if (ownPass != null) { free(ownPass); ownPass = null; }
+        if (ownsOptions && options != null) { free((char*) options); options = null; ownsOptions = false; }
+        state = ST_CLOSED;
+        if (heap) {
+            heap = false;
+            free(this);
+        }
+    }
+
+    // copies of the user name and password for the options (they are freed with the client)
+    public void setCredentials(char* userName, char* pass) {
+        if (ownUser != null) free(ownUser);
+        if (ownPass != null) free(ownPass);
+        ownUser = copyOf(userName);
+        ownPass = pass == null ? null : copyOf(pass);
+        options->username = ownUser;
+        options->password = ownPass;
+        options->passwordLen = -1;
+    }
+
+    public void setHost(char* h, int p) {
+        if (host != null) free(host);
+        host = copyOf(h);
+        port = p;
+    }
+}
+
+private char* copyOf(char* s) {
+    int n = strlen(s);
+    char* r = malloc(n + 1);
+    if (r != null) memcpy(r, s, n + 1);
+    return r;
+}
+
+private void asysRandom(char* buf, int n) {
+    asys.randomBytes(buf, n);
+}
+
+// A client for host and port that you connect() yourself. options == null: the defaults. The client frees itself completely with dispose();
+// `options` stays yours (strings in it must stay valid while the client lives).
+public Client* newClient(char* host, int port, Options* options) {
+    Client* c = (Client*) malloc(sizeof(Client));
+    if (c == null) return null;
+    c->init();
+    c->heap = true;
+    if (options == null) {
+        options = (Options*) malloc(sizeof(Options));
+        if (options == null) { free((char*) c); return null; }
+        options->init();
+        c->ownsOptions = true;
+    }
+    c->options = options;
+    c->setHost(host, port);
+    return c;
+}
+
+// mqtt://[user[:password]@]host[:port][/...]  or mqtts:// (TLS, port 8883). The client id is made up, the session is clean, keep-alive 60 s.
+// Connects and returns the client; null on failure (error() says why).
+public Client* connect(char* url) {
+    return connectWith(url, null);
+}
+
+// the same with your options (clientId, will, keep-alive ...); the host, port, user name, password and TLS in the URL win over the options
+public Client* connectWith(char* url, Options* options) {
+    char hostBuf[256];
+    char userBuf[128];
+    char passBuf[128];
+    int port = 0;
+    bool secure = false;
+    int i = 0;
+    if (startsWith(url, "mqtts://")) { secure = true; i = 8; }
+    else if (startsWith(url, "ssl://")) { secure = true; i = 6; }
+    else if (startsWith(url, "mqtt://")) i = 7;
+    else if (startsWith(url, "tcp://")) i = 6;
+    else { setLast("the URL must start with mqtt:// or mqtts://"); return null; }
+    // user[:password]@
+    int at = -1;
+    for (int k = i; url[k] != 0 && url[k] != '/'; k++) { if (url[k] == '@') at = k; }
+    userBuf[0] = 0;
+    passBuf[0] = 0;
+    bool hasUser = false;
+    bool hasPass = false;
+    if (at >= 0) {
+        int colon = -1;
+        for (int k = i; k < at; k++) { if (url[k] == ':') { colon = k; break; } }
+        int ue = colon >= 0 ? colon : at;
+        if (ue - i > 127 || (colon >= 0 && at - colon - 1 > 127)) { setLast("user name or password too long"); return null; }
+        memcpy(&userBuf[0], &url[i], ue - i);
+        userBuf[ue - i] = 0;
+        hasUser = true;
+        if (colon >= 0) {
+            memcpy(&passBuf[0], &url[colon + 1], at - colon - 1);
+            passBuf[at - colon - 1] = 0;
+            hasPass = true;
+        }
+        i = at + 1;
+    }
+    int hl = 0;
+    while (url[i] != 0 && url[i] != ':' && url[i] != '/') {
+        if (hl >= 255) { setLast("host name too long"); return null; }
+        hostBuf[hl] = url[i];
+        hl++;
+        i++;
+    }
+    hostBuf[hl] = 0;
+    if (hl == 0) { setLast("no host in the URL"); return null; }
+    if (url[i] == ':') {
+        i++;
+        while (isDigit(url[i])) {
+            port = port * 10 + (url[i] - '0');
+            if (port > 65535) { setLast("bad port"); return null; }
+            i++;
+        }
+        if (port == 0) { setLast("bad port"); return null; }
+    }
+    if (port == 0) port = secure ? 8883 : 1883;
+    // the client works on its own copy of the options (yours stay untouched)
+    Options* mine = (Options*) malloc(sizeof(Options));
+    if (mine == null) { setLast("out of memory"); return null; }
+    if (options != null) memcpy((char*) mine, (char*) options, sizeof(Options)); else mine->init();
+    Client* c = newClient(&hostBuf[0], port, mine);
+    if (c == null) { free((char*) mine); setLast("out of memory"); return null; }
+    c->ownsOptions = true;
+    Options* o = mine;
+    if (secure) o->useTls = true;
+    if (hasUser) {
+        c->setCredentials(&userBuf[0], hasPass ? &passBuf[0] : null);
+    }
+    if (!c->connect()) {
+        char* why = c->error;
+        setLast(why);
+        c->dispose();
+        return null;
+    }
+    return c;
+}

@@ -1,0 +1,366 @@
+// The MQTT client in difficult situations: URLs, refused and unanswered connections, credentials, automatic reconnect with resubscribe (the broker drops
+// everybody, the broker restarts), messages published while offline, the clock driven keep-alive of the engine, packets over maxPacket, the limits of
+// the queues (maxQueued, maxIncoming), a server that answers with garbage or refuses, callbacks that publish, disconnect() ending everything.
+import mqtt;
+import mqttd;
+import net;
+import netio;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqttd.Server* srv;
+int PORT;
+char url[100];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+// serves the sockets until `rounds` polls in a row had nothing to do (at most 2 s): no assumption about how fast the system delivers
+void settle(int rounds = 15) {
+    int quiet = 0;
+    int t0 = millis();
+    while (quiet < rounds && millis() - t0 < 2000) {
+        if (srv->poll(1) == 0) quiet++; else quiet = 0;
+    }
+}
+
+mqtt.Client* pc;            // a plain client that publishes
+int fakeServerListen;
+int fakeServerVariant;
+int fakeConn = -1;
+
+int connects;
+int disconnects;
+int retryFlag;
+int lastSessionPresent;
+int onConnect(mqtt.Client* c, int sessionPresent) { connects++; lastSessionPresent = sessionPresent; return 0; }
+int onDisconnect(mqtt.Client* c, int willRetry) { disconnects++; retryFlag = willRetry; return 0; }
+
+// polls a client until the condition holds or ms have passed
+bool online(mqtt.Client* c, int ms) {
+    int t0 = millis();
+    while (millis() - t0 < ms) {
+        c->poll(5);
+        srv->poll(0);
+        if (c->state == mqtt.ST_ONLINE) return true;
+    }
+    return false;
+}
+
+int echoCount;
+int onEcho(mqtt.Client* c, char* topic, char* payload, int n, int qos, int retain) {
+    echoCount++;
+    char reply[60];
+    format(&reply[0], 60, "echo:%s", payload, 0, 0, 0);
+    c->publishText("echo/out", &reply[0], 0, false);          // publishing from inside the callback
+    return 0;
+}
+
+// the fake broker: accepts, reads CONNECT, sends the variant's answer
+int fakeHook() {
+    if (fakeConn < 0 && net.waitReadable(fakeServerListen, 0)) {
+        fakeConn = net.accept(fakeServerListen);
+        net.setNonBlocking(fakeConn, true);
+    }
+    if (fakeConn >= 0) {
+        char buf[200];
+        int n = net.recvSome(fakeConn, &buf[0], 200);
+        if (n > 0) {
+            int len = 0;
+            char* ans = null;
+            if (fakeServerVariant == 0) ans = bytebuf.fromHex("20020005", &len);
+            else if (fakeServerVariant == 1) ans = bytebuf.fromHex("f000", &len);
+            else ans = bytebuf.fromHex("300400016100", &len);
+            net.sendSome(fakeConn, ans, len);
+            free(ans);
+            fakeServerVariant = -1;
+        }
+    }
+    return 0;
+}
+
+int main() {
+    srv = mqttd.newServer();
+    check("the broker listens", srv->listenOn("127.0.0.1", 0, null));
+    PORT = srv->port;
+    format(&url[0], 100, "mqtt://127.0.0.1:%d", PORT, 0, 0, 0);
+    net.setIdleHook(hook);
+    mqttd.Broker* b = srv->broker;
+    b->sysIntervalMs = 0;
+
+    // ---- URLs ---------------------------------------------------------------------------------------------------------------------------------------
+    check("a URL that is not mqtt:// is refused", mqtt.connect("http://127.0.0.1:1883") == null && startsWith(mqtt.error(), "the URL must start with"));
+    check("a URL without a host is refused", mqtt.connect("mqtt://") == null && streq(mqtt.error(), "no host in the URL"));
+    check("a URL with port 0 is refused", mqtt.connect("mqtt://127.0.0.1:0") == null && streq(mqtt.error(), "bad port"));
+    check("a URL with a port over 65535 is refused", mqtt.connect("mqtt://127.0.0.1:70000") == null && streq(mqtt.error(), "bad port"));
+    int dead = net.listen(0, 4);
+    int deadPort = net.localPort(dead);
+    net.close(dead);
+    char deadUrl[100];
+    format(&deadUrl[0], 100, "mqtt://127.0.0.1:%d/", deadPort, 0, 0, 0);
+    int t0 = millis();
+    check("nothing listens there: no client, the reason is given", mqtt.connect(&deadUrl[0]) == null && streq(mqtt.error(), "cannot connect") && millis() - t0 < 2000);
+
+    // ---- credentials in the URL --------------------------------------------------------------------------------------------------------------------------
+    b->addUser("alice", "secret");
+    b->allowAnonymous = false;
+    char u2[120];
+    format(&u2[0], 120, "mqtt://alice:secret@127.0.0.1:%d/some/path", PORT, 0, 0, 0);
+    mqtt.Client* a = mqtt.connect(&u2[0]);
+    check("user name and password in the URL", a != null && a->state == mqtt.ST_ONLINE && a->returnCode == 0);
+    format(&u2[0], 120, "mqtt://alice:wrong@127.0.0.1:%d", PORT, 0, 0, 0);
+    check("a wrong password: no client, the broker's reason", mqtt.connect(&u2[0]) == null && streq(mqtt.error(), "bad user name or password"));
+    check("no credentials at all", mqtt.connect(&url[0]) == null && streq(mqtt.error(), "not authorized"));
+    check("a refusal does not leave a session behind", b->sessionCount() == 1);
+    b->allowAnonymous = true;
+    a->disconnect();
+    check("disconnect() closes for good: publishing is refused", a->state == mqtt.ST_CLOSED && a->publishText("x", "y", 0, false) == -1 && streq(a->error, "not connected"));
+    a->dispose();
+    settle();
+    b->addUser("alice", "secret");
+
+    // ---- a broker that never answers, one that refuses, one that sends garbage -------------------------------------------------------------------------------
+    int mute = net.listen(0, 4);
+    int mutePort = net.localPort(mute);
+    mqtt.Options o1();
+    o1.connectTimeoutMs = 300;
+    mqtt.Client* mc = mqtt.newClient("127.0.0.1", mutePort, &o1);
+    t0 = millis();
+    check("a broker that accepts but never answers: connect() gives up", !mc->connect() && streq(mqtt.error(), "the broker did not answer CONNECT") && millis() - t0 < 2000);
+    mc->dispose();
+    net.close(mute);
+
+    // ---- automatic reconnect with a persistent session -----------------------------------------------------------------------------------------------------
+    mqtt.Options o2();
+    o2.clientId = "rc";
+    o2.cleanSession = false;
+    o2.autoReconnect = true;
+    o2.reconnectMinMs = 20;
+    o2.reconnectMaxMs = 80;
+    mqtt.Client* r = mqtt.newClient("127.0.0.1", PORT, &o2);
+    r->onConnect = onConnect;
+    r->onDisconnect = onDisconnect;
+    check("connect with autoReconnect", r->connect() && connects == 1 && lastSessionPresent == 0);
+    check("subscribe", r->subscribeWait("rc/#", 1, 2000) == 1);
+    pc = mqtt.connect(&url[0]);
+    pc->publishWait("rc/a", "before", 6, 1, false, 2000);
+    mqtt.Message* m = r->waitMessage(1000);
+    check("a message arrives", m != null && streq(m->payload, "before"));
+    if (m != null) m->dispose();
+    srv->dropClients();
+    settle();
+    int pcState = pc->state;
+    pc->poll(50);
+    check("the broker drops everybody: the client notices (onDisconnect, will retry)", r->poll(200) >= 0 && disconnects >= 1 && retryFlag == 1);
+    check("... exactly once", disconnects == 1);
+    int tok = r->publishText("rc/offline", "queued while offline", 1, false);
+    check("publishing while the connection is down is accepted (queued, sent after the reconnect)", tok > 0);
+    check("the client comes back by itself (session present: no resubscribe needed)", online(r, 3000) && connects == 2 && lastSessionPresent == 1);
+    check("the plain client without autoReconnect stays offline", pc->state == mqtt.ST_OFFLINE || pc->state == mqtt.ST_CLOSED);
+    pc->dispose();
+    pc = mqtt.connect(&url[0]);
+    pc->publishWait("rc/b", "after", 5, 1, false, 2000);
+    bool gotAfter = false;
+    bool gotQueued = false;
+    for (int i = 0; i < 5; i++) {
+        m = r->waitMessage(500);
+        if (m == null) break;
+        if (streq(m->payload, "after")) gotAfter = true;
+        if (streq(m->payload, "queued while offline")) gotQueued = true;
+        m->dispose();
+    }
+    check("after the reconnect the old subscription works and the offline message was sent", gotAfter && gotQueued);
+
+    // ---- a clean session is resubscribed by the client ------------------------------------------------------------------------------------------------------
+    mqtt.Options o3();
+    o3.autoReconnect = true;
+    o3.reconnectMinMs = 20;
+    o3.reconnectMaxMs = 80;
+    mqtt.Client* cs = mqtt.newClient("127.0.0.1", PORT, &o3);
+    connects = 0;
+    cs->onConnect = onConnect;
+    cs->connect();
+    check("subscribe (clean session)", cs->subscribeWait("cs/+", 0, 2000) == 0 && cs->subscribeWait("cs/x/#", 1, 2000) == 1);
+    srv->dropClients();
+    settle();
+    cs->poll(100);
+    check("reconnect: the broker has forgotten the session", online(cs, 3000) && lastSessionPresent == 0 && connects == 2);
+    settle();
+    pc->dispose();
+    pc = mqtt.connect(&url[0]);
+    pc->publishWait("cs/a", "one", 3, 0, false, 2000);
+    pc->publishWait("cs/x/y/z", "two", 3, 1, false, 2000);
+    mqtt.Message* m1 = cs->waitMessage(1000);
+    mqtt.Message* m2 = cs->waitMessage(1000);
+    check("both subscriptions were made again by the client", m1 != null && m2 != null && streq(m1->payload, "one") && streq(m2->payload, "two") && m2->qos == 1);
+    if (m1 != null) m1->dispose();
+    if (m2 != null) m2->dispose();
+
+    // ---- the broker goes away and comes back --------------------------------------------------------------------------------------------------------------
+    srv->shutdown();
+    srv = null;
+    int attempts0 = cs->reconnects;
+    cs->poll(300);
+    check("with the broker gone the client is offline and keeps trying (with a growing pause)", cs->state == mqtt.ST_OFFLINE && cs->reconnects > attempts0 && cs->reconnects < attempts0 + 20);
+    srv = mqttd.newServer();
+    check("the broker is back on the same port", srv->listenOn("127.0.0.1", PORT, null));
+    srv->broker->sysIntervalMs = 0;
+    b = srv->broker;
+    connects = 0;
+    check("the client reconnects", online(cs, 3000));
+    check("... and subscribed again", cs->subscribeWait("cs/new", 0, 2000) == 0 && b->subscriptionCount() == 3);
+
+    pc->dispose();
+    pc = mqtt.connect(&url[0]);
+
+    // ---- limits of the client ------------------------------------------------------------------------------------------------------------------------------
+    // maxIncoming: messages that nobody collects are dropped and counted
+    mqtt.Options o4();
+    o4.maxIncoming = 5;
+    mqtt.Client* lazy = mqtt.newClient("127.0.0.1", PORT, &o4);
+    lazy->connect();
+    lazy->subscribeWait("lz/#", 0, 2000);
+    for (int i = 0; i < 20; i++) pc->publishText("lz/x", "m", 0, false);
+    pc->flushAll(2000);
+    for (int i = 0; i < 10; i++) { lazy->poll(5); settle(2); }
+    check("maxIncoming: 5 messages are kept, 15 are dropped and counted", lazy->waiting() == 5 && lazy->dropped == 15 && lazy->received == 20);
+    int collected = 0;
+    m = lazy->next();
+    while (m != null) { collected++; m->dispose(); m = lazy->next(); }
+    check("... the 5 can be collected", collected == 5 && lazy->waiting() == 0);
+
+    // maxPacket: a message that is too big ends the connection
+    mqtt.Options o5();
+    o5.maxPacket = 1000;
+    o5.autoReconnect = false;
+    mqtt.Client* small = mqtt.newClient("127.0.0.1", PORT, &o5);
+    small->connect();
+    small->subscribeWait("big/#", 0, 2000);
+    char* blob = alloc(4000);
+    memset(blob, 'b', 4000);
+    pc->publishWait("big/x", blob, 4000, 0, false, 2000);
+    for (int i = 0; i < 10; i++) { small->poll(10); settle(2); }
+    check("a message over maxPacket: the client closes the connection", small->state == mqtt.ST_OFFLINE && streq(small->error, "packet too large"));
+    check("a message that is too big cannot be published either", small->publish("big/y", blob, 2000, 0, false) == -1);
+
+    // maxQueued and maxQueuedBytes while offline
+    mqtt.Options o6();
+    o6.maxQueued = 3;
+    o6.maxQueuedBytes = 100;
+    mqtt.Client* off = mqtt.newClient("127.0.0.1", PORT, &o6);
+    off->connect();
+    off->disconnect();
+    check("after disconnect() nothing can be queued", off->publishText("q", "x", 1, false) == -1);
+    off->connect();
+    off->poll(10);
+    srv->dropClients();
+    settle();
+    off->poll(50);
+    check("the connection broke (no autoReconnect): offline", off->state == mqtt.ST_OFFLINE);
+    check("messages can be queued while offline", off->publishText("q/1", "a", 1, false) > 0 && off->publishText("q/2", "b", 1, false) > 0 && off->publishText("q/3", "c", 1, false) > 0);
+    check("the 4th is refused: queue full", off->publishText("q/4", "d", 1, false) == -1 && streq(off->error, "send queue full") && off->queued() == 3);
+    off->dispose();
+    mqtt.Client* off2 = mqtt.newClient("127.0.0.1", PORT, &o6);
+    off2->connect();
+    srv->dropClients();
+    settle();
+    off2->poll(50);
+    check("maxQueuedBytes: 60 bytes fit, 60 more do not", off2->publish("q/1", blob, 60, 1, false) > 0 && off2->publish("q/2", blob, 60, 1, false) == -1);
+    off2->dispose();
+
+    // ---- callbacks that publish --------------------------------------------------------------------------------------------------------------------------------
+    pc->dispose();                                      // (the drops above cut it off)
+    pc = mqtt.connect(&url[0]);
+    mqtt.Client* ec = mqtt.connect(&url[0]);
+    ec->onMessage = onEcho;
+    ec->subscribeWait("echo/in", 0, 2000);
+    pc->subscribeWait("echo/out", 0, 2000);
+    pc->publishText("echo/in", "ping", 0, false);
+    pc->flushAll(1000);
+    mqtt.Message* er = null;
+    for (int i = 0; i < 200 && er == null; i++) { ec->poll(5); pc->poll(5); er = pc->next(); }
+    check("a message handler can publish an answer", er != null && streq(er->payload, "echo:ping") && echoCount == 1);
+    if (er != null) er->dispose();
+
+    // ---- servers that misbehave ------------------------------------------------------------------------------------------------------------------------------
+    // a broker that answers CONNECT with the wrong thing (the answer is sent from the idle hook while the client waits)
+    for (int variant = 0; variant < 3; variant++) {
+        int fl = net.listen(0, 4);
+        int flPort = net.localPort(fl);
+        mqtt.Options ov();
+        ov.connectTimeoutMs = 800;
+        mqtt.Client* fv = mqtt.newClient("127.0.0.1", flPort, &ov);
+        // connect in steps: the TCP connection completes by itself (backlog), the answer is sent when the client waits
+        int variantCopy = variant;
+        fakeServerListen = fl;
+        fakeServerVariant = variantCopy;
+        net.setIdleHook(fakeHook);
+        bool ok = fv->connect();
+        net.setIdleHook(hook);
+        char name[100];
+        char* expect = variant == 0 ? "not authorized" : (variant == 1 ? "a packet type that is not allowed here" : "the broker answered CONNECT with something else");
+        format(&name[0], 100, "a broker that answers CONNECT with %s: connect() fails with '%s'", variant == 0 ? "CONNACK 5" : (variant == 1 ? "garbage" : "a PUBLISH"), expect, 0, 0);
+        check(&name[0], !ok && streq(fv->error, expect));
+        if (variant == 0) check("... a refusal with code 5 is final: no more tries", fv->state == mqtt.ST_CLOSED);
+        fv->dispose();
+        net.close(fl);
+        if (fakeConn >= 0) net.close(fakeConn);
+        fakeConn = -1;
+    }
+
+    // ---- the engine with a clock: keep-alive without sockets ----------------------------------------------------------------------------------------------------------
+    mqtt.Options o8();
+    o8.keepAliveSec = 20;
+    o8.connectTimeoutMs = 4000;
+    mqtt.Client* e = mqtt.newClient("localhost", 1, &o8);
+    e->begin(1000);
+    check("begin() queues CONNECT", e->outPending() > 0 && e->state == mqtt.ST_CONNECTING);
+    e->outConsumed(e->outPending());
+    check("without CONNACK the engine gives up after connectTimeoutMs", e->tick(4999) && !e->tick(5001) && streq(e->error, "the broker did not answer CONNECT"));
+    e->lost("test");
+    e->begin(10000);
+    e->outConsumed(e->outPending());
+    char* connack = bytebuf.fromHex("20020000", &t0);
+    e->tick(10000);
+    check("a CONNACK makes it online", e->feed(connack, 4) && e->state == mqtt.ST_ONLINE);
+    check("no ping before three quarters of the keep-alive", e->tick(24999) && e->outPending() == 0);
+    check("a ping after 15 s of silence", e->tick(25000) && e->outPending() == 2 && memcmp(e->outData(), "\xC0\x00", 2) == 0);
+    e->outConsumed(2);
+    check("no PINGRESP within the keep-alive: dead", e->tick(44999) && !e->tick(45001) && streq(e->error, "keep-alive: no answer to PINGREQ"));
+    e->lost("keep-alive");
+    e->begin(50000);
+    e->outConsumed(e->outPending());
+    e->tick(50000);
+    e->feed(connack, 4);
+    e->tick(65000);
+    e->outConsumed(e->outPending());
+    char* pong = bytebuf.fromHex("d000", &t0);
+    e->tick(66000);
+    check("PINGRESP resets it: no ping at once, the next one 15 s after the last packet", e->feed(pong, 2) && e->tick(70000) && e->outPending() == 0 && e->tick(81000) && e->outPending() == 2);
+    e->dispose();
+
+    printf("%d checks, %d failed\n", checks, fails);
+    cs->dispose();
+    r->dispose();
+    lazy->dispose();
+    small->dispose();
+    ec->dispose();
+    pc->dispose();
+    srv->shutdown();
+    return fails == 0 ? 0 : 1;
+}
+

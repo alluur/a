@@ -37,6 +37,8 @@
 //    void net.setNonBlocking(h, on)       non-blocking mode; then  net.sendSome(h, buf, n)  (bytes taken, 0 = buffer full, -1 error) and
 //                                          net.recvSome(h, buf, max)  (bytes, 0 = closed, -2 = nothing now, -1 error)  never block
 //    int  net.connectTimeout(host, port, ms)          connect with a time limit
+//    int  net.connectStart(host, port)     a connect that never waits (the host name lookup apart): a non-blocking socket, then  net.connectDone(h)
+//                                          says 1 made, 0 still on its way, -1 failed
 //    void net.shutdown(h, how)             0 = stop reading, 1 = stop writing, 2 = both
 //    bool net.peer(h, &ip, &port)          address of the other side of a connection
 //    void net.setNoDelay / setKeepAlive / setBroadcast / setReuse (h, on)    socket options
@@ -96,6 +98,61 @@ private int i32(int x) {
 
 private bool windows() {
     return __OS == 1;
+}
+
+// A connect that does not wait: returns a non-blocking socket whose connection is on its way (or already made), -1 when it cannot even be started.
+// connectDone(h) tells how it went. A host name is looked up first, and that lookup can block (the resolver's time out) unless the host is an address.
+public int connectStart(char* host, int port) {
+    int ip = resolve(host);
+    if (ip < 0) {
+        return -1;
+    }
+    int s = newSocket();
+    if (s < 0) {
+        return -1;
+    }
+    setBlocking(s, false);
+    char sa[16];
+    fillAddr(&sa[0], ip, port);
+    int r;
+    if (windows()) {
+        r = i32(__winapi(WS_CONNECT, s, &sa[0], 16, 0));
+    } else {
+        r = __syscall(nr(42, 203), s, &sa[0], 16, 0, 0, 0);
+    }
+    if (r < 0 && !windows() && r != -115) {                 // Linux: -115 EINPROGRESS is the normal case, anything else is a failure now
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+// 1: the connection started with connectStart is made, 0: still on its way, -1: it failed (the caller closes the handle)
+public int connectDone(int h) {
+    int hh[1]; int ev[1]; int re[1];
+    hh[0] = h; ev[0] = WRITABLE; re[0] = 0;
+    int r = poll(&hh[0], &ev[0], &re[0], 1, 0);
+    if (r < 0) {
+        return -1;
+    }
+    if (r == 0) {
+        return 0;
+    }
+    int err = 0;
+    int len = 4;
+    if (windows()) {
+        __winapix(WS_GETSOCKOPT, h, 0xFFFF, 0x1007, &err, &len, 0, 0, 0, 0, 0);     // SO_ERROR
+    } else {
+        __syscall(nr(55, 209), h, 1, 4, &err, &len, 0);
+    }
+    err = err & 0xFFFFFFFF;
+    if (err != 0 || (re[0] & (FAILED | HUNGUP)) != 0) {
+        return -1;
+    }
+    if ((re[0] & WRITABLE) != 0) {
+        return 1;
+    }
+    return 0;
 }
 
 // starts Winsock on Windows (called automatically by the functions below)
@@ -1021,9 +1078,10 @@ private int timeoutOf(int h) {
     return 0;
 }
 
-// While a blocking call of this module waits for a socket to become readable (recv, accept, waitReadable with a time, the TLS handshake of
-// tls.wrap ...), fn() is called again and again (about every 2 ms). A single threaded program can serve the other end of the
-// connection from there, for example a wshub (hub->poll(0)); GUI programs can run their event loop. fn is never called from inside itself.
+// While a blocking call of this module waits for a socket to become readable or writable (recv, accept, send into a full buffer,
+// waitReadable and waitWritable with a time, connectTimeout, the TLS handshake of tls.wrap ...), fn() is called again and again (about every
+// 2 ms). A single threaded program can serve the other end of the connection from there, for example a wshub (hub->poll(0)); GUI programs can
+// run their event loop. fn is never called from inside itself.
 // Pass null to remove the hook. Nothing changes for programs that do not set one.
 public void setIdleHook(func fn) {
     idleFn = fn;
@@ -1031,16 +1089,25 @@ public void setIdleHook(func fn) {
 
 // waits until h can take data, running the idle hook; false when the time limit of the socket (setTimeout) passes
 private bool idleWaitWritable(int h) {
-    int limit = timeoutOf(h);
+    return idleWaitWritableMs(h, timeoutOf(h));
+}
+
+// the same with an explicit limit: ms > 0 gives up after that long, ms < 0 or 0 waits for ever (use pollWritable for ms = 0)
+private bool idleWaitWritableMs(int h, int ms) {
     int t0 = millis();
     for (;;) {
-        int hh[1]; int ev[1]; int re[1];
-        hh[0] = h; ev[0] = WRITABLE; re[0] = 0;
-        if (poll(&hh[0], &ev[0], &re[0], 1, 2) > 0) {
-            return true;
+        int slice = 2;
+        if (ms > 0) {
+            int left = ms - (millis() - t0);
+            if (left <= 0) {
+                return pollWritable(h, 0);
+            }
+            if (left < slice) {
+                slice = left;
+            }
         }
-        if (limit > 0 && millis() - t0 >= limit) {
-            return false;
+        if (pollWritable(h, slice)) {
+            return true;
         }
         if (!inIdle && idleFn != null) {
             inIdle = true;
@@ -1048,6 +1115,12 @@ private bool idleWaitWritable(int h) {
             inIdle = false;
         }
     }
+}
+
+private bool pollWritable(int h, int ms) {
+    int hh[1]; int ev[1]; int re[1];
+    hh[0] = h; ev[0] = WRITABLE; re[0] = 0;
+    return poll(&hh[0], &ev[0], &re[0], 1, ms) > 0;
 }
 
 private bool idleWait(int h, int ms) {
@@ -1074,10 +1147,13 @@ private bool idleWait(int h, int ms) {
     }
 }
 
+// true if the socket can take data within ms milliseconds (a full send buffer, a connect in progress). With an idle hook and ms != 0 the
+// hook runs while it waits (like waitReadable), so a single thread can drain the socket from the hook; ms < 0 waits without a limit.
 public bool waitWritable(int h, int ms) {
-    int hh[1]; int ev[1]; int re[1];
-    hh[0] = h; ev[0] = WRITABLE;
-    return poll(&hh[0], &ev[0], &re[0], 1, ms) > 0;
+    if (idleFn != null && ms != 0) {
+        return idleWaitWritableMs(h, ms);
+    }
+    return pollWritable(h, ms);
 }
 
 // how = 0: no more reading, 1: no more writing (the other side sees the end of the data), 2: both

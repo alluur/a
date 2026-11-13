@@ -1,0 +1,296 @@
+// MQTT client against the broker module over loopback (one thread: the broker runs from net.setIdleHook): connect, SUBSCRIBE with the granted QoS,
+// PUBLISH with QoS 0, 1 and 2 in both directions, wildcards, retained messages, overlapping subscriptions, QoS downgrade, UNSUBSCRIBE, $-topics,
+// binary and empty payloads, a payload of 100 KB, ordering under a small window, callbacks and the message queue, ACL refusals.
+import mqtt;
+import mqttd;
+import net;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqttd.Server* srv;
+int PORT;
+char url[100];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+mqtt.Client* cl[8];
+int ncl;
+
+mqtt.Client* conn(char* id) {
+    mqtt.Options o();
+    o.clientId = id;
+    mqtt.Client* c = mqtt.connectWith(&url[0], &o);
+    if (c != null) { cl[ncl] = c; ncl++; }
+    return c;
+}
+
+// everything that is under way gets a few turns
+void settle() {
+    for (int i = 0; i < 12; i++) {
+        srv->poll(0);
+        for (int k = 0; k < ncl; k++) cl[k]->poll(0);
+    }
+}
+
+// the next message of a client (waits up to 1.5 s, the other clients and the broker are served meanwhile), or null
+mqtt.Message* get(mqtt.Client* c) {
+    int t0 = millis();
+    for (;;) {
+        mqtt.Message* m = c->next();
+        if (m != null) return m;
+        if (millis() - t0 > 1500) return null;
+        srv->poll(0);
+        for (int k = 0; k < ncl; k++) cl[k]->poll(0);
+        sleepMs(1);
+    }
+    return null;
+}
+
+bool nothing(mqtt.Client* c) {
+    settle();
+    return c->next() == null;
+}
+
+// a message with these properties?
+bool isMsg(mqtt.Message* m, char* topic, char* payload, int qos, bool retain) {
+    bool ok = m != null && streq(m->topic, topic) && m->payloadLen == strlen(payload) && memcmp(m->payload, payload, m->payloadLen) == 0 && m->qos == qos && m->retain == retain;
+    if (m != null) m->dispose();
+    return ok;
+}
+
+int cbCount;
+char cbTopic[100];
+char cbPayload[100];
+int cbQos;
+int cbRetain;
+int cbLen;
+int onMessage(mqtt.Client* c, char* topic, char* payload, int n, int qos, int retain) {
+    cbCount++;
+    strcpy(&cbTopic[0], topic);
+    strcpy(&cbPayload[0], payload);                  // the payload is followed by a 0 byte
+    cbQos = qos;
+    cbRetain = retain;
+    cbLen = n;
+    return 0;
+}
+
+int doneCount;
+int lastToken;
+int onPublished(mqtt.Client* c, int token) {
+    doneCount++;
+    lastToken = token;
+    return 0;
+}
+
+int aclDeny(mqttd.Broker* b, char* clientId, int op, char* topic) {
+    if (op == 2 && startsWith(topic, "secret/")) return 0;
+    if (op == 1 && startsWith(topic, "readonly/")) return 0;
+    return 1;
+}
+
+int main() {
+    srv = mqttd.newServer();
+    check("the broker listens", srv->listenOn("127.0.0.1", 0, null));
+    PORT = srv->port;
+    format(&url[0], 100, "mqtt://127.0.0.1:%d", PORT, 0, 0, 0);
+    net.setIdleHook(hook);
+    mqttd.Broker* b = srv->broker;
+    b->sysIntervalMs = 0;                                           // no $SYS noise in this test
+
+    mqtt.Client* a = conn("alice");
+    mqtt.Client* bob = conn("bob");
+    check("two clients are connected", a != null && bob != null && a->state == mqtt.ST_ONLINE && bob->state == mqtt.ST_ONLINE && srv->clients() == 2);
+    check("the broker knows them", b->hasSession("alice") && b->hasSession("bob") && b->sessionCount() == 2);
+    check("a clean session is not present", !a->sessionPresent);
+
+    // ---- subscribe, publish, every QoS -----------------------------------------------------------------------------------------------------------------
+    check("SUBACK grants QoS 0", a->subscribeWait("q/0", 0, 2000) == 0);
+    check("SUBACK grants QoS 1", a->subscribeWait("q/1", 1, 2000) == 1);
+    check("SUBACK grants QoS 2", a->subscribeWait("q/2", 2, 2000) == 2);
+    check("QoS 0 message", bob->publishWait("q/0", "zero", 4, 0, false, 2000));
+    check("... arrives", isMsg(get(a), "q/0", "zero", 0, false));
+    check("QoS 1 message (waits for the PUBACK)", bob->publishWait("q/1", "one", 3, 1, false, 2000));
+    check("... arrives", isMsg(get(a), "q/1", "one", 1, false));
+    check("QoS 2 message (waits for the PUBCOMP)", bob->publishWait("q/2", "two", 3, 2, false, 2000));
+    check("... arrives exactly once", isMsg(get(a), "q/2", "two", 2, false) && nothing(a));
+    check("nothing is left in flight", bob->inflight() == 0 && bob->queued() == 0 && b->sessionInflight("alice") == 0);
+
+    // ---- the QoS of the subscription limits the QoS of the delivery ------------------------------------------------------------------------------------
+    check("a QoS 2 publish to a QoS 0 subscription is delivered with QoS 0", bob->publishWait("q/0", "down2", 5, 2, false, 2000) && isMsg(get(a), "q/0", "down2", 0, false));
+    check("a QoS 2 publish to a QoS 1 subscription is delivered with QoS 1", bob->publishWait("q/1", "down1", 5, 2, false, 2000) && isMsg(get(a), "q/1", "down1", 1, false));
+    check("a QoS 0 publish to a QoS 2 subscription stays QoS 0", bob->publishWait("q/2", "up0", 3, 0, false, 2000) && isMsg(get(a), "q/2", "up0", 0, false));
+
+    // ---- wildcards ----------------------------------------------------------------------------------------------------------------------------------
+    check("subscribe to sport/+/player1", a->subscribeWait("sport/+/player1", 0, 2000) == 0);
+    check("subscribe to news/#", a->subscribeWait("news/#", 0, 2000) == 0);
+    check("subscribe to +/status", a->subscribeWait("+/status", 0, 2000) == 0);
+    bob->publishText("sport/tennis/player1", "m1", 0, false);
+    bob->publishText("sport/golf/player1", "m2", 0, false);
+    bob->publishText("sport/tennis/player2", "m3", 0, false);
+    bob->publishText("sport/tennis/player1/ranking", "m4", 0, false);
+    bob->publishText("news", "m5", 0, false);
+    bob->publishText("news/eu/politics", "m6", 0, false);
+    bob->publishText("sport/status", "m7", 0, false);
+    bob->publishText("x/y/status", "m8", 0, false);
+    check("wildcards: sport/+/player1 gets tennis and golf", isMsg(get(a), "sport/tennis/player1", "m1", 0, false) && isMsg(get(a), "sport/golf/player1", "m2", 0, false));
+    check("wildcards: news/# gets news and news/eu/politics", isMsg(get(a), "news", "m5", 0, false) && isMsg(get(a), "news/eu/politics", "m6", 0, false));
+    check("wildcards: +/status gets sport/status only", isMsg(get(a), "sport/status", "m7", 0, false) && nothing(a));
+
+    // ---- overlapping subscriptions: one copy, the highest QoS ----------------------------------------------------------------------------------------
+    check("subscribe to ov/# with QoS 0", bob->subscribeWait("ov/#", 0, 2000) == 0);
+    check("subscribe to ov/+ with QoS 2", bob->subscribeWait("ov/+", 2, 2000) == 2);
+    check("subscribe to ov/x with QoS 1", bob->subscribeWait("ov/x", 1, 2000) == 1);
+    check("publish to ov/x with QoS 2", a->publishWait("ov/x", "once", 4, 2, false, 2000));
+    check("one copy with QoS 2", isMsg(get(bob), "ov/x", "once", 2, false) && nothing(bob));
+
+    // ---- retained messages --------------------------------------------------------------------------------------------------------------------------
+    check("publish retained", a->publishWait("ret/a", "v1", 2, 1, true, 2000));
+    check("a new subscriber gets it with the retain flag on", bob->subscribeWait("ret/+", 1, 2000) == 1 && isMsg(get(bob), "ret/a", "v1", 1, true));
+    check("a retained message is replaced", a->publishWait("ret/a", "v2", 2, 0, true, 2000) && isMsg(get(bob), "ret/a", "v2", 0, false));
+    check("a second retained topic", a->publishWait("ret/b", "bee", 3, 2, true, 2000) && isMsg(get(bob), "ret/b", "bee", 1, false));
+    mqtt.Client* carl = conn("carl");
+    check("a late subscriber gets both, QoS limited by the subscription", carl->subscribeWait("ret/#", 0, 2000) == 0);
+    mqtt.Message* r1 = get(carl);
+    mqtt.Message* r2 = get(carl);
+    bool gotBoth = r1 != null && r2 != null && r1->retain && r2->retain && r1->qos == 0 && r2->qos == 0
+        && ((streq(r1->topic, "ret/a") && streq(r1->payload, "v2") && streq(r2->topic, "ret/b") && streq(r2->payload, "bee")) || (streq(r2->topic, "ret/a") && streq(r1->topic, "ret/b")));
+    if (r1 != null) r1->dispose();
+    if (r2 != null) r2->dispose();
+    check("... both retained messages", gotBoth && nothing(carl));
+    check("the broker holds two retained messages", b->retainedCount() == 2);
+    check("an empty retained payload clears it", a->publishWait("ret/a", "", 0, 1, true, 2000) && b->retainedCount() == 1);
+    check("... and the live subscriber sees the empty message", isMsg(get(bob), "ret/a", "", 1, false) && isMsg(get(carl), "ret/a", "", 0, false));
+    carl->disconnect();
+    carl->dispose();
+    ncl--;
+    check("clear the other one", a->publishWait("ret/b", "", 0, 0, true, 2000) && b->retainedCount() == 0);
+    bob->unsubscribeWait("ret/+", 2000);
+    nothing(bob);
+    while (bob->next() != null) { }
+
+    // ---- unsubscribe ----------------------------------------------------------------------------------------------------------------------------------
+    check("UNSUBACK", a->unsubscribeWait("q/0", 2000) == 0);
+    bob->publishText("q/0", "gone", 0, false);
+    check("no more messages after UNSUBSCRIBE", nothing(a));
+    check("unsubscribing a filter that is not there is fine", a->unsubscribeWait("never/subscribed", 2000) == 0);
+
+    // ---- $-topics -------------------------------------------------------------------------------------------------------------------------------------
+    check("subscribe to # and $internal/#", a->subscribeWait("#", 0, 2000) == 0 && a->subscribeWait("$internal/#", 0, 2000) == 0);
+    while (a->next() != null) { }
+    b->publish("$internal/x", "dollar", 6, 0, false);
+    check("# does not get $-topics, $internal/# does", isMsg(get(a), "$internal/x", "dollar", 0, false) && nothing(a));
+    a->unsubscribeWait("#", 2000);
+    a->unsubscribeWait("$internal/#", 2000);
+
+    // ---- payloads --------------------------------------------------------------------------------------------------------------------------------------
+    a->subscribeWait("pl/#", 2, 2000);
+    char bin[8];
+    bin[0] = 1; bin[1] = 0; bin[2] = 255; bin[3] = 0; bin[4] = 'z';
+    check("a binary payload with zero bytes", bob->publishWait("pl/bin", &bin[0], 5, 1, false, 2000));
+    mqtt.Message* m = get(a);
+    check("... arrives intact", m != null && m->payloadLen == 5 && m->payload[0] == 1 && m->payload[1] == 0 && (m->payload[2] & 255) == 255 && m->payload[3] == 0 && m->payload[4] == 'z' && m->payload[5] == 0);
+    if (m != null) m->dispose();
+    check("an empty payload", bob->publishWait("pl/empty", "", 0, 2, false, 2000));
+    m = get(a);
+    check("... arrives empty", m != null && m->payloadLen == 0 && m->payload[0] == 0 && streq(m->topic, "pl/empty"));
+    if (m != null) m->dispose();
+    char* big = alloc(100000);
+    for (int i = 0; i < 100000; i++) big[i] = 'a' + i % 26;
+    check("a payload of 100000 bytes with QoS 2", bob->publishWait("pl/big", big, 100000, 2, false, 5000));
+    m = get(a);
+    bool same = m != null && m->payloadLen == 100000 && memcmp(m->payload, big, 100000) == 0;
+    if (m != null) m->dispose();
+    check("... arrives intact", same);
+    char* longTopic = alloc(1010);
+    memcpy(longTopic, "pl/", 3);
+    memset(&longTopic[3], 't', 997);
+    check("... is delivered", bob->publishWait(longTopic, "x", 1, 0, false, 2000) && get(a) != null);
+
+    // ---- order under a small window ---------------------------------------------------------------------------------------------------------------------
+    bob->options->maxInflight = 3;
+    b->maxInflight = 4;
+    a->subscribeWait("ord/#", 1, 2000);
+    char num[16];
+    int sent = 0;
+    for (int i = 0; i < 100; i++) {
+        format(&num[0], 16, "%d", i, 0, 0, 0);
+        if (bob->publishText("ord/n", &num[0], 1, false) > 0) sent++;
+    }
+    check("100 messages with QoS 1 are queued behind a window of 3", sent == 100 && bob->queued() + bob->inflight() > 0);
+    bool inOrder = true;
+    for (int i = 0; i < 100; i++) {
+        m = get(a);
+        if (m == null) { inOrder = false; break; }
+        format(&num[0], 16, "%d", i, 0, 0, 0);
+        if (!streq(m->payload, &num[0])) inOrder = false;
+        m->dispose();
+    }
+    check("... and arrive complete and in order", inOrder);
+    check("the window was never passed", bob->flushAll(2000) && bob->inflight() == 0 && bob->queued() == 0);
+    bob->options->maxInflight = 20;
+
+    // ---- callbacks ------------------------------------------------------------------------------------------------------------------------------------
+    carl = conn("carl");
+    carl->onMessage = onMessage;
+    carl->onPublished = onPublished;
+    carl->subscribeWait("cb/#", 1, 2000);
+    a->publishText("cb/x", "called", 1, false);
+    carl->poll(500);
+    settle();
+    check("onMessage gets the message (payload NUL terminated)", cbCount == 1 && streq(&cbTopic[0], "cb/x") && streq(&cbPayload[0], "called") && cbQos == 1 && cbRetain == 0 && cbLen == 6);
+    check("... and nothing is queued for next()", carl->next() == null);
+    int t1 = carl->publishText("cb/y", "one", 0, false);
+    int t2 = carl->publishText("cb/y", "two", 1, false);
+    int t3 = carl->publishText("cb/y", "three", 2, false);
+    check("publish returns tokens", t1 > 0 && t2 == t1 + 1 && t3 == t2 + 1);
+    check("flushAll waits for all of them", carl->flushAll(2000));
+    check("onPublished was called three times", doneCount == 3 && lastToken == t3 && !carl->isPending(t1) && !carl->isPending(t3));
+    settle();
+    check("... and the three messages came back to the subscriber (itself)", cbCount == 4);
+
+    // ---- errors of the API ------------------------------------------------------------------------------------------------------------------------------
+    check("a topic with a wildcard cannot be published", bob->publishText("a/+", "x", 0, false) == -1 && bob->publishText("a/#", "x", 0, false) == -1);
+    check("an empty topic cannot be published", bob->publishText("", "x", 0, false) == -1);
+    check("QoS 3 is refused", bob->publish("a", "x", 1, 3, false) == -1);
+    check("an invalid filter is refused", bob->subscribe("a/#/b", 0) == -1 && bob->subscribe("", 0) == -1 && bob->subscribe("a+", 0) == -1);
+    check("a payload over maxPacket is refused", bob->publish("a", big, 2000000, 0, false) == -1);
+
+    // ---- ACL: refused subscriptions and publishes -------------------------------------------------------------------------------------------------------
+    b->aclHook = aclDeny;
+    check("a refused subscription gets 0x80", bob->subscribeWait("secret/x", 1, 2000) == 128);
+    check("other filters are still granted", bob->subscribeWait("open/x", 1, 2000) == 1);
+    a->subscribeWait("readonly/#", 0, 2000);
+    bob->publishText("readonly/x", "denied", 0, false);
+    bob->publishWait("readonly/y", "denied", 6, 1, false, 2000);
+    check("a refused publish is not delivered (QoS 1 is still acknowledged)", nothing(a));
+    b->aclHook = null;
+
+    // ---- the broker's books ------------------------------------------------------------------------------------------------------------------------------
+    check("the broker counted messages in and out", b->stats->messagesIn > 100 && b->stats->messagesOut > 100);
+    check("nothing is queued anywhere", b->queuedBytes() == 0 && b->stats->liveItems == 0);
+    carl->disconnect();
+    a->disconnect();
+    bob->disconnect();
+    settle();
+    check("all clients are gone, the sessions with them", srv->clients() == 0 && b->sessionCount() == 0);
+    check("no message is left in the broker", b->stats->liveMsgs == 0 && b->stats->liveItems == 0 && b->retainedCount() == 0);
+    for (int i = 0; i < ncl; i++) cl[i]->dispose();
+
+    printf("%d checks, %d failed\n", checks, fails);
+    srv->shutdown();
+    return fails == 0 ? 0 : 1;
+}

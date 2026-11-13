@@ -1,0 +1,237 @@
+// MQTT parser against malformed and hostile input: every kind of malformed packet gets its error (reserved types, wrong flags, lengths that lie,
+// invalid UTF-8, wildcards where they must not be, packet identifier 0, bad CONNECT flags ...), nothing is buffered beyond the limit, a failed
+// parser stays failed, and a deterministic fuzz run (random bytes in random pieces) neither crashes nor grows without bound.
+import mqtt;
+import netio;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqtt.Packet pk;
+
+// parses hex text with a fresh parser and returns the error code (0: it was accepted)
+int errorOf(int mode, char* hex, int maxPacket = 1000) {
+    int n = 0;
+    char* raw = bytebuf.fromHex(hex, &n);
+    mqtt.Parser* p = mqtt.newParser(mode, maxPacket);
+    p->feed(raw, n);
+    int r = p->next(&pk);
+    int e = r == 1 ? 0 : (r < 0 ? pk.error : -1);
+    p->dispose();
+    free(raw);
+    return e;
+}
+
+void bad(char* name, int mode, char* hex, int err) {
+    int e = errorOf(mode, hex);
+    char line[200];
+    format(&line[0], 200, "%s -> %s", name, mqtt.errorText(err), 0, 0);
+    check(&line[0], e == err);
+    if (e != err) printf("     got %d (%s), wanted %d\n", e, e > 0 ? mqtt.errorText(e) : "no packet", err);
+}
+
+void good(char* name, int mode, char* hex) {
+    check(name, errorOf(mode, hex) == 0);
+}
+
+int rng = 12345;
+int rnd() {
+    rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF;
+    return rng >> 8;
+}
+
+int main() {
+    int S = mqtt.MODE_SERVER;
+    int C = mqtt.MODE_CLIENT;
+
+    // ---- packet types and directions ---------------------------------------------------------------------------------------------------------------
+    bad("type 0 is reserved", S, "0000", mqtt.E_TYPE);
+    bad("type 15 is reserved", S, "f000", mqtt.E_TYPE);
+    bad("type 15 is reserved (client side)", C, "f000", mqtt.E_TYPE);
+    bad("a server does not accept CONNACK", S, "20020000", mqtt.E_TYPE);
+    bad("a server does not accept SUBACK", S, "9003000100", mqtt.E_TYPE);
+    bad("a server does not accept UNSUBACK", S, "b0020001", mqtt.E_TYPE);
+    bad("a server does not accept PINGRESP", S, "d000", mqtt.E_TYPE);
+    bad("a client does not accept CONNECT", C, "101000044d5154540402003c00046d6f7371", mqtt.E_TYPE);
+    bad("a client does not accept SUBSCRIBE", C, "8206000100016100", mqtt.E_TYPE);
+    bad("a client does not accept UNSUBSCRIBE", C, "a2050001000161", mqtt.E_TYPE);
+    bad("a client does not accept PINGREQ", C, "c000", mqtt.E_TYPE);
+    bad("a client does not accept DISCONNECT", C, "e000", mqtt.E_TYPE);
+
+    // ---- fixed header flags -------------------------------------------------------------------------------------------------------------------------
+    bad("SUBSCRIBE needs the flags 0010", S, "8006000100016100", mqtt.E_FLAGS);
+    bad("SUBSCRIBE with the flags 0011", S, "8306000100016100", mqtt.E_FLAGS);
+    bad("UNSUBSCRIBE needs the flags 0010", S, "a0050001000161", mqtt.E_FLAGS);
+    bad("PUBREL needs the flags 0010", S, "60020001", mqtt.E_FLAGS);
+    bad("PUBACK needs the flags 0000", S, "41020001", mqtt.E_FLAGS);
+    bad("PUBREC needs the flags 0000", S, "52020001", mqtt.E_FLAGS);
+    bad("PUBCOMP needs the flags 0000", S, "74020001", mqtt.E_FLAGS);
+    bad("PINGREQ needs the flags 0000", S, "c100", mqtt.E_FLAGS);
+    bad("DISCONNECT needs the flags 0000", S, "e100", mqtt.E_FLAGS);
+    bad("CONNECT needs the flags 0000", S, "111000044d5154540402003c00046d6f7371", mqtt.E_FLAGS);
+    bad("CONNACK needs the flags 0000", C, "21020000", mqtt.E_FLAGS);
+    bad("PUBLISH with QoS 3", S, "36060003612f6200", mqtt.E_QOS);
+    bad("PUBLISH with DUP and QoS 0", S, "38050003612f62", mqtt.E_FLAGS);
+
+    // ---- the remaining length -----------------------------------------------------------------------------------------------------------------------
+    bad("remaining length of five bytes", S, "3080808080010000", mqtt.E_LENGTH);
+    bad("remaining length of four bytes with a continuation", S, "30ffffffff", mqtt.E_LENGTH);
+    bad("remaining length over the packet limit", S, "30ff7f", mqtt.E_TOO_BIG);
+    bad("268435455 bytes announced", S, "30ffffff7f", mqtt.E_TOO_BIG);
+    check("a truncated packet wants more bytes", errorOf(S, "300a0003612f62") == -1);
+    check("a lone header byte wants more bytes", errorOf(S, "30") == -1);
+    check("a length that is cut off wants more bytes", errorOf(S, "3080") == -1);
+
+    // ---- PUBLISH ------------------------------------------------------------------------------------------------------------------------------------
+    good("PUBLISH QoS 0 is fine", S, "300a0003612f6268656c6c6f");
+    bad("PUBLISH whose topic is longer than the packet", S, "30030005" "61", mqtt.E_LENGTH);
+    bad("PUBLISH with a one byte body", S, "300100", mqtt.E_LENGTH);
+    bad("PUBLISH without a body", S, "3000", mqtt.E_LENGTH);
+    bad("PUBLISH with an empty topic", S, "30020000", mqtt.E_TOPIC);
+    bad("PUBLISH with + in the topic", S, "30050003612b62", mqtt.E_TOPIC);
+    bad("PUBLISH with # in the topic", S, "30050003612f23", mqtt.E_TOPIC);
+    bad("PUBLISH QoS 1 with packet id 0", S, "32070003612f620000", mqtt.E_PACKET_ID);
+    bad("PUBLISH QoS 1 without a packet id", S, "32050003612f62", mqtt.E_LENGTH);
+    bad("PUBLISH QoS 2 with half a packet id", S, "34060003612f6200", mqtt.E_LENGTH);
+    bad("PUBLISH with an overlong NUL in the topic", S, "30040002c080", mqtt.E_UTF8);
+    bad("PUBLISH with a surrogate in the topic", S, "30050003eda080", mqtt.E_UTF8);
+
+    // ---- acknowledgements ---------------------------------------------------------------------------------------------------------------------------
+    good("PUBACK is fine", S, "40020001");
+    bad("PUBACK of three bytes", S, "4003000100", mqtt.E_LENGTH);
+    bad("PUBACK of one byte", S, "400100", mqtt.E_LENGTH);
+    bad("PUBACK without a body", S, "4000", mqtt.E_LENGTH);
+    bad("PUBACK with packet id 0", S, "40020000", mqtt.E_PACKET_ID);
+    bad("PUBREL with packet id 0", S, "62020000", mqtt.E_PACKET_ID);
+    bad("UNSUBACK of three bytes", C, "b003000100", mqtt.E_LENGTH);
+    bad("PINGREQ with a body", S, "c00100", mqtt.E_LENGTH);
+    bad("DISCONNECT with a body", S, "e00100", mqtt.E_LENGTH);
+    bad("PINGRESP with a body", C, "d00100", mqtt.E_LENGTH);
+
+    // ---- SUBSCRIBE / UNSUBSCRIBE / SUBACK -------------------------------------------------------------------------------------------------------------
+    good("SUBSCRIBE is fine", S, "820800010003612f6200");
+    bad("SUBSCRIBE without filters", S, "82020001", mqtt.E_LENGTH);
+    bad("SUBSCRIBE with packet id 0", S, "820800000003612f6200", mqtt.E_PACKET_ID);
+    bad("SUBSCRIBE without the QoS byte", S, "820700010003612f62", mqtt.E_LENGTH);
+    bad("SUBSCRIBE with QoS 3", S, "820800010003612f6203", mqtt.E_QOS);
+    bad("SUBSCRIBE with reserved bits in the QoS byte", S, "820800010003612f6204", mqtt.E_QOS);
+    bad("SUBSCRIBE with a filter that is cut off", S, "82050001000a61", mqtt.E_LENGTH);
+    bad("SUBSCRIBE with an empty filter", S, "82050001000000", mqtt.E_TOPIC);
+    bad("SUBSCRIBE with # in the middle", S, "820a000100052f2f232f6200", mqtt.E_TOPIC);
+    bad("SUBSCRIBE with a+ in the filter", S, "820700010002612b00", mqtt.E_TOPIC);
+    bad("SUBSCRIBE with a filter that is not UTF-8", S, "82060001000180" "00", mqtt.E_UTF8);
+    bad("UNSUBSCRIBE without filters", S, "a2020001", mqtt.E_LENGTH);
+    bad("UNSUBSCRIBE with packet id 0", S, "a20700000003612f62", mqtt.E_PACKET_ID);
+    bad("UNSUBSCRIBE with an invalid filter", S, "a206000100026123", mqtt.E_TOPIC);
+    good("SUBACK is fine", C, "90050001000280");
+    bad("SUBACK without codes", C, "90020001", mqtt.E_LENGTH);
+    bad("SUBACK with the code 3", C, "9003000103", mqtt.E_PROTOCOL);
+    bad("SUBACK with the code 129", C, "9003000181", mqtt.E_PROTOCOL);
+    bad("SUBACK with packet id 0", C, "9003000000", mqtt.E_PACKET_ID);
+
+    // ---- CONNECT ------------------------------------------------------------------------------------------------------------------------------------
+    good("CONNECT is fine", S, "101000044d5154540402003c00046d6f7371");
+    good("CONNECT of MQTT 3.1 (the broker answers it with CONNACK 1)", S, "1010" "0006" "4d514973647003" "02003c" "0002" "6162");
+    bad("CONNECT with the name MQXX", S, "101000044d5158580402003c00046d6f7371", mqtt.E_PROTOCOL);
+    bad("CONNECT with a name that is cut off", S, "1003000a4d", mqtt.E_LENGTH);
+    bad("CONNECT with the reserved flag bit set", S, "101000044d5154540403003c00046d6f7371", mqtt.E_PROTOCOL);
+    bad("CONNECT with a password but no user name", S, "101000044d5154540442003c00046d6f7371", mqtt.E_PROTOCOL);
+    bad("CONNECT with will QoS but no will flag", S, "101000044d5154540408003c00046d6f7371", mqtt.E_PROTOCOL);
+    bad("CONNECT with will retain but no will flag", S, "101000044d5154540422003c00046d6f7371", mqtt.E_PROTOCOL);
+    bad("CONNECT with will QoS 3", S, "101000044d515454041e003c00046d6f7371", mqtt.E_QOS);
+    bad("CONNECT with trailing bytes", S, "101100044d5154540402003c00046d6f737100", mqtt.E_LENGTH);
+    bad("CONNECT without a client id", S, "100a00044d5154540402003c", mqtt.E_LENGTH);
+    bad("CONNECT with a client id that is cut off", S, "100d00044d5154540402003c000a6d", mqtt.E_LENGTH);
+    bad("CONNECT with a client id that is not UTF-8", S, "100d00044d5154540402003c0001ff", mqtt.E_UTF8);
+    bad("CONNECT with a will but no will topic", S, "100c00044d5154540406003c0000", mqtt.E_LENGTH);
+    bad("CONNECT with a will topic that has a wildcard", S, "101300044d5154540406003c00016100022b2f0000", mqtt.E_TOPIC);
+    bad("CONNECT with a user flag but no user name", S, "100d00044d5154540482003c000161", mqtt.E_LENGTH);
+
+    // ---- CONNACK ------------------------------------------------------------------------------------------------------------------------------------
+    good("CONNACK is fine", C, "20020000");
+    bad("CONNACK of three bytes", C, "2003000000", mqtt.E_LENGTH);
+    bad("CONNACK with reserved bits in the flags", C, "20020200", mqtt.E_PROTOCOL);
+    bad("CONNACK with return code 6", C, "20020006", mqtt.E_PROTOCOL);
+    bad("CONNACK with session present and an error", C, "20020105", mqtt.E_PROTOCOL);
+
+    // ---- a failed parser stays failed; limits on what is buffered ----------------------------------------------------------------------------------------
+    mqtt.Parser* p = mqtt.newParser(S, 100);
+    int n = 0;
+    char* raw = bytebuf.fromHex("0000", &n);
+    p->feed(raw, n);
+    check("after an error next() keeps failing", p->next(&pk) < 0 && p->next(&pk) < 0 && p->error == mqtt.E_TYPE);
+    char* good1 = bytebuf.fromHex("c000", &n);
+    check("... and feed() refuses more bytes", !p->feed(good1, n) && p->next(&pk) < 0);
+    p->reset();
+    check("reset() makes it usable again", p->feed(good1, n) && p->next(&pk) == 1 && pk.type == mqtt.PINGREQ);
+    p->dispose();
+
+    p = mqtt.newParser(S, 100);
+    char* big = alloc(30000);
+    memset(big, 'x', 30000);
+    check("more bytes than the parser takes: an error, nothing buffered", !p->feed(big, 30000) && p->error == mqtt.E_BUFFER && p->buffered() <= 0);
+    p->dispose();
+
+    // exactly the limit: a PUBLISH with a remaining length of 100 is accepted, 101 is refused before its body is buffered
+    p = mqtt.newParser(S, 100);
+    char head[8];
+    head[0] = 0x30; head[1] = 100;
+    p->feed(&head[0], 2);
+    check("a packet of exactly maxPacket bytes: the parser waits for the body", p->next(&pk) == 0 && p->error == 0);
+    p->dispose();
+    p = mqtt.newParser(S, 100);
+    head[0] = 0x30; head[1] = 101;
+    p->feed(&head[0], 2);
+    check("a packet of maxPacket + 1: refused at the header", p->next(&pk) < 0 && p->error == mqtt.E_TOO_BIG && p->buffered() <= 2);
+    p->dispose();
+    p = mqtt.newParser(S, 100);
+    char* pub = alloc(110);
+    pub[0] = 0x30; pub[1] = 100; pub[2] = 0; pub[3] = 1; pub[4] = 'a';
+    memset(&pub[5], 'z', 97);
+    p->feed(pub, 102);
+    check("a PUBLISH of exactly maxPacket bytes is accepted", p->next(&pk) == 1 && pk.payloadLen == 97 && pk.length == 100);
+    p->dispose();
+
+    // ---- a deterministic fuzz run: random bytes in random pieces, both directions ----------------------------------------------------------------------
+    int packets = 0;
+    int errors = 0;
+    int worst = 0;
+    char buf[300];
+    for (int round = 0; round < 400; round++) {
+        mqtt.Parser* fp = mqtt.newParser(round % 2 == 0 ? S : C, 200);
+        int total = 0;
+        for (int piece = 0; piece < 20; piece++) {
+            int len = 1 + rnd() % 40;
+            // half of the rounds start from a plausible header so that the parser gets past the first byte
+            for (int i = 0; i < len; i++) buf[i] = rnd();
+            if (piece == 0 && round % 3 != 0) { buf[0] = ((1 + rnd() % 14) << 4) | (rnd() % 3 == 0 ? 2 : 0); buf[1] = rnd() % 60; }
+            if (!fp->feed(&buf[0], len)) { errors++; break; }
+            total = total + len;
+            for (;;) {
+                int r = fp->next(&pk);
+                if (r == 1) packets++;
+                else { if (r < 0) errors++; break; }
+            }
+            if (fp->error != 0) break;
+            if (fp->buffered() > worst) worst = fp->buffered();
+        }
+        fp->dispose();
+    }
+    check("fuzz: 400 random streams did not crash", true);
+    check("fuzz: nothing was buffered beyond the limit", worst <= 200 + 5);
+    check("fuzz: both outcomes happened (packets and errors)", errors > 100 && packets >= 0);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

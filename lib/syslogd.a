@@ -1,0 +1,728 @@
+// =============================================================================
+//  syslogd - a syslog collector (RFC 5424 / RFC 3164 over UDP, TCP and TLS) with filters, files, a ring buffer and forwarding         import syslogd;
+//
+//    syslogd.Server* s = syslogd.newServer();
+//    s->listenUdp(514);  s->listenTcp(514);                                  // s->listenTls(6514, tls.loadConfig(certPem, keyPem)); port 0: a free one
+//    syslogd.Filter* f = syslogd.newFilter();  f->setSeverityUpTo(syslog.SEV_WARNING);  f->program = "sshd";  f->setPattern("Failed|refused");
+//    s->collector->addFile(f, "/var/log/auth-problems.log", 1048576, 5);      // rotates at 1 MiB, keeps auth-problems.log.1 ... .5
+//    s->collector->addForward(null, "tls://central.example.org:6514");         // everything goes on to another collector
+//    s->run();                                                               // or for (;;) { s->poll(50); ... s->collector->ring->line(0) ... }
+//
+//  Receiving. UDP: one message per datagram. TCP and TLS: octet counting ("123 <34>1 ...", RFC 6587) or newline framing, told apart per message; a frame over maxMessage,
+//  an octet count that is not a number, or a line that never ends closes the connection. Every message is parsed (syslog.parse: RFC 5424, RFC 3164, or a text without <PRI>);
+//  a message that cannot be parsed is counted and dropped (keepMalformed: stored as a user.notice message). A missing timestamp is replaced by the time of reception, a missing
+//  host by the address of the sender. A TLS listener grows by about 20 KB of never-freed heap per handshake (the tls module): see docs/NET.md.
+//
+//  Filters decide what goes where. A Filter matches on facilities (a bit mask), severities (a bit mask, or "this severe or worse"), the program (app name / tag, with * and ?), the host
+//  (* and ?) and a regular expression over the message text (a search stops after regexSteps steps and then counts as no match, so a pattern like (a+)+b cannot hang the collector); invert negates it. collector->dropFilter drops every message that matches it. Routes: addFile (a text file with
+//  size based rotation), addRing (a bounded in-memory ring), addForward (a syslog.Sender: UDP, TCP or TLS to another collector, the original text is passed on). The default ring
+//  (collector->ring) takes everything that is not dropped. A message goes to every route whose filter matches.
+//
+//  Lines. Files and rings hold one line per message: LINE_TRADITIONAL "Oct 11 22:14:15 host app[pid]: text", LINE_DETAIL "2003-10-11T22:14:15Z host auth.warning app[pid]: text" or LINE_RAW (the message as it came).
+//  Control characters in a message (a line feed, an escape ...) are written as #ooo (octal), so a message cannot forge a log line. File names are fixed by you: nothing from a message
+//  ever becomes part of a path.
+//
+//  Limits (settable): maxMessage (16 KiB), ring capacity and bytes (1000 lines, 1 MiB; lines longer than 4 KiB are cut), file size and number of rotated files, and in the network
+//  layer s->net: maxConns, maxPerIp, idleTimeoutMs, maxOut. Files that cannot be opened are counted and tried again after a second (messages meanwhile are lost for that file).
+//  The collector core has no sockets: collector->ingest(bytes, n, ip, transport) takes one message, FrameParser cuts a TCP stream into messages.
+// =============================================================================
+import syslog;
+import netio;
+import netsrv;
+import tls;
+import regex;
+import asys;
+import datetime;
+import cstdlib;
+module syslogd;
+
+public const LINE_TRADITIONAL = 1;
+public const LINE_RAW = 2;
+public const LINE_DETAIL = 3;
+
+// ---- filters ---------------------------------------------------------------------------------------------------------------------
+// a glob with * and ? (case sensitive)
+public bool glob(char* p, char* s) {
+    int pi = 0;
+    int si = 0;
+    int starP = -1;
+    int starS = 0;
+    while (s[si] != 0) {
+        if (p[pi] == '*') { starP = pi; starS = si; pi++; continue; }
+        if (p[pi] != 0 && (p[pi] == '?' || p[pi] == s[si])) { pi++; si++; continue; }
+        if (starP >= 0) { starS++; si = starS; pi = starP + 1; continue; }
+        return false;
+    }
+    while (p[pi] == '*') pi++;
+    return p[pi] == 0;
+}
+
+public class Filter {
+    public int facilities;              // a bit per facility (0 .. 23); default: all
+    public int severities;              // a bit per severity (0 .. 7); default: all
+    public char* program;               // glob for the app name / tag, null: any
+    public char* host;                  // glob for the host, null: any
+    public regex.Regex* re;             // searched in the message text, null: any
+    public int regexSteps;              // step limit of one search (default 1,000,000; 0 or less: 5 million): a pattern that backtracks without end must not hang the collector
+    public int regexExceeded;           // searches that hit the limit: such a message counts as "does not match the pattern" (and invert turns that around)
+    public bool invert;
+    public bool heap;
+
+    public Filter() { init(); }
+
+    public void init() {
+        facilities = 0xFFFFFF;
+        severities = 0xFF;
+        regexSteps = 1000000;
+    }
+
+    // only these facilities (call it again to add more after clearFacilities())
+    public void clearFacilities() { facilities = 0; }
+    public void addFacility(int f) { if (f >= 0 && f < 24) facilities = facilities | (1 << f); }
+    public void addSeverity(int s) { if (s >= 0 && s < 8) severities = severities | (1 << s); }
+    public void clearSeverities() { severities = 0; }
+    // severity s and every more severe one (0 = emerg ... s): "warning and worse" is setSeverityUpTo(SEV_WARNING)
+    public void setSeverityUpTo(int s) { severities = (1 << (s + 1)) - 1; }
+
+    // a regular expression for the message text (regex module syntax); false (and the old one stays) if it is not valid
+    public bool setPattern(char* pattern) {
+        regex.Regex* r = regex.compile(pattern, 0);
+        if (!r->ok) return false;
+        re = r;
+        return true;
+    }
+
+    public bool matches(syslog.Message* m) {
+        bool ok = true;
+        if (((facilities >> m->facility) & 1) == 0) ok = false;
+        else if (((severities >> m->severity) & 1) == 0) ok = false;
+        else if (program != null && !glob(program, &m->app[0])) ok = false;
+        else if (host != null && !glob(host, &m->host[0])) ok = false;
+        else if (re != null) {
+            int caps[66];
+            re->stepLimit = regexSteps > 0 ? regexSteps : 5000000;          // 0 or less: 5 million, the default of the regex module (never no limit)
+            ok = re->search(m->msg, m->msgLen, 0, &caps[0]) >= 0;
+            if (re->exceeded) {
+                ok = false;
+                regexExceeded++;
+            }
+        }
+        return invert ? !ok : ok;
+    }
+}
+
+public Filter* newFilter() { return new Filter(); }
+
+// ---- the ring buffer ---------------------------------------------------------------------------------------------------------------
+// The newest lines, bounded by count and by bytes: when it is full the oldest line goes. line(0) is the oldest.
+public class Ring {
+    public int capacity;                // lines (default 1000)
+    public int maxBytes;                // bytes of text (default 1 MiB)
+    public int maxLine;                 // longer lines are cut (default 4096)
+    public int overwritten;             // lines that were pushed out
+    public int total;                   // lines ever stored
+    public Filter* filter;              // null: everything that is not dropped
+
+    private char** lines;
+    private int* lens;
+    private char* sevs;
+    private int head;
+    private int count_;
+    private int bytes;
+
+    public Ring() { capacity = 1000; maxBytes = 1048576; maxLine = 4096; }
+
+    public int count() { return count_; }
+    public int byteCount() { return bytes; }
+    public char* line(int i) { return (i >= 0 && i < count_) ? lines[(head + i) % capacity] : null; }
+    public int lineLength(int i) { return (i >= 0 && i < count_) ? lens[(head + i) % capacity] : 0; }
+    public int severityOf(int i) { return (i >= 0 && i < count_) ? sevs[(head + i) % capacity] : -1; }
+
+    private void dropOldest() {
+        char* old = lines[head];
+        bytes = bytes - lens[head];
+        free(old);
+        lines[head] = null;
+        head = (head + 1) % capacity;
+        count_--;
+        overwritten++;
+    }
+
+    public void push(char* text, int n, int severity) {
+        if (capacity < 1) return;
+        if (lines == null) {
+            lines = (char**) malloc(capacity * 8);
+            lens = (int*) malloc(capacity * 8);
+            sevs = malloc(capacity);
+            if (lines == null || lens == null || sevs == null) return;
+        }
+        if (n > maxLine) n = maxLine;
+        if (n > maxBytes) n = maxBytes;
+        while (count_ >= capacity || (count_ > 0 && bytes + n > maxBytes)) dropOldest();
+        char* copy = malloc(n + 1);
+        if (copy == null) return;
+        memcpy(copy, text, n);
+        copy[n] = 0;
+        int at = (head + count_) % capacity;
+        lines[at] = copy;
+        lens[at] = n;
+        sevs[at] = severity;
+        count_++;
+        bytes = bytes + n;
+        total++;
+    }
+
+    public void clear() {
+        while (count_ > 0) dropOldest();
+        overwritten = 0;
+        head = 0;
+    }
+
+    public void dispose() {
+        clear();
+        if (lines != null) { free((char*) lines); free((char*) lens); free(sevs); }
+        lines = null;
+        lens = null;
+        sevs = null;
+    }
+}
+
+// ---- files with rotation ------------------------------------------------------------------------------------------------------------
+public class FileSink {
+    public char* path;
+    public int maxBytes;                // rotate before the file would pass this size (0: never)
+    public int keep;                    // rotated files kept: path.1 (the newest) ... path.keep; 0: the old content is deleted
+    public int lines;                   // lines written
+    public int rotations;
+    public int errors;                  // open and write failures
+    public int lost;                    // lines that could not be written
+    public Filter* filter;
+    public int lineFormat;              // LINE_*, 0: the collector's
+    public int retryMs;                 // a file that cannot be opened is tried again after this long (default 1000)
+
+    private int fd;
+    private int size;
+    private int retryAt;
+    private bool isOpen;
+
+    public int fileSize() { return size; }
+
+    private bool open() {
+        int t = asys.monoMs();
+        if (retryAt != 0 && t < retryAt) return false;
+        fd = asys.fileOpen(path, asys.F_WRITE | asys.F_CREATE | asys.F_APPEND, 416);
+        if (fd < 0) { errors++; retryAt = t + retryMs; if (retryAt == 0) retryAt = 1; return false; }
+        retryAt = 0;
+        size = asys.fileSeek(fd, 0, 2);
+        if (size < 0) size = 0;
+        isOpen = true;
+        return true;
+    }
+
+    public void close() {
+        if (isOpen) { asys.fileClose(fd); isOpen = false; }
+    }
+
+    // path.N names
+    private void nameOf(char* out, int i) {
+        if (i == 0) strcpy(out, path); else format(out, 1100, "%s.%d", path, i, 0, 0);
+    }
+
+    private void rotate() {
+        close();
+        char from[1100];
+        char to[1100];
+        if (keep <= 0) {
+            asys.unlink(path);
+        } else {
+            for (int i = keep - 1; i >= 0; i--) {
+                nameOf(&from[0], i);
+                nameOf(&to[0], i + 1);
+                if (i + 1 == keep) asys.unlink(&to[0]);               // the oldest goes (Windows does not replace files)
+                if (asys.exists(&from[0])) {
+                    asys.unlink(&to[0]);
+                    asys.rename(&from[0], &to[0]);
+                }
+            }
+        }
+        rotations++;
+    }
+
+    // appends one line (a newline is added)
+    public void write(char* text, int n) {
+        if (path == null) return;
+        if (maxBytes > 0 && n + 1 > maxBytes) n = maxBytes - 1;
+        if (!isOpen && !open()) { lost++; return; }
+        if (maxBytes > 0 && size > 0 && size + n + 1 > maxBytes) {
+            rotate();
+            if (!open()) { lost++; return; }
+        }
+        int w = asys.fileWrite(fd, text, n);
+        int w2 = asys.fileWrite(fd, "\n", 1);
+        if (w != n || w2 != 1) {
+            errors++;
+            lost++;
+            close();
+            retryAt = asys.monoMs() + retryMs;
+            if (retryAt == 0) retryAt = 1;
+            return;
+        }
+        size = size + n + 1;
+        lines++;
+    }
+}
+
+// ---- the collector ------------------------------------------------------------------------------------------------------------------------
+public class Stats {
+    public int received;                // messages (datagrams, frames) that arrived
+    public int bytes;
+    public int udp;
+    public int tcp;
+    public int tls;
+    public int parsed;
+    public int malformed;
+    public int dropped;                 // matched the drop filter
+    public int oversize;                // datagrams and frames over maxMessage
+    public int framingErrors;           // TCP / TLS connections closed for a bad frame
+    public int forwarded;
+    public int sev[8];                  // parsed messages per severity
+}
+
+class Route {
+    public Filter* filter;
+    public int kind;                    // 1 file, 2 ring, 3 forward
+    public FileSink* file;
+    public Ring* ring;
+    public syslog.Sender* sender;
+}
+
+public class Collector {
+    public int maxMessage;              // default 16384
+    public bool keepMalformed;          // store messages that cannot be parsed (as user.notice) instead of dropping them
+    public int lineFormat;              // LINE_TRADITIONAL (default), LINE_DETAIL or LINE_RAW for files and rings
+    public Filter* dropFilter;
+    public Ring* ring;                  // the default ring
+    public Stats* stats;
+    public int fixedNow;                // a fixed clock in Unix seconds (tests); 0: the real one
+
+    private Route* routes[64];
+    private int nroutes;
+    private char* lineBuf;
+    private char* escBuf;
+    private syslog.Message* msg;
+
+    public Collector() {
+        maxMessage = 16384;
+        lineFormat = LINE_TRADITIONAL;
+        stats = new Stats();
+        ring = new Ring();
+    }
+
+    public void setClock(int unix) { fixedNow = unix; }
+    public int clockNow() { return fixedNow != 0 ? fixedNow : datetime.now(); }
+
+    // ---- routes ------------------------------------------------------------------------------------------------------------------------------
+    private Route* addRoute(Filter* f, int kind) {
+        if (nroutes >= 64) return null;
+        Route* r = (Route*) malloc(sizeof(Route));
+        r->filter = f;
+        r->kind = kind;
+        routes[nroutes] = r;
+        nroutes++;
+        return r;
+    }
+
+    // a text file with rotation (see FileSink); null if there are too many routes
+    public FileSink* addFile(Filter* f, char* path, int maxBytes, int keep) {
+        Route* r = addRoute(f, 1);
+        if (r == null) return null;
+        FileSink* fs = new FileSink();
+        fs->path = path;
+        fs->maxBytes = maxBytes;
+        fs->keep = keep;
+        fs->lineFormat = 0;
+        fs->retryMs = 1000;
+        r->file = fs;
+        return fs;
+    }
+
+    public Ring* addRing(Filter* f, int capacity, int maxBytes) {
+        Route* r = addRoute(f, 2);
+        if (r == null) return null;
+        Ring* rg = new Ring();
+        rg->capacity = capacity;
+        rg->maxBytes = maxBytes;
+        rg->filter = f;
+        r->ring = rg;
+        return rg;
+    }
+
+    // forwards the messages that match (null: all) to another collector: udp://host:514, tcp://host:514, tls://host:6514. The original text is passed on.
+    public syslog.Sender* addForward(Filter* f, char* url) {
+        syslog.Sender* s = syslog.newSender(url);
+        if (s == null) return null;
+        Route* r = addRoute(f, 3);
+        if (r == null) { s->dispose(); return null; }
+        r->sender = s;
+        return s;
+    }
+
+    public int routeCount() { return nroutes; }
+
+    // ---- lines ---------------------------------------------------------------------------------------------------------------------------------
+    // writes text with control characters as #ooo; returns the length
+    private int escape(char* in, int n, char* out, int max) {
+        int o = 0;
+        for (int i = 0; i < n && o + 4 < max; i++) {
+            int c = in[i] & 255;
+            if (c < 32 || c == 127) {
+                out[o] = '#';
+                out[o + 1] = '0' + ((c >> 6) & 7);
+                out[o + 2] = '0' + ((c >> 3) & 7);
+                out[o + 3] = '0' + (c & 7);
+                o = o + 4;
+            } else {
+                out[o] = c;
+                o++;
+            }
+        }
+        return o;
+    }
+
+    private int buildLine(syslog.Message* m, char* raw, int rawLen, int fmt, int ts) {
+        int o = 0;
+        char* out = lineBuf;
+        int max = maxMessage + 512;
+        if (fmt == LINE_RAW) return escape(raw, rawLen, out, max);
+        char tbuf[40];
+        if (fmt == LINE_DETAIL) {
+            int tn = syslog.formatTime5424(&tbuf[0], ts, 0, 0);
+            memcpy(out, &tbuf[0], tn);
+            o = tn;
+        } else {
+            syslog.formatTime3164(&tbuf[0], ts);
+            memcpy(out, &tbuf[0], 15);
+            o = 15;
+        }
+        out[o] = ' ';
+        o++;
+        int hl = strlen(&m->host[0]);
+        memcpy(&out[o], &m->host[0], hl);
+        o = o + hl;
+        out[o] = ' ';
+        o++;
+        if (fmt == LINE_DETAIL) {
+            o = o + format(&out[o], 64, "%s.%s ", syslog.facilityName(m->facility), syslog.severityName(m->severity), 0, 0);
+        }
+        if (m->app[0] != 0) {
+            int al = strlen(&m->app[0]);
+            memcpy(&out[o], &m->app[0], al);
+            o = o + al;
+            if (m->procid[0] != 0) {
+                out[o] = '[';
+                o++;
+                int pl = strlen(&m->procid[0]);
+                memcpy(&out[o], &m->procid[0], pl);
+                o = o + pl;
+                out[o] = ']';
+                o++;
+            }
+            out[o] = ':';
+            out[o + 1] = ' ';
+            o = o + 2;
+        }
+        o = o + escape(m->msg, m->msgLen, &out[o], max - o);
+        return o;
+    }
+
+    // ---- taking a message in ---------------------------------------------------------------------------------------------------------------------
+    // One message (a datagram, a frame). ip: the sender's address (host order), transport: syslog.TRANSPORT_*. 0 when it was taken, else the parse error.
+    public int ingest(char* data, int n, int ip, int transport) {
+        if (lineBuf == null) {
+            lineBuf = malloc(65536 + 1024);
+            escBuf = malloc(16);
+            msg = (syslog.Message*) malloc(sizeof(syslog.Message));
+        }
+        stats->received++;
+        stats->bytes = stats->bytes + n;
+        if (transport == syslog.TRANSPORT_UDP) stats->udp++;
+        else if (transport == syslog.TRANSPORT_TLS) stats->tls++;
+        else stats->tcp++;
+        if (n > maxMessage || n > 65536) { stats->oversize++; return syslog.E_EMPTY; }
+        while (n > 0 && (data[n - 1] == 10 || data[n - 1] == 13)) n--;           // a line end behind a datagram is not part of the message
+        int now = clockNow();
+        int e = syslog.parse(data, n, msg, now);
+        if (e != 0) {
+            stats->malformed++;
+            if (!keepMalformed || n <= 0) return e;
+            msg->reset();
+            msg->facility = syslog.FAC_USER;
+            msg->severity = syslog.SEV_NOTICE;
+            msg->msg = data;
+            msg->msgLen = n;
+        }
+        stats->parsed++;
+        stats->sev[msg->severity]++;
+        if (msg->timestamp < 0) msg->timestamp = now;
+        if (msg->host[0] == 0) {
+            if (ip != 0) format(&msg->host[0], 20, "%d.%d.%d.%d", (ip >> 24) & 255, (ip >> 16) & 255, (ip >> 8) & 255, ip & 255);
+            else strcpy(&msg->host[0], "-");
+        }
+        if (dropFilter != null && dropFilter->matches(msg)) { stats->dropped++; return 0; }
+        int builtFor = 0;
+        int len = 0;
+        // the default ring
+        if (ring != null && (ring->filter == null || ring->filter->matches(msg))) {
+            len = buildLine(msg, data, n, lineFormat, msg->timestamp);
+            builtFor = lineFormat;
+            ring->push(lineBuf, len, msg->severity);
+        }
+        for (int i = 0; i < nroutes; i++) {
+            Route* r = routes[i];
+            if (r->filter != null && !r->filter->matches(msg)) continue;
+            if (r->kind == 3) {
+                if (r->sender->deliver(data, n)) stats->forwarded++;
+                continue;
+            }
+            int fmt = lineFormat;
+            if (r->kind == 1 && r->file->lineFormat != 0) fmt = r->file->lineFormat;
+            if (builtFor != fmt) { len = buildLine(msg, data, n, fmt, msg->timestamp); builtFor = fmt; }
+            if (r->kind == 1) r->file->write(lineBuf, len);
+            else r->ring->push(lineBuf, len, msg->severity);
+        }
+        return 0;
+    }
+
+    // Moves the forwarding connections on (a connection that is being made, messages that wait in the queue); never waits. Server.poll() calls it every
+    // 10 ms or so; a program that drives a Collector itself calls it now and then.
+    public void pumpForwards() {
+        for (int i = 0; i < nroutes; i++) {
+            if (routes[i]->kind == 3) routes[i]->sender->pump();
+        }
+    }
+
+    // flushes what is queued for forwarding (waits up to ms)
+    public void flushForwards(int ms) {
+        for (int i = 0; i < nroutes; i++) {
+            if (routes[i]->kind == 3) routes[i]->sender->flush(ms);
+        }
+    }
+
+    // closes the files (they open again at the next line)
+    public void closeFiles() {
+        for (int i = 0; i < nroutes; i++) {
+            if (routes[i]->kind == 1) routes[i]->file->close();
+        }
+    }
+
+    public void dispose() {
+        for (int i = 0; i < nroutes; i++) {
+            Route* r = routes[i];
+            if (r->kind == 1) r->file->close();
+            if (r->kind == 2) r->ring->dispose();
+            if (r->kind == 3) r->sender->dispose();
+            free((char*) r);
+            routes[i] = null;
+        }
+        nroutes = 0;
+        if (ring != null) ring->dispose();
+        if (lineBuf != null) { free(lineBuf); free(escBuf); free((char*) msg); lineBuf = null; escBuf = null; msg = null; }
+    }
+}
+
+// ---- cutting a TCP stream into messages ----------------------------------------------------------------------------------------------
+// Octet counting ("<length> <message>") and newline framing, decided for every message: a digit at the start of a frame begins an octet count
+// (digits, a blank, then exactly that many bytes), anything else is a line that ends at LF (CR LF). The frame is handed to the collector.
+public class FrameParser {
+    public int maxFrame;                // default 16384
+    public int error;                   // 1: a bad octet count, 2: a frame or line over maxFrame
+    public int frames;
+    public bool heap;
+
+    private int st;                     // 0 start of a frame, 1 octet count digits, 2 octet body, 3 line
+    private int count;
+    private int digits;
+    private char* buf;
+    private int len;
+    private int cap;
+
+    private bool put(int c) {
+        if (len >= maxFrame) { error = 2; return false; }
+        if (len >= cap) {
+            int nc = cap == 0 ? 256 : cap * 2;
+            if (nc > maxFrame + 16) nc = maxFrame + 16;
+            char* nb = malloc(nc);
+            if (nb == null) { error = 2; return false; }
+            if (buf != null) { memcpy(nb, buf, len); free(buf); }
+            buf = nb;
+            cap = nc;
+        }
+        buf[len] = c;
+        len++;
+        return true;
+    }
+
+    private void done(Collector* col, int ip, int transport) {
+        if (len > 0) col->ingest(buf, len, ip, transport);
+        frames++;
+        len = 0;
+        st = 0;
+        if (cap > 4096) { free(buf); buf = null; cap = 0; }
+    }
+
+    // Takes bytes from the stream; false when the connection must be closed (error says why).
+    public bool feed(Collector* col, char* d, int n, int ip, int transport) {
+        if (maxFrame <= 0) maxFrame = 16384;
+        for (int i = 0; i < n; i++) {
+            int c = d[i] & 255;
+            if (error != 0) return false;
+            if (st == 0) {
+                if (c == 13 || c == 10) continue;
+                len = 0;
+                if (c >= '1' && c <= '9') { st = 1; count = c - '0'; digits = 1; continue; }
+                st = 3;
+                if (!put(c)) return false;
+            } else if (st == 1) {
+                if (c >= '0' && c <= '9') {
+                    count = count * 10 + (c - '0');
+                    digits++;
+                    if (digits > 6 || count > maxFrame) { error = digits > 6 ? 1 : 2; return false; }
+                } else if (c == ' ') {
+                    st = 2;
+                    len = 0;
+                    if (count == 0) { st = 0; }
+                } else {
+                    // not an octet count after all: a line that starts with digits
+                    st = 3;
+                    len = 0;
+                    int v = count;
+                    char tmp[8];
+                    int tn = 0;
+                    while (v > 0) { tmp[tn] = '0' + v % 10; v = v / 10; tn++; }
+                    for (int k = tn - 1; k >= 0; k--) { if (!put(tmp[k])) return false; }
+                    if (c == 10) { done(col, ip, transport); continue; }
+                    if (c != 13 && !put(c)) return false;
+                }
+            } else if (st == 2) {
+                if (!put(c)) return false;
+                if (len >= count) done(col, ip, transport);
+            } else {
+                if (c == 10) {
+                    if (len > 0 && buf[len - 1] == 13) len--;
+                    done(col, ip, transport);
+                } else if (!put(c)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    public void dispose() {
+        if (buf != null) free(buf);
+        buf = null;
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
+    }
+}
+
+// ---- the server: the collector on sockets ---------------------------------------------------------------------------------------------------
+public class Server {
+    public Collector* collector;
+    public netsrv.Server* net;
+    public int pumpAt;                  // when the forwarding connections were last moved on (ms)
+    public int udpPort;                 // the port of the first UDP socket
+    public int tcpPort;                 // the port of the first TCP listener (plain or TLS)
+
+    public Server() {
+        collector = new Collector();
+        net = new netsrv.Server();
+        net->user = (char*) this;
+        net->onOpen = srvOpen;
+        net->onData = srvData;
+        net->onClose = srvClose;
+        net->onDatagram = srvDatagram;
+        net->onTick = srvTick;
+        net->maxOut = 4096;                 // a collector sends nothing: the queue only holds TLS alerts
+        net->handshakeTimeoutMs = 5000;
+    }
+
+    // a UDP socket (port 0: a free one, see udpPort); false if the port cannot be used
+    public bool listenUdp(int port) {
+        int i = net->addUdp(port);
+        if (i < 0) return false;
+        if (udpPort == 0) udpPort = net->udpPort(i);
+        return true;
+    }
+    public bool listenTcp(int port) {
+        bool ok = net->listen(port);
+        if (ok && tcpPort == 0) tcpPort = net->port;
+        return ok;
+    }
+    public bool listenTls(int port, tls.Config* cfg) {
+        bool ok = net->listenTls(port, cfg);
+        if (ok && tcpPort == 0) tcpPort = net->port;
+        return ok;
+    }
+    public bool listenOn(char* host, int port, tls.Config* cfg) {
+        bool ok = net->listenOn(host, port, cfg);
+        if (ok && tcpPort == 0) tcpPort = net->port;
+        return ok;
+    }
+
+    public int poll(int ms) { return net->poll(ms); }
+    public void run() { net->run(); }
+    public void stop() { net->stop(); }
+
+    public void shutdown() {
+        net->shutdown();
+        collector->dispose();
+    }
+}
+
+private int srvOpen(netsrv.Server* s, netsrv.Conn* c) {
+    FrameParser* fp = (FrameParser*) malloc(sizeof(FrameParser));
+    if (fp == null) return -1;
+    fp->heap = true;
+    Server* sv = (Server*) s->user;
+    fp->maxFrame = sv->collector->maxMessage;
+    c->user = (char*) fp;
+    return 0;
+}
+
+private int srvData(netsrv.Server* s, netsrv.Conn* c, char* data, int n) {
+    Server* sv = (Server*) s->user;
+    FrameParser* fp = (FrameParser*) c->user;
+    if (fp == null) return -1;
+    if (!fp->feed(sv->collector, data, n, c->ip, c->secure ? syslog.TRANSPORT_TLS : syslog.TRANSPORT_TCP)) {
+        sv->collector->stats->framingErrors++;
+        return -1;
+    }
+    return 0;
+}
+
+private int srvClose(netsrv.Server* s, netsrv.Conn* c) {
+    FrameParser* fp = (FrameParser*) c->user;
+    if (fp != null) fp->dispose();
+    c->user = null;
+    return 0;
+}
+
+private int srvTick(netsrv.Server* s, int now) {
+    Server* sv = (Server*) s->user;
+    if (now - sv->pumpAt >= 10 || now < sv->pumpAt) {
+        sv->pumpAt = now;
+        sv->collector->pumpForwards();
+    }
+    return 0;
+}
+
+private int srvDatagram(netsrv.Server* s, int udpIndex, int ip, int port, char* data, int n) {
+    Server* sv = (Server*) s->user;
+    sv->collector->ingest(data, n, ip, syslog.TRANSPORT_UDP);
+    return 0;
+}
+
+public Server* newServer() { return new Server(); }

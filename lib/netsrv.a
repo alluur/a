@@ -1,0 +1,629 @@
+// =============================================================================
+//  netsrv - a poll based TCP / TLS / UDP server core for protocol servers (mqttd, redisd, syslogd)         import netsrv;
+//
+//  One thread serves every socket (net.poll): no thread per client, no blocking call in the loop, TLS handshakes included.
+//  The protocol is yours: you get the bytes (onData) and queue answers in the connection's output queue.
+//
+//    int onOpen(netsrv.Server* s, netsrv.Conn* c)                      { c->user = (char*) newState();  return 0; }    // < 0 refuses
+//    int onData(netsrv.Server* s, netsrv.Conn* c, char* data, int n)  { c->out.add("+OK\r\n", 5);  return 0; }        // < 0 closes (after the output)
+//    int onClose(netsrv.Server* s, netsrv.Conn* c)                    { freeState(c->user);  return 0; }              // c->closeReason says why
+//
+//    netsrv.Server* s = new netsrv.Server();
+//    s->onOpen = onOpen;  s->onData = onData;  s->onClose = onClose;
+//    s->maxConns = 200;  s->maxOut = 1 << 20;  s->idleTimeoutMs = 60000;
+//    if (!s->listen(6379)) { ... }                    // s->listenTls(8883, tls.loadConfig(certPem, keyPem)), s->listenOn("127.0.0.1", 0, null)
+//    s->run();                                        // or: for (;;) { s->poll(50); ... }   from your own loop; s->port is the first port
+//
+//  Output: c->out is a netio.Queue with the limit s->maxOut. A client that does not read makes add() fail (c->out.overflow): the
+//  server cuts it off (closeReason R_EVICTED) instead of using up memory. Output queued during a turn is sent at its end.
+//  close(c) finishes the output, says goodbye (TLS close_notify, FIN) and reads away what the peer still sends for a moment (so the last
+//  bytes are not lost to a connection reset); kill(c) drops the connection at once. onClose runs exactly once for every connection
+//  that onOpen has seen, after the turn in which it ended: c->user may be freed there. Conn objects, buffers and TLS sessions are reused.
+//
+//  Backpressure: a protocol that does not want more input while a lot of output is unsent (redisd: a client that pipelines commands with big replies)
+//  calls s->pause(c, resumeBelow) from onData: nothing more is read from that connection (and delivered) until its output queue is down to
+//  resumeBelow bytes, then onResume(server, conn) runs (it may pause again). stallTimeoutMs cuts off a connection that has output and has not
+//  been able to send a single byte for that long (a client that does not read), 30 s by default, 0: never.
+//
+//  Limits: maxConns (at most 1000: net.poll takes 1024 sockets), maxPerIp, maxOut, handshakeTimeoutMs (accept to a finished TLS
+//  handshake), idleTimeoutMs (nothing received), stallTimeoutMs, lingerMs. Datagram sockets: addUdp(port) and onDatagram.
+//  When accept() fails because the process is out of file descriptors (or memory) the listener rests for 50 ms instead of spinning on it
+//  (stats->acceptFailures); maxConns is not tied to the descriptor limit: keep it below `ulimit -n` minus what the program has open.
+// =============================================================================
+import net;
+import tls;
+import netio;
+import cstdlib;
+module netsrv;
+
+public const MAX_CONNS = 1000;
+public const MAX_LISTENERS = 8;
+public const MAX_UDP = 4;
+
+public const ST_FREE = 0;
+public const ST_TLS = 1;            // the TLS handshake is running
+public const ST_OPEN = 2;
+public const ST_CLOSING = 3;        // close() was called: the output is being sent
+public const ST_LINGER = 4;         // our side is finished: the peer's remaining bytes are read away
+public const ST_DEAD = 5;           // will be released at the end of the turn
+
+public const R_NONE = 0;
+public const R_PEER = 1;            // the peer closed the connection
+public const R_ERROR = 2;           // a socket or TLS error
+public const R_LOCAL = 3;           // close() / kill() from the protocol layer, or onData / onOpen returned < 0
+public const R_TIMEOUT = 4;         // idle timeout
+public const R_EVICTED = 5;         // the output queue overflowed (a client that does not read)
+public const R_SHUTDOWN = 6;        // the server was shut down
+
+public class Stats {
+    public int accepted;
+    public int rejected;            // refused at accept (maxConns, maxPerIp, onOpen)
+    public int closed;
+    public int current;
+    public int bytesIn;
+    public int bytesOut;
+    public int evicted;
+    public int timeouts;
+    public int tlsFailures;
+    public int datagrams;
+    public int acceptFailures;      // accept() failed for a reason other than "nothing there" (out of descriptors, memory ...)
+}
+
+public class Conn {
+    public int id;                  // never reused while the server runs
+    public int fd;
+    public int ip;                  // the peer (host order) and its port
+    public int port;
+    public int state;
+    public int listener;            // index of the listener that accepted it
+    public bool secure;
+    public bool opened;             // onOpen was called
+    public int closeReason;
+    public char* user;              // for the protocol layer
+    public int acceptedAt;
+    public int lastRx;
+    public int lingerAt;
+    public netio.Queue out;
+    public tls.Tls* t;
+    public int slot;
+    public bool paused;             // pause(): nothing is read until the output queue is down to resumeBelow bytes
+    public int resumeBelow;
+    public int txAt;                // the last time the connection had no output or sent some (stall detection)
+}
+
+public class Server {
+    public func onOpen;             // int onOpen(server, conn): < 0 refuses the connection
+    public func onData;             // int onData(server, conn, data, n): data is valid during the call; < 0 closes the connection
+    public func onClose;            // onClose(server, conn)
+    public func onTick;             // onTick(server, nowMs): once per poll turn
+    public func onDatagram;         // onDatagram(server, udpIndex, ip, port, data, n)
+    public func onResume;           // onResume(server, conn): the output queue of a paused connection has drained, it is reading again
+    public char* user;
+    public Stats* stats;
+
+    public int maxConns;            // default 1000 (also the upper limit)
+    public int maxPerIp;            // connections from one address, 0: no limit (default)
+    public int maxOut;              // bytes queued for one connection, default 1 MiB
+    public int handshakeTimeoutMs;  // default 5000
+    public int idleTimeoutMs;       // nothing received for this long: closed. 0: never (default)
+    public int stallTimeoutMs;      // output waiting and not one byte sent for this long: cut off (R_EVICTED). Default 30000, 0: never
+    public int lingerMs;            // default 1000
+    public int port;                // the port of the first listener (after listen)
+    public bool running;
+
+    private int lfd[8];
+    private tls.Config* lcfg[8];
+    private int lport[8];
+    private int lrest[8];               // a listener whose accept() failed rests until this time
+    private int nl;
+    private int ufd[4];
+    private int uport[4];
+    private int nu;
+    private Conn* conns[1000];
+    private int nconns;
+    private Conn* freeList[64];
+    private int nfree;
+    private int nextId;
+    private int ph[1024];
+    private int pe[1024];
+    private int pr[1024];
+    private int pkind[1024];            // 0 listener, 1 udp, 2 connection
+    private Conn* pconn[1024];
+    private char* rbuf;
+    private char* ubuf;
+    private int now;
+    private bool stopped;
+
+    public Server() {
+        maxConns = MAX_CONNS;
+        maxOut = 1048576;
+        handshakeTimeoutMs = 5000;
+        lingerMs = 1000;
+        stallTimeoutMs = 30000;
+        stats = new Stats();
+        nextId = 1;
+        now = millis();
+    }
+
+    public int count() { return nconns; }
+
+    // ---- listening -----------------------------------------------------------------------------------------------------------------------------
+    public bool listen(int p) { return listenOn("0.0.0.0", p, null); }
+    public bool listenTls(int p, tls.Config* cfg) { return listenOn("0.0.0.0", p, cfg); }
+
+    // host "127.0.0.1" or "0.0.0.0"; cfg != null: TLS. Port 0 picks a free one. false if it cannot be used
+    public bool listenOn(char* host, int p, tls.Config* cfg) {
+        if (nl >= MAX_LISTENERS) return false;
+        int h = net.listenOn(host, p, 128);
+        if (h < 0) return false;
+        net.setNonBlocking(h, true);
+        lfd[nl] = h;
+        lrest[nl] = 0;
+        lcfg[nl] = cfg;
+        lport[nl] = net.localPort(h);
+        if (nl == 0) port = lport[0];
+        nl++;
+        return true;
+    }
+
+    // the port of listener i (0 is the first one that listen / listenOn made)
+    public int listenerPort(int i) { return (i >= 0 && i < nl) ? lport[i] : -1; }
+
+    // a UDP socket for datagrams (onDatagram); returns its index or -1. Port 0 picks a free one (udpPort(index))
+    public int addUdp(int p) {
+        if (nu >= MAX_UDP) return -1;
+        int h = net.udpBind(p);
+        if (h < 0) return -1;
+        net.setNonBlocking(h, true);
+        ufd[nu] = h;
+        uport[nu] = net.localPort(h);
+        nu++;
+        return nu - 1;
+    }
+    public int udpPort(int i) { return (i >= 0 && i < nu) ? uport[i] : -1; }
+    public bool sendDatagram(int udpIndex, int ip, int p, char* data, int n) {
+        if (udpIndex < 0 || udpIndex >= nu) return false;
+        return net.sendTo(ufd[udpIndex], ip, p, data, n) == n;
+    }
+
+    // ---- connections -----------------------------------------------------------------------------------------------------------------------------
+    private Conn* newConn() {
+        Conn* c = null;
+        if (nfree > 0) {
+            nfree--;
+            c = freeList[nfree];
+        } else {
+            c = (Conn*) malloc(sizeof(Conn));
+            if (c == null) return null;
+        }
+        return c;
+    }
+
+    // gives a finished connection's object back for reuse
+    private void recycle(Conn* c) {
+        c->out.clear();
+        c->out.shrink(16384);
+        c->out.max = 0;
+        c->id = 0; c->fd = -1; c->ip = 0; c->port = 0; c->state = ST_FREE; c->listener = 0; c->secure = false; c->opened = false;
+        c->closeReason = 0; c->user = null; c->acceptedAt = 0; c->lastRx = 0; c->lingerAt = 0; c->t = null; c->slot = 0;
+        c->paused = false; c->resumeBelow = 0; c->txAt = 0;
+        if (nfree < 64) {
+            freeList[nfree] = c;
+            nfree++;
+        } else {
+            c->out.release();
+            free(c);
+        }
+    }
+
+    private int countIp(int ip) {
+        int n = 0;
+        for (int i = 0; i < nconns; i++) {
+            if (conns[i]->ip == ip && conns[i]->state != ST_DEAD) n++;
+        }
+        return n;
+    }
+
+    private void acceptOn(int li) {
+        for (int k = 0; k < 32; k++) {
+            int fd = net.acceptSome(lfd[li]);
+            if (fd < 0) {
+                // -11 (EAGAIN): nothing more to take. -4, -103, -71: interrupted, or the peer gave up before we took it: try again. Anything else with
+                // nothing accepted yet (out of descriptors, out of memory, ...): the listener stays readable, so polling it again at once would spin
+                if (fd == -4 || fd == -103 || fd == -71) continue;
+                if (fd != -11 && k == 0) {
+                    stats->acceptFailures++;
+                    lrest[li] = now + 50;
+                }
+                return;
+            }
+            if (stopped) { net.rawClose(fd); continue; }
+            net.setNonBlocking(fd, true);
+            net.setNoDelay(fd, true);
+            stats->accepted++;
+            int ip = 0;
+            int pt = 0;
+            net.peer(fd, &ip, &pt);
+            int cap = maxConns > MAX_CONNS ? MAX_CONNS : maxConns;
+            if (nconns >= cap || (maxPerIp > 0 && countIp(ip) >= maxPerIp)) {
+                net.rawClose(fd);
+                stats->rejected++;
+                continue;
+            }
+            Conn* c = newConn();
+            if (c == null) { net.rawClose(fd); continue; }
+            c->id = nextId;
+            nextId++;
+            c->fd = fd;
+            c->ip = ip;
+            c->port = pt;
+            c->listener = li;
+            c->acceptedAt = now;
+            c->lastRx = now;
+            c->txAt = now;
+            c->out.max = maxOut;
+            c->slot = nconns;
+            conns[nconns] = c;
+            nconns++;
+            stats->current++;
+            if (lcfg[li] != null) {
+                c->secure = true;
+                c->state = ST_TLS;
+                c->t = tls.accept(lcfg[li]);
+            } else {
+                c->state = ST_OPEN;
+                opened(c);
+            }
+        }
+    }
+
+    // the connection is ready for the protocol: plain, or the handshake is done
+    private void opened(Conn* c) {
+        c->opened = true;
+        if (onOpen != null) {
+            int r = onOpen(this, c);
+            if (r < 0) {
+                stats->rejected++;
+                c->opened = false;
+                end(c, R_LOCAL);
+            }
+        }
+    }
+
+    // marks a connection as finished (its onClose runs at the end of the turn)
+    private void end(Conn* c, int reason) {
+        if (c->state == ST_DEAD) return;
+        c->state = ST_DEAD;
+        if (c->closeReason == 0) c->closeReason = reason;
+    }
+
+    // Finishes the output, says goodbye and reads away what the peer still sends for lingerMs, then drops the connection
+    public void close(Conn* c) {
+        if (c->state == ST_OPEN || c->state == ST_TLS) {
+            c->state = ST_CLOSING;
+            c->lingerAt = now;
+            if (c->closeReason == 0) c->closeReason = R_LOCAL;
+        }
+    }
+
+    // drops the connection at once (unsent output is lost)
+    public void kill(Conn* c) { end(c, R_LOCAL); }
+
+    // Stops reading from the connection until its output queue holds at most resumeBelow bytes (then onResume runs). Call it from onData / onResume.
+    public void pause(Conn* c, int resumeBelow) {
+        c->paused = true;
+        c->resumeBelow = resumeBelow < 0 ? 0 : resumeBelow;
+    }
+
+    // ---- sending ---------------------------------------------------------------------------------------------------------------------------------
+    private bool hasOutput(Conn* c) {
+        if (c->out.pending() > 0) return true;
+        if (c->secure && c->t != null && tls.outLength(c->t) > 0) return true;
+        return false;
+    }
+
+    // sends what the socket takes (never blocks); false if the connection failed
+    private bool pumpOut(Conn* c) {
+        for (int guard = 0; guard < 64; guard++) {
+            if (c->secure) {
+                tls.Tls* t = c->t;
+                int tn = tls.outLength(t);
+                if (tn > 0) {
+                    int r = net.sendSome(c->fd, tls.outData(t), tn);
+                    if (r < 0) return false;
+                    if (r == 0) return true;
+                    tls.outConsumed(t, r);
+                    stats->bytesOut = stats->bytesOut + r;
+                    c->txAt = now;
+                    continue;
+                }
+                int pn = c->out.pending();
+                if (pn > 0 && tls.ready(t)) {
+                    int take = pn > 16384 ? 16384 : pn;
+                    tls.write(t, c->out.data(), take);
+                    c->out.consume(take);
+                    continue;
+                }
+                return true;
+            }
+            int pn = c->out.pending();
+            if (pn == 0) return true;
+            int r = net.sendSome(c->fd, c->out.data(), pn);
+            if (r < 0) return false;
+            if (r == 0) return true;
+            c->out.consume(r);
+            stats->bytesOut = stats->bytesOut + r;
+            c->txAt = now;
+        }
+        return true;
+    }
+
+    // after the output of a closing connection is gone: goodbye, then linger
+    private void finishClosing(Conn* c) {
+        if (c->secure && c->t != null && tls.ready(c->t)) {
+            tls.shutdown(c->t);
+            if (!pumpOut(c)) { end(c, R_ERROR); return; }
+        }
+        net.shutdown(c->fd, 1);
+        c->state = ST_LINGER;
+        c->lingerAt = now;
+    }
+
+    private void flushConn(Conn* c) {
+        if (c->state == ST_DEAD || c->state == ST_FREE) return;
+        int sent0 = stats->bytesOut;
+        if (c->out.overflow) {
+            stats->evicted++;
+            end(c, R_EVICTED);
+            return;
+        }
+        if (c->state == ST_LINGER) return;
+        if (hasOutput(c)) {
+            if (!pumpOut(c)) { end(c, R_ERROR); return; }
+        }
+        if (c->state == ST_CLOSING && !hasOutput(c)) finishClosing(c);
+        if (c->out.pending() == 0) c->out.shrink(65536);
+        if (!hasOutput(c)) {
+            c->txAt = now;
+        } else if (c->state == ST_OPEN && stallTimeoutMs > 0 && now - c->txAt > stallTimeoutMs) {
+            stats->evicted++;
+            end(c, R_EVICTED);                  // output waiting and the peer takes nothing: it does not read
+            return;
+        }
+        if (c->paused && stats->bytesOut != sent0) c->lastRx = now;         // a paused connection is not idle while its replies are being taken
+        if (c->paused && c->state == ST_OPEN && c->out.pending() <= c->resumeBelow) resumeConn(c);
+    }
+
+    // the output of a paused connection has drained: the protocol layer gets to run again (and the data that TLS has already decrypted is delivered)
+    private void resumeConn(Conn* c) {
+        c->paused = false;
+        if (onResume != null) onResume(this, c);
+        if (c->secure && c->t != null) {
+            while (c->state == ST_OPEN && !c->paused && tls.available(c->t) > 0) {
+                int pn = tls.readApp(c->t, rbuf, 16384);
+                if (pn <= 0) break;
+                deliver(c, rbuf, pn);
+                if (c->out.overflow) return;
+            }
+        }
+    }
+
+    // ---- reading ---------------------------------------------------------------------------------------------------------------------------------
+    private void deliver(Conn* c, char* d, int n) {
+        if (n <= 0 || c->state != ST_OPEN) return;
+        if (onData != null) {
+            int r = onData(this, c, d, n);
+            if (r < 0) close(c);
+        }
+    }
+
+    private void readConn(Conn* c) {
+        for (int round = 0; round < 4 && c->state != ST_DEAD && !c->paused; round++) {
+            int n = net.recvSome(c->fd, rbuf, 16384);
+            if (n == -2) return;
+            if (n <= 0) {
+                // the peer closed or the connection failed
+                if (c->state == ST_LINGER || c->state == ST_CLOSING) end(c, n == 0 ? R_PEER : R_ERROR);
+                else end(c, n == 0 ? R_PEER : R_ERROR);
+                return;
+            }
+            c->lastRx = now;
+            stats->bytesIn = stats->bytesIn + n;
+            if (c->state == ST_LINGER || c->state == ST_CLOSING) {
+                // finishing: what the peer sends is read away (TLS data is not decrypted any more)
+                if (n < 16384) return;
+                continue;
+            }
+            if (c->secure) {
+                tls.Tls* t = c->t;
+                tls.feed(t, rbuf, n);
+                if (tls.failed(t)) {
+                    stats->tlsFailures++;
+                    int tn = tls.outLength(t);
+                    if (tn > 0) net.sendSome(c->fd, tls.outData(t), tn);          // an alert, best effort
+                    end(c, R_ERROR);
+                    return;
+                }
+                if (tls.closed(t)) { end(c, R_PEER); return; }
+                if (c->state == ST_TLS && tls.ready(t)) {
+                    c->state = ST_OPEN;
+                    opened(c);
+                }
+                if (!pumpOut(c)) { end(c, R_ERROR); return; }
+                while (c->state == ST_OPEN && !c->paused && tls.available(t) > 0) {
+                    int pn = tls.readApp(t, rbuf, 16384);
+                    if (pn <= 0) break;
+                    deliver(c, rbuf, pn);
+                    if (c->out.overflow) return;
+                }
+            } else {
+                deliver(c, rbuf, n);
+            }
+            if (c->out.overflow) return;
+            if (n < 16384) return;
+        }
+    }
+
+    // ---- the event loop --------------------------------------------------------------------------------------------------------------------------
+    public void run() {
+        running = true;
+        while (running) {
+            poll(50);
+        }
+    }
+
+    public void stop() { running = false; }
+
+    // One turn: waits at most ms milliseconds for something to do, serves what is ready, runs the timers.
+    // Returns the number of sockets that were ready. Never blocks beyond ms.
+    public int poll(int ms) {
+        if (rbuf == null) {
+            rbuf = malloc(16384);
+            ubuf = malloc(65536 + 16);
+        }
+        if (nl == 0 && nu == 0 && nconns == 0) {
+            if (ms > 0) sleepMs(ms > 20 ? 20 : ms);
+            return 0;
+        }
+        now = millis();
+        for (int i = 0; i < nconns; i++) flushConn(conns[i]);          // output queued since the last turn
+        reap();
+        int n = 0;
+        int wait = ms;
+        for (int i = 0; i < nl; i++) {
+            if (lrest[i] > now) {                           // accept() failed a moment ago: not polled until the rest is over
+                if (wait < 0 || lrest[i] - now < wait) wait = lrest[i] - now;
+                continue;
+            }
+            ph[n] = lfd[i]; pe[n] = net.READABLE; pkind[n] = 0; pconn[n] = null; pr[n] = i; n++;
+        }
+        for (int i = 0; i < nu; i++) {
+            ph[n] = ufd[i]; pe[n] = net.READABLE; pkind[n] = 1; pconn[n] = null; pr[n] = i; n++;
+        }
+        int fixed = n;
+        for (int i = 0; i < nconns; i++) {
+            Conn* c = conns[i];
+            if (c->state == ST_DEAD) continue;
+            ph[n] = c->fd;
+            pe[n] = c->paused ? 0 : net.READABLE;
+            if (hasOutput(c) && c->state != ST_LINGER) pe[n] = pe[n] | net.WRITABLE;
+            pkind[n] = 2;
+            pconn[n] = c;
+            n++;
+        }
+        // pr[] is reused for the results: remember the listener indexes first
+        int idx[24];
+        for (int i = 0; i < fixed; i++) idx[i] = pr[i];
+        int r = 0;
+        if (n > 0) {
+            r = net.poll(&ph[0], &pe[0], &pr[0], n, wait);
+        } else if (wait > 0) {
+            sleepMs(wait > 50 ? 50 : wait);                 // only resting listeners: nothing to poll
+        }
+        now = millis();
+        int ready = 0;
+        if (r > 0) {
+            for (int i = 0; i < n; i++) {
+                if (pr[i] == 0) continue;
+                ready++;
+                if (pkind[i] == 0) {
+                    acceptOn(idx[i]);
+                } else if (pkind[i] == 1) {
+                    readUdp(idx[i]);
+                } else {
+                    Conn* c = pconn[i];
+                    if (c->state == ST_DEAD || c->state == ST_FREE) continue;
+                    if ((pr[i] & (net.WRITABLE)) != 0) flushConn(c);
+                    if (c->paused) {
+                        if ((pr[i] & (net.HUNGUP | net.FAILED)) != 0 && c->state != ST_DEAD) end(c, R_ERROR);       // nothing is read while paused
+                    } else if ((pr[i] & (net.READABLE | net.HUNGUP | net.FAILED)) != 0 && c->state != ST_DEAD) {
+                        readConn(c);
+                    }
+                }
+            }
+        }
+        timers();
+        if (onTick != null) onTick(this, now);
+        for (int i = 0; i < nconns; i++) flushConn(conns[i]);
+        reap();
+        return ready;
+    }
+
+    private void readUdp(int ui) {
+        for (int k = 0; k < 64; k++) {
+            int ip = 0;
+            int pt = 0;
+            int n = net.recvFrom(ufd[ui], ubuf, 65536, &ip, &pt);
+            if (n < 0) return;
+            stats->datagrams++;
+            stats->bytesIn = stats->bytesIn + n;
+            ubuf[n] = 0;
+            if (onDatagram != null) onDatagram(this, ui, ip, pt, ubuf, n);
+        }
+    }
+
+    private void timers() {
+        for (int i = 0; i < nconns; i++) {
+            Conn* c = conns[i];
+            if (c->state == ST_TLS && now - c->acceptedAt > handshakeTimeoutMs) {
+                stats->timeouts++;
+                stats->tlsFailures++;
+                end(c, R_TIMEOUT);
+            } else if (c->state == ST_OPEN && idleTimeoutMs > 0 && now - c->lastRx > idleTimeoutMs) {
+                stats->timeouts++;
+                end(c, R_TIMEOUT);
+            } else if (c->state == ST_LINGER && now - c->lingerAt > lingerMs) {
+                end(c, R_LOCAL);
+            } else if (c->state == ST_CLOSING && now - c->lingerAt > 10000) {
+                end(c, R_LOCAL);            // a closing connection whose output never drains
+            }
+        }
+    }
+
+    // releases the finished connections: onClose, the socket, the TLS session, the object
+    private void reap() {
+        int i = 0;
+        while (i < nconns) {
+            Conn* c = conns[i];
+            if (c->state != ST_DEAD) { i++; continue; }
+            if (c->opened && onClose != null) onClose(this, c);
+            if (c->secure && c->t != null) {
+                tls.release(c->t);
+                c->t = null;
+            }
+            net.rawClose(c->fd);
+            stats->closed++;
+            stats->current--;
+            nconns--;
+            if (i < nconns) {
+                conns[i] = conns[nconns];
+                conns[i]->slot = i;
+            }
+            conns[nconns] = null;
+            recycle(c);                     // the object that moved into slot i is looked at next
+        }
+    }
+
+    // drops every connection at once (onClose runs for each at the end of the next turn); the listeners stay
+    public void killAll() {
+        for (int i = 0; i < nconns; i++) end(conns[i], R_LOCAL);
+    }
+
+    // Stops accepting, drops every connection (onClose runs for each) and closes the sockets. The server can listen again afterwards.
+    public void shutdown() {
+        stopped = true;
+        for (int i = 0; i < nl; i++) net.rawClose(lfd[i]);
+        for (int i = 0; i < nu; i++) net.rawClose(ufd[i]);
+        nl = 0;
+        nu = 0;
+        for (int i = 0; i < nconns; i++) end(conns[i], R_SHUTDOWN);
+        reap();
+        stopped = false;
+        port = 0;
+        running = false;
+        if (rbuf != null) { free(rbuf); rbuf = null; }
+        if (ubuf != null) { free(ubuf); ubuf = null; }
+        for (int i = 0; i < nfree; i++) { freeList[i]->out.release(); free(freeList[i]); }
+        nfree = 0;
+    }
+}

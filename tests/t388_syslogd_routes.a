@@ -1,0 +1,432 @@
+// The syslog collector's inner life: filters (facility, severity, program, host, regular expression, invert, the glob), the ring buffer (limits, order,
+// overflow), files (exact content, line formats, rotation by size with kept files, a file that cannot be opened, a line that cannot forge another), routes
+// that take a message to several places, the drop filter, forwarding to a second collector (and to one that is down), flooding, and random garbage.
+// The files go into a directory of its own below build/tests/ (relative path: run it from the root of the repository, tests/run.sh does; the directory is removed at the end).
+import syslog;
+import syslogd;
+import net;
+import os;
+import asys;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// A directory of its own for every run (random name): two runs at the same time in one checkout, or a run that died half way, cannot disturb each other.
+char dirName[100];
+void initDir(char* tag) {
+    char rb[8];
+    asys.randomBytes(&rb[0], 8);
+    int v = 0;
+    for (int i = 0; i < 6; i++) v = v * 256 + (rb[i] & 255);
+    format(&dirName[0], 100, "build/tests/%s_%d", tag, v, 0, 0);
+}
+char* P(char* name) {
+    char* r = alloc(160);
+    format(r, 160, "%s/%s", &dirName[0], name, 0, 0);
+    return r;
+}
+
+int TS = 1065910455;                     // 2003-10-11 22:14:15 UTC
+syslog.Message pm;
+
+// a collector with a fixed clock and a message sent through it
+syslogd.Collector* col;
+
+int feedMsg(char* text) {
+    return col->ingest(text, strlen(text), 0x7F000001, syslog.TRANSPORT_UDP);
+}
+
+// builds "<PRI>Oct 11 22:14:15 host app[pid]: text" and feeds it
+void feedFull(int fac, int sev, char* host, char* app, char* text) {
+    char buf[2048];
+    int n = syslog.build3164(&buf[0], 2048, fac, sev, TS, host, app, -1, text, strlen(text));
+    col->ingest(&buf[0], n, 0x7F000001, syslog.TRANSPORT_UDP);
+}
+
+syslog.Message* parsed(int fac, int sev, char* host, char* app, char* text) {
+    char buf[2048];
+    int n = syslog.build5424(&buf[0], 2048, fac, sev, TS, 0, host, app, null, null, null, text, strlen(text));
+    syslog.parse(&buf[0], n, &pm, TS);
+    return &pm;
+}
+
+// does the filter let this message through?
+bool passes(syslogd.Filter* f, int fac, int sev, char* host, char* app, char* text) {
+    char buf[2048];
+    int n = syslog.build5424(&buf[0], 2048, fac, sev, TS, 0, host, app, null, null, null, text, strlen(text));
+    syslog.Message m;
+    syslog.parse(&buf[0], n, &m, TS);
+    return f->matches(&m);
+}
+
+void globCase(char* p, char* s, bool want) {
+    char name[200];
+    format(&name[0], 200, "glob '%s' on '%s' -> %s", p, s, want ? "yes" : "no", 0);
+    check(&name[0], syslogd.glob(p, s) == want);
+}
+
+bool fileIs(char* path, char* want) {
+    char* t = readFile(path);
+    bool ok = t != null && streq(t, want);
+    if (!ok) {
+        printf("     %s holds: %s\n", path, t == null ? "(nothing)" : t);
+    }
+    return ok;
+}
+
+syslogd.Server* gb;
+int hookB() {
+    gb->poll(0);
+    return 0;
+}
+
+int rng = 31337;
+int rnd() {
+    rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF;
+    return rng >> 8;
+}
+
+int main() {
+    // ---- the glob -------------------------------------------------------------------------------------------------------------------------------------------
+    globCase("*", "", true);
+    globCase("*", "anything", true);
+    globCase("", "", true);
+    globCase("", "a", false);
+    globCase("sshd", "sshd", true);
+    globCase("sshd", "sshd2", false);
+    globCase("ssh*", "sshd", true);
+    globCase("*d", "sshd", true);
+    globCase("s*d", "sshd", true);
+    globCase("s?hd", "sshd", true);
+    globCase("s?d", "sshd", false);
+    globCase("*a*a*a*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false);
+    globCase("SSHD", "sshd", false);
+    globCase("a*", "", false);
+
+    // ---- filters ---------------------------------------------------------------------------------------------------------------------------------------------
+    syslogd.Filter* f = syslogd.newFilter();
+    check("a new filter lets everything through", passes(f, 0, 0, "h", "a", "x") && passes(f, 23, 7, "h", "a", "x"));
+    f->setSeverityUpTo(syslog.SEV_WARNING);
+    check("setSeverityUpTo(warning): emerg ... warning pass, notice ... debug do not", passes(f, 1, 0, "h", "a", "x") && passes(f, 1, 4, "h", "a", "x") && !passes(f, 1, 5, "h", "a", "x") && !passes(f, 1, 7, "h", "a", "x"));
+    f->clearSeverities();
+    f->addSeverity(syslog.SEV_ERR);
+    f->addSeverity(syslog.SEV_DEBUG);
+    check("severities as a set: err and debug only", passes(f, 1, 3, "h", "a", "x") && passes(f, 1, 7, "h", "a", "x") && !passes(f, 1, 4, "h", "a", "x") && !passes(f, 1, 0, "h", "a", "x"));
+    f = syslogd.newFilter();
+    f->clearFacilities();
+    f->addFacility(syslog.FAC_AUTH);
+    f->addFacility(syslog.FAC_LOCAL7);
+    check("facilities as a set: auth and local7", passes(f, 4, 6, "h", "a", "x") && passes(f, 23, 0, "h", "a", "x") && !passes(f, 1, 6, "h", "a", "x") && !passes(f, 16, 6, "h", "a", "x") && !passes(f, 0, 6, "h", "a", "x"));
+    f = syslogd.newFilter();
+    f->program = "ssh*";
+    check("program glob ssh*", passes(f, 1, 6, "h", "sshd", "x") && passes(f, 1, 6, "h", "ssh", "x") && !passes(f, 1, 6, "h", "cron", "x") && !passes(f, 1, 6, "h", "", "x"));
+    f = syslogd.newFilter();
+    f->host = "web-?";
+    check("host glob web-?", passes(f, 1, 6, "web-1", "a", "x") && !passes(f, 1, 6, "web-10", "a", "x") && !passes(f, 1, 6, "db-1", "a", "x"));
+    f = syslogd.newFilter();
+    check("a regular expression is set", f->setPattern("Failed (password|publickey) for (invalid user )?\\w+"));
+    check("... it finds its match anywhere in the text", passes(f, 1, 6, "h", "a", "sshd: Failed password for root from 10.0.0.1") && passes(f, 1, 6, "h", "a", "Failed publickey for invalid user bob") && !passes(f, 1, 6, "h", "a", "Accepted password for root") && !passes(f, 1, 6, "h", "a", ""));
+    check("a regular expression that is not valid is refused (the old one stays)", !f->setPattern("(unclosed") && passes(f, 1, 6, "h", "a", "Failed password for root"));
+    f = syslogd.newFilter();
+    f->setPattern("^ab+c$");
+    check("anchors", passes(f, 1, 6, "h", "a", "abbbc") && !passes(f, 1, 6, "h", "a", "xabc") && !passes(f, 1, 6, "h", "a", "abcx"));
+    f = syslogd.newFilter();
+    f->setPattern("x");
+    f->invert = true;
+    check("invert: messages without an x", passes(f, 1, 6, "h", "a", "abc") && !passes(f, 1, 6, "h", "a", "axc"));
+    f = syslogd.newFilter();
+    f->setSeverityUpTo(syslog.SEV_ERR);
+    f->program = "app";
+    f->host = "h*";
+    f->clearFacilities();
+    f->addFacility(syslog.FAC_USER);
+    f->setPattern("boom");
+    check("all criteria together must match", passes(f, 1, 3, "h1", "app", "big boom") && !passes(f, 2, 3, "h1", "app", "big boom") && !passes(f, 1, 4, "h1", "app", "big boom") && !passes(f, 1, 3, "x1", "app", "big boom")
+          && !passes(f, 1, 3, "h1", "other", "big boom") && !passes(f, 1, 3, "h1", "app", "quiet"));
+    f = syslogd.newFilter();
+    f->setPattern("a.{0,3}b");
+    check("a message with a 0 byte in it is searched to its end", passes(f, 1, 6, "h", "a", "a12b") && !passes(f, 1, 6, "h", "a", "a12345b"));
+
+    // ---- the ring buffer ---------------------------------------------------------------------------------------------------------------------------------------
+    syslogd.Ring* r = new syslogd.Ring();
+    r->capacity = 5;
+    r->maxBytes = 1000;
+    for (int i = 0; i < 3; i++) {
+        char t[20];
+        format(&t[0], 20, "line %d", i, 0, 0, 0);
+        r->push(&t[0], strlen(&t[0]), i);
+    }
+    check("a ring keeps lines in order: oldest first", r->count() == 3 && streq(r->line(0), "line 0") && streq(r->line(2), "line 2") && r->severityOf(1) == 1 && r->overwritten == 0);
+    check("an index outside is null", r->line(3) == null && r->line(-1) == null && r->severityOf(9) == -1 && r->lineLength(9) == 0);
+    for (int i = 3; i < 12; i++) {
+        char t[20];
+        format(&t[0], 20, "line %d", i, 0, 0, 0);
+        r->push(&t[0], strlen(&t[0]), 0);
+    }
+    check("at capacity the oldest line goes: 5 lines, the last five", r->count() == 5 && streq(r->line(0), "line 7") && streq(r->line(4), "line 11") && r->overwritten == 7 && r->total == 12);
+    r->clear();
+    r->maxBytes = 30;
+    for (int i = 0; i < 10; i++) r->push("0123456789", 10, 0);
+    check("maxBytes: the bytes are bounded too (30 bytes: 3 lines)", r->count() == 3 && r->byteCount() == 30);
+    r->push("0123456789012345678901234567890123456789", 40, 0);
+    check("a line longer than maxBytes is cut to it", r->count() == 1 && r->lineLength(0) == 30);
+    r->clear();
+    r->maxBytes = 100000;
+    r->maxLine = 16;
+    r->push("a line that is longer than sixteen bytes", 41, 0);
+    check("a line longer than maxLine is cut", r->lineLength(0) == 16 && streq(r->line(0), "a line that is l"));
+    r->push("", 0, 0);
+    check("an empty line is a line", r->count() == 2 && r->lineLength(1) == 0);
+    r->clear();
+    check("clear() empties it", r->count() == 0 && r->byteCount() == 0 && r->overwritten == 0);
+
+    // ---- the collector: ring, drop filter, routes ------------------------------------------------------------------------------------------------------------------
+    col = new syslogd.Collector();
+    col->setClock(TS);
+    feedFull(syslog.FAC_AUTH, syslog.SEV_ERR, "web-1", "sshd", "Failed password for root");
+    check("a message reaches the default ring in the traditional format", col->ring->count() == 1 && streq(col->ring->line(0), "Oct 11 22:14:15 web-1 sshd: Failed password for root"));
+    check("the statistics", col->stats->received == 1 && col->stats->parsed == 1 && col->stats->sev[syslog.SEV_ERR] == 1 && col->stats->udp == 1 && col->stats->bytes > 20);
+    feedMsg("<165>1 2003-10-11T22:14:15.003Z web-2 app 77 ID1 [m@1 k=\"v\"] a 5424 message");
+    check("an RFC 5424 message: app[pid]", streq(col->ring->line(1), "Oct 11 22:14:15 web-2 app[77]: a 5424 message"));
+    feedMsg("<165>1 2003-08-24T05:14:15.000003-07:00 web-3 app - - - zone");
+    check("a timestamp with an offset is shown in UTC", streq(col->ring->line(2), "Aug 24 12:14:15 web-3 app: zone"));
+    feedMsg("no priority and no header");
+    check("a text without a header: reception time and the address of the sender", streq(col->ring->line(3), "Oct 11 22:14:15 127.0.0.1 no priority and no header"));
+    col->lineFormat = syslogd.LINE_DETAIL;
+    feedFull(syslog.FAC_LOCAL2, syslog.SEV_DEBUG, "h", "t", "detail");
+    check("LINE_DETAIL: ISO time and facility.severity", streq(col->ring->line(4), "2003-10-11T22:14:15Z h local2.debug t: detail"));
+    col->lineFormat = syslogd.LINE_TRADITIONAL;
+    col->ring->clear();
+    feedMsg("<34>Oct 11 22:14:15 h su: first line\nforged: <0>Oct 11 22:14:15 victim root: logged in\x1b[31m");
+    check("a message cannot forge a log line: LF, CR and ESC are written as #ooo", col->ring->count() == 1 && streq(col->ring->line(0), "Oct 11 22:14:15 h su: first line#012forged: <0>Oct 11 22:14:15 victim root: logged in#033[31m"));
+    col->ring->clear();
+    syslogd.Filter* drop = syslogd.newFilter();
+    drop->setPattern("healthcheck");
+    col->dropFilter = drop;
+    int parsed0 = col->stats->parsed;
+    feedFull(1, 6, "h", "lb", "GET /healthcheck 200");
+    feedFull(1, 6, "h", "lb", "GET /index 200");
+    check("the drop filter drops what it matches (and counts it)", col->ring->count() == 1 && col->stats->dropped == 1 && col->stats->parsed == parsed0 + 2);
+    col->dropFilter = null;
+    col->ring->clear();
+
+    syslogd.Filter* errors = syslogd.newFilter();
+    errors->setSeverityUpTo(syslog.SEV_ERR);
+    syslogd.Ring* errRing = col->addRing(errors, 100, 100000);
+    syslogd.Filter* sshOnly = syslogd.newFilter();
+    sshOnly->program = "sshd";
+    syslogd.Ring* sshRing = col->addRing(sshOnly, 100, 100000);
+    feedFull(4, syslog.SEV_ERR, "h", "sshd", "e1");
+    feedFull(4, syslog.SEV_INFO, "h", "sshd", "i1");
+    feedFull(1, syslog.SEV_CRIT, "h", "cron", "c1");
+    feedFull(1, syslog.SEV_INFO, "h", "cron", "i2");
+    check("routes: a message goes to every route whose filter matches", col->ring->count() == 4 && errRing->count() == 2 && sshRing->count() == 2);
+    check("... the right ones", endsWith(errRing->line(0), "sshd: e1") && endsWith(errRing->line(1), "cron: c1") && endsWith(sshRing->line(0), "sshd: e1") && endsWith(sshRing->line(1), "sshd: i1"));
+    check("two extra routes", col->routeCount() == 2);
+
+    // ---- files ---------------------------------------------------------------------------------------------------------------------------------------------------
+    initDir("sl388");
+    makeDir(&dirName[0]);
+    char* names[8];
+    names[0] = P("a.log"); names[1] = P("a.log.1"); names[2] = P("a.log.2"); names[3] = P("a.log.3"); names[4] = P("a.log.4");
+    names[5] = P("b.log"); names[6] = P("c.log"); names[7] = P("d.log");
+    for (int i = 0; i < 8; i++) fileDelete(names[i]);
+    col = new syslogd.Collector();
+    col->setClock(TS);
+    syslogd.FileSink* fa = col->addFile(null, P("b.log"), 0, 0);
+    feedFull(4, 3, "h", "sshd", "one");
+    feedFull(4, 3, "h", "sshd", "two");
+    col->closeFiles();
+    check("a file gets one line per message", fileIs(P("b.log"), "Oct 11 22:14:15 h sshd: one\nOct 11 22:14:15 h sshd: two\n") && fa->lines == 2 && fa->errors == 0);
+    feedFull(4, 3, "h", "sshd", "three");
+    col->closeFiles();
+    check("the file is opened again at the next line and appended to", fileIs(P("b.log"), "Oct 11 22:14:15 h sshd: one\nOct 11 22:14:15 h sshd: two\nOct 11 22:14:15 h sshd: three\n") && fa->fileSize() == 86);
+    fa->lineFormat = syslogd.LINE_DETAIL;
+    feedFull(4, 3, "h", "sshd", "four");
+    col->closeFiles();
+    char* all = readFile(P("b.log"));
+    check("a file can have its own line format", all != null && endsWith(all, "2003-10-11T22:14:15Z h auth.err sshd: four\n"));
+    feedMsg("<34>Oct 11 22:14:15 h su: line one\nforged: <0>Oct 11 22:14:15 victim root: logged in");
+    col->closeFiles();
+    all = readFile(P("b.log"));
+    int lineCount = 0;
+    for (int i = 0; all[i] != 0; i++) { if (all[i] == '\n') lineCount++; }
+    check("a message with a line feed does not add a line to the file", lineCount == 5 && contains(all, "line one#012forged: <0>Oct 11 22:14:15 victim root: logged in\n"));
+
+    // rotation
+    col = new syslogd.Collector();
+    col->setClock(TS);
+    syslogd.FileSink* rot = col->addFile(null, P("a.log"), 200, 3);
+    for (int i = 0; i < 30; i++) {
+        char t[40];
+        format(&t[0], 40, "message number %02d", i, 0, 0, 0);
+        feedFull(1, 6, "h", "a", &t[0]);
+    }
+    col->closeFiles();
+    int s0 = os.fileSize(P("a.log"));
+    int s1 = os.fileSize(P("a.log.1"));
+    int s2 = os.fileSize(P("a.log.2"));
+    int s3 = os.fileSize(P("a.log.3"));
+    check("rotation at 200 bytes with 3 kept files: a.log, a.log.1, .2 and .3 exist", s0 > 0 && s1 > 0 && s2 > 0 && s3 > 0 && os.fileSize(P("a.log.4")) < 0);
+    check("... none is bigger than 200 bytes", s0 <= 200 && s1 <= 200 && s2 <= 200 && s3 <= 200);
+    check("... the rotations are counted", rot->rotations >= 5 && rot->lines == 30);
+    char* f0 = readFile(P("a.log"));
+    char* f1 = readFile(P("a.log.1"));
+    char* f3 = readFile(P("a.log.3"));
+    check("the newest message is in a.log, older ones in .1, .2, .3", contains(f0, "message number 29") && contains(f1, "message number 2") && !contains(f0, "message number 20") && f3 != null);
+    // the order of the numbers across the files: .3 oldest ... a.log newest
+    int lastNum = -1;
+    bool ordered = true;
+    char* parts[4];
+    parts[0] = readFile(P("a.log.3"));
+    parts[1] = readFile(P("a.log.2"));
+    parts[2] = readFile(P("a.log.1"));
+    parts[3] = readFile(P("a.log"));
+    int total = 0;
+    for (int k = 0; k < 4; k++) {
+        char* p = parts[k];
+        int pl = strlen(p);
+        for (int i = 0; i + 17 < pl; i++) {
+            if (memcmp(&p[i], "message number ", 15) == 0) {
+                int v = (p[i + 15] - '0') * 10 + (p[i + 16] - '0');
+                if (v != lastNum + 1 && lastNum >= 0) ordered = false;
+                lastNum = v;
+                total++;
+            }
+        }
+    }
+    check("the files together hold the newest messages in order, without gaps or doubles", ordered && lastNum == 29 && total >= 8);
+    syslogd.FileSink* zero = col->addFile(null, P("c.log"), 100, 0);
+    for (int i = 0; i < 10; i++) feedFull(1, 6, "h", "z", "0123456789012345678901234567890");
+    col->closeFiles();
+    check("keep = 0: the old content is deleted at a rotation, no numbered file is made", os.fileSize(P("c.log")) > 0 && os.fileSize(P("c.log")) <= 100 && os.fileSize(P("c.log.1")) < 0 && zero->rotations >= 1);
+    syslogd.FileSink* tiny = col->addFile(null, P("d.log"), 40, 1);
+    feedFull(1, 6, "h", "t", "a message that is much longer than the file may be");
+    col->closeFiles();
+    check("a line longer than the file limit is cut to fit", os.fileSize(P("d.log")) > 0 && os.fileSize(P("d.log")) <= 40);
+    // an existing file is appended to and counted
+    col = new syslogd.Collector();
+    col->setClock(TS);
+    syslogd.FileSink* again = col->addFile(null, P("a.log"), 200, 3);
+    int before = os.fileSize(P("a.log"));
+    feedFull(1, 6, "h", "a", "after a restart");
+    col->closeFiles();
+    check("an existing file is appended to (its size counts for the rotation)", os.fileSize(P("a.log")) > before || again->rotations == 1);
+    // a file that cannot be opened (the directory does not exist: it is removed first in case an earlier run made it)
+    fileDelete(P("nodir/x.log"));
+    asys.rmdir(P("nodir"));
+    col = new syslogd.Collector();
+    col->setClock(TS);
+    syslogd.FileSink* broken = col->addFile(null, P("nodir/x.log"), 0, 0);
+    broken->retryMs = 60;
+    feedFull(1, 6, "h", "a", "lost one");
+    feedFull(1, 6, "h", "a", "lost two");
+    check("a file that cannot be opened: the lines are lost and counted, one open attempt", broken->errors == 1 && broken->lost == 2 && broken->lines == 0);
+    check("... the ring still gets the messages", col->ring->count() == 2);
+    makeDir(P("nodir"));
+    fileDelete(P("nodir/x.log"));
+    feedFull(1, 6, "h", "a", "still lost");
+    check("... no new attempt before retryMs has passed", broken->errors == 1);
+    sleepMs(80);
+    feedFull(1, 6, "h", "a", "written");
+    col->closeFiles();
+    check("... and the file works after it", broken->lines == 1 && fileIs(P("nodir/x.log"), "Oct 11 22:14:15 h a: written\n"));
+
+    // ---- forwarding ----------------------------------------------------------------------------------------------------------------------------------------------------
+    syslogd.Server* b = syslogd.newServer();
+    b->collector->setClock(TS);
+    b->listenUdp(0);
+    b->listenTcp(0);
+    net.setIdleHook(hookB);
+    gb = b;
+    col = new syslogd.Collector();
+    col->setClock(TS);
+    char url[100];
+    format(&url[0], 100, "tcp://127.0.0.1:%d", b->tcpPort, 0, 0, 0);
+    syslogd.Filter* warnUp = syslogd.newFilter();
+    warnUp->setSeverityUpTo(syslog.SEV_WARNING);
+    syslog.Sender* fw = col->addForward(warnUp, &url[0]);
+    format(&url[0], 100, "udp://127.0.0.1:%d", b->udpPort, 0, 0, 0);
+    syslogd.Filter* sshF = syslogd.newFilter();
+    sshF->program = "sshd";
+    syslog.Sender* fu = col->addForward(sshF, &url[0]);
+    check("two forwarding routes (TCP and UDP)", fw != null && fu != null && col->routeCount() == 2);
+    check("a URL that is not valid is refused", col->addForward(null, "http://x") == null && col->addForward(null, "udp://") == null);
+    feedFull(4, syslog.SEV_ERR, "h", "sshd", "to both");
+    feedFull(1, syslog.SEV_INFO, "h", "cron", "to nobody");
+    feedFull(1, syslog.SEV_WARNING, "h", "cron", "to the TCP one");
+    feedFull(4, syslog.SEV_INFO, "h", "sshd", "to the UDP one");
+    col->flushForwards(2000);
+    for (int i = 0; i < 40; i++) b->poll(2);
+    syslogd.Ring* br = b->collector->ring;
+    check("the second collector got what the filters let through (the original messages)", br->count() == 4 && col->stats->forwarded == 4);
+    bool hasBoth = false; bool hasTcp = false; bool hasUdp = false; bool hasNobody = false;
+    for (int i = 0; i < br->count(); i++) {
+        if (endsWith(br->line(i), "sshd: to both")) hasBoth = true;
+        if (endsWith(br->line(i), "cron: to the TCP one")) hasTcp = true;
+        if (endsWith(br->line(i), "sshd: to the UDP one")) hasUdp = true;
+        if (endsWith(br->line(i), "to nobody")) hasNobody = true;
+    }
+    check("... (the message for both comes twice, once per route)", hasBoth && hasTcp && hasUdp && !hasNobody);
+    // a collector that is down
+    b->shutdown();
+    net.setIdleHook(null);
+    col = new syslogd.Collector();
+    col->setClock(TS);
+    int dead = net.listen(0, 4);
+    int deadPort = net.localPort(dead);
+    net.close(dead);
+    format(&url[0], 100, "tcp://127.0.0.1:%d", deadPort, 0, 0, 0);
+    syslog.Sender* fd = col->addForward(null, &url[0]);
+    fd->connectTimeoutMs = 300;
+    fd->retryIntervalMs = 100000;
+    int t0 = millis();
+    for (int i = 0; i < 2500; i++) feedFull(1, 6, "h", "a", "forwarded into the void");
+    check("forwarding to a collector that is down does not slow the collector down, and the queue is bounded", millis() - t0 < 2000 && fd->queued() <= 1000 && col->ring->count() == 1000);
+    col->dispose();
+
+    // ---- floods and garbage -------------------------------------------------------------------------------------------------------------------------------------------
+    col = new syslogd.Collector();
+    col->setClock(TS);
+    col->ring->capacity = 500;
+    col->ring->maxBytes = 20000;
+    for (int i = 0; i < 20000; i++) {
+        char t[60];
+        format(&t[0], 60, "<14>Oct 11 22:14:15 h app: flood %d", i, 0, 0, 0);
+        col->ingest(&t[0], strlen(&t[0]), 0x7F000001, syslog.TRANSPORT_UDP);
+    }
+    check("20000 messages: all counted, the ring holds the newest within its limits", col->stats->received == 20000 && col->ring->count() <= 500 && col->ring->byteCount() <= 20000 && endsWith(col->ring->line(col->ring->count() - 1), "flood 19999"));
+    check("... the overwritten ones are counted", col->ring->overwritten == 20000 - col->ring->count());
+    col->ring->clear();
+    int junkOk = 0;
+    char junk[300];
+    int before2 = col->stats->received;
+    for (int round = 0; round < 5000; round++) {
+        int len = rnd() % 200;
+        for (int i = 0; i < len; i++) junk[i] = rnd();
+        if (round % 3 == 0 && len > 4) { junk[0] = '<'; junk[1] = '1'; junk[2] = '3'; junk[3] = '>'; }
+        if (round % 7 == 0 && len > 8) { junk[0] = '<'; junk[1] = '3'; junk[2] = '4'; junk[3] = '>'; junk[4] = '1'; junk[5] = ' '; }
+        if (col->ingest(&junk[0], len, 0x01020304, syslog.TRANSPORT_TCP) == 0) junkOk++;
+    }
+    check("5000 random byte strings: no crash, every one is parsed or counted as malformed", col->stats->received == before2 + 5000 && col->stats->parsed + col->stats->malformed + col->stats->oversize >= 5000);
+    check("... the ring is within its limits", col->ring->count() <= 500 && col->ring->byteCount() <= 20000);
+    col->dispose();
+    for (int i = 0; i < 8; i++) fileDelete(names[i]);
+    fileDelete(P("nodir/x.log"));
+    asys.rmdir(P("nodir"));
+    asys.rmdir(&dirName[0]);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}
+

@@ -1,0 +1,96 @@
+// A regular expression in a syslogd filter must not hang the collector: a pattern that backtracks without end (here (a+)+b on a line of a's, which takes
+// 2^n steps) is stopped by the step limit of the filter (regexSteps, default 1,000,000), the message counts as "does not match" (an inverted filter turns that
+// around), the counter regexExceeded says how often it happened, and ordinary patterns on messages of the largest size are not touched by the limit.
+import syslog;
+import syslogd;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int TS = 1065910455;
+
+// the message "text" as the filter sees it (RFC 5424, a long text is fine)
+bool passes(syslogd.Filter* f, char* text, int n) {
+    char* buf = malloc(n + 200);
+    int len = syslog.build5424(buf, n + 200, syslog.FAC_USER, syslog.SEV_NOTICE, TS, 0, "h", "app", null, null, null, text, n);
+    syslog.Message m;
+    int e = syslog.parse(buf, len, &m, TS);
+    bool r = e == 0 && f->matches(&m);
+    free(buf);
+    return r;
+}
+
+int main() {
+    syslogd.Filter* f = syslogd.newFilter();
+    check("the default step limit is 1,000,000", f->regexSteps == 1000000 && f->regexExceeded == 0);
+    check("a catastrophic pattern is a valid pattern", f->setPattern("(a+)+b"));
+
+    // 40 a's and no b: without a limit this takes 2^40 steps
+    char evil[64];
+    for (int i = 0; i < 40; i++) evil[i] = 'a';
+    evil[40] = 'c';
+    evil[41] = 0;
+    check("a line of a's: the search is stopped, no match", !passes(f, &evil[0], 41));
+    check("... and counted once", f->regexExceeded == 1);
+    check("a line with the b still matches (the limit is not hit when the match is near)", passes(f, "aab", 3) && f->regexExceeded == 1);
+    check("a line without any a does not hit the limit", !passes(f, "xyz", 3) && f->regexExceeded == 1);
+
+    // an inverted filter: "does not match" turns into "passes"
+    syslogd.Filter* inv = syslogd.newFilter();
+    inv->setPattern("(a+)+b");
+    inv->invert = true;
+    check("inverted: the stopped search is a non-match, so the message passes", passes(inv, &evil[0], 41) && inv->regexExceeded == 1);
+
+    // the limit is a setting
+    syslogd.Filter* small = syslogd.newFilter();
+    small->setPattern("(a+)+b");
+    small->regexSteps = 2000;
+    for (int i = 0; i < 20; i++) passes(small, &evil[0], 41);
+    check("regexSteps = 2000: 20 hostile messages are stopped 20 times", small->regexExceeded == 20);
+    small->regexSteps = 0;                    // 0: the limit of the regex module itself (5 million steps), which is still a limit
+    check("regexSteps = 0 is not 'always fail': a normal match works", passes(small, "aaab", 4) && small->regexExceeded == 20);
+    check("regexSteps = 0 is not 'no limit': the hostile line is stopped (at 5 million steps)", !passes(small, &evil[0], 41) && small->regexExceeded == 21);
+
+    // ordinary patterns on a message of the biggest size
+    int big = 16000;
+    char* t = malloc(big + 16);
+    for (int i = 0; i < big; i++) t[i] = 'x';
+    memcpy(&t[big - 7], "refused", 7);
+    syslogd.Filter* g = syslogd.newFilter();
+    g->setPattern("Failed|refused");
+    check("16000 bytes, the word at the end: found", passes(g, t, big) && g->regexExceeded == 0);
+    t[big - 7] = 'x';
+    check("16000 bytes, the word missing: not found, limit not hit", !passes(g, t, big) && g->regexExceeded == 0);
+    syslogd.Filter* h = syslogd.newFilter();
+    h->setPattern("[0-9]+ errors?");
+    check("a character class pattern on 16000 bytes: no match, limit not hit", !passes(h, t, big) && h->regexExceeded == 0);
+    free(t);
+
+    // through the collector: the hostile message neither hangs it nor stops the others
+    syslogd.Collector* col = new syslogd.Collector();
+    col->setClock(TS);
+    syslogd.Filter* rf = syslogd.newFilter();
+    rf->setPattern("(a+)+b");
+    syslogd.Ring* only = col->addRing(rf, 10, 100000);
+    char msg[512];
+    int n = syslog.build3164(&msg[0], 512, syslog.FAC_USER, syslog.SEV_ERR, TS, "h", "app", -1, &evil[0], 41);
+    col->ingest(&msg[0], n, 0x7F000001, syslog.TRANSPORT_UDP);
+    n = syslog.build3164(&msg[0], 512, syslog.FAC_USER, syslog.SEV_ERR, TS, "h", "app", -1, "aaab", 4);
+    col->ingest(&msg[0], n, 0x7F000001, syslog.TRANSPORT_UDP);
+    check("the collector: both messages reached the default ring", col->ring->count() == 2);
+    check("... only the one that matches reached the route with the pattern", only->count() == 1 && rf->regexExceeded == 1);
+
+    println(fails == 0 ? "all ok" : "FAILED");
+    printf("%d checks\n", checks);
+    return fails == 0 ? 0 : 1;
+}

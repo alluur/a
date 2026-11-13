@@ -1,0 +1,267 @@
+// Memory of the Redis modules: whatever a client or a server does again and again over months must not use up memory. The heap position (what `new`,
+// alloc and strdup consume, which is never given back) must stay exactly where it is after a warm-up while clients connect, run commands on every data
+// type, pipeline, run transactions, subscribe, reconnect and vanish; while keys of every type are created, expire and are deleted; while the parsers
+// read replies and requests; and while hostile connections come and go. (TLS handshakes are not part of this: see docs/NET.md.)
+import redis;
+import redisd;
+import net;
+import netio;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+redisd.Server* srv;
+int PORT;
+char url[100];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+void settle() {
+    for (int i = 0; i < 25; i++) srv->poll(0);
+}
+
+void freeText(char* s) { if (s != null) free(s); }
+void drop(redis.Reply* r) { if (r != null) r->dispose(); }
+
+void opCommands() {
+    redis.Client* c = redis.connect(&url[0]);
+    c->set("mem:s", "value");
+    freeText(c->get("mem:s"));
+    c->incr("mem:n");
+    c->append("mem:s", "more");
+    c->setEx("mem:t", "tmp", 100);
+    c->ttl("mem:t");
+    c->rpush("mem:l", "a"); c->rpush("mem:l", "b"); c->lpush("mem:l", "c");
+    drop(c->lrange("mem:l", 0, -1));
+    freeText(c->lpop("mem:l"));
+    c->hset("mem:h", "f1", "v1"); c->hset("mem:h", "f2", "v2");
+    freeText(c->hget("mem:h", "f1"));
+    drop(c->hgetall("mem:h"));
+    c->hdel("mem:h", "f1");
+    c->sadd("mem:set", "x"); c->sadd("mem:set", "y");
+    drop(c->smembers("mem:set"));
+    c->srem("mem:set", "x");
+    c->zadd("mem:z", "1.5", "a"); c->zadd("mem:z", "2", "b");
+    drop(c->zrange("mem:z", 0, -1, true));
+    freeText(c->zscore("mem:z", "a"));
+    c->zrem("mem:z", "a");
+    drop(c->keys("mem:*"));
+    drop(c->call("MGET", "mem:s", "mem:n", "nokey"));
+    freeText(c->info());
+    c->flushAll();
+    c->dispose();
+    settle();
+}
+
+void opPipelineAndTx() {
+    redis.Client* c = redis.connect(&url[0]);
+    redis.Pipeline* p = redis.pipeline(c);
+    for (int i = 0; i < 100; i++) p->add("SET", "pk", "value");
+    p->add("GET", "pk");
+    p->run();
+    p->reset();
+    p->add("PING");
+    p->run();
+    p->dispose();
+    c->multi();
+    drop(c->call("SET", "tx", "1"));
+    drop(c->call("INCR", "tx"));
+    drop(c->exec());
+    c->multi();
+    drop(c->call("SET", "tx2", "1"));
+    c->discard();
+    c->multi();
+    drop(c->call("BOGUS"));
+    drop(c->exec());
+    c->flushAll();
+    c->dispose();
+    settle();
+}
+
+void opPubSub() {
+    redis.Client* c = redis.connect(&url[0]);
+    redis.PubSub* ps = redis.pubsub(c);
+    ps->subscribe("mem-news");
+    ps->psubscribe("mem-*");
+    ps->next(20);
+    c->publish("mem-news", "hello");
+    redis.PubMessage* m = ps->next(500);
+    if (m != null) m->dispose();
+    m = ps->next(500);
+    if (m != null) m->dispose();
+    ps->unsubscribe("mem-news");
+    ps->punsubscribe(null);
+    ps->next(20);
+    ps->dispose();
+    c->dispose();
+    settle();
+}
+
+void opReconnect() {
+    redis.Client* c = redis.connect(&url[0]);
+    c->set("rc", "1");
+    srv->dropClients();
+    settle();
+    c->get("rc");
+    freeText(c->get("rc"));
+    c->dispose();
+    settle();
+}
+
+char keyNames[1600];
+
+void opServerKeys() {
+    redis.Client* c = redis.connect(&url[0]);
+    redis.Pipeline* p = redis.pipeline(c);
+    char* names = &keyNames[0];
+    for (int i = 0; i < 20; i++) {
+        char* k0 = &names[(i * 5 + 0) * 16];
+        char* k1 = &names[(i * 5 + 1) * 16];
+        char* k2 = &names[(i * 5 + 2) * 16];
+        char* k3 = &names[(i * 5 + 3) * 16];
+        char* k4 = &names[(i * 5 + 4) * 16];
+        format(k0, 16, "key%d", i, 0, 0, 0);
+        format(k1, 16, "list%d", i, 0, 0, 0);
+        format(k2, 16, "hash%d", i, 0, 0, 0);
+        format(k3, 16, "set%d", i, 0, 0, 0);
+        format(k4, 16, "zset%d", i, 0, 0, 0);
+        p->add("SET", k0, "v");
+        p->add("RPUSH", k1, "a");
+        p->add("RPUSH", k1, "b");
+        p->add("HSET", k2, "f", "v");
+        p->add("SADD", k3, "m");
+        p->add("ZADD", k4, "1", "m");
+    }
+    p->add("SET", "short", "x", "PX", "20");
+    p->run();
+    p->reset();
+    redisd.Store* st = srv->store;
+    st->setClock(st->now + 100);
+    st->sweep(100);
+    for (int i = 0; i < 20; i++) {
+        char* k0 = &names[(i * 5 + 0) * 16];
+        char* k1 = &names[(i * 5 + 1) * 16];
+        char* k2 = &names[(i * 5 + 2) * 16];
+        char* k3 = &names[(i * 5 + 3) * 16];
+        char* k4 = &names[(i * 5 + 4) * 16];
+        p->add("LPOP", k1);
+        p->add("LPOP", k1);
+        p->add("HDEL", k2, "f");
+        p->add("SREM", k3, "m");
+        p->add("ZREM", k4, "m");
+        p->add("DEL", k0);
+    }
+    p->add("RENAME", "nokey", "x");
+    p->run();
+    p->dispose();
+    c->flushAll();
+    c->dispose();
+    settle();
+}
+
+void opMultiDrop() {
+    // a client that disappears in the middle of a transaction with queued commands and subscriptions
+    int h = net.connect("127.0.0.1", PORT);
+    char* t = "MULTI\r\nSET a 1\r\nSET b 2\r\nINCR a\r\n";
+    net.send(h, t, strlen(t));
+    for (int i = 0; i < 10; i++) srv->poll(0);
+    net.close(h);
+    h = net.connect("127.0.0.1", PORT);
+    t = "SUBSCRIBE x y z\r\nPSUBSCRIBE a*\r\n";
+    net.send(h, t, strlen(t));
+    for (int i = 0; i < 10; i++) srv->poll(0);
+    net.close(h);
+    settle();
+}
+
+void opParsers() {
+    redis.ReplyParser* rp = redis.newReplyParser();
+    char* wire = "*3\r\n$3\r\nfoo\r\n*2\r\n:1\r\n+two\r\n$-1\r\n-ERR x\r\n$5\r\nhello\r\n";
+    for (int i = 0; i < strlen(wire); i++) rp->feed(&wire[i], 1);
+    redis.Reply* r = rp->take();
+    while (r != null) { r->dispose(); r = rp->take(); }
+    rp->feed("*2\r\n$100\r\nabc", 12);                       // an incomplete reply: reset() frees the rest
+    rp->reset();
+    rp->dispose();
+    redis.CmdParser* cp = redis.newCmdParser();
+    char* cmd = "*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\nset \"a b\" c\r\n";
+    int off = 0;
+    int n = strlen(cmd);
+    while (off < n) {
+        off = off + cp->feed(&cmd[off], n - off);
+        if (cp->ready) cp->clear();
+    }
+    cp->feed("*2\r\n$10\r\nabc", 12);                        // an incomplete request
+    cp->dispose();
+    netio.Queue q;
+    redis.putStatus(&q, "OK");
+    redis.putBulk(&q, "abc", 3);
+    q.release();
+}
+
+void opHostile() {
+    int h = net.connect("127.0.0.1", PORT);
+    char junk[200];
+    for (int i = 0; i < 200; i++) junk[i] = i * 37;
+    net.send(h, &junk[0], 200);
+    for (int i = 0; i < 10; i++) srv->poll(0);
+    net.close(h);
+    h = net.connect("127.0.0.1", PORT);
+    char* t = "*3\r\n$3\r\nSET\r\n$3\r\nabc\r\n$10\r\n12345";
+    net.send(h, t, strlen(t));
+    for (int i = 0; i < 10; i++) srv->poll(0);
+    net.close(h);
+    h = net.connect("127.0.0.1", PORT);
+    t = "*1\r\n$-5\r\n";
+    net.send(h, t, strlen(t));
+    for (int i = 0; i < 10; i++) srv->poll(0);
+    net.close(h);
+    settle();
+}
+
+void run(char* name, func f) {
+    for (int i = 0; i < 4; i++) f();
+    settle();
+    int h0 = __heap_pos;
+    for (int i = 0; i < 10; i++) f();
+    settle();
+    char t[160];
+    format(&t[0], 160, "%s: 10 operations leave the heap where it was", name, 0, 0, 0);
+    bool ok = __heap_pos == h0;
+    check(&t[0], ok);
+    if (!ok) printf("     the heap grew by %d bytes\n", __heap_pos - h0);
+}
+
+int main() {
+    srv = redisd.newServer();
+    srv->listenOn("127.0.0.1", 0, null);
+    PORT = srv->port;
+    format(&url[0], 100, "redis://127.0.0.1:%d", PORT, 0, 0, 0);
+    net.setIdleHook(hook);
+    run("commands on every data type", opCommands);
+    run("pipelines and transactions", opPipelineAndTx);
+    run("publish / subscribe", opPubSub);
+    run("reconnect after a drop", opReconnect);
+    run("keys of every type: create, expire, delete", opServerKeys);
+    run("clients that vanish in a transaction or a subscription", opMultiDrop);
+    run("parsers and writers", opParsers);
+    run("garbage, half commands and protocol errors", opHostile);
+    redisd.Store* st = srv->store;
+    settle();
+    check("the server is empty at the end", st->clients == 0 && st->used == 0 && st->keyCount(0) == 0 && srv->net->count() == 0);
+    net.setIdleHook(null);
+    printf("failures: %d\n", fails);
+    srv->shutdown();
+    return fails;
+}

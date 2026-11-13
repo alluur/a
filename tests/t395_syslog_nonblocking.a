@@ -1,0 +1,182 @@
+// Forwarding to a collector that does not answer must not hold up anybody: the TCP (and TLS) connection of a syslog Sender is made without waiting
+// (net.connectStart / connectDone, netio.Link.openStart / openStep), the messages wait in the bounded queue, and a collector that forwards keeps serving
+// its own sockets. A target that really drops the SYN is made with a listener whose accept queue is full; where the system does not behave like that
+// (it answers every connect) the checks still hold, they just have less to prove. The times are generous (a blocked connect would take 400 ms and more).
+import syslog;
+import syslogd;
+import net;
+import netio;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+int server;                         // the listener whose accept queue gets full
+int sport;
+int held[12];                       // the connections that fill the queue (nobody accepts them)
+int nheld;
+bool stuck;                         // a connect to it hangs
+
+// fills the accept queue of the listener until a connect hangs (at most 8 connections)
+void makeStuck() {
+    server = net.listen(0, 1);
+    sport = net.localPort(server);
+    net.setNonBlocking(server, true);
+    stuck = false;
+    for (int i = 0; i < 8 && !stuck; i++) {
+        int h = net.connectStart("127.0.0.1", sport);
+        if (h < 0) break;
+        held[nheld] = h;
+        nheld++;
+        int t0 = millis();
+        int r = 0;
+        while (millis() - t0 < 120 && r == 0) r = net.connectDone(h);
+        if (r == 0) stuck = true;
+    }
+}
+
+int main() {
+    // ---- net.connectStart / connectDone ----------------------------------------------------------------------------------------------------------------------------
+    int ls = net.listen(0, 5);
+    int lp = net.localPort(ls);
+    int h = net.connectStart("127.0.0.1", lp);
+    check("connectStart returns a socket at once", h >= 0);
+    int r = 0;
+    int t0 = millis();
+    while (r == 0 && millis() - t0 < 2000) r = net.connectDone(h);
+    check("connectDone says 1 when the connection is made", r == 1);
+    int a = net.accept(ls);
+    check("the listener sees it", a >= 0);
+    net.send(a, "hi", 2);
+    char buf[16];
+    check("and the socket is usable", net.waitReadable(h, 2000) && net.recv(h, &buf[0], 16) == 2);
+    net.close(a);
+    net.close(h);
+    net.close(ls);
+    // a port with nobody listening: the answer is a failure, not a wait
+    int free1 = net.listen(0, 1);
+    int deadPort = net.localPort(free1);
+    net.close(free1);
+    h = net.connectStart("127.0.0.1", deadPort);
+    r = 0;
+    t0 = millis();
+    if (h >= 0) while (r == 0 && millis() - t0 < 2000) r = net.connectDone(h);
+    check("a connect to a closed port ends as a failure (-1), at once", h < 0 || r == -1);
+    if (h >= 0) net.close(h);
+
+    // ---- netio.Link.openStart / openStep -------------------------------------------------------------------------------------------------------------------------
+    ls = net.listen(0, 5);
+    lp = net.localPort(ls);
+    netio.Link* l = netio.newLink();
+    check("openStart starts", l->openStart("127.0.0.1", lp, 1000, false, true) && !l->isOpen());
+    r = 0;
+    t0 = millis();
+    while (r == 0 && millis() - t0 < 2000) r = l->openStep();
+    check("openStep: 1 when open", r == 1 && l->isOpen() && !l->opening());
+    a = net.accept(ls);
+    check("the link is a working link", l->send("abc", 3) == 3 && net.waitReadable(a, 2000) && net.recv(a, &buf[0], 16) == 3 && memcmp(&buf[0], "abc", 3) == 0);
+    l->close();
+    check("close() ends it", !l->isOpen() && !l->opening());
+    net.close(a);
+    net.close(ls);
+    bool started = l->openStart("127.0.0.1", deadPort, 1000, false, true);
+    r = started ? 0 : -1;
+    t0 = millis();
+    while (r == 0 && millis() - t0 < 2000) r = l->openStep();
+    check("a link to a closed port ends as a failure (-1) at once: closed, with a reason", r == -1 && !l->isOpen() && !l->opening() && l->error != null);
+    l->dispose();
+
+    // ---- a target that does not answer -----------------------------------------------------------------------------------------------------------------------------
+    makeStuck();
+    char url[100];
+    format(&url[0], 100, "tcp://127.0.0.1:%d", sport, 0, 0, 0);
+    syslog.Sender* s = syslog.newSender(&url[0]);
+    s->connectTimeoutMs = 400;
+    s->retryIntervalMs = 100;
+    t0 = millis();
+    for (int i = 0; i < 50; i++) {
+        char text[40];
+        format(&text[0], 40, "queued message %d", i, 0, 0, 0);
+        s->info(&text[0]);
+    }
+    int took = millis() - t0;
+    check("50 messages to a target that does not answer cost the caller next to nothing (a blocking connect took 400 ms)", took < 250);
+    check("... they wait in the queue", !stuck || (s->queued() == 50 && s->sent == 0 && s->dropped == 0));
+    if (stuck) {
+        t0 = millis();
+        while (millis() - t0 < 2000 && s->errors == 0) { s->pump(); sleepMs(10); }
+    }
+    check("the attempt gives up after connectTimeoutMs and counts an error", !stuck || (s->errors >= 1 && s->queued() == 50));
+    // the listener takes its queue now: the next attempt is made and everything is delivered
+    for (int i = 0; i < 12; i++) {
+        int c = net.acceptSome(server);
+        if (c >= 0) net.close(c);
+    }
+    check("when the target answers again the messages are delivered, all of them, once", s->flush(5000) && s->queued() == 0 && s->sent == 50);
+    s->dispose();
+
+    // ---- a collector that forwards to it keeps serving its own sockets ---------------------------------------------------------------------------------------
+    for (int i = 0; i < nheld; i++) net.close(held[i]);
+    nheld = 0;
+    net.close(server);
+    makeStuck();
+    format(&url[0], 100, "tcp://127.0.0.1:%d", sport, 0, 0, 0);
+    syslogd.Server* srv = syslogd.newServer();
+    srv->collector->setClock(1065910455);
+    srv->listenUdp(0);
+    syslog.Sender* fwd = srv->collector->addForward(null, &url[0]);
+    fwd->connectTimeoutMs = 400;
+    fwd->retryIntervalMs = 100;
+    int u = net.udpSocket();
+    int worstTurn = 0;
+    int sentCount = 0;
+    t0 = millis();
+    while (millis() - t0 < 800) {
+        if (sentCount < 60) {
+            char dg[80];
+            int n = format(&dg[0], 80, "<14>Oct 11 22:14:15 h app: datagram %d", sentCount, 0, 0, 0);
+            net.sendTo(u, 0x7F000001, srv->udpPort, &dg[0], n);
+            sentCount++;
+        }
+        int t1 = millis();
+        srv->poll(5);
+        int d = millis() - t1;
+        if (d > worstTurn) worstTurn = d;
+    }
+    check("the collector took all 60 datagrams", srv->collector->stats->received == 60);
+    check("no turn of its loop was held up by the connection that does not come (the longest took less than 250 ms; a blocking connect held it for 400 ms)", worstTurn < 250);
+    check("the messages wait for the forward (or went out: the target answered)", fwd->queued() + fwd->sent == 60 && fwd->dropped == 0);
+    srv->shutdown();
+    net.close(u);
+
+    // ---- a TLS target that accepts the connection and never speaks -----------------------------------------------------------------------------------------------
+    for (int i = 0; i < nheld; i++) net.close(held[i]);
+    nheld = 0;
+    net.close(server);
+    int silent = net.listen(0, 5);
+    int silentPort = net.localPort(silent);
+    format(&url[0], 100, "tls://127.0.0.1:%d", silentPort, 0, 0, 0);
+    s = syslog.newSender(&url[0]);
+    s->verify = false;
+    t0 = millis();
+    for (int i = 0; i < 20; i++) s->info("waiting for a handshake that does not come");
+    took = millis() - t0;
+    check("20 messages to a TLS target that never answers the handshake: the caller is not held up", took < 250 && s->queued() == 20);
+    t0 = millis();
+    for (int i = 0; i < 20; i++) { s->pump(); sleepMs(5); }
+    check("pumping it for a while is no wait either (the handshake has about a second)", millis() - t0 < 600 && s->queued() == 20);
+    s->dispose();
+    net.close(silent);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

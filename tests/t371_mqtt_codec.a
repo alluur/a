@@ -1,0 +1,310 @@
+// MQTT 3.1.1 codec: every packet type byte for byte (the reference bytes come from an independent encoder written from the specification),
+// the remaining length table of the specification, parsing the same bytes back, one byte at a time, topic filter matching tables (the examples
+// of section 4.7 of the specification), the validators and the UTF-8 rules.
+import mqtt;
+import netio;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+netio.Queue q;
+
+// the bytes in the queue as hex text
+char* hexq() { return bytebuf.hex(q.data(), q.pending()); }
+
+bool is(char* want) { return streq(hexq(), want); }
+
+// feeds hex text to a parser in one piece and returns the result of next()
+mqtt.Parser* ps;
+mqtt.Packet pk;
+
+int parseHex(char* hex) {
+    int n = 0;
+    char* raw = bytebuf.fromHex(hex, &n);
+    ps->reset();
+    ps->feed(raw, n);
+    return ps->next(&pk);
+}
+
+void lengthCase(char* name, int n, char* hex) {
+    char out[8];
+    int k = mqtt.encodeLength(n, &out[0]);
+    check(name, k > 0 && streq(bytebuf.hex(&out[0], k), hex));
+}
+
+void matches(char* filter, char* topic, bool want) {
+    char name[200];
+    format(&name[0], 200, "match %s  %s  -> %s", filter, topic, want ? "yes" : "no");
+    check(&name[0], mqtt.topicMatches(filter, topic) == want);
+}
+
+void filterCase(char* f, bool want) {
+    char name[200];
+    format(&name[0], 200, "filter '%s' is %s", f, want ? "valid" : "invalid");
+    check(&name[0], mqtt.validTopicFilter(f, strlen(f)) == want);
+}
+
+void topicCase(char* t, bool want) {
+    char name[200];
+    format(&name[0], 200, "topic '%s' is %s", t, want ? "valid" : "invalid");
+    check(&name[0], mqtt.validTopicName(t, strlen(t)) == want);
+}
+
+int main() {
+    ps = mqtt.newParser(mqtt.MODE_SERVER, 1048576);
+
+    // ---- the remaining length (section 2.2.3) --------------------------------------------------------------------------------------------------
+    lengthCase("length 0", 0, "00");
+    lengthCase("length 127", 127, "7f");
+    lengthCase("length 128", 128, "8001");
+    lengthCase("length 16383", 16383, "ff7f");
+    lengthCase("length 16384", 16384, "808001");
+    lengthCase("length 2097151", 2097151, "ffff7f");
+    lengthCase("length 2097152", 2097152, "80808001");
+    lengthCase("length 268435455", 268435455, "ffffff7f");
+    char tmp[8];
+    check("length 268435456 cannot be encoded", mqtt.encodeLength(268435456, &tmp[0]) == 0);
+    check("a negative length cannot be encoded", mqtt.encodeLength(-1, &tmp[0]) == 0);
+
+    // ---- CONNECT ----------------------------------------------------------------------------------------------------------------------------------
+    mqtt.Packet p;
+    p.reset();
+    p.clientId = "mosq"; p.clean = true; p.keepAlive = 60;
+    check("CONNECT clean session, keep-alive 60", mqtt.putConnect(&q, &p) && is("101000044d5154540402003c00046d6f7371"));
+    check("CONNECT parses back", parseHex("101000044d5154540402003c00046d6f7371") == 1 && pk.type == mqtt.CONNECT && pk.level == 4 && pk.clean && pk.keepAlive == 60 && streq(pk.clientId, "mosq") && !pk.hasWill && !pk.hasUser);
+    q.clear();
+    p.reset();
+    p.clientId = "id1"; p.clean = true; p.keepAlive = 10; p.hasWill = true; p.willTopic = "w/t"; p.willPayload = "bye"; p.willLen = 3; p.willQos = 1; p.willRetain = true;
+    p.hasUser = true; p.username = "user"; p.hasPass = true; p.password = "pw"; p.passwordLen = 2;
+    check("CONNECT with will, user name and password", mqtt.putConnect(&q, &p) && is("102300044d51545404ee000a00036964310003772f74000362796500047573657200027077"));
+    check("... parses back", parseHex("102300044d51545404ee000a00036964310003772f74000362796500047573657200027077") == 1 && pk.clean && pk.hasWill && streq(pk.willTopic, "w/t") && pk.willLen == 3 && streq(pk.willPayload, "bye")
+          && pk.willQos == 1 && pk.willRetain && pk.hasUser && streq(pk.username, "user") && pk.hasPass && pk.passwordLen == 2 && streq(pk.password, "pw") && pk.keepAlive == 10 && streq(pk.clientId, "id1"));
+    q.clear();
+    p.reset();
+    p.clientId = "abc";
+    check("CONNECT persistent session, no keep-alive", mqtt.putConnect(&q, &p) && is("100f00044d515454040000000003616263"));
+    q.clear();
+    p.reset();
+    p.clientId = "x"; p.hasPass = true; p.password = "p"; p.passwordLen = 1;
+    check("a password without a user name is refused", !mqtt.putConnect(&q, &p) && q.pending() == 0);
+    p.reset();
+    p.clientId = "x"; p.hasWill = true; p.willTopic = "t"; p.willPayload = ""; p.willLen = 0; p.willQos = 3;
+    check("a will with QoS 3 is refused", !mqtt.putConnect(&q, &p) && q.pending() == 0);
+
+    // ---- CONNACK ----------------------------------------------------------------------------------------------------------------------------------
+    check("CONNACK accepted", mqtt.putConnack(&q, false, 0) && is("20020000"));
+    q.clear();
+    check("CONNACK session present", mqtt.putConnack(&q, true, 0) && is("20020100"));
+    q.clear();
+    check("CONNACK not authorized", mqtt.putConnack(&q, false, 5) && is("20020005"));
+    q.clear();
+    mqtt.Parser* cp = mqtt.newParser(mqtt.MODE_CLIENT, 1000);
+    char* raw = null;
+    int n = 0;
+    raw = bytebuf.fromHex("20020100", &n);
+    cp->feed(raw, n);
+    check("CONNACK parses (client side)", cp->next(&pk) == 1 && pk.type == mqtt.CONNACK && pk.sessionPresent && pk.returnCode == 0);
+
+    // ---- PUBLISH ----------------------------------------------------------------------------------------------------------------------------------
+    check("PUBLISH QoS 0", mqtt.putPublish(&q, "a/b", "hello", 5, 0, false, false, 0) && is("300a0003612f6268656c6c6f"));
+    check("... parses back", parseHex("300a0003612f6268656c6c6f") == 1 && pk.type == mqtt.PUBLISH && pk.qos == 0 && streq(pk.topic, "a/b") && pk.payloadLen == 5 && memcmp(pk.payload, "hello", 5) == 0 && !pk.retain && !pk.dup);
+    q.clear();
+    check("PUBLISH QoS 1, packet id 10", mqtt.putPublish(&q, "a/b", "hello", 5, 1, false, false, 10) && is("320c0003612f62000a68656c6c6f"));
+    check("... parses back", parseHex("320c0003612f62000a68656c6c6f") == 1 && pk.qos == 1 && pk.pid == 10 && pk.payloadLen == 5);
+    q.clear();
+    check("PUBLISH QoS 2 DUP RETAIN, packet id 65535", mqtt.putPublish(&q, "a/b", "x", 1, 2, true, true, 65535) && is("3d080003612f62ffff78"));
+    check("... parses back", parseHex("3d080003612f62ffff78") == 1 && pk.qos == 2 && pk.dup && pk.retain && pk.pid == 65535 && pk.payloadLen == 1);
+    q.clear();
+    check("PUBLISH with an empty payload and RETAIN", mqtt.putPublish(&q, "r/t", "", 0, 0, true, false, 0) && is("31050003722f74"));
+    check("... parses back", parseHex("31050003722f74") == 1 && pk.retain && pk.payloadLen == 0 && streq(pk.topic, "r/t"));
+    q.clear();
+    check("DUP is not sent on QoS 0", mqtt.putPublish(&q, "a", "", 0, 0, false, true, 0) && is("30030001" "61"));
+    q.clear();
+    check("QoS 1 needs a packet id", !mqtt.putPublish(&q, "a", "x", 1, 1, false, false, 0) && q.pending() == 0);
+    check("an empty topic is refused", !mqtt.putPublish(&q, "", "x", 1, 0, false, false, 0));
+    check("QoS 3 is refused", !mqtt.putPublish(&q, "a", "x", 1, 3, false, false, 1));
+    char* bigPayload = alloc(200);
+    memset(bigPayload, 'x', 200);
+    check("a payload of 200 bytes needs a two byte length", mqtt.putPublish(&q, "t", bigPayload, 200, 0, false, false, 0) && q.pending() == 1 + 2 + 2 + 1 + 200 && streq(bytebuf.hex(q.data(), 6), "30cb01000174"));
+    check("... parses back", parseHex(bytebuf.hex(q.data(), q.pending())) == 1 && pk.payloadLen == 200 && pk.length == 203);
+    q.clear();
+
+    // ---- the acknowledgements ---------------------------------------------------------------------------------------------------------------------
+    check("PUBACK", mqtt.putAck(&q, mqtt.PUBACK, 0x1234) && is("40021234"));
+    q.clear();
+    check("PUBREC", mqtt.putAck(&q, mqtt.PUBREC, 0x1234) && is("50021234"));
+    q.clear();
+    check("PUBREL has the flags 0010", mqtt.putAck(&q, mqtt.PUBREL, 0x1234) && is("62021234"));
+    q.clear();
+    check("PUBCOMP", mqtt.putAck(&q, mqtt.PUBCOMP, 0x1234) && is("70021234"));
+    q.clear();
+    check("UNSUBACK", mqtt.putAck(&q, mqtt.UNSUBACK, 0x1234) && is("b0021234"));
+    q.clear();
+    check("PUBACK parses", parseHex("40021234") == 1 && pk.type == mqtt.PUBACK && pk.pid == 0x1234);
+    check("PUBREL parses", parseHex("62021234") == 1 && pk.type == mqtt.PUBREL && pk.pid == 0x1234);
+    check("an acknowledgement with packet id 0 is refused", !mqtt.putAck(&q, mqtt.PUBACK, 0) && q.pending() == 0);
+
+    // ---- SUBSCRIBE and friends --------------------------------------------------------------------------------------------------------------------
+    char* filters[2];
+    int qs[2];
+    filters[0] = "a/b"; filters[1] = "c/#";
+    qs[0] = 0; qs[1] = 2;
+    check("SUBSCRIBE two filters", mqtt.putSubscribe(&q, 1, &filters[0], &qs[0], 2) && is("820e00010003612f62000003632f2302"));
+    check("... parses back", parseHex("820e00010003612f62000003632f2302") == 1 && pk.type == mqtt.SUBSCRIBE && pk.pid == 1 && pk.nfilters == 2 && streq(pk.filters[0], "a/b") && pk.fqos[0] == 0 && streq(pk.filters[1], "c/#") && pk.fqos[1] == 2);
+    q.clear();
+    check("UNSUBSCRIBE two filters", mqtt.putUnsubscribe(&q, 2, &filters[0], 2) && is("a20c00020003612f620003632f23"));
+    check("... parses back", parseHex("a20c00020003612f620003632f23") == 1 && pk.type == mqtt.UNSUBSCRIBE && pk.pid == 2 && pk.nfilters == 2 && streq(pk.filters[1], "c/#"));
+    q.clear();
+    int codes[3];
+    codes[0] = 0; codes[1] = 2; codes[2] = 128;
+    check("SUBACK with a failure code", mqtt.putSuback(&q, 1, &codes[0], 3) && is("90050001000280"));
+    raw = bytebuf.fromHex("90050001000280", &n);
+    cp->reset();
+    cp->feed(raw, n);
+    check("... parses back (client side)", cp->next(&pk) == 1 && pk.type == mqtt.SUBACK && pk.pid == 1 && pk.nfilters == 3 && pk.fqos[0] == 0 && pk.fqos[1] == 2 && pk.fqos[2] == 128);
+    q.clear();
+    char* nofilter[1];
+    check("SUBSCRIBE without filters is refused", !mqtt.putSubscribe(&q, 1, &nofilter[0], &qs[0], 0));
+    qs[0] = 3;
+    check("SUBSCRIBE with QoS 3 is refused", !mqtt.putSubscribe(&q, 1, &filters[0], &qs[0], 1));
+
+    // ---- PINGREQ, PINGRESP, DISCONNECT ------------------------------------------------------------------------------------------------------------
+    check("PINGREQ", mqtt.putEmpty(&q, mqtt.PINGREQ) && is("c000"));
+    q.clear();
+    check("PINGRESP", mqtt.putEmpty(&q, mqtt.PINGRESP) && is("d000"));
+    q.clear();
+    check("DISCONNECT", mqtt.putEmpty(&q, mqtt.DISCONNECT) && is("e000"));
+    q.clear();
+    check("PINGREQ parses", parseHex("c000") == 1 && pk.type == mqtt.PINGREQ);
+    check("DISCONNECT parses", parseHex("e000") == 1 && pk.type == mqtt.DISCONNECT);
+
+    // ---- a queue with a limit: a packet that does not fit is not written at all ---------------------------------------------------------------------
+    q.max = 10;
+    check("a packet over the queue limit is refused as a whole", !mqtt.putPublish(&q, "a/b", "hello world", 11, 0, false, false, 0) && q.pending() == 0 && q.overflow);
+    q.max = 0;
+    q.clear();
+
+    // ---- one byte at a time, and several packets in one piece -------------------------------------------------------------------------------------
+    char* wire = "320c0003612f62000a68656c6c6fc000";                 // a QoS 1 PUBLISH and a PINGREQ
+    raw = bytebuf.fromHex(wire, &n);
+    ps->reset();
+    int got = 0;
+    int types[4];
+    bool needMore = true;
+    for (int i = 0; i < n; i++) {
+        ps->feed(&raw[i], 1);
+        int r = ps->next(&pk);
+        if (r == 1) { types[got] = pk.type; got++; }
+        else if (r < 0) needMore = false;
+    }
+    check("byte by byte: two packets, no error", got == 2 && types[0] == mqtt.PUBLISH && types[1] == mqtt.PINGREQ && needMore);
+    ps->reset();
+    ps->feed(raw, n);
+    check("in one piece: the first packet", ps->next(&pk) == 1 && pk.type == mqtt.PUBLISH && pk.pid == 10);
+    check("in one piece: the second packet", ps->next(&pk) == 1 && pk.type == mqtt.PINGREQ);
+    check("then it wants more", ps->next(&pk) == 0);
+
+    // ---- topic filter matching (section 4.7 of the specification and the usual corners) -------------------------------------------------------------
+    matches("sport/tennis/player1/#", "sport/tennis/player1", true);
+    matches("sport/tennis/player1/#", "sport/tennis/player1/ranking", true);
+    matches("sport/tennis/player1/#", "sport/tennis/player1/score/wimbledon", true);
+    matches("sport/#", "sport", true);
+    matches("sport/+", "sport", false);
+    matches("sport/+", "sport/", true);
+    matches("sport/+", "sport/tennis", true);
+    matches("sport/+", "sport/tennis/player1", false);
+    matches("sport/tennis/+", "sport/tennis/player1", true);
+    matches("sport/tennis/+", "sport/tennis/player1/ranking", false);
+    matches("#", "sport/tennis", true);
+    matches("#", "a", true);
+    matches("+/+", "/finance", true);
+    matches("/+", "/finance", true);
+    matches("+", "/finance", false);
+    matches("+", "finance", true);
+    matches("+/tennis/#", "sport/tennis/player1", true);
+    matches("sport/+/player1", "sport/tennis/player1", true);
+    matches("sport/+/player1", "sport/tennis/player2", false);
+    matches("sport/tennis/player1", "sport/tennis/player1", true);
+    matches("sport/tennis/player1", "sport/tennis/player", false);
+    matches("sport/tennis/player", "sport/tennis/player1", false);
+    matches("a/b", "a/b/c", false);
+    matches("a/b/c", "a/b", false);
+    matches("a//b", "a//b", true);
+    matches("a/+/b", "a//b", true);
+    matches("a/b/", "a/b/", true);
+    matches("a/b/", "a/b", false);
+    matches("$SYS/#", "$SYS/broker/clients", true);
+    matches("#", "$SYS/broker/clients", false);
+    matches("+/broker/clients", "$SYS/broker/clients", false);
+    matches("$SYS/+/clients", "$SYS/broker/clients", true);
+    matches("$SYS/broker/+", "$SYS/broker/clients", true);
+    matches("/#", "$SYS/x", false);
+    matches("#", "/a", true);
+    matches("ab", "a", false);
+    matches("a", "ab", false);
+    matches("Ab", "ab", false);
+
+    // ---- validators -------------------------------------------------------------------------------------------------------------------------------
+    filterCase("a/b/c", true);
+    filterCase("#", true);
+    filterCase("+", true);
+    filterCase("a/#", true);
+    filterCase("a/+/c", true);
+    filterCase("+/+/#", true);
+    filterCase("/", true);
+    filterCase("a/", true);
+    filterCase("", false);
+    filterCase("a#", false);
+    filterCase("a/#/b", false);
+    filterCase("#/a", false);
+    filterCase("a+", false);
+    filterCase("+a", false);
+    filterCase("a/b+/c", false);
+    filterCase("a/++", false);
+    filterCase("##", false);
+    topicCase("a/b", true);
+    topicCase("/", true);
+    topicCase("$SYS/x", true);
+    topicCase("", false);
+    topicCase("a/+", false);
+    topicCase("a/#", false);
+    topicCase("#", false);
+
+    // UTF-8: what the specification forbids (U+0000, surrogates, overlong forms, above U+10FFFF) and what it allows
+    check("utf8: plain ASCII", mqtt.validUtf8("hello", 5));
+    check("utf8: two byte character (é)", mqtt.validUtf8("\xC3\xA9", 2));
+    check("utf8: three byte character (€)", mqtt.validUtf8("\xE2\x82\xAC", 3));
+    check("utf8: four byte character (U+1F600)", mqtt.validUtf8("\xF0\x9F\x98\x80", 4));
+    check("utf8: the highest code point U+10FFFF", mqtt.validUtf8("\xF4\x8F\xBF\xBF", 4));
+    check("utf8: a NUL is refused", !mqtt.validUtf8("a\0b", 3));
+    check("utf8: an overlong NUL (C0 80) is refused", !mqtt.validUtf8("\xC0\x80", 2));
+    check("utf8: an overlong slash (C0 AF) is refused", !mqtt.validUtf8("\xC0\xAF", 2));
+    check("utf8: an overlong three byte form (E0 80 80) is refused", !mqtt.validUtf8("\xE0\x80\x80", 3));
+    check("utf8: a surrogate (ED A0 80) is refused", !mqtt.validUtf8("\xED\xA0\x80", 3));
+    check("utf8: above U+10FFFF (F4 90 80 80) is refused", !mqtt.validUtf8("\xF4\x90\x80\x80", 4));
+    check("utf8: F5 is refused", !mqtt.validUtf8("\xF5\x80\x80\x80", 4));
+    check("utf8: a lone continuation byte is refused", !mqtt.validUtf8("\x80", 1));
+    check("utf8: a cut off sequence is refused", !mqtt.validUtf8("\xE2\x82", 2));
+    check("utf8: a wrong continuation is refused", !mqtt.validUtf8("\xE2\x28\xA1", 3));
+    check("utf8: a PUBLISH whose topic is not UTF-8 is refused", parseHex("30050003" "61c0af") < 0 && pk.error == mqtt.E_UTF8);
+
+    // the names that the module gives to its constants
+    check("error texts", streq(mqtt.errorText(mqtt.E_TOO_BIG), "packet too large") && streq(mqtt.typeName(mqtt.SUBACK), "SUBACK") && streq(mqtt.connackText(4), "bad user name or password"));
+
+    printf("%d checks, %d failed\n", checks, fails);
+    ps->dispose();
+    cp->dispose();
+    q.release();
+    return fails == 0 ? 0 : 1;
+}

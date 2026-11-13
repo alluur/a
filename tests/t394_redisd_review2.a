@@ -1,0 +1,485 @@
+// redisd against the second review of stage net2:
+//  - a bulk string that is announced is not allocated: the buffer of a command parser grows with the bytes that really arrive, and the parsers of all clients
+//    together are held to a budget (maxInput), so 1000 clients that announce 16 MiB each take about nothing
+//  - the keys with a time to live are kept apart and swept like Redis does (samples of 20, again while a quarter was dead): a pile of dead keys goes away
+//    quickly, also in real time through the server loop; a write that would be refused because of maxMemory first removes the keys that are dead
+//  - the hash tables start from a secret (random per store), so keys that collide in the plain FNV-1a hash do not collide here
+//  - replies that were different from Redis 7.0.15: the arguments in "unknown command", the order of the checks of EXPIRE, ZADD with GT LT INCR
+import redis;
+import redisd;
+import netio;
+import net;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+redisd.Store* st;
+redisd.Rclient* cl;
+int now = 1000000;
+
+void show(char* d, int n) {
+    for (int i = 0; i < n; i++) {
+        int c = d[i] & 255;
+        if (c == 13) print("\\r");
+        else if (c == 10) print("\\n");
+        else if (c < 32 || c > 126) printf("\\x%02x", c, 0, 0, 0);
+        else printChar(c);
+    }
+}
+
+bool same(netio.Queue* q, char* want) {
+    int n = strlen(want);
+    return q->pending() == n && memcmp(q->data(), want, n) == 0;
+}
+
+// one command line (inline form) for a client; the reply must be exactly `want`
+bool exOn(redisd.Store* s, redisd.Rclient* c, char* line, char* want) {
+    c->out->clear();
+    char buf[1024];
+    int n = format(&buf[0], 1024, "%s\r\n", line, 0, 0, 0);
+    s->feedAt(c, &buf[0], n);
+    bool ok = same(c->out, want);
+    if (!ok) {
+        print("     got:    ");
+        show(c->out->data(), c->out->pending());
+        print("\n     wanted: ");
+        show(want, strlen(want));
+        print("\n");
+    }
+    c->out->clear();
+    return ok;
+}
+
+void ex(char* line, char* want) {
+    check(line, exOn(st, cl, line, want));
+}
+
+// the text of the reply of a command, for checks that look at a part of it
+char reply[2048];
+char* run(redisd.Store* s, redisd.Rclient* c, char* line) {
+    c->out->clear();
+    char buf[1024];
+    int n = format(&buf[0], 1024, "%s\r\n", line, 0, 0, 0);
+    s->feedAt(c, &buf[0], n);
+    int m = c->out->pending();
+    if (m > 2047) m = 2047;
+    memcpy(&reply[0], c->out->data(), m);
+    reply[m] = 0;
+    c->out->clear();
+    return &reply[0];
+}
+
+// SET key value PX ms for n keys, written as RESP and fed in one piece
+char big[300000];
+void setMany(redisd.Store* s, redisd.Rclient* c, char* prefix, int from, int to, int px) {
+    int pos = 0;
+    for (int i = from; i < to; i++) {
+        char k[40];
+        int kn = format(&k[0], 40, "%s%d", prefix, i, 0, 0);
+        char ms[16];
+        int mn = format(&ms[0], 16, "%d", px, 0, 0, 0);
+        pos = pos + format(&big[pos], 300000 - pos, "*5\r\n$3\r\nSET\r\n$%d\r\n", kn, 0, 0, 0);
+        memcpy(&big[pos], &k[0], kn);
+        pos = pos + kn;
+        pos = pos + format(&big[pos], 300000 - pos, "\r\n$2\r\nvv\r\n$2\r\nPX\r\n$%d\r\n", mn, 0, 0, 0);
+        memcpy(&big[pos], &ms[0], mn);
+        pos = pos + mn;
+        big[pos] = 13;
+        big[pos + 1] = 10;
+        pos = pos + 2;
+        if (pos > 250000) {
+            s->feedAt(c, &big[0], pos);
+            c->out->clear();
+            pos = 0;
+        }
+    }
+    if (pos > 0) s->feedAt(c, &big[0], pos);
+    c->out->clear();
+}
+
+// ---- the plain FNV-1a hash that the tables used before they had a secret ---------------------------------------------------------------------------
+int fnv(char* k, int n) {
+    int h = 0x811C9DC5;
+    for (int i = 0; i < n; i++) h = ((h ^ (k[i] & 255)) * 16777619) & 0xFFFFFFFF;
+    return h;
+}
+
+int main() {
+    // ==== 1. an announced bulk string takes no memory until its bytes arrive ================================================================================
+    redis.CmdParser* p = redis.newCmdParser();
+    int budget = 0;
+    p->budget = &budget;
+    p->budgetMax = 4000000;
+    check("a parser is made", p != null);
+    int took = p->feed("*1\r\n$16777216\r\n", 15);
+    check("the header of a bulk of 16 MiB is read, nothing is ready", took == 15 && p->error == 0 && !p->ready);
+    check("... and the parser holds a few hundred bytes, not 32 MiB", budget > 0 && budget < 1024);
+    char* chunk = (char*) malloc(65536);
+    memset(chunk, 'x', 65536);
+    for (int i = 0; i < 3; i++) p->feed(chunk, 65536);
+    check("196608 bytes of it arrive: the buffer is about as big as what came", p->error == 0 && budget >= 196608 && budget < 600000);
+    p->reset();
+    check("reset gives the memory back (a buffer over 64 KiB)", budget < 1024);
+    // a whole command in pieces: the data of the first argument must survive every move of the buffer
+    int total = 1500000;
+    char hdr[100];
+    int hn = format(&hdr[0], 100, "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$%d\r\n", total, 0, 0, 0);
+    char* data = (char*) malloc(total);
+    for (int i = 0; i < total; i++) data[i] = 'a' + (i * 7 + (i >> 8)) % 26;
+    p->feed(&hdr[0], hn);
+    int off = 0;
+    int piece = 1;
+    while (off < total) {
+        int n = piece;
+        if (n > total - off) n = total - off;
+        p->feed(&data[off], n);
+        off = off + n;
+        piece = piece * 3 + 1;
+        if (piece > 70000) piece = 1;
+    }
+    int tail = p->feed("\r\n", 2);
+    check("a command with a bulk of 1.5 MB that arrives in pieces of every size is complete", p->ready && p->error == 0 && tail == 2 && p->argc() == 3);
+    check("... the first arguments are intact", streq(p->arg(0), "SET") && p->argLen(1) == 1 && p->arg(1)[0] == 'k' && p->argLen(2) == total);
+    check("... and so are the 1.5 MB (a byte for byte compare)", memcmp(p->arg(2), data, total) == 0);
+    p->clear();
+    check("the finished command gives its buffer back", budget < 1024);
+    // the budget
+    p->budgetMax = 300000;
+    p->feed("*1\r\n$1000000\r\n", 14);
+    int sent = 0;
+    while (p->error == 0 && sent < 1000000) { p->feed(chunk, 65536); sent = sent + 65536; }
+    check("over the budget the parser stops with its own error", p->error == redis.E_BUDGET && sent < 400000);
+    check("... which has a text", strlen(redis.errorText(redis.E_BUDGET)) > 10 && !streq(redis.errorText(redis.E_BUDGET), redis.errorText(redis.E_TOO_BIG)));
+    check("... and what it holds stays within the budget", budget <= 300000);
+    p->dispose();
+    check("dispose gives everything back", budget == 0);
+    free(chunk);
+    free(data);
+
+    // ==== 2. 1000 clients that announce 16 MiB each ============================================================================================================
+    st = new redisd.Store();
+    st->setClock(now);
+    redisd.Rclient* many[1000];
+    int opened = 0;
+    for (int i = 0; i < 1000; i++) {
+        many[i] = st->open();
+        if (many[i] == null) continue;
+        opened++;
+        st->feedAt(many[i], "*1\r\n$16777216\r\n", 15);
+    }
+    check("1000 clients each announce a bulk of 16 MiB (the limit): all are served", opened == 1000 && st->clients == 1000);
+    check("the parsers together hold less than a megabyte (it was 32 GB)", st->inputBytes > 0 && st->inputBytes < 1048576);
+    for (int i = 0; i < 1000; i++) if (many[i] != null) st->close(many[i]);
+    check("when the clients are gone the books are empty", st->clients == 0 && st->inputBytes == 0);
+
+    // ==== 3. a big value in a real command, and the budget of the store ========================================================================================
+    cl = st->open();
+    int vlen = 1000000;
+    char* val = (char*) malloc(vlen);
+    for (int i = 0; i < vlen; i++) val[i] = 'A' + (i % 23);
+    char head[100];
+    int headN = format(&head[0], 100, "*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n$%d\r\n", vlen, 0, 0, 0);
+    st->feedAt(cl, &head[0], headN);
+    for (int o = 0; o < vlen; o = o + 50000) st->feedAt(cl, &val[o], 50000);
+    st->feedAt(cl, "\r\n", 2);
+    check("SET of a value of 1 MB sent in pieces: OK", same(cl->out, "+OK\r\n"));
+    cl->out->clear();
+    st->feedAt(cl, "GET big\r\n", 9);
+    int hl = format(&head[0], 100, "$%d\r\n", vlen, 0, 0, 0);
+    check("GET gives it back byte for byte", cl->out->pending() == hl + vlen + 2 && memcmp(cl->out->data(), &head[0], hl) == 0 && memcmp(&cl->out->data()[hl], val, vlen) == 0);
+    cl->out->clear();
+    check("the parser gave its big buffer back after the command", st->inputBytes < 8192);
+    free(val);
+
+    redisd.Store* st2 = new redisd.Store();
+    st2->setClock(now);
+    st2->maxInput = 600000;
+    redisd.Rclient* ca = st2->open();
+    redisd.Rclient* cb = st2->open();
+    char h2[100];
+    int h2n = format(&h2[0], 100, "*3\r\n$3\r\nSET\r\n$1\r\na\r\n$%d\r\n", 400000, 0, 0, 0);
+    char* blob = (char*) malloc(400000);
+    memset(blob, 'q', 400000);
+    st2->feedAt(ca, &h2[0], h2n);
+    st2->feedAt(cb, &h2[0], h2n);
+    for (int o = 0; o < 400000; o = o + 20000) st2->feedAt(ca, blob, 20000);
+    check("with maxInput 600000 the first client's command (it needs 512 KiB of buffer) is accepted so far", !ca->closing && !ca->evict && st2->inputBytes <= 600000);
+    int cbRes = 0;
+    for (int o = 0; o < 400000 && cbRes == 0; o = o + 20000) cbRes = st2->feedAt(cb, blob, 20000);
+    check("the second one would go over the budget: it gets a protocol error and is closed", cbRes < 0 && cb->closing);
+    check("... the error says what is wrong", same(cb->out, "-ERR Protocol error: too much input is buffered, try again later\r\n"));
+    cb->out->clear();
+    check("the budget was never exceeded", st2->inputBytes <= 600000);
+    st2->feedAt(ca, "\r\n", 2);
+    check("the first client finishes its command", same(ca->out, "+OK\r\n"));
+    ca->out->clear();
+    st2->close(cb);
+    redisd.Rclient* cc = st2->open();
+    st2->feedAt(cc, &h2[0], h2n);
+    for (int o = 0; o < 400000; o = o + 20000) st2->feedAt(cc, blob, 20000);
+    st2->feedAt(cc, "\r\n", 2);
+    check("when it is gone the room is there again for a third client", same(cc->out, "+OK\r\n"));
+    free(blob);
+    st2->dispose();
+
+    // ==== 4. keys that collide in plain FNV-1a do not collide here ==========================================================================================
+    // 200 keys with the same low 8 bits of the plain hash (the table of 200 keys has 256 buckets: the old table put all of them in one chain)
+    char* colliding[200];
+    int found = 0;
+    for (int i = 0; found < 200 && i < 200000; i++) {
+        char k[24];
+        int kn = format(&k[0], 24, "c%d", i, 0, 0, 0);
+        if ((fnv(&k[0], kn) & 255) == 0x5A) {
+            colliding[found] = malloc(kn + 1);
+            memcpy(colliding[found], &k[0], kn + 1);
+            found++;
+        }
+    }
+    check("200 keys that fill one bucket of a plain FNV-1a table were found", found == 200);
+    redisd.Store* sh = new redisd.Store();
+    sh->setClock(now);
+    redisd.Rclient* ch = sh->open();
+    for (int i = 0; i < 200; i++) {
+        char line[64];
+        format(&line[0], 64, "SET %s 1", colliding[i], 0, 0, 0);
+        run(sh, ch, &line[0]);
+    }
+    check("they are stored", sh->keyCount(0) == 200);
+    check("... in short chains (the longest has at most 20 keys; plain FNV-1a would give 200)", sh->longestChain(0) <= 20);
+    // the secret makes the order of KEYS different from one store to the next, and a fixed secret makes it the same
+    redisd.Store* sa = new redisd.Store();
+    redisd.Store* sb = new redisd.Store();
+    redisd.Store* sc = new redisd.Store();
+    sa->hashSeed = 1234567;
+    sb->hashSeed = 1234567;
+    sc->hashSeed = 7654321;
+    redisd.Rclient* ra = sa->open();
+    redisd.Rclient* rb = sb->open();
+    redisd.Rclient* rc = sc->open();
+    for (int i = 0; i < 40; i++) {
+        char line[64];
+        format(&line[0], 64, "SET key%d 1", i, 0, 0, 0);
+        run(sa, ra, &line[0]);
+        run(sb, rb, &line[0]);
+        run(sc, rc, &line[0]);
+    }
+    char* ka = (char*) malloc(4096);
+    char* kb = (char*) malloc(4096);
+    char* kc = (char*) malloc(4096);
+    ra->out->clear(); rb->out->clear(); rc->out->clear();
+    sa->feedAt(ra, "KEYS *\r\n", 8);
+    sb->feedAt(rb, "KEYS *\r\n", 8);
+    sc->feedAt(rc, "KEYS *\r\n", 8);
+    int na = ra->out->pending();
+    int nc = rc->out->pending();
+    memcpy(ka, ra->out->data(), na);
+    memcpy(kb, rb->out->data(), rb->out->pending());
+    memcpy(kc, rc->out->data(), nc);
+    check("the same secret gives the same order of keys", na == rb->out->pending() && memcmp(ka, kb, na) == 0);
+    check("another secret gives another order (the same 40 keys)", na == nc && memcmp(ka, kc, na) != 0);
+    check("a store picks its own secret when nobody sets one: two stores differ", sh->hashSeed != 0 && sh->hashSeed != st->hashSeed);
+    for (int i = 0; i < 200; i++) free(colliding[i]);
+    free(ka); free(kb); free(kc);
+    sh->dispose(); sa->dispose(); sb->dispose(); sc->dispose();
+
+    // ==== 5. keys with a time to live: kept apart, swept in samples =========================================================================================
+    st->dispose();
+    st = new redisd.Store();
+    st->setClock(now);
+    cl = st->open();
+    ex("SET a 1 EX 100", "+OK\r\n");
+    check("a key with a TTL is counted", st->expiringCount(0) == 1);
+    ex("SET a 2", "+OK\r\n");
+    check("SET without a TTL takes it off", st->expiringCount(0) == 0);
+    ex("SET b 1 EX 100", "+OK\r\n");
+    ex("PERSIST b", ":1\r\n");
+    check("PERSIST takes it off", st->expiringCount(0) == 0);
+    ex("SET c 1 PX 100", "+OK\r\n");
+    ex("SET c 2 KEEPTTL", "+OK\r\n");
+    check("KEEPTTL keeps it", st->expiringCount(0) == 1);
+    ex("RENAME c d", "+OK\r\n");
+    check("RENAME moves it to the new name", st->expiringCount(0) == 1);
+    ex("GETSET d 3", "$1\r\n2\r\n");
+    check("GETSET takes it off", st->expiringCount(0) == 0);
+    ex("SET e 1", "+OK\r\n");
+    ex("EXPIRE e 100", ":1\r\n");
+    ex("EXPIRE e 200", ":1\r\n");
+    check("EXPIRE twice is still one key with a TTL", st->expiringCount(0) == 1);
+    ex("DEL e", ":1\r\n");
+    check("DEL takes it off", st->expiringCount(0) == 0);
+    ex("SET f 1 PX 100", "+OK\r\n");
+    ex("SET g 1 PX 5000", "+OK\r\n");
+    ex("RENAME g f", "+OK\r\n");
+    check("RENAME over a key with a TTL: one key with a TTL (the renamed one)", st->expiringCount(0) == 1 && st->keyCount(0) == 4);
+    st->setClock(now + 1000);
+    st->sweep(1000);
+    check("the sweep leaves a key alive that has not expired, and the books agree", st->keyCount(0) == 4 && st->expiringCount(0) == 1);
+    st->setClock(now + 10000);
+    st->sweep(1000);
+    check("... and removes it when it has (nothing else)", st->keyCount(0) == 3 && st->expiringCount(0) == 0 && st->stats->expired >= 1);
+    ex("EXISTS f", ":0\r\n");
+    ex("SET h 1 PX 50", "+OK\r\n");
+    ex("SELECT 3", "+OK\r\n");
+    ex("SET h 1 PX 50", "+OK\r\n");
+    check("every database has its own keys with a TTL", st->expiringCount(3) == 1 && st->expiringCount(0) == 1);
+    st->setClock(now + 20000);
+    st->sweep(1000);
+    check("the sweep goes through all databases", st->expiringCount(3) == 0 && st->expiringCount(0) == 0);
+    ex("FLUSHALL", "+OK\r\n");
+    check("FLUSHALL leaves nothing behind (no memory in use)", st->used == 0 && st->keyCount(0) == 0);
+
+    // a pile of dead keys goes away in a few sweeps; keys without a TTL are not touched
+    ex("SELECT 0", "+OK\r\n");
+    st->setClock(now);
+    setMany(st, cl, "dead", 0, 4000, 100);
+    for (int i = 0; i < 1000; i++) {
+        char line[64];
+        format(&line[0], 64, "SET plain%d 1", i, 0, 0, 0);
+        run(st, cl, &line[0]);
+    }
+    check("5000 keys: 4000 will die, 1000 have no TTL", st->keyCount(0) == 5000 && st->expiringCount(0) == 4000);
+    st->setClock(now + 50);
+    check("before their time the sweep removes nothing", st->sweep(1000) == 0 && st->keyCount(0) == 5000);
+    st->setClock(now + 1000);
+    int calls = 0;
+    while (calls < 100 && st->expiringCount(0) > 0) { st->sweep(1000); calls++; }
+    check("4000 dead keys are gone within a few sweeps (the old sweep looked at 20 slots a time)", st->expiringCount(0) == 0 && st->keyCount(0) == 1000 && calls <= 20);
+    check("DBSIZE tells the truth at once", exOn(st, cl, "DBSIZE", ":1000\r\n"));
+    check("the keys without a TTL are all there", exOn(st, cl, "EXISTS plain0 plain999 dead0 dead3999", ":2\r\n"));
+    check("the dead keys were counted", st->stats->expired >= 4000);
+    ex("FLUSHALL", "+OK\r\n");
+
+    // Like Redis the sweep stops when its samples have a tenth dead keys or less: live keys are never touched, and the purge (which a refused write
+    // calls) finishes the job.
+    st->setClock(now + 5000);
+    setMany(st, cl, "live", 0, 2000, 600000);
+    setMany(st, cl, "dead", 0, 1000, 100);
+    st->setClock(now + 6000);
+    for (int i = 0; i < 10; i++) st->sweep(1000);
+    int expiring = st->expiringCount(0);
+    check("2000 live and 1000 dead keys: the sweep removed most of the dead ones (it stops when a block of samples has a tenth dead or less)", expiring >= 2000 && expiring <= 2600);
+    check("... every live key is still there", exOn(st, cl, "EXISTS live0 live1 live1000 live1999", ":4\r\n"));
+    st->purgeExpired();
+    check("the purge removes all that are dead", st->expiringCount(0) == 2000 && st->keyCount(0) == 2000);
+    check("... and no more than that", exOn(st, cl, "EXISTS live0 live1999", ":2\r\n"));
+    ex("FLUSHALL", "+OK\r\n");
+
+    // a steady load of short lived keys never builds a pile: 100 ticks of 100 ms with 200 new keys of 200 ms each
+    int worst = 0;
+    int sets = 0;
+    for (int tick = 0; tick < 100; tick++) {
+        st->setClock(now + 100000 + tick * 100);
+        setMany(st, cl, "t", tick * 200, tick * 200 + 200, 200);
+        sets = sets + 200;
+        st->sweep(1000);
+        if (st->keyCount(0) > worst) worst = st->keyCount(0);
+    }
+    check("20000 short lived keys in 10 s of load: never more than 800 keys are kept (about 400 are alive)", worst <= 800 && sets == 20000);
+    ex("FLUSHALL", "+OK\r\n");
+
+    // ==== 6. a write that maxMemory would refuse first removes the dead keys =================================================================================
+    st->maxMemory = 1099511627776;
+    st->setClock(now + 200000);
+    setMany(st, cl, "m", 0, 2000, 100);
+    int full = st->used;
+    st->maxMemory = full - 1;
+    check("2000 keys with a short life fill the memory to the limit", st->used > st->maxMemory && st->keyCount(0) == 2000);
+    ex("SET fresh 1", "-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    check("while the keys are alive the write is refused (and the purge has nothing to do)", st->stats->rejected == 1 && st->keyCount(0) == 2000 && st->purgeExpired() == 0);
+    st->setClock(now + 200500);
+    ex("SET fresh 1", "+OK\r\n");
+    check("when they are dead the same write goes through: the dead keys were removed first (nothing was refused for them)", st->stats->rejected == 1 && st->keyCount(0) == 1);
+    st->maxMemory = 67108864;
+    ex("FLUSHALL", "+OK\r\n");
+
+    // ==== 7. the replies that were different from Redis 7.0.15 =============================================================================================
+    ex("NOSUCH", "-ERR unknown command 'NOSUCH', with args beginning with: \r\n");
+    ex("NOSUCH a b c", "-ERR unknown command 'NOSUCH', with args beginning with: 'a' 'b' 'c' \r\n");
+    ex("NOSUCH \"a b\" 'c\"d'", "-ERR unknown command 'NOSUCH', with args beginning with: 'a b' 'c\"d' \r\n");
+    char longArg[200];
+    memset(&longArg[0], 'x', 150);
+    longArg[150] = 0;
+    char line[400];
+    format(&line[0], 400, "NOSUCH %s tail", &longArg[0], 0, 0, 0);
+    char want[400];
+    memset(&want[0], 0, 400);
+    int wn = format(&want[0], 400, "-ERR unknown command 'NOSUCH', with args beginning with: '", 0, 0, 0, 0);
+    memset(&want[wn], 'x', 128);
+    memcpy(&want[wn + 128], "' \r\n", 4);
+    ex(&line[0], &want[0]);
+    ex("SET k 1", "+OK\r\n");
+    ex("EXPIRE k a NX XX", "-ERR NX and XX, GT or LT options at the same time are not compatible\r\n");
+    ex("EXPIRE k 10 FOO a", "-ERR Unsupported option FOO\r\n");
+    ex("EXPIRE k a FOO", "-ERR Unsupported option FOO\r\n");
+    ex("EXPIRE k 10 NX XX FOO", "-ERR Unsupported option FOO\r\n");
+    ex("EXPIRE k 10 FOO NX XX", "-ERR Unsupported option FOO\r\n");
+    ex("PEXPIRE k 10 GT LT", "-ERR GT and LT options at the same time are not compatible\r\n");
+    ex("PEXPIRE k a GT LT", "-ERR GT and LT options at the same time are not compatible\r\n");
+    ex("EXPIRE k a", "-ERR value is not an integer or out of range\r\n");
+    ex("EXPIRE k 100 NX", ":1\r\n");
+    ex("ZADD z 1 a 2 b 3 c", ":3\r\n");
+    ex("ZADD z INCR 5 a", "$1\r\n6\r\n");
+    ex("ZADD z GT 4 a", ":0\r\n");
+    ex("ZADD z GT CH 9 a", ":1\r\n");
+    ex("ZADD z LT CH 7 a", ":1\r\n");
+    ex("ZADD z LT 8 a", ":0\r\n");
+    ex("ZADD z GT 5 new", ":1\r\n");
+    ex("ZADD z LT 5 new2", ":1\r\n");
+    ex("ZSCORE z a", "$1\r\n7\r\n");
+    ex("ZADD z INCR 1 a 2 b", "-ERR INCR option supports a single increment-element pair\r\n");
+    ex("ZADD z NX GT 1 a", "-ERR GT, LT, and/or NX options at the same time are not compatible\r\n");
+    ex("ZADD z NX LT 1 a", "-ERR GT, LT, and/or NX options at the same time are not compatible\r\n");
+    ex("ZADD z GT LT 1 a", "-ERR GT, LT, and/or NX options at the same time are not compatible\r\n");
+    ex("ZADD z XX INCR 5 a", "$2\r\n12\r\n");
+    ex("ZADD z NX INCR 5 a", "$-1\r\n");
+    ex("ZADD z XX INCR 5 nothere", "$-1\r\n");
+    ex("ZADD z INCR 2.5 fresh", "$3\r\n2.5\r\n");
+    ex("ZADD z INCR -2.5 fresh", "$1\r\n0\r\n");
+    ex("ZADD z INCR inf big", "$3\r\ninf\r\n");
+    ex("ZADD z INCR -inf big", "-ERR resulting score is not a number (NaN)\r\n");
+    ex("ZADD z GT INCR -1 a", "$-1\r\n");
+    ex("ZADD z LT INCR -1 a", "$2\r\n11\r\n");
+    ex("ZADD nokey XX INCR 1 a", "$-1\r\n");
+    ex("EXISTS nokey", ":0\r\n");
+    ex("ZADD z INCR abc a", "-ERR value is not a valid float\r\n");
+    ex("ZADD z INCR 1", "-ERR syntax error\r\n");
+    ex("FLUSHALL", "+OK\r\n");
+
+    // ==== 8. through the server loop, in real time =============================================================================================================
+    st->dispose();
+    redisd.Server* srv = redisd.newServer();
+    check("a server on a free port", srv->listen(0) && srv->port > 0);
+    int h = net.connect("127.0.0.1", srv->port);
+    net.setTimeout(h, 2000);
+    char* cmds = (char*) malloc(80000);
+    int cp = 0;
+    for (int i = 0; i < 3000; i++) cp = cp + format(&cmds[cp], 80000 - cp, "SET rt%d v PX 300\r\n", i, 0, 0, 0);
+    for (int o = 0; o < cp; o = o + 2000) {
+        int n = cp - o < 2000 ? cp - o : 2000;
+        net.send(h, &cmds[o], n);
+        srv->poll(0);
+    }
+    int t0 = millis();
+    while (millis() - t0 < 20000 && srv->store->stats->commands < 3000) srv->poll(5);
+    check("3000 SETs with a life of 300 ms arrive through a socket and are executed (slow machines: some may be dead already)", srv->store->stats->commands == 3000 && srv->store->keyCount(0) + srv->store->stats->expired == 3000);
+    t0 = millis();
+    while (millis() - t0 < 3000 && srv->store->keyCount(0) > 0) srv->poll(10);
+    check("the server loop sweeps them away by itself within three seconds after the last of them has died (the old sweep took about 20 minutes for 200000)", srv->store->keyCount(0) == 0 && srv->store->expiringCount(0) == 0);
+    check("... and the books are empty", srv->store->used == 0);
+    net.close(h);
+    for (int i = 0; i < 20; i++) srv->poll(1);
+    srv->shutdown();
+    free(cmds);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

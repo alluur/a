@@ -1,0 +1,329 @@
+// The broker on sockets against hostile peers: garbage, announced packets of 256 MB, connections that never send CONNECT, a client that sends and never
+// reads, one that stops in the middle of a packet, a flood of PINGREQs, too many connections, a subscriber that does not read (messages are dropped and
+// counted, the memory of the broker stays bounded, the others are served), many clients at once, takeovers in a row. The broker must survive all
+// of it and keep serving a well behaved client.
+import mqtt;
+import mqttd;
+import netsrv;
+import netio;
+import net;
+import bytebuf;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+mqttd.Server* srv;
+int PORT;
+char url[100];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+// serves the sockets until `rounds` polls in a row had nothing to do (at most 2 s): no assumption about how fast the system delivers
+void settle(int rounds = 20) {
+    int quiet = 0;
+    int t0 = millis();
+    while (quiet < rounds && millis() - t0 < 2000) {
+        if (srv->poll(1) == 0) quiet++; else quiet = 0;
+    }
+}
+
+int raw() {
+    int h = net.connect("127.0.0.1", PORT);
+    net.setTimeout(h, 2000);
+    return h;
+}
+
+void sendHex(int h, char* hex) {
+    int n = 0;
+    char* d = bytebuf.fromHex(hex, &n);
+    net.send(h, d, n);
+    free(d);
+}
+
+// reads and throws away until the peer closes the connection or ms have passed; true if it closed
+bool closedBy(int h, int ms) {
+    int t0 = millis();
+    char buf[1024];
+    for (;;) {
+        if (millis() - t0 > ms) return false;
+        srv->poll(0);
+        if (!net.waitReadable(h, 5)) continue;
+        int n = net.recv(h, &buf[0], 1024);
+        if (n <= 0) return true;
+    }
+    return false;
+}
+
+// reads up to ms for the first byte, returns it (-1: closed or nothing)
+int firstByte(int h, int ms) {
+    int t0 = millis();
+    char c;
+    for (;;) {
+        if (millis() - t0 > ms) return -1;
+        srv->poll(0);
+        if (!net.waitReadable(h, 5)) continue;
+        int n = net.recv(h, &c, 1);
+        if (n <= 0) return -1;
+        return c & 255;
+    }
+    return -1;
+}
+
+mqtt.Client* conn(char* id) {
+    mqtt.Options o();
+    o.clientId = id;
+    return mqtt.connectWith(&url[0], &o);
+}
+
+int main() {
+    srv = mqttd.newServer();
+    check("the broker listens", srv->listenOn("127.0.0.1", 0, null));
+    PORT = srv->port;
+    format(&url[0], 100, "mqtt://127.0.0.1:%d", PORT, 0, 0, 0);
+    net.setIdleHook(hook);
+    mqttd.Broker* b = srv->broker;
+    b->sysIntervalMs = 0;
+    b->connectTimeoutMs = 300;
+    srv->net->handshakeTimeoutMs = 300;
+
+    mqtt.Client* good = conn("good");
+    check("a well behaved client is connected", good != null && good->subscribeWait("ok/#", 1, 2000) == 1);
+
+    // ---- garbage ----------------------------------------------------------------------------------------------------------------------------------
+    int h = raw();
+    sendHex(h, "ffffffffffffffffffffffffffffffff");
+    check("random bytes: the connection is closed", closedBy(h, 2000));
+    net.close(h);
+    h = raw();
+    sendHex(h, "00");
+    sendHex(h, "00");
+    check("a reserved packet type: closed", closedBy(h, 2000));
+    net.close(h);
+    h = raw();
+    sendHex(h, "474554202f20485454502f312e310d0a0d0a");
+    check("an HTTP request sent to the MQTT port: closed", closedBy(h, 2000));
+    net.close(h);
+    h = raw();
+    sendHex(h, "101000044d5154540402003c00046d6f7371");
+    check("a valid CONNECT is answered", firstByte(h, 2000) == 0x20);
+    sendHex(h, "e000");
+    check("DISCONNECT closes", closedBy(h, 2000));
+    net.close(h);
+    check("the broker serves the good client still", good->publishWait("ok/x", "still here", 10, 1, false, 2000));
+    mqtt.Message* m = good->waitMessage(1000);
+    check("... and it gets its own message", m != null && streq(m->payload, "still here"));
+    if (m != null) m->dispose();
+
+    // ---- announced sizes ----------------------------------------------------------------------------------------------------------------------------
+    h = raw();
+    sendHex(h, "10ffffff7f");
+    check("a CONNECT of 256 MB is refused at the header", closedBy(h, 2000));
+    net.close(h);
+    h = raw();
+    sendHex(h, "101000044d5154540402003c00046d6f7371");
+    firstByte(h, 1000);
+    sendHex(h, "30ffffff7f");
+    check("a PUBLISH of 256 MB is refused at the header", closedBy(h, 2000));
+    net.close(h);
+    b->maxPacket = 1000;
+    h = raw();
+    sendHex(h, "101000044d5154540402003c00046d6f7371");
+    firstByte(h, 1000);
+    sendHex(h, "30e807");                                    // a PUBLISH that announces 1000 bytes
+    check("a packet over maxPacket is refused (1000 bytes allowed: this one is exactly 1000)", !closedBy(h, 100));
+    net.close(h);
+    h = raw();
+    sendHex(h, "101000044d5154540402003c00046d6f7371");
+    firstByte(h, 1000);
+    sendHex(h, "30e907");                                    // 1001
+    check("... 1001 is refused", closedBy(h, 2000));
+    net.close(h);
+    b->maxPacket = 1048576;
+
+    // ---- connections that do nothing -----------------------------------------------------------------------------------------------------------------
+    int silent[40];
+    for (int i = 0; i < 40; i++) {
+        silent[i] = raw();
+        srv->poll(0);                       // accept as we go: some systems (AOS) queue only 16 unaccepted connections
+    }
+    int tc = millis();
+    while (srv->net->count() < 40 && millis() - tc < 5000) srv->poll(5);        // a slow system needs longer to finish 40 handshakes
+    settle();
+    check("40 connections that never send CONNECT are counted", srv->net->count() >= 40);
+    int t0 = millis();
+    bool allClosed = true;
+    for (int i = 0; i < 40; i++) {
+        if (!closedBy(silent[i], 3000)) allClosed = false;
+        net.close(silent[i]);
+    }
+    check("... and all of them are closed after the CONNECT time out", allClosed && millis() - t0 < 2500);
+    settle();
+    check("the broker has only the good client left", srv->net->count() == 1 && b->connected == 1 && b->peerCount() == 1);
+
+    // a CONNECT that stops in the middle
+    h = raw();
+    sendHex(h, "101000044d5154540402003c00046d");
+    check("half a CONNECT and silence: closed by the time out", closedBy(h, 2000));
+    net.close(h);
+
+    // ---- a client that sends a flood and never reads ----------------------------------------------------------------------------------------------------
+    int evicted0 = b->stats->evicted;
+    int evictedNet0 = srv->net->stats->evicted;
+    b->maxOut = 4096;
+    srv->net->maxOut = 4096;
+    h = raw();
+    sendHex(h, "101000044d5154540402003c00046d6f7371");
+    firstByte(h, 1000);
+    char* pings = alloc(20000);
+    for (int i = 0; i < 10000; i++) { pings[i * 2] = 0xC0; pings[i * 2 + 1] = 0; }
+    for (int round = 0; round < 6; round++) {
+        net.send(h, pings, 20000);
+        settle(4);
+    }
+    settle(10);
+    check("20000 PINGREQs without reading the answers: the client is cut off", b->stats->evicted > evicted0 || srv->net->stats->evicted > evictedNet0);
+    net.close(h);
+    settle();
+    b->maxOut = 4194304;
+    srv->net->maxOut = 1048576;
+
+    // ---- a subscriber that does not read ------------------------------------------------------------------------------------------------------------
+    b->maxOut = 65536;
+    srv->net->maxOut = 65536;
+    h = raw();
+    netio.Queue q;
+    mqtt.Packet k;
+    k.reset();
+    k.clientId = "mute";
+    k.clean = true;
+    k.keepAlive = 0;
+    mqtt.putConnect(&q, &k);
+    char* f[1];
+    int fq[1];
+    f[0] = "fl/#";
+    fq[0] = 0;
+    mqtt.putSubscribe(&q, 1, &f[0], &fq[0], 1);
+    f[0] = "fq/#";
+    fq[0] = 1;
+    mqtt.putSubscribe(&q, 2, &f[0], &fq[0], 1);
+    net.send(h, q.data(), q.pending());
+    q.clear();
+    settle();
+    check("a client subscribes and then never reads again", b->hasSession("mute") && b->subscriptionCount() >= 2);
+    int dropped0 = b->stats->dropped;
+    char* blob = alloc(2000);
+    memset(blob, 'x', 2000);
+    int sentFl = 0;
+    for (int i = 0; i < 8000 && b->stats->dropped < dropped0 + 50; i++) {         // until the socket buffers are full and the broker starts to drop
+        good->publish("fl/x", blob, 2000, 0, false);
+        sentFl++;
+        if (i % 50 == 49) good->flushAll(2000);
+    }
+    good->flushAll(3000);
+    settle();
+    check("QoS 0 messages for a client that does not read: dropped and counted", b->stats->dropped >= dropped0 + 50);
+    check("... the broker keeps at most maxOut bytes for it", b->maxPeerOutput() <= 65536);
+    check("... the slow client is still connected, nobody else was hurt", b->hasSession("mute") && b->connected == 2);
+    int dropped1 = b->stats->dropped;
+    for (int i = 0; i < 1600; i++) {
+        good->publish("fq/x", "q1", 2, 1, false);
+        if (i % 200 == 199) good->flushAll(3000);
+    }
+    good->flushAll(5000);
+    settle();
+    check("1600 QoS 1 messages for it: at most 20 + maxQueue of them are kept, the rest is dropped", b->sessionQueued("mute") <= 1000 && b->sessionInflight("mute") <= 20 && b->stats->dropped >= dropped1 + 580);
+    check("... and the well behaved client got every acknowledgement", good->inflight() == 0 && good->queued() == 0);
+    check("... and still works", good->publishWait("ok/y", "alive", 5, 1, false, 2000));
+    net.close(h);
+    settle();
+    check("when the slow client goes, its queue goes with it", !b->hasSession("mute") && b->queuedBytes() == 0 && b->stats->liveItems == 0);
+    b->maxOut = 4194304;
+    srv->net->maxOut = 1048576;
+    while (good->next() != null) { }
+
+    // ---- too many connections ----------------------------------------------------------------------------------------------------------------------------
+    srv->net->maxConns = srv->net->count() + 3;
+    int hs[8];
+    for (int i = 0; i < 6; i++) hs[i] = raw();
+    settle();
+    int open = 0;
+    int refused = 0;
+    for (int i = 0; i < 6; i++) {
+        sendHex(hs[i], "101000044d5154540402003c00046d6f7371");
+        if (firstByte(hs[i], 500) == 0x20) open++; else refused++;
+    }
+    check("with maxConns reached the rest is refused at once", open == 3 && refused == 3 && srv->net->stats->rejected >= 3);
+    for (int i = 0; i < 6; i++) net.close(hs[i]);
+    settle();
+    srv->net->maxConns = 1000;
+    srv->net->maxPerIp = 2;
+    for (int i = 0; i < 4; i++) hs[i] = raw();
+    settle();
+    int per = 0;
+    for (int i = 0; i < 4; i++) {
+        sendHex(hs[i], "101000044d5154540402003c00046d6f7371");
+        if (firstByte(hs[i], 300) == 0x20) per++;
+    }
+    check("maxPerIp: the connections of one address are limited (the good client uses one)", per <= 1);
+    for (int i = 0; i < 4; i++) net.close(hs[i]);
+    srv->net->maxPerIp = 0;
+    settle();
+
+    // ---- many clients at once ---------------------------------------------------------------------------------------------------------------------------
+    mqtt.Client* many[60];
+    int up = 0;
+    for (int i = 0; i < 60; i++) {
+        char id[16];
+        format(&id[0], 16, "m%d", i, 0, 0, 0);
+        many[i] = conn(&id[0]);
+        if (many[i] != null && many[i]->subscribeWait("many/#", 0, 3000) == 0) up++;
+    }
+    check("60 clients connect and subscribe", up == 60 && b->connected == 61);
+    good->publishWait("many/x", "all", 3, 0, false, 2000);
+    int heard = 0;
+    for (int i = 0; i < 60; i++) {
+        mqtt.Message* mm = many[i]->waitMessage(2000);
+        if (mm != null) { heard++; mm->dispose(); }
+    }
+    check("one message reaches all of them", heard == 60);
+    for (int i = 0; i < 60; i++) {
+        many[i]->disconnect();
+        many[i]->dispose();
+    }
+    settle();
+    check("they go and the broker is back to one client", b->connected == 1 && b->sessionCount() == 1 && srv->net->count() == 1);
+
+    // ---- takeovers in a row -----------------------------------------------------------------------------------------------------------------------------
+    int tk0 = b->stats->takeovers;
+    mqtt.Client* tk[30];
+    for (int i = 0; i < 30; i++) tk[i] = conn("same");
+    settle();
+    check("30 connections with one client id: one session, 29 takeovers", b->sessionCount() == 2 && b->stats->takeovers == tk0 + 29 && b->connected == 2);
+    for (int i = 0; i < 30; i++) tk[i]->dispose();
+    settle();
+    check("everything is cleaned up afterwards", b->connected == 1 && b->sessionCount() == 1 && srv->net->count() == 1 && b->peerCount() == 1);
+
+    // ---- a broker that stays upright ----------------------------------------------------------------------------------------------------------------------
+    check("the good client works at the end of all this", good->publishWait("ok/end", "fine", 4, 2, false, 2000) && good->waitMessage(1000) != null);
+    good->disconnect();
+    good->dispose();
+    settle();
+    check("no message or queue item is left in the broker", b->stats->liveMsgs == 0 && b->stats->liveItems == 0 && b->queuedBytes() == 0);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    srv->shutdown();
+    return fails == 0 ? 0 : 1;
+}
