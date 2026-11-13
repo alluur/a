@@ -1,0 +1,620 @@
+// The mail module, first part: the pieces that header lines and bodies are made of. base64 and quoted-printable (the examples of the RFCs, edge cases, every byte
+// value), UTF-8 checking, the character sets, RFC 2047 encoded words (the examples of the RFC, split multi-byte characters, invalid words that must stay as they
+// are), folding of header lines (no line over 78 characters, nothing over 998, nothing changed by unfolding, CR / LF refused), header block parsing, addresses (the
+// examples of RFC 5322 appendix A, groups, comments, quoted strings, every kind of invalid address), Date (formatting and the many ways to write one) and Message-ID.
+import mail;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// true when the buffer's bytes are exactly this text
+bool is(mail.Buf* b, char* want) {
+    return b->len == strlen(want) && memcmp(b->text(), want, b->len) == 0;
+}
+
+bool b64(char* in, int n, char* want) {
+    mail.Buf b;
+    mail.base64Encode(in, n, &b, false);
+    bool ok = is(&b, want);
+    b.release();
+    return ok;
+}
+
+bool b64dec(char* in, char* want, int wantLen, bool strict) {
+    mail.Buf b;
+    bool ok = mail.base64Decode(in, strlen(in), &b, strict) && b.len == wantLen && memcmp(b.text(), want, wantLen) == 0;
+    b.release();
+    return ok;
+}
+
+bool qpenc(char* in, int n, char* want, bool binary = false) {
+    mail.Buf b;
+    mail.qpEncode(in, n, &b, binary);
+    bool ok = is(&b, want);
+    if (!ok) printf("     got [%s]\n", b.text());
+    b.release();
+    return ok;
+}
+
+bool qpdec(char* in, char* want, bool lf = false) {
+    mail.Buf b;
+    mail.qpDecode(in, strlen(in), &b, false, lf);
+    bool ok = is(&b, want);
+    if (!ok) printf("     got [%s]\n", b.text());
+    b.release();
+    return ok;
+}
+
+// the text with its encoded words decoded
+bool dec(char* in, char* want) {
+    mail.Buf b;
+    mail.decodeWords(in, strlen(in), &b);
+    bool ok = is(&b, want);
+    if (!ok) printf("     got [%s]\n", b.text());
+    b.release();
+    return ok;
+}
+
+bool addrIs(mail.AddressList* l, int i, char* name, char* addr) {
+    mail.Address* a = l->get(i);
+    return a != null && streq(a->name, name) && streq(a->addr, addr);
+}
+
+// reads a list; the count, or -1; the list is left in *out
+int readList(char* s, mail.AddressList* l) {
+    return mail.parseAddressList(s, strlen(s), l);
+}
+
+bool dateIs(char* s, int unix, int off) {
+    int u = 0;
+    int o = 0;
+    if (!mail.parseDate(s, strlen(s), &u, &o)) return false;
+    return u == unix && o == off;
+}
+
+bool dateBad(char* s) {
+    int u = 0;
+    int o = 0;
+    return !mail.parseDate(s, strlen(s), &u, &o);
+}
+
+bool fmtDate(int unix, int off, char* want) {
+    char buf[64];
+    mail.formatDate(unix, off, &buf[0], 64);
+    bool ok = streq(&buf[0], want);
+    if (!ok) printf("     got [%s]\n", &buf[0]);
+    return ok;
+}
+
+int main() {
+    // ---- base64 (RFC 4648 section 10) ----------------------------------------------------------------------------------------------------------------
+    check("base64 of '' is ''", b64("", 0, ""));
+    check("base64 'f' = Zg==", b64("f", 1, "Zg=="));
+    check("base64 'fo' = Zm8=", b64("fo", 2, "Zm8="));
+    check("base64 'foo' = Zm9v", b64("foo", 3, "Zm9v"));
+    check("base64 'foob' = Zm9vYg==", b64("foob", 4, "Zm9vYg=="));
+    check("base64 'fooba' = Zm9vYmE=", b64("fooba", 5, "Zm9vYmE="));
+    check("base64 'foobar' = Zm9vYmFy", b64("foobar", 6, "Zm9vYmFy"));
+    check("base64 of UTF-8 text", b64("Gr\xC3\xBC\xC3\x9F" "e", 7, "R3LDvMOfZQ=="));
+    check("base64 decode of the same", b64dec("R3LDvMOfZQ==", "Gr\xC3\xBC\xC3\x9F" "e", 7, true));
+    check("base64 decode of every RFC vector", b64dec("Zm9vYmFy", "foobar", 6, true) && b64dec("Zm9vYmE=", "fooba", 5, true) && b64dec("Zg==", "f", 1, true) && b64dec("", "", 0, true));
+    char all[256];
+    for (int i = 0; i < 256; i++) all[i] = i;
+    mail.Buf e;
+    mail.base64Encode(&all[0], 256, &e, true);
+    bool lines = true;
+    int col = 0;
+    for (int i = 0; i < e.len; i++) {
+        if (e.d[i] == 13) { if (col > 76 || e.d[i + 1] != 10) lines = false; col = 0; i++; } else col++;
+    }
+    check("wrapped base64: lines of at most 76 characters, CRLF, one at the end", lines && e.len > 340 && e.d[e.len - 2] == 13 && e.d[e.len - 1] == 10 && e.d[76] == 13);
+    mail.Buf d;
+    check("... decodes to all 256 byte values", mail.base64Decode(e.d, e.len, &d, true) && d.len == 256 && memcmp(d.d, &all[0], 256) == 0);
+    e.release();
+    d.release();
+    check("57 bytes make exactly 76 characters", b64("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcde", 57, "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5emFiY2Rl"));
+    mail.Buf w;
+    mail.base64Encode("abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdef", 58, &w, true);
+    check("58 bytes make a line of 76 and a line of 4", w.len == 76 + 2 + 4 + 2 && w.d[76] == 13);
+    w.release();
+    check("strict decode refuses characters outside the alphabet", !b64dec("Zm9v!YmFy", "foobar", 6, true));
+    check("strict decode refuses a lone sextet", !b64dec("Zm9vY", "foob", 4, true));
+    check("strict decode refuses data after the padding", !b64dec("Zg==Zg", "f", 1, true));
+    check("lenient decode skips garbage", b64dec("Zm9v!YmFy", "foobar", 6, false));
+    check("lenient decode accepts a missing padding", b64dec("Zm9vYg", "foob", 4, false));
+    check("decode skips blanks and line ends", b64dec("Zm9v\r\n YmFy\t", "foobar", 6, true));
+
+    // ---- quoted-printable (RFC 2045 section 6.7) -------------------------------------------------------------------------------------------------------
+    check("qp: plain text is unchanged", qpenc("Hello, world!", 13, "Hello, world!"));
+    check("qp: = is =3D", qpenc("Now's the time = for all folk", 29, "Now's the time =3D for all folk"));
+    check("qp: UTF-8 bytes, upper case hex", qpenc("m\xC3\xBCde", 5, "m=C3=BCde"));
+    check("qp: trailing blanks before a line end are encoded", qpenc("a \r\nb\t\r\nc ", 10, "a=20\r\nb=09\r\nc=20"));
+    check("qp: blanks inside a line stay", qpenc("a b\tc", 5, "a b\tc"));
+    check("qp: LF and a lone CR are line ends (CRLF)", qpenc("a\nb\rc\r\nd", 8, "a\r\nb\r\nc\r\nd"));
+    check("qp: binary mode encodes CR and LF", qpenc("a\r\nb", 4, "a=0D=0Ab", true));
+    char longLine[250];
+    for (int i = 0; i < 200; i++) longLine[i] = 'x';
+    mail.Buf q;
+    mail.qpEncode(&longLine[0], 200, &q, false);
+    bool softOk = true;
+    col = 0;
+    int softBreaks = 0;
+    for (int i = 0; i < q.len; i++) {
+        if (q.d[i] == 13) { col = 0; i++; if (q.d[i - 2] == '=') softBreaks++; } else { col++; if (col > 76) softOk = false; }
+    }
+    check("qp: a line of 200 characters is broken with soft line breaks, none over 76", softOk && softBreaks == 2);
+    mail.Buf q2;
+    check("qp: ... and decodes to the same", mail.qpDecode(q.d, q.len, &q2, false, false) && q2.len == 200 && memcmp(q2.d, &longLine[0], 200) == 0);
+    q.release();
+    q2.release();
+    // lines of exactly 75, 76 and 77 characters
+    for (int len = 74; len <= 78; len++) {
+        char ln[100];
+        for (int i = 0; i < len; i++) ln[i] = 'a' + (i % 26);
+        mail.Buf a;
+        mail.qpEncode(&ln[0], len, &a, false);
+        bool fit = true;
+        col = 0;
+        for (int i = 0; i < a.len; i++) {
+            if (a.d[i] == 13) col = 0; else { col++; if (col > 76) fit = false; }
+        }
+        mail.Buf b;
+        mail.qpDecode(a.d, a.len, &b, false, false);
+        bool same = b.len == len && memcmp(b.d, &ln[0], len) == 0;
+        char nm[80];
+        format(&nm[0], 80, "qp: a line of %d characters fits in 76 and decodes back", len, 0, 0, 0, 0, 0);
+        check(&nm[0], fit && same);
+        a.release();
+        b.release();
+    }
+    char umlauts[300];
+    for (int i = 0; i < 100; i++) { umlauts[i * 2] = 0xC3; umlauts[i * 2 + 1] = 0xBC; }
+    mail.Buf u1;
+    mail.Buf u2;
+    mail.qpEncode(&umlauts[0], 200, &u1, false);
+    mail.qpDecode(u1.d, u1.len, &u2, false, false);
+    check("qp: 200 bytes of =C3=BC round trip", u2.len == 200 && memcmp(u2.d, &umlauts[0], 200) == 0);
+    u1.release();
+    u2.release();
+    check("qp decode: soft line break", qpdec("Now's the time =\r\nfor all", "Now's the time for all"));
+    check("qp decode: soft line break with blanks behind the = and with a bare LF", qpdec("ab=  \r\ncd=\nef", "abcdef"));
+    check("qp decode: =XX in both cases", qpdec("=c3=BC=3d", "\xC3\xBC="));
+    check("qp decode: white space at the end of a line is dropped, an encoded blank is kept", qpdec("a   \r\nb=20\r\nc", "a\r\nb \r\nc"));
+    check("qp decode: hard line ends as LF on request", qpdec("a\r\nb\nc", "a\nb\nc", true));
+    check("qp decode: a bad = stays, the rest is decoded", qpdec("a=ZZb=41", "a=ZZbA"));
+    check("qp decode: = at the very end", qpdec("abc=", "abc"));
+    mail.Buf qh;
+    mail.qpDecode("a_b=C3=BC_c=", 12, &qh, true);
+    check("Q word text: _ is a blank", is(&qh, "a b\xC3\xBC c="));
+    qh.release();
+    // every byte value, binary mode, random lengths
+    int seed = 12345;
+    bool allRound = true;
+    for (int round = 0; round < 30 && allRound; round++) {
+        char data[600];
+        int len = round * 19 % 570;
+        for (int i = 0; i < len; i++) { seed = seed * 1103515245 + 12345; data[i] = (seed >> 16) & 255; }
+        mail.Buf a;
+        mail.Buf b;
+        mail.qpEncode(&data[0], len, &a, true);
+        mail.qpDecode(a.d, a.len, &b, false, false);
+        if (b.len != len || (len > 0 && memcmp(b.d, &data[0], len) != 0)) allRound = false;
+        a.release();
+        b.release();
+    }
+    check("qp binary mode: random data of 30 lengths round trips", allRound);
+
+    // ---- UTF-8 and character sets -----------------------------------------------------------------------------------------------------------------------
+    check("utf8 valid: ASCII, 2, 3 and 4 byte characters", mail.utf8Valid("a\xC3\xBC\xE2\x82\xAC\xF0\x9F\x98\x80", 10));
+    check("utf8 invalid: overlong C0 80", !mail.utf8Valid("\xC0\x80", 2));
+    check("utf8 invalid: overlong E0 80 80 and F0 80 80 80", !mail.utf8Valid("\xE0\x80\x80", 3) && !mail.utf8Valid("\xF0\x80\x80\x80", 4));
+    check("utf8 invalid: a surrogate ED A0 80", !mail.utf8Valid("\xED\xA0\x80", 3));
+    check("utf8 invalid: above U+10FFFF (F4 90 80 80, F5)", !mail.utf8Valid("\xF4\x90\x80\x80", 4) && !mail.utf8Valid("\xF5\x80\x80\x80", 4));
+    check("utf8 invalid: a stray continuation byte, a cut off sequence", !mail.utf8Valid("\x80", 1) && !mail.utf8Valid("\xE2\x82", 2) && !mail.utf8Valid("a\xC3", 2));
+    mail.Buf s1;
+    int bad = mail.utf8Sanitize("a\xC0\x80" "b\xE2\x82", 6, &s1);
+    check("utf8 sanitize: every bad byte becomes U+FFFD", bad == 4 && is(&s1, "a\xEF\xBF\xBD\xEF\xBF\xBD" "b\xEF\xBF\xBD\xEF\xBF\xBD"));
+    s1.release();
+    check("charset names", mail.charsetId("UTF-8", 5) == mail.CS_UTF8 && mail.charsetId("us-ascii", 8) == mail.CS_ASCII && mail.charsetId("ISO-8859-1", 10) == mail.CS_LATIN1
+        && mail.charsetId("Latin1", 6) == mail.CS_LATIN1 && mail.charsetId("windows-1252", 12) == mail.CS_CP1252 && mail.charsetId("iso-8859-15", 11) == mail.CS_LATIN9
+        && mail.charsetId("utf-8*en", 8) == mail.CS_UTF8 && mail.charsetId("koi8-r", 6) == mail.CS_UNKNOWN && mail.charsetId("", 0) == mail.CS_UNKNOWN);
+    mail.Buf c1;
+    check("latin-1 to UTF-8", mail.toUtf8("iso-8859-1", "caf\xE9 \xFC\xDF \xA9", 9, &c1) == 0 && is(&c1, "caf\xC3\xA9 \xC3\xBC\xC3\x9F \xC2\xA9"));
+    c1.release();
+    mail.Buf c2;
+    check("windows-1252: 0x80 is the euro, 0x93 and 0x94 are quotes, 0x81 stays a control character", mail.toUtf8("windows-1252", "\x80 \x93x\x94", 5, &c2) == 0 && is(&c2, "\xE2\x82\xAC \xE2\x80\x9Cx\xE2\x80\x9D"));
+    c2.release();
+    mail.Buf c3;
+    check("iso-8859-15: 0xA4 is the euro", mail.toUtf8("ISO-8859-15", "\xA4 \xBD", 3, &c3) == 0 && is(&c3, "\xE2\x82\xAC \xC5\x93"));
+    c3.release();
+    mail.Buf c4;
+    check("us-ascii with an 8-bit byte: U+FFFD, counted", mail.toUtf8("us-ascii", "a\xE9" "b", 3, &c4) == 1 && is(&c4, "a\xEF\xBF\xBD" "b"));
+    c4.release();
+    mail.Buf c5;
+    check("an unknown character set: -1, nothing written", mail.toUtf8("koi8-r", "abc", 3, &c5) == -1 && c5.len == 0);
+    mail.Buf c6;
+    check("UTF-8 to latin-1: characters that are not in it become ?", mail.utf8ToLatin1("caf\xC3\xA9 \xE2\x82\xAC \xF0\x9F\x98\x80", 14, &c6) == 2 && is(&c6, "caf\xE9 ? ?"));
+    c6.release();
+
+    // ---- RFC 2047 words: decoding (the examples of section 8) --------------------------------------------------------------------------------------------
+    check("2047: =?ISO-8859-1?Q?a?= is a", dec("=?ISO-8859-1?Q?a?=", "a"));
+    check("2047: a word, a blank and a word of text", dec("=?ISO-8859-1?Q?a?= b", "a b"));
+    check("2047: the blank between two words is dropped", dec("=?ISO-8859-1?Q?a?= =?ISO-8859-1?Q?b?=", "ab"));
+    check("2047: ... also several blanks and a line break", dec("=?ISO-8859-1?Q?a?=  =?ISO-8859-1?Q?b?=", "ab") && dec("=?ISO-8859-1?Q?a?=\r\n =?ISO-8859-1?Q?b?=", "ab"));
+    check("2047: _ is a blank", dec("=?ISO-8859-1?Q?a_b?=", "a b"));
+    check("2047: two words with blanks in the text", dec("=?ISO-8859-1?Q?a?= =?ISO-8859-2?Q?_b?=", "a =?ISO-8859-2?Q?_b?="));
+    check("2047: a word in parentheses", dec("(=?ISO-8859-1?Q?a?=)", "(a)"));
+    check("2047: a word and text in parentheses", dec("(=?ISO-8859-1?Q?a?= b)", "(a b)"));
+    check("2047: Keith Moore", dec("=?US-ASCII?Q?Keith_Moore?= <moore@cs.utk.edu>", "Keith Moore <moore@cs.utk.edu>"));
+    check("2047: Andre Pirard (ISO-8859-1, Q)", dec("=?ISO-8859-1?Q?Andr=E9?= Pirard", "Andr\xC3\xA9 Pirard"));
+    check("2047: If you can read this yo|u understand the example (one character set)", dec("=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?= =?ISO-8859-1?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?=", "If you can read this you understand the example."));
+    check("2047: lower case b, q and character set", dec("=?utf-8?b?R3LDvMOfZQ==?= =?utf-8?q?M=C3=BCnchen?=", "Gr\xC3\xBC\xC3\x9F" "eM\xC3\xBCnchen"));
+    check("2047: a language tag after the character set (RFC 2231)", dec("=?UTF-8*en?Q?Hello_=C3=BC?=", "Hello \xC3\xBC"));
+    check("2047: a UTF-8 character split between two words is joined", dec("=?UTF-8?Q?a=C3?= =?UTF-8?Q?=BCb?=", "a\xC3\xBCb"));
+    check("2047: a word of another character set ends the joining", dec("=?UTF-8?Q?=C3?= =?ISO-8859-1?Q?=FC?=", "\xEF\xBF\xBD\xC3\xBC"));
+    check("2047: windows-1252 word", dec("=?windows-1252?Q?=80_5?=", "\xE2\x82\xAC 5"));
+    check("2047: text around and between words stays", dec("Re: =?UTF-8?B?w6TDtg==?= - done", "Re: \xC3\xA4\xC3\xB6 - done"));
+    check("2047: an unknown character set stays as it is", dec("=?koi8-r?Q?abc?=", "=?koi8-r?Q?abc?="));
+    check("2047: an unknown encoding letter stays", dec("=?UTF-8?X?abc?=", "=?UTF-8?X?abc?="));
+    check("2047: base64 that is not valid stays", dec("=?UTF-8?B?!!!?=", "=?UTF-8?B?!!!?="));
+    check("2047: a word that is not finished stays", dec("=?UTF-8?Q?abc", "=?UTF-8?Q?abc"));
+    check("2047: a word with a blank inside stays", dec("=?UTF-8?Q?a b?=", "=?UTF-8?Q?a b?="));
+    check("2047: a word glued to text is no word", dec("x=?UTF-8?Q?a?=", "x=?UTF-8?Q?a?=") && dec("=?UTF-8?Q?a?=x", "=?UTF-8?Q?a?=x"));
+    check("2047: invalid bytes in a UTF-8 word become U+FFFD", dec("=?UTF-8?Q?a=FFb?=", "a\xEF\xBF\xBD" "b"));
+    check("2047: empty text, a word with no text", dec("", "") && dec("=?UTF-8?Q??=", ""));
+    check("2047: ordinary text with = and ? is untouched", dec("what=? a ?= mess =?", "what=? a ?= mess =?"));
+
+    // ---- RFC 2047 words: encoding ------------------------------------------------------------------------------------------------------------------------
+    mail.Buf x1;
+    mail.encodeWords("Hello world", 11, &x1);
+    check("encode: ASCII text is unchanged", is(&x1, "Hello world"));
+    x1.release();
+    mail.Buf x2;
+    mail.encodeWords("Gr\xC3\xBC\xC3\x9F" "e", 7, &x2);
+    check("encode: Grusse is one B word", is(&x2, "=?UTF-8?B?R3LDvMOfZQ==?="));
+    x2.release();
+    mail.Buf x3;
+    mail.encodeWords("Hello Gr\xC3\xBC\xC3\x9F" "e and bye", 21, &x3);
+    check("encode: only the words that need it are encoded", is(&x3, "Hello =?UTF-8?B?R3LDvMOfZQ==?= and bye"));
+    x3.release();
+    mail.Buf x4;
+    mail.encodeWords("caf\xC3\xA9 au lait", 13, &x4);
+    check("encode: only the word with the accent is encoded (B when that is shorter)", is(&x4, "=?UTF-8?B?Y2Fmw6k=?= au lait"));
+    x4.release();
+    mail.Buf x4b;
+    mail.encodeWords("Z\xC3\xBCrich", 7, &x4b);
+    check("encode: mostly ASCII takes Q when that is shorter", is(&x4b, "=?UTF-8?Q?Z=C3=BCrich?="));
+    x4b.release();
+    mail.Buf x5;
+    mail.encodeWords("a =?x?q?y?= b", 13, &x5);
+    check("encode: text that looks like an encoded word is encoded", dec(x5.text(), "a =?x?q?y?= b") && x5.len > 13);
+    x5.release();
+    mail.Buf x6;
+    mail.encodeWords("Dr. M\xC3\xBCller", 11, &x6, true);
+    check("encode (whole): the whole name is encoded, no plain 'Dr.' word is left", dec(x6.text(), "Dr. M\xC3\xBCller") && x6.d[0] == '=' && x6.d[x6.len - 1] == '=');
+    x6.release();
+    // long texts of every script: each word at most 75 characters, each decodes alone to valid UTF-8, all together to the original
+    char* texts[4];
+    texts[0] = "Ein sehr langer Betreff mit \xC3\x9Cml\xC3\xA4uten und vielen W\xC3\xB6rtern, der auf mehrere Zeilen verteilt werden muss, weil er so lang ist";
+    texts[1] = "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x81\xAE\xE3\x83\x86\xE3\x82\xAD\xE3\x82\xB9\xE3\x83\x88\xE3\x81\xA7\xE3\x81\x99\xE3\x80\x82\xE3\x81\xA8\xE3\x81\xA6\xE3\x82\x82\xE9\x95\xB7\xE3\x81\x84\xE3\x83\x86\xE3\x82\xAD\xE3\x82\xB9\xE3\x83\x88\xE3\x81\xA7\xE3\x81\x99\xE3\x80\x82\xE3\x81\xA8\xE3\x81\xA6\xE3\x82\x82\xE9\x95\xB7\xE3\x81\x84";
+    texts[2] = "emoji \xF0\x9F\x98\x80\xF0\x9F\x98\x81\xF0\x9F\x98\x82\xF0\x9F\x98\x83\xF0\x9F\x98\x84\xF0\x9F\x98\x85\xF0\x9F\x98\x86\xF0\x9F\x98\x87\xF0\x9F\x98\x88\xF0\x9F\x98\x89\xF0\x9F\x98\x8A\xF0\x9F\x98\x8B\xF0\x9F\x98\x8C\xF0\x9F\x98\x8D\xF0\x9F\x98\x8E\xF0\x9F\x98\x8F\xF0\x9F\x98\x90 end";
+    texts[3] = "\xC3\xA4";
+    for (int t = 0; t < 4; t++) {
+        mail.Buf x;
+        int tn = strlen(texts[t]);
+        mail.encodeWords(texts[t], tn, &x);
+        // split into words
+        bool wordsOk = true;
+        int nwords = 0;
+        int i = 0;
+        while (i < x.len) {
+            int a = i;
+            while (i < x.len && x.d[i] != ' ') i++;
+            if (i - a > 75) wordsOk = false;
+            if (x.d[a] == '=' && x.d[a + 1] == '?') {
+                nwords++;
+                mail.Buf one;
+                mail.decodeWords(&x.d[a], i - a, &one);
+                if (!mail.utf8Valid(one.d, one.len) || one.len == 0) wordsOk = false;
+                one.release();
+            }
+            while (i < x.len && x.d[i] == ' ') i++;
+        }
+        mail.Buf back;
+        mail.decodeWords(x.d, x.len, &back);
+        char nm[100];
+        format(&nm[0], 100, "encode: text %d: words of at most 75 characters, each valid alone, decodes to the original", t, 0, 0, 0, 0, 0);
+        check(&nm[0], wordsOk && back.len == tn && memcmp(back.d, texts[t], tn) == 0 && nwords >= 1);
+        x.release();
+        back.release();
+    }
+
+    // ---- folding -------------------------------------------------------------------------------------------------------------------------------------------
+    mail.Buf f1;
+    check("fold: a short field is on one line", mail.foldHeader(&f1, "Subject", "Hello", 5) && is(&f1, "Subject: Hello\r\n"));
+    f1.release();
+    char* longv = "The quick brown fox jumps over the lazy dog and then the quick brown fox jumps over the lazy dog again and again and again until the end";
+    mail.Buf f2;
+    mail.foldHeader(&f2, "Subject", longv, strlen(longv));
+    bool lineOk = true;
+    int ln = 0;
+    int nl = 0;
+    for (int i = 0; i < f2.len; i++) {
+        if (f2.d[i] == 13) { if (ln > 78) lineOk = false; ln = 0; nl++; i++; } else ln++;
+    }
+    mail.Buf unf;
+    for (int i = 0; i < f2.len; i++) {
+        if (f2.d[i] == 13 && f2.d[i + 1] == 10) { i++; continue; }
+        unf.addByte(f2.d[i]);
+    }
+    check("fold: a long field is broken at blanks, no line over 78", lineOk && nl == 2 && f2.d[f2.len - 2] == 13);
+    check("fold: unfolding gives the field back", is(&unf, "Subject: The quick brown fox jumps over the lazy dog and then the quick brown fox jumps over the lazy dog again and again and again until the end"));
+    f2.release();
+    unf.release();
+    mail.Buf f3;
+    mail.foldHeader(&f3, "X", "a  b   c", 8);
+    check("fold: the blanks that are there stay", is(&f3, "X: a  b   c\r\n"));
+    f3.release();
+    mail.Buf f4;
+    mail.foldHeader(&f4, "Subject", "=?UTF-8?B?R3LDvMOfZQ==?= =?UTF-8?B?R3LDvMOfZQ==?= =?UTF-8?B?R3LDvMOfZQ==?=", 74);
+    check("fold: three encoded words go on three lines or less, none over 78", f4.len > 0 && f4.d[f4.len - 1] == 10);
+    f4.release();
+    char* hugeWord = alloc(3000);
+    for (int i = 0; i < 2500; i++) hugeWord[i] = 'x';
+    mail.Buf f5;
+    mail.foldHeader(&f5, "X-Huge", hugeWord, 2500);
+    int maxLine = 0;
+    ln = 0;
+    for (int i = 0; i < f5.len; i++) {
+        if (f5.d[i] == 13) { if (ln > maxLine) maxLine = ln; ln = 0; i++; } else ln++;
+    }
+    check("fold: a word of 2500 bytes is cut so that no line passes 998", maxLine <= 998 && maxLine >= 900);
+    f5.release();
+    mail.Buf f6;
+    check("fold: a value with CR or LF is refused, nothing is written", !mail.foldHeader(&f6, "Subject", "a\r\nBcc: x@y.z", 13) && f6.len == 0 && !mail.foldHeader(&f6, "Subject", "a\nb", 3));
+    check("fold: a bad field name is refused", !mail.foldHeader(&f6, "Bad Name", "x", 1) && !mail.foldHeader(&f6, "A:B", "x", 1) && !mail.foldHeader(&f6, "", "x", 1) && f6.len == 0);
+    check("header names and values", mail.validHeaderName("X-Mailer") && !mail.validHeaderName("X Mailer") && !mail.validHeaderName("") && mail.validHeaderValue("a b") && !mail.validHeaderValue("a\rb") && !mail.validHeaderValue("a\nb"));
+
+    // ---- header blocks -----------------------------------------------------------------------------------------------------------------------------------------
+    char* hb = "From: ann@example.org\r\nSubject: one\r\n two\r\n\tthree\r\nTo:  bob@example.org  \r\nX-Empty:\r\nReceived: a\r\nReceived: b\r\n\r\nbody text";
+    mail.Headers h;
+    int used = 0;
+    int defects = mail.parseHeaders(hb, strlen(hb), &h, &used, 500, 262144, 65536);
+    check("headers: count, the body starts behind the empty line", defects == 0 && h.count == 6 && used == strlen(hb) - 9 && memcmp(&hb[used], "body text", 9) == 0);
+    check("headers: a folded value is unfolded, the blanks stay", streq(h.get("Subject"), "one two\tthree"));
+    check("headers: blanks around a value are trimmed, an empty value is empty", streq(h.get("to"), "bob@example.org") && streq(h.get("X-EMPTY"), ""));
+    check("headers: names in any case, repeated fields", h.countOf("received") == 2 && streq(h.items[h.indexOf("Received", 0)]->value, "a") && streq(h.items[h.indexOf("Received", h.indexOf("Received", 0) + 1)]->value, "b"));
+    check("headers: remove and set", h.remove("RECEIVED") == 2 && h.get("Received") == null && h.set("Subject", "new") && streq(h.get("Subject"), "new") && h.countOf("Subject") == 1);
+    check("headers: add refuses CR, LF and bad names", !h.add("X-A", "a\r\nb") && !h.add("X A", "b") && h.add("X-Ok", "fine") && streq(h.get("x-ok"), "fine"));
+    h.dispose();
+    char* hb2 = "A: 1\nB: 2\n continued\n\nrest";
+    mail.Headers h2;
+    defects = mail.parseHeaders(hb2, strlen(hb2), &h2, &used, 500, 262144, 65536);
+    check("headers: bare LF line ends are read", defects == 0 && h2.count == 2 && streq(h2.get("B"), "2 continued") && streq(&hb2[used], "rest"));
+    h2.dispose();
+    char* hb3 = "From bob@example.org Fri Nov 13 14:30:00 2026\nSubject: mbox\n\nbody";
+    mail.Headers h3;
+    defects = mail.parseHeaders(hb3, strlen(hb3), &h3, &used, 500, 262144, 65536);
+    check("headers: the From line of an mbox file is skipped", defects == 0 && h3.count == 1 && streq(h3.get("Subject"), "mbox"));
+    h3.dispose();
+    char* hb4 = "Subject: x\r\nthis is not a header\r\nmore";
+    mail.Headers h4;
+    defects = mail.parseHeaders(hb4, strlen(hb4), &h4, &used, 500, 262144, 65536);
+    check("headers: a line without a colon ends the block (D_BAD_HEADER), the body starts there", (defects & mail.D_BAD_HEADER) != 0 && h4.count == 1 && memcmp(&hb4[used], "this is not", 11) == 0);
+    h4.dispose();
+    mail.Headers h5;
+    defects = mail.parseHeaders("", 0, &h5, &used, 500, 262144, 65536);
+    check("headers: no input, no fields", defects == 0 && h5.count == 0 && used == 0);
+    h5.dispose();
+    char* many = alloc(20000);
+    int mp = 0;
+    for (int i = 0; i < 1000; i++) mp = mp + format(&many[mp], 40, "X-%d: v\r\n", i, 0, 0, 0, 0, 0);
+    mp = mp + format(&many[mp], 40, "\r\nBODY", 0, 0, 0, 0, 0, 0);
+    mail.Headers h6;
+    defects = mail.parseHeaders(many, mp, &h6, &used, 100, 262144, 65536);
+    check("headers: more than maxHeaders fields: 100 are kept, the rest skipped, D_BAD_HEADER, the body is still found", h6.count == 100 && (defects & mail.D_BAD_HEADER) != 0 && memcmp(&many[used], "BODY", 4) == 0);
+    h6.dispose();
+    mail.Headers h7;
+    defects = mail.parseHeaders(many, mp, &h7, &used, 5000, 2000, 65536);
+    check("headers: a block over maxBytes is cut (the fields before it are kept) and the body still found", h7.count > 100 && h7.count < 400 && (defects & mail.D_BAD_HEADER) != 0 && memcmp(&many[used], "BODY", 4) == 0);
+    h7.dispose();
+    char* longval = alloc(5000);
+    memcpy(longval, "S: ", 3);
+    for (int i = 0; i < 4000; i++) longval[3 + i] = 'y';
+    memcpy(&longval[4003], "\r\n\r\n", 4);
+    mail.Headers h8;
+    defects = mail.parseHeaders(longval, 4007, &h8, &used, 500, 262144, 1000);
+    check("headers: one value is cut at maxLine", h8.count == 1 && strlen(h8.get("S")) <= 1000 && strlen(h8.get("S")) >= 998);
+    h8.dispose();
+
+    // ---- addresses (RFC 5322 appendix A) ------------------------------------------------------------------------------------------------------------------------
+    mail.AddressList l1;
+    check("addr: \"Joe Q. Public\" <john.q.public@example.com>", readList("\"Joe Q. Public\" <john.q.public@example.com>", &l1) == 1 && addrIs(&l1, 0, "Joe Q. Public", "john.q.public@example.com"));
+    l1.dispose();
+    mail.AddressList l2;
+    check("addr: Mary Smith <mary@x.test>, jdoe@example.org, Who? <one@y.test>", readList("Mary Smith <mary@x.test>, jdoe@example.org, Who? <one@y.test>", &l2) == 3
+        && addrIs(&l2, 0, "Mary Smith", "mary@x.test") && addrIs(&l2, 1, "", "jdoe@example.org") && addrIs(&l2, 2, "Who?", "one@y.test"));
+    l2.dispose();
+    mail.AddressList l3;
+    check("addr: <boss@nil.test>, \"Giant; \\\"Big\\\" Box\" <sysservices@example.net>", readList("<boss@nil.test>, \"Giant; \\\"Big\\\" Box\" <sysservices@example.net>", &l3) == 2
+        && addrIs(&l3, 0, "", "boss@nil.test") && addrIs(&l3, 1, "Giant; \"Big\" Box", "sysservices@example.net"));
+    l3.dispose();
+    mail.AddressList l4;
+    check("addr: a group, flattened, Address.group says which", readList("A Group:Ed Jones <c@a.test>,joe@where.test,John <jdoe@one.test>;", &l4) == 3 && addrIs(&l4, 0, "Ed Jones", "c@a.test")
+        && addrIs(&l4, 2, "John", "jdoe@one.test") && streq(l4.items[1]->group, "A Group"));
+    l4.dispose();
+    mail.AddressList l5;
+    check("addr: an empty group (Undisclosed recipients:;) has no addresses", readList("Undisclosed recipients:;", &l5) == 0 && l5.count == 0);
+    l5.dispose();
+    mail.AddressList l6;
+    check("addr: a group and an address after it", readList("Team: a@x.test, b@x.test; c@y.test", &l6) == 3 && l6.items[2]->group == null && streq(l6.items[0]->group, "Team"));
+    l6.dispose();
+    mail.AddressList l7;
+    check("addr: comments (Pete(A nice \\) chap) <pete(his account)@silly.test(his host)>)", readList("Pete(A nice \\) chap) <pete(his account)@silly.test(his host)>", &l7) == 1 && addrIs(&l7, 0, "Pete", "pete@silly.test"));
+    l7.dispose();
+    mail.AddressList l8;
+    check("addr: the old form address (Name)", readList("jdoe@example.org (John Doe), kate@x.test", &l8) == 2 && addrIs(&l8, 0, "John Doe", "jdoe@example.org") && addrIs(&l8, 1, "", "kate@x.test"));
+    l8.dispose();
+    mail.AddressList l9;
+    check("addr: a quoted local part keeps its quotes, a domain literal is fine", readList("\"john doe\"@example.org, user@[192.168.0.1], <\"a\\\"b\"@x.test>", &l9) == 3
+        && addrIs(&l9, 0, "", "\"john doe\"@example.org") && addrIs(&l9, 1, "", "user@[192.168.0.1]") && addrIs(&l9, 2, "", "\"a\\\"b\"@x.test"));
+    l9.dispose();
+    mail.AddressList l10;
+    check("addr: empty elements are skipped, blanks and line breaks around are fine", readList(" , a@x.test ,,\r\n b@y.test, ", &l10) == 2);
+    l10.dispose();
+    mail.AddressList l11;
+    check("addr: an obsolete route in front of the address is dropped", readList("<@a.test,@b.test:x@c.test>", &l11) == 1 && addrIs(&l11, 0, "", "x@c.test"));
+    l11.dispose();
+    mail.AddressList l12;
+    check("addr: display names with encoded words are decoded", readList("=?UTF-8?B?SsO8cmdlbg==?= M\xC3\xBCller <j@x.test>, \"=?ISO-8859-1?Q?Andr=E9?=\" <a@x.test>", &l12) == 2
+        && addrIs(&l12, 0, "J\xC3\xBCrgen M\xC3\xBCller", "j@x.test") && addrIs(&l12, 1, "Andr\xC3\xA9", "a@x.test"));
+    l12.dispose();
+    char* badAddrs[16];
+    badAddrs[0] = "a@";
+    badAddrs[1] = "@b.test";
+    badAddrs[2] = "a b@c.test";
+    badAddrs[3] = "<a@b.test";
+    badAddrs[4] = "a@b.test>";
+    badAddrs[5] = "\"unterminated <a@b.test>";
+    badAddrs[6] = "a..b@c.test";
+    badAddrs[7] = ".a@b.test";
+    badAddrs[8] = "a.@b.test";
+    badAddrs[9] = "caf\xC3\xA9@b.test";
+    badAddrs[10] = "plainword";
+    badAddrs[11] = "a@b@c.test";
+    badAddrs[12] = "a@-b.test";
+    badAddrs[13] = "a@b..test";
+    badAddrs[14] = "Name <a@b.test> trailing";
+    badAddrs[15] = "(unterminated comment a@b.test";
+    int refused = 0;
+    for (int i = 0; i < 16; i++) {
+        mail.AddressList lb;
+        if (readList(badAddrs[i], &lb) < 0) refused++; else printf("     accepted: %s\n", badAddrs[i]);
+        lb.dispose();
+    }
+    check("addr: 16 kinds of invalid address are refused", refused == 16);
+    mail.AddressList l13;
+    check("addr: more than maxCount addresses is an error", mail.parseAddressList("a@x.test, b@x.test, c@x.test", 29, &l13, 2) == -1);
+    l13.dispose();
+    char longLocal[100];
+    for (int i = 0; i < 65; i++) longLocal[i] = 'a';
+    longLocal[65] = 0;
+    char longAddr[200];
+    format(&longAddr[0], 200, "%s@x.test", &longLocal[0], 0, 0, 0, 0, 0);
+    check("addr: a local part of 65 characters is refused, 64 is fine", !mail.validAddress(&longAddr[0], strlen(&longAddr[0])) && mail.validAddress(&longAddr[1], strlen(&longAddr[1])));
+    check("addr: validAddress", mail.validAddress("a@b.test", 8) && mail.validAddress("a.b+c@d-e.f.test", 16) && mail.validAddress("a@b", 3) && !mail.validAddress("a", 1) && !mail.validAddress("", 0));
+    // formatting
+    mail.Buf a1;
+    check("format: no name is just the address", mail.formatAddress(&a1, null, "a@b.test") && is(&a1, "a@b.test") && mail.formatAddress(&a1, "", "c@d.test"));
+    a1.release();
+    mail.Buf a2;
+    mail.formatAddress(&a2, "Ann Lee", "ann@x.test");
+    check("format: a plain name", is(&a2, "Ann Lee <ann@x.test>"));
+    a2.release();
+    mail.Buf a3;
+    mail.formatAddress(&a3, "Doe, Jane \"JD\"", "jane@x.test");
+    check("format: special characters are quoted and escaped", is(&a3, "\"Doe, Jane \\\"JD\\\"\" <jane@x.test>"));
+    a3.release();
+    mail.Buf a4;
+    mail.formatAddress(&a4, "Dr. Who", "who@x.test");
+    check("format: a dot needs quotes", is(&a4, "\"Dr. Who\" <who@x.test>"));
+    a4.release();
+    mail.Buf a5;
+    mail.formatAddress(&a5, "J\xC3\xBCrgen M\xC3\xBCller", "j@x.test");
+    check("format: a UTF-8 name is encoded whole", is(&a5, "=?UTF-8?Q?J=C3=BCrgen_M=C3=BCller?= <j@x.test>") || is(&a5, "=?UTF-8?B?SsO8cmdlbiBNw7xsbGVy?= <j@x.test>"));
+    a5.release();
+    mail.Buf a6;
+    check("format: an invalid address or a name with a line break is refused", !mail.formatAddress(&a6, "x", "not an address") && !mail.formatAddress(&a6, "a\r\nBcc: v@x.test", "a@b.test") && !mail.formatAddress(&a6, "a\nb", "a@b.test") && a6.len == 0);
+    // parse(format(x)) == x
+    char* names[8];
+    names[0] = "Plain Name";
+    names[1] = "Doe, Jane";
+    names[2] = "Quote\"d and back\\slash";
+    names[3] = "J\xC3\xBCrgen \xE2\x82\xAC 5";
+    names[4] = "Dr. Who?";
+    names[5] = "=?not?q?really?=";
+    names[6] = "<angle> (paren) @at";
+    names[7] = "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xE3\x81\xAE\xE5\x90\x8D\xE5\x89\x8D";
+    int roundOk = 0;
+    for (int i = 0; i < 8; i++) {
+        mail.Buf fb;
+        mail.formatAddress(&fb, names[i], "n@x.test");
+        mail.AddressList rl;
+        if (readList(fb.text(), &rl) == 1 && addrIs(&rl, 0, names[i], "n@x.test")) roundOk++; else printf("     round trip failed for [%s]: [%s]\n", names[i], fb.text());
+        fb.release();
+        rl.dispose();
+    }
+    check("format then parse gives the name back (8 names with specials, UTF-8, encoded-word look-alikes)", roundOk == 8);
+    mail.AddressList l14;
+    readList("a@x.test, \"B, b\" <b@x.test>", &l14);
+    mail.Buf a7;
+    mail.formatAddressList(&a7, &l14);
+    check("format: a list is separated by comma and blank", is(&a7, "a@x.test, \"B, b\" <b@x.test>"));
+    a7.release();
+    l14.dispose();
+
+    // ---- Date ----------------------------------------------------------------------------------------------------------------------------------------------------
+    check("date: the epoch", fmtDate(0, 0, "Thu, 1 Jan 1970 00:00:00 +0000"));
+    check("date: 13 Nov 2026", fmtDate(1794580200, 0, "Fri, 13 Nov 2026 14:30:00 +0000"));
+    check("date: zone +0530 and -0800 (the time is shown in the zone)", fmtDate(1794580200, 330, "Fri, 13 Nov 2026 20:00:00 +0530") && fmtDate(1794580200, -480, "Fri, 13 Nov 2026 06:30:00 -0800"));
+    check("date: a date before 1970 and a leap day", fmtDate(-27723480, -210, "Thu, 13 Feb 1969 23:32:00 -0330") && fmtDate(1709226000, -300, "Thu, 29 Feb 2024 12:00:00 -0500"));
+    check("date: the zone is limited to +-23:59", fmtDate(0, 100000, "Thu, 1 Jan 1970 23:59:00 +2359"));
+    check("date parse: RFC 5322 A.1.2 (21 Nov 1997 09:55:06 -0600)", dateIs("Fri, 21 Nov 1997 09:55:06 -0600", 880127706, -360));
+    check("date parse: A.2 (1 Jul 2003 10:52:37 +0200)", dateIs("Tue, 1 Jul 2003 10:52:37 +0200", 1057049557, 120));
+    check("date parse: a comment at the end, seconds missing (13 Feb 1969 23:32 -0330 (Newfoundland Time))", dateIs("Thu, 13 Feb 1969 23:32 -0330 (Newfoundland Time)", -27723480, -210));
+    check("date parse: obsolete two digit year and GMT", dateIs("21 Nov 97 09:55:06 GMT", 880106106, 0));
+    check("date parse: zone names", dateIs("29 Feb 2024 12:00:00 EST", 1709226000, -300) && dateIs("1 Jan 2000 00:00:00 PDT", 946710000, -420) && dateIs("31 Dec 1999 23:59:59 UT", 946684799, 0));
+    check("date parse: a leap second counts as 59", dateIs("31 Dec 1999 23:59:60 +0000", 946684799, 0));
+    check("date parse: no zone is UTC, blanks and tabs between the fields", dateIs("  Fri,   13\tNov 2026  14:30:00  ", 1794580200, 0));
+    check("date parse: the day name is optional and not checked", dateIs("13 Nov 2026 14:30:00 +0000", 1794580200, 0) && dateIs("Mon, 13 Nov 2026 14:30:00 +0000", 1794580200, 0));
+    check("date parse: +1400", dateIs("1 Mar 2050 00:00:00 +1400", 2529655200, 840));
+    check("date parse: month names in any case", dateIs("13 NOV 2026 14:30:00 +0000", 1794580200, 0) && dateIs("13 nov 2026 14:30:00 +0000", 1794580200, 0));
+    check("date parse: 32 January, 29 February 2025, 31 April are refused", dateBad("32 Jan 2020 10:00:00 +0000") && dateBad("29 Feb 2025 10:00:00 +0000") && dateBad("31 Apr 2025 10:00:00 +0000"));
+    check("date parse: hour 24, minute 60, second 61 are refused", dateBad("1 Jan 2020 24:00:00 +0000") && dateBad("1 Jan 2020 10:60:00 +0000") && dateBad("1 Jan 2020 10:00:61 +0000"));
+    check("date parse: a bad month, a bad zone, junk, empty", dateBad("1 Foo 2020 10:00:00 +0000") && dateBad("1 Jan 2020 10:00:00 +9999") && dateBad("1 Jan 2020 10:00:00 +05") && dateBad("yesterday") && dateBad("") && dateBad("1 Jan 2020"));
+    check("date parse: a year before 1900, a comment that is not closed", dateBad("1 Jan 1899 10:00:00 +0000") && dateBad("1 Jan 2020 10:00:00 +0000 (x"));
+    // a round trip over many instants
+    bool dateRound = true;
+    int t = -2000000000;
+    for (int i = 0; i < 400 && dateRound; i++) {
+        char buf[64];
+        int off = (i % 7) * 60 - 180 + (i % 3) * 15;
+        mail.formatDate(t, off, &buf[0], 64);
+        int u = 0;
+        int o = 0;
+        if (!mail.parseDate(&buf[0], strlen(&buf[0]), &u, &o) || u != t || o != off) { dateRound = false; printf("     %d -> %s -> %d\n", t, &buf[0], u); }
+        t = t + 24137293 + i * 1000;
+    }
+    check("date: 400 instants from 1906 to the future survive format and parse", dateRound);
+
+    // ---- Message-ID --------------------------------------------------------------------------------------------------------------------------------------------
+    char id1[320];
+    char id2[320];
+    int n1 = mail.newMessageId("mail.example.org", &id1[0], 320);
+    mail.newMessageId("mail.example.org", &id2[0], 320);
+    check("message id: <time.random@domain>, in the form of a message id", n1 > 30 && mail.validMessageId(&id1[0], n1) && endsWith(&id1[0], "@mail.example.org>") && id1[0] == '<');
+    check("message id: two ids differ", !streq(&id1[0], &id2[0]));
+    char id3[320];
+    int n3 = mail.newMessageId("evil.org>\r\nBcc: x@y.z", &id3[0], 320);
+    check("message id: a domain with > and a line break is replaced", endsWith(&id3[0], "@localhost.localdomain>") && mail.validMessageId(&id3[0], n3));
+    char id4[320];
+    mail.newMessageId(null, &id4[0], 320);
+    check("message id: no domain is localhost.localdomain", endsWith(&id4[0], "@localhost.localdomain>"));
+    check("message id: validMessageId", mail.validMessageId("<a@b.test>", 10) && !mail.validMessageId("a@b.test", 8) && !mail.validMessageId("<a b@c.test>", 12) && !mail.validMessageId("<>", 2));
+    char id5[20];
+    int n5 = mail.newMessageId("mail.example.org", &id5[0], 20);
+    check("message id: a small buffer is not overrun", n5 == 19 && id5[19] == 0);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

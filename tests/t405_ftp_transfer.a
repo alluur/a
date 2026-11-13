@@ -1,0 +1,568 @@
+// The FTP client against the FTP server module over loopback (one thread: the server runs from net.setIdleHook), and against a scripted server for what the client
+// does on the wire. Listings in all three forms, downloads and uploads of every size (empty, every byte value, 1.5 MB), resume with REST in both directions, append, ASCII mode
+// (CRLF on the wire, LF in the files), the four ways to open a data connection (EPSV, PASV, EPRT, PORT), names and quoting, errors (missing files, a directory instead of a file,
+// refused uploads, the size limit), the transcript byte for byte, and the client against a server that lies: a PASV reply with a foreign address, EPSV refused, a greeting 120,
+// a connection that is cut in a transfer, a data connection that stays silent, a listing that never ends.
+import ftp;
+import ftpd;
+import net;
+import netio;
+import asys;
+import mail;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+ftpd.Server* srv;
+char root[200];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+void rmTree(char* path) {
+    asys.DirList dl;
+    if (asys.listDir(path, &dl) < 0) return;
+    for (int i = 0; i < dl.count; i++) {
+        char sub[400];
+        format(&sub[0], 400, "%s/%s", path, dl.name(i), 0, 0, 0, 0);
+        asys.Stat st;
+        if (asys.lstat(&sub[0], &st) >= 0 && st.isDir()) rmTree(&sub[0]); else asys.unlink(&sub[0]);
+    }
+    dl.dispose();
+    asys.rmdir(path);
+}
+
+char* qtext(netio.Queue* q) {
+    q->reserve(1);
+    char* d = q->data();
+    d[q->pending()] = 0;
+    return d;
+}
+
+char* path(char* rel) {
+    char* r = alloc(500);
+    format(r, 500, "%s/%s", &root[0], rel, 0, 0, 0, 0);
+    return r;
+}
+
+void put(char* rel, char* data, int n) { asys.writeFile(path(rel), data, n); }
+
+char* slurp(char* rel, int* n) {
+    int len = 0;
+    char* d = asys.readFile(path(rel), &len, 100000000, null);
+    if (n != null) *n = len;
+    return d;
+}
+
+bool fileIs(char* rel, char* want, int n) {
+    int len = 0;
+    char* d = slurp(rel, &len);
+    return d != null && len == n && (n == 0 || memcmp(d, want, n) == 0);
+}
+
+char* pattern(int n, int seed) {
+    char* p = alloc(n + 1);
+    int s = seed;
+    for (int i = 0; i < n; i++) { s = s * 1103515245 + 12345; p[i] = (s >> 16) & 255; }
+    return p;
+}
+
+ftp.Options* opts() {
+    ftp.Options* o = ftp.newOptions();
+    o->username = "ann";
+    o->password = "secret";
+    o->authTls = ftp.STARTTLS_NEVER;
+    o->record = true;
+    o->commandTimeoutMs = 5000;
+    o->dataTimeoutMs = 5000;
+    o->connectTimeoutMs = 5000;
+    o->now = 1794580200;
+    return o;
+}
+
+ftp.Client* login(ftp.Options* o) {
+    ftp.Client* c = ftp.newClient("127.0.0.1", srv->port, o);
+    if (!c->connect()) { printf("     connect: %s\n", c->error); }
+    return c;
+}
+
+// ---- a scripted server for the wire tests --------------------------------------------------------------------------------------------------------------
+int lsn = -1;
+int conn = -1;
+int dlsn = -1;                  // the data listener
+int dconn = -1;
+mail.Buf rx;
+mail.Buf unit;
+char* script[24];
+int nscript = 0;
+int spos = 0;
+char* dataToSend = null;
+int dataLen = 0;
+int dataSent = 0;
+bool dataSilent = false;
+bool dataForever = false;
+
+void sendRaw(int fd, char* text, int n) {
+    int off = 0;
+    int t0 = millis();
+    while (off < n && millis() - t0 < 2000) {
+        int r = net.sendSome(fd, &text[off], n - off);
+        if (r < 0) return;
+        off = off + r;
+    }
+}
+
+void answer() {
+    if (spos >= nscript) return;
+    char* a = script[spos];
+    spos++;
+    if (streq(a, "<CLOSE>")) { net.rawClose(conn); conn = -1; return; }
+    if (streq(a, "<SILENT>")) return;
+    if (contains(a, "%P")) {
+        // the data port of the fake data listener
+        char buf[300];
+        int dp = net.localPort(dlsn);
+        mail.Buf b;
+        for (int i = 0; a[i] != 0; i++) {
+            if (a[i] == '%' && startsWith(&a[i], "%PORT%")) { char t[12]; format(&t[0], 12, "%d", dp, 0, 0, 0, 0, 0); b.addText(&t[0]); i = i + 5; }
+            else if (a[i] == '%' && startsWith(&a[i], "%P1%")) { char t[12]; format(&t[0], 12, "%d", dp / 256, 0, 0, 0, 0, 0); b.addText(&t[0]); i = i + 3; }
+            else if (a[i] == '%' && startsWith(&a[i], "%P2%")) { char t[12]; format(&t[0], 12, "%d", dp % 256, 0, 0, 0, 0, 0); b.addText(&t[0]); i = i + 3; }
+            else b.addByte(a[i]);
+        }
+        sendRaw(conn, b.text(), b.len);
+        b.release();
+        return;
+    }
+    sendRaw(conn, a, strlen(a));
+}
+
+int fakeHook() {
+    if (lsn < 0) return 0;
+    if (conn < 0) {
+        int c = net.acceptSome(lsn);
+        if (c >= 0) { conn = c; net.setNonBlocking(c, true); answer(); }
+    } else {
+        char buf[4096];
+        int n = net.recvSome(conn, &buf[0], 4096);
+        if (n == 0) { net.rawClose(conn); conn = -1; }
+        else if (n > 0) {
+            rx.add(&buf[0], n);
+            for (int i = 0; i < n; i++) {
+                unit.addByte(buf[i]);
+                if (buf[i] == 10) { unit.len = 0; answer(); }
+            }
+        }
+    }
+    if (dlsn >= 0) {
+        if (dconn < 0) {
+            int c = net.acceptSome(dlsn);
+            if (c >= 0) { dconn = c; net.setNonBlocking(c, true); dataSent = 0; }
+        } else if (!dataSilent) {
+            if (dataForever) {
+                char junk[1000];
+                for (int i = 0; i < 1000; i++) junk[i] = 'x';
+                net.sendSome(dconn, &junk[0], 1000);
+            } else if (dataToSend != null) {
+                if (dataSent < dataLen) {
+                    int r = net.sendSome(dconn, &dataToSend[dataSent], dataLen - dataSent);
+                    if (r > 0) dataSent = dataSent + r;
+                }
+                if (dataSent >= dataLen) { net.rawClose(dconn); dconn = -1; dlsn = dlsn; dataToSend = null; }
+            }
+        }
+    }
+    return 0;
+}
+
+void say(char* a, char* b = null, char* c = null, char* d = null, char* e = null, char* f = null, char* g = null, char* h = null, char* i = null, char* j = null) {
+    nscript = 0;
+    char* all[10];
+    all[0] = a; all[1] = b; all[2] = c; all[3] = d; all[4] = e; all[5] = f; all[6] = g; all[7] = h; all[8] = i; all[9] = j;
+    for (int x = 0; x < 10; x++) { if (all[x] != null) { script[nscript] = all[x]; nscript++; } }
+}
+
+void fakeReset() {
+    if (conn >= 0) { net.rawClose(conn); conn = -1; }
+    if (dconn >= 0) { net.rawClose(dconn); dconn = -1; }
+    rx.len = 0;
+    unit.len = 0;
+    nscript = 0;
+    spos = 0;
+    dataToSend = null;
+    dataSilent = false;
+    dataForever = false;
+}
+
+char* sent() { return rx.text(); }
+
+int main() {
+    char rnd[4];
+    asys.randomBytes(&rnd[0], 4);
+    format(&root[0], 200, "build/tests/t405-%d", (rnd[0] & 255) * 65536 + (rnd[1] & 255) * 256 + (rnd[2] & 255), 0, 0, 0, 0);
+    asys.mkdirs(&root[0]);
+    char sub[500];
+    format(&sub[0], 500, "%s/pub", &root[0], 0, 0, 0, 0, 0);
+    asys.mkdirs(&sub[0]);
+    format(&sub[0], 500, "%s/ro", &root[0], 0, 0, 0, 0, 0);
+    asys.mkdirs(&sub[0]);
+    srv = ftpd.newServer();
+    srv->addUser("ann", "secret", &root[0], ftpd.P_ALL);
+    srv->addUser("reader", "pw", &root[0], ftpd.P_READ | ftpd.P_LIST);
+    srv->maxUpload = 400000;
+    srv->fakeNow = 1794580200;
+    srv->dataTimeoutMs = 3000;
+    srv->listenOn("127.0.0.1", 0, null);
+    net.setIdleHook(hook);
+
+    put("hello.txt", "hello world\n", 12);
+    put("empty.bin", "", 0);
+    char* allBytes = alloc(256);
+    for (int i = 0; i < 256; i++) allBytes[i] = i;
+    put("all.bin", allBytes, 256);
+    char* big = pattern(1500000, 7);
+    put("pub/big.bin", big, 1500000);
+    put("pub/name with spaces.txt", "x", 1);
+
+    // ---- login and the first lines, byte for byte -----------------------------------------------------------------------------------------------------
+    ftp.Options* o = opts();
+    ftp.Client* c = login(o);
+    check("connect and login", c->isOpen() && c->loggedIn && c->binary && c->hasMlsd && c->hasSize && c->hasMdtm && c->hasRest && c->hasUtf8);
+    check("transcript: the greeting, USER, PASS (the password is not in it), FEAT, TYPE", startsWith(c->transcript(), "S: 220 FTP server ready.\nC: USER ann\nS: 331 Please specify the password.\nC: PASS ****\nS: 230 Login successful.\nC: FEAT\nS: 211-Features:\nS:  EPSV\n")
+        && !contains(c->transcript(), "secret") && contains(c->transcript(), "C: TYPE I\nS: 200 Switching to Binary mode.\n"));
+    char* pwd = c->pwd();
+    check("PWD is the root", pwd != null && streq(pwd, "/"));
+    free(pwd);
+    check("CWD, PWD, CDUP", c->cwd("pub") && streq(c->pwd(), "/pub") && c->cdup() && streq(c->pwd(), "/") && !c->cwd("nothing") && contains(c->error, "550"));
+    check("a CWD to a file or above the root", !c->cwd("hello.txt") && c->cwd("/pub/..") && c->cwd("../../..") && streq(c->pwd(), "/"));
+
+    // ---- listings ------------------------------------------------------------------------------------------------------------------------------------------
+    ftp.EntryList* l = c->listEntries("");
+    check("listEntries (MLSD): the entries of the root", l != null && l->count == 5 && l->find("pub") != null && l->find("pub")->kind == ftp.K_DIR && l->find("hello.txt")->size == 12 && l->find("hello.txt")->kind == ftp.K_FILE && l->find("empty.bin")->size == 0);
+    check("... with dates (the file was made a moment ago)", l != null && l->find("hello.txt")->mtime > 1700000000 && l->find("hello.txt")->mtime <= 4000000000);
+    l->dispose();
+    l = c->listEntries("pub");
+    check("listEntries of a subdirectory: names with blanks", l != null && l->count == 2 && l->find("name with spaces.txt") != null && l->find("big.bin")->size == 1500000);
+    l->dispose();
+    netio.Queue q;
+    check("LIST: ls -l lines, the file names at the end", c->list("", &q) && q.pending() > 100 && contains(qtext(&q), " ftp      ftp   ") && contains(qtext(&q), "hello.txt\r\n"));
+    q.release();
+    char* names = c->nlst("pub");
+    check("NLST: the names, one per line", names != null && contains(names, "big.bin\r\n") && contains(names, "name with spaces"));
+    free(names);
+    // a UTF-8 name (not where the file system takes names in another encoding: Windows)
+    bool utf8Ok = true;
+    if (!asys.isWindows()) {
+        put("pub/\xC3\xA4\xE2\x82\xAC name.txt", "x", 1);
+        l = c->listEntries("pub");
+        utf8Ok = l != null && l->find("\xC3\xA4\xE2\x82\xAC name.txt") != null;
+        if (l != null) l->dispose();
+        asys.unlink(path("pub/\xC3\xA4\xE2\x82\xAC name.txt"));
+    }
+    check("a UTF-8 name in a listing", utf8Ok);
+    ftp.Options* o2 = opts();
+    ftp.Client* c2 = login(o2);
+    c2->hasMlsd = false;
+    l = c2->listEntries("pub");
+    check("listEntries without MLSD (LIST, ls -l format) gives the same entries", l != null && l->count == 2 && l->find("big.bin")->size == 1500000 && l->find("big.bin")->kind == ftp.K_FILE && l->find("big.bin")->mtime > 1700000000);
+    l->dispose();
+    c2->quit();
+    c2->dispose();
+    l = c->listEntries("nothing");
+    check("a directory that does not exist: null, 550", l == null && contains(c->error, "550"));
+    format(&sub[0], 500, "%s/pub/empty", &root[0], 0, 0, 0, 0, 0);
+    asys.mkdirs(&sub[0]);
+    l = c->listEntries("pub/empty");
+    check("an empty directory: an empty list", l != null && l->count == 0);
+    l->dispose();
+    for (int i = 0; i < 1500; i++) {
+        char nm[100];
+        format(&nm[0], 100, "many/file%04d.txt", i, 0, 0, 0, 0, 0);
+        if (i == 0) { format(&sub[0], 500, "%s/many", &root[0], 0, 0, 0, 0, 0); asys.mkdirs(&sub[0]); }
+        put(&nm[0], "x", 1);
+    }
+    l = c->listEntries("many");
+    check("a directory with 1500 files (about 100 KB of listing)", l != null && l->count == 1500 && streq(l->get(0)->name, "file0000.txt") && streq(l->get(1499)->name, "file1499.txt"));
+    l->dispose();
+
+    // ---- downloads -------------------------------------------------------------------------------------------------------------------------------------------
+    int n = 0;
+    char* d = c->retrieveAll("hello.txt", &n, 1000);
+    check("retrieveAll: a small file", d != null && n == 12 && memcmp(d, "hello world\n", 12) == 0 && d[12] == 0);
+    free(d);
+    d = c->retrieveAll("empty.bin", &n, 1000);
+    check("retrieveAll: an empty file", d != null && n == 0);
+    free(d);
+    d = c->retrieveAll("all.bin", &n, 1000);
+    check("retrieveAll: every byte value", d != null && n == 256 && memcmp(d, allBytes, 256) == 0);
+    free(d);
+    d = c->retrieveAll("pub/big.bin", &n, 2000000);
+    check("retrieveAll: 1.5 MB", d != null && n == 1500000 && memcmp(d, big, 1500000) == 0);
+    free(d);
+    d = c->retrieveAll("pub/big.bin", &n, 100000);
+    check("retrieveAll: over the limit fails (the connection stays usable)", d == null && contains(c->error, "bigger than the limit") && c->noop());
+    d = c->retrieveAll("nothing.txt", &n, 1000);
+    check("retrieveAll: a file that does not exist: null, 550, the connection is fine", d == null && contains(c->error, "550") && c->isOpen() && c->noop());
+    d = c->retrieveAll("pub", &n, 1000);
+    check("retrieveAll: a directory is refused", d == null && contains(c->error, "550"));
+    char dl1[300];
+    format(&dl1[0], 300, "%s/dl.bin", &root[0], 0, 0, 0, 0, 0);
+    check("download to a file: 1.5 MB", c->download("pub/big.bin", &dl1[0], false));
+    int dn = 0;
+    char* dd = asys.readFile(&dl1[0], &dn, 100000000, null);
+    check("... the file is identical", dd != null && dn == 1500000 && memcmp(dd, big, 1500000) == 0);
+    // resume: the first 700000 bytes are there already
+    asys.writeFile(&dl1[0], big, 700000);
+    check("download with resume: the rest is added (REST 700000)", c->download("pub/big.bin", &dl1[0], true));
+    dd = asys.readFile(&dl1[0], &dn, 100000000, null);
+    check("... and the file is whole", dd != null && dn == 1500000 && memcmp(dd, big, 1500000) == 0 && contains(c->transcript(), "C: REST 700000\nS: 350 Restart position accepted (700000).\n"));
+    check("download with resume of a file that is complete: nothing is sent, success", c->download("pub/big.bin", &dl1[0], true));
+    asys.writeFile(&dl1[0], big, 1600000);
+    check("download with resume of a local file that is longer than the remote one: REST is refused (554)", !c->download("pub/big.bin", &dl1[0], true) && contains(c->error, "554"));
+    asys.unlink(&dl1[0]);
+
+    // ---- uploads -------------------------------------------------------------------------------------------------------------------------------------------
+    check("store: a small file", c->store("up1.txt", "uploaded\n", 9) && fileIs("up1.txt", "uploaded\n", 9));
+    check("store: an empty file", c->store("up2.bin", "", 0) && fileIs("up2.bin", "", 0));
+    check("store: every byte value", c->store("up3.bin", allBytes, 256) && fileIs("up3.bin", allBytes, 256));
+    check("store: replaces a file that is there", c->store("up1.txt", "new\n", 4) && fileIs("up1.txt", "new\n", 4));
+    check("append: adds to it", c->append("up1.txt", "more\n", 5) && fileIs("up1.txt", "new\nmore\n", 9));
+    check("append to a file that is not there makes it", c->append("up4.txt", "first\n", 6) && fileIs("up4.txt", "first\n", 6));
+    char* mid = pattern(300000, 3);
+    check("store: 300000 bytes (the limit of the server is 400000)", c->store("up5.bin", mid, 300000) && fileIs("up5.bin", mid, 300000));
+    check("store: over the limit: 552 and the connection stays usable", !c->store("up6.bin", big, 500000) && contains(c->error, "552") && c->noop());
+    check("store: into a directory that does not exist, over a directory", !c->store("nodir/x.txt", "x", 1) && !c->store("pub", "x", 1) && c->noop());
+    char up[300];
+    format(&up[0], 300, "%s/local.bin", &root[0], 0, 0, 0, 0, 0);
+    asys.writeFile(&up[0], big, 1000000);
+    check("upload from a file: 1 MB would go over the limit (552); the part that came stays", !c->upload(&up[0], "up7.bin", false) && contains(c->error, "552"));
+    asys.writeFile(&up[0], mid, 300000);
+    check("upload from a file: 300000 bytes", c->upload(&up[0], "up8.bin", false) && fileIs("up8.bin", mid, 300000));
+    put("up9.bin", mid, 100000);
+    check("upload with resume: the server has 100000 bytes (SIZE), the rest is sent after REST", c->upload(&up[0], "up9.bin", true) && fileIs("up9.bin", mid, 300000) && contains(c->transcript(), "C: REST 100000\n"));
+    asys.unlink(&up[0]);
+    check("upload of a local file that does not exist", !c->upload("build/tests/does-not-exist", "x", false) && contains(c->error, "cannot open the local file"));
+
+    // ---- ASCII mode ------------------------------------------------------------------------------------------------------------------------------------------
+    put("text.txt", "one\ntwo\r\nthree\rfour\n\n", 21);
+    check("TYPE A", c->type(false) && !c->binary);
+    d = c->retrieveAll("text.txt", &n, 1000);
+    check("ASCII download: LF on the disk is CRLF on the wire and LF again here (a lone CR stays, CRLF on disk becomes LF)", d != null && n == 20 && memcmp(d, "one\ntwo\nthree\rfour\n\n", 20) == 0);
+    free(d);
+    check("ASCII upload: LF here is CRLF on the wire and LF on the disk", c->store("text2.txt", "a\nb\r\nc\n", 7) && fileIs("text2.txt", "a\nb\nc\n", 6));
+    check("TYPE I again", c->type(true) && c->binary);
+    // the wire: what the server really sends in ASCII mode, read from a raw data connection
+    int rc = net.connect("127.0.0.1", srv->port);
+    net.setTimeout(rc, 3000);
+    char rb[2000];
+    net.recv(rc, &rb[0], 2000);
+    net.send(rc, "USER ann\r\nPASS secret\r\nTYPE A\r\nEPSV\r\n", 37);
+    int got = 0;
+    mail.Buf ctl;
+    while (!contains(ctl.text(), "229 ") && got < 20) { int r = net.recv(rc, &rb[0], 2000); if (r <= 0) break; ctl.add(&rb[0], r); got++; }
+    char* ep = strstr(ctl.text(), "(|||");
+    int dport = ep == null ? 0 : ftp.parseEpsv(ep);
+    int rd = net.connect("127.0.0.1", dport);
+    net.setTimeout(rd, 3000);
+    net.send(rc, "RETR text.txt\r\n", 15);
+    mail.Buf wire;
+    for (int i = 0; i < 30; i++) { int r = net.recv(rd, &rb[0], 2000); if (r <= 0) break; wire.add(&rb[0], r); }
+    check("ASCII on the wire: every line ends with CRLF, CRLF on the disk stays CRLF, a lone CR stays", wire.len == 24 && memcmp(wire.d, "one\r\ntwo\r\nthree\rfour\r\n\r\n", 24) == 0);
+    net.close(rd);
+    net.close(rc);
+
+    // ---- the other operations ----------------------------------------------------------------------------------------------------------------------------
+    check("MKD, RNFR / RNTO, RMD", c->mkd("newdir") && asys.isDir(path("newdir")) && c->rename("newdir", "renamed") && asys.isDir(path("renamed")) && !asys.exists(path("newdir")) && c->rmd("renamed") && !asys.exists(path("renamed")));
+    check("MKD of a name with a quote in it: the reply doubles the quote", asys.isWindows() || c->mkd("a\"b") && (asys.isWindows() || (asys.isDir(path("a\"b")) && contains(c->transcript(), "S: 257 \"/a\"\"b\" directory created.\n") && c->cwd("a\"b") && streq(c->pwd(), "/a\"b") && c->cdup() && c->rmd("a\"b"))));
+    check("DELE", c->dele("up1.txt") && !asys.exists(path("up1.txt")) && !c->dele("up1.txt") && contains(c->error, "550") && !c->dele("pub") && asys.isDir(path("pub")));
+    check("RMD of a directory with something in it, of a file, of the root", !c->rmd("pub") && !c->rmd("hello.txt") && !c->rmd("/") && asys.isDir(path("pub")));
+    check("RENAME of a file that is not there, onto a name that exists", !c->rename("nothing", "x") && !c->rename("hello.txt", "all.bin") && fileIs("all.bin", allBytes, 256));
+    check("SIZE and MDTM", c->size("hello.txt") == 12 && c->size("empty.bin") == 0 && c->size("pub/big.bin") == 1500000 && c->size("nothing") == -1 && c->size("pub") == -1 && c->mdtm("hello.txt") > 1700000000 && c->mdtm("nothing") == -1);
+    check("a path with CR or LF is refused by the client, nothing is sent", !c->cwd("a\r\nDELE hello.txt") && !c->dele("x\ny") && c->noop() && fileIs("hello.txt", "hello world\n", 12) && !contains(c->transcript(), "DELE hello"));
+        c->quit();
+    check("after quit", !c->isOpen());
+    c->dispose();
+
+    // ---- the read-only user ----------------------------------------------------------------------------------------------------------------------------------
+    o = opts();
+    o->username = "reader";
+    o->password = "pw";
+    c = login(o);
+    check("a user without write rights: reads and lists", c->loggedIn && c->retrieveAll("hello.txt", &n, 100) != null && c->listEntries("") != null);
+    check("... cannot store, append, delete, make or remove a directory, rename", !c->store("x.txt", "x", 1) && contains(c->error, "550") && !c->append("hello.txt", "x", 1) && !c->dele("hello.txt") && !c->mkd("d") && !c->rmd("ro") && !c->rename("hello.txt", "h2") && c->noop());
+    check("... and nothing changed", fileIs("hello.txt", "hello world\n", 12) && !asys.exists(path("x.txt")) && !asys.exists(path("d")) && asys.isDir(path("ro")));
+    c->quit();
+    c->dispose();
+    o = opts();
+    o->password = "wrong";
+    ftp.Client* bad = ftp.newClient("127.0.0.1", srv->port, o);
+    check("a wrong password: connect fails (530), the client is closed", !bad->connect() && contains(bad->error, "530") && !bad->isOpen());
+    bad->dispose();
+
+    // ---- the four ways to open a data connection ------------------------------------------------------------------------------------------------------------------------
+    int mode = 0;
+    for (int m = 0; m < 4; m++) {
+        o = opts();
+        char* nm = "";
+        if (m == 0) nm = "EPSV";
+        if (m == 1) { o->useEpsv = false; nm = "PASV"; }
+        if (m == 2) { o->passive = false; nm = "EPRT"; }
+        if (m == 3) { o->passive = false; o->useEprt = false; nm = "PORT"; }
+        c = login(o);
+        bool ok = c->loggedIn;
+        ftp.EntryList* e = c->listEntries("pub");
+        ok = ok && e != null && e->count == 3;
+        if (e != null) e->dispose();
+        int rn = 0;
+        char* r = c->retrieveAll("all.bin", &rn, 1000);
+        ok = ok && r != null && rn == 256 && memcmp(r, allBytes, 256) == 0;
+        ok = ok && c->store("mode.bin", mid, 100000) && fileIs("mode.bin", mid, 100000);
+        bool wire = false;
+        if (m == 0) wire = contains(c->transcript(), "C: EPSV\n") && !contains(c->transcript(), "C: PASV\n");
+        if (m == 1) wire = contains(c->transcript(), "C: PASV\n") && contains(c->transcript(), "S: 227 Entering Passive Mode (127,0,0,1,") && !contains(c->transcript(), "C: EPSV\n");
+        if (m == 2) wire = contains(c->transcript(), "C: EPRT |1|127.0.0.1|") && !contains(c->transcript(), "C: PORT");
+        if (m == 3) wire = contains(c->transcript(), "C: PORT 127,0,0,1,") && !contains(c->transcript(), "C: EPRT");
+        char label[100];
+        format(&label[0], 100, "%s: list, download, upload of 100000 bytes, and the command on the wire", nm, 0, 0, 0, 0, 0);
+        check(&label[0], ok && wire);
+        c->quit();
+        c->dispose();
+        asys.unlink(path("mode.bin"));
+    }
+
+    // ---- URLs ------------------------------------------------------------------------------------------------------------------------------------------------------
+    check("URLs: other schemes, no host, bad ports", ftp.connect("http://x") == null && startsWith(ftp.error(), "the URL must start with") && ftp.connect("ftp://") == null && streq(ftp.error(), "no host in the URL") && ftp.connect("ftp://127.0.0.1:0") == null && ftp.connect("ftp://127.0.0.1:99999") == null);
+    char url[200];
+    format(&url[0], 200, "ftp://ann:secret@127.0.0.1:%d/pub", srv->port, 0, 0, 0, 0, 0);
+    check("a URL with a password and no TLS: refused, the password is never sent (AUTH TLS is required for it)", ftp.connect(&url[0]) == null && contains(ftp.error(), "AUTH TLS"));
+    o = opts();
+    c = ftp.connectWith(&url[0], o);
+    check("... with authTls NEVER in the options the URL works", c != null && c->loggedIn);
+    if (c != null) { c->quit(); c->dispose(); }
+    char url2[200];
+    format(&url2[0], 200, "ftp://127.0.0.1:%d", srv->port, 0, 0, 0, 0, 0);
+    o = opts();
+    o->username = "anonymous";
+    c = ftp.connectWith(&url2[0], o);
+    check("a URL without credentials logs in as anonymous (the server has no anonymous account: 530)", c == null);
+    int deadL = net.listen(0, 4);
+    int deadP = net.localPort(deadL);
+    net.close(deadL);
+    char durl[100];
+    format(&durl[0], 100, "ftp://127.0.0.1:%d", deadP, 0, 0, 0, 0, 0);
+    check("nothing listens there: no client, a reason", ftp.connect(&durl[0]) == null && strlen(ftp.error()) > 0);
+
+    // ---- a scripted server: what the client does with replies that are not nice --------------------------------------------------------------------------------------
+    srv = null;
+    net.setIdleHook(fakeHook);
+    lsn = net.listenOn("127.0.0.1", 0, 4);
+    net.setNonBlocking(lsn, true);
+    dlsn = net.listenOn("127.0.0.1", 0, 4);
+    net.setNonBlocking(dlsn, true);
+    int fport = net.localPort(lsn);
+    // login of the scripted server: 220, USER, PASS, FEAT, TYPE
+    fakeReset();
+    say("220 fake\r\n", "331 pw\r\n", "230 in\r\n", "211-Features:\r\n MLST type*;size*\r\n SIZE\r\n211 End\r\n", "200 type\r\n", "227 Entering Passive Mode (10,255,255,1,%P1%,%P2%).\r\n", "150 here\r\n226 done\r\n", "221 bye\r\n");
+    dataToSend = "hello from the fake\n";
+    dataLen = 20;
+    o = opts();
+    c = ftp.newClient("127.0.0.1", fport, o);
+    check("the scripted server: login", c->connect());
+    o->useEpsv = false;
+    c->opt->useEpsv = false;
+    d = c->retrieveAll("f.txt", &n, 1000);
+    check("a PASV reply with a foreign address (10.255.255.1): the client goes to the address of the control connection, the data arrives", d != null && n == 20 && memcmp(d, "hello from the fake\n", 20) == 0);
+    c->quit();
+    c->dispose();
+    fakeReset();
+    say("220 fake\r\n", "331 pw\r\n", "230 in\r\n", "500 no feat\r\n", "200 type\r\n", "500 EPSV not understood\r\n", "227 Entering Passive Mode (1,2,3,4,%P1%,%P2%).\r\n", "150 here\r\n226 done\r\n");
+    dataToSend = "second\n";
+    dataLen = 7;
+    o = opts();
+    c = ftp.newClient("127.0.0.1", fport, o);
+    c->connect();
+    d = c->retrieveAll("f.txt", &n, 1000);
+    check("EPSV answered with 500: PASV is used instead (and EPSV is not tried again)", d != null && n == 7 && contains(c->transcript(), "C: EPSV\nS: 500 EPSV not understood\nC: PASV\n"));
+    c->dispose();
+    fakeReset();
+    say("120 service ready in 1 minute\r\n220 now ready\r\n", "331 pw\r\n", "230 in\r\n", "500 no feat\r\n", "200 type\r\n");
+    o = opts();
+    c = ftp.newClient("127.0.0.1", fport, o);
+    check("a greeting 120 is followed by the 220", c->connect());
+    c->dispose();
+    fakeReset();
+    say("421 too many users\r\n");
+    o = opts();
+    c = ftp.newClient("127.0.0.1", fport, o);
+    check("a greeting 421: connect fails", !c->connect() && !c->isOpen());
+    c->dispose();
+    fakeReset();
+    say("220 fake\r\n", "331 pw\r\n", "230 in\r\n", "500 no feat\r\n", "200 type\r\n", "229 Entering Extended Passive Mode (|||%PORT%|)\r\n", "150 here\r\n");
+    dataSilent = true;
+    o = opts();
+    o->dataTimeoutMs = 300;
+    o->commandTimeoutMs = 300;
+    c = ftp.newClient("127.0.0.1", fport, o);
+    c->connect();
+    d = c->retrieveAll("f.txt", &n, 1000);
+    check("a data connection that stays silent: the client gives up after dataTimeoutMs", d == null && contains(c->error, "silent") );
+    c->dispose();
+    fakeReset();
+    say("220 fake\r\n", "331 pw\r\n", "230 in\r\n", "500 no feat\r\n", "200 type\r\n", "229 Entering Extended Passive Mode (|||%PORT%|)\r\n", "150 here\r\n", "426 aborted\r\n");
+    dataForever = true;
+    o = opts();
+    o->maxList = 5000;
+    o->commandTimeoutMs = 300;
+    c = ftp.newClient("127.0.0.1", fport, o);
+    c->connect();
+    netio.Queue lq;
+    bool lok = c->list("", &lq);
+    check("a listing that never ends is cut at maxList (the error says so), memory stays small", !lok && lq.pending() <= 5000 && contains(c->error, "longer than the limit"));
+    lq.release();
+    c->dispose();
+    fakeReset();
+    say("220 fake\r\n", "331 pw\r\n", "230 in\r\n", "500 no feat\r\n", "200 type\r\n", "229 Entering Extended Passive Mode (|||%PORT%|)\r\n", "<CLOSE>");
+    o = opts();
+    c = ftp.newClient("127.0.0.1", fport, o);
+    c->connect();
+    d = c->retrieveAll("f.txt", &n, 1000);
+    check("a control connection cut after EPSV: the transfer fails, the client is closed", d == null && !c->isOpen());
+    c->dispose();
+    fakeReset();
+    say("220 fake\r\n", "331 pw\r\n", "230 in\r\n", "500 no feat\r\n", "200 type\r\n", "229 garbage\r\n");
+    o = opts();
+    c = ftp.newClient("127.0.0.1", fport, o);
+    c->connect();
+    d = c->retrieveAll("f.txt", &n, 1000);
+    check("a reply to EPSV that cannot be read", d == null && contains(c->error, "cannot be read"));
+    c->dispose();
+    fakeReset();
+    say("220 fake\r\n", "331 pw\r\n", "230 in\r\n", "500 no feat\r\n", "200 type\r\n", "257 no quotes here\r\n");
+    o = opts();
+    c = ftp.newClient("127.0.0.1", fport, o);
+    c->connect();
+    check("a PWD reply without a quoted path", c->pwd() == null);
+    c->dispose();
+    fakeReset();
+    say("220 fake\r\n", "331 pw\r\n", "530 login incorrect\r\n");
+    o = opts();
+    c = ftp.newClient("127.0.0.1", fport, o);
+    check("a login that is refused: the text of the server is in the error", !c->connect() && contains(c->error, "530") && contains(c->error, "login incorrect"));
+    c->dispose();
+
+    net.setIdleHook(null);
+    rmTree(&root[0]);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

@@ -340,6 +340,8 @@ that pipelines commands with big replies is served as fast as it reads, instead 
 **Descriptors.** `maxConns` is not tied to the limit of file descriptors (`ulimit -n`): keep it below that limit minus what the program has open. When `accept()` fails for lack of descriptors or memory the listener rests for 50 ms and then tries again (`stats->acceptFailures`): before, it spun at 100% processor time as
 long as the descriptors were gone. The server recovers when connections close (`tests/net2.sh` checks both with `ulimit -n 30`).
 
+**Work in slices.** A protocol that has a long job for one connection (`pop3d` sizing a big mailbox at the login) does a part of it from `onData` or `onResume`, calls `s->pause(c, 1 << 30)` (the connection resumes at the next turn and `onResume` runs) and `s->wake()` (the next `poll()` does not wait for sockets): the other connections are served between the parts.
+
 `close(c)` sends what is queued, says goodbye (TLS close_notify, FIN) and reads away the peer's remaining bytes for `lingerMs` (so the last bytes are not lost to a reset); `kill(c)` drops it at once. `onClose` runs
 exactly once for every connection that `onOpen` saw. Conn objects, buffers and TLS sessions are reused. `killAll()` drops every connection, `shutdown()` everything.
 
@@ -552,3 +554,156 @@ What the strict memory tests do: they compare `__heap_pos` (what `new`, `alloc` 
 * **One thread.** The clients are not thread safe; one `netsrv.Server` serves all its sockets from the thread that calls `poll`.
 * **Memory worst cases are products of limits** (clients times queue size): the defaults suit a normal machine; lower them for AOS (128 MB) as the tables above say.
 * **Interoperability** was checked by hand during development, with independent programs where the machine had them: `redis-cli` against `redisd` (commands of every type, `--pipe`, `SUBSCRIBE` / `PUBLISH`, `--raw`, error replies), util-linux `logger` against `syslogd` (UDP and TCP, RFC 3164 and RFC 5424 with structured data), `nc` as the receiver of the `syslog` sender (the bytes of datagrams and of both TCP framings) and a hand written Python raw-socket MQTT client against `mqttd` (connect, subscribe, QoS 0 / 1 / 2, retained, will, ping, a malformed packet). `tests/net2.sh` repeats these checks (Linux; needs python3; `redis-cli`, `redis-server` and `logger` are used when they are installed; it is not part of `make test`; the raw MQTT client is `tests/net2_mqtt.py`) and adds: the raw MQTT client sends a real MQTT 5 CONNECT (CONNACK 1, then closed), `tests/net2_redisd_limits.py` (300 connections that announce a 16 MiB bulk each must not make `redisd` grow; 4000 keys with `PX 100` must be swept away by the server loop), the `redis` client module run against a real `redis-server` and against `redisd` (the program `tests/net2_redis_client.a`; the two outputs must be identical; checked with Redis 7.0.15), the descriptor limit (`tests/net2_fdlimit.py`: with `ulimit -n 30` a server must not spin and must serve again afterwards) and the UDP sender with a name that does not resolve (`tests/net2_udpretry.a`). `redisd` was also compared with Redis 7.0.15 reply by reply with random commands over strings, lists, hashes, sets, sorted sets, expiry, `MULTI`, pub/sub (the reviewers' script is not part of the repository; the differences that remain are the ones listed under "Where it differs"). There is no MQTT client or broker from another vendor on the development machine, so MQTT was not checked against mosquitto or paho; the tests of the modules use them against each other and byte-exact examples from the specifications.
+
+# Mail and file transfer: `mail`, `smtp`, `smtpd`, `ftp`, `ftpd`, `pop3`, `pop3d`
+
+Three more protocol families, each as a **client and a small server** (the servers are for tests and for AOS, they are built to be safe, not to be fast), and the message library under the mail ones.
+Everything runs on the five targets with the same code and uses only layers that AOS also has (`net`, `netio`, `netsrv`, `tls`, `asys`, `datetime`, `hash`).
+
+| Module | What it is |
+|---|---|
+| `mail` | RFC 5322 messages and MIME: header folding, RFC 2047 encoded words, addresses with display names, RFC 2231 parameters, Date, Message-ID, multipart/mixed / alternative / related, base64 and quoted-printable, attachments, a parser with limits |
+| `smtp` | an SMTP client: EHLO, STARTTLS and TLS from the start, AUTH CRAM-MD5 / PLAIN / LOGIN, SIZE, 8BITMIME, pipelining, dot-stuffing, partial failures of the recipients, a time out for every step |
+| `smtpd` | an SMTP server (a mailbox sink): not an open relay, STARTTLS, AUTH, Maildir delivery or a callback, size / recipient / line / rate / memory limits |
+| `ftp` | an FTP client: EPSV / PASV / EPRT / PORT, LIST (Unix and DOS) / MLSD / NLST parsing, RETR / STOR / APPE with REST, ASCII and binary, AUTH TLS with PROT P and implicit FTPS, time outs |
+| `ftpd` | an FTP server: users with rights, a jail per user, passive and active mode without bounce, AUTH TLS and implicit TLS, idle and data time outs, limits |
+| `pop3` | a POP3 client: STLS, APOP, UIDL, TOP, deletions that are committed by QUIT |
+| `pop3d` | a POP3 server for a Maildir: STLS, APOP, UIDL, TOP, messages streamed in blocks |
+| `netline` | the plumbing: a client connection that reads lines and replies under time limits, and the server's line parser that cuts at CRLF only |
+
+Changed underneath: `netio.Link` got `startTls` (turn an open connection into a TLS client: STARTTLS, AUTH TLS, STLS), `adopt` (take an accepted or connected socket, plain or as TLS **client or server**) and `finish`;
+`netsrv.Server` got `startTls(conn, cfg)` (the connection becomes a TLS connection when the queued "go ahead" line has been sent; plain bytes that arrive meanwhile end the connection) and `watch(fd, events, tag)` / `unwatch` / `onWatch`
+(sockets of the protocol layer, the FTP data connections, in the same poll set: one thread serves control and data connections).
+
+## mail
+
+```c
+import mail;
+mail.Message* m = mail.newMessage();
+m->from("Ann <ann@example.org>");  m->to("Bob <bob@example.org>, carol@example.org");  m->subject("Gr\xC3\xBC\xC3\x9F" "e");       // UTF-8 subject: RFC 2047 words
+m->text("Hello\n");  m->html("<p>Hello</p>");                                          // both: multipart/alternative
+m->attach("report.pdf", "application/pdf", data, n);  m->attachInline("logo.png", "image/png", png, pn, "logo1");   // mixed, related
+int n;  char* wire = m->build(&n);                                                     // CRLF, 7-bit clean (m->allow8bit = true: UTF-8 text goes out as 8bit)
+mail.Part* p = mail.parse(wire, n, null);                                              // null: default limits; p->decodedHeader("Subject"), p->addresses("From"), p->firstText("plain"), p->attachment(i)
+```
+
+**Building.** Header fields are folded at blanks (78 characters when possible, never over 998); non-ASCII subjects and names become RFC 2047 words of at most 75 characters (B or Q, whichever is shorter, cut only between characters);
+display names with specials are quoted; `Date` and `Message-ID` are made when you do not set them (the id has a random part and a domain that is a plain host name, never text from outside); `Bcc` goes to the envelope
+(`recipients()`), not into the message (`includeBcc` writes it). Text parts are canonicalised to CRLF and take 7bit, quoted-printable or base64 by what they contain (a line over 998 bytes, or NUL, or 8-bit data without `allow8bit`
+cannot be 7bit); attachments are base64 with lines of 76. File names go out as `filename="..."` or, for non-ASCII, as RFC 2231 `filename*=UTF-8''...` **plus** a plain fallback; control characters become `_`, at most 255 bytes.
+Boundaries are random (or `setBoundaryPrefix` + a counter for tests) and chosen so that they occur in none of the parts. **Header injection is not possible through the builder**: a subject, address, name or custom field with CR or LF is refused,
+the fields the builder writes itself (From, To, Subject, Date, Content-*, ...) cannot be set as extra fields, a bad address changes nothing, and **an address list with a CR or LF in it is refused as a whole** (`from`, `to`, `cc`, `bcc`, `replyTo` return false and the list is as it was: the text is never "repaired" into another address).
+
+**Parsing.** `parse` never gives up because a sender made a mistake: it records defects (`D_NO_END_BOUNDARY`, `D_BAD_ENCODING`, `D_BAD_CHARSET`, `D_BAD_HEADER`, `D_CHARSET_GUESSED`, `D_TOO_DEEP`, ...) and reads on. Bodies are decoded (base64 is lenient,
+quoted-printable decodes what it can); text parts are converted to UTF-8 from UTF-8, US-ASCII, ISO-8859-1, ISO-8859-15 and windows-1252 (invalid bytes become U+FFFD; no charset and 8-bit bytes: UTF-8 if valid, else windows-1252) and get LF line ends
+(`ParseOptions`: `convertCharset`, `normalizeNewlines`). Multiparts of any depth up to the limit, `message/rfc822` parsed as a message, `multipart/digest` defaults, preambles and epilogues ignored, boundaries that are prefixes of others,
+missing end boundaries. Limits (`ParseOptions`): `maxSize` 32 MiB, `maxDepth` 12, `maxParts` 500, `maxHeaders` 500, `maxHeaderBytes` 256 KiB, `maxHeaderLine` 64 KiB, `maxPartSize` 32 MiB (a part that decodes to more is cut, `D_TOO_BIG`). Decoded sizes can never exceed
+the message size (there is no compression), so a message cannot grow into a bomb. `safeFilename` makes a file name that came with a message fit to be a name in a directory (the last component, no control characters, no leading dots).
+`Part.attachmentCount()` counts leaf parts that are attachments or have a file name or are neither text nor multipart, except the pictures of an HTML part (they have a Content-ID and are not marked `attachment`).
+
+**Pieces that work alone:** `base64Encode/Decode` (strict and lenient), `qpEncode/Decode` (76 character lines, trailing blanks encoded, soft breaks), `encodeWords/decodeWords` (words are joined across split multi-byte characters; the blank between two words is dropped as the RFC says),
+`foldHeader`, `parseHeaders`, `parseAddressList` (groups, comments, quoted strings, obsolete routes; 16 kinds of invalid address are refused: `a b@c`, `a..b@c`, `<a@b`, 8-bit local parts, ...; SMTPUTF8 is not supported), `formatAddress`,
+`parseParams` (RFC 2231 continuations and extended values; the extended form wins over a plain one), `formatDate` / `parseDate` (also the obsolete forms: two-digit years, zone names, comments; impossible dates are refused), `newMessageId`.
+
+## smtp
+
+```c
+smtp.Client* c = smtp.connect("smtp://ann:secret@mail.example.org:587");        // smtps:// = TLS from the start
+char* rcpts[2];  rcpts[0] = "bob@example.org";  rcpts[1] = "carol@example.org";
+smtp.Result* r = c->send("ann@example.org", &rcpts[0], 2, data, len);           // r->ok, r->code, r->status (2000000 = 2.0.0), r->accepted, r->rejected, r->rcptCode[i], r->why()
+c->sendMessage(message);  c->quit();  c->dispose();
+```
+
+EHLO (HELO when the server does not know it), STARTTLS (`options->startTls`: `STARTTLS_NEVER`, `STARTTLS_IF_OFFERED` (default), `STARTTLS_REQUIRED`; the capabilities are read again; **plain text that the server sends behind its "go ahead" fails the
+connection** instead of becoming the answer to a later command), AUTH CRAM-MD5 (preferred: the password is not sent), PLAIN, LOGIN. **The password is never sent in the clear** (PLAIN and LOGIN need TLS or `allowPlainAuth`); with credentials in the URL STARTTLS is required, so a server
+(or a man in the middle) that hides STARTTLS makes `connect` fail before any AUTH is sent. The transcript (`options->record`) shows secrets as `****`. `send`: MAIL FROM with `SIZE=` (a message over the advertised limit is not sent) and `BODY=8BITMIME` (8-bit data to a server without it is refused
+before anything is sent), RCPT TO for every recipient (a refusal does not stop the others: the `Result` has every code; `allOrNothing` cancels the message), DATA with **dot-stuffing and canonical line ends** (bare LF and CR become CRLF, a CRLF is added at the end; a line of dots,
+a CR LF pair split by a block boundary and an empty message are tested), PIPELINING when offered and wanted. Time outs per step (`commandTimeoutMs`, `dataTimeoutMs` per block, `dataEndTimeoutMs`); after a time out or a lost connection the client is closed and the result is `temporary`.
+Addresses, names for EHLO and every command line are checked for CR, LF and NUL (no command injection); NUL in the message is refused.
+
+## smtpd
+
+```c
+smtpd.Server* s = smtpd.newServer();  s->core->hostname = "mail.example.org";  s->core->addLocalDomain("example.org");
+s->core->addUser("ann", "secret");  s->core->maildir = "/var/mail";  s->core->tlsConfig = cfg;  s->listen(2525);  s->run();
+```
+
+**Not an open relay.** A recipient is accepted when its domain is a local domain, or the session authenticated (`relayAuthenticated`, on), or the client is on the loopback address with `relayLoopback` (off), or `acceptAnyRecipient` (off: the sink mode for tests); else
+`554 5.7.1 Relay access denied`. Sub-domains, domain literals, look-alikes, the percent hack and source routes do not make a foreign recipient local (all tested). `rcptHook` may veto (550 / 450), `requireTls` and `authRequired` refuse MAIL FROM early (530); PLAIN and LOGIN are only offered on TLS unless `allowInsecureAuth`.
+**Delivery** goes to `deliverHook` or, with `maildir` set, into `<maildir>/<name>/new/` (written in `tmp/`, then renamed; `Return-Path` and `Received` are added); the mailbox name is made from the local part (a-z 0-9 . _ + -, no leading dot, no `..`, 50 characters at most) and a recipient whose name is not like that is refused at RCPT
+(553), so nothing from the network is ever a path. **Lines end only with CRLF** (the line parser cuts at CRLF only): a bare LF or CR in a command is an error, in a message it rejects the message (550 5.6.0; `strictLineEnds = false` accepts it as text), so the "SMTP smuggling" shapes (`LF . CRLF`, `CRLF . LF`, `CRLF . CR CRLF`) neither end a message nor start a second one (tested).
+After STARTTLS the session starts again (RFC 3207) and **a command that follows STARTTLS in the same read is never run** (the connection is closed). Limits: `maxMessage` 10 MiB (SIZE; an oversized message is read and thrown away without being buffered, 552), `maxRecipients` 100, `maxLine` 1024, `maxDataLine` 8192, `maxBadCommands` 10, `maxMessagesPerSession` 100,
+`maxAuthFailures` 3, `maxBuffered` 64 MiB of message data for all sessions together (452), `rateMsgs` / `rateConns` per address in `rateWindowMs` (450 / 421; a table of 256 addresses), and `net->maxConns`, `maxPerIp`, `idleTimeoutMs` (2 minutes). Not supported: SMTPUTF8, DSN, CHUNKING, a queue and relaying (the server only delivers to local mailboxes), IPv6.
+
+## ftp
+
+```c
+ftp.Client* c = ftp.connect("ftp://ann:secret@ftp.example.org/");                   // ftps:// = TLS from the start
+ftp.EntryList* l = c->listEntries("pub");  c->download("a.txt", "/tmp/a.txt", false);  c->upload("/tmp/b.pdf", "b.pdf", true);  c->store("hi.txt", "hi\n", 3);
+```
+
+Passive mode by default: EPSV, then PASV when the server does not know EPSV; **the address in a PASV reply is never used** (the data connection goes to the host of the control connection: a server cannot point the client at another machine). Active mode (`passive = false`): EPRT, then PORT,
+a listener on the local address, only a connection from the address of the server is accepted. **The order of a protected data connection** is the one of vsftpd, ProFTPD, FileZilla Server and Python's `ftplib`: the server sends the 150 as soon as it has the data connection, and the TLS handshake comes after it. The client makes only the TCP connection before the transfer command (passive), sends the command, and starts the TLS handshake **at once, without waiting for the 150**,
+while it keeps watching the control connection (a refusal such as 550 ends the wait with the server's text; so does a data connection that the server closes because it refused the command): a server that sends the 150 first and a server that handshakes first both work. (The first version of the modules handshook first on both sides and so only worked with itself: `ftplib` and `curl -P -` hung.) `listEntries` uses MLSD when FEAT lists MLST, else LIST, and parses **Unix `ls -l`** (with and without year, links, names with blanks, no group column), **DOS/IIS**
+and **MLSD** listings (`parseListing`; lines that are none of them are counted in `unparsed`; `.` and `..` are skipped). Downloads and uploads stream (16 KB blocks, nothing is held whole except in `retrieveAll`/`store`); `download(..., true)` and `upload(..., true)` resume with REST; `type(false)` is ASCII (CRLF on the wire, LF here).
+TLS (RFC 4217): `AUTH TLS` (`authTls`: NEVER / IF_OFFERED (default) / REQUIRED), `PBSZ 0`, `PROT P` so that data connections are encrypted too (the client is the TLS client for both, also when the server makes the TCP connection in active mode); a URL with a password requires AUTH TLS (the password is not sent in the clear).
+Names that a server sends are data: `safeName` makes one fit for a local path. Time outs: `connectTimeoutMs`, `commandTimeoutMs`, `dataTimeoutMs` (no byte moves for that long; there is no limit on the time of a transfer that keeps moving); a listing over `maxList` (8 MiB) fails (`error`: "the listing is longer than the limit"). When the data connection breaks by itself during a transfer (a server that refuses an upload closes it, and on a host with small socket buffers the send fails before the reply is read) **the error is the reply of the server** ("the transfer failed: 552 The file is bigger than the limit."), not only "the data connection failed". Not supported: servers that require TLS session reuse for data connections (vsftpd with `require_ssl_reuse`), IPv6, proxies.
+
+## ftpd
+
+```c
+ftpd.Server* s = ftpd.newServer();  s->addUser("ann", "secret", "/srv/ftp/ann", ftpd.P_ALL);  s->addAnonymous("/srv/ftp/pub", ftpd.P_READ | ftpd.P_LIST);
+s->tlsConfig = cfg;  s->listen(2121);  s->run();
+```
+
+**The jail.** A path is normalised as a virtual path (`.` and `..` resolved, `..` at the root stays at the root; every name must be a valid file name: no backslash, no control character, no name of only dots, at most 255 bytes (55 on AOS)); then it is looked up below the user's directory
+**component by component with `lstat`: a symbolic link anywhere on the way ends the lookup** (550, as if the file did not exist), and links are not shown in listings. Nothing is decoded (`%2e%2e` is a name), and absolute paths start at the root of the jail. Tested: `..` in every command, absolute paths, encodings, backslashes,
+control characters, links to files and directories outside, links to `..`, creating files and directories through links. Left open: a race between the lookup and the use (someone who can write to the directory could swap a directory for a link in between): use the server for directories that nobody else changes. Windows reserved names (`CON`) are not handled.
+**No bounce:** `PORT` and `EPRT` only for the address of the client itself and for ports from `activePortMin` (1024); passive data connections must come from the address of the control connection (another one is closed at once), the listener closes with the first connection or after `dataTimeoutMs`, a session has one data connection at most (a new `PASV` closes the old listener); `allowActive = false` turns active mode off.
+Rights per user: `P_READ` (RETR, SIZE, MDTM), `P_LIST` (LIST, NLST, MLSD, MLST, CWD), `P_WRITE` (STOR, APPE, MKD), `P_DELETE` (DELE, RMD), `P_RENAME` (RNFR, RNTO); each command checks its own right (tested for six users). Login: a wrong password and an unknown user look the same, 3 failures end the session (421),
+anonymous login only if you add an anonymous account. TLS: `AUTH TLS` (a command that follows it in the same read is not run: the connection is closed), `PBSZ`, `PROT`, implicit TLS with `listenTls`, `requireTls` (no USER / PASS before TLS), `requireDataTls` (no transfers without PROT P); after AUTH TLS the session starts again.
+**The order of a protected data connection** (PROT P): the 150 goes out as soon as the transfer command has been seen *and* the TCP data connection is there, and the client starts the TLS handshake after it (what `ftplib`, Java and `lftp` do; tested with Python's `ftplib.FTP_TLS` and `curl --ssl-reqd`, passive and active, uploads of 0, 5 and 100001 bytes). A client that handshakes before it sends the command (`curl`) is served too: the handshake runs whenever its bytes arrive. A data connection that fails before any command waited for it (garbage instead of a ClientHello) ends silently: no reply that nobody asked for. A transfer command while another one still waits for its data connection is refused with 425 (it used to open a second file and lose the first).
+A listing that is longer than `maxList` is **refused with 451** (nothing is sent, the data connection is given up); it used to be cut and still end with "226 Transfer complete". `pasvAddress` must be a dotted address; anything else makes `PASV` answer 425 (a long value used to overflow a 24 byte buffer).
+Commands: USER PASS QUIT NOOP FEAT OPTS SYST HELP PWD CWD CDUP TYPE MODE STRU ALLO PASV EPSV (also `EPSV ALL`) PORT EPRT REST RETR STOR APPE LIST NLST MLSD MLST DELE RMD MKD RNFR RNTO SIZE MDTM ABOR STAT; Telnet sequences in front of a command (ABOR after IAC IP IAC SYNCH) are skipped; lines must end with CRLF (a bare LF or a NUL is 500). TYPE A converts line ends.
+Transfers run in the same poll loop as the control connections (a block of at most 8 x 16 KB per turn and connection), so one transfer does not stop the others. Limits: `maxSessions` (`net->maxConns`, 200), `net->maxPerIp`, `idleTimeoutMs` (300 s, not while a transfer runs), `dataTimeoutMs` (30 s: waiting for a data connection, and no byte moving), `maxLoginFailures`, `maxLine` 4096, `maxList` 4 MiB, `maxUpload` (bytes of one upload), passive ports `pasvMin` / `pasvMax`, `pasvAddress` for NAT.
+An upload that fails stays as the part that came (like most servers; REST or APPE continue it). Not supported: STOU, ACCT, SMNT, REIN, SITE, wildcards in LIST, IPv6, quotas, a log.
+
+## pop3 and pop3d
+
+```c
+pop3.Client* c = pop3.connect("pop3://ann:secret@host");   int n = c->count();   char* msg = c->retr(1, &len);   c->dele(1);   c->quit();      // QUIT commits the deletions
+pop3d.Server* s = pop3d.newServer();  s->addUser("ann", "secret", "/var/mail/ann");  s->listen(1110);  s->run();                          // the Maildir that smtpd.maildir fills
+```
+
+The client: STLS (`startTls`, plain bytes behind the `+OK` fail the connection), APOP (`useApop`; the password is not sent), USER / PASS **only on TLS** unless `allowPlainLogin` (so a URL with a password needs STLS), message numbers checked, messages over `maxMessage` stop the transfer (the connection is closed), time outs. The server lists `new/` and `cur/` at the login
+(at most `maxMessages` 1000; the file name is the UIDL; names with other characters than 0x21 to 0x7E or over 70 characters are skipped), counts the size as it goes over the wire (CRLF) **in slices** (`scanBytesPerTurn`, 2 MiB of message files and 200 files per turn of the loop: the answer to PASS comes when the last message is counted, the other connections are served meanwhile, and the commands that the same client pipelined behind PASS wait; measured with four files of 100 MB: the login took 1.9 s and the greeting of another client was never more than 30 ms late; it was 2.1 s late before), streams RETR and TOP in blocks of 16 KB under backpressure (the output queue stays small: a message of any size is no problem, and pipelined commands wait their turn),
+makes line ends CRLF and stuffs dots (a flood of pipelined RETRs is served by a loop, not by recursion), deletes at QUIT only (a connection that breaks deletes nothing), has `requireTls`, `apop` (off: it needs the password in plain text on the server), 3 login failures, lines over 512 bytes are `-ERR`, `idleTimeoutMs` 10 minutes. The Maildir is not locked.
+
+## Tests (mail, SMTP, FTP, POP3)
+
+`tests/t397` to `t409` run in the normal suite on every target (client and server in one thread from `net.setIdleHook`, ephemeral ports, scripted fake servers for the wire tests, nothing depends on the size of socket buffers). Files are made in a directory with a random name below `build/tests/` and removed again.
+
+| Test | What |
+|---|---|
+| `t397` | base64 (the RFC 4648 vectors), quoted-printable (line lengths 74 to 78, every byte value), UTF-8 checking, character sets, the examples of RFC 2047 section 8 (split multi-byte characters, invalid words that must stay), encoding words of every script, folding, header blocks and their limits, the addresses of RFC 5322 appendix A, 16 kinds of invalid address, format and parse round trips, dates (the examples of RFC 5322, obsolete forms, impossible dates, 400 round trips), message ids |
+| `t398` | messages byte for byte (plain, quoted-printable, alternative, mixed, related, 8bit, Latin-1; checked by hand and with Python's email package), attachments with names that need RFC 2231 or that try to inject headers, refusals (also CR / LF inside an address), boundaries that occur in the data, 16 awkward texts, every byte value in an attachment, 300 KB, message/rfc822, `serialize(parse(x))` |
+| `t399` | the parser against nested multiparts, nearly identical boundaries, missing parts, unknown encodings, wrong and missing charsets, RFC 2231, `safeFilename`, every limit (size, depth 40 levels, 2000 parts, 10000 headers, decoded size), 300 random and mutated messages, and strict memory |
+| `t400` | the SMTP client byte for byte against a scripted server: dot-stuffing at the edges (also across the 8192 byte blocks), SIZE and 8BITMIME, partial failures, allOrNothing, pipelining, a connection cut in six phases, silence, 421, broken replies, injection, URLs, reuse |
+| `t401` | SMTP over TLS and with AUTH: STARTTLS with a 300 KB message, TLS from the start, certificates, PLAIN / LOGIN / CRAM-MD5 with good and bad passwords, a server that hides STARTTLS, transcripts without secrets, plain bytes behind STARTTLS from both sides, the session that starts again |
+| `t402` | smtpd byte for byte: a whole dialogue, every error, the relay policy, sizes and the buffer budget, dot-unstuffing, bare CR and LF and the smuggling shapes, Maildir content and path traversal through the local part, rate limits with a fake clock, AUTH step by step, hostile sockets |
+| `t403` | strict memory of the mail modules (sessions, clients, builder, line parser): the heap does not move |
+| `t404` | PASV / EPSV replies, listing formats (Unix, DOS, MLSD), `safeName`, the jail: path normalisation (every way up and out) and the lookup with symbolic links |
+| `t405` | FTP client against the server: listings, 1.5 MB downloads and uploads, REST both ways, APPE, ASCII mode (also on the wire), the four data connection modes, errors, the read-only user, URLs; and against a scripted server that lies (a foreign address in PASV, EPSV refused, silence, a listing that never ends) |
+| `t406` | ftpd against hostile clients through raw sockets: the jail by name and by link, the bounce, passive connections, a matrix of rights for six users, broken commands (long, NUL, bare LF, Telnet, 2000 pipelined), logins, limits, time outs; `pasvAddress` that is not an address, a listing over `maxList` (451, not a cut listing) |
+| `t407` | FTP over TLS: AUTH TLS in passive and active mode, implicit TLS, certificates, `requireTls` / `requireDataTls`, a client that skips PROT P, bytes behind AUTH TLS, a data connection in the clear; **the order of the other FTPS programs**: ftpd against hand-made clients that wait for the 150 before the handshake (passive and active, RETR, LIST, STOR), that handshake first (curl) and that send the ClientHello and the command back to back, tiny uploads whose close_notify comes with the Finished message, garbage before the command, a client that never handshakes, a second command that waits; the client against scripted servers in the order of vsftpd and in the other order (passive and active: download, listing, upload, refusal, a refused upload whose data connection is closed under the client) |
+| `t408` | strict memory of the FTP modules (16 client rounds in both modes, aborted transfers, raw clients that drop their data connection) and the server's sessions, listeners and watched sockets afterwards |
+| `t409` | POP3: the exact dialogue, CRLF and dot-stuffing, TOP, deletions at QUIT, a message of 300 KB in blocks, the client, APOP, STLS with a real handshake, plain bytes behind STLS, limits, memory; a mailbox that is sized in 120 slices while a second client gets its greeting, a command pipelined behind PASS, clients that leave in the middle of the count |
+
+**What the independent review of this stage found** (fixed; the tests keep them fixed): **the FTPS data connections only worked between these two modules** (the server sent the 150 after the TLS handshake, the client handshook before the command: Python's `ftplib` and `curl -P -` hung until a 425; a server in the order of vsftpd made the client time out); a tiny FTPS upload whose Finished message, data and close_notify arrived in one read was a "failed handshake" (`netio`, `tls`: `handshakeDone`); a close_notify of the peer was not answered with ours (Python waits for it at the end of an upload: `SSLEOFError`); a client that was refused or cut off on the data connection said "the data connection failed" instead of the reply of the server; a listing over `maxList` was cut and still ended with 226; `pasvAddress` was copied into a 24 byte stack buffer; the `pop3d` login read the whole mailbox before it served anyone else; `mail.Message.from` and friends "repaired" an address that had a CR LF in it instead of refusing it.
+
+Bugs that the tests found in these modules while they were written (they are fixed, the tests keep them fixed): a use after free in the AUTH LOGIN of `smtpd` (the user name was read after it was freed), a CR LF header block that TOP could not split (`pop3d`), the REST offset that was
+forgotten before RETR (`ftpd`), a reply that was read twice after a refused active-mode transfer (`ftp`), and an `EntryList` that did not free itself.
+
+**Not done / not verified.** The AOS boot test (`boot_test.py net` in the AOS repository, branch `ws-net3`) now runs `t340` to `t409`; `t397` to `t409` (the 13 tests of this stage) passed inside AOS in QEMU after the review fixes (the review had found that `t405` failed there because the upload was bigger than the socket buffers of AOS: the client now reports the reply of the server). Nothing in these modules assumes the size of socket buffers or backlogs.
+The servers and the TLS were checked against independent programs with `tests/net3.sh` (Linux; not part of `make test`; needs python3, openssl and curl): Python's `smtplib`, `ftplib` (passive and active, MLSD, REST, the jail, anonymous access; **and `ftplib.FTP_TLS` with PROT P, passive and active, uploads of 0, 5 and 100001 bytes**) and `poplib`, and `curl` over SMTP, FTP (passive, active, the jail), **FTPS (`--ssl-reqd`, passive and `-P -`: download, listing, upload)** and POP3; Python's `email` package reads what the `mail` module builds and the `mail` module reads what `email` builds; and the A FTP client against a Python FTPS server in the order of vsftpd, passive and active (23 checks, all passed on the development machine). They were **not** checked against `lftp`, Thunderbird, Postfix, Dovecot or vsftpd themselves (not on the machine); STARTTLS of SMTP and STLS of POP3 were tried here only module against module; FTPS data connections have no TLS session reuse (a server that demands it refuses them); and the SMTP, FTP and POP3 clients were not run against real servers on the internet.
+TLS handshakes keep about 20 KB of heap each (see Memory above): a TLS listener of `smtpd`, `ftpd` or `pop3d` that anyone can reach grows with every handshake, and the strict memory tests leave TLS out. IPv4 only.

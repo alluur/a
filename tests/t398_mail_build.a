@@ -1,0 +1,623 @@
+// The mail module, second part: building messages and reading them again. Byte for byte against the wire text of messages that were checked by hand and with
+// Python's email package: plain, quoted-printable, alternative, mixed, related, 8bit, Latin-1; attachments with names that need RFC 2231; refusals (header injection,
+// bad addresses, bad types); boundaries that must not occur in the data; and round trips: what build() writes, parse() reads back exactly (every byte value in
+// an attachment, awkward text, big bodies), and a parsed tree can be written and read again.
+import mail;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// the text with every LF replaced by CRLF (a heap string)
+char* crlf(char* s) {
+    mail.Buf b;
+    for (int i = 0; s[i] != 0; i++) {
+        if (s[i] == 10) b.addByte(13);
+        b.addByte(s[i]);
+    }
+    return b.take();
+}
+
+mail.Message* base() {
+    mail.Message* m = mail.newMessage();
+    m->from("Ann <ann@example.org>");
+    m->to("Bob <bob@example.org>");
+    m->setDate(1794580200, 0);
+    m->setMessageId("<id1@example.org>");
+    m->setBoundaryPrefix("BND");
+    return m;
+}
+
+// builds the message and compares it with the expected text (written with LF, compared with CRLF); the message is disposed
+bool built(mail.Message* m, char* wantLf) {
+    int n = 0;
+    char* got = m->build(&n);
+    char* want = crlf(wantLf);
+    bool ok = got != null && n == strlen(want) && memcmp(got, want, n) == 0;
+    if (!ok) {
+        if (got == null) printf("     build failed: %s\n", mail.error());
+        else {
+            int i = 0;
+            while (i < n && got[i] == want[i]) i++;
+            printf("     differs at byte %d (got %d bytes, want %d): [%s]\n", i, n, (int) strlen(want), &got[i > 20 ? i - 20 : 0]);
+        }
+    }
+    if (got != null) free(got);
+    free(want);
+    m->dispose();
+    return ok;
+}
+
+bool eqs(char* a, char* b) { return a != null && b != null && streq(a, b); }
+
+// A simple
+char* W_A =
+    "From: Ann <ann@example.org>\n"
+    "To: Bob <bob@example.org>\n"
+    "Subject: Hi\n"
+    "Date: Fri, 13 Nov 2026 14:30:00 +0000\n"
+    "Message-ID: <id1@example.org>\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: text/plain; charset=utf-8\n"
+    "Content-Transfer-Encoding: 7bit\n"
+    "\n"
+    "Hello Bob\n"
+    "Second line\n";
+
+// B qp
+char* W_B =
+    "From: Ann <ann@example.org>\n"
+    "To: Bob <bob@example.org>\n"
+    "Subject: =?UTF-8?B?R3LDvMOfZQ==?=\n"
+    "Date: Fri, 13 Nov 2026 14:30:00 +0000\n"
+    "Message-ID: <id1@example.org>\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: text/plain; charset=utf-8\n"
+    "Content-Transfer-Encoding: quoted-printable\n"
+    "\n"
+    "Bin ich nicht m=C3=BCde?\n";
+
+// C alt
+char* W_C =
+    "From: Ann <ann@example.org>\n"
+    "To: Bob <bob@example.org>\n"
+    "Subject: Both\n"
+    "Date: Fri, 13 Nov 2026 14:30:00 +0000\n"
+    "Message-ID: <id1@example.org>\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: multipart/alternative; boundary=BND1\n"
+    "\n"
+    "--BND1\n"
+    "Content-Type: text/plain; charset=utf-8\n"
+    "Content-Transfer-Encoding: 7bit\n"
+    "\n"
+    "plain\n"
+    "\n"
+    "--BND1\n"
+    "Content-Type: text/html; charset=utf-8\n"
+    "Content-Transfer-Encoding: 7bit\n"
+    "\n"
+    "<b>html</b>\n"
+    "\n"
+    "--BND1--\n";
+
+// D mixed
+char* W_D =
+    "From: Ann <ann@example.org>\n"
+    "To: Bob <bob@example.org>\n"
+    "Subject: Att\n"
+    "Date: Fri, 13 Nov 2026 14:30:00 +0000\n"
+    "Message-ID: <id1@example.org>\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: multipart/mixed; boundary=BND1\n"
+    "\n"
+    "--BND1\n"
+    "Content-Type: text/plain; charset=utf-8\n"
+    "Content-Transfer-Encoding: 7bit\n"
+    "\n"
+    "see attached\n"
+    "\n"
+    "--BND1\n"
+    "Content-Type: text/plain; charset=utf-8\n"
+    "Content-Transfer-Encoding: 7bit\n"
+    "Content-Disposition: attachment; filename=a.txt\n"
+    "\n"
+    "hello\n"
+    "\n"
+    "--BND1--\n";
+
+// E related
+char* W_E =
+    "From: Ann <ann@example.org>\n"
+    "To: Bob <bob@example.org>\n"
+    "Subject: Inline\n"
+    "Date: Fri, 13 Nov 2026 14:30:00 +0000\n"
+    "Message-ID: <id1@example.org>\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: multipart/related; boundary=BND1\n"
+    "\n"
+    "--BND1\n"
+    "Content-Type: text/html; charset=utf-8\n"
+    "Content-Transfer-Encoding: 7bit\n"
+    "\n"
+    "<img src=\"cid:p1\">\n"
+    "--BND1\n"
+    "Content-Type: image/png\n"
+    "Content-Transfer-Encoding: base64\n"
+    "Content-Disposition: inline; filename=p.png\n"
+    "Content-ID: <p1>\n"
+    "\n"
+    "iVBORw0K\n"
+    "\n"
+    "--BND1--\n";
+
+// F 8bit
+char* W_F =
+    "From: Ann <ann@example.org>\n"
+    "To: Bob <bob@example.org>\n"
+    "Subject: 8bit\n"
+    "Date: Fri, 13 Nov 2026 14:30:00 +0000\n"
+    "Message-ID: <id1@example.org>\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: text/plain; charset=utf-8\n"
+    "Content-Transfer-Encoding: 8bit\n"
+    "\n"
+    "m\xC3\xBCde\n";
+
+// G latin1
+char* W_G =
+    "From: Ann <ann@example.org>\n"
+    "To: Bob <bob@example.org>\n"
+    "Subject: Latin\n"
+    "Date: Fri, 13 Nov 2026 14:30:00 +0000\n"
+    "Message-ID: <id1@example.org>\n"
+    "MIME-Version: 1.0\n"
+    "Content-Type: text/plain; charset=iso-8859-1\n"
+    "Content-Transfer-Encoding: quoted-printable\n"
+    "\n"
+    "caf=E9 ?\n";
+
+// a compact description of a part tree: mixed(alternative(plain,related(html,png)),pdf)
+void shape(mail.Part* p, mail.Buf* out) {
+    if (p->isMultipart()) {
+        out->addText(p->subtype);
+        out->addByte('(');
+        for (int i = 0; i < p->nchildren; i++) {
+            if (i > 0) out->addByte(',');
+            shape(p->children[i], out);
+        }
+        out->addByte(')');
+    } else {
+        out->addText(p->subtype);
+    }
+}
+
+bool shapeIs(mail.Part* p, char* want) {
+    mail.Buf b;
+    shape(p, &b);
+    bool ok = b.len == strlen(want) && memcmp(b.text(), want, b.len) == 0;
+    if (!ok) printf("     shape [%s], wanted [%s]\n", b.text(), want);
+    b.release();
+    return ok;
+}
+
+// builds, parses and returns the tree (the wire text is freed)
+mail.Part* roundTrip(mail.Message* m) {
+    int n = 0;
+    char* w = m->build(&n);
+    if (w == null) return null;
+    mail.Part* p = mail.parse(w, n, null);
+    free(w);
+    return p;
+}
+
+bool bodyIs(mail.Part* p, char* want, int n) {
+    return p != null && p->bodyLen == n && memcmp(p->body, want, n) == 0 && p->body[n] == 0;
+}
+
+// text with its line ends changed to LF (what parse gives back)
+char* lfOnly(char* s) {
+    mail.Buf b;
+    for (int i = 0; s[i] != 0; i++) {
+        if (s[i] == 13) { b.addByte(10); if (s[i + 1] == 10) i++; } else b.addByte(s[i]);
+    }
+    return b.take();
+}
+
+int main() {
+    // ---- byte for byte -----------------------------------------------------------------------------------------------------------------------------------
+    mail.Message* m = base();
+    m->subject("Hi");
+    m->text("Hello Bob\nSecond line\n");
+    check("build: a plain text message", built(m, W_A));
+    m = base();
+    m->subject("Gr\xC3\xBC\xC3\x9F" "e");
+    m->text("Bin ich nicht m\xC3\xBCde?\n");
+    check("build: UTF-8 subject and body (B word, quoted-printable)", built(m, W_B));
+    m = base();
+    m->subject("Both");
+    m->text("plain\n");
+    m->html("<b>html</b>\n");
+    check("build: text and html are multipart/alternative", built(m, W_C));
+    m = base();
+    m->subject("Att");
+    m->text("see attached\n");
+    m->attach("a.txt", "text/plain", "hello\n", 6);
+    check("build: an attachment makes multipart/mixed", built(m, W_D));
+    m = base();
+    m->subject("Inline");
+    m->html("<img src=\"cid:p1\">");
+    m->attachInline("p.png", "image/png", "\x89PNG\r\n", 6, "p1");
+    check("build: an inline picture with the html is multipart/related", built(m, W_E));
+    m = base();
+    m->subject("8bit");
+    m->allow8bit = true;
+    m->text("m\xC3\xBCde\n");
+    int n8 = 0;
+    char* w8 = m->build(&n8);
+    check("build: allow8bit sends UTF-8 text as 8bit and says so (needs8bit)", w8 != null && m->needs8bit && strstr(w8, "Content-Transfer-Encoding: 8bit") != null);
+    free(w8);
+    check("build: ... byte for byte", built(m, W_F));
+    m = base();
+    m->subject("7bit only");
+    m->text("m\xC3\xBCde\n");
+    int n7 = 0;
+    char* w7 = m->build(&n7);
+    check("build: without allow8bit the message is 7-bit clean and needs8bit stays false", w7 != null && !m->needs8bit && mail.isAscii(w7, n7));
+    free(w7);
+    m->dispose();
+    m = base();
+    m->subject("Latin");
+    check("build: setCharset accepts utf-8 and iso-8859-1 only", m->setCharset("iso-8859-1") && m->setCharset("UTF-8") && !m->setCharset("koi8-r") && m->setCharset("iso-8859-1"));
+    m->text("caf\xC3\xA9 \xE2\x82\xAC\n");
+    check("build: ISO-8859-1 text (the euro sign becomes ?)", built(m, W_G));
+
+    // ---- a message made of everything ------------------------------------------------------------------------------------------------------------------------
+    m = base();
+    m->to("carol@example.org");
+    m->cc("Dave <dave@example.org>");
+    m->bcc("eve@example.org, BOB@example.org");
+    m->replyTo("Ann Reply <reply@example.org>");
+    m->subject("Everything");
+    m->text("t\n");
+    m->html("<p>h</p>");
+    m->attachInline("a.png", "image/png", "A", 1, "cid-a@example.org");
+    m->attach("r.pdf", "application/pdf", "PDF", 3);
+    m->attach("s.csv", "text/csv", "a,b\n1,2\n", 8);
+    m->inReplyTo("<prev@example.org>");
+    m->references("<first@example.org> <prev@example.org>");
+    m->header("X-Mailer", "A mail module");
+    m->header("List-Id", "<list.example.org>");
+    int ne = 0;
+    char* we = m->build(&ne);
+    check("everything: the message is built", we != null);
+    mail.Part* pe = mail.parse(we, ne, null);
+    check("everything: the tree is mixed(alternative(plain,related(html,png)),pdf,csv)", shapeIs(pe, "mixed(alternative(plain,related(html,png)),pdf,csv)"));
+    check("everything: Bcc is not in the message", pe->header("Bcc") == null && strstr(we, "eve@example.org") == null);
+    mail.AddressList* to = pe->addresses("To");
+    mail.AddressList* cc = pe->addresses("Cc");
+    check("everything: To has two addresses, Cc one", to->count == 2 && cc->count == 1 && streq(to->get(1)->addr, "carol@example.org") && streq(cc->get(0)->name, "Dave"));
+    check("everything: In-Reply-To, References and the own fields are there", eqs(pe->header("In-Reply-To"), "<prev@example.org>") && eqs(pe->header("References"), "<first@example.org> <prev@example.org>")
+        && eqs(pe->header("X-Mailer"), "A mail module") && eqs(pe->header("Reply-To"), "Ann Reply <reply@example.org>"));
+    check("everything: attachments are the pdf and the csv (the inline picture is not one)", pe->attachmentCount() == 2 && streq(pe->attachment(0)->filename, "r.pdf") && streq(pe->attachment(1)->filename, "s.csv") && pe->leafCount() == 5);
+    check("everything: the picture is found by its Content-ID", pe->findContentId("cid-a@example.org") != null && streq(pe->findContentId("cid-a@example.org")->type, "image") && pe->findContentId("nothing") == null);
+    check("everything: the csv text is kept exactly", bodyIs(pe->attachment(1), "a,b\n1,2\n", 8));
+    pe->dispose();
+    free(we);
+    mail.AddressList* rc = m->recipients();
+    check("recipients: To, Cc and Bcc without doubles (BOB@ is bob@ again)", rc->count == 4 && streq(rc->get(0)->addr, "bob@example.org") && streq(rc->get(1)->addr, "carol@example.org") && streq(rc->get(2)->addr, "dave@example.org")
+        && streq(rc->get(3)->addr, "eve@example.org"));
+    rc->dispose();
+    to->dispose();
+    cc->dispose();
+    check("sender: the address of the first From", streq(m->sender(), "ann@example.org"));
+    m->includeBcc = true;
+    int nb = 0;
+    char* wb = m->build(&nb);
+    check("includeBcc: the Bcc field is written when asked for", wb != null && strstr(wb, "Bcc: ") != null);
+    free(wb);
+    m->dispose();
+
+    // ---- refusals ----------------------------------------------------------------------------------------------------------------------------------------------
+    m = mail.newMessage();
+    check("refuse: no From", m->to("a@b.test") && m->text("x") && m->build(null) == null && startsWith(mail.error(), "a message needs a From"));
+    m->dispose();
+    m = mail.newMessage();
+    check("refuse: no recipient", m->from("c@d.test") && m->text("x") && m->build(null) == null && startsWith(mail.error(), "a message needs a recipient"));
+    check("refuse: a bad address changes nothing", !m->to("not an address") && !m->to("ok@x.test, broken") && m->toList == null && !m->cc("<x") && !m->bcc("a b@c.test") && !m->replyTo("@") && !m->from("a@@b"));
+    // CR and LF in an address are refused, not "repaired": the address list does not change (the earlier version dropped the first address and wrote an empty From field)
+    check("refuse: CR or LF in an address (From, To, Cc, Bcc, Reply-To)", !m->from("a@b.test\r\nBcc: evil@x.test") && !m->from("\"Evil\r\nBcc: x@y.test\" <a@b.test>") && !m->from("a@b.test\nBcc: evil@x.test")
+        && !m->to("a@b.test,\r\n b@c.test") && !m->cc("a@b.test\r") && !m->bcc("\nx@y.test") && !m->replyTo("Ann <a@b.test>\r\nBcc: z@y.test") && m->fromList->count == 1 && streq(m->fromList->get(0)->addr, "c@d.test") && m->toList == null && m->ccList == null && m->bccList == null && m->replyToList == null);
+    check("refuse: a subject with CR or LF (header injection)", !m->subject("Hi\r\nBcc: spy@evil.test") && !m->subject("Hi\nthere") && m->subject("Fine"));
+    check("refuse: a header with CR or LF in the value or a bad name", !m->header("X-A", "v\r\nBcc: x@y.test") && !m->header("X A", "v") && !m->header("", "v") && m->header("X-Ok", "v"));
+    check("refuse: the fields the builder writes are not set as extra fields", !m->header("From", "x@y.test") && !m->header("to", "x@y.test") && !m->header("Subject", "x") && !m->header("Date", "x") && !m->header("message-id", "<a@b.c>")
+        && !m->header("MIME-Version", "2.0") && !m->header("Content-Type", "text/plain") && !m->header("Content-Transfer-Encoding", "7bit") && !m->header("In-Reply-To", "<a@b.c>") && !m->header("Bcc", "x@y.test"));
+    check("refuse: bad message ids and references", !m->setMessageId("no brackets@x.test") && !m->setMessageId("<a b@x.test>") && !m->inReplyTo("<>") && !m->references("<a@b.test> junk") && m->references("<a@b.test>   <c@d.test>"));
+    check("refuse: bad attachment types, names and ids", !m->attach("a.bin", "nonsense", "x", 1) && !m->attach("a.bin", "a/b/c", "x", 1) && !m->attach("a.bin", "text/plain; charset=x", "x", 1) && !m->attach("a.bin", "/plain", "x", 1)
+        && !m->attach(null, "a/b", "x", 1) && !m->attachInline("a.png", "image/png", "x", 1, null) && !m->attachInline("a.png", "image/png", "x", 1, "a b") && !m->attachInline("a.png", "image/png", "x", 1, "<x>") && m->natts == 0);
+    m->dispose();
+
+    // ---- names of attachments --------------------------------------------------------------------------------------------------------------------------------
+    m = base();
+    m->subject("Names");
+    m->text("t\n");
+    m->attach("bad\r\nBcc: spy@evil.test.txt", "application/octet-stream", "1", 1);
+    m->attach("quote\"back\\slash.txt", "application/octet-stream", "2", 1);
+    m->attach("\xC3\x9C" "bersicht f\xC3\xBCr 2026 \xE2\x82\xAC.txt", "application/octet-stream", "3", 1);
+    m->attach("caf\xC3\xA9.txt", "application/octet-stream", "4", 1);
+    char longName[400];
+    for (int i = 0; i < 300; i++) longName[i] = 'n';
+    longName[300] = 0;
+    m->attach(&longName[0], "application/octet-stream", "5", 1);
+    int nn = 0;
+    char* wn = m->build(&nn);
+    mail.Part* pn = mail.parse(wn, nn, null);
+    check("names: a line break in a file name cannot start a header (the message has no Bcc)", strstr(wn, "\r\nBcc:") == null && pn->header("Bcc") == null && pn->attachmentCount() == 5);
+    check("names: CR and LF became _", streq(pn->attachment(0)->filename, "bad__Bcc: spy@evil.test.txt"));
+    check("names: quote and backslash survive", streq(pn->attachment(1)->filename, "quote\"back\\slash.txt"));
+    check("names: a non-ASCII name goes out as RFC 2231 and comes back", streq(pn->attachment(2)->filename, "\xC3\x9C" "bersicht f\xC3\xBCr 2026 \xE2\x82\xAC.txt") && strstr(wn, "filename*=UTF-8''%C3%9Cbersicht%20f%C3%BCr%202026%20%E2%82%AC.txt") != null);
+    check("names: ... with a plain fallback for old readers", strstr(wn, "filename=\"_bersicht f_r 2026 _.txt\"") != null);
+    check("names: caf\xC3\xA9 (one 2-byte character, one underscore in the fallback)", streq(pn->attachment(3)->filename, "caf\xC3\xA9.txt") && strstr(wn, "filename=\"caf_.txt\"") != null);
+    check("names: a name of 300 bytes is cut at 255", strlen(pn->attachment(4)->filename) == 255);
+    int maxLine = 0;
+    int ln = 0;
+    for (int i = 0; i < nn; i++) {
+        if (wn[i] == 13) { if (ln > maxLine) maxLine = ln; ln = 0; i++; } else ln++;
+    }
+    check("names: no line of the message passes 998", maxLine <= 998);
+    pn->dispose();
+    free(wn);
+    m->dispose();
+
+    // ---- boundaries that occur in the data --------------------------------------------------------------------------------------------------------------------
+    m = base();
+    m->subject("Clash");
+    m->text("t\n");
+    m->attach("clash.txt", "text/plain", "--BND1\n--BND2\n--BND3\nnot a boundary, only text\n", 47);
+    int nc = 0;
+    char* wc = m->build(&nc);
+    mail.Part* pc = mail.parse(wc, nc, null);
+    check("boundary: a boundary that occurs in an attachment is not used", pc != null && pc->boundary != null && streq(pc->boundary, "BND4") && pc->nchildren == 2);
+    check("boundary: ... and the attachment is read back whole", bodyIs(pc->child(1), "--BND1\n--BND2\n--BND3\nnot a boundary, only text\n", 47));
+    pc->dispose();
+    free(wc);
+    m->dispose();
+    // random boundaries: two messages differ, and every boundary is a valid one
+    m = base();
+    m->boundaryPrefix = null;
+    m->text("a\n");
+    m->html("b\n");
+    int nr1 = 0;
+    int nr2 = 0;
+    char* wr1 = m->build(&nr1);
+    char* wr2 = m->build(&nr2);
+    mail.Part* pr1 = mail.parse(wr1, nr1, null);
+    mail.Part* pr2 = mail.parse(wr2, nr2, null);
+    check("boundary: random boundaries differ from message to message and are valid", pr1->boundary != null && pr2->boundary != null && !streq(pr1->boundary, pr2->boundary) && strlen(pr1->boundary) == 24 && pr1->nchildren == 2);
+    pr1->dispose();
+    pr2->dispose();
+    free(wr1);
+    free(wr2);
+    m->dispose();
+
+    // ---- shapes ------------------------------------------------------------------------------------------------------------------------------------------------
+    m = base(); m->to("c@x.test");
+    mail.Part* ps = roundTrip(m);
+    check("shape: no body at all is an empty text part", shapeIs(ps, "plain") && ps->bodyLen == 0);
+    ps->dispose(); m->dispose();
+    m = base();
+    m->attach("a.bin", "application/octet-stream", "x", 1);
+    ps = roundTrip(m);
+    check("shape: only an attachment is mixed(bin)", shapeIs(ps, "mixed(octet-stream)"));
+    ps->dispose(); m->dispose();
+    m = base();
+    m->text("t");
+    m->attachInline("a.png", "image/png", "x", 1, "c1");
+    ps = roundTrip(m);
+    check("shape: an inline picture without html is a part of mixed, still found by its Content-ID", shapeIs(ps, "mixed(plain,png)") && ps->leafCount() == 2 && ps->findContentId("c1") != null);
+    ps->dispose(); m->dispose();
+    m = base();
+    m->html("<p>x</p>");
+    m->attach("a.bin", "application/octet-stream", "x", 1);
+    ps = roundTrip(m);
+    check("shape: html and an attachment is mixed(html,bin)", shapeIs(ps, "mixed(html,octet-stream)"));
+    ps->dispose(); m->dispose();
+    m = base();
+    m->html("<p>x</p>");
+    m->attachInline("a.png", "image/png", "x", 1, "c1");
+    ps = roundTrip(m);
+    check("shape: html and an inline picture is related(html,png)", shapeIs(ps, "related(html,png)"));
+    ps->dispose(); m->dispose();
+
+    // ---- round trips of text -----------------------------------------------------------------------------------------------------------------------------------
+    char* texts[16];
+    texts[0] = "";
+    texts[1] = "no newline at the end";
+    texts[2] = ".\n.\n..dots at the start\n.";
+    texts[3] = "From me to you\n>From you to me\n";
+    texts[4] = "trailing spaces   \n  leading\n\ttab\t\n  \n";
+    texts[5] = "line\n\n\n\nmany blank lines\n\n";
+    texts[6] = "a=b = c=3D =\n=20 =\n";
+    texts[7] = "Gr\xC3\xBC\xC3\x9F" "e aus M\xC3\xBCnchen\nZ\xC3\xBCrich \xE2\x82\xAC 5\n";
+    texts[8] = "emoji \xF0\x9F\x98\x80 and CJK \xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\n";
+    texts[9] = "--not-a-boundary\n--BND1\n-- \n";
+    texts[10] = "tab\tin the middle\tand at the end\t";
+    texts[11] = "a\n";
+    texts[12] = "\n";
+    texts[13] = "x";
+    texts[14] = "I\xC3\xB1t\xC3\xABrn\xC3\xA2ti\xC3\xB4n\xC3\xA0liz\xC3\xA6ti\xC3\xB8n 1234567890 1234567890 1234567890 1234567890 1234567890 1234567890 1234567890 1234567890 1234567890\n";
+    texts[15] = "ends with an equals sign =";
+    int tOk = 0;
+    for (int i = 0; i < 16; i++) {
+        m = base();
+        m->text(texts[i]);
+        m->html(texts[i]);
+        mail.Part* p = roundTrip(m);
+        mail.Part* tp = p == null ? null : p->firstText("plain");
+        mail.Part* hp = p == null ? null : p->firstText("html");
+        if (tp != null && hp != null && bodyIs(tp, texts[i], strlen(texts[i])) && bodyIs(hp, texts[i], strlen(texts[i]))) tOk++;
+        else printf("     text %d did not come back\n", i);
+        if (p != null) p->dispose();
+        m->dispose();
+    }
+    check("round trip: 16 awkward texts (dots, From lines, blanks, = signs, CJK, emoji, no final newline) as text and html", tOk == 16);
+    // text with other line ends: CR, CRLF and LF all become LF
+    m = base();
+    m->text("one\rtwo\r\nthree\nfour\r\r\nfive");
+    ps = roundTrip(m);
+    check("round trip: CR, CRLF and LF line ends all come back as LF", bodyIs(ps, "one\ntwo\nthree\nfour\n\nfive", 24));
+    ps->dispose(); m->dispose();
+    // a line of 5000 characters, a text of 300 KB
+    char* longText = alloc(5100);
+    for (int i = 0; i < 5000; i++) longText[i] = 'a' + (i % 26);
+    m = base();
+    m->text(longText);
+    int nl2 = 0;
+    char* wl = m->build(&nl2);
+    int maxl = 0;
+    ln = 0;
+    for (int i = 0; i < nl2; i++) {
+        if (wl[i] == 13) { if (ln > maxl) maxl = ln; ln = 0; i++; } else ln++;
+    }
+    mail.Part* pl = mail.parse(wl, nl2, null);
+    check("round trip: a line of 5000 characters is quoted-printable (lines of at most 76) and comes back", maxl <= 998 && strstr(wl, "quoted-printable") != null && bodyIs(pl->firstText("plain"), longText, 5000));
+    pl->dispose();
+    free(wl);
+    m->dispose();
+    int bigN = 300000;
+    char* big = alloc(bigN + 1);
+    int seed = 7;
+    for (int i = 0; i < bigN; i++) {
+        seed = seed * 1103515245 + 12345;
+        int r = (seed >> 16) & 63;
+        big[i] = r < 6 ? '\n' : (r < 12 ? ' ' : 'a' + r % 26);
+    }
+    m = base();
+    m->text(big);
+    ps = roundTrip(m);
+    check("round trip: a text of 300000 bytes", bodyIs(ps, big, bigN));
+    ps->dispose(); m->dispose();
+
+    // ---- round trips of binary data ---------------------------------------------------------------------------------------------------------------------------
+    char* bin = alloc(256 * 12 + 1);
+    for (int i = 0; i < 256 * 12; i++) bin[i] = (i % 256) ^ ((i / 256) * 37);
+    m = base();
+    m->text("t");
+    m->attach("all.bin", "application/octet-stream", bin, 256 * 12);
+    m->attach("one.bin", "application/x-test", "\x00", 1);
+    m->attach("empty.bin", "application/octet-stream", "", 0);
+    m->attach("crlf.bin", "application/octet-stream", "\r\n\r\n--BND1\r\n\r\n", 14);
+    ps = roundTrip(m);
+    check("round trip: binary attachments (every byte value, a NUL, empty, CRLF and boundary look-alikes)", ps != null && ps->nchildren == 5 && bodyIs(ps->child(1), bin, 256 * 12) && bodyIs(ps->child(2), "\x00", 1) && bodyIs(ps->child(3), "", 0)
+        && bodyIs(ps->child(4), "\r\n\r\n--BND1\r\n\r\n", 14));
+    check("round trip: ... with the types and names", streq(ps->child(1)->subtype, "octet-stream") && streq(ps->child(2)->type, "application") && streq(ps->child(2)->subtype, "x-test") && streq(ps->child(4)->filename, "crlf.bin")
+        && streq(ps->child(1)->encoding, "base64"));
+    ps->dispose(); m->dispose();
+    // a text attachment that is not UTF-8 text stays text; a Latin-1 charset is converted back to UTF-8 by the parser
+    m = base();
+    m->setCharset("iso-8859-1");
+    m->text("caf\xC3\xA9 na\xC3\xAFve\n");
+    ps = roundTrip(m);
+    check("round trip: a Latin-1 text is converted to UTF-8 by the parser", bodyIs(ps, "caf\xC3\xA9 na\xC3\xAFve\n", 13) && streq(ps->charset, "iso-8859-1") && ps->utf8);
+    ps->dispose(); m->dispose();
+    // 8bit
+    m = base();
+    m->allow8bit = true;
+    m->text("m\xC3\xBCde \xE2\x82\xAC\n");
+    ps = roundTrip(m);
+    check("round trip: an 8bit body", bodyIs(ps, "m\xC3\xBCde \xE2\x82\xAC\n", 10) && streq(ps->encoding, "8bit"));
+    ps->dispose(); m->dispose();
+    // mostly non-ASCII text takes base64
+    m = base();
+    m->text("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x81\xAE\xE3\x83\x86\xE3\x82\xAD\xE3\x82\xB9\xE3\x83\x88\n");
+    ps = roundTrip(m);
+    check("round trip: text that is mostly non-ASCII is base64", streq(ps->encoding, "base64") && bodyIs(ps, "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x81\xAE\xE3\x83\x86\xE3\x82\xAD\xE3\x82\xB9\xE3\x83\x88\n", 25));
+    ps->dispose(); m->dispose();
+
+    // ---- header round trips ---------------------------------------------------------------------------------------------------------------------------------------
+    m = mail.newMessage();
+    m->from("\"M\xC3\xBCller, J\xC3\xBCrgen\" <jm@example.org>");
+    m->to("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E <jp@example.org>, \"Dr. Who\" <who@example.org>, plain@example.org");
+    char* subj = "Re: Ein sehr langer Betreff mit \xC3\x9Cml\xC3\xA4uten und vielen W\xC3\xB6rtern, der auf mehrere Zeilen verteilt werden muss \xE2\x82\xAC 100 und noch mehr Text dahinter";
+    m->subject(subj);
+    m->text("x\n");
+    ps = roundTrip(m);
+    char* gotSubj = ps->decodedHeader("Subject");
+    check("header round trip: a long UTF-8 subject is folded, encoded and read back", eqs(gotSubj, subj));
+    free(gotSubj);
+    mail.AddressList* fa = ps->addresses("From");
+    mail.AddressList* ta = ps->addresses("To");
+    check("header round trip: names with comma, umlauts, CJK, a dot", fa->count == 1 && streq(fa->get(0)->name, "M\xC3\xBCller, J\xC3\xBCrgen") && ta->count == 3 && streq(ta->get(0)->name, "\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E") && streq(ta->get(1)->name, "Dr. Who") && streq(ta->get(2)->name, ""));
+    fa->dispose();
+    ta->dispose();
+    int du = 0;
+    int doff = 0;
+    check("header round trip: the Date field of a message is read", ps->date(&du, &doff) && du > 1767225600);
+    ps->dispose();
+    m->dispose();
+    m = base();
+    m->setDate(1057049557, 120);
+    m->text("d");
+    ps = roundTrip(m);
+    check("header round trip: Date with a zone", ps->date(&du, &doff) && du == 1057049557 && doff == 120 && eqs(ps->header("Date"), "Tue, 1 Jul 2003 10:52:37 +0200"));
+    ps->dispose(); m->dispose();
+    m = base();
+    m->messageId = null;
+    m->text("d");
+    ps = roundTrip(m);
+    char* mid = ps->header("Message-ID");
+    check("header round trip: a Message-ID is made from the domain of the From address", mid != null && mail.validMessageId(mid, strlen(mid)) && endsWith(mid, "@example.org>"));
+    ps->dispose(); m->dispose();
+    m = base();
+    m->dateUnix = 0;
+    m->hasDate = false;
+    m->text("d");
+    ps = roundTrip(m);
+    check("header round trip: no date set means now (a date after 2026-01-01)", ps->date(&du, &doff) && du > 1767225600);
+    ps->dispose(); m->dispose();
+
+    // ---- a message inside a message, a parsed tree written again ----------------------------------------------------------------------------------------------------
+    mail.Message* inner = base();
+    inner->subject("inner \xC3\xA4");
+    inner->text("inner body\n");
+    int ni = 0;
+    char* wi = inner->build(&ni);
+    inner->dispose();
+    m = base();
+    m->subject("outer");
+    m->text("outer body\n");
+    m->attachMessage("forwarded.eml", wi, ni);
+    ps = roundTrip(m);
+    mail.Part* fw = ps->attachment(0);
+    check("message/rfc822: the attached message is a part of its own type, the message inside is parsed", fw != null && fw->is("message", "rfc822") && fw->nchildren == 1 && bodyIs(fw->child(0), "inner body\n", 11) && fw->bodyLen == ni);
+    char* isub = fw->child(0)->decodedHeader("Subject");
+    check("message/rfc822: ... its headers are read too", eqs(isub, "inner \xC3\xA4"));
+    free(isub);
+    int nw2 = 0;
+    char* w2 = mail.serialize(ps, null, &nw2);
+    mail.Part* p2 = mail.parse(w2, nw2, null);
+    check("serialize(parse(x)): the written tree reads back with the same shape and the same bodies", shapeIs(p2, "mixed(plain,rfc822)") && bodyIs(p2->child(0), "outer body\n", 11) && p2->child(1)->bodyLen == ni && p2->child(1)->nchildren == 1
+        && bodyIs(p2->child(1)->child(0), "inner body\n", 11));
+    check("serialize(parse(x)): the fields of the first message are still there", eqs(p2->header("Message-ID"), "<id1@example.org>") && eqs(p2->header("Subject"), "outer") && p2->headers->count == ps->headers->count);
+    p2->dispose();
+    free(w2);
+    mail.WriteOptions* wo = mail.newWriteOptions();
+    wo->maxSize = 200;
+    check("serialize: a message over maxSize is not written (null, error)", mail.serialize(ps, wo, null) == null && startsWith(mail.error(), "the message is too big"));
+    free((char*) wo);
+    ps->dispose();
+    free(wi);
+    m->dispose();
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

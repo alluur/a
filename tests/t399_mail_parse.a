@@ -1,0 +1,531 @@
+// The mail module, third part: reading messages that are not nice. Nested multiparts, preambles, boundaries that are nearly the same, missing end boundaries,
+// parts without headers, unknown encodings, garbage in base64 and quoted-printable, character sets (declared, missing, wrong, unknown), RFC 2231 parameters, file
+// names that must not become paths, every limit (message size, nesting, number of parts, headers, decoded size), random garbage, and memory: building, reading and
+// freeing again and again must not move the heap.
+import mail;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+// the text with LF changed to CRLF (a heap string)
+char* crlf(char* s) {
+    mail.Buf b;
+    for (int i = 0; s[i] != 0; i++) {
+        if (s[i] == 10) b.addByte(13);
+        b.addByte(s[i]);
+    }
+    return b.take();
+}
+
+// reads a message written with LF
+mail.Part* readLf(char* text, mail.ParseOptions* o = null) {
+    char* w = crlf(text);
+    mail.Part* p = mail.parse(w, strlen(w), o);
+    free(w);
+    return p;
+}
+
+bool bodyIs(mail.Part* p, char* want) {
+    int n = strlen(want);
+    bool ok = p != null && p->bodyLen == n && memcmp(p->body, want, n) == 0 && p->body[n] == 0;
+    if (!ok && p != null) printf("     body [%s] (%d)\n", p->body, p->bodyLen);
+    return ok;
+}
+
+bool eqs(char* a, char* b) { return a != null && b != null && streq(a, b); }
+
+int totalParts(mail.Part* p) {
+    int n = 1;
+    for (int i = 0; i < p->nchildren; i++) n = n + totalParts(p->children[i]);
+    return n;
+}
+
+int maxDepthOf(mail.Part* p) {
+    int d = p->depth;
+    for (int i = 0; i < p->nchildren; i++) {
+        int k = maxDepthOf(p->children[i]);
+        if (k > d) d = k;
+    }
+    return d;
+}
+
+// a part that was read: its fields can be used as strings
+bool sane(mail.Part* p) {
+    if (p->type == null || p->subtype == null || p->body == null && p->nchildren == 0 && !p->isMultipart()) return false;
+    if (p->body != null && p->body[p->bodyLen] != 0) return false;
+    for (int i = 0; i < p->nchildren; i++) {
+        if (!sane(p->children[i])) return false;
+    }
+    return true;
+}
+
+int main() {
+    // ---- nested multiparts ------------------------------------------------------------------------------------------------------------------------------
+    char* nested =
+        "Subject: nested\n"
+        "Content-Type: multipart/mixed; boundary=\"outer\"\n"
+        "\n"
+        "This is the preamble. It is ignored.\n"
+        "--outer\n"
+        "Content-Type: multipart/alternative; boundary=inner\n"
+        "\n"
+        "--inner\n"
+        "Content-Type: text/plain\n"
+        "\n"
+        "plain text\n"
+        "--inner\n"
+        "Content-Type: multipart/related; boundary=\"deep\"\n"
+        "\n"
+        "--deep\n"
+        "Content-Type: text/html\n"
+        "\n"
+        "<p>html</p>\n"
+        "--deep\n"
+        "Content-Type: image/gif\n"
+        "Content-Transfer-Encoding: base64\n"
+        "Content-ID: <  gif1@x  >\n"
+        "\n"
+        "R0lGODlhAQABAAAAACw=\n"
+        "--deep--\n"
+        "--inner--\n"
+        "--outer\n"
+        "Content-Type: application/pdf; name=\"doc.pdf\"\n"
+        "Content-Disposition: attachment\n"
+        "\n"
+        "%PDF-1.4\n"
+        "--outer--\n"
+        "This is the epilogue. It is ignored too.\n";
+    mail.Part* p = readLf(nested);
+    check("nested: three levels are read, the preamble and the epilogue are ignored", p != null && p->defects == 0 && totalParts(p) == 7 && p->nchildren == 2 && p->child(0)->nchildren == 2 && p->child(0)->child(1)->nchildren == 2);
+    check("nested: the leaves", bodyIs(p->child(0)->child(0), "plain text") && bodyIs(p->child(0)->child(1)->child(0), "<p>html</p>") && p->child(0)->child(1)->child(1)->bodyLen == 14);
+    check("nested: the Content-ID loses its brackets and blanks, the name of the type parameter is the file name", eqs(p->child(0)->child(1)->child(1)->contentId, "gif1@x") && eqs(p->child(1)->filename, "doc.pdf") && bodyIs(p->child(1), "%PDF-1.4"));
+    check("nested: depth numbers", p->depth == 0 && p->child(0)->child(1)->child(1)->depth == 3 && maxDepthOf(p) == 3);
+    check("nested: findContentId and the walks", p->findContentId("gif1@x") != null && p->leafCount() == 4 && p->attachmentCount() == 1 && p->firstText("plain") != null && p->firstText("html") != null);
+    p->dispose();
+
+    // ---- boundaries -------------------------------------------------------------------------------------------------------------------------------------
+    char* sim =
+        "Content-Type: multipart/mixed; boundary=BND\n"
+        "\n"
+        "--BND  \t\n"
+        "Content-Type: text/plain\n"
+        "\n"
+        "first\n"
+        "--BND2 is not a delimiter, it is text\n"
+        "--BNDX nor this\n"
+        "--BND--x is no closing line either\n"
+        " --BND is indented: text\n"
+        "--BND\n"
+        "\n"
+        "second, a part without headers\n"
+        "--BND--   \n";
+    p = readLf(sim);
+    check("boundary: trailing blanks are allowed, look-alikes are text, a part may have no headers", p != null && p->nchildren == 2 && p->defects == 0
+        && bodyIs(p->child(0), "first\n--BND2 is not a delimiter, it is text\n--BNDX nor this\n--BND--x is no closing line either\n --BND is indented: text") && bodyIs(p->child(1), "second, a part without headers"));
+    check("boundary: a part without headers is text/plain", eqs(p->child(1)->type, "text") && eqs(p->child(1)->subtype, "plain"));
+    p->dispose();
+    char* noEnd = "Content-Type: multipart/mixed; boundary=b\n\n--b\n\nfirst\n--b\n\nsecond, never closed\n";
+    p = readLf(noEnd);
+    check("missing end boundary: the last part runs to the end, D_NO_END_BOUNDARY", p->nchildren == 2 && (p->defects & mail.D_NO_END_BOUNDARY) != 0 && bodyIs(p->child(1), "second, never closed"));
+    p->dispose();
+    char* noBoundary = "Content-Type: multipart/mixed\n\n--b\n\nfirst\n--b--\n";
+    p = readLf(noBoundary);
+    check("no boundary parameter: D_NO_BOUNDARY, the body is kept as it is", p->nchildren == 0 && (p->defects & mail.D_NO_BOUNDARY) != 0 && bodyIs(p, "--b\r\n\r\nfirst\r\n--b--\r\n"));
+    p->dispose();
+    char* noLine = "Content-Type: multipart/mixed; boundary=zzz\n\nno boundary line anywhere\n";
+    p = readLf(noLine);
+    check("a boundary that never occurs: D_NO_BOUNDARY, the body is kept", p->nchildren == 0 && (p->defects & mail.D_NO_BOUNDARY) != 0 && bodyIs(p, "no boundary line anywhere\r\n"));
+    p->dispose();
+    char longB[100];
+    for (int i = 0; i < 71; i++) longB[i] = 'b';
+    longB[71] = 0;
+    char hdr[300];
+    format(&hdr[0], 300, "Content-Type: multipart/mixed; boundary=\"%s\"\n\n--%s\n\nx\n--%s--\n", &longB[0], &longB[0], &longB[0], 0, 0, 0);
+    p = readLf(&hdr[0]);
+    check("a boundary of 71 characters is invalid (D_BAD_BOUNDARY), 70 is fine", (p->defects & mail.D_BAD_BOUNDARY) != 0 && p->nchildren == 0);
+    p->dispose();
+    longB[70] = 0;
+    format(&hdr[0], 300, "Content-Type: multipart/mixed; boundary=\"%s\"\n\n--%s\n\nx\n--%s--\n", &longB[0], &longB[0], &longB[0], 0, 0, 0);
+    p = readLf(&hdr[0]);
+    check("... a boundary of 70", p->defects == 0 && p->nchildren == 1);
+    p->dispose();
+    p = readLf("Content-Type: multipart/mixed; boundary=\"a<b>c\"\n\n--a<b>c\n\nx\n--a<b>c--\n");
+    check("a boundary with characters that are not allowed is invalid", (p->defects & mail.D_BAD_BOUNDARY) != 0);
+    p->dispose();
+    p = readLf("Content-Type: multipart/mixed; boundary=b\n\n--b\n\n--b\n\n--b\n--b--\n");
+    check("empty parts are read", p->nchildren == 3 && p->child(0)->bodyLen == 0 && p->child(1)->bodyLen == 0 && p->child(2)->bodyLen == 0 && p->defects == 0);
+    p->dispose();
+    p = readLf("Content-Type: multipart/mixed; boundary=b\n\n--b\nno blank line, no header\n--b--\n");
+    check("a part with text where the headers should be: D_BAD_HEADER, the text is the body", p->nchildren == 1 && (p->child(0)->defects & mail.D_BAD_HEADER) != 0 && bodyIs(p->child(0), "no blank line, no header"));
+    p->dispose();
+    p = readLf("Content-Type: multipart/digest; boundary=d\n\n--d\n\nSubject: first\n\nbody one\n--d\nContent-Type: text/plain\n\nplain in a digest\n--d--\n");
+    check("multipart/digest: parts default to message/rfc822 (and are parsed as messages)", p->nchildren == 2 && p->child(0)->is("message", "rfc822") && p->child(0)->nchildren == 1 && eqs(p->child(0)->child(0)->header("Subject"), "first")
+        && p->child(1)->is("text", "plain"));
+    p->dispose();
+    p = readLf("Content-Type: multipart/mixed; boundary=b\nContent-Transfer-Encoding: base64\n\n--b\n\nhello\n--b--\n");
+    check("a multipart with a transfer encoding: the encoding is ignored (RFC 2045 6.4)", p->nchildren == 1 && bodyIs(p->child(0), "hello"));
+    p->dispose();
+
+    // ---- encodings ---------------------------------------------------------------------------------------------------------------------------------------
+    p = readLf("Content-Type: text/plain\nContent-Transfer-Encoding: x-uuencode\n\nbegin 644 x\n");
+    check("an unknown transfer encoding: D_BAD_ENCODING, the data is kept as it is", (p->defects & mail.D_BAD_ENCODING) != 0 && bodyIs(p, "begin 644 x\n"));
+    p->dispose();
+    p = readLf("Content-Type: application/octet-stream\nContent-Transfer-Encoding: base64\n\nR0lG!!OD\nlhAQ*ABAAAAACw=\n");
+    check("base64 with garbage characters is read leniently", p->bodyLen == 14 && memcmp(p->body, "GIF89a\x01\x00\x01\x00\x00\x00\x00,", 14) == 0);
+    p->dispose();
+    p = readLf("Content-Type: text/plain\nContent-Transfer-Encoding: quoted-printable\n\nok =3D here, bad =ZZ there, soft =\nbreak, end=\n");
+    check("quoted-printable with a bad escape: D_BAD_ENCODING, the rest is decoded", (p->defects & mail.D_BAD_ENCODING) != 0 && bodyIs(p, "ok = here, bad =ZZ there, soft break, end"));
+    p->dispose();
+    p = readLf("Content-Type: text/plain\nContent-Transfer-Encoding: BASE64 (comment)\n\naGVsbG8=\n");
+    check("the encoding name is case blind and may have a comment", bodyIs(p, "hello") && eqs(p->encoding, "base64"));
+    p->dispose();
+    p = readLf("Content-Type: text/plain\nContent-Transfer-Encoding: 7bit\n\nplain\n");
+    check("7bit and 8bit and binary are plain copies", bodyIs(p, "plain\n"));
+    p->dispose();
+
+    // ---- character sets ----------------------------------------------------------------------------------------------------------------------------------
+    p = readLf("Content-Type: text/plain; charset=iso-8859-1\nContent-Transfer-Encoding: 8bit\n\ncaf\xE9 na\xEFve\n");
+    check("charset: iso-8859-1 is converted to UTF-8", bodyIs(p, "caf\xC3\xA9 na\xC3\xAFve\n") && p->utf8 && p->defects == 0);
+    p->dispose();
+    p = readLf("Content-Type: text/plain; charset=\"ISO-8859-1\"\nContent-Transfer-Encoding: quoted-printable\n\ncaf=E9\n");
+    check("charset: quoted-printable Latin-1", bodyIs(p, "caf\xC3\xA9\n"));
+    p->dispose();
+    p = readLf("Content-Type: text/plain; charset=windows-1252\n\nprice \x80 5 \x93quoted\x94\n");
+    check("charset: windows-1252", bodyIs(p, "price \xE2\x82\xAC 5 \xE2\x80\x9Cquoted\xE2\x80\x9D\n"));
+    p->dispose();
+    p = readLf("Content-Type: text/plain; charset=utf-8\n\nbad \xFF byte, good \xC3\xBC\n");
+    check("charset: UTF-8 with an invalid byte: U+FFFD and D_BAD_CHARSET", bodyIs(p, "bad \xEF\xBF\xBD byte, good \xC3\xBC\n") && (p->defects & mail.D_BAD_CHARSET) != 0);
+    p->dispose();
+    p = readLf("Content-Type: text/plain; charset=koi8-r\n\n\xC1\xC2\n");
+    check("charset: an unknown set: the bytes are kept, D_BAD_CHARSET, utf8 is false", bodyIs(p, "\xC1\xC2\n") && (p->defects & mail.D_BAD_CHARSET) != 0 && !p->utf8);
+    p->dispose();
+    p = readLf("Content-Type: text/plain\n\nplain ascii only\n");
+    check("charset: none declared and only ASCII: nothing to do", p->defects == 0 && p->charset == null && bodyIs(p, "plain ascii only\n"));
+    p->dispose();
+    p = readLf("Subject: x\n\nm\xC3\xBCde\n");
+    check("charset: none declared, valid UTF-8: taken as UTF-8 (D_CHARSET_GUESSED)", bodyIs(p, "m\xC3\xBCde\n") && (p->defects & mail.D_CHARSET_GUESSED) != 0);
+    p->dispose();
+    p = readLf("Subject: x\n\nm\xFC" "de\n");
+    check("charset: none declared, not UTF-8: windows-1252 (D_CHARSET_GUESSED)", bodyIs(p, "m\xC3\xBCde\n") && (p->defects & mail.D_CHARSET_GUESSED) != 0);
+    p->dispose();
+    p = readLf("Content-Type: text/plain; charset=us-ascii\n\nsays ascii, is \xC3\xBC\n");
+    check("charset: us-ascii with 8-bit bytes is guessed too", bodyIs(p, "says ascii, is \xC3\xBC\n") && (p->defects & mail.D_CHARSET_GUESSED) != 0);
+    p->dispose();
+    mail.ParseOptions* raw = mail.newParseOptions();
+    raw->convertCharset = false;
+    raw->normalizeNewlines = false;
+    char* wraw = crlf("Content-Type: text/plain; charset=iso-8859-1\n\ncaf\xE9\nline2\n");
+    p = mail.parse(wraw, strlen(wraw), raw);
+    check("options: convertCharset and normalizeNewlines off give the bytes as sent", p->bodyLen == 13 && memcmp(p->body, "caf\xE9\r\nline2\r\n", 13) == 0);
+    p->dispose();
+    free(wraw);
+    free((char*) raw);
+    p = readLf("Content-Type: application/octet-stream; charset=iso-8859-1\n\nbinary \xE9\n");
+    check("charset: only text parts are converted (and their line ends are not touched)", bodyIs(p, "binary \xE9\r\n"));
+    p->dispose();
+
+    // ---- parameters (RFC 2231) ----------------------------------------------------------------------------------------------------------------------------
+    p = readLf("Content-Type: application/x\nContent-Disposition: attachment; filename*=utf-8''%e2%82%ac%20price.txt\n\nx");
+    check("2231: filename*=utf-8''%e2%82%ac%20price.txt", eqs(p->filename, "\xE2\x82\xAC price.txt"));
+    p->dispose();
+    p = readLf("Content-Type: application/x\nContent-Disposition: attachment; filename*0*=utf-8''a%20b; filename*1=c; filename*2*=%C3%A4.txt\n\nx");
+    check("2231: continuations (a%20b + c + %C3%A4.txt)", eqs(p->filename, "a bc\xC3\xA4.txt"));
+    p->dispose();
+    p = readLf("Content-Type: application/x\nContent-Disposition: attachment; filename*1=\"world.txt\"; filename*0=\"hello \"\n\nx");
+    check("2231: the pieces are put in the order of their numbers", eqs(p->filename, "hello world.txt"));
+    p->dispose();
+    p = readLf("Content-Type: application/x\nContent-Disposition: attachment; filename*=iso-8859-1'en'caf%E9.txt\n\nx");
+    check("2231: a charset and a language, Latin-1", eqs(p->filename, "caf\xC3\xA9.txt"));
+    p->dispose();
+    p = readLf("Content-Type: application/x\nContent-Disposition: attachment; filename=\"fallback.txt\"; filename*=utf-8''real%20name.txt\n\nx");
+    check("2231: when both forms are there the extended one wins", eqs(p->filename, "real name.txt"));
+    p->dispose();
+    p = readLf("Content-Type: application/x\nContent-Disposition: attachment; filename*=utf-8''real%20name.txt; filename=\"fallback.txt\"\n\nx");
+    check("2231: ... in either order", eqs(p->filename, "real name.txt"));
+    p->dispose();
+    p = readLf("Content-Type: application/x\nContent-Disposition: attachment; filename=\"=?utf-8?B?w5xiZXJzaWNodC50eHQ=?=\"\n\nx");
+    check("2047 in a parameter (not allowed, common): decoded", eqs(p->filename, "\xC3\x9C" "bersicht.txt"));
+    p->dispose();
+    p = readLf("Content-Type: application/pdf; name=\"report.pdf\"\n\nx");
+    check("the name of Content-Type is the file name when there is no Content-Disposition", eqs(p->filename, "report.pdf") && p->disposition == null);
+    p->dispose();
+    p = readLf("Content-Type: application/pdf; name=\"a.pdf\"\nContent-Disposition: inline; filename=\"b.pdf\"\n\nx");
+    check("the filename of Content-Disposition wins over name", eqs(p->filename, "b.pdf") && eqs(p->disposition, "inline"));
+    p->dispose();
+    p = readLf("Content-Type: text/plain;\n charset=\"utf-8\";\n format=flowed\nContent-Disposition: attachment;\n\tfilename=\"two words.txt\"\n\nx");
+    check("parameters over several lines, quoted values with blanks", eqs(p->charset, "utf-8") && eqs(p->filename, "two words.txt") && eqs(p->disposition, "attachment"));
+    p->dispose();
+    p = readLf("Content-Type: TEXT/HTML; CHARSET=UTF-8\n\nx");
+    check("type, subtype and charset are lower case", eqs(p->type, "text") && eqs(p->subtype, "html") && eqs(p->charset, "utf-8"));
+    p->dispose();
+    p = readLf("Content-Type: nonsense\n\nx");
+    check("a Content-Type that is not type/subtype is application/octet-stream", p->is("application", "octet-stream"));
+    p->dispose();
+    p = readLf("Content-Type: application/x\nContent-Disposition: attachment; filename=\"a\\\"b\\\\c.txt\"; x=; =y; z\n\nx");
+    check("quoted-pair in a quoted value, broken parameters are skipped", eqs(p->filename, "a\"b\\c.txt"));
+    p->dispose();
+    char* safe[10];
+    char* safeWant[10];
+    safe[0] = "../../etc/passwd"; safeWant[0] = "passwd";
+    safe[1] = "C:\\Users\\x\\y.txt"; safeWant[1] = "y.txt";
+    safe[2] = ".bashrc"; safeWant[2] = "bashrc";
+    safe[3] = "...hidden"; safeWant[3] = "hidden";
+    safe[4] = "a\x01" "b\x7F" "c.txt"; safeWant[4] = "abc.txt";
+    safe[5] = ""; safeWant[5] = "attachment";
+    safe[6] = "dir/"; safeWant[6] = "attachment";
+    safe[7] = "..\\..\\x"; safeWant[7] = "x";
+    safe[8] = "a:b*c?d\"e<f>g|h.txt"; safeWant[8] = "a_b_c_d_e_f_g_h.txt";
+    safe[9] = "name with trailing dots. . ."; safeWant[9] = "name with trailing dots";
+    int sf = 0;
+    for (int i = 0; i < 10; i++) {
+        char* r = mail.safeFilename(safe[i]);
+        if (streq(r, safeWant[i])) sf++; else printf("     safeFilename(%d) = [%s]\n", i, r);
+        free(r);
+    }
+    check("safeFilename: paths, dot files, control characters, reserved characters", sf == 10);
+    char* lf = alloc(400);
+    for (int i = 0; i < 100; i++) { lf[i * 3] = 0xE2; lf[i * 3 + 1] = 0x82; lf[i * 3 + 2] = 0xAC; }
+    char* sl = mail.safeFilename(lf);
+    check("safeFilename: at most 120 bytes, cut between characters", strlen(sl) == 120 && mail.utf8Valid(sl, 120));
+    free(sl);
+
+    // ---- headers -------------------------------------------------------------------------------------------------------------------------------------------
+    p = readLf("From bob@example.org Fri Nov 13 14:30:00 2026\nSubject: mbox style\n\nbody\n");
+    check("the From line of an mbox is skipped", eqs(p->header("Subject"), "mbox style") && bodyIs(p, "body\n"));
+    p->dispose();
+    p = mail.parse("", 0, null);
+    check("an empty message: an empty text part", p != null && p->headers->count == 0 && p->bodyLen == 0 && p->is("text", "plain"));
+    p->dispose();
+    p = readLf("Subject: only headers\nTo: a@b.test\n");
+    check("a message with headers and no body", p->headers->count == 2 && p->bodyLen == 0);
+    p->dispose();
+    char* bare = "Subject: bare LF only\nTo: a@b.test\n\nbody\nmore\n";
+    p = mail.parse(bare, strlen(bare), null);
+    check("a message with bare LF line ends", p->headers->count == 2 && bodyIs(p, "body\nmore\n"));
+    p->dispose();
+    p = readLf("Subject: x\n\nContent-Type: multipart/mixed; boundary=b\n\n--b\n\nnot a part header block\n");
+    check("a Content-Type in the body is text", p->is("text", "plain") && p->nchildren == 0);
+    p->dispose();
+    p = readLf("Subject: =?UTF-8?B?w6TDtg==?= test\nFrom: a@b.test\nDate: Fri, 13 Nov 2026 14:30:00 +0000\n\nx");
+    char* sj = p->decodedHeader("Subject");
+    int du = 0;
+    int doff = 0;
+    check("decodedHeader and date", eqs(sj, "\xC3\xA4\xC3\xB6 test") && p->date(&du, &doff) && du == 1794580200 && p->decodedHeader("Nothing") == null);
+    free(sj);
+    mail.AddressList* none = p->addresses("To");
+    check("addresses of a field that is not there: an empty list", none != null && none->count == 0 && !none->bad);
+    none->dispose();
+    p->dispose();
+    p = readLf("To: a@b.test\nTo: broken address, c@d.test\nTo: e@f.test\n\nx");
+    mail.AddressList* al = p->addresses("To");
+    check("addresses: a broken field sets bad and is left out, the other fields are read", al->bad && al->count == 2 && streq(al->get(0)->addr, "a@b.test") && streq(al->get(1)->addr, "e@f.test"));
+    al->dispose();
+    p->dispose();
+
+    // ---- limits --------------------------------------------------------------------------------------------------------------------------------------------
+    mail.ParseOptions* o = mail.newParseOptions();
+    o->maxSize = 100;
+    char* big = alloc(500);
+    for (int i = 0; i < 400; i++) big[i] = 'a';
+    p = mail.parse(big, 400, o);
+    check("limit: a message over maxSize is refused", p == null && startsWith(mail.error(), "the message is too big"));
+    o->init();
+    // nesting
+    mail.Buf deep;
+    int levels = 40;
+    for (int i = 0; i < levels; i++) {
+        char h[120];
+        format(&h[0], 120, "Content-Type: multipart/mixed; boundary=b%d\r\n\r\n--b%d\r\n", i, i, 0, 0, 0, 0);
+        deep.addText(&h[0]);
+    }
+    deep.addText("Content-Type: text/plain\r\n\r\nthe leaf at the bottom\r\n");
+    for (int i = levels - 1; i >= 0; i--) {
+        char h[60];
+        format(&h[0], 60, "--b%d--\r\n", i, 0, 0, 0, 0, 0);
+        deep.addText(&h[0]);
+    }
+    p = mail.parse(deep.d, deep.len, o);
+    check("limit: 40 nested multiparts are read to maxDepth (12), the one at the limit keeps its body, D_TOO_DEEP", p != null && maxDepthOf(p) == 12 && sane(p));
+    mail.Part* walk = p;
+    int dd = 0;
+    while (walk->nchildren > 0) { walk = walk->child(0); dd++; }
+    check("limit: ... and that part has the rest as its body", dd == 12 && (walk->defects & mail.D_TOO_DEEP) != 0 && walk->bodyLen > 100 && strstr(walk->body, "the leaf at the bottom") != null);
+    p->dispose();
+    o->maxDepth = 3;
+    p = mail.parse(deep.d, deep.len, o);
+    check("limit: maxDepth 3", maxDepthOf(p) == 3);
+    p->dispose();
+    o->init();
+    deep.release();
+    // number of parts
+    mail.Buf flat;
+    flat.addText("Content-Type: multipart/mixed; boundary=f\r\n\r\n");
+    for (int i = 0; i < 2000; i++) flat.addText("--f\r\n\r\nx\r\n");
+    flat.addText("--f--\r\n");
+    p = mail.parse(flat.d, flat.len, o);
+    check("limit: 2000 parts: 499 are read (the root is one of maxParts = 500), D_TOO_MANY_PARTS", p != null && p->nchildren == 499 && totalParts(p) == 500 && (p->defects & mail.D_TOO_MANY_PARTS) != 0);
+    p->dispose();
+    o->maxParts = 5;
+    p = mail.parse(flat.d, flat.len, o);
+    check("limit: maxParts 5", p->nchildren == 4);
+    p->dispose();
+    o->init();
+    flat.release();
+    // decoded size
+    mail.Buf b64;
+    char* raw100k = alloc(100000);
+    for (int i = 0; i < 100000; i++) raw100k[i] = i * 7;
+    b64.addText("Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\n");
+    mail.base64Encode(raw100k, 100000, &b64, true);
+    o->maxPartSize = 1000;
+    p = mail.parse(b64.d, b64.len, o);
+    check("limit: a part that decodes to more than maxPartSize is cut, D_TOO_BIG", p->bodyLen == 1000 && (p->defects & mail.D_TOO_BIG) != 0 && memcmp(p->body, raw100k, 1000) == 0);
+    p->dispose();
+    o->init();
+    p = mail.parse(b64.d, b64.len, o);
+    check("limit: ... and with the default limit all 100000 bytes", p->bodyLen == 100000 && p->defects == 0 && memcmp(p->body, raw100k, 100000) == 0);
+    p->dispose();
+    b64.release();
+    o->maxPartSize = 10;
+    p = readLf("Content-Type: text/plain\n\nthis is longer than ten bytes\n", o);
+    check("limit: a plain body is cut at maxPartSize too", p->bodyLen == 10 && (p->defects & mail.D_TOO_BIG) != 0);
+    p->dispose();
+    o->init();
+    // headers
+    o->maxHeaders = 3;
+    p = readLf("A: 1\nB: 2\nC: 3\nD: 4\nE: 5\n\nbody", o);
+    check("limit: maxHeaders (3 kept, D_BAD_HEADER, the body is found)", p->headers->count == 3 && (p->defects & mail.D_BAD_HEADER) != 0 && bodyIs(p, "body"));
+    p->dispose();
+    o->init();
+    o->maxHeaderBytes = 20;
+    p = readLf("A: 1\nB: 2\nC: 3\nD: 4\nE: 5\nF: 6\nG: 7\n\nbody", o);
+    check("limit: maxHeaderBytes", p->headers->count < 7 && (p->defects & mail.D_BAD_HEADER) != 0 && bodyIs(p, "body"));
+    p->dispose();
+    o->init();
+    free((char*) o);
+    // a header block of 10000 fields with the default options: 500 are kept
+    mail.Buf hh;
+    for (int i = 0; i < 10000; i++) hh.addText("X: y\r\n");
+    hh.addText("\r\nbody");
+    p = mail.parse(hh.d, hh.len, null);
+    check("limit: 10000 header fields: 500 are kept, the body is found", p->headers->count == 500 && bodyIs(p, "body"));
+    p->dispose();
+    hh.release();
+
+    // ---- garbage -------------------------------------------------------------------------------------------------------------------------------------------
+    char* seedMsg =
+        "Content-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n--b1\r\nContent-Type: multipart/alternative; boundary=b2\r\n\r\n--b2\r\nContent-Type: text/plain; charset=iso-8859-1\r\n"
+        "Content-Transfer-Encoding: quoted-printable\r\n\r\ncaf=E9 =\r\nmore\r\n--b2\r\nContent-Type: text/html\r\n\r\n<p>x</p>\r\n--b2--\r\n--b1\r\nContent-Type: application/pdf; name*0*=utf-8''a%20;name*1=b\r\n"
+        "Content-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\nUERGIGRhdGE=\r\n--b1--\r\n";
+    int sl2 = strlen(seedMsg);
+    int seed = 4242;
+    int crashFree = 0;
+    for (int round = 0; round < 300; round++) {
+        char* m = alloc(sl2 + 64);
+        memcpy(m, seedMsg, sl2);
+        int len = sl2;
+        int muts = 1 + round % 12;
+        for (int k = 0; k < muts; k++) {
+            seed = seed * 1103515245 + 12345;
+            int pos = ((seed >> 8) & 0xFFFFFF) % len;
+            seed = seed * 1103515245 + 12345;
+            int kind = (seed >> 16) % 4;
+            if (kind == 0) m[pos] = (seed >> 8) & 255;
+            else if (kind == 1) m[pos] = "=-\r\n;\"':?*<>()@, \t"[(seed >> 8) % 19];
+            else if (kind == 2 && len > 10) len = pos + 1 + (seed >> 8) % (len - pos);
+            else { m[pos] = 10; }
+        }
+        if (round % 50 == 49) { for (int i = 0; i < len; i++) { seed = seed * 1103515245 + 12345; m[i] = (seed >> 16) & 255; } }
+        mail.Part* fp = mail.parse(m, len, null);
+        if (fp != null) {
+            if (sane(fp) && totalParts(fp) <= 500) crashFree++;
+            fp->dispose();
+        } else crashFree++;
+    }
+    check("garbage: 300 mutated and random messages are read without a crash, every part is usable", crashFree == 300);
+    mail.AddressList gl;
+    int gseed = 99;
+    int gOk = 0;
+    for (int round = 0; round < 300; round++) {
+        char g[80];
+        int gl2 = 1 + round % 70;
+        for (int i = 0; i < gl2; i++) { gseed = gseed * 1103515245 + 12345; g[i] = "ab@. <>\"(),;:\\=?_x\r\n"[(gseed >> 16) % 21]; }
+        g[gl2] = 0;
+        mail.AddressList one;
+        mail.parseAddressList(&g[0], gl2, &one);
+        for (int i = 0; i < one.count; i++) { if (!mail.validAddress(one.items[i]->addr, strlen(one.items[i]->addr))) gOk++; }
+        one.dispose();
+    }
+    check("garbage: 300 random address lists: no crash, every address returned is valid", gOk == 0);
+    int dseed = 5;
+    for (int round = 0; round < 300; round++) {
+        char g[60];
+        int gl3 = 1 + round % 50;
+        for (int i = 0; i < gl3; i++) { dseed = dseed * 1103515245 + 12345; g[i] = "0123456789 :+-,JanFebTueGMTUT()\t"[(dseed >> 16) % 33]; }
+        int u = 0;
+        int off = 0;
+        mail.parseDate(&g[0], gl3, &u, &off);
+        mail.Buf w;
+        mail.decodeWords(&g[0], gl3, &w);
+        w.release();
+    }
+    check("garbage: 300 random dates and encoded-word texts: no crash", true);
+
+    // ---- memory ---------------------------------------------------------------------------------------------------------------------------------------------
+    char* subjects = "Gr\xC3\xBC\xC3\x9F" "e aus M\xC3\xBCnchen";
+    int rounds = 0;
+    int heap0 = 0;
+    for (int r = 0; r < 25; r++) {
+        if (r == 5) heap0 = __heap_pos;
+        mail.Message* mm = mail.newMessage();
+        mm->from("\"Doe, Jane\" <jane@example.org>");
+        mm->to("Bob <bob@example.org>, \xC3\x9Cnal <u@example.org>");
+        mm->cc("c@example.org");
+        mm->subject(subjects);
+        mm->text("Hello M\xC3\xBCnchen\nline two\n");
+        mm->html("<p>Hello</p>");
+        mm->attach("a\xC3\xA4.bin", "application/octet-stream", "0123456789", 10);
+        mm->attachInline("p.png", "image/png", "xyz", 3, "c1");
+        mm->header("X-A", "b");
+        int n = 0;
+        char* w = mm->build(&n);
+        mail.AddressList* rc = mm->recipients();
+        rc->dispose();
+        mm->dispose();
+        mail.Part* pp = mail.parse(w, n, null);
+        char* s = pp->decodedHeader("Subject");
+        free(s);
+        mail.AddressList* fa = pp->addresses("From");
+        fa->dispose();
+        int wn = 0;
+        char* w2 = mail.serialize(pp, null, &wn);
+        free(w2);
+        pp->dispose();
+        free(w);
+        char id[200];
+        mail.newMessageId("example.org", &id[0], 200);
+        char dt[80];
+        mail.formatDate(1794580200 + r, 60, &dt[0], 80);
+        int u = 0;
+        int off = 0;
+        mail.parseDate(&dt[0], strlen(&dt[0]), &u, &off);
+        mail.Part* bad = mail.parse(nested, strlen(nested), null);
+        bad->dispose();
+        rounds++;
+    }
+    check("memory: 20 rounds of build, parse, serialize and free do not move the heap at all", rounds == 25 && __heap_pos == heap0);
+    if (__heap_pos != heap0) printf("     the heap grew by %d bytes\n", __heap_pos - heap0);
+
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

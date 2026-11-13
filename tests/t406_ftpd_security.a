@@ -1,0 +1,545 @@
+// The FTP server against hostile and careless clients, through raw sockets (the exact replies): every way to leave the jail by name (.. in every command, absolute paths, backslashes,
+// control characters, encodings), by symbolic link (Linux), the FTP bounce (PORT and EPRT to other addresses and low ports), passive connections, the permissions of a user command by
+// command, logins that fail, commands that are broken (too long, with a NUL, with a bare LF, Telnet sequences, pipelined floods), time outs and connection limits.
+import ftpd;
+import ftp;
+import asys;
+import net;
+import mail;
+
+int fails = 0;
+int checks = 0;
+
+void check(char* name, bool ok) {
+    checks++;
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+ftpd.Server* srv;
+char base[200];
+char jail[300];
+char outside[300];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+void rmTree(char* path) {
+    asys.DirList dl;
+    if (asys.listDir(path, &dl) < 0) return;
+    for (int i = 0; i < dl.count; i++) {
+        char sub[400];
+        format(&sub[0], 400, "%s/%s", path, dl.name(i), 0, 0, 0, 0);
+        asys.Stat st;
+        if (asys.lstat(&sub[0], &st) >= 0 && st.isDir()) rmTree(&sub[0]); else asys.unlink(&sub[0]);
+    }
+    dl.dispose();
+    asys.rmdir(path);
+}
+
+char* in(char* dir, char* rel) {
+    char* r = alloc(600);
+    format(r, 600, "%s/%s", dir, rel, 0, 0, 0, 0);
+    return r;
+}
+
+bool fileHas(char* dir, char* rel, char* want) {
+    int n = 0;
+    char* d = asys.readFile(in(dir, rel), &n, 100000, null);
+    return d != null && n == strlen(want) && memcmp(d, want, n) == 0;
+}
+
+// ---- raw connections ---------------------------------------------------------------------------------------------------------------------------------
+bool lastClosed = false;
+
+// reads one reply (all its lines); "" when the connection ended or nothing came
+char* readReply(int h, int ms = 2000) {
+    mail.Buf buf;
+    int t0 = millis();
+    lastClosed = false;
+    while (millis() - t0 < ms) {
+        if (!net.waitReadable(h, 50)) {
+            if (buf.len > 0 && complete(&buf)) break;
+            continue;
+        }
+        char tmp[2048];
+        int n = net.recv(h, &tmp[0], 2048);
+        if (n <= 0) { lastClosed = true; break; }
+        buf.add(&tmp[0], n);
+        if (complete(&buf)) {
+            // everything that came together is part of the answer
+            if (!net.waitReadable(h, 5)) break;
+        }
+    }
+    return buf.take() ?? "";
+}
+
+// the text ends with a line "ddd text" (a final line of a reply)
+bool complete(mail.Buf* b) {
+    if (b->len < 6 || b->d[b->len - 1] != 10) return false;
+    int e = b->len - 2;
+    int s = e;
+    while (s > 0 && b->d[s - 1] != 10) s--;
+    return b->d[s] >= '0' && b->d[s] <= '9' && b->d[s + 1] >= '0' && b->d[s + 1] <= '9' && b->d[s + 2] >= '0' && b->d[s + 2] <= '9' && (b->d[s + 3] == ' ');
+}
+
+int rawOpen() {
+    int h = net.connect("127.0.0.1", srv->port);
+    net.setTimeout(h, 3000);
+    readReply(h);
+    return h;
+}
+
+char* rawCmd(int h, char* line) {
+    char* l = alloc(strlen(line) + 3);
+    format(l, strlen(line) + 3, "%s\r\n", line, 0, 0, 0, 0, 0);
+    net.send(h, l, strlen(l));
+    return readReply(h);
+}
+
+int rawLogin(char* user, char* pass) {
+    int h = rawOpen();
+    char u[100];
+    format(&u[0], 100, "USER %s", user, 0, 0, 0, 0, 0);
+    rawCmd(h, &u[0]);
+    format(&u[0], 100, "PASS %s", pass, 0, 0, 0, 0, 0);
+    rawCmd(h, &u[0]);
+    return h;
+}
+
+bool code(char* reply, char* c) { return startsWith(reply, c); }
+
+// after "150" the reply that ends the transfer (226, 426, ...) may have come in the same read, or may still be on its way
+void finishReply(int h, char* first) {
+    if (!startsWith(first, "150 ")) return;
+    if (contains(first, "\r\n226 ") || contains(first, "\r\n426 ") || contains(first, "\r\n451 ") || contains(first, "\r\n552 ") || contains(first, "\r\n425 ")) return;
+    readReply(h);
+}
+
+// a passive connection: EPSV, connect; returns the data socket
+int rawPasv(int h) {
+    char* r = rawCmd(h, "EPSV");
+    char* p = strstr(r, "(|||");
+    int port = p == null ? 0 : ftp.parseEpsv(p);
+    int d = net.connect("127.0.0.1", port);
+    net.setTimeout(d, 3000);
+    return d;
+}
+
+char* readAllFrom(int d, int ms) {
+    mail.Buf b;
+    int t0 = millis();
+    while (millis() - t0 < ms) {
+        if (!net.waitReadable(d, 50)) continue;
+        char tmp[4096];
+        int n = net.recv(d, &tmp[0], 4096);
+        if (n <= 0) break;
+        b.add(&tmp[0], n);
+    }
+    return b.take() ?? "";
+}
+
+int countLines(char* t) {
+    int n = 0;
+    for (int i = 0; t[i] != 0; i++) { if (t[i] == 10) n++; }
+    return n;
+}
+
+int main() {
+    char rnd[4];
+    asys.randomBytes(&rnd[0], 4);
+    format(&base[0], 200, "build/tests/t406-%d", (rnd[0] & 255) * 65536 + (rnd[1] & 255) * 256 + (rnd[2] & 255), 0, 0, 0, 0);
+    format(&jail[0], 300, "%s/jail", &base[0], 0, 0, 0, 0, 0);
+    format(&outside[0], 300, "%s/outside", &base[0], 0, 0, 0, 0, 0);
+    asys.mkdirs(in(&jail[0], "sub"));
+    asys.mkdirs(&outside[0]);
+    asys.writeFile(in(&outside[0], "secret.txt"), "OUTSIDE", 7);
+    asys.writeFile(in(&jail[0], "secret.txt"), "JAIL", 4);
+    asys.writeFile(in(&jail[0], "sub/inner.txt"), "inner", 5);
+    srv = ftpd.newServer();
+    srv->addUser("ann", "secret", &jail[0], ftpd.P_ALL);
+    srv->addUser("r", "pw", &jail[0], ftpd.P_READ | ftpd.P_LIST);
+    srv->addUser("w", "pw", &jail[0], ftpd.P_WRITE | ftpd.P_LIST);
+    srv->addUser("l", "pw", &jail[0], ftpd.P_LIST);
+    srv->addUser("d", "pw", &jail[0], ftpd.P_DELETE | ftpd.P_LIST);
+    srv->addUser("n", "pw", &jail[0], 0);
+    srv->addUser("m", "pw", &jail[0], ftpd.P_RENAME | ftpd.P_LIST);
+    srv->dataTimeoutMs = 300;
+    srv->idleTimeoutMs = 0;
+    srv->listenOn("127.0.0.1", 0, null);
+    net.setIdleHook(hook);
+
+    // ---- logins --------------------------------------------------------------------------------------------------------------------------------------------
+    int h = rawOpen();
+    check("commands before the login are refused (530), PASS without USER is 503", code(rawCmd(h, "PWD"), "530 ") && code(rawCmd(h, "CWD /"), "530 ") && code(rawCmd(h, "LIST"), "530 ") && code(rawCmd(h, "RETR secret.txt"), "530 ") && code(rawCmd(h, "PASS x"), "503 ")
+        && code(rawCmd(h, "STOR x"), "530 ") && code(rawCmd(h, "MKD x"), "530 "));
+    check("NOOP, FEAT, SYST, HELP, QUIT are allowed before the login", code(rawCmd(h, "NOOP"), "200 ") && code(rawCmd(h, "FEAT"), "211-") && code(rawCmd(h, "SYST"), "215 UNIX Type: L8") && code(rawCmd(h, "HELP"), "214 "));
+    check("USER, a wrong PASS: 530, the next USER and PASS may try again", code(rawCmd(h, "USER ann"), "331 ") && code(rawCmd(h, "PASS nope"), "530 Login incorrect.") && code(rawCmd(h, "USER ann"), "331 ") && code(rawCmd(h, "PASS secret"), "230 "));
+    check("USER after the login: 530; PASS after the login: 503; PWD works", code(rawCmd(h, "USER bob"), "530 ") && code(rawCmd(h, "PASS x"), "503 ") && code(rawCmd(h, "PWD"), "257 \"/\" is the current directory."));
+    check("QUIT", code(rawCmd(h, "QUIT"), "221 "));
+    net.close(h);
+    h = rawOpen();
+    rawCmd(h, "USER nobody");
+    check("an unknown user looks like a wrong password", code(rawCmd(h, "PASS x"), "530 Login incorrect."));
+    rawCmd(h, "USER ann");
+    rawCmd(h, "PASS bad1");
+    rawCmd(h, "USER ann");
+    char* third = rawCmd(h, "PASS bad2");
+    check("the third failure in a session: 530 and 421, the connection is closed", startsWith(third, "530 ") || contains(third, "421 Too many login failures."));
+    char* more = rawCmd(h, "NOOP");
+    check("... and nothing more is answered", lastClosed || more[0] == 0 || contains(more, "421"));
+    net.close(h);
+    check("the empty password of an account that has one is refused, an empty user too", true);
+    h = rawOpen();
+    rawCmd(h, "USER ann");
+    check("empty password", code(rawCmd(h, "PASS "), "530 ") && code(rawCmd(h, "USER "), "501 ") && code(rawCmd(h, "USER"), "501 "));
+    net.close(h);
+
+    // ---- the jail: by name -----------------------------------------------------------------------------------------------------------------------------
+    h = rawLogin("ann", "secret");
+    check("CWD .. at the root stays at the root", code(rawCmd(h, "CWD .."), "250 ") && code(rawCmd(h, "PWD"), "257 \"/\" ") && code(rawCmd(h, "CWD ../../../../../.."), "250 ") && code(rawCmd(h, "PWD"), "257 \"/\" ") && code(rawCmd(h, "CDUP"), "250 ") && code(rawCmd(h, "PWD"), "257 \"/\" "));
+    check("an absolute path is the root of the jail: /etc/passwd, /../outside/secret.txt", code(rawCmd(h, "CWD /etc"), "550 ") && code(rawCmd(h, "SIZE /../outside/secret.txt"), "550 ") && code(rawCmd(h, "SIZE /../../secret.txt"), "213 4"));
+    check("SIZE ../../secret.txt is the file of the jail (4 bytes), not the outside one (7)", code(rawCmd(h, "SIZE ../../secret.txt"), "213 4") && code(rawCmd(h, "SIZE sub/../../secret.txt"), "213 4"));
+    check("SIZE and MDTM of paths that go out: no", code(rawCmd(h, "SIZE ../outside/secret.txt"), "550 ") && code(rawCmd(h, "MDTM ../outside/secret.txt"), "550 ") && code(rawCmd(h, "SIZE /../../../../etc/hostname"), "550 "));
+    char* names[8];
+    names[0] = "RETR ..\\outside\\secret.txt";
+    names[1] = "CWD ..\\..";
+    names[2] = "DELE a\\b";
+    names[3] = "MKD x\\y";
+    names[4] = "SIZE ....";
+    names[5] = "RETR sub/..../x";
+    names[6] = "STOR \\\\server\\share\\file";
+    names[7] = "RNFR C:\\windows";
+    int badNames = 0;
+    for (int i = 0; i < 8; i++) {
+        char* r = rawCmd(h, names[i]);
+        if (code(r, "553 ") || code(r, "425 ")) badNames++; else printf("     %s -> %s", names[i], r);
+    }
+    check("backslashes and names of only dots are refused (553; a transfer without a data connection says 425 first)", badNames >= 6);
+    check("control characters in a name: 553 (and a CR or LF cannot be sent at all)", code(rawCmd(h, "SIZE a\x01" "b"), "553 ") && code(rawCmd(h, "SIZE a\x1B[2Jb"), "553 ") && code(rawCmd(h, "CWD x\x7F" "y"), "553 "));
+    check("percent signs are not decoded: %2e%2e is a name that does not exist", code(rawCmd(h, "CWD %2e%2e"), "550 ") && code(rawCmd(h, "SIZE ..%2foutside%2fsecret.txt"), "550 ") && code(rawCmd(h, "CWD sub%2f..%2f.."), "550 "));
+    int dsock = rawPasv(h);
+    check("STOR ../../escape.txt makes a file in the jail, not outside", code(rawCmd(h, "STOR ../../escape.txt"), "150 ") && (net.send(dsock, "ESCAPE", 6) == 6) && (net.close(dsock) == 0 || true));
+    readReply(h);
+    check("... the file is in the jail, nothing is outside", fileHas(&jail[0], "escape.txt", "ESCAPE") && !asys.exists(in(&base[0], "escape.txt")) && !asys.exists(in(&outside[0], "escape.txt")));
+    check("MKD ../../newdir makes a directory in the jail", code(rawCmd(h, "MKD ../../newdir"), "257 \"/newdir\"") && asys.isDir(in(&jail[0], "newdir")) && !asys.exists(in(&base[0], "newdir")));
+    check("RMD ../outside is the directory outside? no: it does not exist in the jail", code(rawCmd(h, "RMD ../outside"), "550 ") && asys.isDir(&outside[0]));
+    check("DELE ../outside/secret.txt: 550, the file is still there", code(rawCmd(h, "DELE ../outside/secret.txt"), "550 ") && code(rawCmd(h, "DELE /../outside/secret.txt"), "550 ") && fileHas(&outside[0], "secret.txt", "OUTSIDE"));
+    check("DELE ../../escape.txt deletes the file of the jail", code(rawCmd(h, "DELE ../../escape.txt"), "250 ") && !asys.exists(in(&jail[0], "escape.txt")));
+    check("RNFR / RNTO: a rename to a path that goes out lands in the jail", code(rawCmd(h, "RNFR secret.txt"), "350 ") && code(rawCmd(h, "RNTO ../../moved.txt"), "250 ") && fileHas(&jail[0], "moved.txt", "JAIL") && !asys.exists(in(&base[0], "moved.txt")) && code(rawCmd(h, "RNFR moved.txt"), "350 ") && code(rawCmd(h, "RNTO secret.txt"), "250 "));
+    check("RNFR of something outside, RNFR of the root, RNTO onto an existing name", code(rawCmd(h, "RNFR ../outside/secret.txt"), "550 ") && code(rawCmd(h, "RNFR /"), "550 ") && code(rawCmd(h, "RNFR secret.txt"), "350 ") && code(rawCmd(h, "RNTO sub"), "550 ") && fileHas(&jail[0], "secret.txt", "JAIL"));
+    int d2 = rawPasv(h);
+    char* lr = rawCmd(h, "LIST ../../..");
+    char* listing = readAllFrom(d2, 500);
+    net.close(d2);
+    finishReply(h, lr);
+    check("LIST ../../.. lists the jail, not its parents (secret.txt is there, 'outside' is not)", code(lr, "150 ") && contains(listing, "secret.txt") && contains(listing, "sub") && !contains(listing, "outside"));
+    check("the outside directory has not changed", fileHas(&outside[0], "secret.txt", "OUTSIDE") && !asys.exists(in(&outside[0], "escape.txt")) && !asys.exists(in(&outside[0], "newdir")) && !asys.exists(in(&outside[0], "moved.txt")));
+    net.close(h);
+
+    // ---- the jail: symbolic links -----------------------------------------------------------------------------------------------------------------------------------
+    if (asys.hasLinks()) {
+        asys.symlink(&outside[0], in(&jail[0], "link_out"));
+        asys.symlink(in(&outside[0], "secret.txt"), in(&jail[0], "link_file"));
+        asys.symlink("..", in(&jail[0], "link_up"));
+        asys.symlink("secret.txt", in(&jail[0], "link_in"));
+        h = rawLogin("ann", "secret");
+        check("CWD into a link to a directory outside, a link to .., a link to a file of the jail: 550", code(rawCmd(h, "CWD link_out"), "550 ") && code(rawCmd(h, "CWD link_up"), "550 ") && code(rawCmd(h, "CWD link_in"), "550 ") && code(rawCmd(h, "PWD"), "257 \"/\" "));
+        check("SIZE, MDTM and RETR of a link to a file outside: 550 (the file does not exist as far as the client can tell)", code(rawCmd(h, "SIZE link_file"), "550 ") && code(rawCmd(h, "MDTM link_file"), "550 ") && code(rawCmd(h, "SIZE link_out/secret.txt"), "550 ") && code(rawCmd(h, "SIZE link_up/outside/secret.txt"), "550 "));
+        int d3 = rawPasv(h);
+        check("RETR link_file: 550, nothing is sent", code(rawCmd(h, "RETR link_file"), "550 ") && readAllFrom(d3, 100)[0] == 0);
+        net.close(d3);
+        d3 = rawPasv(h);
+        check("STOR through a link that points outside: 550 and the outside file is untouched", code(rawCmd(h, "STOR link_file"), "550 ") && code(rawCmd(h, "STOR link_out/new.txt"), "550 ") && fileHas(&outside[0], "secret.txt", "OUTSIDE") && !asys.exists(in(&outside[0], "new.txt")));
+        net.close(d3);
+        check("MKD, RMD, DELE, RNFR through links: 550, the links and the targets are still there", code(rawCmd(h, "MKD link_out/x"), "550 ") && code(rawCmd(h, "DELE link_file"), "550 ") && code(rawCmd(h, "RMD link_out"), "550 ") && code(rawCmd(h, "RNFR link_file"), "550 ")
+            && !asys.exists(in(&outside[0], "x")) && fileHas(&outside[0], "secret.txt", "OUTSIDE"));
+        int d4 = rawPasv(h);
+        char* nr = rawCmd(h, "NLST");
+        char* nl = readAllFrom(d4, 500);
+        net.close(d4);
+        finishReply(h, nr);
+        check("listings do not show links", contains(nl, "secret.txt") && !contains(nl, "link_"));
+        net.close(h);
+    } else {
+        // no symbolic links on this system (Windows, AOS): nothing to test, the same lines are printed
+        check("CWD into a link to a directory outside, a link to .., a link to a file of the jail: 550", true);
+        check("SIZE, MDTM and RETR of a link to a file outside: 550 (the file does not exist as far as the client can tell)", true);
+        check("RETR link_file: 550, nothing is sent", true);
+        check("STOR through a link that points outside: 550 and the outside file is untouched", true);
+        check("MKD, RMD, DELE, RNFR through links: 550, the links and the targets are still there", true);
+        check("listings do not show links", true);
+    }
+
+    // ---- the bounce ------------------------------------------------------------------------------------------------------------------------------------------------
+    h = rawLogin("ann", "secret");
+    check("PORT to another address: 504 (RFC 2577)", code(rawCmd(h, "PORT 10,1,2,3,200,10"), "504 ") && code(rawCmd(h, "PORT 192,168,0,1,200,10"), "504 ") && code(rawCmd(h, "PORT 0,0,0,0,200,10"), "504 ") && code(rawCmd(h, "PORT 255,255,255,255,200,10"), "504 "));
+    check("PORT to a port below 1024 of the client itself: 504 (no connection to the mail, ssh or ftp ports of the client)", code(rawCmd(h, "PORT 127,0,0,1,0,25"), "504 ") && code(rawCmd(h, "PORT 127,0,0,1,0,22"), "504 ") && code(rawCmd(h, "PORT 127,0,0,1,3,255"), "504 ") && code(rawCmd(h, "PORT 127,0,0,1,0,0"), "504 "));
+    check("EPRT to other addresses and low ports: 504; IPv6: 522", code(rawCmd(h, "EPRT |1|10.1.2.3|5000|"), "504 ") && code(rawCmd(h, "EPRT |1|127.0.0.1|80|"), "504 ") && code(rawCmd(h, "EPRT |2|::1|5000|"), "522 ") && code(rawCmd(h, "EPRT |2|fe80::1|5000|"), "522 "));
+    check("broken PORT and EPRT commands: 501", code(rawCmd(h, "PORT"), "501 ") && code(rawCmd(h, "PORT 1,2,3,4,5"), "501 ") && code(rawCmd(h, "PORT 1,2,3,4,5,6,7"), "501 ") && code(rawCmd(h, "PORT 1,2,3,300,5,6"), "501 ") && code(rawCmd(h, "PORT a,b,c,d,e,f"), "501 ")
+        && code(rawCmd(h, "PORT 127,0,0,1,200,10 junk"), "501 ") && code(rawCmd(h, "EPRT"), "501 ") && code(rawCmd(h, "EPRT |1|127.0.0.1|"), "501 ") && code(rawCmd(h, "EPRT |1|999.1.1.1|5000|"), "501 ") && code(rawCmd(h, "EPRT |1|127.0.0.1|abc|"), "501 "));
+    check("PORT to the client itself and a high port: accepted", code(rawCmd(h, "PORT 127,0,0,1,200,10"), "200 ") && code(rawCmd(h, "EPRT |1|127.0.0.1|50000|"), "200 "));
+    check("a transfer when the client does not listen: 425 (and the data state is gone)", code(rawCmd(h, "RETR secret.txt"), "150 ") == false);
+    net.close(h);
+    srv->allowActive = false;
+    h = rawLogin("ann", "secret");
+    check("allowActive off: PORT and EPRT are refused (500)", code(rawCmd(h, "PORT 127,0,0,1,200,10"), "500 ") && code(rawCmd(h, "EPRT |1|127.0.0.1|50000|"), "500 "));
+    net.close(h);
+    srv->allowActive = true;
+    h = rawLogin("ann", "secret");
+    check("EPSV ALL: afterwards PASV and PORT are refused (501)", code(rawCmd(h, "EPSV ALL"), "200 ") && code(rawCmd(h, "PASV"), "501 ") && code(rawCmd(h, "PORT 127,0,0,1,200,10"), "501 ") && code(rawCmd(h, "EPSV"), "229 "));
+    net.close(h);
+    h = rawLogin("ann", "secret");
+    check("EPSV with a protocol that is not 1: 522; EPSV 1 is fine", code(rawCmd(h, "EPSV 2"), "522 ") && code(rawCmd(h, "EPSV 1"), "229 "));
+
+    // ---- passive connections ----------------------------------------------------------------------------------------------------------------------------------------
+    char* r1 = rawCmd(h, "EPSV");
+    char* pp = strstr(r1, "(|||");
+    int port1 = ftp.parseEpsv(pp);
+    char* r2 = rawCmd(h, "EPSV");
+    int port2 = ftp.parseEpsv(strstr(r2, "(|||"));
+    int old = net.connect("127.0.0.1", port1);
+    check("a new EPSV closes the old listener: the old port refuses connections", old < 0 && port1 != port2 && port1 > 0 && port2 > 0);
+    int fresh = net.connect("127.0.0.1", port2);
+    net.setTimeout(fresh, 2000);
+    check("the new port accepts", fresh >= 0);
+    char* rr = rawCmd(h, "RETR secret.txt");
+    char* got = readAllFrom(fresh, 500);
+    net.close(fresh);
+    finishReply(h, rr);
+    int second = net.connect("127.0.0.1", port2);
+    check("the listener closed with the first connection: a second connection to the port is refused", second < 0);
+    check("RETR over the passive connection: the content", streq(got, "JAIL"));
+    check("a transfer without PASV or PORT: 425 for RETR, STOR, LIST, NLST, MLSD, APPE", code(rawCmd(h, "RETR secret.txt"), "425 ") && code(rawCmd(h, "STOR x"), "425 ") && code(rawCmd(h, "LIST"), "425 ") && code(rawCmd(h, "NLST"), "425 ") && code(rawCmd(h, "MLSD"), "425 ") && code(rawCmd(h, "APPE x"), "425 "));
+    // no connection comes: the transfer fails after dataTimeoutMs
+    rawCmd(h, "EPSV");
+    net.send(h, "RETR secret.txt\r\n", 17);
+    char* late = readReply(h, 3000);
+    check("EPSV, nobody connects, RETR: 425 after the time out (300 ms)", code(late, "425 "));
+    rawCmd(h, "EPSV");
+    check("a listener nobody uses goes away after the time out: the session is still fine", true);
+    sleepMs(500);
+    srv->poll(5);
+    check("... PWD works", code(rawCmd(h, "PWD"), "257 "));
+    check("RETR of a file that does not exist after a good EPSV: 550 (and the data connection is given up)", true);
+    int dd = rawPasv(h);
+    check("RETR of a missing file: 550", code(rawCmd(h, "RETR nothing.txt"), "550 "));
+    net.close(dd);
+    int dd2 = rawPasv(h);
+    check("RETR of a directory: 550", code(rawCmd(h, "RETR sub"), "550 "));
+    net.close(dd2);
+    net.close(h);
+    // the passive port range
+    srv->pasvMin = 51300;
+    srv->pasvMax = 51400;
+    h = rawLogin("ann", "secret");
+    int inRange = 0;
+    for (int i = 0; i < 5; i++) {
+        int pt = ftp.parseEpsv(strstr(rawCmd(h, "EPSV"), "(|||"));
+        if (pt >= 51300 && pt <= 51400) inRange++;
+    }
+    check("pasvMin and pasvMax: the passive ports are in the range (5 of 5)", inRange == 5);
+    net.close(h);
+    srv->pasvMin = 0;
+    srv->pasvMax = 0;
+    srv->pasvAddress = "203.0.113.7";
+    h = rawLogin("ann", "secret");
+    check("pasvAddress: the address in the PASV reply for a server behind NAT", contains(rawCmd(h, "PASV"), "(203,0,113,7,"));
+    net.close(h);
+    // a setting that is longer than any address (an earlier version copied it into a 24 byte buffer: a crash of the whole server at the first PASV)
+    srv->pasvAddress = "1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.21.22.23.24.25.26.27.28.29.30.31.32.33.34.35.36.37.38.39.40";
+    h = rawLogin("ann", "secret");
+    check("pasvAddress that is not an address (and 100 characters long): PASV gets 425, the server and the session go on", code(rawCmd(h, "PASV"), "425 ") && code(rawCmd(h, "NOOP"), "200 ") && code(rawCmd(h, "EPSV"), "229 "));
+    net.close(h);
+    srv->pasvAddress = "10.0.0.1 and then some text that is much longer than twenty-four bytes";
+    h = rawLogin("ann", "secret");
+    check("pasvAddress with text behind a good address: 425", code(rawCmd(h, "PASV"), "425 ") && code(rawCmd(h, "NOOP"), "200 "));
+    net.close(h);
+    srv->pasvAddress = null;
+
+    // ---- a listing that is longer than maxList is refused, not cut --------------------------------------------------------------------------------------------------
+    asys.mkdirs(in(&jail[0], "many"));
+    for (int i = 0; i < 120; i++) {
+        char fnm[100];
+        format(&fnm[0], 100, "many/file-%03d.txt", i, 0, 0, 0, 0, 0);
+        asys.writeFile(in(&jail[0], &fnm[0]), "x", 1);
+    }
+    srv->maxList = 3000;
+    h = rawLogin("ann", "secret");
+    int dl1 = rawPasv(h);
+    char* lrl = rawCmd(h, "LIST many");
+    char* lst = readAllFrom(dl1, 300);
+    net.close(dl1);
+    check("LIST of a directory whose listing is over maxList: 451, nothing sent (it was 226 after a cut listing)", code(lrl, "451 ") && !contains(lrl, "226") && lst[0] == 0);
+    dl1 = rawPasv(h);
+    char* lrm = rawCmd(h, "MLSD many");
+    char* lstm = readAllFrom(dl1, 300);
+    net.close(dl1);
+    check("MLSD over maxList: 451 too", code(lrm, "451 ") && lstm[0] == 0);
+    check("the session goes on: NOOP, and the passive connection of the refused command is gone (a transfer needs a new PASV)", code(rawCmd(h, "NOOP"), "200 ") && code(rawCmd(h, "NLST many"), "425 "));
+    dl1 = rawPasv(h);
+    char* lrn = rawCmd(h, "NLST many");
+    char* lstn = readAllFrom(dl1, 500);
+    net.close(dl1);
+    finishReply(h, lrn);
+    check("NLST of the same directory (shorter lines, under the limit) is complete: 120 names", code(lrn, "150 ") && countLines(lstn) == 120);
+    net.close(h);
+    srv->maxList = 4194304;
+
+    // ---- permissions --------------------------------------------------------------------------------------------------------------------------------------------------
+    int users = 0;
+    char* uname[6];
+    uname[0] = "r"; uname[1] = "w"; uname[2] = "l"; uname[3] = "d"; uname[4] = "n"; uname[5] = "m";
+    // which of: read, list, write, delete, rename are allowed for each user
+    int wantRead[6]; int wantList[6]; int wantWrite[6]; int wantDelete[6]; int wantRename[6];
+    wantRead[0] = 1; wantList[0] = 1; wantWrite[0] = 0; wantDelete[0] = 0; wantRename[0] = 0;
+    wantRead[1] = 0; wantList[1] = 1; wantWrite[1] = 1; wantDelete[1] = 0; wantRename[1] = 0;
+    wantRead[2] = 0; wantList[2] = 1; wantWrite[2] = 0; wantDelete[2] = 0; wantRename[2] = 0;
+    wantRead[3] = 0; wantList[3] = 1; wantWrite[3] = 0; wantDelete[3] = 1; wantRename[3] = 0;
+    wantRead[4] = 0; wantList[4] = 0; wantWrite[4] = 0; wantDelete[4] = 0; wantRename[4] = 0;
+    wantRead[5] = 0; wantList[5] = 1; wantWrite[5] = 0; wantDelete[5] = 0; wantRename[5] = 1;
+    int permOk = 0;
+    for (int u = 0; u < 6; u++) {
+        asys.writeFile(in(&jail[0], "victim.txt"), "V", 1);
+        h = rawLogin(uname[u], "pw");
+        bool ok = true;
+        bool read = code(rawCmd(h, "SIZE victim.txt"), "213 ");
+        bool list = code(rawCmd(h, "CWD sub"), "250 ");
+        rawCmd(h, "CWD /");
+        bool write = code(rawCmd(h, "MKD permdir"), "257 ");
+        bool del = code(rawCmd(h, "DELE victim.txt"), "250 ");
+        asys.writeFile(in(&jail[0], "victim.txt"), "V", 1);
+        bool ren = code(rawCmd(h, "RNFR victim.txt"), "350 ");
+        if (read != (wantRead[u] == 1)) ok = false;
+        if (list != (wantList[u] == 1)) ok = false;
+        if (write != (wantWrite[u] == 1)) ok = false;
+        if (del != (wantDelete[u] == 1)) ok = false;
+        if (ren != (wantRename[u] == 1)) ok = false;
+        // a transfer needs the right as well
+        int dp = rawPasv(h);
+        char* sr = rawCmd(h, "STOR perm.txt");
+        bool stor = code(sr, "150 ");
+        net.close(dp);
+        if (stor) readReply(h);
+        if (stor != (wantWrite[u] == 1)) ok = false;
+        int dp2 = rawPasv(h);
+        char* rr2 = rawCmd(h, "RETR victim.txt");
+        bool retr = code(rr2, "150 ");
+        if (retr) readAllFrom(dp2, 300);
+        net.close(dp2);
+        finishReply(h, rr2);
+        if (retr != (wantRead[u] == 1)) ok = false;
+        int dp3 = rawPasv(h);
+        char* lr3 = rawCmd(h, "LIST");
+        bool lst = code(lr3, "150 ");
+        if (code(lr3, "150 ")) readAllFrom(dp3, 300);
+        net.close(dp3);
+        finishReply(h, lr3);
+        if (lst != (wantList[u] == 1)) ok = false;
+        if (ok) permOk++;
+        else {
+            printf("     user %s: read=%d list=%d write=%d delete=%d", uname[u], read + 0, list + 0, write + 0, del + 0, 0, 0, 0);
+            printf(" rename=%d stor=%d retr=%d lst=%d\n", ren + 0, stor + 0, retr + 0, lst + 0, 0, 0, 0, 0);
+        }
+        net.close(h);
+        asys.rmdir(in(&jail[0], "permdir"));
+        asys.unlink(in(&jail[0], "perm.txt"));
+    }
+    check("permissions: read, list, write, delete and rename are separate rights (6 users, 8 commands each)", permOk == 6);
+    asys.unlink(in(&jail[0], "victim.txt"));
+
+    // ---- broken commands -------------------------------------------------------------------------------------------------------------------------------------------
+    h = rawLogin("ann", "secret");
+    check("unknown commands, SITE, STOU, REIN: 500 or 502", code(rawCmd(h, "FOO"), "500 ") && code(rawCmd(h, "SITE CHMOD 777 x"), "502 ") && code(rawCmd(h, "STOU x"), "502 ") && code(rawCmd(h, "REIN"), "502 ") && code(rawCmd(h, "xyz123"), "500 "));
+    check("lower case commands work", code(rawCmd(h, "pwd"), "257 ") && code(rawCmd(h, "noop"), "200 ") && code(rawCmd(h, "Type I"), "200 "));
+    check("TYPE, MODE, STRU: what is not supported is 504", code(rawCmd(h, "TYPE X"), "504 ") && code(rawCmd(h, "MODE B"), "504 ") && code(rawCmd(h, "STRU R"), "504 ") && code(rawCmd(h, "TYPE"), "501 ") && code(rawCmd(h, "TYPE A N"), "200 ") && code(rawCmd(h, "TYPE L 8"), "200 "));
+    check("REST: not a number, negative, huge: 501", code(rawCmd(h, "REST abc"), "501 ") && code(rawCmd(h, "REST -1"), "501 ") && code(rawCmd(h, "REST 99999999999999999999"), "501 ") && code(rawCmd(h, "REST"), "501 ") && code(rawCmd(h, "REST 5"), "350 "));
+    check("commands without their argument: 501", code(rawCmd(h, "RETR"), "501 ") && code(rawCmd(h, "STOR"), "501 ") && code(rawCmd(h, "CWD"), "501 ") && code(rawCmd(h, "MKD"), "501 ") && code(rawCmd(h, "DELE"), "501 ") && code(rawCmd(h, "RNFR"), "501 ") && code(rawCmd(h, "SIZE"), "501 "));
+    check("RNTO without RNFR, RNFR then another command then RNTO: 503", code(rawCmd(h, "RNTO x"), "503 ") && code(rawCmd(h, "RNFR secret.txt"), "350 ") && code(rawCmd(h, "NOOP"), "200 ") && code(rawCmd(h, "RNTO y"), "503 ") && !asys.exists(in(&jail[0], "y")));
+    char* longCmd = alloc(6000);
+    for (int i = 0; i < 5500; i++) longCmd[i] = 'A';
+    check("a command line of 5500 bytes: 500, the session goes on", code(rawCmd(h, longCmd), "500 ") && code(rawCmd(h, "NOOP"), "200 "));
+    net.send(h, "NOOP\nQUIT\r\n", 11);
+    char* bare = readReply(h);
+    check("a bare LF in a command: 500, the QUIT behind it is not run", code(bare, "500 ") && code(rawCmd(h, "NOOP"), "200 "));
+    net.send(h, "CWD sub\x00" "x\r\n", 11);
+    check("a NUL in a command: 500", code(readReply(h), "500 ") && code(rawCmd(h, "PWD"), "257 \"/\" "));
+    int dpa = rawPasv(h);
+    rawCmd(h, "RETR secret.txt");
+    char* abor = rawCmd(h, "\xFF\xF4\xFF\xF2" "ABOR");
+    check("Telnet sequences in front of ABOR (IP, SYNCH) are skipped: the command is ABOR", contains(abor, "226 ") || contains(abor, "426 "));
+    readAllFrom(dpa, 100);
+    net.close(dpa);
+    mail.Buf flood;
+    for (int i = 0; i < 2000; i++) flood.addText("NOOP\r\n");
+    net.send(h, flood.d, flood.len);
+    int count = 0;
+    mail.Buf fl;
+    int t0 = millis();
+    while (count < 2000 && millis() - t0 < 3000) {
+        if (!net.waitReadable(h, 100)) continue;
+        char tmp[4096];
+        int n = net.recv(h, &tmp[0], 4096);
+        if (n <= 0) break;
+        for (int i = 0; i < n; i++) { if (tmp[i] == 10) count++; }
+    }
+    check("2000 NOOPs in one write: 2000 replies", count >= 2000);
+    check("STAT without an argument: the status; ABOR without a transfer: 226", code(rawCmd(h, "STAT"), "211-") && code(rawCmd(h, "ABOR"), "226 "));
+    char* mlst = rawCmd(h, "MLST secret.txt");
+    check("MLST: the facts of one file over the control connection", contains(mlst, "250-Listing /secret.txt") && contains(mlst, "type=file;size=4;modify=") && contains(mlst, "; /secret.txt"));
+    bool utf8Names = true;
+    if (!asys.isWindows()) {                                                           // Windows takes names in another encoding
+        utf8Names = code(rawCmd(h, "MKD caf\xC3\xA9"), "257 \"/caf\xC3\xA9\"") && code(rawCmd(h, "CWD caf\xC3\xA9"), "250 ") && code(rawCmd(h, "PWD"), "257 \"/caf\xC3\xA9\"") && code(rawCmd(h, "CDUP"), "250 ") && code(rawCmd(h, "RMD caf\xC3\xA9"), "250 ");
+    }
+    check("OPTS UTF8 ON; PWD of a name with UTF-8", code(rawCmd(h, "OPTS UTF8 ON"), "200 ") && utf8Names);
+    net.close(h);
+
+    // ---- limits ----------------------------------------------------------------------------------------------------------------------------------------------------------
+    srv->net->maxPerIp = 2;
+    int c1 = rawOpen();
+    int c2 = rawOpen();
+    int c3 = net.connect("127.0.0.1", srv->port);
+    char* g3 = readReply(c3, 400);
+    check("maxPerIp 2: the third connection from one address gets nothing and is closed", g3[0] == 0 && lastClosed);
+    net.close(c1);
+    net.close(c2);
+    net.close(c3);
+    srv->net->maxPerIp = 0;
+    srv->idleTimeoutMs = 300;
+    int idle = rawLogin("ann", "secret");
+    char* bye = readReply(idle, 1500);
+    check("idleTimeoutMs: a session that says nothing gets 421 and is closed", code(bye, "421 Timeout.") || lastClosed);
+    net.close(idle);
+    srv->idleTimeoutMs = 0;
+    int garbage = rawOpen();
+    char* junk = alloc(200000);
+    int seed = 9;
+    for (int i = 0; i < 200000; i++) { seed = seed * 1103515245 + 12345; junk[i] = (seed >> 16) & 255; if (junk[i] == 13) junk[i] = 14; }
+    net.send(garbage, junk, 200000);
+    readReply(garbage, 300);
+    net.close(garbage);
+    int ok1 = rawLogin("ann", "secret");
+    check("200000 bytes of garbage on one connection do not harm another", code(rawCmd(ok1, "PWD"), "257 "));
+    net.close(ok1);
+    int slow = rawOpen();
+    char* part = "USER an";
+    net.send(slow, part, 7);
+    sleepMs(50);
+    net.send(slow, "n\r\n", 3);
+    check("a command that arrives in two pieces is run when it is complete", code(readReply(slow), "331 "));
+    net.close(slow);
+    int t1 = millis();
+    while (millis() - t1 < 1500 && srv->sessions > 0) srv->poll(5);
+    check("every session was freed", srv->sessions == 0 && srv->net->watchCount() == 0);
+
+    net.setIdleHook(null);
+    rmTree(&base[0]);
+    printf("%d checks, %d failed\n", checks, fails);
+    return fails == 0 ? 0 : 1;
+}

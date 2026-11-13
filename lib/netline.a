@@ -1,0 +1,515 @@
+// =============================================================================
+//  netline - line based protocol plumbing for the mail and file transfer modules (smtp, ftp, pop3 and their servers)        import netline;
+//
+//  CLIENT side: netline.Conn is a connection (plain, TLS from the start, or switched to TLS later with startTls) with a read buffer that cuts the
+//  stream into lines (CRLF) and runs under time limits. Nothing blocks for longer than the limit you give; net.setIdleHook works (a test can serve the
+//  other end of the connection from the hook).
+//
+//    netline.Conn* c = netline.open("mail.example.org", 587, 5000, false, true);       // host, port, connect time out, TLS from the start, verify the certificate
+//    c->writeLine("EHLO client.example.org");                                          // text and CRLF; a text with CR, LF or NUL is refused (no command injection)
+//    char line[1024];  int n = c->readLine(&line[0], 1024, 5000);                      // length, or E_EOF, E_TIMEOUT, E_TOO_LONG, E_FAILED
+//    netline.Reply r;  c->readReply(&r, netline.STYLE_SMTP, 5000);   r.code  r.text()   // "250-first" / "250 last": a reply of one or more lines
+//    c->startTls("mail.example.org", true, 5000);                                      // STARTTLS: refuses when plain text from the peer is still unread
+//    c->close();  c->dispose();
+//
+//  SERVER side: netline.Lines cuts what a connection delivers into lines. Only CRLF ends a line (a bare LF or CR stays inside the line: the protocol layer
+//  decides; "SMTP smuggling" lives on servers that treat LF and CRLF alike). A line longer than maxLine is thrown away while it arrives (memory stays bounded) and
+//  reported once with -2 when its end is there, so the server can answer "500 line too long" and go on.
+//
+//    netline.Lines in;  in.maxLine = 512;  in.feed(data, n);  char line[513];
+//    for (;;) { int k = in.next(&line[0], 512); if (k == -1) break; if (k == -2) { /* too long */ continue; }  handle(line, k); }
+// =============================================================================
+import net;
+import netio;
+import tls;
+import cstdlib;
+module netline;
+
+public const E_EOF = -1;                // the peer closed the connection (or it failed: see Conn.error)
+public const E_TIMEOUT = -2;
+public const E_TOO_LONG = -3;           // a line over the limit (it is not stored)
+public const E_FAILED = -4;
+
+public const STYLE_SMTP = 0;            // every line of a reply starts with the code ("250-" ... "250 "); a line that does not is a protocol error
+public const STYLE_FTP = 1;             // "211-" starts a multi line reply, the lines in between are free text, "211 " (the same code) ends it
+
+// true when the text has no CR, LF or NUL: what may go into a command line
+public bool isLineSafe(char* s) {
+    if (s == null) return false;
+    for (int i = 0; s[i] != 0; i++) {
+        if (s[i] == 13 || s[i] == 10) return false;
+    }
+    return true;
+}
+
+// ---- the server's line parser ---------------------------------------------------------------------------------------------------
+public class Lines {
+    public int maxLine;                 // longest line (without the CRLF) that is kept, default 1000
+    public int maxBuffer;               // bytes held that have not been taken as lines, default 65536 (feed fails above it)
+    public bool bare;                   // set by next(): the last line had a bare CR or LF inside it
+
+    private netio.Queue q;
+    private int scan;
+    private bool discarding;
+
+    public Lines() {
+        maxLine = 1000;
+        maxBuffer = 65536;
+    }
+
+    // adds received bytes; false when more than maxBuffer bytes would be held (the caller drops the connection: it keeps sending and never finishes a line)
+    public bool feed(char* d, int n) {
+        if (n <= 0) return true;
+        q.max = maxBuffer + maxLine + 4;
+        return q.add(d, n);
+    }
+
+    public int pending() { return q.pending(); }
+
+    // The next complete line copied into out (max bytes at most, plus the 0 byte: out needs max + 1), without the CRLF. Returns its length, -1 when no
+    // complete line is there yet, -2 for a line that was longer than maxLine or max (it was dropped).
+    public int next(char* out, int max) {
+        int lim = maxLine < max ? maxLine : max;
+        for (;;) {
+            int avail = q.pending();
+            char* d = q.data();
+            int i = scan;
+            bool found = false;
+            while (i + 1 < avail) {
+                if (d[i] == 13 && d[i + 1] == 10) { found = true; break; }
+                i++;
+            }
+            if (found) {
+                scan = 0;
+                if (discarding) {
+                    discarding = false;
+                    q.consume(i + 2);
+                    return -2;
+                }
+                if (i > lim) {
+                    q.consume(i + 2);
+                    return -2;
+                }
+                memcpy(out, d, i);
+                out[i] = 0;
+                bare = false;
+                for (int k = 0; k < i; k++) {
+                    if (out[k] == 13 || out[k] == 10) { bare = true; break; }
+                }
+                q.consume(i + 2);
+                return i;
+            }
+            // no CRLF yet. The last byte could be the CR of one that arrives later
+            if (discarding) {
+                if (avail > 1) q.consume(avail - 1);
+                scan = 0;
+                return -1;
+            }
+            if (avail > lim + 2) {
+                discarding = true;
+                q.consume(avail - 1);
+                scan = 0;
+                return -1;
+            }
+            scan = avail > 0 ? avail - 1 : 0;
+            return -1;
+        }
+        return -1;
+    }
+
+    // forgets everything (a new TLS session starts clean)
+    public void clear() {
+        q.clear();
+        scan = 0;
+        discarding = false;
+    }
+
+    public void release() {
+        q.release();
+        scan = 0;
+        discarding = false;
+    }
+}
+
+// ---- a reply of one or more lines (SMTP, FTP) -------------------------------------------------------------------------------------
+public class Reply {
+    public int code;                    // 250, 550 ... (0: nothing read)
+    public int lines;                   // how many lines the reply had
+    public int status;                  // SMTP: the enhanced status code ("2.1.5") as class * 1000000 + subject * 1000 + detail (2001005), 0: none given
+    private netio.Queue t;              // the text of the lines (without the codes) separated by \n
+
+    public Reply() { }
+
+    // the text of all lines (the part after "250 " or "250-"), separated by a line feed; valid until the next read into this Reply
+    public char* text() {
+        t.reserve(1);
+        char* d = t.data();
+        if (t.cap == 0) return "";
+        d[t.pending()] = 0;
+        return d;
+    }
+    public int textLength() { return t.pending(); }
+
+    // the line number n (0 first) copied into out (a 0 byte follows); false when there is no such line
+    public bool line(int n, char* out, int max) {
+        char* d = t.data();
+        int len = t.pending();
+        int at = 0;
+        for (int k = 0; k < n; k++) {
+            while (at < len && d[at] != 10) at++;
+            if (at >= len) return false;
+            at++;
+        }
+        if (n >= lines) return false;
+        int e = at;
+        while (e < len && d[e] != 10) e++;
+        int m = e - at;
+        if (m > max - 1) m = max - 1;
+        memcpy(out, &d[at], m);
+        out[m] = 0;
+        return true;
+    }
+
+    public void clear() {
+        code = 0;
+        lines = 0;
+        status = 0;
+        t.clear();
+    }
+
+    // adds a line of text
+    public bool addLine(char* s, int n) {
+        if (lines > 0) t.addByte(10);
+        lines++;
+        return t.add(s, n);
+    }
+
+    public void release() {
+        t.release();
+        code = 0;
+        lines = 0;
+    }
+
+    public bool positive() { return code >= 200 && code < 400; }
+    public bool ok() { return code >= 200 && code < 300; }
+}
+
+// "2.1.5" at the start of s: class * 1000000 + subject * 1000 + detail (2001005); 0 when s does not start with a status code followed by a blank or the end
+public int parseStatus(char* s) {
+    int cls = s[0] - '0';
+    if (cls != 2 && cls != 4 && cls != 5) return 0;
+    if (s[1] != '.') return 0;
+    int i = 2;
+    int subj = 0;
+    int digits = 0;
+    while (s[i] >= '0' && s[i] <= '9') { subj = subj * 10 + (s[i] - '0'); i++; digits++; if (digits > 3) return 0; }
+    if (digits == 0 || s[i] != '.') return 0;
+    i++;
+    int det = 0;
+    digits = 0;
+    while (s[i] >= '0' && s[i] <= '9') { det = det * 10 + (s[i] - '0'); i++; digits++; if (digits > 3) return 0; }
+    if (digits == 0) return 0;
+    if (s[i] != 0 && s[i] != ' ') return 0;
+    return cls * 1000000 + subj * 1000 + det;
+}
+
+// ---- the client connection ------------------------------------------------------------------------------------------------------
+public class Conn {
+    public netio.Link* link;
+    public char* error;                 // why the last call failed (a constant text)
+    public int maxLine;                 // the longest line that readLine accepts, default 8192 (8 MiB in total is read at most per reply: see readReply)
+    public int maxReplyLines;           // lines in one reply, default 1000
+    public int maxReplyBytes;           // bytes in one reply, default 256 KiB
+    public bool tlsActive;
+    public bool recording;              // true: every line sent and received is kept (see transcript())
+    public int bytesIn;
+    public int bytesOut;
+
+    private netio.Queue rq;             // received bytes that are not used yet
+    private int scan;
+    private netio.Queue log;
+    private char* tmp;
+    private bool eof;
+    public bool heap;                   // made by open() / wrap(): dispose() frees the object too
+
+    public Conn() {
+        maxLine = 8192;
+        maxReplyLines = 1000;
+        maxReplyBytes = 262144;
+    }
+
+    public bool isOpen() { return link != null && link->isOpen() && !eof; }
+
+    // received bytes that nobody has used yet (for the protocols that need to know: STARTTLS)
+    public int buffered() { return rq.pending(); }
+
+    private void note(char* who, char* data, int n) {
+        if (!recording) return;
+        log.max = 1048576;
+        log.addText(who);
+        log.add(data, n);
+        log.addByte(10);
+    }
+
+    // everything sent ("C: line") and received ("S: line") since recording was switched on, one line each (the CRLF is not part of it)
+    public char* transcript() {
+        log.reserve(1);
+        if (log.cap == 0) return "";
+        char* d = log.data();
+        d[log.pending()] = 0;
+        return d;
+    }
+    public void clearTranscript() { log.clear(); }
+
+    // Reads more bytes into the buffer: the count, 0 at the end of the connection, -1 failed, -2 time out
+    private int more(int timeoutMs) {
+        if (link == null) { error = "not connected"; return -1; }
+        if (tmp == null) tmp = malloc(4096);
+        if (tmp == null) { error = "out of memory"; return -1; }
+        int t0 = millis();
+        for (;;) {
+            int r = link->recv(tmp, 4096);
+            if (r > 0) {
+                bytesIn = bytesIn + r;
+                rq.max = maxLine + maxReplyBytes + 8192;
+                if (!rq.add(tmp, r)) { error = "the peer sends more than the limit"; return -1; }
+                return r;
+            }
+            if (r == 0) { eof = true; error = "the connection was closed by the peer"; return 0; }
+            if (r == -1) { error = "the connection failed"; return -1; }
+            int left = timeoutMs - (millis() - t0);
+            if (left <= 0) { error = "time out"; return -2; }
+            link->waitReadable(left > 50 ? 50 : left);
+        }
+        return -1;
+    }
+
+    // One line without its line end (CRLF; a bare LF ends a line too on this side, as clients should be liberal) copied into out (max - 1 bytes at most).
+    // Returns its length, E_EOF (closed or failed: error says why), E_TIMEOUT, or E_TOO_LONG (longer than min(max - 1, maxLine): the rest of the line is dropped).
+    public int readLine(char* out, int max, int timeoutMs) {
+        int lim = max - 1 < maxLine ? max - 1 : maxLine;
+        int t0 = millis();
+        bool dropping = false;
+        for (;;) {
+            int avail = rq.pending();
+            char* d = rq.data();
+            int i = scan;
+            while (i < avail && d[i] != 10) i++;
+            if (i < avail) {
+                // a line end at i
+                int len = i;
+                if (len > 0 && d[len - 1] == 13) len--;
+                scan = 0;
+                if (dropping || len > lim) {
+                    rq.consume(i + 1);
+                    error = "line too long";
+                    return E_TOO_LONG;
+                }
+                memcpy(out, d, len);
+                out[len] = 0;
+                rq.consume(i + 1);
+                note("S: ", out, len);
+                return len;
+            }
+            if (avail > lim + 1) {
+                // too long already: drop what is held and go on to the end of the line
+                dropping = true;
+                rq.consume(avail);
+                scan = 0;
+            } else {
+                scan = avail;
+            }
+            int left = timeoutMs - (millis() - t0);
+            if (left <= 0) { error = "time out"; return E_TIMEOUT; }
+            int r = more(left);
+            if (r == -2) return E_TIMEOUT;
+            if (r <= 0) return E_EOF;                   // closed or failed; a line that was cut off by the end of the connection is not complete
+        }
+        return E_EOF;
+    }
+
+    // exactly n bytes (for a block that has a length); returns n, or fewer when the connection ended or the time ran out (error says why)
+    public int readBytes(char* out, int n, int timeoutMs) {
+        int t0 = millis();
+        int got = 0;
+        while (got < n) {
+            int avail = rq.pending();
+            if (avail > 0) {
+                int take = avail < n - got ? avail : n - got;
+                memcpy(&out[got], rq.data(), take);
+                rq.consume(take);
+                scan = 0;
+                got = got + take;
+                continue;
+            }
+            int left = timeoutMs - (millis() - t0);
+            if (left <= 0) { error = "time out"; return got; }
+            int r = more(left);
+            if (r <= 0) return got;
+        }
+        return got;
+    }
+
+    // Some bytes (at most max): what is there, waits only when nothing is. Returns the count, 0 at the end, -1 failed, -2 time out.
+    public int readSome(char* out, int max, int timeoutMs) {
+        if (rq.pending() == 0) {
+            int r = more(timeoutMs);
+            if (r <= 0) return r;
+        }
+        int take = rq.pending() < max ? rq.pending() : max;
+        memcpy(out, rq.data(), take);
+        rq.consume(take);
+        scan = 0;
+        return take;
+    }
+
+    // Writes all n bytes within timeoutMs. false on a failure or a time out (error says why)
+    public bool write(char* data, int n, int timeoutMs) {
+        if (link == null || !link->isOpen()) { error = "not connected"; return false; }
+        if (!link->sendAll(data, n, timeoutMs)) {
+            error = link->isOpen() ? "time out" : "the connection failed";
+            return false;
+        }
+        bytesOut = bytesOut + n;
+        return true;
+    }
+
+    // adds a line to the transcript as if it had been sent (for protocols that send several commands in one write)
+    public void noteSent(char* text) { note("C: ", text, strlen(text)); }
+
+    // text and CRLF in one write. A text with CR, LF or NUL is refused (that would be a second command: injection) and nothing is sent.
+    // noteAs: what the transcript shows instead of the text (a password must not end up in a transcript: pass "AUTH PLAIN ****").
+    public bool writeLine(char* text, int timeoutMs, char* noteAs = null) {
+        if (!isLineSafe(text)) { error = "a line must not contain CR, LF or NUL"; return false; }
+        int n = strlen(text);
+        char* b = malloc(n + 3);
+        if (b == null) { error = "out of memory"; return false; }
+        memcpy(b, text, n);
+        b[n] = 13;
+        b[n + 1] = 10;
+        if (noteAs != null) note("C: ", noteAs, strlen(noteAs)); else note("C: ", text, n);
+        bool ok = write(b, n + 2, timeoutMs);
+        free(b);
+        return ok;
+    }
+
+    // a reply of one or more lines (see STYLE_SMTP, STYLE_FTP) within timeoutMs for all of it. Returns the code, or a negative E_ value
+    public int readReply(Reply* r, int style, int timeoutMs) {
+        r->clear();
+        int t0 = millis();
+        char* line = malloc(maxLine + 2);
+        if (line == null) { error = "out of memory"; return E_FAILED; }
+        int result = 0;
+        int total = 0;
+        int firstCode = -1;
+        for (;;) {
+            int left = timeoutMs - (millis() - t0);
+            if (left < 0) left = 0;
+            int n = readLine(line, maxLine + 1, left);
+            if (n < 0) { result = n; break; }
+            bool coded = n >= 3 && isDigit(line[0]) && isDigit(line[1]) && isDigit(line[2]) && (n == 3 || line[3] == ' ' || line[3] == '-');
+            if (firstCode < 0) {
+                if (!coded) { error = "the reply does not start with a three digit code"; result = E_FAILED; break; }
+                firstCode = (line[0] - '0') * 100 + (line[1] - '0') * 10 + (line[2] - '0');
+                r->code = firstCode;
+            }
+            bool last;
+            int from = 0;
+            if (coded && ((line[0] - '0') * 100 + (line[1] - '0') * 10 + (line[2] - '0')) == firstCode) {
+                last = (n == 3 || line[3] == ' ');
+                from = n == 3 ? 3 : 4;
+            } else if (style == STYLE_FTP) {
+                last = false;                   // free text inside a multi line reply
+                from = 0;
+                if (coded) from = 0;
+            } else {
+                error = "a reply line with another code than the first one";
+                result = E_FAILED;
+                break;
+            }
+            total = total + (n - from) + 1;
+            if (r->lines >= maxReplyLines || total > maxReplyBytes) { error = "the reply is too long"; result = E_FAILED; break; }
+            if (!r->addLine(&line[from], n - from)) { error = "the reply is too long"; result = E_FAILED; break; }
+            if (last) break;
+        }
+        free(line);
+        if (result < 0) return result;
+        if (style == STYLE_SMTP) r->status = parseStatus(&r->text()[0]);
+        return r->code;
+    }
+
+    // STARTTLS / AUTH TLS: the handshake as the client. Refused when bytes of the peer are still unread (they would be plain text that TLS never saw: the
+    // classic STARTTLS injection). false: error says why, the connection is closed.
+    public bool startTls(char* hostName, bool verify, int timeoutMs) {
+        if (link == null) { error = "not connected"; return false; }
+        if (rq.pending() > 0) {
+            error = "the peer sent plain text after its go-ahead for TLS";
+            close();
+            return false;
+        }
+        if (!link->startTls(hostName, verify, timeoutMs)) {
+            error = link->error != null ? link->error : "TLS handshake failed";
+            close();
+            return false;
+        }
+        tlsActive = true;
+        scan = 0;
+        return true;
+    }
+
+    public void close() {
+        if (link != null) link->close();
+        eof = true;
+    }
+
+    public void dispose() {
+        close();
+        if (link != null) { link->dispose(); link = null; }
+        rq.release();
+        log.release();
+        if (tmp != null) { free(tmp); tmp = null; }
+        if (heap) { heap = false; free((char*) this); }
+    }
+}
+
+// connects (and runs the TLS handshake when useTls: the certificate is checked when verify is true); null when it fails: netline.lastError()
+private char lastErr[160];
+
+private void setErr(char* s) {
+    int n = strlen(s);
+    if (n > 150) n = 150;
+    memcpy(&lastErr[0], s, n);
+    lastErr[n] = 0;
+}
+
+public char* lastError() { return &lastErr[0]; }
+
+public Conn* open(char* host, int port, int timeoutMs, bool useTls, bool verify) {
+    Conn* c = (Conn*) malloc(sizeof(Conn));
+    if (c == null) { setErr("out of memory"); return null; }
+    c->maxLine = 8192;
+    c->maxReplyLines = 1000;
+    c->maxReplyBytes = 262144;
+    c->heap = true;
+    c->link = netio.newLink();
+    if (c->link == null) { free((char*) c); setErr("out of memory"); return null; }
+    if (!c->link->open(host, port, timeoutMs, useTls, verify)) {
+        setErr(c->link->error != null ? c->link->error : "cannot connect");
+        c->dispose();
+        return null;
+    }
+    c->tlsActive = useTls;
+    return c;
+}
+
+// a Conn around a link that is open already (it is disposed with the Conn)
+public Conn* wrap(netio.Link* l) {
+    Conn* c = (Conn*) malloc(sizeof(Conn));
+    if (c == null) return null;
+    c->maxLine = 8192;
+    c->maxReplyLines = 1000;
+    c->maxReplyBytes = 262144;
+    c->heap = true;
+    c->link = l;
+    return c;
+}

@@ -1,0 +1,197 @@
+// Memory of the FTP modules: what a client and a server do again and again must not use up memory. The heap position (what `new`, alloc and strdup consume, which is never given
+// back) must stay exactly where it is after a warm-up while clients connect, list, download, upload, resume, rename, make and remove directories, fail, abort transfers and
+// leave without QUIT (in passive and in active mode), while the parsers read listings, and while hostile connections come and go; and the server must have freed every session, listener and
+// watched socket afterwards. (TLS handshakes are not part of this: see docs/NET.md.)
+import ftp;
+import ftpd;
+import asys;
+import net;
+import netio;
+
+int fails = 0;
+
+void check(char* name, bool ok) {
+    if (ok) {
+        printf("ok   %s\n", name);
+    } else {
+        printf("FAIL %s\n", name);
+        fails++;
+    }
+}
+
+ftpd.Server* srv;
+char root[200];
+
+int hook() {
+    srv->poll(0);
+    return 0;
+}
+
+void rmTree(char* path) {
+    asys.DirList dl;
+    if (asys.listDir(path, &dl) < 0) return;
+    for (int i = 0; i < dl.count; i++) {
+        char sub[400];
+        format(&sub[0], 400, "%s/%s", path, dl.name(i), 0, 0, 0, 0);
+        asys.Stat st;
+        if (asys.lstat(&sub[0], &st) >= 0 && st.isDir()) rmTree(&sub[0]); else asys.unlink(&sub[0]);
+    }
+    dl.dispose();
+    asys.rmdir(path);
+}
+
+char* DATA;
+
+// one round of a client with everything it can do
+void clientRound(bool passive) {
+    ftp.Options* o = ftp.newOptions();
+    o->username = "ann";
+    o->password = "secret";
+    o->authTls = ftp.STARTTLS_NEVER;
+    o->passive = passive;
+    o->record = true;
+    o->commandTimeoutMs = 3000;
+    o->dataTimeoutMs = 3000;
+    ftp.Client* c = ftp.newClient("127.0.0.1", srv->port, o);
+    if (c->connect()) {
+        ftp.EntryList* l = c->listEntries("");
+        if (l != null) l->dispose();
+        int n = 0;
+        char* d = c->retrieveAll("data.bin", &n, 100000);
+        if (d != null) free(d);
+        c->store("up.bin", DATA, 30000);
+        c->append("up.bin", DATA, 1000);
+        c->mkd("dir1");
+        c->rename("dir1", "dir2");
+        c->rmd("dir2");
+        c->size("up.bin");
+        c->mdtm("up.bin");
+        char* pwd = c->pwd();
+        if (pwd != null) free(pwd);
+        c->retrieveAll("nothing", &n, 100);
+        c->dele("nothing");
+        c->cwd("/");
+        char* names = c->nlst("");
+        if (names != null) free(names);
+        c->retrieveAll("data.bin", &n, 1000);            // over the limit: aborted in the middle
+        c->noop();
+        c->dele("up.bin");
+        c->quit();
+    }
+    c->dispose();
+    free((char*) o);
+    // a client that leaves without QUIT, one that fails to log in, one with a bad URL
+    o = ftp.newOptions();
+    o->username = "ann";
+    o->password = "secret";
+    o->authTls = ftp.STARTTLS_NEVER;
+    o->passive = passive;
+    c = ftp.newClient("127.0.0.1", srv->port, o);
+    c->connect();
+    c->dispose();
+    free((char*) o);
+    o = ftp.newOptions();
+    o->username = "ann";
+    o->password = "wrong";
+    o->authTls = ftp.STARTTLS_NEVER;
+    c = ftp.newClient("127.0.0.1", srv->port, o);
+    c->connect();
+    c->dispose();
+    free((char*) o);
+    ftp.Client* none = ftp.connect("gopher://x");
+    if (none != null) none->dispose();
+}
+
+// a raw client that starts a transfer and goes away
+void rawRound() {
+    int h = net.connect("127.0.0.1", srv->port);
+    net.setTimeout(h, 2000);
+    char b[2048];
+    net.recv(h, &b[0], 2048);
+    net.send(h, "USER ann\r\nPASS secret\r\nEPSV\r\n", 29);
+    int got = 0;
+    int t0 = millis();
+    char all[4000];
+    all[0] = 0;
+    while (millis() - t0 < 1000 && !contains(&all[0], "229 ")) {
+        if (!net.waitReadable(h, 50)) continue;
+        int n = net.recv(h, &b[0], 2000);
+        if (n <= 0) break;
+        if (got + n < 3900) { memcpy(&all[got], &b[0], n); got = got + n; all[got] = 0; }
+    }
+    char* p = strstr(&all[0], "(|||");
+    int port = p == null ? 0 : ftp.parseEpsv(p);
+    int d = net.connect("127.0.0.1", port);
+    net.setTimeout(d, 1000);
+    net.send(h, "RETR data.bin\r\n", 15);
+    net.recv(d, &b[0], 100);                             // a first piece, then the data connection is dropped in the middle
+    net.close(d);
+    sleepMs(5);
+    net.send(h, "EPSV\r\nSTOR half.bin\r\n", 21);
+    sleepMs(5);
+    net.close(h);
+    for (int i = 0; i < 30; i++) srv->poll(2);
+}
+
+int main() {
+    char rnd[4];
+    asys.randomBytes(&rnd[0], 4);
+    format(&root[0], 200, "build/tests/t408-%d", (rnd[0] & 255) * 65536 + (rnd[1] & 255) * 256 + (rnd[2] & 255), 0, 0, 0, 0);
+    asys.mkdirs(&root[0]);
+    DATA = alloc(40000);
+    int seed = 5;
+    for (int i = 0; i < 40000; i++) { seed = seed * 1103515245 + 12345; DATA[i] = (seed >> 16) & 255; }
+    char fp[300];
+    format(&fp[0], 300, "%s/data.bin", &root[0], 0, 0, 0, 0, 0);
+    asys.writeFile(&fp[0], DATA, 40000);
+    srv = ftpd.newServer();
+    srv->addUser("ann", "secret", &root[0], ftpd.P_ALL);
+    srv->dataTimeoutMs = 2000;
+    srv->listenOn("127.0.0.1", 0, null);
+    net.setIdleHook(hook);
+
+    for (int r = 0; r < 3; r++) { clientRound(true); clientRound(false); }
+    int h0 = __heap_pos;
+    for (int r = 0; r < 8; r++) { clientRound(true); clientRound(false); }
+    check("clients against the server, passive and active: 16 rounds of every operation, aborted transfers, failed logins: the heap did not move", __heap_pos == h0);
+    if (__heap_pos != h0) printf("     the heap grew by %d bytes\n", __heap_pos - h0);
+    int t0 = millis();
+    while (millis() - t0 < 2000 && srv->sessions > 0) srv->poll(5);
+    check("... the server has freed every session and watched socket", srv->sessions == 0 && srv->net->watchCount() == 0);
+
+    for (int r = 0; r < 4; r++) rawRound();
+    int h1 = __heap_pos;
+    for (int r = 0; r < 8; r++) rawRound();
+    check("raw clients that drop their data connection in the middle and leave: the heap did not move", __heap_pos == h1);
+    if (__heap_pos != h1) printf("     the heap grew by %d bytes\n", __heap_pos - h1);
+    t0 = millis();
+    while (millis() - t0 < 2000 && srv->sessions > 0) srv->poll(5);
+    check("... and nothing is left open", srv->sessions == 0 && srv->net->watchCount() == 0);
+
+    char* unix = "drwxr-xr-x   2 ftp      ftp          4096 Nov 13 14:30 docs\r\n-rw-r--r--   1 ftp      ftp          1234 Nov 10 09:05 notes.txt\r\n";
+    char* mlsd = "type=dir;modify=20261113143000;perm=flcdmpe; sub dir\r\ntype=file;size=1234;modify=20261110090500; a file\r\n";
+    for (int r = 0; r < 4; r++) {
+        ftp.EntryList l;
+        ftp.parseListing(unix, strlen(unix), false, &l, 1794580200);
+        ftp.parseListing(mlsd, strlen(mlsd), true, &l, 1794580200);
+        char* sn0 = ftp.safeName("../x/y.txt");
+        free(sn0);
+        l.dispose();
+    }
+    int h2 = __heap_pos;
+    for (int r = 0; r < 200; r++) {
+        ftp.EntryList l;
+        ftp.parseListing(unix, strlen(unix), false, &l, 1794580200);
+        ftp.parseListing(mlsd, strlen(mlsd), true, &l, 1794580200);
+        char* sn = ftp.safeName("../x/y.txt");
+        free(sn);
+        l.dispose();
+    }
+    check("the listing parsers: the heap did not move", __heap_pos == h2);
+    if (__heap_pos != h2) printf("     the heap grew by %d bytes\n", __heap_pos - h2);
+
+    net.setIdleHook(null);
+    rmTree(&root[0]);
+    printf("%d failed\n", fails);
+    return fails == 0 ? 0 : 1;
+}
