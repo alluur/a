@@ -284,23 +284,30 @@ private double dpoisRaw(double x, double lambda) {
     return dmath.exp(-stirlerr(x) - bd0(x, lambda)) / dmath.sqrt(2.0 * dmath.PI * x);
 }
 
-// binomial probability of x successes in n trials, success probability p (q = 1 - p), by Loader's algorithm
-private double dbinomRaw(double x, double n, double p, double q) {
+// binomial probability of x successes in n trials, success probability p (q = 1 - p), by Loader's algorithm; nmx = n - x must be given exactly (the caller often knows it
+// without a subtraction: for the incomplete beta function n = a + b and nmx = b, and a + b - a would lose the digits of b when a is huge)
+private double dbinomRawC(double x, double nmx, double n, double p, double q) {
     if (p == 0.0) { return (x == 0.0) ? 1.0 : 0.0; }
     if (q == 0.0) { return (x == n) ? 1.0 : 0.0; }
-    if (x < 0.0 || x > n) { return 0.0; }
+    if (x < 0.0 || nmx < 0.0) { return 0.0; }
     if (x == 0.0) {
         if (n == 0.0) { return 1.0; }
         double lc = (p < 0.1) ? -bd0(n, n * q) - n * p : n * dmath.log(q);
         return dmath.exp(lc);
     }
-    if (x == n) {
+    if (nmx == 0.0) {
         double lc = (q < 0.1) ? -bd0(n, n * p) - n * q : n * dmath.log(p);
         return dmath.exp(lc);
     }
-    double lc = stirlerr(n) - stirlerr(x) - stirlerr(n - x) - bd0(x, n * p) - bd0(n - x, n * q);
-    double lf = 2.0 * LN_SQRT_2PI + dmath.log(x) + dmath.log1p(-x / n);
+    double lc = stirlerr(n) - stirlerr(x) - stirlerr(nmx) - bd0(x, n * p) - bd0(nmx, n * q);
+    double ratio = (2.0 * x > n) ? dmath.log(nmx / n) : dmath.log1p(-x / n);         // log(1 - x / n) without cancellation when x is close to n
+    double lf = 2.0 * LN_SQRT_2PI + dmath.log(x) + ratio;
     return dmath.exp(lc - 0.5 * lf);
+}
+
+private double dbinomRaw(double x, double n, double p, double q) {
+    if (x > n) { return 0.0; }
+    return dbinomRawC(x, n - x, n, p, q);
 }
 
 // ---- incomplete gamma ------------------------------------------------------------------------------------------------------------------------
@@ -326,11 +333,17 @@ private void incGammaBoth(double a, double x, double* P, double* Q) {
         double ap = a;
         double del = 1.0 / a;
         double sum = del;
+        bool converged = false;
         for (int n = 0; n < 1000000; n++) {
             ap += 1.0;
             del *= x / ap;
             sum += del;
-            if (absd(del) < absd(sum) * 1.0e-17) { break; }
+            if (absd(del) < absd(sum) * 1.0e-17) { converged = true; break; }
+        }
+        if (!converged) {                                  // a above about 1e12: the series needs more than 10^6 terms; NaN is better than a wrong number
+            *P = nanValue();
+            *Q = nanValue();
+            return;
         }
         double p = sum * pre;
         if (p > 1.0) { p = 1.0; }
@@ -341,6 +354,7 @@ private void incGammaBoth(double a, double x, double* P, double* Q) {
         double c = 1.0 / FPMIN;
         double d = 1.0 / b;
         double h = d;
+        bool converged = false;
         for (int i = 1; i < 1000000; i++) {
             double an = -(double) i * ((double) i - a);
             b += 2.0;
@@ -351,7 +365,12 @@ private void incGammaBoth(double a, double x, double* P, double* Q) {
             d = 1.0 / d;
             double del = d * c;
             h *= del;
-            if (absd(del - 1.0) < 1.0e-16) { break; }
+            if (absd(del - 1.0) < 1.0e-16) { converged = true; break; }
+        }
+        if (!converged) {
+            *P = nanValue();
+            *Q = nanValue();
+            return;
         }
         double q = pre * h;
         if (q > 1.0) { q = 1.0; }
@@ -403,9 +422,9 @@ private double betaCf(double a, double b, double x) {
         d = 1.0 / d;
         double del = d * c;
         h *= del;
-        if (absd(del - 1.0) < 1.0e-16) { break; }
+        if (absd(del - 1.0) < 1.0e-16) { return h; }
     }
-    return h;
+    return nanValue();                                     // no convergence within 10^6 terms (a or b above about 1e12): NaN, never a wrong number
 }
 
 // I_x(a, b) and 1 - I_x(a, b), both without cancellation; y must be 1 - x (the caller computes it from the exact data where possible)
@@ -425,7 +444,7 @@ private void incBetaBoth(double x, double y, double a, double b, double* lo, dou
         *up = 0.0;
         return;
     }
-    double bt = dbinomRaw(a, a + b, x, y) * a * b / (a + b);          // x^a y^b / B(a, b) through the binomial probability (Loader)
+    double bt = dbinomRawC(a, b, a + b, x, y) * a * b / (a + b);          // x^a y^b / B(a, b) through the binomial probability (Loader)
     if (x < (a + 1.0) / (a + b + 2.0)) {
         double v = bt * betaCf(a, b, x) / a;
         if (v > 1.0) { v = 1.0; }
@@ -565,6 +584,27 @@ private const KIND_GAMMA = 4;
 private const KIND_BETA = 5;
 
 private void distBoth(int kind, double x, double a, double b, double* lo, double* up) {
+    if (kind == KIND_T && a >= 1.0e5 && finite(a) && x * x < 2.0e-4 * a) {
+        // Large degrees of freedom: the incomplete beta function loses digits there (its continued fraction needs about sqrt(df) terms and rounds in every one: the error is
+        // 1e-12 at df = 1e5 and 1e-9 at 1e8), the expansion of the t distribution in 1 / df does not. With the Cornish-Fisher polynomials (Abramowitz and Stegun 26.7.5)
+        //   g1 = (t^3 + t) / 4,  g2 = (5 t^5 + 16 t^3 + 3 t) / 96,  g3 = (3 t^7 + 19 t^5 + 17 t^3 - 15 t) / 384
+        // the normal quantile z of the t value (the inverse series: z = t + a1 / df + a2 / df^2 + a3 / df^3) has a1 = -g1, a2 = g1 g1' - g2, a3 = g2' g1 - g3 - g1' a2 - g1'' g1^2 / 2.
+        // In the domain t^2 < 2e-4 df the first neglected term is below 1e-14 relative
+        double ax = absd(x);
+        double x2 = ax * ax;
+        double g1 = (x2 * ax + ax) * 0.25;
+        double g1d = (3.0 * x2 + 1.0) * 0.25;
+        double g1dd = 1.5 * ax;
+        double g2 = ((5.0 * x2 * x2 + 16.0 * x2) * ax + 3.0 * ax) / 96.0;
+        double g2d = (25.0 * x2 * x2 + 48.0 * x2 + 3.0) / 96.0;
+        double g3 = ((3.0 * x2 * x2 * x2 + 19.0 * x2 * x2 + 17.0 * x2) * ax - 15.0 * ax) / 384.0;
+        double a2 = g1 * g1d - g2;
+        double a3 = g2d * g1 - g3 - g1d * a2 - 0.5 * g1dd * g1 * g1;
+        double z = ax - g1 / a + a2 / (a * a) + a3 / (a * a * a);
+        double tail = normalTail(z);
+        if (x >= 0.0) { *up = tail; *lo = 1.0 - tail; } else { *lo = tail; *up = 1.0 - tail; }
+        return;
+    }
     if (kind == KIND_T) {
         double v = a;
         double xx = x * x;
