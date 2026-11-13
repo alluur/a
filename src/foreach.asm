@@ -74,6 +74,12 @@ fe_decl:
     push rbx
     mov rbx, rdi
     mov qword [rbx+16], -1
+    call is_var_start                   ; foreach (var x in values): the same as leaving the type out
+    test eax, eax
+    jz .typed
+    call next_token
+    jmp .name
+.typed:
     call is_type_start
     test eax, eax
     jz .name

@@ -205,6 +205,9 @@ parse_stmt:
     call lex_restore
     add rsp, 128
 .notlabel:
+    call is_var_start
+    test eax, eax
+    jnz parse_var_decl
     call is_type_start
     test eax, eax
     jnz parse_local_decl
@@ -323,6 +326,12 @@ parse_for:
     call next_token
     jmp .cond
 .init:
+    call is_var_start
+    test eax, eax
+    jz .init_t
+    call parse_var_decl
+    jmp .cond
+.init_t:
     call is_type_start
     test eax, eax
     jz .initexpr
@@ -701,6 +710,183 @@ parse_local_decl:
     pop r12
     pop rbx
     ret
+
+
+; ---- var: the type of a local variable is taken from its initializer ------------------------------------------------------
+;   var x = expr;     var a = 1, b = "text";     for (var i = 0; ...)     foreach (var x in values)
+; `var` is not a keyword: it is the declaration word only where a new name can follow it and nothing named var is in scope.
+section .rodata
+w_var: db "var", 0
+section .text
+
+; is_var_start: eax = 1 when the current token is the word var, not declared as anything in the current scope, followed by a name or '('
+is_var_start:
+    cmp qword [tk], T_ID
+    jne .no
+    cmp dword [tk_len], 3
+    jne .no
+    mov rax, [tk_ptr]
+    cmp word [rax], 'va'
+    jne .no
+    cmp byte [rax+2], 'r'
+    jne .no
+    push rbx
+    mov rdi, rax
+    mov esi, 3
+    call sym_lookup
+    test rax, rax
+    jnz .no1
+    cmp dword [cur_class], -1
+    je .look
+    mov edi, [cur_class]                ; a field or method called var of the class being compiled is not the declaration word
+    mov rsi, [tk_ptr]
+    mov edx, 3
+    call struct_find_field
+    test rax, rax
+    jnz .no1
+    mov edi, [cur_class]
+    mov rsi, [tk_ptr]
+    mov edx, 3
+    call struct_find_method
+    test rax, rax
+    jnz .no1
+.look:
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor ebx, ebx
+    cmp qword [tk], T_ID
+    je .yes
+    cmp qword [tk], '('
+    jne .back
+.yes:
+    mov ebx, 1
+.back:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    mov eax, ebx
+    pop rbx
+    ret
+.no1:
+    pop rbx
+.no:
+    xor eax, eax
+    ret
+
+; var_declare: rdi = name pointer, esi = name length, rdx = type of the variable (the value is in A, converted to that type).
+; Creates the local variable and stores A (or, for a struct, the object that A points to) into it.
+var_declare:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi
+    mov r13d, esi
+    mov rbx, rdx
+    mov rdi, rbx
+    call check_concrete
+    mov rdi, rbx
+    call type_size
+    add rax, 7
+    and rax, -8
+    jnz .sz
+    mov eax, 8
+.sz:
+    add [frame_size], eax
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, S_LOCAL
+    call sym_new
+    mov qword [rax+SYM_EXTRA], 0
+    mov [rax+SYM_TYPE], rbx
+    mov r14d, [frame_size]
+    neg r14
+    mov [rax+SYM_VAL], r14
+    mov rdi, rbx
+    call type_ls
+    test eax, eax
+    jz .agg
+    mov edi, r14d
+    mov rsi, rbx
+    call store_local_typed
+    jmp .out
+.agg:
+    mov edi, r14d                       ; a struct or class value: A is the address of the source object, copy it
+    CG lea_local_b
+    mov rdi, rbx
+    call emit_store_type
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; parse_var_decl: the current token is `var`; reads  var name = expr {, name = expr} ;
+parse_var_decl:
+    push rbx
+    push r12
+    push r13
+    call next_token
+    cmp qword [tk], '('
+    je .tuple
+.decl:
+    cmp qword [tk], T_ID
+    je .d1
+    ERR "expected a variable name after var"
+.d1:
+    mov r12, [tk_ptr]
+    mov r13d, [tk_len]
+    call next_token
+    cmp qword [tk], '='
+    je .init
+    ERR "var needs an initializer: the type of the variable is taken from it (var x = value;)"
+.init:
+    call next_token
+    cmp qword [tk], '{'
+    jne .i1
+    ERR "cannot infer the type of the variable from a {...} list: write the type"
+.i1:
+    xor ebx, ebx
+    cmp qword [tk], K_NULL
+    jne .i2
+    mov ebx, 1                          ; remember a plain null: its type (void*) says nothing
+.i2:
+    call parse_assign
+    call to_rvalue
+    mov rax, [e_type]
+    cmp rax, TY_VOID
+    jne .i3
+    ERR "cannot infer the type of the variable: the initializer has no value (it is void)"
+.i3:
+    test ebx, ebx
+    jz .i4
+    cmp rax, TY_VOID | TY_PTR1
+    jne .i4
+    ERR "cannot infer the type of the variable from null: write the type, for example  char* p = null;"
+.i4:
+    mov rdi, r12
+    mov esi, r13d
+    mov rdx, [e_type]
+    call var_declare
+    cmp qword [tk], ','
+    jne .end
+    call next_token
+    jmp .decl
+.end:
+    mov edi, ';'
+    call expect
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.tuple:
+    pop r13
+    pop r12
+    pop rbx
+    ERR "var (a, b) = ... is not available yet"
 
 ; ---- const declaration (global when pass 1, local inside functions) -------------
 ; const NAME = expr;   const TYPE NAME = expr;

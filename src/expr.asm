@@ -805,6 +805,14 @@ parse_type:
     cmp ecx, S_TYPEDEF
     je .typedef
 .unk:
+    cmp qword [tk], T_ID
+    jne .unk1
+    mov rdi, w_var
+    call tk_is_word
+    test eax, eax
+    jz .unk1
+    ERR "var can only declare a local variable that has an initializer (var x = value;), not parameters, fields or globals"
+.unk1:
     mov edi, msg_unktype
     cmp qword [tk], T_ID
     je fatal_error_tok

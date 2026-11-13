@@ -2224,6 +2224,14 @@ parse_items:
     call is_type_start
     test eax, eax
     jnz .decl
+    cmp qword [tk], T_ID
+    jne .topbad
+    mov rdi, w_var
+    call tk_is_word
+    test eax, eax
+    jz .topbad
+    ERR "var can only declare a local variable that has an initializer (var x = value;), not parameters, fields or globals"
+.topbad:
     mov edi, msg_toplevel
     cmp qword [tk], T_ID
     je fatal_error_tok
