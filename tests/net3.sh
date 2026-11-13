@@ -107,6 +107,76 @@ if command -v curl >/dev/null; then
   curl -s -u ann:pw "ftp://127.0.0.1:$P/../../outside.txt" | grep -q "secret-outside" && bad "curl: the jail leaked a file" || ok "curl cannot leave the jail"
 fi
 
+# ---- FTPS (RFC 4217): ftplib.FTP_TLS and curl against ftpd, and the A client against a server in the order of vsftpd (150 first, the TLS handshake of the data connection after it).
+# The first version of the modules only worked with itself: the server sent 150 after the handshake, the client handshook before the command (ftplib and active curl hung).
+if command -v openssl >/dev/null; then
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout $W/ftps.key -out $W/ftps.pem -days 2 -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1 >/dev/null 2>&1
+  FTPSDIR=$W/ftps; mkdir -p $FTPSDIR; echo "hello ftps" > $FTPSDIR/hello.txt; head -c 200000 /dev/urandom > $FTPSDIR/big.bin
+  P=$(port); $W/ftpd_demo $P $FTPSDIR pw $W/ftps.pem $W/ftps.key > $W/ftpsd.out 2>&1 & pids="$pids $!"; sleep 0.7
+  python3 - $P $FTPSDIR <<'PY' && ok "ftplib.FTP_TLS (AUTH TLS, PROT P): passive and active RETR, STOR (0, 5, 100001 bytes: a small upload ends with close_notify right behind the data), NLST, MLSD, LIST" || bad "ftplib FTP_TLS against ftpd"
+import ftplib, sys, io, os, ssl
+port, d = int(sys.argv[1]), sys.argv[2]
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+for passive in (True, False):
+    f = ftplib.FTP_TLS(context=ctx); f.connect("127.0.0.1", port, timeout=10); f.auth(); f.login("ann", "pw"); f.prot_p(); f.set_pasv(passive)
+    buf = io.BytesIO(); f.retrbinary("RETR hello.txt", buf.write); assert buf.getvalue() == b"hello ftps\n", buf.getvalue()
+    big = io.BytesIO(); f.retrbinary("RETR big.bin", big.write); assert big.getvalue() == open(d + "/big.bin", "rb").read()
+    for n in (0, 5, 100001):
+        data = os.urandom(n)
+        f.storbinary("STOR up%d.bin" % n, io.BytesIO(data))
+        assert open(d + "/up%d.bin" % n, "rb").read() == data, n
+    assert sorted(f.nlst()) == sorted(os.listdir(d)), f.nlst()
+    assert {n for n, facts in f.mlsd()} == set(os.listdir(d))
+    lines = []; f.retrlines("LIST", lines.append); assert any("hello.txt" in l for l in lines), lines
+    assert f.size("hello.txt") == 11
+    f.quit()
+    for n in (0, 5, 100001): os.unlink(d + "/up%d.bin" % n)
+PY
+  if command -v curl >/dev/null; then
+    for mode in "" "-P -"; do
+      curl -s -k --ssl-reqd $mode -u ann:pw ftp://127.0.0.1:$P/hello.txt | grep -q "hello ftps" && ok "curl --ssl-reqd $mode: a download over FTPS" || bad "curl FTPS download ($mode)"
+      curl -s -k --ssl-reqd $mode -u ann:pw ftp://127.0.0.1:$P/ | grep -q "big.bin" && ok "curl --ssl-reqd $mode: a listing over FTPS" || bad "curl FTPS list ($mode)"
+      echo "uploaded by curl $mode" > $W/cu.txt
+      curl -s -k --ssl-reqd $mode -u ann:pw -T $W/cu.txt ftp://127.0.0.1:$P/cu.txt && cmp -s $W/cu.txt $FTPSDIR/cu.txt && ok "curl --ssl-reqd $mode: an upload over FTPS" || bad "curl FTPS upload ($mode)"
+      rm -f $FTPSDIR/cu.txt
+    done
+  fi
+  cat > $W/ftpsc.a <<'AEOF'
+import ftp;
+// usage: ftpsc URL passive|active   (the server is the Python mock: certificates are not checked)
+int main(int argc, char** argv) {
+    ftp.Options* o = ftp.newOptions();
+    o->verify = false;
+    o->authTls = ftp.STARTTLS_REQUIRED;
+    o->passive = strcmp(argv[2], "passive") == 0;
+    o->commandTimeoutMs = 5000; o->connectTimeoutMs = 5000; o->dataTimeoutMs = 5000;
+    ftp.Client* c = ftp.connectWith(argv[1], o);
+    if (c == null) { printf("connect failed: %s\n", ftp.error()); return 1; }
+    int n = 0;
+    char* d = c->retrieveAll("hello.txt", &n, 1 << 20);
+    if (d == null) printf("get failed: %s\n", c->error); else printf("get: %d bytes: %s", n, d);
+    netio.Queue q;
+    if (c->list("", &q)) printf("list: %s", q.data()); else printf("list failed: %s\n", c->error);
+    printf("put: %s\n", c->store("up.txt", "uploaded by the A client\n", 25) ? "ok" : c->error);
+    char* m = c->retrieveAll("missing", &n, 1000);
+    printf("missing: %s\n", m == null ? c->error : "no error?");
+    printf("after: %s\n", c->noop() ? "noop ok" : "control connection lost");
+    c->quit();
+    return 0;
+}
+AEOF
+  $AC $W/ftpsc.a -o $W/ftpsc
+  rm -f $W/mockport; python3 tests/net3_ftps_mock.py $W/mockport $W/ftps.pem $W/ftps.key > $W/mock.out 2>&1 & pids="$pids $!"
+  for i in 1 2 3 4 5 6 7 8 9 10; do [ -s $W/mockport ] && break; sleep 0.3; done
+  for mode in passive active; do
+    want="$(printf 'get: 16 bytes: hello from mock\nlist: -rw-r--r--   1 ftp ftp 16 Jan  1  2020 hello.txt\nput: ok\nmissing: the transfer was refused: 550 no such file\nafter: noop ok')"
+    got="$(timeout 60 $W/ftpsc ftp://ann:pw@127.0.0.1:$(cat $W/mockport)/ $mode 2>&1 | tr -d '\r')"
+    [ "$got" = "$want" ] && ok "the A client against an FTPS server in the order of vsftpd (150 first, handshake after it), $mode: download, listing, upload, a refusal, the connection goes on" || { bad "A client against the FTPS mock ($mode)"; echo "$got"; }
+  done
+else
+  echo "skip FTPS checks (openssl is not installed)"
+fi
+
 # ---- the mail module against Python's email package, both ways (see also the tests t397 to t399)
 cat > $W/mailtest.a <<'AEOF'
 import mail;
