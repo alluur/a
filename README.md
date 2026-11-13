@@ -147,7 +147,8 @@ int main() {
   (`(int, int) divmod(int a, int b) { return (a / b, a % b); }`, `(int q, int r) = divmod(7, 2);`, `(a, b) = (b, a);`, `t.0`);
   lambdas (`algo.sortBy(a, n, (int x, int y) => x - y)`, `x => x * 2`; no captures: pass values as parameters) and string interpolation
   (`$"x = {x}, pi = {pi:.3f}"`) lowered to the same formatter as `printf`, which takes any number of values and prints doubles
-  exactly (`%e %f %g`, correctly rounded, also `%v` for the shortest text that reads back).
+  exactly (`%e %f %g`, correctly rounded, also `%v` for the shortest text that reads back). The exact float formatter makes every program that uses `printf` or
+  `format` about 12 KB larger (hello world with one `printf`: 24.7 KB instead of 12.4 KB; `print` / `println` alone are unchanged).
 * **Classes:** single inheritance, `virtual`, `abstract` classes and methods, `override` / `final` with signature checks, `static` fields and
   methods (`Counter.count`, `Util.square(3)`), and the run time checks `x is Dog` / `x as Dog`.
 * **No hidden runtime:** the "standard library" is written in A itself (`lib/std.a`) and
@@ -198,6 +199,8 @@ same programs compiled by GCC, on every target (see [`docs/INTERNALS.md`](docs/I
 `tests/run.sh` compiles every `tests/t*.a`, runs it and compares stdout and the exit code with the
 `.out` / `.exit` files next to it (`.err` files hold the expected text of a compile error).
 `TARGET=windows tests/run.sh`, `TARGET=linux-arm64 tests/run.sh`, … select another target.
+
+`tests/hostile.sh` compiles hostile source text (12000 nested tuples, 3000 nested lambdas, 200000 parentheses ...) with a time limit: the compiler has to answer in milliseconds.
 
 `tests/tui.sh` runs the terminal toolkit's programs in a pseudo terminal and checks the screen with a terminal emulator written in
 Python (typing, menus, mouse, resize, paste, suspend to a shell, signals, `TERM` variants); `tests/gui.sh` tests the graphical stack,

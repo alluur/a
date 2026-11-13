@@ -701,6 +701,7 @@ parse_local_decl:
     mov rdi, rbx
     mov rsi, r14
     xor edx, edx
+    mov ecx, '}'
     call init_local_list
     jmp .next
 .nolist:
@@ -710,6 +711,8 @@ parse_local_decl:
     call to_rvalue
     mov rdi, rbx
     call tuple_check
+    mov rdi, rbx
+    call struct_check                   ; P p = 5;  used to compile and crash
     mov edi, r14d
     CG lea_local_b
     mov rdi, rbx
@@ -1094,7 +1097,13 @@ parse_static_local:
     cmp qword [tk], '{'
     je .glist
     bt rbx, TF_ARRAY_BIT
-    jnc .i0
+    jc .glist
+    cmp qword [tk], '('
+    jne .i0
+    mov rdi, rbx                        ; static (int, int) t = (5, 6);  a tuple literal of constants
+    call type_is_tuple
+    test eax, eax
+    jz .i0
 .glist:
     mov rdi, r15
     mov esi, 8
@@ -1109,6 +1118,8 @@ parse_static_local:
     xor edx, edx
     jmp .reg
 .i0:
+    mov rdi, rbx
+    call struct_global_check
     call const_expr
     push rax
     push rdx
@@ -1236,6 +1247,7 @@ init_elem:
     mov rdi, rbx
     mov rsi, r12
     mov rdx, r13
+    mov ecx, '}'
     call init_local_list
     jmp .out
 .nobrace:
@@ -1283,16 +1295,37 @@ init_elem:
 .value:
     cmp dword [init_mode], 0
     jne .dvalue
+    mov rdi, rbx
+    call tuple_expect_here              ; (int, int) a[2] = {(1, 2), (3, 4)};  a tuple literal is converted to the element type
     call parse_assign
     call to_rvalue
     mov rdi, rbx
     call coerce_to
+    mov rdi, rbx
+    call tuple_check
+    mov rdi, rbx
+    call struct_check                   ; P a[2] = {5, 6};  used to compile and crash
     mov edi, r12d
     CG lea_local_b
     mov rdi, rbx
     call emit_store_type
     jmp .out
 .dvalue:
+    cmp qword [tk], '('
+    jne .dv0
+    mov rdi, rbx
+    call type_is_tuple
+    test eax, eax
+    jz .dv0
+    mov rdi, rbx                        ; a tuple literal of constants in a global (or static) initializer: (5, 6)
+    mov rsi, r12
+    mov rdx, r13
+    mov ecx, ')'
+    call init_local_list
+    jmp .out
+.dv0:
+    mov rdi, rbx
+    call struct_global_check
     cmp rbx, TY_DOUBLE
     jne .dint
     call const_double
@@ -1341,7 +1374,8 @@ init_elem:
     pop rbx
     ret
 
-; init_local_list: rdi = type (struct or array), rsi = frame offset, rdx = element count (arrays). Current token: '{'
+; init_local_list: rdi = type (struct or array), rsi = frame offset, rdx = element count (arrays), ecx = the closing token ('}' for a
+; {...} list; ')' for the literal (a, b) of a tuple with constant elements in a global initializer). Current token: the opening one
 init_local_list:
     push rbx
     push r12
@@ -1349,6 +1383,8 @@ init_local_list:
     push r14
     push r15
     push rbp
+    push qword [init_close]             ; (nested lists have their own closing token)
+    mov [init_close], rcx
     mov rbx, rdi
     mov r12, rsi
     mov r14, rdx
@@ -1373,7 +1409,8 @@ init_local_list:
     add rax, field_tab
     mov r13, rax
 .sloop:
-    cmp qword [tk], '}'
+    mov rax, [init_close]
+    cmp [tk], rax
     je .close
     cmp qword [tk], '.'
     jne .nodesig
@@ -1453,7 +1490,8 @@ init_local_list:
     mov r13, rax
     xor ebp, ebp
 .aloop:
-    cmp qword [tk], '}'
+    mov rax, [init_close]
+    cmp [tk], rax
     je .close
     cmp qword [tk], '['
     jne .anodesig
@@ -1481,8 +1519,15 @@ init_local_list:
     call next_token
     jmp .aloop
 .close:
-    mov edi, '}'
+    cmp qword [init_close], ')'
+    jne .cl2
+    test r14d, r14d                     ; a tuple literal gives all the elements
+    jz .cl2
+    ERR "this tuple has a different number of elements than the type that is expected here"
+.cl2:
+    mov rdi, [init_close]
     call expect
+    pop qword [init_close]
     pop rbp
     pop r15
     pop r14

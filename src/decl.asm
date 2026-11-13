@@ -2042,7 +2042,13 @@ parse_global_vars:
     cmp qword [tk], '{'
     je .glist
     bt rbx, TF_ARRAY_BIT
-    jnc .i0
+    jc .glist
+    cmp qword [tk], '('
+    jne .i0
+    mov rdi, rbx                        ; (int, int) g = (5, 6);  a tuple literal of constants
+    call type_is_tuple
+    test eax, eax
+    jz .i0
 .glist:
     mov rdi, r15
     mov esi, 8
@@ -2057,6 +2063,8 @@ parse_global_vars:
     xor edx, edx
     jmp .reg
 .i0:
+    mov rdi, rbx
+    call struct_global_check
     cmp rbx, TY_DOUBLE
     jne .i0int
     call const_double

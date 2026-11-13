@@ -21,8 +21,11 @@
 section .rodata
 fn_interp:   db "__interp", 0
 fn_boolstr:  db "__boolstr", 0
+fn_i2f:      db "__i2f", 0              ; integer -> the bits of a double, with integer arithmetic only (lib/std.a)
+fn_u2f:      db "__u2f", 0
 interp_convs: db "diuxXobcspeEfFgGv", 0
-interp_flags: db "-+ #0123456789.lhzjtLq", 0
+interp_flagch: db "-+ #", 0
+interp_lens:   db "lhzjtLq", 0
 section .text
 
 ; frame of parse_interp
@@ -202,25 +205,69 @@ parse_interp:
     mov r14d, eax
     dec r15
 .c2:
-    xor ecx, ecx
+    ; the rest has to be  flags width .precision length  in this order (like in printf), e.g. -08  10  .3  -10.2  #x  hh  ll
+    mov rsi, [rsp + IF_SPEC]
+    xor ecx, ecx                        ; position in the spec
+    xor r8d, r8d                        ; part: 0 flags, 1 width, 2 precision, 3 length
+    xor r9d, r9d                        ; number of length letters
+    xor r10d, r10d                      ; the first length letter
 .c3:
     cmp rcx, r15
     jae .c5
-    mov rsi, [rsp + IF_SPEC]
     movzx eax, byte [rsi + rcx]
-    mov rdi, interp_flags
-.c4:
-    cmp byte [rdi], 0
-    jne .c4a
-    ERR "bad format in an interpolated string: after the colon come flags - + space 0 #, a width, .precision, l h z and a conversion letter"
-.c4a:
-    cmp [rdi], al
-    je .c4b
-    inc rdi
-    jmp .c4
-.c4b:
     inc rcx
+    mov rdi, interp_lens
+    call interp_chr_in
+    test eax, eax
+    jnz .c3len
+    movzx eax, byte [rsi + rcx - 1]
+    cmp r8d, 3
+    je .c4bad                           ; after the length letters nothing else may come
+    cmp al, '.'
+    jne .c3a
+    cmp r8d, 2
+    jae .c4bad                          ; a second point
+    mov r8d, 2
     jmp .c3
+.c3a:
+    cmp al, '0'
+    jb .c3f
+    cmp al, '9'
+    ja .c3f
+    test r8d, r8d
+    jnz .c3                             ; a digit of the width or of the precision
+    cmp al, '0'
+    je .c3                              ; the flag 0
+    mov r8d, 1                          ; 1-9 starts the width
+    jmp .c3
+.c3f:
+    test r8d, r8d
+    jnz .c4bad                          ; flags only come first
+    mov rdi, interp_flagch
+    call interp_chr_in
+    test eax, eax
+    jnz .c3
+.c4bad:
+    ERR "bad format in an interpolated string: after the colon come flags - + space 0 #, a width, .precision, l h z and a conversion letter, in this order"
+.c3len:
+    movzx eax, byte [rsi + rcx - 1]
+    cmp r8d, 3
+    je .c3l2
+    mov r8d, 3
+    mov r9d, 1
+    mov r10d, eax
+    jmp .c3
+.c3l2:
+    inc r9d
+    cmp r9d, 2
+    ja .c4bad                           ; at most two
+    cmp eax, r10d
+    jne .c4bad                          ; hh and ll only
+    cmp al, 'h'
+    je .c3
+    cmp al, 'l'
+    je .c3
+    jmp .c4bad
 .c5:
     ; ---- the type of the value decides the default letter and the conversions
     mov rax, [e_type]
@@ -281,8 +328,15 @@ parse_interp:
     call interp_in
     test eax, eax
     jz .ti2
-    mov edi, TY_DOUBLE
-    call coerce_to                      ; an integer with %f: converted to double
+    ; an integer with %f: its double (the bits are what the formatter takes). The conversion is made by std.a with integer
+    ; arithmetic, so the soft-float runtime is not needed (it is only loaded when the program mentions double); a uint64 of
+    ; 2^63 or more stays positive
+    mov rdi, fn_i2f
+    cmp qword [e_type], TY_U64
+    jne .ti1a
+    mov rdi, fn_u2f
+.ti1a:
+    call call_rt1
     jmp .push
 .ti2:
     cmp r14d, 's'
@@ -353,6 +407,21 @@ section .rodata
 interp_floatconvs: db "eEfFgGv", 0
 interp_ptrconvs:   db "spxXdu", 0
 section .text
+
+; interp_chr_in: rdi = a string of characters, eax = a character -> eax = 1 when it is in the string (preserves rsi, rcx, r8-r10)
+interp_chr_in:
+.l: cmp byte [rdi], 0
+    je .no
+    cmp [rdi], al
+    je .yes
+    inc rdi
+    jmp .l
+.yes:
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
 
 ; interp_in: rdi = a string of letters, r14d = a letter -> eax = 1 when the letter is in the string
 interp_in:

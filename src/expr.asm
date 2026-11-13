@@ -1985,6 +1985,7 @@ parse_primary:
     mov rdi, rbx
     mov rsi, r12
     mov rdx, r13
+    mov ecx, '}'
     call init_local_list
     mov edi, r12d
     CG lea_local_a
@@ -3773,6 +3774,8 @@ parse_assign:
     call coerce_to
     mov rdi, rbx
     call tuple_check
+    mov rdi, rbx
+    call struct_check                   ; p = 5;  with a struct p used to compile and crash
     CG pop_b
     mov rdi, rbx
     call emit_store_type
@@ -4265,6 +4268,29 @@ const_unary:
     jmp .out
 .paren:
     call next_token
+    cmp qword [tk], ')'
+    je .parlam
+    call lambda_ahead                   ; (a, b) => ...   in a global initializer or a default parameter value
+    test eax, eax
+    jz .par1
+.parlam:
+    cmp qword [tk], ')'                 ; () is only a lambda when => follows
+    jne .parlam2
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor ebx, ebx
+    cmp qword [tk], T_FATARROW
+    sete bl
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    test ebx, ebx
+    jz .par1
+.parlam2:
+    ERR "a lambda can only be used inside a function (not in a global initializer or as the default value of a parameter)"
+.par1:
     mov edi, 1
     call const_binary
     push rax
@@ -4293,6 +4319,20 @@ const_unary:
     call sym_lookup
     test rax, rax
     jnz .id1
+    sub rsp, 128                        ; x => ...  is a lambda, which needs a function
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor ebx, ebx
+    cmp qword [tk], T_FATARROW
+    sete bl
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    test ebx, ebx
+    jz .id0
+    ERR "a lambda can only be used inside a function (not in a global initializer or as the default value of a parameter)"
+.id0:
     jmp fatal_undeclared
 .id1:
     mov r12, rax

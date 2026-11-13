@@ -15,6 +15,7 @@ fn_dmul:  db "dmul", 0
 fn_ddiv:  db "ddiv", 0
 fn_dcmp:  db "dcmp", 0
 fn_itod:  db "itod", 0
+fn_utod:  db "__u2f", 0                ; uint64 to double (lib/std.a): a value of 2^63 or more is not negative
 fn_dtoi:  db "dtoi", 0
 fn_dneg:  db "dneg", 0
 CSTR msg_dblop, "operator not available for double (use + - * / and comparisons)"
@@ -88,6 +89,10 @@ coerce_to:
     test eax, eax
     jz .out
     mov rdi, fn_itod
+    cmp qword [e_type], TY_U64
+    jne .cv1
+    mov rdi, fn_utod
+.cv1:
     call call_rt1
     mov qword [e_type], TY_DOUBLE
 .out:
@@ -176,6 +181,10 @@ float_binop:
 .r_int:
     ; right is an int, left a double: convert the right one
     mov rdi, fn_itod
+    cmp r13, TY_U64
+    jne .ri1
+    mov rdi, fn_utod
+.ri1:
     call call_rt1
     CG push_a
     jmp .call
@@ -187,6 +196,10 @@ float_binop:
     mov edi, 1
     CG load_stack_a
     mov rdi, fn_itod
+    cmp r12, TY_U64
+    jne .li1
+    mov rdi, fn_utod
+.li1:
     call call_rt1
     CG pop_b
     mov edi, 1

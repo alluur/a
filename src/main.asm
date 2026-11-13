@@ -2438,6 +2438,7 @@ data_base_f:    resq 1
 opt_objs:       resq 64
 opt_E:          resd 1
 init_mode:      resd 1
+init_close:     resq 1                      ; the token that ends the initializer list that is being parsed
 defer_n:        resd 1
 agg_anon_ptr:   resq 1
 agg_anon_len:   resd 1

@@ -246,6 +246,38 @@ tuple_start_la:
     pop rbx
     ret
 
+; struct_check: rdi = the type of a target (variable, array element, field); the value is in A with type e_type. A struct, class or
+; tuple target needs a struct value: a scalar (or a pointer) was taken for the address of a struct and crashed at run time.
+; (preserves rdi)
+struct_check:
+    test edi, 0xFF00
+    jnz .ok
+    bt rdi, TF_ARRAY_BIT
+    jc .ok
+    cmp dil, TY_STRUCT
+    jne .ok
+    mov rax, [e_type]
+    cmp al, TY_STRUCT
+    jne .bad
+    test eax, 0xFE00                    ; a struct, or a pointer to one (the struct is copied from it: dec = new Decoder() in lib/term.a)
+    jz .ok
+.bad:
+    ERR "a struct, class or tuple can only be initialized or assigned from a value of a struct type (or a {...} list); this value is not one"
+.ok:
+    ret
+
+; struct_global_check: rdi = the type of a global variable that is initialized with a single constant value
+struct_global_check:
+    test edi, 0xFF00
+    jnz .ok
+    bt rdi, TF_ARRAY_BIT
+    jc .ok
+    cmp dil, TY_STRUCT
+    jne .ok
+    ERR "a global struct, class or tuple is initialized with a {...} list (a tuple also with a literal (a, b) of constants), not with a single value"
+.ok:
+    ret
+
 ; tuple_expect_here: rdi = the type the expression that starts at the current token has to have. A tuple type is remembered
 ; so that a tuple literal at this very token is converted to it. (preserves rdi)
 tuple_expect_here:

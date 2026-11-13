@@ -235,7 +235,8 @@ and `tk_start` of the current token.
 `tests/run.sh [pattern]` compiles and runs each `tests/t*.a`. Expected stdout is `tNN_name.out`,
 the expected exit code `tNN_name.exit` (default 0), stdin `tNN_name.in`, and `tNN_name.err` holds a
 fragment of the message for tests that must fail to compile (`t9x_err_*`). The same suite is run
-for every target (see [TARGETS.md](TARGETS.md)).
+for every target (see [TARGETS.md](TARGETS.md)). `tests/hostile.sh` generates hostile source text (deep nesting of tuples, lambdas, casts and parentheses,
+very long lists) and compiles it with a time limit, so that a lookahead that rescans the nested text (quadratic compile time) is found.
 
 ### Differential fuzzing
 
@@ -306,11 +307,16 @@ decision as a chain of 1000 `streq` calls takes 3.3 microseconds; compiling `exa
   call arguments (the declared parameter type) and `var` / pattern initializers; `parse_primary .paren` makes a tuple only when its own `(` is that token (and
   `parse_stmt` clears the token, so an expectation cannot leak into a later statement). With a type the elements are `coerce_to` the field types (int to double) and
   the arity is checked; `tuple_check` makes every other meeting of a tuple with another type an error (return, argument, initialization, assignment; also the fast
-  path of the assignment to a plain local, which once let a tuple address into an `int`). Patterns: `tuple_stmt_kind` scans to the matching `)` and looks for `=` (one
+  path of the assignment to a plain local, which once let a tuple address into an `int`). `struct_check` (after `tuple_check`, in local initializers, list elements
+  and assignments) refuses a scalar for a struct target, `struct_global_check` the same for a global / static initializer. `init_elem` calls `tuple_expect_here`, so a literal
+  works as a list element; in a global (`init_mode` 1) a `(` for a tuple type is parsed by `init_local_list` with the closing token `)` (`init_close`, saved and restored by
+  nested lists; the arity must be complete). Patterns: `tuple_stmt_kind` scans to the matching `)` and looks for `=` (one
   more lookahead for statements that start with `(`); the declaration form computes the value, keeps its address in a hidden local and declares the variables with
   `var_declare`; the assignment form pushes the addresses of the targets (`parse_unary`, so any lvalue), computes the value, copies it into a temporary and
   stores element i with the target `i` found by `load_stack_a`. `.0` `.1` are handled in `parse_postfix .member` (and the lexer does not make `1.0` of `t.1.0`).
-* **Lambdas.** `parse_primary .paren` asks `lambda_ahead` (a scan to the matching `)` that looks for `=>` or `-> type =>`) when `(` is followed by `)`, a type or a name
+* **Lambdas.** `parse_primary .paren` asks `lambda_ahead` (a scan to the first `)` that looks for `=>` or `-> type =>`; the scan stops at any `(`, `;`, `{` or `}`
+  because a parameter list holds only names and types - this keeps the compile time linear for hostile text like `(a, (a, (a, ...`: it was quadratic, 30 s for 12000 levels,
+  see `tests/hostile.sh`) when `(` is followed by `)`, a type or a name
   followed by `,` / `)`; `.id` checks the characters after an identifier for `=>` (`x => ...`). `parse_lambda` saves the state of the function being compiled (frame size,
   return chain, labels and their table, loop records, defers and their buffer, `frame_patch`, ... about 7 KB on the compiler's stack), emits `jmp over`, the prologue,
   the parameters as locals (`16 + slot * (n-1-i)` like `compile_function`), the body (a block with `parse_block`, or one expression), the default return, the epilogue and
@@ -323,7 +329,9 @@ decision as a chain of 1000 `streq` calls takes 3.3 microseconds; compiling `exa
 * **Interpolation.** The lexer makes `$"..."` one token (`T_ISTR`): `tk_ptr` / `tk_len` are the raw text; braces are counted so that `{f("a")}` and `{'}'}` do not end it.
   `parse_interp` walks the raw text: literal characters (escapes through `lex_escape`, `%` doubled) go into a format text that has been reserved in the data section
   (`data_alloc`, filled in at compile time); for `{expr:spec}` it sets `src_ptr` inside the literal, calls `next_token` and `parse_assign` (so any expression works), reads the
-  spec as raw text up to `}`, chooses the conversion letter by the type (see LANGUAGE.md), converts (`coerce_to` double, `__boolstr` for bool) and pushes the value;
+  spec as raw text up to `}`, checks it with a small state machine (flags, width, precision, length, in this order), chooses the conversion letter by the type (see
+  LANGUAGE.md), converts (an integer with a float letter through `__i2f` / `__u2f` of lib/std.a, which work with integer arithmetic: the soft-float runtime is only loaded
+  when the lexer sees `double` or a float literal, and that happens in pass 1, too early for a decision made while parsing the literal in pass 2; `__boolstr` for bool) and pushes the value;
   at the end it pushes the number of values and calls `__interp` (`vformat` to measure, `alloc(len + 1)`, `vformat` to fill) - the argument order is that of every `...`
   function: the format first (its address is pushed before any value is evaluated), the values, then their number.
 * **The formatter** (`vformat` in lib/std.a) handles floating point with integer code only: `__fmt_exact` makes the exact decimal digits of `m * 2^k` (a double is
@@ -331,10 +339,14 @@ decision as a chain of 1000 `streq` calls takes 3.3 microseconds; compiling `exa
   the digit string half to even (exact: the digits are all there), `__fmt_emit_f / _e / _x` write the text, `%g` rounds once to P digits and strips zeros, and `%v`
   (`__fmt_shortest`) takes the shortest digit string that lies between the midpoints to the neighbouring doubles (the exact decimal values of `(2m +- 1) * 2^(k-1)`, the lower one
   `(4m - 1) * 2^(k-2)` when m is a power of 2), inclusive when the mantissa is even, nearest to the value first. `printf` / `format` / `fprintf` ... are `...` functions that copy
-  `va_arg(i)` into an array (32 on the stack, more from the heap) and call `vformat`.
+  `va_arg(i)` into an array (32 on the stack, more in the buffer of `__fmt_args_take`, one block that only grows) and call `vformat`. Widths and precisions are cut to
+  `__FMT_LIMIT` (100000000) when they are read, and padding goes through `__fmt_fill`, which stores only what fits and otherwise just counts. `float.asm` converts a `uint64`
+  to double with `__u2f` (std.a), every other integer with `itod`.
 * **Tests:** `t320` (var), `t321` / `t322` (tuples), `t323` / `t324` / `t325` (lambdas), `t326` (3400 exact float and integer cases: the expected output of the floats is from Python's `%`, of
   the integers from glibc's `printf`; `tests/gen/gen_format_test.py`), `t327` (flags, `*`, lengths, many values, truncation, hostile specifications; the first part is the output of a C
-  program), `t328` (interpolation), `t329` (highlighter), `tests/link/lambda_tuple` (tuples and lambdas across separately compiled units) and `.err` tests for every error message. The generator's
+  program), `t328` (interpolation, also every wrong order of the spec), `t329` (highlighter), `t331` (integers with float letters, ints only; Python oracle,
+  `tests/gen/gen_interp_int_test.py`), `t332` (width and precision limits, many values without allocation), `t333` (tuple literals in lists, global tuples, struct targets),
+  `t334` (uint64 to double), `t335` (valid specs), `tests/hostile.sh` (hostile nesting must compile in milliseconds), `tests/link/lambda_tuple` (tuples and lambdas across separately compiled units) and `.err` tests for every error message. The generator's
   `--stress N SEED PREFIX` mode was run with 130000 random cases (random bit patterns, denormals, ties, powers of two and their neighbours) without a difference; the `%f %e %g` text also agrees with
   glibc except for the known glibc bug in `%#g` when rounding carries into a new digit (`printf("%#g", 999999.5)` prints `1.e+06`; Python and this formatter print `1.00000e+06`).
   Compiling `examples/gui/abrowse.a` takes the same time as before (0.19 s).

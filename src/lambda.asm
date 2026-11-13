@@ -90,18 +90,13 @@ lambda_ahead:
     sub rsp, 128
     mov rdi, rsp
     call lex_save
-    mov ebx, 1                          ; depth: the '(' has been consumed
 .l: mov rax, [tk]
     cmp rax, '('
-    jne .a
-    inc ebx
-    jmp .nx
-.a: cmp rax, ')'
-    jne .b
-    dec ebx
-    jz .end
-    jmp .nx
-.b: cmp rax, T_EOF
+    je .no                              ; the parameters of a lambda are names and types: never a '(' inside. (Stopping here also
+                                        ; keeps the scan short for nested (a, (a, (a, ... text: no quadratic compile time)
+    cmp rax, ')'
+    je .end
+    cmp rax, T_EOF
     je .no
     cmp rax, ';'
     je .no
