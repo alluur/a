@@ -9,11 +9,12 @@
 //  redis-cli, redis-py and the redis client module talk to it. Commands: PING ECHO QUIT AUTH SELECT (16 databases) | GET SET (EX PX NX XX KEEPTTL)
 //  SETNX SETEX PSETEX GETSET DEL EXISTS EXPIRE PEXPIRE (NX XX GT LT) TTL PTTL PERSIST INCR DECR INCRBY DECRBY APPEND STRLEN MGET MSET KEYS (glob) TYPE RENAME |
 //  LPUSH RPUSH LPOP RPOP (with a count) LRANGE LLEN LINDEX | HSET HGET HGETALL HDEL HLEN HEXISTS HKEYS HVALS | SADD SREM SMEMBERS SISMEMBER SCARD |
-//  ZADD (NX XX CH) ZRANGE (WITHSCORES) ZSCORE ZREM ZCARD ZRANK | PUBLISH SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE | MULTI EXEC DISCARD |
-//  FLUSHALL FLUSHDB DBSIZE INFO COMMAND CLIENT. Keys and values are binary safe, keys expire (lazily and by a sweep), errors read like Redis'.
+//  ZADD (NX XX GT LT CH INCR) ZRANGE (WITHSCORES) ZSCORE ZREM ZCARD ZRANK | PUBLISH SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE | MULTI EXEC DISCARD |
+//  FLUSHALL FLUSHDB DBSIZE INFO COMMAND CLIENT. Keys and values are binary safe, keys expire (lazily and by an active sweep like Redis': a table of the keys with a TTL, samples of 20, more while a tenth is dead), errors read like Redis'.
 //  Not supported: persistence, replication, scripting, streams, WATCH, RESP3, blocking commands, cluster.
 //
-//  Limits (settable): maxBulk (a bulk string, default 16 MiB), maxArgs (1024), maxCommand (bytes of one command, 32 MiB), maxInline (64 KiB), maxQueued
+//  Limits (settable): maxBulk (a bulk string, default 16 MiB; the buffer of a command grows with the bytes that arrive, it is not made for the announced size), maxInput (all command
+//  buffers of all clients together, 128 MiB: a command that would go over it gets a protocol error), maxArgs (1024), maxCommand (bytes of one command, 32 MiB), maxInline (64 KiB), maxQueued
 //  (commands after MULTI, 1000), maxSubs (channels and patterns per client, 1000), maxMemory (heap blocks of data, default 64 MiB: writes then answer -OOM),
 //  outHigh (1 MiB of unsent replies: the client's next command waits, backpressure), maxReply (0: automatic), and in the network layer s->net: maxConns (1000),
 //  maxPerIp, maxOut (16 MiB: bytes waiting for a client because messages are pushed to it; a subscriber that does not read is cut off), stallTimeoutMs (30 s:
@@ -21,7 +22,8 @@
 //
 //  The server core has no sockets: store->open() makes a client, c->feed(bytes, n) runs the commands in them, c->out holds the RESP bytes of the
 //  replies (when c->paused is set the client has replies that nobody took: send c->out, then call store->resume(c)). The tests drive it directly and
-//  check the bytes; redisd.Server connects it to netsrv. A listener with TLS grows by about 20 KB of never-freed heap per handshake (the tls module):
+//  check the bytes; redisd.Server connects it to netsrv. The hash tables start from a random secret (store->hashSeed fixes it), so the order of KEYS and of the members of a hash or set
+//  changes from run to run, and keys cannot be chosen to collide. A listener with TLS grows by about 20 KB of never-freed heap per handshake (the tls module):
 //  see docs/NET.md.
 // =============================================================================
 import redis;
@@ -31,6 +33,7 @@ import tls;
 import cfloat;
 import cmath;
 import cstdlib;
+import asys;
 module redisd;
 
 public const TYPE_STRING = 1;
@@ -75,10 +78,19 @@ class Ht {
     public int cap;
     public int count;
     public int* acct;                   // the store's byte counter
+    public int seed;                    // the store's secret: the same keys land in other buckets in every process (no hash flooding)
+    public bool still;                  // true while somebody walks the table and removes entries: it must not shrink then
 
+    // FNV-1a that starts from a secret value, then a finalizer that spreads the high bits into the low ones (the bucket is chosen by the low bits)
     private int hashOf(char* k, int n) {
-        int h = 0x811C9DC5;
+        int h = (0x811C9DC5 ^ seed) & 0xFFFFFFFF;
         for (int i = 0; i < n; i++) h = ((h ^ (k[i] & 255)) * 16777619) & 0xFFFFFFFF;
+        h = (h + ((seed >> 32) & 0xFFFFFFFF)) & 0xFFFFFFFF;
+        h = h ^ (h >> 16);
+        h = (h * 0x85EBCA6B) & 0xFFFFFFFF;
+        h = h ^ (h >> 13);
+        h = (h * 0xC2B2AE35) & 0xFFFFFFFF;
+        h = h ^ (h >> 16);
         return h;
     }
 
@@ -154,7 +166,12 @@ class Ht {
         *acct = *acct - bc((char*) e) - bc(e->key) - SLOT_SHARE;
         free(e->key);
         free((char*) e);
-        if (cap > 64 && count < cap / 8) resize(cap / 2);
+        if (!still) settle();
+    }
+
+    // a table that is nearly empty gets smaller
+    public void settle() {
+        while (cap > 64 && count < cap / 8) resize(cap / 2);
     }
 
     // entries in table order: start with pos = 0, e = null
@@ -230,8 +247,8 @@ public class Rclient {
 // ---- the store ----------------------------------------------------------------------------------------------------------------------
 class Db {
     public Ht* keys;
-    public int expires;
-    public int cursor;
+    public Ht* exp;                     // the keys that have a time to live (key -> the time in num): the sweep looks at these only
+    public int cursor;                  // where the sweep goes on in exp
 }
 
 public class Stats {
@@ -257,6 +274,10 @@ public class Store {
                                         // reasonable reply can be); a command whose reply goes beyond it (MGET of the same big key a thousand times) cuts the client off
     public int outHigh;                 // while this many bytes of replies are unsent the client's next command waits (backpressure), default 1 MiB; 0: never
     public int used;                    // bytes of data (approximate: keys, values and entries)
+    public int maxInput;                // the most the command parsers of all clients together may hold (bytes of buffers for commands that are still arriving), default 128 MiB;
+                                        // a client whose command would make them hold more gets a protocol error and is disconnected
+    public int inputBytes;              // what the parsers hold now
+    public int hashSeed;                // the secret of the hash tables (random; tests that print the order of keys set a fixed value before the first key)
     public int now;                     // the clock in ms
     public Stats* stats;
     public int clients;                 // connected clients
@@ -268,9 +289,14 @@ public class Store {
     private int clCap;
     private int nextId;
     private char* scratch;
+    private int nextExpire;             // no key expires before this time (a lower bound; the purge makes it exact)
+    private int purgeAt;                // when the last purge ran (they are not run more often than every 100 ms)
 
     public Store() {
         makeTable();
+        nextExpire = 9223372036854775807;
+        maxInput = 134217728;
+        asys.randomBytes((char*) &hashSeed, 8);
         maxBulk = 16777216;
         maxArgs = 1024;
         maxCommand = 33554432;
@@ -297,6 +323,8 @@ public class Store {
         c->parser->maxArgs = maxArgs > 1024 ? 1024 : maxArgs;
         c->parser->maxCommand = maxCommand;
         c->parser->maxInline = maxInline;
+        c->parser->budget = &inputBytes;
+        c->parser->budgetMax = maxInput;
         c->out = &c->ownOut;
         c->ownOut.max = maxOut;
         c->pushMax = maxOut;
@@ -374,6 +402,7 @@ public class Store {
             Db* d = (Db*) malloc(sizeof(Db));
             d->keys = (Ht*) malloc(sizeof(Ht));
             d->keys->acct = &used;
+            d->keys->seed = hashSeed;
             dbs[i] = d;
         }
         return dbs[i];
@@ -451,10 +480,29 @@ public class Store {
         Ent* e = d->keys->detach(k, n);
         if (e == null) return;
         Value* v = (Value*) e->val;
-        if (v->expireAt != 0) d->expires--;
+        bool ttl = v->expireAt != 0;
         freeValue(v);
         d->keys->release(e);
+        if (ttl) ttlDrop(d, k, n);          // last: k may be the very key of the entry that is freed here (the sweep)
     }
+
+    // ---- the keys with a time to live -----------------------------------------------------------------------------------------------------------
+    private void ttlPut(Db* d, char* k, int n, int at) {
+        if (d->exp == null) d->exp = newHt();
+        bool created = false;
+        Ent* e = d->exp->put(k, n, &created);
+        e->num = at;
+        if (at < nextExpire) nextExpire = at;
+    }
+
+    private void ttlDrop(Db* d, char* k, int n) {
+        if (d->exp == null) return;
+        Ent* e = d->exp->detach(k, n);
+        if (e != null) d->exp->release(e);
+        if (d->exp->count == 0 && !d->exp->still) { freeHt(d->exp); d->exp = null; }      // nothing has a TTL any more: the table goes
+    }
+
+    private int expCount(Db* d) { return d->exp == null ? 0 : d->exp->count; }
 
     // a new value for a key (the old one is replaced)
     private Value* create(Rclient* c, char* k, int n, int type) {
@@ -463,7 +511,7 @@ public class Store {
         Ent* e = d->keys->put(k, n, &created);
         if (!created) {
             Value* old = (Value*) e->val;
-            if (old->expireAt != 0) d->expires--;
+            if (old->expireAt != 0) ttlDrop(d, k, n);
             freeValue(old);
         }
         Value* v = (Value*) malloc(sizeof(Value));
@@ -482,10 +530,10 @@ public class Store {
         used = used + bc(ns);
     }
 
-    private void setExpire(Rclient* c, Value* v, int at) {
+    private void setExpire(Rclient* c, char* k, int kn, Value* v, int at) {
         Db* d = db(c->db);
-        if (v->expireAt == 0 && at != 0) d->expires++;
-        if (v->expireAt != 0 && at == 0) d->expires--;
+        if (at != 0) ttlPut(d, k, kn, at);
+        else if (v->expireAt != 0) ttlDrop(d, k, kn);
         v->expireAt = at;
     }
 
@@ -648,6 +696,13 @@ public class Store {
         c->out->max = c->pushMax;
     }
 
+    // copies up to `limit` bytes of a (n bytes) as far as the first 0 byte (a C string is what Redis prints); returns how many
+    private int copyC(char* dst, char* a, int n, int limit) {
+        int w = 0;
+        while (w < n && w < limit && a[w] != 0) { dst[w] = a[w]; w++; }
+        return w;
+    }
+
     private void exec1(Rclient* c, int argc, char** argv, int* lens) {
         int ci = cmdIndex(argv[0], lens[0]);
         // authentication
@@ -656,12 +711,23 @@ public class Store {
             return;
         }
         if (ci < 0) {
-            char msg[120];
-            char shown[40];
-            int sn = lens[0] > 30 ? 30 : lens[0];
-            memcpy(&shown[0], argv[0], sn);
-            shown[sn] = 0;
-            format(&msg[0], 120, "ERR unknown command '%s', with args beginning with: ", &shown[0], 0, 0, 0);
+            // as Redis words it: the name (up to 128 bytes), then 'arg' for each argument while fewer than 128 bytes are written (each cut to what is left)
+            char msg[512];
+            int n = format(&msg[0], 512, "ERR unknown command '", 0, 0, 0, 0);
+            n = n + copyC(&msg[n], argv[0], lens[0], 128);
+            n = n + format(&msg[n], 512 - n, "', with args beginning with: ", 0, 0, 0, 0);
+            int shownLen = 0;
+            for (int i = 1; i < argc && shownLen < 128; i++) {
+                msg[n] = 39;
+                n++;
+                int w = copyC(&msg[n], argv[i], lens[i], 128 - shownLen);
+                n = n + w;
+                msg[n] = 39;
+                msg[n + 1] = ' ';
+                n = n + 2;
+                shownLen = shownLen + w + 3;
+            }
+            msg[n] = 0;
             if (c->multi) c->dirty = true;
             err(c, &msg[0]);
             return;
@@ -690,9 +756,12 @@ public class Store {
             return;
         }
         if ((flags & 1) != 0 && used > maxMemory) {
-            stats->rejected++;
-            err(c, "OOM command not allowed when used memory > 'maxmemory'.");
-            return;
+            purgeExpired();                                  // keys that are dead already must not be the reason to refuse a write
+            if (used > maxMemory) {
+                stats->rejected++;
+                err(c, "OOM command not allowed when used memory > 'maxmemory'.");
+                return;
+            }
         }
         command(c, ci, argc, argv, lens);
     }
@@ -804,19 +873,20 @@ public class Store {
             if (l[1] == l[2] && memcmp(a[1], a[2], l[1]) == 0) { ok(c); return; }
             Db* d = db(c->db);
             Ent* e = d->keys->detach(a[1], l[1]);
+            if (v->expireAt != 0) ttlDrop(d, a[1], l[1]);
             Value* old = lookup(c, a[2], l[2]);
             if (old != null) removeKey(d, a[2], l[2]);
             bool created = false;
             Ent* ne = d->keys->put(a[2], l[2], &created);
             ne->val = e->val;
             d->keys->release(e);
+            if (v->expireAt != 0) ttlPut(d, a[2], l[2], v->expireAt);
             ok(c);
             return;
         }
         if (streq(name, "expire") || streq(name, "pexpire")) {
             bool secs = streq(name, "expire");
             int t = 0;
-            if (!redis.parseInt(a[2], l[2], &t)) { notInt(c); return; }
             bool nx = false;
             bool xx = false;
             bool gt = false;
@@ -839,6 +909,8 @@ public class Store {
             }
             if (nx && (xx || gt || lt)) { err(c, "ERR NX and XX, GT or LT options at the same time are not compatible"); return; }
             if (gt && lt) { err(c, "ERR GT and LT options at the same time are not compatible"); return; }
+            // (Redis reads the options first, then the number)
+            if (!redis.parseInt(a[2], l[2], &t)) { notInt(c); return; }
             // the time is checked before the key is looked at (Redis does too): an absurd time is an error even for a key that does not exist
             if (secs) {
                 if (t > 9223372036854775 || t < -9223372036854775) { err(c, "ERR invalid expire time in 'expire' command"); return; }
@@ -854,7 +926,7 @@ public class Store {
             if (gt && (cur == 0 || when <= cur)) { num(c, 0); return; }
             if (lt && cur != 0 && when >= cur) { num(c, 0); return; }
             if (when <= now) { removeKey(db(c->db), a[1], l[1]); num(c, 1); return; }
-            setExpire(c, v, when);
+            setExpire(c, a[1], l[1], v, when);
             num(c, 1);
             return;
         }
@@ -869,7 +941,7 @@ public class Store {
         if (streq(name, "persist")) {
             Value* v = lookup(c, a[1], l[1]);
             if (v == null || v->expireAt == 0) { num(c, 0); return; }
-            setExpire(c, v, 0);
+            setExpire(c, a[1], l[1], v, 0);
             num(c, 1);
             return;
         }
@@ -900,7 +972,7 @@ public class Store {
             if (secs) t = t * 1000;
             Value* v = create(c, a[1], l[1], TYPE_STRING);
             setString(v, a[3], l[3]);
-            setExpire(c, v, now + t);
+            setExpire(c, a[1], l[1], v, now + t);
             ok(c);
             return;
         }
@@ -909,7 +981,7 @@ public class Store {
             if (v != null && v->type != TYPE_STRING) { wrongType(c); return; }
             if (v == null) nil(c); else bulk(c, v->s, v->slen);
             Value* nv = v != null ? v : create(c, a[1], l[1], TYPE_STRING);
-            if (v != null) setExpire(c, v, 0);
+            if (v != null) setExpire(c, a[1], l[1], v, 0);
             setString(nv, a[2], l[2]);
             return;
         }
@@ -1017,7 +1089,8 @@ public class Store {
                 d->keys->tab[sl] = null;
             }
             d->keys->count = 0;
-            d->expires = 0;
+            if (d->exp != null) { freeHt(d->exp); d->exp = null; }
+            d->cursor = 0;
         }
     }
 
@@ -1030,7 +1103,7 @@ public class Store {
         for (int i = 0; i < 16; i++) {
             if (dbs[i] != null && dbs[i]->keys->count > 0) {
                 keysTotal = keysTotal + dbs[i]->keys->count;
-                kn = kn + format(&ks[kn], 400 - kn, "db%d:keys=%d,expires=%d,avg_ttl=0\r\n", i, dbs[i]->keys->count, dbs[i]->expires, 0);
+                kn = kn + format(&ks[kn], 400 - kn, "db%d:keys=%d,expires=%d,avg_ttl=0\r\n", i, dbs[i]->keys->count, expCount(dbs[i]), 0);
             }
         }
         int n = format(&buf[0], 1200, "# Server\r\nredis_version:7.0.0-redisd\r\nredis_mode:standalone\r\nprocess_id:1\r\n\r\n# Clients\r\nconnected_clients:%d\r\n\r\n# Memory\r\nused_memory:%d\r\nmaxmemory:%d\r\n\r\n", clients, used, maxMemory, 0);
@@ -1103,8 +1176,8 @@ public class Store {
         int keep = (v != null && keepTtl) ? v->expireAt : 0;
         Value* nv = create(c, a[1], l[1], TYPE_STRING);
         setString(nv, a[2], l[2]);
-        if (ttl != 0) setExpire(c, nv, now + ttl);
-        else if (keep != 0) setExpire(c, nv, keep);
+        if (ttl != 0) setExpire(c, a[1], l[1], nv, now + ttl);
+        else if (keep != 0) setExpire(c, a[1], l[1], nv, keep);
         if (!get) ok(c);
     }
 
@@ -1333,6 +1406,7 @@ public class Store {
     private Ht* newHt() {
         Ht* h = (Ht*) malloc(sizeof(Ht));
         h->acct = &used;
+        h->seed = hashSeed;
         used = used + bc((char*) h) + HT_BASE;
         return h;
     }
@@ -1666,26 +1740,36 @@ public class Store {
             bool nx = false;
             bool xx = false;
             bool ch = false;
+            bool gt = false;
+            bool lt = false;
+            bool incr = false;
             int i = 2;
             while (i < argc) {
                 if (streqi(a[i], "nx")) nx = true;
                 else if (streqi(a[i], "xx")) xx = true;
                 else if (streqi(a[i], "ch")) ch = true;
+                else if (streqi(a[i], "gt")) gt = true;
+                else if (streqi(a[i], "lt")) lt = true;
+                else if (streqi(a[i], "incr")) incr = true;
                 else break;
                 i++;
             }
             if (nx && xx) { err(c, "ERR XX and NX options at the same time are not compatible"); return; }
+            if ((gt && nx) || (lt && nx) || (gt && lt)) { err(c, "ERR GT, LT, and/or NX options at the same time are not compatible"); return; }
             if (i >= argc || (argc - i) % 2 != 0) { syntax(c); return; }
+            if (incr && argc - i > 2) { err(c, "ERR INCR option supports a single increment-element pair"); return; }
             // all scores are checked before anything changes
             for (int k = i; k < argc; k = k + 2) {
                 int dummy = 0;
                 if (!parseScore(a[k], l[k], &dummy)) { err(c, "ERR value is not a valid float"); return; }
             }
             if (wrong) { wrongType(c); return; }
-            if (v == null && xx) { num(c, 0); return; }
+            if (v == null && xx) { if (incr) nil(c); else num(c, 0); return; }
             if (v == null) { v = create(c, a[1], l[1], TYPE_ZSET); v->zmem = newHt(); }
             int added = 0;
             int changed = 0;
+            int processed = 0;                              // elements that were not skipped by NX, XX, GT or LT
+            int newScore = 0;
             for (int k = i; k < argc; k = k + 2) {
                 int score = 0;
                 parseScore(a[k], l[k], &score);
@@ -1694,6 +1778,18 @@ public class Store {
                 Ent* existing = v->zmem->find(a[k + 1], l[k + 1]);
                 if (existing != null) {
                     if (nx) continue;
+                    int cur = existing->num;
+                    if (incr) {
+                        score = dadd(cur, score);
+                        if (isnan(score)) {
+                            if (v->zn == 0) removeKey(db(c->db), a[1], l[1]);
+                            err(c, "ERR resulting score is not a number (NaN)");
+                            return;
+                        }
+                    }
+                    if ((lt && dcmp(score, cur) >= 0) || (gt && dcmp(score, cur) <= 0)) continue;
+                    processed++;
+                    newScore = score;
                     if (dcmp(existing->num, score) != 0) {
                         zremoveOrd(v, existing);
                         existing->num = score;
@@ -1707,8 +1803,11 @@ public class Store {
                 e->num = score;
                 zinsert(v, e);
                 added++;
+                processed++;
+                newScore = score;
             }
             if (v->zn == 0) removeKey(db(c->db), a[1], l[1]);
+            if (incr) { if (processed > 0) putScore(c, newScore); else nil(c); return; }
             num(c, ch ? added + changed : added);
             return;
         }
@@ -1771,41 +1870,123 @@ public class Store {
     }
 
     // ---- expiry sweep and tick ---------------------------------------------------------------------------------------------------------------------
-    // Removes expired keys: looks at up to `budget` entries of each database per call (a cursor remembers where it was).
-    public void sweep(int budget) {
+    // Active expiry, as Redis does it: takes samples of up to 20 of the keys that have a time to live (in each database) and deletes the expired ones.
+    // The samples come in blocks of 10 (200 keys, so that chance does not decide): when more than a tenth of a block was dead there is another block, up to
+    // `rounds` samples per database and not for longer than 25 ms in all. The server calls it every 100 ms with 1000 rounds: a pile of dead keys goes away
+    // at some 100000 keys per second, and when almost nothing is dead a call costs one block. At most about a tenth of the keys that have a TTL are
+    // dead at any time (Redis keeps the same bound). The keys are found in a table of their own, so keys that never expire cost the sweep nothing.
+    // Returns the number of keys removed.
+    public int sweep(int rounds) {
+        int removed = 0;
+        int t0 = millis();
         for (int i = 0; i < 16; i++) {
             Db* d = dbs[i];
-            if (d == null || d->expires == 0 || d->keys->cap == 0) continue;
-            int looked = 0;
-            while (looked < budget && looked < d->keys->cap) {
-                int slot = d->cursor % d->keys->cap;
-                d->cursor++;
-                looked++;
-                Ent* e = d->keys->tab[slot];
+            if (d == null || d->exp == null || d->exp->count == 0) continue;
+            Ht* x = d->exp;
+            x->still = true;                                 // entries are removed while the table is walked: it must keep its shape
+            int done = 0;
+            while (done < rounds && x->count > 0) {
+                int sampled = 0;
+                int dead = 0;
+                for (int r = 0; r < 10 && x->count > 0; r++) {
+                    int got = 0;
+                    int visited = 0;
+                    while (got < 20 && visited < 200 && x->count > 0) {
+                        int slot = d->cursor % x->cap;
+                        d->cursor++;
+                        visited++;
+                        Ent* e = x->tab[slot];
+                        while (e != null) {
+                            Ent* nx = e->next;
+                            got++;
+                            if (e->num <= now) {
+                                removeKey(d, e->key, e->klen);
+                                stats->expired++;
+                                removed++;
+                                dead++;
+                            }
+                            e = nx;
+                        }
+                    }
+                    sampled = sampled + got;
+                    done++;
+                }
+                if (dead * 10 <= sampled) break;             // a tenth or less was dead: this database is clean enough
+                if (millis() - t0 > 25) break;
+            }
+            x->still = false;
+            x->settle();
+            if (x->count == 0) { freeHt(x); d->exp = null; }
+        }
+        return removed;
+    }
+
+    // Deletes every expired key now (a pass over all keys that have a time to live). The server uses it before it refuses a write because of maxMemory.
+    // It does nothing when no key can have expired yet and runs at most every 100 ms, so a client that hammers the server with writes at the limit
+    // cannot make it scan all the time. Returns the number of keys removed.
+    public int purgeExpired() {
+        if (now < nextExpire) return 0;
+        if (now - purgeAt < 100 && now >= purgeAt) return 0;
+        purgeAt = now;
+        int removed = 0;
+        int next = 9223372036854775807;
+        for (int i = 0; i < 16; i++) {
+            Db* d = dbs[i];
+            if (d == null || d->exp == null || d->exp->count == 0) continue;
+            Ht* x = d->exp;
+            x->still = true;
+            for (int sl = 0; sl < x->cap; sl++) {
+                Ent* e = x->tab[sl];
                 while (e != null) {
                     Ent* nx = e->next;
-                    Value* v = (Value*) e->val;
-                    if (v->expireAt != 0 && v->expireAt <= now) {
+                    if (e->num <= now) {
                         removeKey(d, e->key, e->klen);
                         stats->expired++;
-                        // the chain may have changed: start the slot again
-                        nx = d->keys->tab[slot];
+                        removed++;
+                    } else if (e->num < next) {
+                        next = e->num;
                     }
                     e = nx;
                 }
             }
+            x->still = false;
+            x->settle();
+            if (x->count == 0) { freeHt(x); d->exp = null; }
         }
+        nextExpire = next;
+        return removed;
+    }
+
+    // The longest chain in the key table of a database: a diagnostic. With a good hash it stays short whatever the keys are (about 6 for 200 keys, however
+    // they were chosen); a hash an attacker can predict would put them all in one bucket.
+    public int longestChain(int dbi) {
+        if (dbs[dbi] == null) return 0;
+        Ht* h = dbs[dbi]->keys;
+        int best = 0;
+        for (int i = 0; i < h->cap; i++) {
+            int n = 0;
+            Ent* e = h->tab[i];
+            while (e != null) { n++; e = e->next; }
+            if (n > best) best = n;
+        }
+        return best;
     }
 
     public int keyCount(int dbi) { return dbs[dbi] == null ? 0 : dbs[dbi]->keys->count; }
-    public int expiringCount(int dbi) { return dbs[dbi] == null ? 0 : dbs[dbi]->expires; }
+    public int expiringCount(int dbi) { return dbs[dbi] == null ? 0 : expCount(dbs[dbi]); }
 
     // frees everything
     public void dispose() {
         while (ncl > 0) close(cl[ncl - 1]);
         flush(-1);
         for (int i = 0; i < 16; i++) {
-            if (dbs[i] != null) { if (dbs[i]->keys->tab != null) free((char*) dbs[i]->keys->tab); free((char*) dbs[i]->keys); free((char*) dbs[i]); dbs[i] = null; }
+            if (dbs[i] != null) {
+                if (dbs[i]->exp != null) freeHt(dbs[i]->exp);
+                if (dbs[i]->keys->tab != null) free((char*) dbs[i]->keys->tab);
+                free((char*) dbs[i]->keys);
+                free((char*) dbs[i]);
+                dbs[i] = null;
+            }
         }
         if (cl != null) free((char*) cl);
         cl = null;
@@ -1845,6 +2026,7 @@ public class Server {
     public Store* store;
     public netsrv.Server* net;
     public int port;
+    public int sweepAt;                 // when the expiry sweep last ran (ms)
 
     public Server() {
         makeTable();
@@ -1929,13 +2111,12 @@ private int srvClose(netsrv.Server* s, netsrv.Conn* c) {
     return 0;
 }
 
-private int sweepAt;
 private int srvTick(netsrv.Server* s, int now) {
     Server* sv = (Server*) s->user;
     sv->store->now = now;
-    if (now - sweepAt >= 100 || now < sweepAt) {
-        sweepAt = now;
-        sv->store->sweep(20);
+    if (now - sv->sweepAt >= 100 || now < sv->sweepAt) {
+        sv->sweepAt = now;
+        sv->store->sweep(1000);
     }
     return 0;
 }

@@ -44,6 +44,7 @@ public const E_TOO_BIG = 2;             // a bulk string, a line or a whole repl
 public const E_TOO_MANY = 3;            // more elements or arguments than allowed
 public const E_DEPTH = 4;               // arrays nested too deep
 public const E_NUMBER = 5;              // a length or integer that is not a number (or too big)
+public const E_BUDGET = 6;              // the parsers of a server together hold more input than their budget allows
 
 public char* errorText(int e) {
     if (e == E_NONE) return "no error";
@@ -52,6 +53,7 @@ public char* errorText(int e) {
     if (e == E_TOO_MANY) return "Protocol error: too many elements";
     if (e == E_DEPTH) return "Protocol error: arrays nested too deep";
     if (e == E_NUMBER) return "Protocol error: invalid number";
+    if (e == E_BUDGET) return "Protocol error: too much input is buffered, try again later";
     return "Protocol error";
 }
 
@@ -504,6 +506,8 @@ public class CmdParser {
     public bool ready;                  // a complete command is waiting
     public int commands;
     public bool heap;
+    public int* budget;                 // null, or a counter shared by the parsers of a server: the bytes of buffers they hold (see budgetMax)
+    public int budgetMax;               // a parser whose buffers would take the counter above this gets E_BUDGET (0: no limit)
 
     private int st;                     // 0 start, 1 array length, 2 bulk length, 3 bulk data, 4 CR LF, 5 inline line
     private char* lb;
@@ -520,6 +524,7 @@ public class CmdParser {
     private int bulkLeft;
     private int bulkStart;
     private int crPending;
+    private int held;                   // what this parser has added to the budget counter (its two buffers)
 
     public CmdParser() { init(); }
 
@@ -539,13 +544,27 @@ public class CmdParser {
         return e;
     }
 
-    private bool grow(int more) {
+    // Counts the change of a buffer's size in the shared budget; false (and nothing changed) if the budget does not allow it.
+    private bool charge(int oldSize, int newSize) {
+        if (budget == null) return true;
+        int delta = newSize - oldSize;
+        if (delta > 0 && budgetMax > 0 && *budget + delta > budgetMax) return false;
+        *budget = *budget + delta;
+        held = held + delta;
+        return true;
+    }
+
+    // Room for `more` bytes after the ones in the arena (and the 0 byte behind them); keep is how many bytes of the arena are in use (they are copied
+    // when the arena moves). A bulk string is NOT given room for its declared length when its header arrives: the arena grows with the bytes that
+    // really come (doubling), so a client that declares 16 MiB and sends nothing costs 256 bytes.
+    private bool grow(int more, int keep) {
         if (alen + more + 1 > acap) {
             int nc = acap == 0 ? 256 : acap * 2;
             while (nc < alen + more + 1) nc = nc * 2;
+            if (!charge(acap, nc)) { fail(E_BUDGET); return false; }
             char* na = malloc(nc);
-            if (na == null) return false;
-            if (arena != null) { memcpy(na, arena, alen); free(arena); }
+            if (na == null) { charge(nc, acap); fail(E_TOO_BIG); return false; }
+            if (arena != null) { memcpy(na, arena, keep); free(arena); }
             arena = na;
             acap = nc;
         }
@@ -560,7 +579,7 @@ public class CmdParser {
             if (i >= ll) break;
             // one word: collected into the arena directly
             int start = alen;
-            if (!grow(ll - i + 1)) { fail(E_TOO_BIG); return false; }
+            if (!grow(ll - i + 1, alen)) { if (error == 0) fail(E_TOO_BIG); return false; }
             if (argc_ >= maxArgs) { fail(E_TOO_MANY); return false; }
             int w = 0;
             char* word = &arena[alen];
@@ -665,7 +684,7 @@ public class CmdParser {
         // st == 6
         if (v < 0 || v > maxBulk) { fail(v < 0 ? E_NUMBER : E_TOO_BIG); return; }
         if (alen + v > maxCommand) { fail(E_TOO_BIG); return; }
-        if (!grow(v) || !slot()) { if (error == 0) fail(E_TOO_BIG); return; }
+        if (!grow(0, alen) || !slot()) { if (error == 0) fail(E_TOO_BIG); return; }      // room for the data comes with the data (feed)
         bulkStart = alen;
         bulkLeft = v;
         off[argc_] = alen;
@@ -681,6 +700,7 @@ public class CmdParser {
                 int take = bulkLeft;
                 if (take > n - i) take = n - i;
                 int done = alens[argc_] - bulkLeft;
+                if (take > 0 && !grow(done + take, bulkStart + done)) break;
                 if (take > 0) memcpy(&arena[bulkStart + done], &d[i], take);
                 bulkLeft = bulkLeft - take;
                 i = i + take;
@@ -734,8 +754,9 @@ public class CmdParser {
                 if (ll >= maxInline) { fail(E_TOO_BIG); break; }
                 if (lb == null || ll >= lcap) {
                     int nc = lcap == 0 ? 128 : lcap * 2;
+                    if (!charge(lcap, nc)) { fail(E_BUDGET); break; }
                     char* nb = malloc(nc);
-                    if (nb == null) { fail(E_TOO_BIG); break; }
+                    if (nb == null) { charge(nc, lcap); fail(E_TOO_BIG); break; }
                     if (lb != null) { memcpy(nb, lb, ll); free(lb); }
                     lb = nb;
                     lcap = nc;
@@ -752,7 +773,7 @@ public class CmdParser {
         ready = false;
         argc_ = 0;
         alen = 0;
-        if (acap > 65536) { free(arena); arena = null; acap = 0; }
+        if (acap > 65536) { charge(acap, 0); free(arena); arena = null; acap = 0; }
     }
 
     public void reset() {
@@ -761,13 +782,14 @@ public class CmdParser {
         ll = 0;
         error = 0;
         bulkLeft = 0;
-        if (lb != null && lcap > 4096) { free(lb); lb = null; lcap = 0; }
+        if (lb != null && lcap > 4096) { charge(lcap, 0); free(lb); lb = null; lcap = 0; }
     }
 
     public void dispose() {
         if (lb != null) free(lb);
         if (arena != null) free(arena);
         if (off != null) { free((char*) off); free((char*) alens); }
+        if (budget != null) { *budget = *budget - held; held = 0; }
         lb = null; arena = null; off = null; alens = null; lcap = 0; acap = 0; ocap = 0;
         if (heap) {
             heap = false;
