@@ -1228,8 +1228,8 @@ number whose bits are 3 (a denormal, `0.000000`), as in C it would be undefined;
 cast to int first. (Interpolated strings know the types and convert for you.) A function that takes a `double` parameter needs no care:
 `f(x)` converts the argument to the declared type as always.
 
-**Size.** The exact float formatter is part of `vformat`, so every program that uses `printf` or `format` is about 12 KB larger than before (a hello world with one
-`printf` is 24.7 KB instead of 12.4 KB). A program that only uses `print` / `println` is not affected. There is no switch to leave the float code out: a program
+**Size.** The exact float formatter is part of `vformat`, so every program that uses `printf` or `format` has about 14 KB more machine code than before (a hello world with one
+`printf`: 24.7 KB of code, 10.8 KB before; the executable is 28.8 KB instead of 12.4 KB because the file is rounded up to 4 KB pages). A program that only uses `print` / `println` is not affected. There is no switch to leave the float code out: a program
 may pass the bits of a double (`cmath`) to `%f` without ever mentioning the type `double`, so the compiler cannot tell that it is not needed.
 
 **Speed.** The exact algorithm is simple, not the fastest: about 1 microsecond for `%f` of an ordinary number, 4 for `%v`, 7 for `1e300` and 28 for

@@ -147,8 +147,8 @@ int main() {
   (`(int, int) divmod(int a, int b) { return (a / b, a % b); }`, `(int q, int r) = divmod(7, 2);`, `(a, b) = (b, a);`, `t.0`);
   lambdas (`algo.sortBy(a, n, (int x, int y) => x - y)`, `x => x * 2`; no captures: pass values as parameters) and string interpolation
   (`$"x = {x}, pi = {pi:.3f}"`) lowered to the same formatter as `printf`, which takes any number of values and prints doubles
-  exactly (`%e %f %g`, correctly rounded, also `%v` for the shortest text that reads back). The exact float formatter makes every program that uses `printf` or
-  `format` about 12 KB larger (hello world with one `printf`: 24.7 KB instead of 12.4 KB; `print` / `println` alone are unchanged).
+  exactly (`%e %f %g`, correctly rounded, also `%v` for the shortest text that reads back). The exact float formatter gives every program that uses `printf` or
+  `format` about 14 KB more machine code (hello world with one `printf`: a 28.8 KB executable instead of 12.4 KB, files are rounded to 4 KB pages; `print` / `println` alone are unchanged).
 * **Classes:** single inheritance, `virtual`, `abstract` classes and methods, `override` / `final` with signature checks, `static` fields and
   methods (`Counter.count`, `Util.square(3)`), and the run time checks `x is Dog` / `x as Dog`.
 * **No hidden runtime:** the "standard library" is written in A itself (`lib/std.a`) and
