@@ -11,8 +11,9 @@
 //    properties      trace()  norm1()  normInf()  normFro()  normMax()  isSymmetric(tol)  isFinite()  det()  rank()  cond()  inverse()  solve(&b)
 //  LU                LU f(&a);  f.solve(b, x);  f.det();  f.inverse();  f.rcond()   partial pivoting; refuses singular matrices (see below)
 //  Cholesky          Cholesky c(&a);  c.solve(b, x);  c.det();  c.logDet();       A = L L^T for symmetric positive definite matrices
-//  QR                QR f(&a);  f.q(false)  f.r()  f.solveLS(b, x, &resid)        Householder, any shape
-//  lstsq(&a, b, x)   least squares for any matrix (QR, or the SVD minimum norm solution when A is rank deficient)
+//  QR                QR f(&a);  f.q(false)  f.r()  f.rcond()  f.solveLS(b, x, &resid)       Householder, any shape; solveLS refuses a (numerically) rank deficient A
+//  lstsq(&a, b, x)   least squares for any matrix (QR, or the SVD minimum norm solution when A is rank deficient: the QR answer is only used when the
+//                    column scaled R has an estimated rcond above rows * eps, so an A = u v^T computed in doubles is recognised as rank deficient)
 //  SymEigen          SymEigen e(&a);  e.values[i]  e.vectors  (Jacobi, ascending order, orthonormal columns)
 //  SVD               SVD s(&a);  s.s[i]  s.u  s.v  s.rank()  s.cond()  s.pinv()  s.solve(b, x)       one sided Jacobi (Hestenes), singular values descending
 //  Sparse            SparseVector, CsrMatrix (built with CooBuilder), mulVec, mulVecT, mul, add, transpose, cg(...) conjugate gradient
@@ -784,6 +785,7 @@ public class LU {
         if (!factored) { return nanValue(); }
         double v = (double) sign;
         for (int i = 0; i < n; i++) { v *= lu.d[i * n + i]; }
+        if (v == 0.0) { return 0.0; }          // never -0.0 (a zero pivot times a negative sign would print as -0)
         return v;
     }
 
@@ -1112,6 +1114,8 @@ public class QR {
     public int n;
     public int err;
     private double* w;
+    private double rc;                     // rcond() of R, computed on first use
+    private bool rcDone;
 
     public QR(Matrix* a) {
         err = OK;
@@ -1226,13 +1230,120 @@ public class QR {
         return mn / mx;
     }
 
+    // The estimated reciprocal condition number (1-norm, Hager / Higham estimate as in LU.rcond) of R with its columns scaled to length 1, so the value does not
+    // depend on the units of the columns. 1 = perfect, near 0 = nearly rank deficient: unpivoted QR does NOT show a rank deficiency in the diagonal of R alone
+    // (a matrix that is rank 1 on paper often has r22 / r11 of 1e-15), the condition of the whole triangle does. 0 when m < n or a column is zero, NaN when
+    // there is not enough memory for the estimate or the QR failed.
+    public double rcond() {
+        if (!ok()) { return nanValue(); }
+        if (m < n) { return 0.0; }
+        if (!rcDone) {
+            rc = estimateRcond();
+            rcDone = (rc == rc);
+        }
+        return rc;
+    }
+
+    // x = (R D^-1)^-1 x in place, D = diag(dsc): back substitution then times D
+    private void rSolveScaled(double* x, double* dsc) {
+        double* q = qr.d;
+        for (int i = n - 1; i >= 0; i--) {
+            double s = x[i];
+            for (int j = i + 1; j < n; j++) { s -= q[i * n + j] * x[j]; }
+            x[i] = s / q[i * n + i];
+        }
+        for (int i = 0; i < n; i++) { x[i] *= dsc[i]; }
+    }
+
+    // x = (R D^-1)^-T x in place: times D, then forward substitution with R^T
+    private void rSolveScaledT(double* x, double* dsc) {
+        double* q = qr.d;
+        for (int i = 0; i < n; i++) { x[i] *= dsc[i]; }
+        for (int i = 0; i < n; i++) {
+            double s = x[i];
+            for (int j = 0; j < i; j++) { s -= q[j * n + i] * x[j]; }
+            x[i] = s / q[i * n + i];
+        }
+    }
+
+    private double estimateRcond() {
+        double* q = qr.d;
+        double* dsc = newDoubles(3 * n);
+        if (dsc == null) { return nanValue(); }
+        double* x = &dsc[n];
+        double* z = &dsc[2 * n];
+        double* y = w;                         // m >= n numbers of scratch space
+        double anorm = 0.0;
+        for (int j = 0; j < n; j++) {
+            double cn = strideNorm(&q[j], n, j + 1);
+            if (cn == 0.0 || !finite(cn)) {
+                freeMem(dsc);
+                return 0.0;
+            }
+            dsc[j] = cn;
+        }
+        for (int j = 0; j < n; j++) {
+            double cs = 0.0;
+            for (int i = 0; i <= j; i++) { cs += absd(q[i * n + j]); }
+            cs /= dsc[j];
+            if (cs > anorm) { anorm = cs; }
+        }
+        for (int i = 0; i < n; i++) {
+            if (q[i * n + i] == 0.0) {
+                freeMem(dsc);
+                return 0.0;
+            }
+        }
+        double est = 0.0;
+        for (int i = 0; i < n; i++) { x[i] = 1.0 / (double) n; }
+        int lastJ = -1;
+        for (int iter = 0; iter < 5; iter++) {
+            for (int i = 0; i < n; i++) { y[i] = x[i]; }
+            rSolveScaled(y, dsc);
+            double nrm = vecNorm1(y, n);
+            if (!finite(nrm)) { est = infValue(); break; }
+            if (iter > 0 && nrm <= est) { break; }
+            est = nrm;
+            for (int i = 0; i < n; i++) { z[i] = (y[i] >= 0.0) ? 1.0 : -1.0; }
+            rSolveScaledT(z, dsc);
+            int j = 0;
+            double zmax = absd(z[0]);
+            for (int i = 1; i < n; i++) {
+                if (absd(z[i]) > zmax) { zmax = absd(z[i]); j = i; }
+            }
+            double zx = vecDot(z, x, n);
+            if (iter > 0 && (zmax <= zx || j == lastJ)) { break; }
+            for (int i = 0; i < n; i++) { x[i] = 0.0; }
+            x[j] = 1.0;
+            lastJ = j;
+        }
+        if (n > 1 && finite(est)) {            // Higham's second candidate: an alternating vector
+            double sgn = 1.0;
+            for (int i = 0; i < n; i++) {
+                x[i] = sgn * (1.0 + (double) i / (double) (n - 1));
+                sgn = -sgn;
+            }
+            for (int i = 0; i < n; i++) { y[i] = x[i]; }
+            rSolveScaled(y, dsc);
+            double alt = 2.0 * vecNorm1(y, n) / (3.0 * (double) n);
+            if (alt > est) { est = alt; }
+        }
+        freeMem(dsc);
+        if (!finite(est) || est == 0.0) { return 0.0; }
+        return 1.0 / (anorm * est);
+    }
+
     // Least squares: minimizes |A x - b|_2 for m >= n. b has m numbers, x has n numbers; *resid (optional) receives the norm of the residual.
-    // ERR_RANK when R has a (numerically) zero diagonal element: use matrix.lstsq, which falls back to the SVD.
+    // ERR_RANK when R is (numerically) singular: a zero or tiny diagonal element, or rcond() <= m * eps (what a rank deficient matrix looks like after
+    // rounding, e.g. the product u v^T of two vectors). Use matrix.lstsq, which then falls back to the SVD and its minimum norm solution.
     public int solveLS(double* b, double* x, double* resid = null) {
         if (!ok()) { return (err != OK) ? err : ERR_ARG; }
         if (b == null || x == null) { return ERR_ARG; }
         if (m < n) { return ERR_DIM; }
         if (diagRatio() <= (double) m * EPS) { return ERR_RANK; }
+        double rcnd = rcond();
+        if (rcnd != rcnd) { return ERR_MEMORY; }
+        if (rcnd <= (double) m * EPS) { return ERR_RANK; }
         for (int i = 0; i < m; i++) { w[i] = b[i]; }
         applyQt(w);
         for (int i = n - 1; i >= 0; i--) {
@@ -1253,6 +1364,8 @@ public class QR {
         w = null;
         m = 0;
         n = 0;
+        rc = 0.0;
+        rcDone = false;
         err = ERR_ARG;
     }
 }
