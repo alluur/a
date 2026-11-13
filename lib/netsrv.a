@@ -25,6 +25,14 @@
 //  resumeBelow bytes, then onResume(server, conn) runs (it may pause again). stallTimeoutMs cuts off a connection that has output and has not
 //  been able to send a single byte for that long (a client that does not read), 30 s by default, 0: never.
 //
+//  STARTTLS: s->startTls(c, cfg) (call it from onData after the protocol said "go ahead"; the answer you queued is sent in plain text first) turns the
+//  connection into a TLS connection as a server. Plain bytes that arrive while the switch is pending, or that follow the command in the same read,
+//  are never delivered to onData as TLS data would be: the protocol layer asks c->upgrading and drops the connection when the peer sent more (the
+//  STARTTLS injection attack). onOpen does not run again; a failed handshake ends the connection.
+//
+//  Other descriptors: s->watch(fd, events, tag) adds a socket of yours to the poll set (a data connection of an FTP server) and onWatch(server, tag,
+//  fd, revents) runs when it is ready; s->unwatch(fd) removes it. What you watch is yours to read, write and close.
+//
 //  Limits: maxConns (at most 1000: net.poll takes 1024 sockets), maxPerIp, maxOut, handshakeTimeoutMs (accept to a finished TLS
 //  handshake), idleTimeoutMs (nothing received), stallTimeoutMs, lingerMs. Datagram sockets: addUdp(port) and onDatagram.
 //  When accept() fails because the process is out of file descriptors (or memory) the listener rests for 50 ms instead of spinning on it
@@ -89,6 +97,8 @@ public class Conn {
     public bool paused;             // pause(): nothing is read until the output queue is down to resumeBelow bytes
     public int resumeBelow;
     public int txAt;                // the last time the connection had no output or sent some (stall detection)
+    public tls.Config* upgradeCfg;  // startTls() was called: the switch to TLS happens when the queued output has been sent
+    public bool upgrading;          // true from startTls() until the handshake is done (the protocol layer treats input in this state as an attack)
 }
 
 public class Server {
@@ -98,6 +108,7 @@ public class Server {
     public func onTick;             // onTick(server, nowMs): once per poll turn
     public func onDatagram;         // onDatagram(server, udpIndex, ip, port, data, n)
     public func onResume;           // onResume(server, conn): the output queue of a paused connection has drained, it is reading again
+    public func onWatch;            // onWatch(server, tag, fd, revents): a socket added with watch() is ready (revents: net.READABLE, WRITABLE, FAILED, HUNGUP)
     public char* user;
     public Stats* stats;
 
@@ -124,6 +135,11 @@ public class Server {
     private Conn* freeList[64];
     private int nfree;
     private int nextId;
+    private int wfd[512];
+    private int wev[512];
+    private int wtag[512];
+    private int nw;
+    private int ptag[1024];
     private int ph[1024];
     private int pe[1024];
     private int pr[1024];
@@ -206,7 +222,7 @@ public class Server {
         c->out.max = 0;
         c->id = 0; c->fd = -1; c->ip = 0; c->port = 0; c->state = ST_FREE; c->listener = 0; c->secure = false; c->opened = false;
         c->closeReason = 0; c->user = null; c->acceptedAt = 0; c->lastRx = 0; c->lingerAt = 0; c->t = null; c->slot = 0;
-        c->paused = false; c->resumeBelow = 0; c->txAt = 0;
+        c->paused = false; c->resumeBelow = 0; c->txAt = 0; c->upgradeCfg = null; c->upgrading = false;
         if (nfree < 64) {
             freeList[nfree] = c;
             nfree++;
@@ -309,6 +325,44 @@ public class Server {
     // drops the connection at once (unsent output is lost)
     public void kill(Conn* c) { end(c, R_LOCAL); }
 
+    // STARTTLS: the connection becomes a TLS connection (this side is the TLS server) as soon as the output that is queued now, the protocol's
+    // "go ahead" line, has been sent. Returns false when the connection is not open and plain. From now on c->upgrading is true, and
+    // plain bytes that arrive before the handshake are an attack: the connection is ended (R_ERROR), the data is not delivered.
+    public bool startTls(Conn* c, tls.Config* cfg) {
+        if (c->state != ST_OPEN || c->secure || c->upgradeCfg != null || cfg == null) return false;
+        c->upgradeCfg = cfg;
+        c->upgrading = true;
+        return true;
+    }
+
+    // ---- sockets of the protocol layer in the same poll set -----------------------------------------------------------------------------------
+    // Watches fd for events (net.READABLE, net.WRITABLE or both); calling it again for the same fd changes the events. false when the set is full (512).
+    public bool watch(int fd, int events, int tag) {
+        for (int i = 0; i < nw; i++) {
+            if (wfd[i] == fd) { wev[i] = events; wtag[i] = tag; return true; }
+        }
+        if (nw >= 512) return false;
+        wfd[nw] = fd;
+        wev[nw] = events;
+        wtag[nw] = tag;
+        nw++;
+        return true;
+    }
+
+    public void unwatch(int fd) {
+        for (int i = 0; i < nw; i++) {
+            if (wfd[i] == fd) {
+                nw--;
+                wfd[i] = wfd[nw];
+                wev[i] = wev[nw];
+                wtag[i] = wtag[nw];
+                return;
+            }
+        }
+    }
+
+    public int watchCount() { return nw; }
+
     // Stops reading from the connection until its output queue holds at most resumeBelow bytes (then onResume runs). Call it from onData / onResume.
     public void pause(Conn* c, int resumeBelow) {
         c->paused = true;
@@ -382,6 +436,13 @@ public class Server {
             if (!pumpOut(c)) { end(c, R_ERROR); return; }
         }
         if (c->state == ST_CLOSING && !hasOutput(c)) finishClosing(c);
+        if (c->upgradeCfg != null && c->state == ST_OPEN && !c->secure && !hasOutput(c)) {
+            c->t = tls.accept(c->upgradeCfg);                   // the "go ahead" is sent: the next bytes from the peer are its ClientHello
+            c->upgradeCfg = null;
+            c->secure = true;
+            c->state = ST_TLS;
+            c->acceptedAt = now;
+        }
         if (c->out.pending() == 0) c->out.shrink(65536);
         if (!hasOutput(c)) {
             c->txAt = now;
@@ -418,6 +479,13 @@ public class Server {
     }
 
     private void readConn(Conn* c) {
+        if (c->upgradeCfg != null && c->state == ST_OPEN) {
+            // plain bytes while the switch to TLS is pending: the peer cannot have the "go ahead" yet, this is an injection
+            int junk = net.recvSome(c->fd, rbuf, 16384);
+            if (junk == -2) return;
+            end(c, junk == 0 ? R_PEER : R_ERROR);
+            return;
+        }
         for (int round = 0; round < 4 && c->state != ST_DEAD && !c->paused; round++) {
             int n = net.recvSome(c->fd, rbuf, 16384);
             if (n == -2) return;
@@ -447,7 +515,8 @@ public class Server {
                 if (tls.closed(t)) { end(c, R_PEER); return; }
                 if (c->state == ST_TLS && tls.ready(t)) {
                     c->state = ST_OPEN;
-                    opened(c);
+                    if (c->upgrading) c->upgrading = false;       // STARTTLS: the protocol layer is running already
+                    else opened(c);
                 }
                 if (!pumpOut(c)) { end(c, R_ERROR); return; }
                 while (c->state == ST_OPEN && !c->paused && tls.available(t) > 0) {
@@ -511,6 +580,14 @@ public class Server {
             pconn[n] = c;
             n++;
         }
+        for (int i = 0; i < nw && n < 1024; i++) {
+            ph[n] = wfd[i];
+            pe[n] = wev[i];
+            pkind[n] = 3;
+            pconn[n] = null;
+            ptag[n] = wtag[i];
+            n++;
+        }
         // pr[] is reused for the results: remember the listener indexes first
         int idx[24];
         for (int i = 0; i < fixed; i++) idx[i] = pr[i];
@@ -530,6 +607,8 @@ public class Server {
                     acceptOn(idx[i]);
                 } else if (pkind[i] == 1) {
                     readUdp(idx[i]);
+                } else if (pkind[i] == 3) {
+                    if (onWatch != null) onWatch(this, ptag[i], ph[i], pr[i]);
                 } else {
                     Conn* c = pconn[i];
                     if (c->state == ST_DEAD || c->state == ST_FREE) continue;

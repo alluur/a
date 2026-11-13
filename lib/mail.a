@@ -1,0 +1,3060 @@
+// =============================================================================
+//  mail - Internet messages (RFC 5322) and MIME (RFC 2045-2049, 2231)                                         import mail;
+//
+//  Build a message:
+//    mail.Message* m = mail.newMessage();
+//    m->from("Ann <ann@example.org>");  m->to("Bob <bob@example.org>, carol@example.org");  m->subject("Gruesse aus Muenchen");     // UTF-8 is fine: RFC 2047
+//    m->text("Hello Bob\n");  m->html("<p>Hello <b>Bob</b></p>");                                           // both: multipart/alternative
+//    m->attach("report.pdf", "application/pdf", data, n);                                                  // multipart/mixed
+//    m->attachInline("logo.png", "image/png", png, pn, "logo1");                                           // multipart/related, <img src="cid:logo1">
+//    int n;  char* wire = m->build(&n);                                                                    // the whole message, CRLF line ends (free it)
+//    m->dispose();
+//
+//  Read one:
+//    mail.Part* p = mail.parse(wire, n, null);                                                              // null options: the default limits; null: mail.error()
+//    char* subject = p->decodedHeader("Subject");                                                           // RFC 2047 words decoded to UTF-8 (free it)
+//    mail.AddressList* from = p->addresses("From");   println(from->get(0)->name);  println(from->get(0)->addr);   from->dispose();
+//    mail.Part* text = p->firstText("plain");  println(text->body);                                         // decoded, in UTF-8, line ends LF
+//    for (int i = 0; i < p->attachmentCount(); i++) { mail.Part* a = p->attachment(i);  a->filename  a->body  a->bodyLen }
+//    p->dispose();
+//
+//  Pieces that work alone: header lines (foldHeader, Headers), addresses (parseAddressList, formatAddress), RFC 2047 (encodeWords, decodeWords), RFC 2231
+//  parameters (parseParams), Date (formatDate, parseDate), Message-ID (newMessageId), transfer encodings (base64Encode / base64Decode, qpEncode / qpDecode)
+//  and the character sets UTF-8, US-ASCII, ISO-8859-1, ISO-8859-15 and windows-1252 (toUtf8, utf8ToLatin1).
+//
+//  What the parser guards against: a message over maxSize, a header block over maxHeaderBytes or with more than maxHeaders lines, MIME trees deeper than maxDepth
+//  or with more than maxParts parts, a decoded part over maxPartSize, lines over 998 bytes are not an error (many senders break that rule) but a header line
+//  over maxHeaderLine bytes is cut. Defects are recorded in Part.defects and never stop the parse (a message that is a little broken is still read).
+//  Everything is malloc / free: Part.dispose() frees the whole tree, Headers, AddressList and the texts the functions return are yours to free.
+// =============================================================================
+import hash;
+import datetime;
+import asys;
+import cstdlib;
+import cstring;
+module mail;
+
+// ---- limits (the defaults of the parser) ------------------------------------------------------------------------------------------
+public const MAX_SIZE = 33554432;              // 32 MiB: the largest message that parse() reads and build() makes
+public const MAX_DEPTH = 12;                   // levels of multipart / message nesting
+public const MAX_PARTS = 500;                  // parts in one tree
+public const MAX_HEADERS = 500;                // header lines in one header block
+public const MAX_HEADER_BYTES = 262144;        // header block size
+public const MAX_HEADER_LINE = 65536;          // one unfolded header (longer ones are cut)
+public const MAX_PART_SIZE = 33554432;         // one decoded part
+
+// defects (bits of Part.defects)
+public const D_NO_BOUNDARY = 1;                // a multipart without a usable boundary parameter
+public const D_NO_END_BOUNDARY = 2;            // the closing boundary line is missing
+public const D_TOO_DEEP = 4;                   // nesting over maxDepth: the part is kept as a plain body
+public const D_TOO_MANY_PARTS = 8;             // more parts than maxParts: the rest was ignored
+public const D_BAD_ENCODING = 16;              // base64 / quoted-printable that could not be decoded cleanly, or an unknown transfer encoding
+public const D_BAD_CHARSET = 32;               // an unknown character set (the body is kept as it is) or bytes that are not valid in it
+public const D_BAD_HEADER = 64;                // a header line without a colon, a header block that was too long
+public const D_TOO_BIG = 128;                  // the decoded body is over maxPartSize (it was cut)
+public const D_CHARSET_GUESSED = 256;          // no charset and 8-bit bytes: taken as UTF-8 when valid, else ISO-8859-1
+public const D_BAD_BOUNDARY = 512;             // an invalid boundary parameter (too long, bad characters)
+
+private char lastErr[160];
+
+private void setErr(char* s) {
+    int n = strlen(s);
+    if (n > 150) n = 150;
+    memcpy(&lastErr[0], s, n);
+    lastErr[n] = 0;
+}
+
+// why the last parse / build call that returned null failed
+public char* error() { return &lastErr[0]; }
+
+// ---- a growing buffer ----------------------------------------------------------------------------------------------------------
+public class Buf {
+    public char* d;
+    public int len;
+    public int cap;
+    public int max;                 // 0: no limit; else an add that would pass it fails (failed is set)
+    public bool failed;
+
+    public bool grow(int need) {
+        if (need < 0) { failed = true; return false; }
+        if (max > 0 && need > max) { failed = true; return false; }
+        if (d != null && need + 1 <= cap) return true;
+        int nc = cap < 64 ? 64 : cap;
+        while (nc < need + 1) {
+            nc = nc * 2;
+            if (nc <= 0) { failed = true; return false; }
+        }
+        char* nd = malloc(nc);
+        if (nd == null) { failed = true; return false; }
+        if (d != null) {
+            memcpy(nd, d, len);
+            free(d);
+        }
+        d = nd;
+        cap = nc;
+        return true;
+    }
+
+    public bool add(char* s, int n) {
+        if (n < 0 || failed) return false;
+        if (!grow(len + n)) return false;
+        if (n > 0) memcpy(&d[len], s, n);
+        len = len + n;
+        return true;
+    }
+
+    public bool addByte(int c) {
+        if (failed) return false;
+        if (!grow(len + 1)) return false;
+        d[len] = c;
+        len++;
+        return true;
+    }
+
+    public bool addText(char* s) { return add(s, strlen(s)); }
+
+    // n copies of byte c
+    public bool addRepeat(int c, int n) {
+        for (int i = 0; i < n; i++) {
+            if (!addByte(c)) return false;
+        }
+        return true;
+    }
+
+    // the text with a 0 byte behind it (never null; valid until the next add)
+    public char* text() {
+        if (!grow(len)) return "";
+        d[len] = 0;
+        return d;
+    }
+
+    // hands the memory over: a heap string (NUL terminated) that the caller frees; the buffer is empty afterwards
+    public char* take() {
+        if (!grow(len)) return null;
+        d[len] = 0;
+        char* r = d;
+        d = null;
+        cap = 0;
+        len = 0;
+        return r;
+    }
+
+    public void clear() { len = 0; failed = false; }
+
+    public void release() {
+        if (d != null) free(d);
+        d = null;
+        cap = 0;
+        len = 0;
+        failed = false;
+    }
+}
+
+public Buf* newBuf(int max = 0) {
+    Buf* b = (Buf*) malloc(sizeof(Buf));
+    if (b != null) b->max = max;
+    return b;
+}
+
+public void freeBuf(Buf* b) {
+    if (b == null) return;
+    b->release();
+    free((char*) b);
+}
+
+// ---- small helpers --------------------------------------------------------------------------------------------------------------
+private int lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+// case insensitive comparison of n bytes of s with the 0 terminated text t (t must have exactly n characters)
+public bool eqNoCase(char* s, int n, char* t) {
+    int i = 0;
+    while (i < n) {
+        if (t[i] == 0) return false;
+        if (lower(s[i]) != lower(t[i])) return false;
+        i++;
+    }
+    return t[i] == 0;
+}
+
+// a heap copy of n bytes of s (NUL terminated); null when out of memory
+public char* copyN(char* s, int n) {
+    if (n < 0) n = 0;
+    char* r = malloc(n + 1);
+    if (r == null) return null;
+    if (n > 0) memcpy(r, s, n);
+    return r;
+}
+
+public char* copyText(char* s) { return s == null ? null : copyN(s, strlen(s)); }
+
+// a copy of n bytes in lower case
+private char* copyLower(char* s, int n) {
+    char* r = copyN(s, n);
+    if (r != null) {
+        for (int i = 0; i < n; i++) r[i] = lower(r[i]);
+    }
+    return r;
+}
+
+private bool isWsp(int c) { return c == ' ' || c == '\t'; }
+
+// RFC 5322 atext: letters, digits and ! # $ % & ' * + - / = ? ^ _ ` { | } ~
+public bool isAtext(int c) {
+    if (c >= 'a' && c <= 'z') return true;
+    if (c >= 'A' && c <= 'Z') return true;
+    if (c >= '0' && c <= '9') return true;
+    return c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' || c == '+' || c == '-' || c == '/' || c == '=' || c == '?'
+        || c == '^' || c == '_' || c == '`' || c == '{' || c == '|' || c == '}' || c == '~';
+}
+
+// a MIME token character (RFC 2045): printable ASCII except space and the specials ( ) < > @ , ; : \ " / [ ] ? =
+public bool isTokenChar(int c) {
+    if (c <= 32 || c >= 127) return false;
+    return c != '(' && c != ')' && c != '<' && c != '>' && c != '@' && c != ',' && c != ';' && c != ':' && c != '\\' && c != '"' && c != '/' && c != '[' && c != ']' && c != '?' && c != '=';
+}
+
+private int hexv(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+private int hexUpper(int v) { return v < 10 ? '0' + v : 'A' + v - 10; }
+
+// true when the n bytes are 7-bit ASCII without NUL
+public bool isAscii(char* s, int n) {
+    for (int i = 0; i < n; i++) {
+        if (s[i] >= 128 || s[i] == 0) return false;
+    }
+    return true;
+}
+
+// ---- base64 -----------------------------------------------------------------------------------------------------------------------
+private int b64c(int v) {
+    if (v < 26) return 'A' + v;
+    if (v < 52) return 'a' + v - 26;
+    if (v < 62) return '0' + v - 52;
+    return v == 62 ? '+' : '/';
+}
+
+private int b64v(int c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+// Appends the base64 text of n bytes. wrap: lines of 76 characters, each ended by CRLF (the body form, also for the last line); else one unbroken text.
+public bool base64Encode(char* data, int n, Buf* out, bool wrap) {
+    int col = 0;
+    for (int i = 0; i < n; i = i + 3) {
+        int b0 = data[i] & 255;
+        int b1 = i + 1 < n ? data[i + 1] & 255 : 0;
+        int b2 = i + 2 < n ? data[i + 2] & 255 : 0;
+        if (!out->addByte(b64c(b0 >> 2))) return false;
+        if (!out->addByte(b64c(((b0 & 3) << 4) | (b1 >> 4)))) return false;
+        if (!out->addByte(i + 1 < n ? b64c(((b1 & 15) << 2) | (b2 >> 6)) : '=')) return false;
+        if (!out->addByte(i + 2 < n ? b64c(b2 & 63) : '=')) return false;
+        col = col + 4;
+        if (wrap && col >= 76) {
+            if (!out->add("\r\n", 2)) return false;
+            col = 0;
+        }
+    }
+    if (wrap && col > 0) return out->add("\r\n", 2);
+    return !out->failed;
+}
+
+// Decodes base64 text into out. White space is skipped; "=" ends the data. strict: any other character that is not in the alphabet, a lone
+// sextet at the end or anything but "=" and white space after the padding is an error (false). Not strict (message bodies, RFC 2045 6.8): other
+// characters are ignored, a missing padding is fine.
+public bool base64Decode(char* s, int n, Buf* out, bool strict) {
+    int acc = 0;
+    int bits = 0;
+    int i = 0;
+    int sextets = 0;
+    while (i < n) {
+        int c = s[i] & 255;
+        i++;
+        if (c == '=') {
+            while (i < n) {
+                int e = s[i] & 255;
+                if (e != '=' && !isWsp(e) && e != 13 && e != 10 && strict) return false;
+                i++;
+            }
+            break;
+        }
+        int v = b64v(c);
+        if (v < 0) {
+            if (c == ' ' || c == '\t' || c == 13 || c == 10) continue;
+            if (strict) return false;
+            continue;
+        }
+        acc = ((acc << 6) | v) & 0xFFFFFF;
+        bits = bits + 6;
+        sextets++;
+        if (bits >= 8) {
+            bits = bits - 8;
+            if (!out->addByte((acc >> bits) & 255)) return false;
+        }
+    }
+    if (strict && sextets % 4 == 1) return false;
+    return !out->failed;
+}
+
+// ---- quoted-printable -------------------------------------------------------------------------------------------------------------
+// Appends the quoted-printable form of n bytes (RFC 2045 6.7). Text (binary false): CR LF, LF and a lone CR are line ends and come out as CRLF; binary:
+// CR and LF are encoded as =0D and =0A. Lines have at most 76 characters (soft line breaks "="), white space at the end of a line is encoded, the
+// hexadecimal digits are upper case.
+public bool qpEncode(char* data, int n, Buf* out, bool binary) {
+    int col = 0;
+    int i = 0;
+    while (i < n) {
+        int c = data[i] & 255;
+        bool eol = false;
+        int skip = 1;
+        if (!binary && (c == 13 || c == 10)) {
+            eol = true;
+            if (c == 13 && i + 1 < n && data[i + 1] == 10) skip = 2;
+        }
+        if (eol) {
+            if (!out->add("\r\n", 2)) return false;
+            col = 0;
+            i = i + skip;
+            continue;
+        }
+        // is a line end (or the end of the data) next after this byte?
+        int nx = i + 1;
+        bool lastOfLine = nx >= n || (!binary && (data[nx] == 13 || data[nx] == 10));
+        bool plain = (c >= 33 && c <= 126 && c != '=') || ((c == ' ' || c == '\t') && !lastOfLine);
+        int w = plain ? 1 : 3;
+        int limit = lastOfLine ? 76 : 75;
+        if (col + w > limit) {
+            if (!out->add("=\r\n", 3)) return false;
+            col = 0;
+        }
+        if (plain) {
+            if (!out->addByte(c)) return false;
+        } else {
+            if (!out->addByte('=') || !out->addByte(hexUpper(c >> 4)) || !out->addByte(hexUpper(c & 15))) return false;
+        }
+        col = col + w;
+        i++;
+    }
+    return !out->failed;
+}
+
+// Decodes quoted-printable. Body form (header false): soft line breaks are removed, white space before a line end is dropped, a hard line end comes out as CRLF
+// (lf: as LF), "=XX" with two hexadecimal digits is the byte, any other "=" stays as it is (and false is returned: the text was not clean, it is decoded
+// as well as it goes). Header form (RFC 2047 "Q"): "_" is a blank and there are no lines.
+public bool qpDecode(char* s, int n, Buf* out, bool header, bool lf = false) {
+    bool clean = true;
+    int i = 0;
+    int litWs = 0;                      // blanks and tabs that were written as they are since the last other byte: they go when a line ends
+    while (i < n) {
+        int c = s[i] & 255;
+        if (c == '=') {
+            if (i + 2 < n && hexv(s[i + 1] & 255) >= 0 && hexv(s[i + 2] & 255) >= 0) {
+                out->addByte(hexv(s[i + 1] & 255) * 16 + hexv(s[i + 2] & 255));
+                litWs = 0;
+                i = i + 3;
+                continue;
+            }
+            if (!header) {
+                // a soft line break: "=" then optional white space, then the line end (or the end of the data)
+                int k = i + 1;
+                while (k < n && isWsp(s[k] & 255)) k++;
+                if (k >= n) { i = k; litWs = 0; continue; }
+                if (s[k] == 13 && k + 1 < n && s[k + 1] == 10) { i = k + 2; litWs = 0; continue; }
+                if (s[k] == 10) { i = k + 1; litWs = 0; continue; }
+            }
+            clean = false;
+            out->addByte('=');
+            litWs = 0;
+            i++;
+            continue;
+        }
+        if (header) {
+            out->addByte(c == '_' ? ' ' : c);
+            i++;
+            continue;
+        }
+        if (c == 13 || c == 10) {
+            out->len = out->len - litWs;
+            litWs = 0;
+            if (c == 13 && i + 1 < n && s[i + 1] == 10) i++;
+            if (lf) out->addByte(10); else out->add("\r\n", 2);
+            i++;
+            continue;
+        }
+        out->addByte(c);
+        litWs = isWsp(c) ? litWs + 1 : 0;
+        i++;
+    }
+    if (!header) out->len = out->len - litWs;
+    return clean && !out->failed;
+}
+
+// ---- UTF-8 and character sets ----------------------------------------------------------------------------------------------------
+// The length of the valid UTF-8 sequence that starts at s[i] (n bytes in all): 1 to 4, 0 when it is invalid (a stray continuation byte, an overlong form,
+// a surrogate, above U+10FFFF, cut off at the end).
+public int utf8SeqLen(char* s, int i, int n) {
+    int c = s[i] & 255;
+    if (c < 0x80) return 1;
+    if (c < 0xC2) return 0;
+    if (c < 0xE0) {
+        if (i + 1 < n && (s[i + 1] & 0xC0) == 0x80) return 2;
+        return 0;
+    }
+    if (c < 0xF0) {
+        if (i + 2 >= n) return 0;
+        int b1 = s[i + 1] & 255;
+        if ((b1 & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80) return 0;
+        if (c == 0xE0 && b1 < 0xA0) return 0;
+        if (c == 0xED && b1 >= 0xA0) return 0;
+        return 3;
+    }
+    if (c < 0xF5) {
+        if (i + 3 >= n) return 0;
+        int b1 = s[i + 1] & 255;
+        if ((b1 & 0xC0) != 0x80 || (s[i + 2] & 0xC0) != 0x80 || (s[i + 3] & 0xC0) != 0x80) return 0;
+        if (c == 0xF0 && b1 < 0x90) return 0;
+        if (c == 0xF4 && b1 >= 0x90) return 0;
+        return 4;
+    }
+    return 0;
+}
+
+public bool utf8Valid(char* s, int n) {
+    int i = 0;
+    while (i < n) {
+        int k = utf8SeqLen(s, i, n);
+        if (k == 0) return false;
+        i = i + k;
+    }
+    return true;
+}
+
+// appends the UTF-8 form of a code point
+public bool utf8Put(Buf* out, int cp) {
+    if (cp < 0x80) return out->addByte(cp);
+    if (cp < 0x800) return out->addByte(0xC0 | (cp >> 6)) && out->addByte(0x80 | (cp & 63));
+    if (cp < 0x10000) return out->addByte(0xE0 | (cp >> 12)) && out->addByte(0x80 | ((cp >> 6) & 63)) && out->addByte(0x80 | (cp & 63));
+    return out->addByte(0xF0 | (cp >> 18)) && out->addByte(0x80 | ((cp >> 12) & 63)) && out->addByte(0x80 | ((cp >> 6) & 63)) && out->addByte(0x80 | (cp & 63));
+}
+
+// appends the text with every byte that is not valid UTF-8 replaced by U+FFFD; returns how many were replaced
+public int utf8Sanitize(char* s, int n, Buf* out) {
+    int bad = 0;
+    int i = 0;
+    while (i < n) {
+        int k = utf8SeqLen(s, i, n);
+        if (k == 0) {
+            utf8Put(out, 0xFFFD);
+            bad++;
+            i++;
+        } else {
+            out->add(&s[i], k);
+            i = i + k;
+        }
+    }
+    return bad;
+}
+
+public const CS_UNKNOWN = 0;
+public const CS_UTF8 = 1;
+public const CS_ASCII = 2;
+public const CS_LATIN1 = 3;
+public const CS_CP1252 = 4;
+public const CS_LATIN9 = 5;
+
+// the character set named s (n bytes, any letter case, a language tag "*en" is ignored): CS_UTF8 CS_ASCII CS_LATIN1 CS_CP1252 CS_LATIN9, or CS_UNKNOWN
+public int charsetId(char* s, int n) {
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '*') { n = i; break; }
+    }
+    if (eqNoCase(s, n, "utf-8") || eqNoCase(s, n, "utf8")) return CS_UTF8;
+    if (eqNoCase(s, n, "us-ascii") || eqNoCase(s, n, "ascii") || eqNoCase(s, n, "ansi_x3.4-1968") || eqNoCase(s, n, "iso646-us")) return CS_ASCII;
+    if (eqNoCase(s, n, "iso-8859-1") || eqNoCase(s, n, "iso8859-1") || eqNoCase(s, n, "iso_8859-1") || eqNoCase(s, n, "latin1") || eqNoCase(s, n, "latin-1") || eqNoCase(s, n, "l1")) return CS_LATIN1;
+    if (eqNoCase(s, n, "windows-1252") || eqNoCase(s, n, "cp1252") || eqNoCase(s, n, "x-cp1252")) return CS_CP1252;
+    if (eqNoCase(s, n, "iso-8859-15") || eqNoCase(s, n, "iso8859-15") || eqNoCase(s, n, "latin9") || eqNoCase(s, n, "latin-9")) return CS_LATIN9;
+    return CS_UNKNOWN;
+}
+
+// the Unicode code point of byte b (128 to 255) in windows-1252
+private int cp1252(int b) {
+    switch (b) {
+        case 0x80: return 0x20AC;
+        case 0x82: return 0x201A;
+        case 0x83: return 0x0192;
+        case 0x84: return 0x201E;
+        case 0x85: return 0x2026;
+        case 0x86: return 0x2020;
+        case 0x87: return 0x2021;
+        case 0x88: return 0x02C6;
+        case 0x89: return 0x2030;
+        case 0x8A: return 0x0160;
+        case 0x8B: return 0x2039;
+        case 0x8C: return 0x0152;
+        case 0x8E: return 0x017D;
+        case 0x91: return 0x2018;
+        case 0x92: return 0x2019;
+        case 0x93: return 0x201C;
+        case 0x94: return 0x201D;
+        case 0x95: return 0x2022;
+        case 0x96: return 0x2013;
+        case 0x97: return 0x2014;
+        case 0x98: return 0x02DC;
+        case 0x99: return 0x2122;
+        case 0x9A: return 0x0161;
+        case 0x9B: return 0x203A;
+        case 0x9C: return 0x0153;
+        case 0x9E: return 0x017E;
+        case 0x9F: return 0x0178;
+    }
+    return b;
+}
+
+private int latin9(int b) {
+    switch (b) {
+        case 0xA4: return 0x20AC;
+        case 0xA6: return 0x0160;
+        case 0xA8: return 0x0161;
+        case 0xB4: return 0x017D;
+        case 0xB8: return 0x017E;
+        case 0xBC: return 0x0152;
+        case 0xBD: return 0x0153;
+        case 0xBE: return 0x0178;
+    }
+    return b;
+}
+
+// Appends the n bytes in the character set (a CS_ value) as UTF-8. Bytes that do not exist in the set (a byte over 127 in US-ASCII, invalid UTF-8) become U+FFFD.
+// Returns how many were replaced.
+public int toUtf8Id(int cs, char* data, int n, Buf* out) {
+    int bad = 0;
+    if (cs == CS_UTF8) return utf8Sanitize(data, n, out);
+    for (int i = 0; i < n; i++) {
+        int b = data[i] & 255;
+        if (b < 128) { out->addByte(b); continue; }
+        if (cs == CS_ASCII) { utf8Put(out, 0xFFFD); bad++; continue; }
+        if (cs == CS_CP1252) utf8Put(out, cp1252(b));
+        else if (cs == CS_LATIN9) utf8Put(out, latin9(b));
+        else utf8Put(out, b);
+    }
+    return bad;
+}
+
+// the same for a character set that is named: -1 when the name is not known (nothing is appended), else the number of replaced bytes
+public int toUtf8(char* charset, char* data, int n, Buf* out) {
+    int cs = charsetId(charset, strlen(charset));
+    if (cs == CS_UNKNOWN) return -1;
+    return toUtf8Id(cs, data, n, out);
+}
+
+// Appends the UTF-8 text as ISO-8859-1; a character that is not in it becomes "?". Returns how many were replaced.
+public int utf8ToLatin1(char* s, int n, Buf* out) {
+    int bad = 0;
+    int i = 0;
+    while (i < n) {
+        int c = s[i] & 255;
+        int k = utf8SeqLen(s, i, n);
+        if (k <= 1) {
+            if (k == 0 || c >= 128) { out->addByte('?'); bad++; } else out->addByte(c);
+            i++;
+            continue;
+        }
+        int cp = 0;
+        if (k == 2) cp = ((c & 31) << 6) | (s[i + 1] & 63);
+        if (cp < 256 && k == 2) out->addByte(cp); else { out->addByte('?'); bad++; }
+        i = i + k;
+    }
+    return bad;
+}
+
+// ---- RFC 2047: encoded words ------------------------------------------------------------------------------------------------------
+// the encoded word that starts at s[i] ("=?charset?B?text?="): its end (the index behind "?=") and the pieces, or -1
+private int wordAt(char* s, int i, int n, int* csStart, int* csEnd, int* enc, int* tStart, int* tEnd) {
+    if (i + 1 >= n || s[i] != '=' || s[i + 1] != '?') return -1;
+    int j = i + 2;
+    *csStart = j;
+    while (j < n && s[j] != '?' && isTokenChar(s[j] & 255)) j++;
+    if (j >= n || s[j] != '?' || j == *csStart) return -1;
+    *csEnd = j;
+    j++;
+    if (j >= n) return -1;
+    int e = lower(s[j] & 255);
+    if (e != 'b' && e != 'q') return -1;
+    *enc = e;
+    j++;
+    if (j >= n || s[j] != '?') return -1;
+    j++;
+    *tStart = j;
+    while (j < n && s[j] != '?' && (s[j] & 255) > 32 && (s[j] & 255) < 127) j++;
+    if (j + 1 >= n || s[j] != '?' || s[j + 1] != '=') return -1;
+    *tEnd = j;
+    if (j + 2 - i > 1024) return -1;
+    return j + 2;
+}
+
+private void flushRaw(Buf* raw, int cs, Buf* out) {
+    if (raw->len > 0) toUtf8Id(cs, raw->d, raw->len, out);
+    raw->len = 0;
+}
+
+// Appends the text with its RFC 2047 encoded words decoded to UTF-8 (the character sets of toUtf8; a word in another character set, or one that does not decode, is left as it is).
+// White space between two encoded words is dropped, as the RFC says; a multi-byte character that was split between two words with the same character set is joined.
+// Returns true when at least one word was decoded.
+public bool decodeWords(char* s, int n, Buf* out) {
+    Buf raw;
+    Buf ws;
+    int rawCs = 0;
+    bool active = false;
+    bool any = false;
+    int i = 0;
+    while (i < n) {
+        int c = s[i] & 255;
+        if (c == '=' && i + 1 < n && s[i + 1] == '?' && (i == 0 || isWsp(s[i - 1] & 255) || s[i - 1] == 13 || s[i - 1] == 10 || s[i - 1] == '(' || s[i - 1] == '"')) {
+            int a; int b; int e; int ts; int te;
+            int end = wordAt(s, i, n, &a, &b, &e, &ts, &te);
+            if (end > 0 && (end >= n || !(isAlpha(s[end] & 255) || isDigit(s[end] & 255)))) {
+                int cs = charsetId(&s[a], b - a);
+                Buf dec;
+                bool ok = cs != CS_UNKNOWN;
+                if (ok) {
+                    if (e == 'b') ok = base64Decode(&s[ts], te - ts, &dec, true);
+                    else ok = qpDecode(&s[ts], te - ts, &dec, true);
+                }
+                if (ok) {
+                    if (active && cs != rawCs) flushRaw(&raw, rawCs, out);
+                    if (!active) { out->add(ws.d == null ? "" : ws.d, ws.len); }
+                    ws.len = 0;
+                    rawCs = cs;
+                    active = true;
+                    raw.add(dec.d == null ? "" : dec.d, dec.len);
+                    dec.release();
+                    any = true;
+                    i = end;
+                    continue;
+                }
+                dec.release();
+            }
+        }
+        if (isWsp(c) || c == 13 || c == 10) {
+            if (active) ws.addByte(c); else out->addByte(c);
+            i++;
+            continue;
+        }
+        if (active) {
+            flushRaw(&raw, rawCs, out);
+            out->add(ws.d == null ? "" : ws.d, ws.len);
+            ws.len = 0;
+            active = false;
+        }
+        out->addByte(c);
+        i++;
+    }
+    if (active) {
+        flushRaw(&raw, rawCs, out);
+        out->add(ws.d == null ? "" : ws.d, ws.len);
+    }
+    raw.release();
+    ws.release();
+    return any;
+}
+
+// a heap string with the text decoded (see decodeWords); unfolded: CR LF inside the text becomes nothing and the blank behind it stays
+public char* decodeText(char* s) {
+    Buf out;
+    int n = strlen(s);
+    char* tmp = malloc(n + 1);
+    if (tmp == null) return null;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == 13 || s[i] == 10) continue;
+        tmp[k] = s[i];
+        k++;
+    }
+    decodeWords(tmp, k, &out);
+    free(tmp);
+    return out.take() ?? copyN("", 0);
+}
+
+private bool qLiteral(int c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '!' || c == '*' || c == '+' || c == '-' || c == '/';
+}
+
+// the length of one word's text in Q encoding for the bytes s[a..b)
+private int qLen(char* s, int a, int b) {
+    int n = 0;
+    for (int i = a; i < b; i++) {
+        int c = s[i] & 255;
+        n = n + ((qLiteral(c) || c == ' ') ? 1 : 3);
+    }
+    return n;
+}
+
+// Appends a text so that it is safe in a header: ASCII text stays as it is; text with other characters, with control characters or with something that looks
+// like an encoded word becomes RFC 2047 encoded words in UTF-8 ("B" or "Q", whichever is shorter), each at most 75 characters long and cut only between
+// characters, separated by blanks (the folding of the header may break the line there). The words that need no encoding at the start and the end stay as they are
+// (whole: the whole text is encoded when anything needs it: for the display name of an address, where a word like "Dr." is not allowed).
+public bool encodeWords(char* s, int n, Buf* out, bool whole = false) {
+    // find the range of words that must be encoded
+    int first = -1;
+    int last = -1;
+    int i = 0;
+    while (i < n) {
+        while (i < n && s[i] == ' ') i++;
+        int j = i;
+        bool need = false;
+        while (j < n && s[j] != ' ') {
+            int c = s[j] & 255;
+            if (c >= 127 || (c < 32 && c != '\t')) need = true;
+            if (c == '=' && j + 1 < n && s[j + 1] == '?') need = true;
+            j++;
+        }
+        if (j > i && need) {
+            if (first < 0) first = i;
+            last = j;
+        }
+        i = j;
+    }
+    if (first < 0) return out->add(s, n);
+    if (whole) { first = 0; last = n; }
+    if (!out->add(s, first)) return false;
+    // the unit [first, last)
+    int total = last - first;
+    int qn = qLen(s, first, last);
+    int bn = (total + 2) / 3 * 4;
+    bool useQ = qn <= bn;
+    int a = first;
+    bool firstWord = true;
+    while (a < last) {
+        int b = a;
+        if (useQ) {
+            int size = 0;
+            while (b < last) {
+                int k = utf8SeqLen(s, b, last);
+                if (k == 0) k = 1;
+                int w = qLen(s, b, b + k);
+                if (size + w > 63) break;
+                size = size + w;
+                b = b + k;
+            }
+        } else {
+            int cnt = 0;
+            while (b < last) {
+                int k = utf8SeqLen(s, b, last);
+                if (k == 0) k = 1;
+                if (cnt + k > 45) break;
+                cnt = cnt + k;
+                b = b + k;
+            }
+        }
+        if (b == a) b = a + 1;
+        if (!firstWord) out->addByte(' ');
+        firstWord = false;
+        out->addText(useQ ? "=?UTF-8?Q?" : "=?UTF-8?B?");
+        if (useQ) {
+            for (int k = a; k < b; k++) {
+                int c = s[k] & 255;
+                if (c == ' ') out->addByte('_');
+                else if (qLiteral(c)) out->addByte(c);
+                else { out->addByte('='); out->addByte(hexUpper(c >> 4)); out->addByte(hexUpper(c & 15)); }
+            }
+        } else {
+            base64Encode(&s[a], b - a, out, false);
+        }
+        out->add("?=", 2);
+        a = b;
+    }
+    return out->add(&s[last], n - last);
+}
+
+// ---- header lines -------------------------------------------------------------------------------------------------------------------
+// a header field name: 1 to 76 printable ASCII characters without a colon
+public bool validHeaderName(char* name) {
+    if (name == null) return false;
+    int n = strlen(name);
+    if (n == 0 || n > 76) return false;
+    for (int i = 0; i < n; i++) {
+        int c = name[i] & 255;
+        if (c <= 32 || c >= 127 || c == ':') return false;
+    }
+    return true;
+}
+
+// a header value that can be written: no CR, LF or NUL (that would end the header: header injection)
+public bool validHeaderValue(char* value) {
+    if (value == null) return false;
+    for (int i = 0; value[i] != 0; i++) {
+        if (value[i] == 13 || value[i] == 10) return false;
+    }
+    return true;
+}
+
+// Appends "Name: value" folded for transport and the CRLF behind it. Lines are broken at blanks so that they have 78 characters at most when possible (a word that is
+// longer stays whole; one over 900 bytes is cut into pieces of 900: no line ever passes the 998 of RFC 5322). The blanks that were there stay (a fold only adds CRLF before one).
+// A value with CR or LF is refused (false, nothing written).
+public bool foldHeader(Buf* out, char* name, char* value, int n) {
+    if (!validHeaderName(name)) return false;
+    for (int i = 0; i < n; i++) {
+        if (value[i] == 13 || value[i] == 10 || value[i] == 0) return false;
+    }
+    int col = strlen(name) + 1;
+    out->addText(name);
+    out->addByte(':');
+    int i = 0;
+    bool firstUnit = true;
+    while (i < n) {
+        int ws = i;
+        while (i < n && isWsp(value[i] & 255)) i++;
+        int wl = i - ws;
+        int w = i;
+        while (i < n && !isWsp(value[i] & 255)) i++;
+        int L = i - w;
+        if (L == 0) break;
+        if (firstUnit) { ws = -1; wl = 1; }
+        // the word is longer than a line can be: cut it
+        int pos = w;
+        int left = L;
+        bool firstPiece = true;
+        while (left > 0) {
+            int take = left > 900 ? 900 : left;
+            int lead = firstPiece ? wl : 1;
+            if (col + lead + take > 78 && col > (firstUnit ? 0 : 1)) {
+                out->add("\r\n", 2);
+                col = 0;
+                if (firstPiece && ws >= 0) { out->add(&value[ws], wl); col = wl; } else { out->addByte(' '); col = 1; }
+            } else {
+                if (firstPiece && ws >= 0) { out->add(&value[ws], wl); col = col + wl; } else { out->addByte(' '); col = col + 1; }
+            }
+            out->add(&value[pos], take);
+            col = col + take;
+            pos = pos + take;
+            left = left - take;
+            firstPiece = false;
+        }
+        firstUnit = false;
+    }
+    return out->add("\r\n", 2);
+}
+
+// ---- a list of header fields --------------------------------------------------------------------------------------------------------
+public class Header {
+    public char* name;
+    public char* value;             // unfolded, without the blanks at both ends (RFC 2047 words are not decoded)
+}
+
+public class Headers {
+    public Header** items;
+    public int count;
+    public int cap;
+
+    // adds a field without checking it (the parser uses this); false when out of memory
+    public bool addRaw(char* name, int nl, char* value, int vl) {
+        if (count >= cap) {
+            int nc = cap == 0 ? 16 : cap * 2;
+            Header** ni = (Header**) malloc(nc * 8);
+            if (ni == null) return false;
+            for (int i = 0; i < count; i++) ni[i] = items[i];
+            if (items != null) free((char*) items);
+            items = ni;
+            cap = nc;
+        }
+        Header* h = (Header*) malloc(sizeof(Header));
+        if (h == null) return false;
+        h->name = copyN(name, nl);
+        h->value = copyN(value, vl);
+        if (h->name == null || h->value == null) {
+            if (h->name != null) free(h->name);
+            if (h->value != null) free(h->value);
+            free((char*) h);
+            return false;
+        }
+        items[count] = h;
+        count++;
+        return true;
+    }
+
+    // adds a field; false when the name is not valid or the value has CR, LF or NUL (nothing is added)
+    public bool add(char* name, char* value) {
+        if (!validHeaderName(name) || !validHeaderValue(value)) return false;
+        return addRaw(name, strlen(name), value, strlen(value));
+    }
+
+    // the index of the first field with this name (any letter case) from index `from` on, or -1
+    public int indexOf(char* name, int from = 0) {
+        int nl = strlen(name);
+        for (int i = from; i < count; i++) {
+            if (eqNoCase(items[i]->name, strlen(items[i]->name), name) && strlen(items[i]->name) == nl) return i;
+        }
+        return -1;
+    }
+
+    // the value of the first field with this name, or null (a pointer into the list: valid until the field is changed)
+    public char* get(char* name) {
+        int i = indexOf(name, 0);
+        return i < 0 ? null : items[i]->value;
+    }
+
+    public int countOf(char* name) {
+        int n = 0;
+        int i = indexOf(name, 0);
+        while (i >= 0) { n++; i = indexOf(name, i + 1); }
+        return n;
+    }
+
+    // removes every field with this name; returns how many
+    public int remove(char* name) {
+        int removed = 0;
+        int i = 0;
+        while (i < count) {
+            if (eqNoCase(items[i]->name, strlen(items[i]->name), name)) {
+                free(items[i]->name);
+                free(items[i]->value);
+                free((char*) items[i]);
+                for (int k = i; k + 1 < count; k++) items[k] = items[k + 1];
+                count--;
+                removed++;
+            } else {
+                i++;
+            }
+        }
+        return removed;
+    }
+
+    // replaces the value of the first field with this name and removes the others; adds it when there is none. false when the name or value is not valid
+    public bool set(char* name, char* value) {
+        if (!validHeaderName(name) || !validHeaderValue(value)) return false;
+        remove(name);
+        return add(name, value);
+    }
+
+    public void dispose() {
+        for (int i = 0; i < count; i++) {
+            free(items[i]->name);
+            free(items[i]->value);
+            free((char*) items[i]);
+        }
+        if (items != null) free((char*) items);
+        items = null;
+        count = 0;
+        cap = 0;
+    }
+}
+
+// Reads the header block at the start of s (n bytes): lines up to the first empty line (CRLF, or a bare LF as many programs write it). Continuation lines (they start with a blank
+// or tab) are joined to the line before. A first line "From " of an mbox file is skipped; a line without a colon ends the header (a missing blank line) and sets D_BAD_HEADER.
+// At most maxHeaders fields and maxBytes bytes (more: the rest of the block is skipped, D_TOO_MANY or D_BAD_HEADER); one value is cut at maxLine bytes. *consumed is the offset
+// of the body. Returns the defect bits.
+public int parseHeaders(char* s, int n, Headers* h, int* consumed, int maxHeaders, int maxBytes, int maxLine) {
+    int defects = 0;
+    int i = 0;
+    if (n >= 5 && memcmp(s, "From ", 5) == 0) {
+        while (i < n && s[i] != 10) i++;
+        if (i < n) i++;
+    }
+    int limit = n < maxBytes ? n : maxBytes;
+    Buf val;
+    char* name = null;
+    int nl = 0;
+    int stop = -1;
+    while (i < n) {
+        // one physical line [i, e)
+        int e = i;
+        while (e < n && s[e] != 10) e++;
+        int le = e;
+        if (le > i && s[le - 1] == 13) le--;
+        if (le == i) {                                  // the empty line: the body starts behind it
+            i = e < n ? e + 1 : e;
+            stop = i;
+            break;
+        }
+        if (i >= limit) {                               // the block is longer than we read: skip to its empty line
+            defects = defects | D_BAD_HEADER;
+            while (i < n) {
+                int e2 = i;
+                while (e2 < n && s[e2] != 10) e2++;
+                int l2 = e2;
+                if (l2 > i && s[l2 - 1] == 13) l2--;
+                bool emptyLine = l2 == i;
+                i = e2 < n ? e2 + 1 : e2;
+                if (emptyLine) break;
+            }
+            stop = i;
+            break;
+        }
+        if (isWsp(s[i] & 255)) {
+            // a continuation of the field before
+            if (name != null && val.len < maxLine) {
+                int room = maxLine - val.len;
+                int take = le - i;
+                if (take > room) take = room;
+                val.add(&s[i], take);
+            }
+            i = e < n ? e + 1 : e;
+            continue;
+        }
+        // a new field: finish the one before
+        if (name != null) {
+            if (h->count < maxHeaders) {
+                int a = 0;
+                while (a < val.len && isWsp(val.d[a] & 255)) a++;
+                int b = val.len;
+                while (b > a && isWsp(val.d[b - 1] & 255)) b--;
+                h->addRaw(name, nl, val.d == null ? "" : &val.d[a], b - a);
+            } else {
+                defects = defects | D_BAD_HEADER;
+            }
+            free(name);
+            name = null;
+            val.len = 0;
+        }
+        int colon = i;
+        while (colon < le && s[colon] != ':') colon++;
+        bool ok = colon < le && colon > i;
+        for (int k = i; ok && k < colon; k++) {
+            int c = s[k] & 255;
+            if (c <= 32 || c >= 127) ok = false;
+        }
+        if (!ok) {
+            defects = defects | D_BAD_HEADER;
+            stop = i;
+            break;
+        }
+        nl = colon - i;
+        name = copyN(&s[i], nl);
+        int vstart = colon + 1;
+        int take = le - vstart;
+        if (take > maxLine) take = maxLine;
+        val.len = 0;
+        val.add(&s[vstart], take);
+        i = e < n ? e + 1 : e;
+    }
+    if (name != null) {
+        if (h->count < maxHeaders) {
+            int a = 0;
+            while (a < val.len && isWsp(val.d[a] & 255)) a++;
+            int b = val.len;
+            while (b > a && isWsp(val.d[b - 1] & 255)) b--;
+            h->addRaw(name, nl, val.d == null ? "" : &val.d[a], b - a);
+        } else {
+            defects = defects | D_BAD_HEADER;
+        }
+        free(name);
+    }
+    val.release();
+    *consumed = stop >= 0 ? stop : n;
+    return defects;
+}
+
+// ---- addresses ----------------------------------------------------------------------------------------------------------------------
+public class Address {
+    public char* name;              // the display name in UTF-8 ("" when there is none)
+    public char* addr;              // local@domain exactly as it goes into the envelope (a quoted local part keeps its quotes)
+    public char* group;             // the group the address was listed in ("Team: a@x, b@y;"), else null
+}
+
+public class AddressList {
+    public Address** items;
+    public int count;
+    public int cap;
+    public bool bad;                // set by Part.addresses: a field of the header could not be read (the addresses of the other fields are in the list)
+    public bool heap;               // made by newAddressList(): dispose() frees the object too
+
+    public bool add(char* name, int nl, char* addr, int al, char* group = null, int gl = 0) {
+        if (count >= cap) {
+            int nc = cap == 0 ? 4 : cap * 2;
+            Address** ni = (Address**) malloc(nc * 8);
+            if (ni == null) return false;
+            for (int i = 0; i < count; i++) ni[i] = items[i];
+            if (items != null) free((char*) items);
+            items = ni;
+            cap = nc;
+        }
+        Address* a = (Address*) malloc(sizeof(Address));
+        if (a == null) return false;
+        a->name = copyN(name, nl);
+        a->addr = copyN(addr, al);
+        a->group = group == null ? null : copyN(group, gl);
+        items[count] = a;
+        count++;
+        return true;
+    }
+
+    public Address* get(int i) { return (i >= 0 && i < count) ? items[i] : null; }
+
+    public void dispose() {
+        for (int i = 0; i < count; i++) {
+            free(items[i]->name);
+            free(items[i]->addr);
+            if (items[i]->group != null) free(items[i]->group);
+            free((char*) items[i]);
+        }
+        if (items != null) free((char*) items);
+        items = null;
+        count = 0;
+        cap = 0;
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
+    }
+}
+
+// a new empty list that dispose() frees completely (a list that you declare yourself is freed by dispose() too, but its object is yours)
+public AddressList* newAddressList() {
+    AddressList* l = (AddressList*) malloc(sizeof(AddressList));
+    if (l != null) l->heap = true;
+    return l;
+}
+
+// the domain part of an address: dot separated labels (letters, digits, "-" and "_" inside; 63 characters at most each, 253 in all) or a literal in brackets
+private bool validDomain(char* s, int n) {
+    if (n < 1 || n > 253) return false;
+    if (s[0] == '[') {
+        if (s[n - 1] != ']' || n < 3) return false;
+        for (int i = 1; i < n - 1; i++) {
+            int c = s[i] & 255;
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '.' || c == ':')) return false;
+        }
+        return true;
+    }
+    int lab = 0;
+    for (int i = 0; i < n; i++) {
+        int c = s[i] & 255;
+        if (c == '.') {
+            if (lab == 0 || s[i - 1] == '-') return false;
+            lab = 0;
+            continue;
+        }
+        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-' || c == '_';
+        if (!ok) return false;
+        if (lab == 0 && c == '-') return false;
+        lab++;
+        if (lab > 63) return false;
+    }
+    return lab > 0 && s[n - 1] != '-';
+}
+
+// an address in the form local@domain: the local part is a dot-atom (no empty parts) or a quoted string, the whole at most 254 bytes, no 8-bit characters (SMTPUTF8
+// is not supported), no blanks or control characters
+public bool validAddress(char* s, int n) {
+    if (n < 3 || n > 254) return false;
+    int at = -1;
+    if (s[0] == '"') {
+        int i = 1;
+        while (i < n && s[i] != '"') {
+            int c = s[i] & 255;
+            if (c == '\\') { i++; if (i >= n) return false; c = s[i] & 255; }
+            if (c < 32 || c >= 127) return false;
+            i++;
+        }
+        if (i >= n - 1 || s[i + 1] != '@') return false;
+        at = i + 1;
+        if (at - 0 > 66) return false;
+    } else {
+        int i = 0;
+        while (i < n && s[i] != '@') {
+            int c = s[i] & 255;
+            if (!isAtext(c) && c != '.') return false;
+            i++;
+        }
+        if (i == 0 || i >= n - 1) return false;
+        if (s[0] == '.' || s[i - 1] == '.') return false;
+        for (int k = 0; k + 1 < i; k++) {
+            if (s[k] == '.' && s[k + 1] == '.') return false;
+        }
+        at = i;
+        if (at > 64) return false;
+    }
+    return validDomain(&s[at + 1], n - at - 1);
+}
+
+// skips a comment that starts at s[i] == '(' (they nest, "\" quotes); returns the index behind it, or -1 when it is not closed
+private int skipComment(char* s, int i, int n) {
+    int depth = 0;
+    while (i < n) {
+        int c = s[i];
+        if (c == '\\' && i + 1 < n) { i = i + 2; continue; }
+        if (c == '(') depth++;
+        if (c == ')') { depth--; if (depth == 0) return i + 1; }
+        i++;
+    }
+    return -1;
+}
+
+// the display name in s[a..b): comments are removed, quoted strings unquoted, blanks collapsed, encoded words decoded
+private char* cleanPhrase(char* s, int a, int b) {
+    Buf t;
+    int i = a;
+    bool space = false;
+    while (i < b) {
+        int c = s[i] & 255;
+        if (c == '(') {
+            int e = skipComment(s, i, b);
+            if (e < 0) break;
+            i = e;
+            space = t.len > 0;
+            continue;
+        }
+        if (c == '"') {
+            if (space) t.addByte(' ');
+            space = false;
+            i++;
+            while (i < b && s[i] != '"') {
+                if (s[i] == '\\' && i + 1 < b) i++;
+                t.addByte(s[i]);
+                i++;
+            }
+            i++;
+            continue;
+        }
+        if (isWsp(c) || c == 13 || c == 10) { space = t.len > 0; i++; continue; }
+        if (space) { t.addByte(' '); space = false; }
+        t.addByte(c);
+        i++;
+    }
+    Buf d;
+    decodeWords(t.d == null ? "" : t.d, t.len, &d);
+    t.release();
+    char* r = d.take();
+    return r == null ? copyN("", 0) : r;
+}
+
+// the text of an addr-spec in s[a..b) without comments and blanks around the parts; a quoted local part stays quoted. Returns the length written into out, or -1
+private int cleanAddrSpec(char* s, int a, int b, char* out, int max) {
+    int k = 0;
+    int i = a;
+    bool inq = false;
+    bool pendingSpace = false;
+    while (i < b) {
+        int c = s[i] & 255;
+        if (!inq && c == '(') {
+            int e = skipComment(s, i, b);
+            if (e < 0) return -1;
+            i = e;
+            continue;
+        }
+        if (!inq && (isWsp(c) || c == 13 || c == 10)) {
+            if (k > 0) pendingSpace = true;               // blanks at the ends are fine, blanks between the parts of an address are not
+            i++;
+            continue;
+        }
+        if (pendingSpace) return -1;
+        if (c == '"') inq = !inq;
+        if (c == '\\' && inq && i + 1 < b) {
+            if (k + 2 >= max) return -1;
+            out[k] = c; k++; i++; c = s[i] & 255;
+        }
+        if (k + 1 >= max) return -1;
+        out[k] = c;
+        k++;
+        i++;
+    }
+    out[k] = 0;
+    return k;
+}
+
+// the first comment in s[a..b) (its text without the parentheses) as a heap string, or null
+private char* firstComment(char* s, int a, int b) {
+    int i = a;
+    bool inq = false;
+    while (i < b) {
+        if (s[i] == '"') inq = !inq;
+        if (!inq && s[i] == '(') {
+            int e = skipComment(s, i, b);
+            if (e < 0) return null;
+            return cleanPhrase(s, i + 1, e - 1);
+        }
+        if (inq && s[i] == '\\') i++;
+        i++;
+    }
+    return null;
+}
+
+// one mailbox in s[a..b): "Name <addr>", "<addr>", "addr" or "addr (Name)". false when it is not valid.
+private bool parseMailbox(char* s, int a, int b, AddressList* out, char* group, int gl) {
+    char addr[260];
+    // the angle brackets (outside quotes and comments)
+    int lt = -1;
+    int gt = -1;
+    int i = a;
+    bool inq = false;
+    while (i < b) {
+        int c = s[i];
+        if (inq) {
+            if (c == '\\') i++;
+            else if (c == '"') inq = false;
+        } else if (c == '"') {
+            inq = true;
+        } else if (c == '(') {
+            int e = skipComment(s, i, b);
+            if (e < 0) return false;
+            i = e - 1;
+        } else if (c == '<') {
+            if (lt >= 0) return false;
+            lt = i;
+        } else if (c == '>') {
+            if (lt < 0 || gt >= 0) return false;
+            gt = i;
+        }
+        i++;
+    }
+    if (inq) return false;
+    if (lt >= 0) {
+        if (gt < 0) return false;
+        // only blanks and comments may follow the ">"
+        int j = gt + 1;
+        while (j < b) {
+            if (isWsp(s[j] & 255) || s[j] == 13 || s[j] == 10) { j++; continue; }
+            if (s[j] == '(') { int e = skipComment(s, j, b); if (e < 0) return false; j = e; continue; }
+            return false;
+        }
+        int ia = lt + 1;
+        // an obsolete route "@a.example,@b.example:" in front of the address is dropped
+        int k = ia;
+        while (k < gt && isWsp(s[k] & 255)) k++;
+        if (k < gt && s[k] == '@') {
+            int colon = k;
+            while (colon < gt && s[colon] != ':') colon++;
+            if (colon < gt) ia = colon + 1;
+        }
+        int n = cleanAddrSpec(s, ia, gt, &addr[0], 260);
+        if (n < 0 || !validAddress(&addr[0], n)) return false;
+        char* name = cleanPhrase(s, a, lt);
+        bool ok = out->add(name, strlen(name), &addr[0], n, group, gl);
+        free(name);
+        return ok;
+    }
+    int n = cleanAddrSpec(s, a, b, &addr[0], 260);
+    if (n < 0 || !validAddress(&addr[0], n)) return false;
+    char* name = firstComment(s, a, b);
+    bool ok = out->add(name == null ? "" : name, name == null ? 0 : strlen(name), &addr[0], n, group, gl);
+    if (name != null) free(name);
+    return ok;
+}
+
+// Reads a list of mailboxes and groups (the form of the To, Cc, From ... fields, RFC 5322 3.4): "Ann <ann@example.org>, bob@example.org (Bob), Team: c@x, d@y;".
+// Display names are decoded (comments removed, quoted strings unquoted, RFC 2047 words turned to UTF-8); groups are flattened (Address.group tells the group); empty
+// elements (",,") are skipped. Returns the number of addresses, or -1 when something is not valid (error() says what; out holds what was read before) or when there
+// are more than maxCount of them.
+public int parseAddressList(char* s, int n, AddressList* out, int maxCount = 1000) {
+    int start = 0;
+    int i = 0;
+    bool inq = false;
+    int depth = 0;
+    bool ang = false;
+    char* group = null;
+    int gl = 0;
+    int base = out->count;
+    while (i <= n) {
+        int c = i < n ? s[i] & 255 : -1;
+        if (inq) {
+            if (c == '\\') i++;
+            else if (c == '"') inq = false;
+            else if (c < 0) { setErr("an unterminated quoted string in an address"); return -1; }
+            i++;
+            continue;
+        }
+        if (depth > 0) {
+            if (c == '\\') i++;
+            else if (c == '(') depth++;
+            else if (c == ')') depth--;
+            else if (c < 0) { setErr("an unterminated comment in an address"); return -1; }
+            i++;
+            continue;
+        }
+        if (c == '"') { inq = true; i++; continue; }
+        if (c == '(') { depth = 1; i++; continue; }
+        if (c == '<') ang = true;
+        if (c == '>') ang = false;
+        if (c < 0 || (!ang && (c == ',' || c == ';' || c == ':'))) {
+            int a = start;
+            int b = i;
+            while (a < b && (isWsp(s[a] & 255) || s[a] == 13 || s[a] == 10)) a++;
+            while (b > a && (isWsp(s[b - 1] & 255) || s[b - 1] == 13 || s[b - 1] == 10)) b--;
+            if (c == ':') {
+                if (group != null) { free(group); setErr("a group inside a group"); return -1; }
+                char* g = cleanPhrase(s, a, b);
+                group = g;
+                gl = strlen(g);
+                start = i + 1;
+                i++;
+                continue;
+            }
+            if (b > a) {
+                if (out->count - base >= maxCount) { if (group != null) free(group); setErr("too many addresses"); return -1; }
+                if (!parseMailbox(s, a, b, out, group, gl)) {
+                    if (group != null) free(group);
+                    setErr("not a valid address");
+                    return -1;
+                }
+            }
+            if (c == ';' && group != null) { free(group); group = null; gl = 0; }
+            start = i + 1;
+        }
+        i++;
+    }
+    if (group != null) free(group);
+    return out->count - base;
+}
+
+// Appends one mailbox for a header: "Name <addr>" (the name is quoted when it has special characters, encoded as RFC 2047 words when it is not plain ASCII)
+// or just the address when there is no name. false when the address is not valid or the name has a control character (no header injection through a name).
+public bool formatAddress(Buf* out, char* name, char* addr) {
+    int al = strlen(addr);
+    if (!validAddress(addr, al)) return false;
+    int nl = name == null ? 0 : strlen(name);
+    if (nl == 0) return out->add(addr, al);
+    bool plain = true;
+    bool ascii = true;
+    for (int i = 0; i < nl; i++) {
+        int c = name[i] & 255;
+        if (c == 13 || c == 10 || c == 0) return false;
+        if (c >= 127 || (c < 32 && c != '\t')) ascii = false;
+        if (!(isAtext(c) || c == ' ')) plain = false;
+    }
+    if (!ascii) {
+        // the name is UTF-8: sanitised, then encoded whole
+        Buf clean;
+        utf8Sanitize(name, nl, &clean);
+        bool ok = encodeWords(clean.d, clean.len, out, true);
+        clean.release();
+        if (!ok) return false;
+    } else if (plain) {
+        // an atom text that looks like an encoded word has to be encoded as well
+        bool looks = false;
+        for (int i = 0; i + 1 < nl; i++) { if (name[i] == '=' && name[i + 1] == '?') looks = true; }
+        if (looks) { if (!encodeWords(name, nl, out, true)) return false; } else out->add(name, nl);
+    } else {
+        out->addByte('"');
+        for (int i = 0; i < nl; i++) {
+            int c = name[i] & 255;
+            if (c == '"' || c == '\\') out->addByte('\\');
+            out->addByte(c);
+        }
+        out->addByte('"');
+    }
+    out->add(" <", 2);
+    out->add(addr, al);
+    return out->addByte('>');
+}
+
+// Appends the whole list for a header, separated by ", " (the fold of the header breaks the line at the blanks). false when an address is not valid.
+public bool formatAddressList(Buf* out, AddressList* list) {
+    for (int i = 0; i < list->count; i++) {
+        if (i > 0) out->add(", ", 2);
+        if (!formatAddress(out, list->items[i]->name, list->items[i]->addr)) return false;
+    }
+    return true;
+}
+
+// ---- parameters of Content-Type and Content-Disposition (RFC 2045 5.1, RFC 2231) ----------------------------------------------------
+public class Params {
+    public char* names[24];         // lower case
+    public char* values[24];        // decoded: quotes removed, RFC 2231 continuations joined and converted to UTF-8
+    public int count;
+
+    public char* get(char* name) {
+        for (int i = 0; i < count; i++) {
+            if (streq(names[i], name)) return values[i];
+        }
+        return null;
+    }
+
+    public bool put(char* name, int nl, char* v, int vl) {
+        if (count >= 24) return false;
+        for (int i = 0; i < count; i++) {
+            if (strlen(names[i]) == nl && eqNoCase(name, nl, names[i])) return true;
+        }
+        names[count] = copyLower(name, nl);
+        values[count] = copyN(v, vl);
+        count++;
+        return true;
+    }
+
+    public void dispose() {
+        for (int i = 0; i < count; i++) {
+            free(names[i]);
+            free(values[i]);
+        }
+        count = 0;
+    }
+}
+
+// the bytes of s[a..b) with %XX sequences decoded
+private bool pctDecode(char* s, int a, int b, Buf* out) {
+    int i = a;
+    while (i < b) {
+        if (s[i] == '%' && i + 2 < b && hexv(s[i + 1] & 255) >= 0 && hexv(s[i + 2] & 255) >= 0) {
+            out->addByte(hexv(s[i + 1] & 255) * 16 + hexv(s[i + 2] & 255));
+            i = i + 3;
+        } else {
+            out->addByte(s[i]);
+            i++;
+        }
+    }
+    return !out->failed;
+}
+
+// the names s[a1..a1+l1) and s[a2..a2+l2) (up to their first "*") are the same parameter
+private bool sameBase(char* s, int a1, int l1, int a2, int l2) {
+    int b1 = 0;
+    while (b1 < l1 && s[a1 + b1] != '*') b1++;
+    int b2 = 0;
+    while (b2 < l2 && s[a2 + b2] != '*') b2++;
+    if (b1 != b2) return false;
+    for (int q = 0; q < b1; q++) {
+        if (lower(s[a1 + q] & 255) != lower(s[a2 + q] & 255)) return false;
+    }
+    return true;
+}
+
+// Reads "value; name=token; name2=\"quoted\"; ..." (s[0..n)): the part before the first ";" (blanks trimmed) is returned as a heap string, the parameters are stored in p
+// (names in lower case). RFC 2231 is understood: "name*=utf-8''%E2%82%AC" (character set, language, percent encoding) and the continuations "name*0=..; name*1=..",
+// "name*0*=..". A parameter that is an RFC 2047 encoded word as a whole (filename="=?UTF-8?B?...?=": not allowed, but common) is decoded too. At most 24 parameters.
+public char* parseParams(char* s, int n, Params* p) {
+    int i = 0;
+    while (i < n && s[i] != ';') i++;
+    int a = 0;
+    int b = i;
+    while (a < b && isWsp(s[a] & 255)) a++;
+    while (b > a && isWsp(s[b - 1] & 255)) b--;
+    char* mainValue = copyN(&s[a], b - a);
+    // the raw pairs: where the name is in s, and the value as a heap string
+    int rn[48];
+    int rnl[48];
+    char* rv[48];
+    int rvl[48];
+    int cnt = 0;
+    while (i < n && cnt < 48) {
+        i++;                                           // the ";"
+        while (i < n && (isWsp(s[i] & 255) || s[i] == 13 || s[i] == 10)) i++;
+        if (i >= n) break;
+        int ns = i;
+        while (i < n && s[i] != '=' && s[i] != ';') i++;
+        int ne = i;
+        while (ne > ns && isWsp(s[ne - 1] & 255)) ne--;
+        if (i >= n || s[i] != '=') continue;           // a piece without "=": skipped up to the next ";"
+        i++;
+        while (i < n && isWsp(s[i] & 255)) i++;
+        Buf tmp;
+        if (i < n && s[i] == '"') {
+            i++;
+            while (i < n && s[i] != '"') {
+                if (s[i] == '\\' && i + 1 < n) i++;
+                tmp.addByte(s[i]);
+                i++;
+            }
+            i++;
+            while (i < n && s[i] != ';') i++;
+        } else {
+            int k = i;
+            while (i < n && s[i] != ';') i++;
+            int e = i;
+            while (e > k && isWsp(s[e - 1] & 255)) e--;
+            tmp.add(&s[k], e - k);
+        }
+        char* val = tmp.take();
+        if (val == null) val = copyN("", 0);
+        rn[cnt] = ns;
+        rnl[cnt] = ne - ns;
+        rv[cnt] = val;
+        rvl[cnt] = strlen(val);
+        cnt++;
+    }
+    bool used[48];
+    bool star[48];
+    for (int k = 0; k < cnt; k++) {
+        used[k] = false;
+        star[k] = false;
+        for (int q = 0; q < rnl[k]; q++) { if (s[rn[k] + q] == '*') star[k] = true; }
+    }
+    // the RFC 2231 ones first (when a name is given both ways, the extended form wins, as in RFC 6266): all the pieces of one name together
+    for (int k = 0; k < cnt; k++) {
+        if (used[k] || !star[k]) continue;
+        int bl = 0;
+        while (bl < rnl[k] && s[rn[k] + bl] != '*') bl++;
+        char bn[48];
+        bool skip = bl == 0 || bl > 40;
+        if (!skip) {
+            for (int q = 0; q < bl; q++) bn[q] = lower(s[rn[k] + q] & 255);
+            bn[bl] = 0;
+        }
+        int idxs[16];
+        int which[16];
+        int np = 0;
+        for (int m = k; m < cnt; m++) {
+            if (used[m] || !star[m] || !sameBase(s, rn[m], rnl[m], rn[k], rnl[k])) continue;
+            used[m] = true;
+            if (skip) continue;
+            // behind the first "*": nothing ("name*": extended), digits, and a "*" for an extended piece
+            int q = rn[m] + bl + 1;
+            int end = rn[m] + rnl[m];
+            int num = 0;
+            bool ext = false;
+            if (q >= end) {
+                ext = true;                                             // "name*"
+            } else {
+                int digs = 0;
+                while (q < end && s[q] >= '0' && s[q] <= '9' && digs < 4) { num = num * 10 + (s[q] - '0'); q++; digs++; }
+                if (digs == 0) continue;
+                if (q < end && s[q] == '*') { ext = true; q++; }
+                if (q != end) continue;                                 // malformed: ignored
+            }
+            if (np < 16) { idxs[np] = num; which[np] = m | (ext ? 0x10000 : 0); np++; }
+        }
+        if (skip || np == 0) continue;
+        for (int x = 1; x < np; x++) {                                  // in the order of the numbers
+            int ki = idxs[x];
+            int kw = which[x];
+            int y = x - 1;
+            while (y >= 0 && idxs[y] > ki) { idxs[y + 1] = idxs[y]; which[y + 1] = which[y]; y--; }
+            idxs[y + 1] = ki;
+            which[y + 1] = kw;
+        }
+        Buf raw;
+        int csId = CS_UTF8;
+        for (int x = 0; x < np; x++) {
+            int m = which[x] & 0xFFFF;
+            bool ext = (which[x] & 0x10000) != 0;
+            char* val = rv[m];
+            int vl = rvl[m];
+            if (!ext) { raw.add(val, vl); continue; }
+            int from = 0;
+            if (x == 0) {                                               // charset'language'text
+                int q1 = -1;
+                int q2 = -1;
+                for (int z = 0; z < vl; z++) {
+                    if (val[z] == '\'') { if (q1 < 0) q1 = z; else { q2 = z; break; } }
+                }
+                if (q1 >= 0 && q2 > q1) {
+                    if (q1 > 0) {
+                        csId = charsetId(val, q1);
+                        if (csId == CS_UNKNOWN) csId = CS_UTF8;
+                    }
+                    from = q2 + 1;
+                }
+            }
+            pctDecode(val, from, vl, &raw);
+        }
+        Buf conv;
+        if (raw.len > 0) toUtf8Id(csId, raw.d, raw.len, &conv);
+        p->put(&bn[0], bl, conv.d == null ? "" : conv.d, conv.len);
+        raw.release();
+        conv.release();
+    }
+    // the plain parameters
+    for (int k = 0; k < cnt; k++) {
+        if (star[k] || rnl[k] == 0) continue;
+        char* val = rv[k];
+        bool wholeWord = rvl[k] > 8 && val[0] == '=' && val[1] == '?' && (eqNoCase(&s[rn[k]], rnl[k], "filename") || eqNoCase(&s[rn[k]], rnl[k], "name"));
+        if (wholeWord) {
+            char* dec = decodeText(val);
+            if (dec != null) { p->put(&s[rn[k]], rnl[k], dec, strlen(dec)); free(dec); }
+        } else {
+            p->put(&s[rn[k]], rnl[k], val, rvl[k]);
+        }
+    }
+    for (int k = 0; k < cnt; k++) free(rv[k]);
+    return mainValue;
+}
+
+// ---- Date and Message-ID ------------------------------------------------------------------------------------------------------------
+private char* wday3(int w) {
+    switch (w) {
+        case 0: return "Sun";
+        case 1: return "Mon";
+        case 2: return "Tue";
+        case 3: return "Wed";
+        case 4: return "Thu";
+        case 5: return "Fri";
+        case 6: return "Sat";
+    }
+    return "Sun";
+}
+
+private char* mon3(int m) {
+    switch (m) {
+        case 1: return "Jan";
+        case 2: return "Feb";
+        case 3: return "Mar";
+        case 4: return "Apr";
+        case 5: return "May";
+        case 6: return "Jun";
+        case 7: return "Jul";
+        case 8: return "Aug";
+        case 9: return "Sep";
+        case 10: return "Oct";
+        case 11: return "Nov";
+        case 12: return "Dec";
+    }
+    return "Jan";
+}
+
+// "Fri, 13 Nov 2026 14:30:00 +0100": the time unix (seconds since 1970, UTC) as it is in a zone that is offsetMinutes ahead of UTC (the zone is limited to +-23:59).
+// Writes into out (max bytes); returns the length.
+public int formatDate(int unix, int offsetMinutes, char* out, int max) {
+    if (offsetMinutes > 1439) offsetMinutes = 1439;
+    if (offsetMinutes < -1439) offsetMinutes = -1439;
+    datetime.DateTime d(unix + offsetMinutes * 60);
+    char head[48];
+    format(&head[0], 48, "%s, %d %s %04d ", wday3(d.weekday), d.day, mon3(d.month), d.year, 0, 0);
+    char tail[32];
+    int om = offsetMinutes < 0 ? -offsetMinutes : offsetMinutes;
+    format(&tail[0], 32, "%02d:%02d:%02d %c%02d%02d", d.hour, d.minute, d.second, offsetMinutes < 0 ? '-' : '+', om / 60, om % 60);
+    char both[96];
+    int n = format(&both[0], 96, "%s%s", &head[0], &tail[0], 0, 0, 0);
+    if (n >= max) n = max - 1;
+    memcpy(out, &both[0], n);
+    out[n] = 0;
+    return n;
+}
+
+private int monthNumber(char* s) {
+    for (int m = 1; m <= 12; m++) {
+        if (eqNoCase(s, 3, mon3(m))) return m;
+    }
+    return 0;
+}
+
+// the zone offset in minutes of an obsolete zone name (UT, GMT, EST, EDT, CST, CDT, MST, MDT, PST, PDT; military letters count as 0 as RFC 5322 says), or -9999
+private int zoneName(char* s, int n) {
+    if (eqNoCase(s, n, "UT") || eqNoCase(s, n, "GMT") || eqNoCase(s, n, "Z")) return 0;
+    if (eqNoCase(s, n, "EST")) return -300;
+    if (eqNoCase(s, n, "EDT")) return -240;
+    if (eqNoCase(s, n, "CST")) return -360;
+    if (eqNoCase(s, n, "CDT")) return -300;
+    if (eqNoCase(s, n, "MST")) return -420;
+    if (eqNoCase(s, n, "MDT")) return -360;
+    if (eqNoCase(s, n, "PST")) return -480;
+    if (eqNoCase(s, n, "PDT")) return -420;
+    if (n == 1 && isAlpha(s[0] & 255)) return 0;
+    return -9999;
+}
+
+// Reads a date of the Date field (RFC 5322 3.3 and the obsolete forms): an optional day name, "13 Nov 2026 14:30[:00] +0100" (or a zone name), two and three digit
+// years (50 to 99 is 19xx, 0 to 49 is 20xx, three digits are 1900 plus), comments in parentheses, extra blanks. The date must exist (30 February, hour 24, minute 60
+// are refused; a second of 60 is a leap second and counts as 59). *unix gets the time in UTC, *offset the zone in minutes. false when it cannot be read.
+public bool parseDate(char* s, int n, int* unix, int* offset) {
+    int i = 0;
+    // an optional "Fri," (the name is not checked against the date: it is redundant, and wrong more often than not)
+    while (i < n && isWsp(s[i] & 255)) i++;
+    int w = i;
+    while (w < n && isAlpha(s[w] & 255)) w++;
+    if (w > i && w < n && s[w] == ',') {
+        if (w - i != 3) return false;
+        i = w + 1;
+    }
+    // the fields: day month year hh:mm[:ss] zone, separated by blanks and comments
+    int pos[8];
+    int len[8];
+    int cnt = 0;
+    while (i < n && cnt < 8) {
+        while (i < n && (isWsp(s[i] & 255) || s[i] == 13 || s[i] == 10)) i++;
+        if (i >= n) break;
+        if (s[i] == '(') { int e = skipComment(s, i, n); if (e < 0) return false; i = e; continue; }
+        int a = i;
+        while (i < n && !isWsp(s[i] & 255) && s[i] != 13 && s[i] != 10 && s[i] != '(') i++;
+        pos[cnt] = a;
+        len[cnt] = i - a;
+        cnt++;
+    }
+    if (cnt < 4) return false;
+    int day = 0;
+    int dl = len[0];
+    if (dl < 1 || dl > 2) return false;
+    for (int k = 0; k < dl; k++) { if (!isDigit(s[pos[0] + k] & 255)) return false; day = day * 10 + (s[pos[0] + k] - '0'); }
+    if (len[1] != 3) return false;
+    int mon = monthNumber(&s[pos[1]]);
+    if (mon == 0) return false;
+    int year = 0;
+    int yl = len[2];
+    if (yl < 2 || yl > 4) return false;
+    for (int k = 0; k < yl; k++) { if (!isDigit(s[pos[2] + k] & 255)) return false; year = year * 10 + (s[pos[2] + k] - '0'); }
+    if (yl == 2) year = year < 50 ? year + 2000 : year + 1900;
+    else if (yl == 3) year = year + 1900;
+    if (year < 1900) return false;
+    if (day < 1 || day > datetime.daysInMonth(year, mon)) return false;
+    // the time
+    char* t = &s[pos[3]];
+    int tl = len[3];
+    int hh = 0;
+    int mm = 0;
+    int ss = 0;
+    int k = 0;
+    int digs = 0;
+    while (k < tl && isDigit(t[k] & 255)) { hh = hh * 10 + (t[k] - '0'); k++; digs++; }
+    if (digs < 1 || digs > 2 || k >= tl || t[k] != ':') return false;
+    k++;
+    digs = 0;
+    while (k < tl && isDigit(t[k] & 255)) { mm = mm * 10 + (t[k] - '0'); k++; digs++; }
+    if (digs != 2) return false;
+    if (k < tl) {
+        if (t[k] != ':') return false;
+        k++;
+        digs = 0;
+        while (k < tl && isDigit(t[k] & 255)) { ss = ss * 10 + (t[k] - '0'); k++; digs++; }
+        if (digs != 2 || k != tl) return false;
+    }
+    if (hh > 23 || mm > 59 || ss > 60) return false;
+    if (ss == 60) ss = 59;
+    // the zone (missing: UTC)
+    int zone = 0;
+    if (cnt >= 5) {
+        char* z = &s[pos[4]];
+        int zl = len[4];
+        if ((z[0] == '+' || z[0] == '-') && zl == 5) {
+            int zh = 0;
+            int zm = 0;
+            for (int q = 1; q < 5; q++) { if (!isDigit(z[q] & 255)) return false; }
+            zh = (z[1] - '0') * 10 + (z[2] - '0');
+            zm = (z[3] - '0') * 10 + (z[4] - '0');
+            if (zm > 59) return false;
+            zone = zh * 60 + zm;
+            if (z[0] == '-') zone = -zone;
+        } else {
+            zone = zoneName(z, zl);
+            if (zone == -9999) return false;
+        }
+    }
+    *unix = datetime.toUnix(year, mon, day, hh, mm, ss) - zone * 60;
+    *offset = zone;
+    return true;
+}
+
+private bool domainOk(char* d) {
+    if (d == null || d[0] == 0) return false;
+    int n = strlen(d);
+    if (n > 200) return false;
+    for (int i = 0; i < n; i++) {
+        int c = d[i] & 255;
+        if (!(isAlpha(c) || isDigit(c) || c == '.' || c == '-')) return false;
+    }
+    return d[0] != '.' && d[n - 1] != '.';
+}
+
+// A new unique message id "<20261113143000.0a1b2c3d4e5f6071@domain>" (the time and 64 random bits) into out (max bytes). A domain that is not a plain host name (or null) is replaced
+// by "localhost.localdomain": nothing from outside can put a ">" or a line break into the id. Returns the length.
+public int newMessageId(char* domain, char* out, int max) {
+    datetime.DateTime d(datetime.now());
+    char rnd[8];
+    asys.randomBytes(&rnd[0], 8);
+    char hx[20];
+    for (int i = 0; i < 8; i++) {
+        int hi = (rnd[i] >> 4) & 15;
+        int lo = rnd[i] & 15;
+        hx[i * 2] = hi < 10 ? '0' + hi : 'a' + hi - 10;
+        hx[i * 2 + 1] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+    }
+    hx[16] = 0;
+    char buf[320];
+    int n = format(&buf[0], 320, "<%04d%02d%02d%02d%02d%02d.", d.year, d.month, d.day, d.hour, d.minute, d.second);
+    char rest[260];
+    n = n + format(&rest[0], 260, "%s@%s>", &hx[0], domainOk(domain) ? domain : "localhost.localdomain", 0, 0, 0);
+    strcat(&buf[0], &rest[0]);
+    if (n >= max) n = max - 1;
+    memcpy(out, &buf[0], n);
+    out[n] = 0;
+    return n;
+}
+
+// true for "<local@domain>" in the form of a message id (also as a list element of References)
+public bool validMessageId(char* s, int n) {
+    if (n < 5 || s[0] != '<' || s[n - 1] != '>') return false;
+    return validAddress(&s[1], n - 2);
+}
+
+// ---- parts: a MIME entity (headers, and a body or child parts) -----------------------------------------------------------------------
+public class ParseOptions {
+    public int maxSize;                 // the whole message
+    public int maxDepth;                // nesting of multipart and message/rfc822
+    public int maxParts;
+    public int maxHeaders;              // fields in one header block
+    public int maxHeaderBytes;          // size of one header block
+    public int maxHeaderLine;           // one field's value (unfolded)
+    public int maxPartSize;             // one decoded body
+    public bool normalizeNewlines;      // CRLF becomes LF in text parts (default true)
+    public bool convertCharset;         // text parts are converted to UTF-8 (default true)
+
+    public ParseOptions() { init(); }
+
+    public void init() {
+        maxSize = MAX_SIZE;
+        maxDepth = MAX_DEPTH;
+        maxParts = MAX_PARTS;
+        maxHeaders = MAX_HEADERS;
+        maxHeaderBytes = MAX_HEADER_BYTES;
+        maxHeaderLine = MAX_HEADER_LINE;
+        maxPartSize = MAX_PART_SIZE;
+        normalizeNewlines = true;
+        convertCharset = true;
+    }
+}
+
+public ParseOptions* newParseOptions() {
+    ParseOptions* o = (ParseOptions*) malloc(sizeof(ParseOptions));
+    if (o != null) o->init();
+    return o;
+}
+
+public class Part {
+    public Headers* headers;
+    public char* type;              // "text", "multipart", "image" ... (lower case, never null)
+    public char* subtype;           // "plain", "alternative", "png" ...
+    public char* charset;           // the character set that was declared (lower case) or null
+    public char* boundary;          // multipart: the boundary parameter
+    public char* disposition;       // "inline", "attachment" or null
+    public char* filename;          // from Content-Disposition (filename) or Content-Type (name), decoded to UTF-8, as the sender wrote it: use safeFilename() before it becomes a path
+    public char* contentId;         // Content-ID without the angle brackets
+    public char* encoding;          // the Content-Transfer-Encoding that was used: "7bit", "8bit", "binary", "quoted-printable", "base64" (null: chosen when written)
+    public char* body;              // the decoded body (a 0 byte follows); text parts are UTF-8 with LF line ends (see ParseOptions)
+    public int bodyLen;
+    public Part** children;         // multipart: the parts; message/rfc822: the message inside (also in body)
+    public int nchildren;
+    public int cchildren;
+    public int defects;             // D_ bits
+    public int depth;
+    public bool utf8;               // a text part whose body is valid UTF-8 now
+
+    public bool isMultipart() { return streq(type, "multipart"); }
+    public bool isText() { return streq(type, "text"); }
+    public bool is(char* t, char* st) { return streq(type, t) && streq(subtype, st); }
+
+    public Part* child(int i) { return (i >= 0 && i < nchildren) ? children[i] : null; }
+
+    // adds a child part (the parent frees it); false when out of memory
+    public bool addChild(Part* c) {
+        if (nchildren >= cchildren) {
+            int nc = cchildren == 0 ? 4 : cchildren * 2;
+            Part** nl = (Part**) malloc(nc * 8);
+            if (nl == null) return false;
+            for (int i = 0; i < nchildren; i++) nl[i] = children[i];
+            if (children != null) free((char*) children);
+            children = nl;
+            cchildren = nc;
+        }
+        children[nchildren] = c;
+        nchildren++;
+        return true;
+    }
+
+    // the value of the first header field with this name (not decoded) or null; valid until the part is changed
+    public char* header(char* name) { return headers->get(name); }
+
+    // the field with RFC 2047 words decoded to UTF-8 (a heap string, free it), or null when there is no such field
+    public char* decodedHeader(char* name) {
+        char* v = headers->get(name);
+        return v == null ? null : decodeText(v);
+    }
+
+    // the addresses of every field with this name (From, To, Cc, Reply-To ...), as an AddressList that is yours (dispose it). A field that is not valid sets list->bad and gives no
+    // addresses; the other fields are still read.
+    public AddressList* addresses(char* name) {
+        AddressList* l = newAddressList();
+        if (l == null) return null;
+        int i = headers->indexOf(name, 0);
+        while (i >= 0) {
+            char* v = headers->items[i]->value;
+            int before = l->count;
+            if (parseAddressList(v, strlen(v), l) < 0) {
+                l->bad = true;
+                // what was added before the error stays out: drop it
+                while (l->count > before) {
+                    l->count--;
+                    free(l->items[l->count]->name);
+                    free(l->items[l->count]->addr);
+                    if (l->items[l->count]->group != null) free(l->items[l->count]->group);
+                    free((char*) l->items[l->count]);
+                }
+            }
+            i = headers->indexOf(name, i + 1);
+        }
+        return l;
+    }
+
+    // the Date field as seconds since 1970 (UTC); false when there is none or it cannot be read. *offset: the zone in minutes
+    public bool date(int* unix, int* offset) {
+        char* v = headers->get("Date");
+        if (v == null) return false;
+        return parseDate(v, strlen(v), unix, offset);
+    }
+
+    // the first text part of this subtype ("plain", "html") that is not an attachment, searching the tree depth first; null when there is none
+    public Part* firstText(char* sub) {
+        if (isMultipart()) {
+            for (int i = 0; i < nchildren; i++) {
+                Part* f = children[i]->firstText(sub);
+                if (f != null) return f;
+            }
+            return null;
+        }
+        if (is("text", sub) && (disposition == null || !streq(disposition, "attachment")) && filename == null) return this;
+        return null;
+    }
+
+    // Walks the leaves (parts that are not multiparts, a message/rfc822 counts as one leaf) in order. mode 0: all of them, 1: the attachments (see attachmentCount).
+    // Returns how many there are; target >= 0: *found gets the target-th one.
+    private int walk(int mode, int target, Part** found) {
+        if (isMultipart() && nchildren > 0) {
+            int total = 0;
+            for (int i = 0; i < nchildren; i++) {
+                int k = children[i]->walk(mode, target >= 0 ? target - total : -1, found);
+                total = total + k;
+                if (target >= 0 && total > target) return total;
+            }
+            return total;
+        }
+        bool take = true;
+        if (mode == 1) {
+            bool att = disposition != null && streq(disposition, "attachment");
+            bool inl = contentId != null && !att;                       // a resource of the html text: it has a Content-ID and is not marked as an attachment
+            take = att || (!inl && (filename != null || (!isText() && !isMultipart())));
+            if (is("text", "plain") && !att && filename == null) take = false;
+            if (is("text", "html") && !att && filename == null) take = false;
+        }
+        if (take && target == 0) *found = this;
+        return take ? 1 : 0;
+    }
+
+    public int leafCount() { Part* f = null; return walk(0, -1, &f); }
+    public Part* leaf(int i) { Part* f = null; walk(0, i, &f); return f; }
+
+    // The attachments: leaf parts with Content-Disposition attachment, or with a file name, or of a type other than text and multipart (an image or a PDF without a
+    // disposition), except the parts that have a Content-ID and are not marked as attachments (the pictures of an HTML text) and the plain and HTML text bodies.
+    // A message/rfc822 inside counts as one.
+    public int attachmentCount() { Part* f = null; return walk(1, -1, &f); }
+    public Part* attachment(int i) { Part* f = null; walk(1, i, &f); return f; }
+
+    // the part with this Content-ID (without the angle brackets), searching the tree; null when there is none
+    public Part* findContentId(char* cid) {
+        if (contentId != null && streq(contentId, cid)) return this;
+        for (int i = 0; i < nchildren; i++) {
+            Part* f = children[i]->findContentId(cid);
+            if (f != null) return f;
+        }
+        return null;
+    }
+
+    // frees this part and everything below it
+    public void dispose() {
+        for (int i = 0; i < nchildren; i++) children[i]->dispose();
+        if (children != null) free((char*) children);
+        if (headers != null) { headers->dispose(); free((char*) headers); }
+        if (type != null) free(type);
+        if (subtype != null) free(subtype);
+        if (charset != null) free(charset);
+        if (boundary != null) free(boundary);
+        if (disposition != null) free(disposition);
+        if (filename != null) free(filename);
+        if (contentId != null) free(contentId);
+        if (encoding != null) free(encoding);
+        if (body != null) free(body);
+        free((char*) this);
+    }
+}
+
+// a new empty part (text/plain); null when out of memory
+public Part* newPart() {
+    Part* p = (Part*) malloc(sizeof(Part));
+    if (p == null) return null;
+    p->headers = (Headers*) malloc(sizeof(Headers));
+    p->type = copyN("text", 4);
+    p->subtype = copyN("plain", 5);
+    if (p->headers == null || p->type == null || p->subtype == null) { p->dispose(); return null; }
+    return p;
+}
+
+// replaces a text field of a part (a copy of s is made; null clears it)
+private void setField(char** field, char* s, int n) {
+    if (*field != null) free(*field);
+    *field = s == null ? null : copyN(s, n);
+}
+
+public void setType(Part* p, char* type, char* subtype) {
+    setField(&p->type, type, strlen(type));
+    setField(&p->subtype, subtype, strlen(subtype));
+}
+
+// ---- reading a message ---------------------------------------------------------------------------------------------------------------
+private class ParseState {
+    public ParseOptions* o;
+    public int parts;
+}
+
+// a boundary parameter: 1 to 70 characters of the set of RFC 2046 (letters, digits and '()+_,-./:=? ), no blank at the end
+private bool validBoundary(char* b) {
+    if (b == null) return false;
+    int n = strlen(b);
+    if (n < 1 || n > 70 || b[n - 1] == ' ') return false;
+    for (int i = 0; i < n; i++) {
+        int c = b[i] & 255;
+        bool ok = isAlpha(c) || isDigit(c) || c == '\'' || c == '(' || c == ')' || c == '+' || c == '_' || c == ',' || c == '-' || c == '.' || c == '/' || c == ':' || c == '=' || c == '?' || c == ' ';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+// a file name that is safe to use as a name in a directory: only the last component of a path (after "/" or "\"), no control characters, no leading dots (so no ".."
+// and no hidden files), at most 120 bytes (cut between characters), "attachment" when nothing is left. The result is a heap string.
+public char* safeFilename(char* name) {
+    int n = name == null ? 0 : strlen(name);
+    int from = 0;
+    for (int i = 0; i < n; i++) {
+        if (name[i] == '/' || name[i] == '\\') from = i + 1;
+    }
+    Buf b;
+    for (int i = from; i < n; i++) {
+        int c = name[i] & 255;
+        if (c < 32 || c == 127) continue;
+        if (c == ':' || c == '*' || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') c = '_';
+        if (b.len == 0 && c == '.') continue;
+        b.addByte(c);
+    }
+    int len = b.len;
+    if (len > 120) {
+        len = 120;
+        while (len > 0 && (b.d[len] & 0xC0) == 0x80) len--;
+    }
+    while (len > 0 && (b.d[len - 1] == ' ' || b.d[len - 1] == '.')) len--;
+    char* r = len == 0 ? copyN("attachment", 10) : copyN(b.d, len);
+    b.release();
+    return r;
+}
+
+private bool containsHighBit(char* s, int n) {
+    for (int i = 0; i < n; i++) {
+        if ((s[i] & 128) != 0) return true;
+    }
+    return false;
+}
+
+// decodes the body of a leaf part into p->body (transfer encoding, then for text the character set and the line ends)
+private void decodeBody(Part* p, char* body, int bl, ParseState* st) {
+    ParseOptions* o = st->o;
+    Buf out;
+    out.max = o->maxPartSize;
+    char* enc = p->encoding == null ? "7bit" : p->encoding;
+    if (streq(enc, "base64")) {
+        if (!base64Decode(body, bl, &out, false)) p->defects = p->defects | D_BAD_ENCODING;
+        if (out.failed) p->defects = p->defects | D_TOO_BIG;
+        out.failed = false;
+    } else if (streq(enc, "quoted-printable")) {
+        if (!qpDecode(body, bl, &out, false, false)) p->defects = p->defects | D_BAD_ENCODING;
+        if (out.failed) p->defects = p->defects | D_TOO_BIG;
+        out.failed = false;
+    } else {
+        if (!(streq(enc, "7bit") || streq(enc, "8bit") || streq(enc, "binary"))) p->defects = p->defects | D_BAD_ENCODING;
+        int take = bl;
+        if (take > o->maxPartSize) { take = o->maxPartSize; p->defects = p->defects | D_TOO_BIG; }
+        out.add(body, take);
+    }
+    if (p->isText() && o->convertCharset) {
+        int cs = p->charset == null ? CS_ASCII : charsetId(p->charset, strlen(p->charset));
+        bool high = containsHighBit(out.d == null ? "" : out.d, out.len);
+        Buf conv;
+        conv.max = o->maxPartSize;
+        if ((cs == CS_ASCII || p->charset == null) && high) {
+            // no usable declaration: UTF-8 when it is valid, else windows-1252
+            p->defects = p->defects | D_CHARSET_GUESSED;
+            if (utf8Valid(out.d, out.len)) toUtf8Id(CS_UTF8, out.d, out.len, &conv);
+            else toUtf8Id(CS_CP1252, out.d, out.len, &conv);
+            out.release();
+            out = conv;
+            conv.d = null; conv.len = 0; conv.cap = 0;
+            p->utf8 = true;
+        } else if (cs == CS_UNKNOWN) {
+            p->defects = p->defects | D_BAD_CHARSET;
+            p->utf8 = !high || utf8Valid(out.d, out.len);
+        } else if (cs == CS_UTF8 || cs == CS_ASCII) {
+            if (high) {
+                int bad = utf8Sanitize(out.d, out.len, &conv);
+                if (bad > 0) {
+                    p->defects = p->defects | D_BAD_CHARSET;
+                    out.release();
+                    out = conv;
+                    conv.d = null; conv.len = 0; conv.cap = 0;
+                }
+            }
+            p->utf8 = true;
+        } else {
+            toUtf8Id(cs, out.d, out.len, &conv);
+            out.release();
+            out = conv;
+            conv.d = null; conv.len = 0; conv.cap = 0;
+            p->utf8 = true;
+        }
+        conv.release();
+        if (o->normalizeNewlines && out.len > 0) {
+            int k = 0;
+            for (int i = 0; i < out.len; i++) {
+                if (out.d[i] == 13 && i + 1 < out.len && out.d[i + 1] == 10) continue;
+                out.d[k] = out.d[i];
+                k++;
+            }
+            out.len = k;
+        }
+    }
+    p->bodyLen = out.len;
+    p->body = out.take();
+    if (p->body == null) p->body = copyN("", 0);
+}
+
+private Part* parseEntity(char* s, int n, ParseState* st, int depth, bool inDigest);
+
+// splits a multipart body at its boundary lines and parses the parts. false when there is no boundary line at all.
+private bool splitMultipart(Part* p, char* body, int bl, ParseState* st, int depth) {
+    char* bd = p->boundary;
+    int bdl = strlen(bd);
+    bool digest = streq(p->subtype, "digest");
+    int i = 0;
+    int partStart = -1;
+    bool sawClose = false;
+    while (i <= bl) {
+        int e = i;
+        while (e < bl && body[e] != 10) e++;
+        int le = e;
+        if (le > i && body[le - 1] == 13) le--;
+        bool isDelim = false;
+        bool isClose = false;
+        if (le - i >= bdl + 2 && body[i] == '-' && body[i + 1] == '-' && memcmp(&body[i + 2], bd, bdl) == 0) {
+            int k = i + 2 + bdl;
+            if (k + 2 <= le && body[k] == '-' && body[k + 1] == '-') {
+                int q = k + 2;
+                while (q < le && isWsp(body[q] & 255)) q++;
+                if (q == le) { isDelim = true; isClose = true; }
+            } else {
+                int q = k;
+                while (q < le && isWsp(body[q] & 255)) q++;
+                if (q == le) isDelim = true;
+            }
+        }
+        if (isDelim) {
+            if (partStart >= 0) {
+                int pe = i;
+                if (pe > partStart && body[pe - 1] == 10) pe--;
+                if (pe > partStart && body[pe - 1] == 13) pe--;
+                Part* c = parseEntity(&body[partStart], pe - partStart, st, depth + 1, digest);
+                if (c != null) p->addChild(c);
+            }
+            if (isClose) { sawClose = true; break; }
+            partStart = e < bl ? e + 1 : bl;
+        }
+        if (e >= bl) break;
+        i = e + 1;
+    }
+    if (partStart < 0) return false;
+    if (!sawClose) {
+        p->defects = p->defects | D_NO_END_BOUNDARY;
+        int pe = bl;
+        if (pe > partStart && body[pe - 1] == 10) pe--;
+        if (pe > partStart && body[pe - 1] == 13) pe--;
+        Part* c = parseEntity(&body[partStart], pe - partStart, st, depth + 1, digest);
+        if (c != null) p->addChild(c);
+    }
+    return true;
+}
+
+private Part* parseEntity(char* s, int n, ParseState* st, int depth, bool inDigest) {
+    ParseOptions* o = st->o;
+    if (st->parts >= o->maxParts) return null;
+    st->parts++;
+    Part* p = newPart();
+    if (p == null) return null;
+    p->depth = depth;
+    int consumed = 0;
+    p->defects = parseHeaders(s, n, p->headers, &consumed, o->maxHeaders, o->maxHeaderBytes, o->maxHeaderLine);
+    char* body = &s[consumed];
+    int bl = n - consumed;
+    // Content-Type
+    char* ct = p->headers->get("Content-Type");
+    Params prm;
+    if (ct != null) {
+        char* mv = parseParams(ct, strlen(ct), &prm);
+        int slash = -1;
+        int ml = strlen(mv);
+        for (int i = 0; i < ml; i++) { if (mv[i] == '/') { slash = i; break; } }
+        bool ok = slash > 0 && slash < ml - 1;
+        for (int i = 0; ok && i < ml; i++) { if (i != slash && !isTokenChar(mv[i] & 255)) ok = false; }
+        if (ok) {
+            free(p->type);
+            free(p->subtype);
+            p->type = copyLower(mv, slash);
+            p->subtype = copyLower(&mv[slash + 1], ml - slash - 1);
+        } else {
+            setType(p, "application", "octet-stream");
+        }
+        free(mv);
+        char* v = prm.get("charset");
+        if (v != null) p->charset = copyLower(v, strlen(v));
+        v = prm.get("boundary");
+        if (v != null) p->boundary = copyN(v, strlen(v));
+        v = prm.get("name");
+        if (v != null) p->filename = copyN(v, strlen(v));
+    } else if (inDigest) {
+        setType(p, "message", "rfc822");
+    }
+    prm.dispose();
+    // Content-Disposition
+    char* cd = p->headers->get("Content-Disposition");
+    if (cd != null) {
+        Params dp;
+        char* mv = parseParams(cd, strlen(cd), &dp);
+        if (strlen(mv) > 0) p->disposition = copyLower(mv, strlen(mv));
+        free(mv);
+        char* v = dp.get("filename");
+        if (v != null) { if (p->filename != null) free(p->filename); p->filename = copyN(v, strlen(v)); }
+        dp.dispose();
+    }
+    char* cid = p->headers->get("Content-ID");
+    if (cid != null) {
+        int a = 0;
+        int b = strlen(cid);
+        while (a < b && (cid[a] == '<' || isWsp(cid[a] & 255))) a++;
+        while (b > a && (cid[b - 1] == '>' || isWsp(cid[b - 1] & 255))) b--;
+        if (b > a) p->contentId = copyN(&cid[a], b - a);
+    }
+    char* cte = p->headers->get("Content-Transfer-Encoding");
+    if (cte != null) {
+        int a = 0;
+        int b = strlen(cte);
+        for (int i = 0; i < b; i++) { if (cte[i] == '(' || cte[i] == ';') { b = i; break; } }
+        while (a < b && isWsp(cte[a] & 255)) a++;
+        while (b > a && isWsp(cte[b - 1] & 255)) b--;
+        p->encoding = copyLower(&cte[a], b - a);
+    }
+    if (p->isMultipart()) {
+        if (!validBoundary(p->boundary)) {
+            p->defects = p->defects | (p->boundary == null ? D_NO_BOUNDARY : D_BAD_BOUNDARY);
+        } else if (depth >= o->maxDepth) {
+            p->defects = p->defects | D_TOO_DEEP;
+        } else if (splitMultipart(p, body, bl, st, depth)) {
+            return p;
+        } else {
+            p->defects = p->defects | D_NO_BOUNDARY;
+        }
+        // not split: kept as a body that is not decoded
+        if (p->encoding != null) { free(p->encoding); p->encoding = null; }
+        Buf raw;
+        raw.max = o->maxPartSize;
+        raw.add(body, bl);
+        p->bodyLen = raw.len;
+        p->body = raw.take();
+        if (p->body == null) p->body = copyN("", 0);
+        return p;
+    }
+    decodeBody(p, body, bl, st);
+    if (p->is("message", "rfc822") && depth < o->maxDepth && p->bodyLen > 0) {
+        Part* inner = parseEntity(p->body, p->bodyLen, st, depth + 1, false);
+        if (inner != null) p->addChild(inner);
+    } else if (p->is("message", "rfc822") && depth >= o->maxDepth) {
+        p->defects = p->defects | D_TOO_DEEP;
+    }
+    return p;
+}
+
+// Reads a message (a whole message or any MIME entity): headers, then the body, decoded; multiparts become a tree of parts. null when the message is longer than maxSize, or
+// when out of memory (error() says which). A broken message is still read as far as it goes (see the D_ bits in Part.defects): the parser never gives up because a sender made a mistake.
+// opt may be null (the defaults).
+public Part* parse(char* data, int n, ParseOptions* opt) {
+    ParseOptions def;
+    def.init();
+    ParseState st;
+    st.o = opt == null ? &def : opt;
+    if (n < 0 || n > st.o->maxSize) { setErr("the message is too big"); return null; }
+    Part* p = parseEntity(data, n, &st, 0, false);
+    if (p == null) { setErr("out of memory or too many parts"); return null; }
+    if (st.parts >= st.o->maxParts) p->defects = p->defects | D_TOO_MANY_PARTS;
+    return p;
+}
+
+// ---- writing a message ---------------------------------------------------------------------------------------------------------------
+public class WriteOptions {
+    public bool allow8bit;              // 8-bit bodies may go out as they are (the server offers 8BITMIME); else UTF-8 text is quoted-printable or base64
+    public int maxSize;                 // the largest message (default MAX_SIZE): a bigger one is not written
+    public char* boundaryPrefix;        // null: random boundaries; else prefix + a counter (for tests that compare bytes)
+    public int boundaryCounter;
+    public bool needs8bit;              // OUT: the message written has 8-bit data (it must go to a server that offers 8BITMIME)
+
+    public WriteOptions() { maxSize = MAX_SIZE; }
+}
+
+public WriteOptions* newWriteOptions() {
+    WriteOptions* o = (WriteOptions*) malloc(sizeof(WriteOptions));
+    if (o != null) o->maxSize = MAX_SIZE;
+    return o;
+}
+
+// a parameter value is written as a token, as a quoted string, or (non-ASCII) in the RFC 2231 form name*=UTF-8''%C3%A4 with a plain fallback
+private void writeParam(Buf* hv, char* name, char* value) {
+    int n = strlen(value);
+    bool ascii = true;
+    bool token = n > 0;
+    for (int i = 0; i < n; i++) {
+        int c = value[i] & 255;
+        if (c >= 128) ascii = false;
+        if (!isTokenChar(c)) token = false;
+    }
+    hv->add("; ", 2);
+    if (ascii) {
+        hv->addText(name);
+        hv->addByte('=');
+        if (token) { hv->add(value, n); return; }
+        hv->addByte('"');
+        for (int i = 0; i < n; i++) {
+            int c = value[i] & 255;
+            if (c < 32 || c == 127) c = '_';
+            if (c == '"' || c == '\\') hv->addByte('\\');
+            hv->addByte(c);
+        }
+        hv->addByte('"');
+        return;
+    }
+    // the extended form
+    hv->addText(name);
+    hv->addText("*=UTF-8''");
+    Buf clean;
+    utf8Sanitize(value, n, &clean);
+    for (int i = 0; i < clean.len; i++) {
+        int c = clean.d[i] & 255;
+        bool attr = isAlpha(c) || isDigit(c) || c == '!' || c == '#' || c == '$' || c == '&' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~';
+        if (attr) hv->addByte(c);
+        else { hv->addByte('%'); hv->addByte(hexUpper(c >> 4)); hv->addByte(hexUpper(c & 15)); }
+    }
+    // a plain fallback for readers that do not know RFC 2231
+    hv->add("; ", 2);
+    hv->addText(name);
+    hv->addText("=\"");
+    for (int i = 0; i < clean.len; i++) {
+        int c = clean.d[i] & 255;
+        if ((c & 0xC0) == 0x80) continue;                               // the rest of a multi-byte character
+        if (c >= 128 || c < 32 || c == 127) c = '_';
+        if (c == '"' || c == '\\') hv->addByte('\\');
+        hv->addByte(c);
+    }
+    hv->addByte('"');
+    clean.release();
+}
+
+private bool writeField(Buf* out, char* name, Buf* value) {
+    return foldHeader(out, name, value->d == null ? "" : value->d, value->len);
+}
+
+// true for the fields that the writer makes from the part's own members
+private bool generatedField(char* name) {
+    int n = strlen(name);
+    return eqNoCase(name, n, "Content-Type") || eqNoCase(name, n, "Content-Transfer-Encoding") || eqNoCase(name, n, "Content-Disposition") || eqNoCase(name, n, "Content-ID") || eqNoCase(name, n, "MIME-Version");
+}
+
+// the text of a boundary that is new: random, or prefix and counter
+private void newBoundary(WriteOptions* o, char* out) {
+    if (o->boundaryPrefix != null) {
+        o->boundaryCounter++;
+        char tmp[16];
+        format(&tmp[0], 16, "%d", o->boundaryCounter, 0, 0, 0, 0);
+        int pl = strlen(o->boundaryPrefix);
+        if (pl > 50) pl = 50;
+        memcpy(out, o->boundaryPrefix, pl);
+        out[pl] = 0;
+        strcat(out, &tmp[0]);
+        return;
+    }
+    char rnd[11];
+    asys.randomBytes(&rnd[0], 11);
+    out[0] = '=';
+    out[1] = '_';
+    for (int i = 0; i < 11; i++) {
+        int hi = (rnd[i] >> 4) & 15;
+        int lo = rnd[i] & 15;
+        out[2 + i * 2] = hi < 10 ? '0' + hi : 'a' + hi - 10;
+        out[3 + i * 2] = lo < 10 ? '0' + lo : 'a' + lo - 10;
+    }
+    out[24] = 0;
+}
+
+// the encoded body of a leaf part in out; *cte gets the Content-Transfer-Encoding that was used; *charsetOut the charset of the text
+private bool encodeLeaf(Part* p, WriteOptions* o, Buf* out, char** cte, char** charsetOut) {
+    char* data = p->body == null ? "" : p->body;
+    int n = p->bodyLen;
+    Buf conv;
+    *charsetOut = null;
+    if (p->isText()) {
+        int cs = p->charset == null ? CS_UTF8 : charsetId(p->charset, strlen(p->charset));
+        Buf utf;
+        if (cs == CS_LATIN1) {
+            utf8ToLatin1(data, n, &utf);
+            *charsetOut = "iso-8859-1";
+        } else {
+            utf8Sanitize(data, n, &utf);
+            *charsetOut = "utf-8";
+        }
+        // canonical line ends: CRLF
+        for (int i = 0; i < utf.len; i++) {
+            int c = utf.d[i] & 255;
+            if (c == 13) {
+                conv.add("\r\n", 2);
+                if (i + 1 < utf.len && utf.d[i + 1] == 10) i++;
+            } else if (c == 10) {
+                conv.add("\r\n", 2);
+            } else {
+                conv.addByte(c);
+            }
+        }
+        utf.release();
+        data = conv.d == null ? "" : conv.d;
+        n = conv.len;
+    }
+    bool high = false;
+    bool nul = false;
+    int maxLine = 0;
+    int line = 0;
+    int nonAscii = 0;
+    for (int i = 0; i < n; i++) {
+        int c = data[i] & 255;
+        if (c >= 128) { high = true; nonAscii++; }
+        if (c == 0) nul = true;
+        if (c == 10) line = 0; else line++;
+        if (line > maxLine) maxLine = line;
+    }
+    bool lineOk = maxLine <= 998;
+    char* want = p->encoding;
+    bool ok = true;
+    if (p->isText() || p->is("message", "rfc822")) {
+        if (want != null && streq(want, "base64")) {
+            *cte = "base64";
+            ok = base64Encode(data, n, out, true);
+        } else if (want != null && streq(want, "quoted-printable")) {
+            *cte = "quoted-printable";
+            ok = qpEncode(data, n, out, false);
+        } else if (!high && !nul && lineOk) {
+            *cte = "7bit";
+            ok = out->add(data, n);
+        } else if (o->allow8bit && !nul && lineOk && (p->isText() || p->is("message", "rfc822"))) {
+            *cte = "8bit";
+            o->needs8bit = true;
+            ok = out->add(data, n);
+        } else if (p->isText() && nonAscii * 3 <= n && !nul) {
+            *cte = "quoted-printable";
+            ok = qpEncode(data, n, out, false);
+        } else {
+            *cte = "base64";
+            ok = base64Encode(data, n, out, true);
+        }
+    } else if (want != null && streq(want, "quoted-printable")) {
+        *cte = "quoted-printable";
+        ok = qpEncode(data, n, out, true);
+    } else {
+        *cte = "base64";
+        ok = base64Encode(data, n, out, true);
+    }
+    conv.release();
+    return ok && !out->failed;
+}
+
+private bool boundaryClash(Buf* kid, char* b) {
+    int bl = strlen(b);
+    for (int i = 0; i + 2 + bl <= kid->len; i++) {
+        if ((i == 0 || kid->d[i - 1] == 10) && kid->d[i] == '-' && kid->d[i + 1] == '-' && memcmp(&kid->d[i + 2], b, bl) == 0) return true;
+    }
+    return false;
+}
+
+// writes the part: its header fields, an empty line and the body (a multipart: the child parts between boundary lines). root: also MIME-Version.
+private bool writePart(Part* p, Buf* out, WriteOptions* o, bool root, int depth) {
+    if (depth > 20) { setErr("the part tree is too deep"); return false; }
+    // the fields that came with the part
+    Headers* h = p->headers;
+    for (int i = 0; i < h->count; i++) {
+        if (generatedField(h->items[i]->name)) continue;
+        if (!foldHeader(out, h->items[i]->name, h->items[i]->value, strlen(h->items[i]->value))) { setErr("a header field cannot be written"); return false; }
+    }
+    if (root) out->addText("MIME-Version: 1.0\r\n");
+    Buf hv;
+    char* tp = p->type;
+    char* stp = p->subtype;
+    if (p->isMultipart() && p->nchildren > 0) {
+        // the children first (the boundary must not occur in them)
+        int nk = p->nchildren;
+        Buf** kb = (Buf**) malloc(nk * 8);
+        if (kb == null) { setErr("out of memory"); return false; }
+        bool ok = true;
+        int made = 0;
+        for (int i = 0; i < nk && ok; i++) {
+            kb[i] = newBuf(o->maxSize);
+            made++;
+            if (kb[i] == null) { ok = false; break; }
+            ok = writePart(p->children[i], kb[i], o, false, depth + 1);
+        }
+        char b[80];
+        if (ok) {
+            int tries = 0;
+            for (;;) {
+                if (p->boundary != null && validBoundary(p->boundary) && tries == 0) {
+                    int bl = strlen(p->boundary);
+                    memcpy(&b[0], p->boundary, bl);
+                    b[bl] = 0;
+                } else {
+                    newBoundary(o, &b[0]);
+                }
+                bool clash = false;
+                for (int i = 0; i < nk && !clash; i++) clash = boundaryClash(kb[i], &b[0]);
+                if (!clash) break;
+                tries++;
+                if (tries > 20) { ok = false; setErr("no boundary that does not occur in the parts"); break; }
+                if (p->boundary != null && tries == 1) { free(p->boundary); p->boundary = null; }
+            }
+        }
+        if (ok) {
+            if (p->boundary == null || !streq(p->boundary, &b[0])) setField(&p->boundary, &b[0], strlen(&b[0]));
+            hv.addText(tp);
+            hv.addByte('/');
+            hv.addText(stp);
+            writeParam(&hv, "boundary", &b[0]);
+            writeField(out, "Content-Type", &hv);
+            out->add("\r\n", 2);
+            for (int i = 0; i < nk; i++) {
+                out->add("--", 2);
+                out->addText(&b[0]);
+                out->add("\r\n", 2);
+                out->add(kb[i]->d == null ? "" : kb[i]->d, kb[i]->len);
+                out->add("\r\n", 2);
+            }
+            out->add("--", 2);
+            out->addText(&b[0]);
+            out->add("--\r\n", 4);
+        }
+        for (int i = 0; i < made; i++) freeBuf(kb[i]);
+        free((char*) kb);
+        hv.release();
+        if (!ok && lastErr[0] == 0) setErr("the message is too big");
+        return ok && !out->failed;
+    }
+    // a leaf
+    Buf body;
+    body.max = o->maxSize;
+    char* cte = "7bit";
+    char* cs = null;
+    if (!encodeLeaf(p, o, &body, &cte, &cs)) { body.release(); hv.release(); setErr("the message is too big"); return false; }
+    hv.addText(tp);
+    hv.addByte('/');
+    hv.addText(stp);
+    if (cs != null) writeParam(&hv, "charset", cs);
+    if (p->filename != null && p->disposition == null) writeParam(&hv, "name", p->filename);
+    writeField(out, "Content-Type", &hv);
+    hv.clear();
+    hv.addText(cte);
+    writeField(out, "Content-Transfer-Encoding", &hv);
+    if (p->disposition != null) {
+        hv.clear();
+        hv.addText(p->disposition);
+        if (p->filename != null) writeParam(&hv, "filename", p->filename);
+        writeField(out, "Content-Disposition", &hv);
+    }
+    if (p->contentId != null) {
+        hv.clear();
+        hv.addByte('<');
+        hv.addText(p->contentId);
+        hv.addByte('>');
+        writeField(out, "Content-ID", &hv);
+    }
+    out->add("\r\n", 2);
+    out->add(body.d == null ? "" : body.d, body.len);
+    body.release();
+    hv.release();
+    return !out->failed;
+}
+
+// Writes the part tree as a message (CRLF line ends, header fields folded, bodies encoded: see WriteOptions). The result is a new heap string with *outLen bytes; null on
+// failure (error()). A part with an encoding that is set keeps it when it is possible. Boundaries that are missing are made (and stored in the parts).
+public char* serialize(Part* p, WriteOptions* opt, int* outLen) {
+    WriteOptions def;
+    if (opt == null) { def.maxSize = MAX_SIZE; opt = &def; }
+    lastErr[0] = 0;
+    Buf out;
+    out.max = opt->maxSize;
+    if (!writePart(p, &out, opt, true, 0)) {
+        out.release();
+        if (lastErr[0] == 0) setErr("the message is too big");
+        return null;
+    }
+    if (outLen != null) *outLen = out.len;
+    char* r = out.take();
+    return r;
+}
+
+// ---- the builder -------------------------------------------------------------------------------------------------------------------------
+private class Attachment {
+    public char* filename;
+    public char* type;
+    public char* subtype;
+    public char* cid;
+    public char* data;
+    public int len;
+    public bool inl;
+}
+
+public class Message {
+    public AddressList* fromList;
+    public AddressList* toList;
+    public AddressList* ccList;
+    public AddressList* bccList;
+    public AddressList* replyToList;
+    public char* subjectText;
+    public char* textBody;
+    public int textLen;
+    public char* htmlBody;
+    public int htmlLen;
+    public char* charset;               // "utf-8" (default) or "iso-8859-1" for the text and html parts
+    public int dateUnix;
+    public int dateOffset;
+    public bool hasDate;
+    public char* messageId;             // null: a new one is made by build()
+    public char* inReplyToId;
+    public char* referencesIds;
+    public Headers* extra;
+    public Attachment** atts;
+    public int natts;
+    public int catts;
+    public bool allow8bit;
+    public bool includeBcc;             // write a Bcc field (default: no, the recipients are only in the envelope)
+    public char* boundaryPrefix;        // for tests: boundaries are prefix + counter
+    public bool needs8bit;              // OUT of build(): the message has 8-bit parts
+
+    // Adds mailboxes to the From field ("Ann <ann@example.org>", several separated by commas). false (and nothing is added) when one is not valid.
+    public bool from(char* mailboxes) { return addAddr(&fromList, mailboxes); }
+    public bool to(char* mailboxes) { return addAddr(&toList, mailboxes); }
+    public bool cc(char* mailboxes) { return addAddr(&ccList, mailboxes); }
+    public bool bcc(char* mailboxes) { return addAddr(&bccList, mailboxes); }
+    public bool replyTo(char* mailboxes) { return addAddr(&replyToList, mailboxes); }
+
+    private bool addAddr(AddressList** l, char* mailboxes) {
+        AddressList tmp;
+        int k = parseAddressList(mailboxes, strlen(mailboxes), &tmp);
+        if (k < 0) { tmp.dispose(); return false; }
+        if (*l == null) *l = newAddressList();
+        if (*l == null) { tmp.dispose(); return false; }
+        for (int i = 0; i < tmp.count; i++) (*l)->add(tmp.items[i]->name, strlen(tmp.items[i]->name), tmp.items[i]->addr, strlen(tmp.items[i]->addr));
+        tmp.dispose();
+        return true;
+    }
+
+    // the subject (UTF-8); false when it has a CR or LF
+    public bool subject(char* s) {
+        if (!validHeaderValue(s)) return false;
+        setField(&subjectText, s, strlen(s));
+        return true;
+    }
+
+    // the plain text body (UTF-8, any line ends)
+    public bool text(char* s) {
+        setField(&textBody, s, strlen(s));
+        textLen = strlen(s);
+        return textBody != null;
+    }
+
+    public bool html(char* s) {
+        setField(&htmlBody, s, strlen(s));
+        htmlLen = strlen(s);
+        return htmlBody != null;
+    }
+
+    // the date of the Date field (default: now), in a zone offsetMinutes ahead of UTC
+    public void setDate(int unix, int offsetMinutes) {
+        dateUnix = unix;
+        dateOffset = offsetMinutes;
+        hasDate = true;
+    }
+
+    // a Message-ID "<local@domain>" (default: made by build()); false when it is not in that form
+    public bool setMessageId(char* id) {
+        if (!validMessageId(id, strlen(id))) return false;
+        setField(&messageId, id, strlen(id));
+        return true;
+    }
+
+    public bool inReplyTo(char* id) {
+        if (!validMessageId(id, strlen(id))) return false;
+        setField(&inReplyToId, id, strlen(id));
+        return true;
+    }
+
+    // the References field: message ids separated by blanks
+    public bool references(char* ids) {
+        int n = strlen(ids);
+        int i = 0;
+        while (i < n) {
+            while (i < n && isWsp(ids[i] & 255)) i++;
+            int a = i;
+            while (i < n && !isWsp(ids[i] & 255)) i++;
+            if (i > a && !validMessageId(&ids[a], i - a)) return false;
+        }
+        setField(&referencesIds, ids, n);
+        return true;
+    }
+
+    // another header field (X-Mailer, List-Id ...); false when the name or value is not valid or the field is one that the builder writes itself
+    public bool header(char* name, char* value) {
+        if (!validHeaderName(name) || !validHeaderValue(value)) return false;
+        int n = strlen(name);
+        if (eqNoCase(name, n, "From") || eqNoCase(name, n, "To") || eqNoCase(name, n, "Cc") || eqNoCase(name, n, "Bcc") || eqNoCase(name, n, "Subject") || eqNoCase(name, n, "Date")
+            || eqNoCase(name, n, "Message-ID") || eqNoCase(name, n, "MIME-Version") || eqNoCase(name, n, "Reply-To") || eqNoCase(name, n, "In-Reply-To") || eqNoCase(name, n, "References")
+            || (n >= 8 && eqNoCase(name, 8, "Content-"))) return false;
+        if (extra == null) extra = (Headers*) malloc(sizeof(Headers));
+        if (extra == null) return false;
+        return extra->add(name, value);
+    }
+
+    private bool addAtt(char* filename, char* type, char* data, int n, char* cid, bool inl) {
+        if (filename == null || type == null || n < 0) return false;
+        int tl = strlen(type);
+        int slash = -1;
+        for (int i = 0; i < tl; i++) { if (type[i] == '/') { slash = i; break; } }
+        if (slash < 1 || slash >= tl - 1 || tl > 100) return false;
+        for (int i = 0; i < tl; i++) { if (i != slash && !isTokenChar(type[i] & 255)) return false; }
+        if (cid != null) {
+            int cl = strlen(cid);
+            if (cl == 0 || cl > 200) return false;
+            for (int i = 0; i < cl; i++) { if (!isAtext(cid[i] & 255) && cid[i] != '.' && cid[i] != '@') return false; }
+        }
+        if (natts >= 1000) return false;
+        Attachment* a = (Attachment*) malloc(sizeof(Attachment));
+        if (a == null) return false;
+        Buf fn;
+        int fl = strlen(filename);
+        if (fl > 255) fl = 255;
+        for (int i = 0; i < fl; i++) {
+            int c = filename[i] & 255;
+            fn.addByte((c < 32 || c == 127) ? '_' : c);
+        }
+        a->filename = fn.take();
+        a->type = copyLower(type, slash);
+        a->subtype = copyLower(&type[slash + 1], tl - slash - 1);
+        a->cid = cid == null ? null : copyText(cid);
+        a->data = malloc(n + 1);
+        if (a->data == null) { free(a->filename); free(a->type); free(a->subtype); if (a->cid != null) free(a->cid); free((char*) a); return false; }
+        if (n > 0) memcpy(a->data, data, n);
+        a->len = n;
+        a->inl = inl;
+        if (natts >= catts) {
+            int nc = catts == 0 ? 4 : catts * 2;
+            Attachment** na = (Attachment**) malloc(nc * 8);
+            if (na == null) return false;
+            for (int i = 0; i < natts; i++) na[i] = atts[i];
+            if (atts != null) free((char*) atts);
+            atts = na;
+            catts = nc;
+        }
+        atts[natts] = a;
+        natts++;
+        return true;
+    }
+
+    // an attachment (Content-Disposition: attachment); type is "application/pdf" and so on; the data is copied. The file name is cut at 255 bytes, control characters become "_"
+    public bool attach(char* filename, char* type, char* data, int n) { return addAtt(filename, type, data, n, null, false); }
+
+    // a picture or file that the HTML text uses as <img src="cid:logo1"> (multipart/related)
+    public bool attachInline(char* filename, char* type, char* data, int n, char* cid) { return cid != null && addAtt(filename, type, data, n, cid, true); }
+
+    // a whole message (as a file of type message/rfc822)
+    public bool attachMessage(char* filename, char* data, int n) { return addAtt(filename, "message/rfc822", data, n, null, false); }
+
+    // the envelope recipients: To, Cc and Bcc, each address once (compared without regard to case). A list that is yours.
+    public AddressList* recipients() {
+        AddressList* r = newAddressList();
+        if (r == null) return null;
+        AddressList* lists[3];
+        lists[0] = toList; lists[1] = ccList; lists[2] = bccList;
+        for (int k = 0; k < 3; k++) {
+            if (lists[k] == null) continue;
+            for (int i = 0; i < lists[k]->count; i++) {
+                char* a = lists[k]->items[i]->addr;
+                bool dup = false;
+                for (int j = 0; j < r->count; j++) {
+                    if (eqNoCase(a, strlen(a), r->items[j]->addr)) { dup = true; break; }
+                }
+                if (!dup) r->add("", 0, a, strlen(a));
+            }
+        }
+        return r;
+    }
+
+    // the address for MAIL FROM: the first From address, or null
+    public char* sender() { return (fromList != null && fromList->count > 0) ? fromList->items[0]->addr : null; }
+
+    private Part* textPart(char* sub, char* data, int n) {
+        Part* p = newPart();
+        if (p == null) return null;
+        setField(&p->subtype, sub, strlen(sub));
+        if (charset != null) setField(&p->charset, charset, strlen(charset));
+        p->body = copyN(data, n);
+        p->bodyLen = n;
+        return p;
+    }
+
+    private Part* container(char* sub) {
+        Part* p = newPart();
+        if (p == null) return null;
+        setType(p, "multipart", sub);
+        return p;
+    }
+
+    private Part* attPart(Attachment* a) {
+        Part* p = newPart();
+        if (p == null) return null;
+        setType(p, a->type, a->subtype);
+        setField(&p->disposition, a->inl ? "inline" : "attachment", a->inl ? 6 : 10);
+        setField(&p->filename, a->filename, strlen(a->filename));
+        if (a->cid != null) setField(&p->contentId, a->cid, strlen(a->cid));
+        p->body = copyN(a->data, a->len);
+        p->bodyLen = a->len;
+        return p;
+    }
+
+    private void addMailboxes(Part* root, char* name, AddressList* l) {
+        if (l == null || l->count == 0) return;
+        Buf v;
+        formatAddressList(&v, l);
+        root->headers->addRaw(name, strlen(name), v.d == null ? "" : v.d, v.len);
+        v.release();
+    }
+
+    // Builds the message: the fields From, To, Cc, Reply-To, Subject, Date and Message-ID (made when you have not set them), In-Reply-To, References, your own fields,
+    // MIME-Version and the body as a MIME tree: text only: one part; text and html: multipart/alternative; inline attachments: multipart/related around the html;
+    // attachments: multipart/mixed. Returns the message (heap, CRLF line ends, 7-bit clean unless allow8bit) and its length in *outLen; null on failure (error()):
+    // no From, no recipients, over the size limit.
+    public char* build(int* outLen) {
+        lastErr[0] = 0;
+        if (fromList == null || fromList->count == 0) { setErr("a message needs a From address"); return null; }
+        if ((toList == null || toList->count == 0) && (ccList == null || ccList->count == 0) && (bccList == null || bccList->count == 0)) { setErr("a message needs a recipient"); return null; }
+        // the body parts
+        Part* textP = null;
+        Part* htmlP = null;
+        if (textBody != null) textP = textPart("plain", textBody, textLen);
+        if (htmlBody != null) htmlP = textPart("html", htmlBody, htmlLen);
+        int nInline = 0;
+        int nAttach = 0;
+        for (int i = 0; i < natts; i++) { if (atts[i]->inl) nInline++; else nAttach++; }
+        if (textP == null && htmlP == null && nAttach == 0 && nInline == 0) textP = textPart("plain", "", 0);
+        Part* display = null;
+        Part* htmlSide = htmlP;
+        if (htmlP != null && nInline > 0) {
+            Part* rel = container("related");
+            rel->addChild(htmlP);
+            for (int i = 0; i < natts; i++) { if (atts[i]->inl) rel->addChild(attPart(atts[i])); }
+            htmlSide = rel;
+        }
+        if (textP != null && htmlSide != null) {
+            display = container("alternative");
+            display->addChild(textP);
+            display->addChild(htmlSide);
+        } else if (htmlSide != null) {
+            display = htmlSide;
+        } else {
+            display = textP;
+        }
+        // inline attachments without an html part are plain attachments
+        Part* root = display;
+        if (nAttach > 0 || (nInline > 0 && htmlP == null)) {
+            root = container("mixed");
+            if (display != null) root->addChild(display);
+            for (int i = 0; i < natts; i++) {
+                if (atts[i]->inl && htmlP != null) continue;
+                root->addChild(attPart(atts[i]));
+            }
+        }
+        // the header fields
+        Headers* h = root->headers;
+        addMailboxes(root, "From", fromList);
+        addMailboxes(root, "To", toList);
+        addMailboxes(root, "Cc", ccList);
+        if (includeBcc) addMailboxes(root, "Bcc", bccList);
+        addMailboxes(root, "Reply-To", replyToList);
+        if (subjectText != null) {
+            Buf v;
+            Buf clean;
+            utf8Sanitize(subjectText, strlen(subjectText), &clean);
+            encodeWords(clean.d == null ? "" : clean.d, clean.len, &v);
+            h->addRaw("Subject", 7, v.d == null ? "" : v.d, v.len);
+            v.release();
+            clean.release();
+        }
+        char date[64];
+        int dn = formatDate(hasDate ? dateUnix : datetime.now(), hasDate ? dateOffset : 0, &date[0], 64);
+        h->addRaw("Date", 4, &date[0], dn);
+        char mid[300];
+        int mn = 0;
+        if (messageId != null) {
+            mn = strlen(messageId);
+            if (mn > 290) mn = 290;
+            memcpy(&mid[0], messageId, mn);
+            mid[mn] = 0;
+        } else {
+            char* at = null;
+            char* fa = fromList->items[0]->addr;
+            for (int i = strlen(fa) - 1; i >= 0; i--) { if (fa[i] == '@') { at = &fa[i + 1]; break; } }
+            mn = newMessageId(at, &mid[0], 300);
+        }
+        h->addRaw("Message-ID", 10, &mid[0], mn);
+        if (inReplyToId != null) h->addRaw("In-Reply-To", 11, inReplyToId, strlen(inReplyToId));
+        if (referencesIds != null) h->addRaw("References", 10, referencesIds, strlen(referencesIds));
+        if (extra != null) {
+            for (int i = 0; i < extra->count; i++) h->addRaw(extra->items[i]->name, strlen(extra->items[i]->name), extra->items[i]->value, strlen(extra->items[i]->value));
+        }
+        WriteOptions wo;
+        wo.maxSize = MAX_SIZE;
+        wo.allow8bit = allow8bit;
+        wo.boundaryPrefix = boundaryPrefix;
+        char* r = serialize(root, &wo, outLen);
+        needs8bit = wo.needs8bit;
+        root->dispose();
+        return r;
+    }
+
+    public void dispose() {
+        if (fromList != null) fromList->dispose();
+        if (toList != null) toList->dispose();
+        if (ccList != null) ccList->dispose();
+        if (bccList != null) bccList->dispose();
+        if (replyToList != null) replyToList->dispose();
+        if (subjectText != null) free(subjectText);
+        if (textBody != null) free(textBody);
+        if (htmlBody != null) free(htmlBody);
+        if (charset != null) free(charset);
+        if (messageId != null) free(messageId);
+        if (inReplyToId != null) free(inReplyToId);
+        if (referencesIds != null) free(referencesIds);
+        if (boundaryPrefix != null) free(boundaryPrefix);
+        if (extra != null) { extra->dispose(); free((char*) extra); }
+        for (int i = 0; i < natts; i++) {
+            free(atts[i]->filename);
+            free(atts[i]->type);
+            free(atts[i]->subtype);
+            if (atts[i]->cid != null) free(atts[i]->cid);
+            free(atts[i]->data);
+            free((char*) atts[i]);
+        }
+        if (atts != null) free((char*) atts);
+        free((char*) this);
+    }
+
+    // the character set of the text and html parts: "utf-8" or "iso-8859-1" (characters that Latin-1 does not have become "?"); false for another name
+    public bool setCharset(char* cs) {
+        int id = charsetId(cs, strlen(cs));
+        if (id != CS_UTF8 && id != CS_LATIN1) return false;
+        setField(&charset, id == CS_UTF8 ? "utf-8" : "iso-8859-1", id == CS_UTF8 ? 5 : 10);
+        return true;
+    }
+
+    // deterministic boundaries ("prefix1", "prefix2" ...) for tests that compare bytes
+    public void setBoundaryPrefix(char* prefix) { setField(&boundaryPrefix, prefix, strlen(prefix)); }
+}
+
+public Message* newMessage() {
+    Message* m = (Message*) malloc(sizeof(Message));
+    return m;
+}

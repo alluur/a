@@ -233,6 +233,72 @@ public class Link {
         return 0;
     }
 
+    // Switches an open plain link to TLS as the CLIENT (STARTTLS of SMTP and POP3, AUTH TLS of FTP): the handshake blocks up to timeoutMs
+    // (at least one second). false when the link is not open and plain, or the handshake failed (the link is closed then; error says why).
+    // Nothing the peer sent in plain text may be waiting unread: the caller must have used every byte it received (a server that adds plain
+    // text after its "go ahead" must not be able to make the client treat that text as the answer to a later command).
+    public bool startTls(char* hostName, bool verify, int timeoutMs) {
+        if (fd < 0 || secure || ast != 0) { error = "the link is not an open plain connection"; return false; }
+        error = null;
+        tlsEof = false;
+        if (rbuf == null) rbuf = malloc(4096);
+        if (rbuf == null) { error = "out of memory"; close(); return false; }
+        host = copyText(hostName);
+        if (host == null) { error = "out of memory"; close(); return false; }
+        t = tls.client(host, verify);
+        secure = true;
+        if (!handshake(timeoutMs < 1000 ? 1000 : timeoutMs)) {
+            char* why = error;
+            close();
+            error = why;
+            return false;
+        }
+        return true;
+    }
+
+    // Takes over a connected socket that accept() made (the link owns it from now on and closes it). mode 0: plain, ready at once.
+    // mode 1: TLS as a client of hostName (the certificate is checked when verify is true); mode 2: TLS as a SERVER with cfg. The handshake of the modes 1 and 2
+    // is a state machine like openStart's: call openStep() until it says 1 (or finish(ms) to wait). FTPS data connections: the FTP client is
+    // always the TLS client and the server always the TLS server, whichever side made the TCP connection (RFC 4217).
+    public bool adopt(int sock, int mode, char* hostName, bool verify, tls.Config* cfg, int timeoutMs) {
+        close();
+        error = null;
+        tlsEof = false;
+        if (sock < 0) { error = "no socket"; return false; }
+        fd = sock;
+        net.setNoDelay(fd, true);
+        net.setNonBlocking(fd, true);
+        rbuf = malloc(4096);
+        if (rbuf == null) { error = "out of memory"; close(); return false; }
+        if (mode == 0) return true;
+        if (mode == 1) {
+            host = copyText(hostName == null ? "" : hostName);
+            if (host == null) { error = "out of memory"; close(); return false; }
+            t = tls.client(host, verify);
+        } else {
+            if (cfg == null) { error = "no TLS configuration"; close(); return false; }
+            t = tls.accept(cfg);
+        }
+        secure = true;
+        atls = timeoutMs < 1000 ? 1000 : timeoutMs;
+        adeadline = millis() + atls;
+        ast = 2;
+        return true;
+    }
+
+    // waits (running the idle hook) until the handshake of an openStart / adopt is over: true when open, false when it failed or ms passed
+    public bool finish(int ms) {
+        int t0 = millis();
+        for (;;) {
+            int r = openStep();
+            if (r > 0) return true;
+            if (r < 0) return false;
+            if (millis() - t0 > ms) { error = "timed out"; close(); return false; }
+            if (ast == 1) net.waitWritable(fd, 5); else net.rawWaitReadable(fd, 5);
+        }
+        return false;
+    }
+
     private bool handshake(int timeoutMs) {
         int t0 = millis();
         for (;;) {
