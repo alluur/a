@@ -1400,7 +1400,14 @@ parse_primary:
     je .flt
     cmp eax, T_SCOPE
     je .scope
+    cmp eax, T_ISTR
+    je .istr
     ERR "expected an expression"
+
+; $"text {expr:spec}"  - see interp.asm
+.istr:
+    call parse_interp
+    jmp .out
 
 .flt:
     mov rdi, [tk_val]

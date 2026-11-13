@@ -29,6 +29,7 @@ section .text
 %include "foreach.asm"
 %include "tuple.asm"
 %include "lambda.asm"
+%include "interp.asm"
 %include "switch.asm"
 %include "decl.asm"
 %include "pp.asm"

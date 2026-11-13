@@ -124,6 +124,7 @@
 %define K_DEFER         199     ; defer expression;
 %define K_DOUBLE        198     ; double, float     ; asm(a, b, c) { x64: ...; arm64: ...; }
 %define K_FOREACH       203     ; foreach (T x in values) ...
+%define T_ISTR          204     ; $"text {expr} text": an interpolated string, tk_ptr / tk_len = the raw text between the quotes
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1
