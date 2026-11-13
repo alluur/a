@@ -1353,6 +1353,8 @@ gen_call:
 
 ; va_check: va_arg / va_count are only available in a function whose parameter list ends in ...
 va_check:
+    cmp dword [lam_depth], 0
+    jne .bad
     mov rax, [cur_func]
     test rax, rax
     jz .bad
@@ -1476,6 +1478,10 @@ parse_primary:
 .this1:
     cmp dword [cur_static], 0
     je .this2
+    cmp dword [lam_depth], 0
+    je .this1a
+    ERR "'this' cannot be used in a lambda: pass the object as a parameter"
+.this1a:
     ERR "'this' cannot be used in a static method"
 .this2:
     mov edi, [cur_this_off]
@@ -1807,8 +1813,25 @@ parse_primary:
 .paren:
     mov r12, [tk_start]                 ; this '(' : a tuple literal here may be the whole expression that has a known tuple type
     call next_token
+    cmp qword [tk], ')'
+    je .lam                             ; () => ...
     call is_type_start
+    mov r13d, eax                       ; 1: a type starts here
     test eax, eax
+    jnz .la
+    cmp qword [tk], T_ID                ; (a, b) => ...   (a) => ...   but not (a + b)
+    jne .notlam
+    call tuple_peek_char
+    cmp eax, ','
+    je .la
+    cmp eax, ')'
+    jne .notlam
+.la:
+    call lambda_ahead                   ; is the matching ')' followed by => ?
+    test eax, eax
+    jnz .lam
+.notlam:
+    test r13d, r13d
     jnz .cast
     xor r13d, r13d
     cmp r12, [tup_expect_tok]
@@ -1830,6 +1853,10 @@ parse_primary:
 .tuple:
     mov rdi, r13                        ; (a, b, ...) : a tuple literal
     call parse_tuple_rest
+    jmp .out
+.lam:
+    xor edi, edi                        ; (parameters) => body
+    call parse_lambda
     jmp .out
 .cast:
     call parse_type
@@ -2078,6 +2105,24 @@ parse_primary:
 .id:
     mov r13, [tk_ptr]
     mov r14d, [tk_len]
+    mov rsi, [src_ptr]                  ; x => body : a lambda with one parameter
+    movzx eax, byte [rsi]
+    cmp eax, ' '
+    jne .noarrow0
+.arrsp:
+    inc rsi
+    movzx eax, byte [rsi]
+    cmp eax, ' '
+    je .arrsp
+.noarrow0:
+    cmp eax, '='
+    jne .noarrow
+    cmp byte [rsi+1], '>'
+    jne .noarrow
+    mov edi, 1
+    call parse_lambda
+    jmp .out
+.noarrow:
     cmp r14d, 6
     jne .nova1
     cmp dword [r13], 'va_a'
@@ -2175,6 +2220,18 @@ parse_primary:
     ERR "a type name cannot be used as a value"
 
 .local:
+    cmp dword [lam_depth], 0
+    je .local0
+    mov rax, r12                        ; inside a lambda: only its own parameters and locals can be used
+    sub rax, symtab
+    shr rax, 6
+    cmp eax, [lam_sym_base]
+    jae .local0
+    mov [tk_ptr], r13
+    mov [tk_len], r14d
+    mov edi, msg_lam_capture
+    jmp fatal_error_tok
+.local0:
     test dword [r12+SYM_FLAGS], F_BYREF
     jz .local1
     mov edi, [r12+SYM_VAL]
@@ -2475,6 +2532,10 @@ parse_primary:
 .implicit_field:
     cmp dword [cur_static], 0
     je .ifs
+    cmp dword [lam_depth], 0
+    je .ifs0
+    ERR "a lambda has no object: it cannot use a field of the enclosing class (pass what it needs as a parameter)"
+.ifs0:
     ERR "a static method has no object: this field needs one"
 .ifs:
     mov r12, rax
@@ -2516,6 +2577,10 @@ parse_primary:
     jnz .im_static
     cmp dword [cur_static], 0
     je .im2
+    cmp dword [lam_depth], 0
+    je .im1a
+    ERR "a lambda has no object: it cannot call a method of the enclosing class without an object (pass the object as a parameter)"
+.im1a:
     ERR "a static method has no object: this method needs one"
 .im2:
     mov edi, [cur_this_off]

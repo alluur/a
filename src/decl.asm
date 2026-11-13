@@ -291,6 +291,9 @@ compile_function:
     mov r12, rdi
     mov r13d, [sym_count]
     mov [cur_func], r12
+    mov rax, [r12+SYM_TYPE]
+    mov [ret_type], rax
+    mov dword [lam_depth], 0
     call define_function
     CG prologue
     mov dword [frame_size], 0

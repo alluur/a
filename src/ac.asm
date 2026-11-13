@@ -28,6 +28,7 @@ section .text
 %include "stmt.asm"
 %include "foreach.asm"
 %include "tuple.asm"
+%include "lambda.asm"
 %include "switch.asm"
 %include "decl.asm"
 %include "pp.asm"

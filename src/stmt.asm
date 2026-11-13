@@ -395,33 +395,28 @@ parse_return:
     call next_token
     cmp qword [tk], ';'
     je .void
-    mov rax, [cur_func]
-    test rax, rax
-    jz .nx
-    mov rdi, [rax+SYM_TYPE]
+    cmp qword [cur_func], 0
+    je .nx
+    mov rdi, [ret_type]
     call tuple_expect_here              ; return (a, b);  in a function that returns a tuple
 .nx:
     call parse_expr
     call to_rvalue
-    mov rax, [cur_func]
-    test rax, rax
-    jz .j
-    mov rdi, [rax+SYM_TYPE]
+    cmp qword [cur_func], 0
+    je .j
+    mov rdi, [ret_type]
     call coerce_to                      ; int <-> double
-    mov rax, [cur_func]
-    mov rdi, [rax+SYM_TYPE]
+    mov rdi, [ret_type]
     call tuple_check
-    mov rax, [cur_func]
-    cmp qword [rax+SYM_TYPE], TY_BOOL
+    cmp qword [ret_type], TY_BOOL
     jne .notbool
     CG tobool
     jmp .j
 .notbool:
-    mov rdi, [rax+SYM_TYPE]
+    mov rdi, [ret_type]
     call emit_normalize                 ; a narrow result is returned truncated and extended
-    mov rax, [cur_func]
     ; a struct result is copied to the address that the caller passed as the hidden last argument
-    mov rdx, [rax+SYM_TYPE]
+    mov rdx, [ret_type]
     test edx, 0xFF00
     jnz .j
     cmp dl, TY_STRUCT

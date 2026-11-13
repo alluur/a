@@ -78,6 +78,7 @@
 %define T_ANDANDEQ      156     ; &&=
 %define T_QQEQ          157     ; ??=
 %define T_DOTDOTEQ      158     ; ..=  inclusive range: foreach (int i in 1..=10)
+%define T_FATARROW      159     ; =>   lambda: (int a, int b) => a + b
 ; keywords
 %define K_INT           160
 %define K_CHAR          161
@@ -390,6 +391,7 @@
     %1 cmp_ugt
     %1 cmp_ule
     %1 cmp_uge
+    %1 lea_code_a          ; rdi = code position (of this output) -> A = the address of that code (position independent, no relocation)
 %endmacro
 
 %assign CGI_COUNT 0

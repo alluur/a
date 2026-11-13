@@ -733,6 +733,33 @@ a64_lea_func_a:
     pop rdi
     ret
 
+; rdi = a position in the code buffer -> A = its address:  adr x0, target  (+-1 MiB; position independent)
+a64_lea_code_a:
+    push rax
+    push rdx
+    push rdi
+    mov rax, rdi
+    sub rax, [code_pos]
+    lea rdx, [rax + 0x100000]
+    cmp rdx, 0x1FFFFF
+    ja .far
+    mov edx, eax
+    and edx, 3
+    shl edx, 29                     ; immlo
+    sar rax, 2
+    and eax, 0x7FFFF
+    shl eax, 5                      ; immhi
+    or eax, edx
+    or eax, 0x10000000              ; adr x0, ...
+    mov edi, eax
+    call emit_d
+    pop rdi
+    pop rdx
+    pop rax
+    ret
+.far:
+    ERR "a lambda is more than 1 MiB away from the place that uses it (AArch64 adr range)"
+
 a64_call_a:
     A64 0xD63F0000                  ; blr x0
     ret

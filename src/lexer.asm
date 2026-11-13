@@ -94,6 +94,7 @@ ops2:
     db "^^", T_XORXOR
     db "??", T_QQ
     db "..", T_DOTDOT
+    db "=>", T_FATARROW
     db 0
 singles:
     db "(){}[];,.:?~=!<>&|^+-*/%", 0

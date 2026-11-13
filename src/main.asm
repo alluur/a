@@ -2383,6 +2383,9 @@ field_count:    resd 1
 field_limit:    resd 1                  ; the fields of tuple types are made downwards from FIELD_MAX
 tup_expect:     resq 1                  ; the tuple type that the expression starting at tup_expect_tok has to have
 tup_expect_tok: resq 1
+ret_type:       resq 1                  ; the result type of the function (or lambda) being compiled
+lam_depth:      resd 1                  ; > 0 while the body of a lambda is compiled
+lam_sym_base:   resd 1                  ; symbol count at the start of the innermost lambda: older locals cannot be used
 file_count:     resd 1
 cur_module:     resd 1
 cur_file_id:    resd 1

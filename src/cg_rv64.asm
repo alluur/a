@@ -837,6 +837,33 @@ rv64_lea_func_a:
     pop rdi
     ret
 
+; rdi = a position in the code buffer -> A = its address:  auipc a0, hi20 ; addi a0, a0, lo12  (position independent)
+rv64_lea_code_a:
+    push rax
+    push rdx
+    push rdi
+    mov rax, rdi
+    sub rax, [code_pos]             ; offset from the auipc
+    lea rdx, [rax + 0x800]
+    sar rdx, 12                     ; hi20
+    mov rdi, rdx
+    shl rdi, 12
+    sub rax, rdi                    ; lo12, -2048 .. 2047
+    and edx, 0xFFFFF
+    shl edx, 12
+    or edx, (A0 << 7) | 0x17        ; auipc a0, hi20
+    mov edi, edx
+    call emit_d
+    and eax, 0xFFF
+    shl eax, 20
+    or eax, RV_I(0, A0, 0, A0, 0x13)    ; addi a0, a0, lo12
+    mov edi, eax
+    call emit_d
+    pop rdi
+    pop rdx
+    pop rax
+    ret
+
 rv64_call_a:
     RV RV_I(0, A0, 0, RA, 0x67)     ; jalr ra, 0(a0)
     ret
