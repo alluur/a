@@ -86,6 +86,7 @@ public class EntryList {
     public int count;
     public int cap;
     public int unparsed;            // lines of a listing that were not understood
+    public bool heap;               // made by newEntryList() (listEntries): dispose() frees the object too
 
     public Entry* get(int i) { return (i >= 0 && i < count) ? items[i] : null; }
 
@@ -127,10 +128,18 @@ public class EntryList {
         items = null;
         count = 0;
         cap = 0;
+        if (heap) {
+            heap = false;
+            free((char*) this);
+        }
     }
 }
 
-public EntryList* newEntryList() { return (EntryList*) malloc(sizeof(EntryList)); }
+public EntryList* newEntryList() {
+    EntryList* l = (EntryList*) malloc(sizeof(EntryList));
+    if (l != null) l->heap = true;
+    return l;
+}
 
 private int monthOf(char* s, int n) {
     if (n != 3) return 0;
@@ -714,6 +723,15 @@ public class Client {
         return true;
     }
 
+    // PROT C: data connections in the clear (when the server allows it); true when the server said 200
+    public bool protC() {
+        int c = command("PROT C");
+        if (c < 0) return false;
+        if (c != 200) return replyFail("PROT C refused");
+        dataProtected = false;
+        return true;
+    }
+
     // TYPE I (binary) or TYPE A (text: CRLF on the wire, LF in the files and buffers of this side)
     public bool type(bool isBinary) {
         if (typeKnown && binary == isBinary) return true;
@@ -875,12 +893,24 @@ public class Client {
         return null;
     }
 
-    // active mode: waits for the server to connect (only the address of the server is accepted) and makes the link
-    private netio.Link* acceptData() {
+    // Active mode: waits for the server to connect (only the address of the server is accepted) and makes the link. While it waits it also looks at the control connection: a reply
+    // there (a refusal such as 550, or the preliminary 150 that some servers send first) is read; *prelim tells that the 1xx reply has been read. With TLS the server does not
+    // send 150 before the handshake of the data connection is over, so the connection must be accepted before the reply is waited for.
+    private netio.Link* acceptData(bool* prelim, bool* consumed) {
         int t0 = millis();
         netio.Link* l = null;
+        *prelim = false;
+        *consumed = false;
+        bool refused = false;
         while (millis() - t0 < opt->dataTimeoutMs) {
-            if (!net.waitReadable(activeListener, 100)) continue;
+            if (conn->buffered() > 0 || conn->link->waitReadable(0)) {
+                int c = readReply();
+                if (c < 0) { closeActive(); *consumed = true; return null; }
+                if (c / 100 != 1) { closeActive(); *consumed = true; replyFail("the transfer was refused"); return null; }
+                *prelim = true;
+                continue;
+            }
+            if (!net.waitReadable(activeListener, 50)) continue;
             int s = net.acceptSome(activeListener);
             if (s < 0) continue;
             int pip = 0;
@@ -895,7 +925,7 @@ public class Client {
         net.close(activeListener);
         activeListener = -1;
         activePending = false;
-        if (l == null && lastErr[0] == 0) fail("the server did not connect for the data");
+        if (l == null && !refused && lastErr[0] == 0) fail("the server did not connect for the data");
         return l;
     }
 
@@ -919,7 +949,23 @@ public class Client {
         }
         char cmd[1100];
         if (path != null && path[0] != 0) format(&cmd[0], 1100, "%s %s", verb, path, 0, 0, 0, 0);
-        else format(&cmd[0], 1100, "%s", verb, 0, 0, 0, 0, 0);
+        else format(&cmd[0], 1100, "%s", verb, 0, 0, 0, 0, 0, 0);
+        if (activePending) {
+            if (!conn->writeLine(&cmd[0], opt->commandTimeoutMs)) { error = conn->error; breakConn(); closeActive(); return null; }
+            bool prelim = false;
+            bool consumed = false;
+            l = acceptData(&prelim, &consumed);
+            if (l == null) {
+                if (isOpen() && !consumed) { char* why = error; readReply(); error = why; }
+                return null;
+            }
+            if (!prelim) {
+                int c2 = readReply();
+                if (c2 < 0) { l->dispose(); return null; }
+                if (c2 / 100 != 1) { l->dispose(); replyFail("the transfer was refused"); return null; }
+            }
+            return l;
+        }
         int c = command(&cmd[0]);
         if (c < 0) { if (l != null) l->dispose(); closeActive(); return null; }
         if (c / 100 != 1) {
@@ -927,10 +973,6 @@ public class Client {
             closeActive();
             replyFail("the transfer was refused");
             return null;
-        }
-        if (activePending) {
-            l = acceptData();
-            if (l == null) { readReply(); return null; }
         }
         return l;
     }
