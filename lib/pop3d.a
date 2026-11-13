@@ -8,6 +8,8 @@
 //
 //  Commands: USER, PASS, APOP, STAT, LIST, UIDL, RETR, TOP, DELE, RSET, NOOP, QUIT, CAPA, STLS. At the login the files of new/ and cur/ are listed (at most maxMessages, 1000; a file whose
 //  name has a character outside 0x21 to 0x7E or is longer than 70 characters is skipped: the name is the UIDL) and their size as it goes over the wire (CRLF line ends) is counted.
+//  That counting reads every message once, so it is done in slices: at most scanBytesPerTurn bytes of files (2 MiB) and 200 files per turn of the server loop, and the "+OK n messages"
+//  that answers PASS comes when the last file is counted. Meanwhile the other connections are served as always (the connection that logs in does not read more commands: they wait).
 //  RETR sends the message in blocks of 32 KiB as the connection takes them (the output queue never holds more than a few blocks: a message of any size is no problem), with CRLF
 //  line ends, every line that starts with "." stuffed and a CRLF at the end. DELE only marks; QUIT deletes the marked files (a connection that breaks deletes nothing). The Maildir
 //  is not locked: two sessions for one user at once see the same files (the second to quit finds some already gone and says nothing).
@@ -67,6 +69,16 @@ public class Session {
     public int topLines;            // TOP: lines of the body still to send (-1: RETR, no limit)
     public bool inBody;
     public bool streaming;
+    // the login scan (sizes of the messages), done in slices
+    public bool scanning;
+    public int scanDir;             // 0: new/, 1: cur/, 2: done
+    public asys.DirList* scanList;  // the listing of the directory that is being walked (heap, or null)
+    public int scanPos;             // the next entry of it
+    public int scanFd;              // the message whose size is being counted (-1: none)
+    public Msg* scanMsg;
+    public int scanTotal;
+    public bool scanLastCr;
+    public int scanLast;
 }
 
 private char* copyText(char* s) {
@@ -84,6 +96,8 @@ public class Server {
     public bool requireTls;
     public bool apop;
     public int maxMessages;
+    public int scanBytesPerTurn;    // login: bytes of message files read per turn of the loop while the sizes are counted (default 2 MiB)
+    public int scanSteps;           // how many slices the logins needed in all (for tests and statistics)
     public int maxLoginFailures;
     public int maxLine;
     public int idleTimeoutMs;
@@ -102,6 +116,7 @@ public class Server {
     public Server() {
         hostname = "pop3d";
         maxMessages = 1000;
+        scanBytesPerTurn = 2097152;
         maxLoginFailures = 3;
         maxLine = 512;
         idleTimeoutMs = 600000;
@@ -192,6 +207,9 @@ public class Server {
         s->lines.maxLine = maxLine;
         s->lines.maxBuffer = 65536 + maxLine;
         s->fd = -1;
+        s->scanFd = -1;
+        s->scanList = null;
+        s->scanning = false;
         s->tlsOn = c->secure;
         s->lastCmd = millis();
         slist[nslist] = s;
@@ -222,8 +240,15 @@ public class Server {
         s->nmsgs = 0;
     }
 
+    private void scanEnd(Session* s) {
+        if (s->scanFd >= 0) { asys.fileClose(s->scanFd); s->scanFd = -1; }
+        if (s->scanList != null) { s->scanList->dispose(); free((char*) s->scanList); s->scanList = null; }
+        s->scanning = false;
+    }
+
     public void freeSession(Session* s) {
         if (s->fd >= 0) { asys.fileClose(s->fd); s->fd = -1; }
+        scanEnd(s);
         freeMsgs(s);
         for (int i = 0; i < nslist; i++) {
             if (slist[i] == s) { nslist--; slist[i] = slist[nslist]; slist[nslist] = null; break; }
@@ -250,7 +275,7 @@ public class Server {
         char* line = malloc(maxLine + 4);
         if (line == null) { s->closeAfter = true; return -1; }
         for (;;) {
-            if (s->closeAfter || s->streaming) break;                 // while a message is sent the next command waits (its bytes stay in the line parser)
+            if (s->closeAfter || s->streaming || s->scanning) break;  // while a message is sent or the mailbox is sized the next command waits (its bytes stay in the line parser)
             int k = s->lines.next(line, maxLine);
             if (k == -1) break;
             if (k == -2) { err(s, "line too long"); continue; }
@@ -406,7 +431,7 @@ public class Server {
         startSession(s, a);
     }
 
-    // after the login: the Maildir is listed
+    // after the login: the Maildir is listed and the sizes are counted, a slice per turn (scanStep); the answer to PASS is sent when that is done
     private void startSession(Session* s, Account* a) {
         s->acct = a;
         s->state = ST_TRANS;
@@ -414,65 +439,110 @@ public class Server {
         if (s->user != null) { free(s->user); s->user = null; }
         s->msgs = (Msg**) malloc((maxMessages + 1) * 8);
         if (s->msgs == null) { err(s, "out of memory"); s->closeAfter = true; return; }
+        s->scanning = true;
+        s->scanDir = 0;
+        s->scanPos = 0;
+        scanStep(s);
+    }
+
+    // one slice of the login scan; when it is not finished the connection is paused for a turn and the loop is told not to wait
+    public void scanStep(Session* s) {
+        scanSteps++;
+        Account* a = s->acct;
         char* subs[2];
         subs[0] = "new";
         subs[1] = "cur";
-        for (int d = 0; d < 2 && s->nmsgs < maxMessages; d++) {
-            char dir[500];
-            format(&dir[0], 500, "%s/%s", a->dir, subs[d], 0, 0, 0, 0);
-            asys.DirList dl;
-            if (asys.listDir(&dir[0], &dl) < 0) continue;
-            dl.sort(false, false);
-            for (int i = 0; i < dl.count && s->nmsgs < maxMessages; i++) {
-                char* nm = dl.name(i);
-                int nl = strlen(nm);
-                bool good = nl >= 1 && nl <= 70 && nm[0] != '.';
-                for (int k = 0; k < nl && good; k++) { if ((nm[k] & 255) < 33 || (nm[k] & 255) > 126) good = false; }
-                if (!good) continue;
-                char full[700];
-                format(&full[0], 700, "%s/%s", &dir[0], nm, 0, 0, 0, 0);
-                asys.Stat st;
-                if (asys.lstat(&full[0], &st) < 0 || !st.isFile()) continue;
-                Msg* m = (Msg*) malloc(sizeof(Msg));
-                if (m == null) break;
-                m->name = copyText(nm);
-                m->sub = subs[d];
-                m->size = wireSize(&full[0], st.size);
-                s->msgs[s->nmsgs] = m;
-                s->nmsgs++;
-            }
-            dl.dispose();
-        }
-        char t[100];
-        int total = 0;
-        for (int i = 0; i < s->nmsgs; i++) total = total + s->msgs[i]->size;
-        format(&t[0], 100, "%d messages (%d octets)", s->nmsgs, total, 0, 0, 0, 0);
-        ok(s, &t[0]);
-    }
-
-    // the size of a file as it is sent: every line end is CRLF, the last line ends with one (counted by reading the file)
-    private int wireSize(char* path, int rawSize) {
-        int fd = asys.fileOpen(path, asys.F_READ | asys.F_NOFOLLOW, 0);
-        if (fd < 0) return rawSize;
+        int bytes = scanBytesPerTurn < 4096 ? 4096 : scanBytesPerTurn;
+        int files = 0;
         if (chunk == null) chunk = malloc(65536 + 64);
-        int total = 0;
-        bool lastCr = false;
-        bool atStart = true;
-        int last = 10;
+        if (chunk == null) { scanEnd(s); err(s, "out of memory"); s->closeAfter = true; return; }
         for (;;) {
-            int n = asys.fileRead(fd, chunk, 32768);
-            if (n <= 0) break;
-            for (int i = 0; i < n; i++) {
-                int c = chunk[i] & 255;
-                if (c == 10 && !lastCr) total++;                       // an LF without CR becomes CRLF: one more
-                total++;
-                lastCr = c == 13;
-                last = c;
+            if (s->scanFd >= 0) {
+                // a message is being counted: its size as it is sent has every line end as CRLF and a CRLF at the end
+                bool eof = false;
+                while (bytes > 0) {
+                    int n = asys.fileRead(s->scanFd, chunk, bytes < 32768 ? bytes : 32768);
+                    if (n <= 0) { eof = true; break; }
+                    bytes = bytes - n;
+                    for (int i = 0; i < n; i++) {
+                        int c = chunk[i] & 255;
+                        if (c == 10 && !s->scanLastCr) s->scanTotal++;                // an LF without CR becomes CRLF: one more
+                        s->scanTotal++;
+                        s->scanLastCr = c == 13;
+                        s->scanLast = c;
+                    }
+                }
+                if (!eof) break;                                                       // the budget of this turn is spent
+                asys.fileClose(s->scanFd);
+                s->scanFd = -1;
+                if (s->scanTotal > 0 && s->scanLast != 10) s->scanTotal = s->scanTotal + 2;        // the CRLF that ends the last line
+                s->scanMsg->size = s->scanTotal;
+                s->scanMsg = null;
+            }
+            if (bytes <= 0 || files >= 200) break;
+            if (s->scanList == null) {
+                if (s->scanDir >= 2 || s->nmsgs >= maxMessages) {
+                    // done
+                    scanEnd(s);
+                    int total = 0;
+                    for (int i = 0; i < s->nmsgs; i++) total = total + s->msgs[i]->size;
+                    char t[100];
+                    format(&t[0], 100, "%d messages (%d octets)", s->nmsgs, total, 0, 0, 0, 0);
+                    ok(s, &t[0]);
+                    return;
+                }
+                char dir[500];
+                format(&dir[0], 500, "%s/%s", a->dir, subs[s->scanDir], 0, 0, 0, 0);
+                asys.DirList* fresh = (asys.DirList*) malloc(sizeof(asys.DirList));          // malloc (zeroed): `new` memory can never be freed
+                if (fresh == null) { scanEnd(s); err(s, "out of memory"); s->closeAfter = true; return; }
+                if (asys.listDir(&dir[0], fresh) < 0) {
+                    free((char*) fresh);
+                    s->scanDir++;
+                    continue;
+                }
+                fresh->sort(false, false);
+                s->scanList = fresh;
+                s->scanPos = 0;
+            }
+            asys.DirList* dl = s->scanList;
+            if (s->scanPos >= dl->count || s->nmsgs >= maxMessages) {
+                dl->dispose();
+                free((char*) dl);
+                s->scanList = null;
+                s->scanDir++;
+                continue;
+            }
+            char* nm = dl->name(s->scanPos);
+            s->scanPos++;
+            files++;
+            int nl = strlen(nm);
+            bool good = nl >= 1 && nl <= 70 && nm[0] != '.';
+            for (int k = 0; k < nl && good; k++) { if ((nm[k] & 255) < 33 || (nm[k] & 255) > 126) good = false; }
+            if (!good) continue;
+            char full[700];
+            format(&full[0], 700, "%s/%s/%s", a->dir, subs[s->scanDir], nm, 0, 0, 0);
+            asys.Stat st;
+            if (asys.lstat(&full[0], &st) < 0 || !st.isFile()) continue;
+            Msg* m = (Msg*) malloc(sizeof(Msg));
+            if (m == null) continue;
+            m->name = copyText(nm);
+            m->sub = subs[s->scanDir];
+            m->size = st.size;                                                         // until the count says otherwise (a file that cannot be opened keeps its size)
+            m->deleted = false;
+            s->msgs[s->nmsgs] = m;
+            s->nmsgs++;
+            int fd = asys.fileOpen(&full[0], asys.F_READ | asys.F_NOFOLLOW, 0);
+            if (fd >= 0) {
+                s->scanFd = fd;
+                s->scanMsg = m;
+                s->scanTotal = 0;
+                s->scanLastCr = false;
+                s->scanLast = 10;
             }
         }
-        asys.fileClose(fd);
-        if (total > 0 && last != 10) total = total + 2;                // the CRLF that ends the last line
-        return total;
+        // not finished: the other connections get their turn
+        net->pause(s->conn, 1073741824);
+        net->wake();
     }
 
     private void cmdStat(Session* s) {
@@ -612,7 +682,7 @@ public class Server {
         for (int i = 0; i < nslist; i++) {
             Session* s = slist[i];
             if (s->closeAfter || idleTimeoutMs <= 0) continue;
-            if (!s->streaming && now - s->lastCmd > idleTimeoutMs) {
+            if (!s->streaming && !s->scanning && now - s->lastCmd > idleTimeoutMs) {
                 err(s, "idle time out");
                 s->closeAfter = true;
                 net->close(s->conn);
@@ -645,8 +715,9 @@ private int popResume(netsrv.Server* ns, netsrv.Conn* c) {
     Server* sv = (Server*) ns->user;
     Session* s = (Session*) c->user;
     if (s == null) return 0;
+    if (s->scanning) sv->scanStep(s);
     if (s->streaming) sv->pumpMessage(s);
-    if (!s->streaming) sv->feed(s, "", 0);                       // commands that arrived while the message was sent
+    if (!s->streaming && !s->scanning) sv->feed(s, "", 0);        // commands that arrived while the message was sent or the mailbox was sized
     if (s->closeAfter) ns->close(c);
     return 0;
 }
