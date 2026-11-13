@@ -333,6 +333,14 @@ parse_for:
     call next_token
     jmp .cond
 .init:
+    cmp qword [tk], '('
+    jne .init0
+    call tuple_stmt_kind                ; for ((a, b) = (0, 1); ...)
+    test eax, eax
+    jz .init0
+    call parse_tuple_stmt               ; (it consumes the ';')
+    jmp .cond
+.init0:
     call is_var_start
     test eax, eax
     jz .init_t
@@ -370,6 +378,16 @@ parse_for:
     mov [r12+16], rax
     cmp qword [tk], ')'
     je .noinc
+    cmp qword [tk], '('
+    jne .incexpr
+    call tuple_stmt_kind                ; for (...; ...; (a, b) = (b, a + b))
+    test eax, eax
+    jz .incexpr
+    mov dword [tup_noterm], 1
+    call parse_tuple_stmt               ; (the ')' of the for is not consumed)
+    mov dword [tup_noterm], 0
+    jmp .noinc
+.incexpr:
     call parse_expr
     call discard_result
 .noinc:

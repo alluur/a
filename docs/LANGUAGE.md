@@ -121,6 +121,7 @@ const int MASK = 0xF0;    // optionally with a type
 const uint8 SMALL = 300;  // a typed constant is cut to its type: 44
 ```
 
+* **`var`** declares a local variable whose type is the type of its initializer (see [`var`](#var-the-type-comes-from-the-initializer) below).
 * **Every variable is zero-initialised** — locals, arrays, structs and heap memory.
 * **Scope:** a variable lives until the end of the block it is declared in; an inner declaration
   may shadow an outer one. A `for` loop variable lives in the loop.
@@ -138,6 +139,34 @@ const uint8 SMALL = 300;  // a typed constant is cut to its type: 44
       static_assert(__ARCH >= 0 && __ARCH <= 3);
 
   (`static_assert` is a word only where a statement or declaration starts; the message has to be a text in quotes.)
+
+### `var`: the type comes from the initializer
+
+```c
+var n = 5;                    // int
+var pi = 3.14;                // double
+var name = "bob";             // char*
+var p = &n;                   // int*
+var f = twice;                // func
+var pt = makePoint(1, 2);     // a copy of the struct that the function returns
+var a = 1, s = "two";         // several declarators, each with its own type
+for (var i = 0; i < 10; i++) { }
+foreach (var x in values) { }                  // the same as foreach (x in values): the type of the elements
+```
+
+`var` always needs an initializer and is for **local variables** only (not parameters, fields or globals). The initializer is
+evaluated *before* the name exists, so `var x = x + 1;` uses an outer `x`. An array becomes a pointer to its first element.
+The compiler says what it cannot know instead of guessing:
+
+| Source | Error |
+|---|---|
+| `var x;` | `var needs an initializer` |
+| `var x = f();` with a `void` function | `cannot infer the type of the variable: the initializer has no value (it is void)` |
+| `var p = null;` | `cannot infer the type of the variable from null: write the type` |
+| `var a = {1, 2};` | `cannot infer the type of the variable from a {...} list` |
+
+`var` is not a keyword: it is the declaration word only where a new name (or a `(`) follows and nothing called `var` is in scope,
+so `var var = 7;` and old programs with a variable named `var` still work.
 
 ## 5. Operators
 
@@ -344,8 +373,7 @@ area(5, 4);         // 20
 area(5, 4, 200);    // 40
 ```
 
-This works for functions, methods and constructors (`new Counter()` / `Counter c;` with `Counter(int start = 1)`), and it is
-how the standard library's `printf(fmt, a, b, c, d, e, f, g, h)` accepts one to eight values.
+This works for functions, methods and constructors (`new Counter()` / `Counter c;` with `Counter(int start = 1)`).
 Text defaults are fine too: `char* sep = ", "`. (A function cannot have default values and `...` together.)
 
 ### Structs by value
@@ -432,6 +460,81 @@ int main() {
 A `func` carries no signature: the arguments are not checked against the function, and the call returns an `int` (the
 function's result as a 64-bit value). Only ordinary functions have an address (not methods or built-in `__...` functions).
 `qsort`, `bsearch`, `atexit` and `signal` of the C library take `func` arguments.
+
+### Lambdas
+
+A lambda is an anonymous function. It becomes a hidden function of the program and its value is a `func`, so it can be stored,
+passed and called like the address of a named function:
+
+```c
+func twice = (int x) => x * 2;                       // an expression: its value is the result
+func add = (a, b) => a + b;                          // parameters without a type are int
+func inc = x => x + 1;                               // one parameter: no parentheses needed
+func none = () => 77;
+func sum = (int a, int b) => { int s = 0; for (int i = a; i <= b; i++) s += i; return s; };    // a block: use return
+func half = (double x) -> double => x * 0.5;         // -> type: the type of the result (the default is int)
+
+algo.sortBy(items, n, (int a, int b) => a - b);      // where a library function wants a func
+printlnInt(((int a) => a + 100)(5));                 // called where it is written: 105
+```
+
+* **Result:** an expression body returns the value of the expression, a block body uses `return` (and returns 0 when it ends).
+  Like every call through a `func`, a call of a lambda yields an `int`: a `double` result is its 64 bit pattern, read it with
+  `__dbl(f(x))`; doubles that are passed to a lambda arrive correctly (`f(1.5)` passes the bits). A lambda cannot return a
+  struct or tuple by value.
+* **No captures.** A lambda does not see the local variables, parameters or `this` of the function it is written in: that would
+  need an environment that outlives the call, and a `func` is only a code address. Using one is a compile error that tells you
+  what to do: `a lambda cannot use a local variable of the enclosing function (pass it as a parameter, or use a global); this one is 'n'`.
+  (`this`, the fields and the methods of the class around it are refused the same way.) Globals, static locals, constants, enums,
+  functions and types are visible. Lambdas can be nested, each one sees only its own parameters and locals.
+  *Stretch goal (capturing by value through a heap environment) was not done.*
+* **How it works:** the code of the lambda is placed inline, jumped over by the enclosing function
+  (`jmp over; prologue; body; epilogue; over:`) and its address is made by the back end primitive `lea_code_a` (position independent,
+  no relocation): lambdas work in objects (`ac -c`), with the linker and on every target. Dead function elimination treats the body as
+  part of the enclosing function. Its own labels, loops (`break` and `continue` cannot reach outside), `defer` and `static` locals work as in a function.
+* **Syntax notes:** `(a, b) => ...` is a lambda only when the parenthesis is followed by `=>` (otherwise it is a tuple or the comma
+  operator); the parameter list may hold types (`int* p`, `char* s`, `func f`, class names). `=>` is a token of its own.
+
+### Tuples and multiple results
+
+A tuple is a fixed list of values of different types. A function returns several values by returning a tuple:
+
+```c
+(int, int) divmod(int a, int b) { return (a / b, a % b); }
+(char*, int) named() { return ("seven", 7); }
+
+(int q, int r) = divmod(7, 2);          // declares q = 3 and r = 1
+var (q2, r2) = divmod(100, 7);          // the same, the types come from the tuple
+(char* s, int n) = named();
+(int only, _) = divmod(17, 5);          // _ throws an element away
+int a = 1, b = 2;
+(a, b) = (b, a);                        // assigns to variables that exist; all values are computed first: a swap
+(arr[0], arr[2]) = (arr[2], arr[0]);    // the targets can be any lvalues: elements, fields, *p ...
+(int, double) t = divmod2(3);           // a tuple is a value: variables, fields, parameters, arrays, pointers
+printlnInt(t.0);                        // .0 .1 ... are the elements (also t.0.1 for a tuple in a tuple)
+t.1 = 2.5;
+var u = (1, "two", 3.5);                // a tuple literal; its type is (int, char*, double)
+```
+
+* **Type:** `(T1, T2, ...)` with two to sixteen element types. The same list of types is always the same type. The compiler makes a hidden
+  struct for it (every element at the alignment of its type, the size rounded to 8), so a tuple is passed, returned and copied by value
+  like a struct: a function that returns a tuple gets the address of the result as a hidden last argument, an argument is copied by the
+  caller. `sizeof((int, int))` is 16. A tuple with two elements of the same type is *not* an array.
+* **A literal needs a context.** `(a, b)` is a tuple literal where a tuple is expected: `return` in a function that returns a tuple, the
+  initializer of a tuple variable or of `var`, the right side of an assignment to a tuple or of a pattern, an argument for a tuple
+  parameter. Everywhere else `(a, b)` is still the **comma operator** (`int c = (a = 5, a + 1);` is 6), so no old program changes. When the
+  context knows the type the elements are converted one by one (`(int, double) t = (1, 2);` makes 2.0; `(uint8, int32) = (300, 5000 * 1000000)`
+  truncates). The elements are evaluated left to right, once each. Other tuple values (a function result, a variable) are used as they are:
+  `divmod(20, 6).0`.
+* **Patterns:** `(T a, T b) = value;`, `var (a, b) = value;` and `(x, y) = value;` need a tuple with the same number of elements; `_`
+  skips one. The variables are created after the value is computed (the initializer cannot see them). The assignment form pushes the
+  addresses of the targets first, copies the value into a temporary, then assigns from left to right: `(i, i) = (1, 2)` leaves 2,
+  `(v[i], i) = (5, 2)` uses the old `i` for the first target. Patterns are statements (also `for (var (a, b) = f(); ...)`), they cannot be nested
+  (`((a, b), c) = ...` is an error, assign the inner tuple to a variable first) and each side has to match: the value of another tuple type is an error
+  (`tuple types do not match`).
+* **Errors:** `(int, void)` (`a tuple element cannot be void`), 17 elements, `t.2` on a pair (`this tuple has no element with that number`), a pattern with the
+  wrong number of names, a value that is not a tuple on the right of a pattern, and every place where a tuple meets another type
+  (`return`, initialization, assignment, argument).
 
 ### `typedef`, `static` and `union`
 

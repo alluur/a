@@ -720,8 +720,11 @@ parse_tuple_decl_go:
     inc r14d
     jmp .dv
 .dvdone:
+    cmp dword [tup_noterm], 0
+    jne .noterm
     mov edi, ';'
     call expect
+.noterm:
     add rsp, TS_BYTES
     pop r15
     pop r14
@@ -857,8 +860,11 @@ parse_tuple_assign:
 .avdone:
     mov edi, r12d
     CG drop
+    cmp dword [tup_noterm], 0
+    jne .noterm
     mov edi, ';'
     call expect
+.noterm:
     add rsp, TS_BYTES
     pop r15
     pop r14

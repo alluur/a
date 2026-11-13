@@ -3754,6 +3754,8 @@ parse_assign:
     call to_rvalue
     mov rdi, rbx
     call coerce_to
+    mov rdi, rbx
+    call tuple_check                    ; a tuple cannot be assigned to a plain variable
     mov edi, r12d
     mov rsi, rbx
     call store_local_typed
