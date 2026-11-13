@@ -702,17 +702,74 @@ void hexToStr(int n, char* buf) {
 // vformat(out, max, fmt, args, nargs): printf style formatting of an array of values into a buffer.
 // Returns the length the complete text has (like C's snprintf); at most max-1 characters are stored
 // and the text is always NUL terminated.
-//   flags       -  left-align   0  zero padding   +  always a sign   space  space for positive   #  0x / 0 / 0b prefix
-//   width       digits or *     precision  .digits or .*  (minimum digits for numbers, maximum length for %s)
-//   length      h hh l ll z j t are accepted; h and hh narrow the value, everything else is 64 bits
+//   flags       -  left-align   0  zero padding   +  always a sign   space  space for positive   #  0x / 0 / 0b prefix, decimal point
+//   width       digits or *     precision  .digits or .*  (minimum digits for integers, digits after the point for %f %e,
+//                               significant digits for %g, maximum length for %s)
+//   length      h hh l ll z j t q L are accepted; h and hh narrow the integer, everything else is 64 bits
 //   conversions d i  signed decimal     u  unsigned decimal     x X  hex     o  octal     b  binary
 //               c  character    s  string    p  pointer    %  percent sign
-// Every value is one 64-bit slot of args (text and pointers are passed as their address).
-// (For %f %e %g use printfd / sprintfd from the cmath module.)
+//               e E f F g G  a double (its 64 bits are the value in args), printed correctly rounded (exactly: the digits of
+//                            the binary value are computed with big numbers, halves go to even), also denormals, -0.0, inf, nan
+//               v  a double as the shortest text that reads back as the same number (1e+22  0.1  1.5e-07), no forced .0
+// Every value is one 64-bit slot of args (text and pointers are passed as their address, a double as its bits: a double
+// that is passed through the ... of printf / format arrives as its bits).
 void __fmt_put(char* out, int max, int pos, int ch) {
     if (pos < max - 1) {
         out[pos] = ch;
     }
+}
+
+// n copies of ch at out[pos...] (n >= 0): only the part that fits is stored, the rest is just counted, so a huge width costs
+// nothing when the buffer is full. Returns pos + n.
+int __fmt_fill(char* out, int max, int pos, int ch, int n) {
+    int room = max - 1 - pos;
+    if (room > n) {
+        room = n;
+    }
+    for (int i = 0; i < room; i++) {
+        out[pos + i] = ch;
+    }
+    return pos + n;
+}
+
+// A width or a precision is at most this (a larger one, written in the format or given through *, is cut to it)
+const __FMT_LIMIT = 100000000;
+
+// the 64 bits of the double that is closest to the unsigned 64-bit number n (ties to even), with integer arithmetic only: the
+// integer of  $"{n:.2f}"  and of a uint64 converted to double. __i2f is the same for a signed integer.
+int __u2f(int n) {
+    if (n == 0) {
+        return 0;
+    }
+    int e = 63;
+    while (((n >> e) & 1) == 0) {
+        e--;
+    }
+    int m;
+    if (e <= 52) {
+        m = n << (52 - e);
+    } else {
+        int sh = e - 52;
+        uint64 u = n;
+        m = u >> sh;
+        int low = n & ((1 << sh) - 1);
+        int half = 1 << (sh - 1);
+        if (low > half || (low == half && (m & 1) != 0)) {
+            m++;
+            if (m == (1 << 53)) {
+                m = m >> 1;
+                e++;
+            }
+        }
+    }
+    return ((e + 1023) << 52) | (m & 0xFFFFFFFFFFFFF);
+}
+
+int __i2f(int n) {
+    if (n < 0) {
+        return (1 << 63) | __u2f(-n);
+    }
+    return __u2f(n);
 }
 
 // digits of v (taken as an unsigned 64-bit number) written backwards so that the last digit is buf[end-1];
@@ -749,6 +806,553 @@ int __fmt_digits(char* buf, int end, int v, int base, bool upper) {
         v = q;
     }
     return i;
+}
+
+// ---- doubles: exact decimal digits ---------------------------------------------------------------------------------
+// A big number is an array of base 10^9 limbs, least significant first; a[0] is the number of limbs.
+
+// a = a * x   (0 < x < 2^31)
+void __fmt_bmul(int* a, int x) {
+    int carry = 0;
+    int n = a[0];
+    for (int i = 1; i <= n; i++) {
+        int v = a[i] * x + carry;
+        carry = v / 1000000000;
+        a[i] = v - carry * 1000000000;
+    }
+    while (carry != 0) {
+        n++;
+        a[n] = carry % 1000000000;
+        carry = carry / 1000000000;
+    }
+    a[0] = n;
+}
+
+// The exact decimal digits of m * 2^k (0 < m < 2^60, -1100 < k < 1030) into digs (800 bytes, no leading zeros, the last
+// digits may be zeros); returns their number. *pp = the number of digits before the decimal point (zero or negative when
+// zeros follow the point before the first digit), so the value is 0.d1d2d3... * 10^pp.
+int __fmt_exact(char* digs, int m, int k, int* pp) {
+    int a[100];
+    a[1] = m % 1000000000;
+    int hi = m / 1000000000;
+    a[2] = hi % 1000000000;
+    a[3] = hi / 1000000000;
+    a[0] = 3;
+    while (a[0] > 1 && a[a[0]] == 0) {
+        a[0] = a[0] - 1;
+    }
+    if (k >= 0) {
+        int n = k;
+        while (n >= 29) {
+            __fmt_bmul(&a[0], 536870912);
+            n = n - 29;
+        }
+        if (n > 0) {
+            __fmt_bmul(&a[0], 1 << n);
+        }
+    } else {
+        // m * 2^k = m * 5^-k / 10^-k
+        int n = -k;
+        while (n >= 13) {
+            __fmt_bmul(&a[0], 1220703125);
+            n = n - 13;
+        }
+        if (n > 0) {
+            int p = 1;
+            for (int i = 0; i < n; i++) {
+                p = p * 5;
+            }
+            __fmt_bmul(&a[0], p);
+        }
+    }
+    int len = 0;
+    for (int i = a[0]; i >= 1; i--) {
+        int v = a[i];
+        for (int j = 8; j >= 0; j--) {
+            digs[len + j] = '0' + v % 10;
+            v = v / 10;
+        }
+        len = len + 9;
+    }
+    int lz = 0;
+    while (lz < len - 1 && digs[lz] == '0') {
+        lz++;
+    }
+    if (lz > 0) {
+        for (int i = 0; i + lz < len; i++) {
+            digs[i] = digs[i + lz];
+        }
+        len = len - lz;
+    }
+    if (k >= 0) {
+        *pp = len;
+    } else {
+        *pp = len + k;
+    }
+    return len;
+}
+
+// does rounding d[0..nd) to keep digits (0 <= keep < nd) go up?  Nearest, an exact half goes to the even neighbour.
+bool __fmt_roundup(char* d, int nd, int keep) {
+    int c = d[keep] - '0';
+    if (c > 5) {
+        return true;
+    }
+    if (c < 5) {
+        return false;
+    }
+    for (int i = keep + 1; i < nd; i++) {
+        if (d[i] != '0') {
+            return true;
+        }
+    }
+    int prev = 0;
+    if (keep > 0) {
+        prev = d[keep - 1] - '0';
+    }
+    return (prev & 1) == 1;
+}
+
+// adds one unit in the last place of d[0..keep): returns 1 when it carries out of the first digit (all digits become 0)
+int __fmt_incr(char* d, int keep) {
+    int i = keep - 1;
+    while (i >= 0) {
+        if (d[i] == '9') {
+            d[i] = '0';
+            i--;
+        } else {
+            d[i] = d[i] + 1;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// Rounds d[0..nd) (value 0.d1d2... * 10^*pp) to keep digits. Returns the number of digits that matter afterwards: the digits at
+// d[n] and beyond are zeros. keep < 0 gives 0 (the value rounds to zero); a carry out of the first digit makes it 1 followed by zeros
+// and raises *pp.
+int __fmt_roundto(char* d, int nd, int* pp, int keep) {
+    if (keep < 0) {
+        return 0;
+    }
+    if (keep >= nd) {
+        return nd;
+    }
+    if (__fmt_roundup(d, nd, keep)) {
+        if (__fmt_incr(d, keep) != 0) {
+            d[0] = '1';
+            *pp = *pp + 1;
+            if (keep == 0) {
+                return 1;
+            }
+        }
+    }
+    return keep;
+}
+
+// 1 when the decimal  c (cn digits, point position cp)  is greater than b, 0 when equal, -1 when smaller (both are positive,
+// the first digit is not 0)
+int __fmt_cmp(char* c, int cn, int cp, char* b, int bn, int bp) {
+    if (cp != bp) {
+        if (cp > bp) {
+            return 1;
+        }
+        return -1;
+    }
+    int n = cn;
+    if (bn > n) {
+        n = bn;
+    }
+    for (int i = 0; i < n; i++) {
+        int x = '0';
+        int y = '0';
+        if (i < cn) {
+            x = c[i];
+        }
+        if (i < bn) {
+            y = b[i];
+        }
+        if (x != y) {
+            if (x > y) {
+                return 1;
+            }
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// is the p digit decimal c (point position cp) inside the interval between the neighbours of the double (dl / du: the
+// midpoints to the next smaller / larger double; the ends belong to it when the mantissa is even)?
+bool __fmt_inside(char* c, int p, int cp, char* dl, int nl, int pl, char* du, int nu, int pu, bool incl) {
+    int lo = __fmt_cmp(c, p, cp, dl, nl, pl);
+    int hi = __fmt_cmp(c, p, cp, du, nu, pu);
+    if (incl) {
+        return lo >= 0 && hi <= 0;
+    }
+    return lo > 0 && hi < 0;
+}
+
+// The shortest digits that read back as the same double (m * 2^k; tight: the next smaller double is closer, because m is a power of 2).
+// The digits go to d (at least 20 bytes), the count is returned, *pp = the point position. Where several shortest texts exist the
+// one nearest to the value is taken.
+int __fmt_shortest(char* d, int m, int k, bool tight, int* pp) {
+    char dv[800];
+    char dl[800];
+    char du[800];
+    int pv = 0;
+    int pl = 0;
+    int pu = 0;
+    int nv = __fmt_exact(&dv[0], m, k, &pv);
+    int nu = __fmt_exact(&du[0], 2 * m + 1, k - 1, &pu);
+    int nl;
+    if (tight) {
+        nl = __fmt_exact(&dl[0], 4 * m - 1, k - 2, &pl);
+    } else {
+        nl = __fmt_exact(&dl[0], 2 * m - 1, k - 1, &pl);
+    }
+    bool incl = (m & 1) == 0;
+    char down[24];
+    char up[24];
+    int p = 1;
+    while (p <= 17) {
+        for (int i = 0; i < p; i++) {
+            if (i < nv) {
+                down[i] = dv[i];
+            } else {
+                down[i] = '0';
+            }
+            up[i] = down[i];
+        }
+        int pup = pv;
+        if (__fmt_incr(&up[0], p) != 0) {
+            up[0] = '1';
+            pup = pv + 1;
+        }
+        bool nearUp = false;
+        if (p < nv) {
+            nearUp = __fmt_roundup(&dv[0], nv, p);
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            bool useUp = nearUp;
+            if (pass == 1) {
+                useUp = !nearUp;
+            }
+            char* c = &down[0];
+            int cp = pv;
+            if (useUp) {
+                c = &up[0];
+                cp = pup;
+            }
+            if (__fmt_inside(c, p, cp, &dl[0], nl, pl, &du[0], nu, pu, incl)) {
+                int n = p;
+                while (n > 1 && c[n - 1] == '0') {
+                    n--;
+                }
+                for (int i = 0; i < n; i++) {
+                    d[i] = c[i];
+                }
+                *pp = cp;
+                return n;
+            }
+        }
+        p++;
+    }
+    for (int i = 0; i < 17; i++) {
+        d[i] = down[i];
+    }
+    *pp = pv;
+    return 17;
+}
+
+// ---- doubles: the text of the number --------------------------------------------------------------------------------
+// d[0..nr) are the digits (d[n] for n >= nr are zeros), the value is 0.d1d2... * 10^pp. Each function writes the unsigned text into b
+// and returns its length.
+
+// %f: the integer part, then p digits after the point (the point itself only when p > 0 or alt)
+int __fmt_emit_f(char* b, char* d, int nr, int pp, int p, bool alt) {
+    int n = 0;
+    if (pp <= 0) {
+        b[n] = '0';
+        n++;
+    } else {
+        for (int i = 0; i < pp; i++) {
+            if (i < nr) {
+                b[n] = d[i];
+            } else {
+                b[n] = '0';
+            }
+            n++;
+        }
+    }
+    if (p > 0 || alt) {
+        b[n] = '.';
+        n++;
+    }
+    for (int j = 0; j < p; j++) {
+        int idx = pp + j;
+        if (idx >= 0 && idx < nr) {
+            b[n] = d[idx];
+        } else {
+            b[n] = '0';
+        }
+        n++;
+    }
+    return n;
+}
+
+// the exponent part  e+05  e-123  of x
+int __fmt_emit_x(char* b, int n, int x, bool upper) {
+    if (upper) {
+        b[n] = 'E';
+    } else {
+        b[n] = 'e';
+    }
+    n++;
+    if (x < 0) {
+        b[n] = '-';
+        x = -x;
+    } else {
+        b[n] = '+';
+    }
+    n++;
+    if (x >= 100) {
+        b[n] = '0' + x / 100;
+        n++;
+        x = x % 100;
+    }
+    b[n] = '0' + x / 10;
+    b[n + 1] = '0' + x % 10;
+    return n + 2;
+}
+
+// %e: one digit, the point, p more digits, the exponent
+int __fmt_emit_e(char* b, char* d, int nr, int pp, int p, bool alt, bool upper) {
+    int n = 0;
+    if (nr > 0) {
+        b[n] = d[0];
+    } else {
+        b[n] = '0';
+    }
+    n++;
+    if (p > 0 || alt) {
+        b[n] = '.';
+        n++;
+    }
+    for (int j = 1; j <= p; j++) {
+        if (j < nr) {
+            b[n] = d[j];
+        } else {
+            b[n] = '0';
+        }
+        n++;
+    }
+    int x = pp - 1;
+    if (nr == 0) {
+        x = 0;
+    }
+    return __fmt_emit_x(b, n, x, upper);
+}
+
+// removes the zeros at the end of the fraction of  123.4500  (and the point); in an exponent form the zeros in front of the e
+int __fmt_strip(char* b, int n) {
+    int e = n;
+    for (int i = 0; i < n; i++) {
+        if (b[i] == 'e' || b[i] == 'E') {
+            e = i;
+            break;
+        }
+    }
+    int pt = -1;
+    for (int i = 0; i < e; i++) {
+        if (b[i] == '.') {
+            pt = i;
+            break;
+        }
+    }
+    if (pt < 0) {
+        return n;
+    }
+    int z = e;
+    while (z > pt + 1 && b[z - 1] == '0') {
+        z--;
+    }
+    if (z == pt + 1) {
+        z = pt;
+    }
+    int t = n - e;
+    for (int i = 0; i < t; i++) {
+        b[z + i] = b[e + i];
+    }
+    return z + t;
+}
+
+// %v: the shortest digits
+int __fmt_emit_v(char* b, char* d, int nr, int pp) {
+    int n = 0;
+    int x = pp - 1;
+    if (x < -4 || x >= 16) {
+        b[n] = d[0];
+        n++;
+        if (nr > 1) {
+            b[n] = '.';
+            n++;
+            for (int i = 1; i < nr; i++) {
+                b[n] = d[i];
+                n++;
+            }
+        }
+        return __fmt_emit_x(b, n, x, false);
+    }
+    if (pp <= 0) {
+        b[n] = '0';
+        b[n + 1] = '.';
+        n = n + 2;
+        for (int i = 0; i < -pp; i++) {
+            b[n] = '0';
+            n++;
+        }
+        for (int i = 0; i < nr; i++) {
+            b[n] = d[i];
+            n++;
+        }
+        return n;
+    }
+    for (int i = 0; i < pp; i++) {
+        if (i < nr) {
+            b[n] = d[i];
+        } else {
+            b[n] = '0';
+        }
+        n++;
+    }
+    if (nr > pp) {
+        b[n] = '.';
+        n++;
+        for (int i = pp; i < nr; i++) {
+            b[n] = d[i];
+            n++;
+        }
+    }
+    return n;
+}
+
+// One floating point conversion: the number bits (a double's 64 bits) with the conversion e E f F g G v, the precision prec (-1: not
+// given), the width and flags. Writes the whole field at out[o...] (see __fmt_put) and returns the new position.
+int __fmt_float_field(char* out, int max, int o, int bits, int conv, int prec, int width, bool left, bool zero, bool plus, bool space, bool alt) {
+    char body[2300];
+    char digs[800];
+    int bl = 0;
+    bool neg = bits < 0;
+    int ex = (bits >> 52) & 0x7FF;
+    int frac = bits & 0xFFFFFFFFFFFFF;
+    bool upper = conv == 'E' || conv == 'F' || conv == 'G';
+    bool special = false;
+    if (ex == 0x7FF) {
+        special = true;
+        char* txt = "inf";
+        if (frac != 0) {
+            txt = "nan";
+            neg = false;
+        }
+        if (upper) {
+            if (frac != 0) { txt = "NAN"; } else { txt = "INF"; }
+        }
+        for (int i = 0; i < 3; i++) {
+            body[i] = txt[i];
+        }
+        bl = 3;
+    } else {
+        int c = conv | 32;
+        if (prec > 1800) {
+            prec = 1800;
+        }
+        int m = frac;
+        int k = -1074;
+        if (ex != 0) {
+            m = frac | 0x10000000000000;
+            k = ex - 1075;
+        }
+        int nd = 0;
+        int pp = 1;
+        if (m != 0) {
+            nd = __fmt_exact(&digs[0], m, k, &pp);
+        }
+        if (c == 'v') {
+            char sd[24];
+            if (m == 0) {
+                sd[0] = '0';
+                body[0] = '0';
+                bl = 1;
+            } else {
+                int sp = 0;
+                int sn = __fmt_shortest(&sd[0], m, k, frac == 0 && ex > 1, &sp);
+                bl = __fmt_emit_v(&body[0], &sd[0], sn, sp);
+            }
+        } else if (c == 'f') {
+            int p = prec;
+            if (p < 0) { p = 6; }
+            int nr = __fmt_roundto(&digs[0], nd, &pp, pp + p);
+            bl = __fmt_emit_f(&body[0], &digs[0], nr, pp, p, alt);
+        } else if (c == 'e') {
+            int p = prec;
+            if (p < 0) { p = 6; }
+            int nr = __fmt_roundto(&digs[0], nd, &pp, p + 1);
+            bl = __fmt_emit_e(&body[0], &digs[0], nr, pp, p, alt, upper);
+        } else {
+            int p = prec;
+            if (p < 0) { p = 6; }
+            if (p == 0) { p = 1; }
+            int nr = __fmt_roundto(&digs[0], nd, &pp, p);
+            int x = pp - 1;
+            if (nr == 0) {
+                x = 0;
+            }
+            if (x < -4 || x >= p) {
+                bl = __fmt_emit_e(&body[0], &digs[0], nr, pp, p - 1, alt, upper);
+            } else {
+                bl = __fmt_emit_f(&body[0], &digs[0], nr, pp, p - 1 - x, alt);
+            }
+            if (!alt) {
+                bl = __fmt_strip(&body[0], bl);
+            }
+        }
+    }
+    int sgn = 0;
+    if (neg) {
+        sgn = '-';
+    } else if (plus) {
+        sgn = '+';
+    } else if (space) {
+        sgn = ' ';
+    }
+    int len = bl;
+    if (sgn != 0) {
+        len++;
+    }
+    int pad = width - len;
+    if (pad < 0) {
+        pad = 0;
+    }
+    bool zpad = zero && !left && !special;
+    if (!left && !zpad) {
+        o = __fmt_fill(out, max, o, ' ', pad);
+        pad = 0;
+    }
+    if (sgn != 0) {
+        __fmt_put(out, max, o, sgn);
+        o++;
+    }
+    if (zpad) {
+        o = __fmt_fill(out, max, o, '0', pad);
+        pad = 0;
+    }
+    for (int i = 0; i < bl; i++) {
+        __fmt_put(out, max, o, body[i]);
+        o++;
+    }
+    o = __fmt_fill(out, max, o, ' ', pad);
+    return o;
 }
 
 int vformat(char* out, int max, char* fmt, int* args, int nargs) {
@@ -788,13 +1392,20 @@ int vformat(char* out, int max, char* fmt, int* args, int nargs) {
             i++;
             if (width < 0) {
                 left = true;
-                width = -width;
+                if (width < -__FMT_LIMIT) {         // (also the smallest int, which -width cannot make positive)
+                    width = __FMT_LIMIT;
+                } else {
+                    width = -width;
+                }
             }
         } else {
             while (isDigit(fmt[i])) {
-                width = width * 10 + (fmt[i] - '0');
+                if (width < __FMT_LIMIT) { width = width * 10 + (fmt[i] - '0'); }
                 i++;
             }
+        }
+        if (width > __FMT_LIMIT) {
+            width = __FMT_LIMIT;
         }
         int prec = -1;
         if (fmt[i] == '.') {
@@ -804,12 +1415,16 @@ int vformat(char* out, int max, char* fmt, int* args, int nargs) {
                 if (ai < nargs) { prec = args[ai]; }
                 ai++;
                 i++;
+                if (prec < 0) { prec = -1; }        // a negative precision is the same as none
             } else {
                 while (isDigit(fmt[i])) {
-                    prec = prec * 10 + (fmt[i] - '0');
+                    if (prec < __FMT_LIMIT) { prec = prec * 10 + (fmt[i] - '0'); }
                     i++;
                 }
             }
+        }
+        if (prec > __FMT_LIMIT) {
+            prec = __FMT_LIMIT;
         }
         int narrow = 0;
         again = true;
@@ -833,6 +1448,13 @@ int vformat(char* out, int max, char* fmt, int* args, int nargs) {
         if (t == '%') {
             __fmt_put(out, max, o, '%');
             o++;
+            continue;
+        }
+        if (t == 'e' || t == 'E' || t == 'f' || t == 'F' || t == 'g' || t == 'G' || t == 'v') {
+            int bits = 0;
+            if (ai < nargs) { bits = args[ai]; }
+            ai++;
+            o = __fmt_float_field(out, max, o, bits, t, prec, width, left, zero, plus, space, alt);
             continue;
         }
         int v = 0;
@@ -924,36 +1546,23 @@ int vformat(char* out, int max, char* fmt, int* args, int nargs) {
         int pad = width - len;
         if (pad < 0) { pad = 0; }
         if (!left && !(zero && numeric && prec < 0)) {
-            while (pad > 0) {
-                __fmt_put(out, max, o, ' ');
-                o++;
-                pad--;
-            }
+            o = __fmt_fill(out, max, o, ' ', pad);
+            pad = 0;
         }
         for (int k = 0; k < nsgn; k++) {
             __fmt_put(out, max, o, sgn[k]);
             o++;
         }
         if (!left && zero && numeric && prec < 0) {
-            while (pad > 0) {
-                __fmt_put(out, max, o, '0');
-                o++;
-                pad--;
-            }
+            o = __fmt_fill(out, max, o, '0', pad);
+            pad = 0;
         }
-        for (int k = 0; k < nzero; k++) {
-            __fmt_put(out, max, o, '0');
-            o++;
-        }
+        o = __fmt_fill(out, max, o, '0', nzero);
         for (int k = 0; k < blen; k++) {
             __fmt_put(out, max, o, body[k]);
             o++;
         }
-        while (pad > 0) {
-            __fmt_put(out, max, o, ' ');
-            o++;
-            pad--;
-        }
+        o = __fmt_fill(out, max, o, ' ', pad);
     }
     if (max > 0) {
         if (o < max - 1) {
@@ -965,45 +1574,111 @@ int vformat(char* out, int max, char* fmt, int* args, int nargs) {
     return o;
 }
 
-// format(out, max, fmt, a, b, ...): vformat with up to eight values (unused ones can be left out);
-// returns the number of characters stored.
-int format(char* out, int max, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
-    int args[8];
-    args[0] = a;
-    args[1] = b;
-    args[2] = c;
-    args[3] = d;
-    args[4] = e;
-    args[5] = f;
-    args[6] = g;
-    args[7] = h;
-    int n = vformat(out, max, fmt, &args[0], 8);
-    if (n > max - 1) {
-        n = max - 1;
+// The values of a call with more than 32 of them are collected in one buffer that is kept and only grows (it is not allocated
+// again for every call, so a loop of such calls does not use more and more memory). While it is in use another call
+// (a signal handler, a thread) gets a buffer of its own from alloc, which is not freed.
+int* __fmt_argbuf;
+int __fmt_argcap;
+bool __fmt_argbusy;
+
+int* __fmt_args_take(int n) {
+    if (__fmt_argbusy) {
+        return (int*) alloc(n * 8);
     }
-    return n;
+    if (n > __fmt_argcap) {
+        int c = __fmt_argcap * 2;
+        if (c < n) {
+            c = n;
+        }
+        __fmt_argbuf = (int*) alloc(c * 8);
+        __fmt_argcap = c;
+    }
+    __fmt_argbusy = true;
+    return __fmt_argbuf;
 }
 
-// printf("%s is %d years old\n", name, age)   - up to eight values, text is passed as it is
-void printf(char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0) {
-    int args[8];
-    args[0] = a;
-    args[1] = b;
-    args[2] = c;
-    args[3] = d;
-    args[4] = e;
-    args[5] = f;
-    args[6] = g;
-    args[7] = h;
+void __fmt_args_release(int* a) {
+    if (a == __fmt_argbuf) {
+        __fmt_argbusy = false;
+    }
+}
+
+// format(out, max, fmt, ...): vformat with any number of values (more than 32 are collected in the heap);
+// returns the number of characters stored.
+int format(char* out, int max, char* fmt, ...) {
+    int n = va_count();
+    int small[32];
+    int* args = &small[0];
+    if (n > 32) {
+        args = __fmt_args_take(n);
+    }
+    for (int i = 0; i < n; i++) {
+        args[i] = va_arg(i);
+    }
+    int r = vformat(out, max, fmt, args, n);
+    if (n > 32) {
+        __fmt_args_release(args);
+    }
+    if (r > max - 1) {
+        r = max - 1;
+    }
+    return r;
+}
+
+// printf("%s is %d years old\n", name, age)   - any number of values, text is passed as it is, a double as it is
+void printf(char* fmt, ...) {
+    int n = va_count();
+    int small[32];
+    int* args = &small[0];
+    if (n > 32) {
+        args = __fmt_args_take(n);
+    }
+    for (int i = 0; i < n; i++) {
+        args[i] = va_arg(i);
+    }
     char buf[1024];
-    int n = vformat(&buf[0], 1024, fmt, &args[0], 8);
-    if (n < 1024) {
-        __write(1, &buf[0], n);
+    int len = vformat(&buf[0], 1024, fmt, args, n);
+    if (len < 1024) {
+        if (n > 32) {
+            __fmt_args_release(args);
+        }
+        __write(1, &buf[0], len);
         return;
     }
-    char* big = alloc(n + 1);
-    vformat(big, n + 1, fmt, &args[0], 8);
-    __write(1, big, n);
+    char* big = alloc(len + 1);
+    vformat(big, len + 1, fmt, args, n);
+    if (n > 32) {
+        __fmt_args_release(args);
+    }
+    __write(1, big, len);
+}
+
+// the text true / false (used by interpolated strings)
+char* __boolstr(int b) {
+    if (b != 0) {
+        return "true";
+    }
+    return "false";
+}
+
+// $"..." is lowered to this: the same formatter as format and printf, the result is a new text from alloc (it lives until the program ends)
+char* __interp(char* fmt, ...) {
+    int n = va_count();
+    int small[32];
+    int* args = &small[0];
+    if (n > 32) {
+        args = __fmt_args_take(n);
+    }
+    for (int i = 0; i < n; i++) {
+        args[i] = va_arg(i);
+    }
+    int len = vformat(null, 0, fmt, args, n);
+    char* s = alloc(len + 1);
+    vformat(s, len + 1, fmt, args, n);
+    if (n > 32) {
+        __fmt_args_release(args);
+    }
+    return s;
 }
 
 // writes ch n times

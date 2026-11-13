@@ -170,11 +170,11 @@ climits - C <limits.h>, <stdint.h>, <stddef.h>, <stdbool.h> constants   import c
 
 In A `int` and `long` are both 64-bit, `char` is an unsigned byte and `bool` a byte, so the
 limits of INT_*, LONG_* and LLONG_* are the 64-bit ones. The fixed-width names (INT8_MAX ...
-UINT32_MAX) are there for code that cares about exact sizes. UINT64_MAX / ULLONG_MAX do not
-exist because A has no unsigned 64-bit type (the bit pattern is -1).
+UINT32_MAX) are there for code that cares about exact sizes. UINT64_MAX, ULLONG_MAX, ULONG_MAX and
+SIZE_MAX are uint64 constants (all bits set).
 ```
 
-Constants: `CHAR_BIT`, `CHAR_MIN`, `CHAR_MAX`, `SCHAR_MIN`, `SCHAR_MAX`, `UCHAR_MAX`, `SHRT_MIN`, `SHRT_MAX`, `USHRT_MAX`, `INT_MIN`, `INT_MAX`, `LONG_MIN`, `LONG_MAX`, `LLONG_MIN`, `LLONG_MAX`, `INT8_MIN`, `INT8_MAX`, `UINT8_MAX`, `INT16_MIN`, `INT16_MAX`, `UINT16_MAX`, `INT32_MIN`, `INT32_MAX`, `UINT32_MAX`, `INT64_MIN`, `INT64_MAX`, `INTPTR_MIN`, `INTPTR_MAX`, `INTMAX_MIN`, `INTMAX_MAX`, `PTRDIFF_MIN`, `PTRDIFF_MAX`, `SIZE_MAX`, `SSIZE_MAX`, `MB_LEN_MAX`, `PATH_MAX`, `NAME_MAX`, `NULL`
+Constants: `CHAR_BIT`, `CHAR_MIN`, `CHAR_MAX`, `SCHAR_MIN`, `SCHAR_MAX`, `UCHAR_MAX`, `SHRT_MIN`, `SHRT_MAX`, `USHRT_MAX`, `INT_MIN`, `INT_MAX`, `LONG_MIN`, `LONG_MAX`, `LLONG_MIN`, `LLONG_MAX`, `INT8_MIN`, `INT8_MAX`, `UINT8_MAX`, `INT16_MIN`, `INT16_MAX`, `UINT16_MAX`, `INT32_MIN`, `INT32_MAX`, `UINT32_MAX`, `INT64_MIN`, `INT64_MAX`, `INTPTR_MIN`, `INTPTR_MAX`, `INTMAX_MIN`, `INTMAX_MAX`, `PTRDIFF_MIN`, `PTRDIFF_MAX`, `UINT_MAX`, `SSIZE_MAX`, `MB_LEN_MAX`, `PATH_MAX`, `NAME_MAX`, `NULL`
 
 ### cerrno
 `<errno.h>` - `errno`, the error numbers, `strerror` and `perror`.  
@@ -341,15 +341,17 @@ scanf fscanf sscanf vsscanf.
   printf                   is in the standard library; it prints to stdout like in C
 
 Differences from C that come from the language:
-  * there are no variable argument lists: the printf family takes up to eight values
-    (text and pointers are passed as they are), the v... functions take an array of them (an `int*`),
-    scanf takes up to eight pointers. Values are 64-bit, so %d / %i / %u / %x read and write a whole `int`;
+  * the printf family (printf, fprintf, sprintf, snprintf, asprintf, dprintf) takes any number of values (they are passed in the
+    ... of the function), the v... functions take an array of them (an `int*`), scanf takes up to eight pointers.
+    Text and pointers are passed as they are, values are 64-bit, so %d / %i / %u / %x print and read a whole `int`;
     hh, h and l ... modifiers choose 1, 2 or 8 bytes in scanf.
+  * floating point: a double passed through the ... of printf (or fprintf, sprintf ...) arrives as its 64 bit pattern, and the
+    conversions %e %E %f %F %g %G print it correctly rounded (the same code as format in the standard library, see
+    docs/LANGUAGE.md section "Text formatting"); %v prints the shortest text that reads back. scanf reads %f %lf %e %g into an
+    int (8 bytes, also without the l); fprintfd / vfprintfd also write %a; printfd, sprintfd, snprintfd of cfloat are the older
+    names with %a.
   * output to files is buffered (4 KiB) and written out at fclose / fflush / exit; stdout and stderr
     are not buffered.
-  * floating point (see cmath / cfloat): a double is the int that holds its bit pattern. scanf reads %f %lf %e %g into an int
-    (8 bytes, also without the l); fprintfd / vfprintfd write %f %e %g %a. printf / fprintf / sprintf keep to the integer
-    conversions (use printfd, sprintfd, snprintfd of cfloat for text on the screen or in buffers).
 ```
 
 Constants: `EOF`, `SEEK_SET`, `SEEK_CUR`, `SEEK_END`, `BUFSIZ`, `FILENAME_MAX`, `FOPEN_MAX`, `TMP_MAX`, `L_tmpnam`, `_IOFBF`, `_IOLBF`, `_IONBF`, `stdin`, `stdout`, `stderr`
@@ -392,16 +394,16 @@ Types: `FILE`
 | `int fwrite(char* ptr, int size, int count, FILE* f)` | writes count items of size bytes; returns how many complete items were written |
 | `int vfprintf(FILE* f, char* fmt, int* args, int n)` | ---- formatted output ------------------------------------------------------------------------------------------ vfprintf: the values are an array (see vformat in the standard library for the formats) |
 | `int vprintf(char* fmt, int* args, int n)` |  |
-| `int fprintf(FILE* f, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int g = 0, int h = 0, int i = 0)` |  |
+| `int fprintf(FILE* f, char* fmt, ...)` |  |
 | `int vfprintfd(FILE* f, char* fmt, int* args, int n)` | like vfprintf, with %f %e %g %a for doubles |
 | `int fprintfd(FILE* f, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int g = 0, int h = 0, int i = 0)` |  |
 | `int vsprintf(char* out, char* fmt, int* args, int n)` | the buffer must be large enough for the result |
 | `int vsnprintf(char* out, int size, char* fmt, int* args, int n)` | writes at most size-1 characters and a zero; returns the length the full result has |
-| `int sprintf(char* out, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0)` |  |
-| `int snprintf(char* out, int size, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0)` |  |
+| `int sprintf(char* out, char* fmt, ...)` |  |
+| `int snprintf(char* out, int size, char* fmt, ...)` |  |
 | `int vasprintf(char** out, char* fmt, int* args, int n)` | like sprintf into a new malloc'ed buffer; *out receives it (free it with free). Returns the length, -1 on failure |
-| `int asprintf(char** out, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0)` |  |
-| `int dprintf(int fd, char* fmt, int a = 0, int b = 0, int c = 0, int d = 0, int e = 0, int f = 0, int g = 0, int h = 0)` | printf to a raw file descriptor |
+| `int asprintf(char** out, char* fmt, ...)` |  |
+| `int dprintf(int fd, char* fmt, ...)` | printf to a raw file descriptor |
 | `int remove(char* path)` | deletes a file or an empty directory; 0 on success, -1 with errno set |
 | `int rename(char* from, char* to)` | renames or moves a file or directory (an existing destination is replaced); 0 on success, -1 with errno set |
 | `char* tmpnam(char* buf)` | makes up a name for a temporary file ("/tmp/tmpXXXXXX", or in %TEMP% on Windows); buf must hold 260 characters. Returns buf (or a static buffer when buf is null). |

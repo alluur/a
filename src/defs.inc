@@ -78,6 +78,7 @@
 %define T_ANDANDEQ      156     ; &&=
 %define T_QQEQ          157     ; ??=
 %define T_DOTDOTEQ      158     ; ..=  inclusive range: foreach (int i in 1..=10)
+%define T_FATARROW      159     ; =>   lambda: (int a, int b) => a + b
 ; keywords
 %define K_INT           160
 %define K_CHAR          161
@@ -123,6 +124,7 @@
 %define K_DEFER         199     ; defer expression;
 %define K_DOUBLE        198     ; double, float     ; asm(a, b, c) { x64: ...; arm64: ...; }
 %define K_FOREACH       203     ; foreach (T x in values) ...
+%define T_ISTR          204     ; $"text {expr} text": an interpolated string, tk_ptr / tk_len = the raw text between the quotes
 
 ; ---- symbol kinds ------------------------------------------------------------
 %define S_LOCAL         1
@@ -173,6 +175,7 @@
 ; per class flags (st_flags)
 %define SF_ABSTRACT     1       ; abstract class: no objects of it
 %define SF_FINAL        2       ; final class: nothing derives from it
+%define SF_TUPLE        4       ; a hidden struct made for a tuple type (src/tuple.asm)
 
 ; ---- struct table entry (32 bytes) -------------------------------------------
 %define ST_NAME         0       ; qword
@@ -389,6 +392,7 @@
     %1 cmp_ugt
     %1 cmp_ule
     %1 cmp_uge
+    %1 lea_code_a          ; rdi = code position (of this output) -> A = the address of that code (position independent, no relocation)
 %endmacro
 
 %assign CGI_COUNT 0

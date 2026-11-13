@@ -94,6 +94,7 @@ ops2:
     db "^^", T_XORXOR
     db "??", T_QQ
     db "..", T_DOTDOT
+    db "=>", T_FATARROW
     db 0
 singles:
     db "(){}[];,.:?~=!<>&|^+-*/%", 0
@@ -334,7 +335,101 @@ next_token:
     je .string
     cmp al, 0x27
     je .char
+    cmp al, '$'
+    je .dollar
     jmp .op
+
+; ---- interpolated string  $"text {expr:spec} text"  : the raw text between the quotes is the token (the parser, interp.asm,
+; reads it). Braces are counted so that an expression may contain strings and characters: $"{f("a")}".  {{ and }} are braces.
+.dollar:
+    cmp byte [rsi+1], '"'
+    jne .badchar
+    add rsi, 2
+    mov r12, rsi
+    xor ecx, ecx                        ; depth of {...}
+.d1:
+    movzx eax, byte [rsi]
+    test al, al
+    jz .d_err
+    cmp al, 10
+    je .d_err
+    test ecx, ecx
+    jnz .d_in
+    cmp al, '"'
+    je .d_end
+    cmp al, 0x5C
+    je .d_esc
+    cmp al, '{'
+    jne .d_rb
+    cmp byte [rsi+1], '{'
+    je .d_skip2
+    inc ecx
+    inc rsi
+    jmp .d1
+.d_rb:
+    cmp al, '}'
+    jne .d_adv
+    cmp byte [rsi+1], '}'
+    je .d_skip2
+.d_adv:
+    inc rsi
+    jmp .d1
+.d_skip2:
+    add rsi, 2
+    jmp .d1
+.d_esc:
+    cmp byte [rsi+1], 0
+    je .d_err
+    cmp byte [rsi+1], 10
+    je .d_err
+    add rsi, 2
+    jmp .d1
+.d_in:
+    cmp al, '{'
+    jne .d_in1
+    inc ecx
+    jmp .d_adv
+.d_in1:
+    cmp al, '}'
+    jne .d_in2
+    dec ecx
+    jmp .d_adv
+.d_in2:
+    cmp al, '"'
+    je .d_nest
+    cmp al, 0x27
+    jne .d_adv
+.d_nest:
+    mov dl, al                          ; a string or character inside the expression: skip it
+.d_n1:
+    inc rsi
+    movzx eax, byte [rsi]
+    test al, al
+    jz .d_err
+    cmp al, 10
+    je .d_err
+    cmp al, 0x5C
+    jne .d_n2
+    inc rsi
+    cmp byte [rsi], 0
+    je .d_err
+    jmp .d_n1
+.d_n2:
+    cmp al, dl
+    jne .d_n1
+    inc rsi
+    jmp .d1
+.d_end:
+    mov rax, rsi
+    sub rax, r12
+    mov [tk_ptr], r12
+    mov [tk_len], rax
+    mov qword [tk], T_ISTR
+    inc rsi
+    mov [src_ptr], rsi
+    jmp .done
+.d_err:
+    ERR "unterminated interpolated string (a missing quote or }, or a line break)"
 
 ; ---- identifier / keyword
 .ident:
@@ -394,9 +489,30 @@ next_token:
     jmp .dec
 .decend:
     ; a '.' followed by a digit, or an exponent, makes it a floating point literal
+    ; (but not after a member access:  t.1.0  is  t . 1 . 0  for nested tuples)
     mov al, [rsi]
     cmp al, '.'
     jne .dexp
+    mov rdx, [tk_start]
+    cmp byte [rdx-1], '.'
+    jne .dotflt
+    movzx edx, byte [rdx-2]
+    cmp dl, ')'
+    je .numdone
+    cmp dl, ']'
+    je .numdone
+    cmp dl, '_'
+    je .numdone
+    cmp dl, '0'
+    jb .dotflt
+    cmp dl, '9'
+    jbe .numdone
+    or dl, 0x20
+    cmp dl, 'a'
+    jb .dotflt
+    cmp dl, 'z'
+    jbe .numdone
+.dotflt:
     movzx eax, byte [rsi+1]
     sub eax, '0'
     cmp eax, 9

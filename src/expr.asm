@@ -630,6 +630,8 @@ is_type_start_impl:
     mov eax, [tk]
     cmp eax, K_INT
     je .yes
+    cmp eax, '('
+    je tuple_start_la                   ; (T1, T2) is a tuple type, (T) x a cast, (a, b) a literal
     cmp eax, K_STRUCT
     je .yes
     cmp eax, K_CLASS
@@ -735,6 +737,8 @@ parse_type:
     push rbx
     push r12
     mov eax, [tk]
+    cmp eax, '('
+    je .tuple
     cmp eax, K_STRUCT
     je .tagkw
     cmp eax, K_CLASS
@@ -805,10 +809,22 @@ parse_type:
     cmp ecx, S_TYPEDEF
     je .typedef
 .unk:
+    cmp qword [tk], T_ID
+    jne .unk1
+    mov rdi, w_var
+    call tk_is_word
+    test eax, eax
+    jz .unk1
+    ERR "var can only declare a local variable that has an initializer (var x = value;), not parameters, fields or globals"
+.unk1:
     mov edi, msg_unktype
     cmp qword [tk], T_ID
     je fatal_error_tok
     jmp fatal_error
+.tuple:
+    call parse_tuple_type               ; (int, double, char*) ...  and the token after ')' is current
+    mov rbx, rax
+    jmp .star
 .int:
     mov ebx, TY_INT
     jmp .star0
@@ -1154,6 +1170,14 @@ gen_call:
     cmp qword [tk], ')'
     je .args_done
 .arg:
+    mov rax, [r12+SYM_EXTRA]
+    test rax, rax
+    jz .arge
+    cmp ebx, [r12+SYM_NPAR]
+    jae .arge
+    mov rdi, [rax+rbx*8]
+    call tuple_expect_here              ; a tuple literal as the argument is converted to the parameter type
+.arge:
     call parse_assign
     call to_rvalue
 .argconv:
@@ -1165,6 +1189,9 @@ gen_call:
     jae .argcv
     mov rdi, [rax+rbx*8]
     call coerce_to
+    mov rax, [r12+SYM_EXTRA]
+    mov rdi, [rax+rbx*8]
+    call tuple_check
 .argcv:
     mov rax, [e_type]
     test eax, 0xFF00
@@ -1326,6 +1353,8 @@ gen_call:
 
 ; va_check: va_arg / va_count are only available in a function whose parameter list ends in ...
 va_check:
+    cmp dword [lam_depth], 0
+    jne .bad
     mov rax, [cur_func]
     test rax, rax
     jz .bad
@@ -1371,7 +1400,14 @@ parse_primary:
     je .flt
     cmp eax, T_SCOPE
     je .scope
+    cmp eax, T_ISTR
+    je .istr
     ERR "expected an expression"
+
+; $"text {expr:spec}"  - see interp.asm
+.istr:
+    call parse_interp
+    jmp .out
 
 .flt:
     mov rdi, [tk_val]
@@ -1449,6 +1485,10 @@ parse_primary:
 .this1:
     cmp dword [cur_static], 0
     je .this2
+    cmp dword [lam_depth], 0
+    je .this1a
+    ERR "'this' cannot be used in a lambda: pass the object as a parameter"
+.this1a:
     ERR "'this' cannot be used in a static method"
 .this2:
     mov edi, [cur_this_off]
@@ -1778,13 +1818,63 @@ parse_primary:
     jmp .out
 
 .paren:
+    mov r12, [tk_start]                 ; this '(' : a tuple literal here may be the whole expression that has a known tuple type
     call next_token
+    cmp qword [tk], ')'
+    je .lam                             ; () => ...
     call is_type_start
+    mov r13d, eax                       ; 1: a type starts here
     test eax, eax
+    jnz .la
+    cmp qword [tk], T_ID                ; (a, b) => ...   (a) => ...   but not (a + b)
+    jne .notlam
+    call tuple_peek_char
+    cmp eax, ','
+    je .la
+    cmp eax, ')'
+    jne .notlam
+.la:
+    call lambda_ahead                   ; is the matching ')' followed by => ?
+    test eax, eax
+    jnz .lam
+.notlam:
+    test r13d, r13d
     jnz .cast
-    call parse_expr
+    xor r13d, r13d
+    cmp r12, [tup_expect_tok]
+    jne .legacy
+    ; a tuple is expected here (return in a function that returns one, a tuple variable, var, a pattern, an argument): (a, b) is a literal
+    mov r13, [tup_expect]
+    mov qword [tup_expect_tok], 0
+    cmp r13, -1
+    jne .pt
+    call tuple_expect_any               ; var / a pattern without types: any tuple, the elements too
+    jmp .pp
+.pt:
+    mov rdi, r13                        ; the first element has the type of the first field of the tuple
+    xor esi, esi
+    call tuple_field
+    mov rdi, [rax+FD_TYPE]
+    call tuple_expect_here
+.pp:
+    call parse_assign
+    cmp qword [tk], ','
+    je .tuple
     mov edi, ')'
     call expect
+    jmp .out
+.legacy:
+    call parse_expr                     ; without such a context  (a, b)  is the comma operator: a is evaluated, the value is b
+    mov edi, ')'
+    call expect
+    jmp .out
+.tuple:
+    mov rdi, r13                        ; (a, b, ...) : a tuple literal
+    call parse_tuple_rest
+    jmp .out
+.lam:
+    xor edi, edi                        ; (parameters) => body
+    call parse_lambda
     jmp .out
 .cast:
     call parse_type
@@ -1895,6 +1985,7 @@ parse_primary:
     mov rdi, rbx
     mov rsi, r12
     mov rdx, r13
+    mov ecx, '}'
     call init_local_list
     mov edi, r12d
     CG lea_local_a
@@ -2033,6 +2124,24 @@ parse_primary:
 .id:
     mov r13, [tk_ptr]
     mov r14d, [tk_len]
+    mov rsi, [src_ptr]                  ; x => body : a lambda with one parameter
+    movzx eax, byte [rsi]
+    cmp eax, ' '
+    jne .noarrow0
+.arrsp:
+    inc rsi
+    movzx eax, byte [rsi]
+    cmp eax, ' '
+    je .arrsp
+.noarrow0:
+    cmp eax, '='
+    jne .noarrow
+    cmp byte [rsi+1], '>'
+    jne .noarrow
+    mov edi, 1
+    call parse_lambda
+    jmp .out
+.noarrow:
     cmp r14d, 6
     jne .nova1
     cmp dword [r13], 'va_a'
@@ -2130,6 +2239,18 @@ parse_primary:
     ERR "a type name cannot be used as a value"
 
 .local:
+    cmp dword [lam_depth], 0
+    je .local0
+    mov rax, r12                        ; inside a lambda: only its own parameters and locals can be used
+    sub rax, symtab
+    shr rax, 6
+    cmp eax, [lam_sym_base]
+    jae .local0
+    mov [tk_ptr], r13
+    mov [tk_len], r14d
+    mov edi, msg_lam_capture
+    jmp fatal_error_tok
+.local0:
     test dword [r12+SYM_FLAGS], F_BYREF
     jz .local1
     mov edi, [r12+SYM_VAL]
@@ -2430,6 +2551,10 @@ parse_primary:
 .implicit_field:
     cmp dword [cur_static], 0
     je .ifs
+    cmp dword [lam_depth], 0
+    je .ifs0
+    ERR "a lambda has no object: it cannot use a field of the enclosing class (pass what it needs as a parameter)"
+.ifs0:
     ERR "a static method has no object: this field needs one"
 .ifs:
     mov r12, rax
@@ -2471,6 +2596,10 @@ parse_primary:
     jnz .im_static
     cmp dword [cur_static], 0
     je .im2
+    cmp dword [lam_depth], 0
+    je .im1a
+    ERR "a lambda has no object: it cannot call a method of the enclosing class without an object (pass the object as a parameter)"
+.im1a:
     ERR "a static method has no object: this method needs one"
 .im2:
     mov edi, [cur_this_off]
@@ -2747,6 +2876,23 @@ parse_postfix:
     call next_token
     cmp qword [tk], T_ID
     je .mb1
+    cmp qword [tk], T_NUM
+    jne .mberr
+    test dword [st_flags + rbx*4], SF_TUPLE   ; t.0  t.1 : the elements of a tuple
+    jz .mberr
+    mov rax, rbx
+    shl rax, 5
+    mov eax, [struct_tab + rax + ST_NFIELDS]
+    cmp [tk_val], rax
+    jb .tnum
+    ERR "this tuple has no element with that number"
+.tnum:
+    mov rdi, [e_type]
+    mov esi, [tk_val]
+    call tuple_field
+    mov r12, rax
+    jmp .fok
+.mberr:
     ERR "expected a member name"
 .mb1:
     mov r13, [tk_ptr]
@@ -3609,6 +3755,8 @@ parse_assign:
     call to_rvalue
     mov rdi, rbx
     call coerce_to
+    mov rdi, rbx
+    call tuple_check                    ; a tuple cannot be assigned to a plain variable
     mov edi, r12d
     mov rsi, rbx
     call store_local_typed
@@ -3618,10 +3766,16 @@ parse_assign:
 .p3:
     CG push_a
     call next_token
+    mov rdi, rbx
+    call tuple_expect_here              ; t = (1, 2);  the literal is converted to the type of t
     call parse_assign
     call to_rvalue
     mov rdi, rbx
     call coerce_to
+    mov rdi, rbx
+    call tuple_check
+    mov rdi, rbx
+    call struct_check                   ; p = 5;  with a struct p used to compile and crash
     CG pop_b
     mov rdi, rbx
     call emit_store_type
@@ -4114,6 +4268,29 @@ const_unary:
     jmp .out
 .paren:
     call next_token
+    cmp qword [tk], ')'
+    je .parlam
+    call lambda_ahead                   ; (a, b) => ...   in a global initializer or a default parameter value
+    test eax, eax
+    jz .par1
+.parlam:
+    cmp qword [tk], ')'                 ; () is only a lambda when => follows
+    jne .parlam2
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor ebx, ebx
+    cmp qword [tk], T_FATARROW
+    sete bl
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    test ebx, ebx
+    jz .par1
+.parlam2:
+    ERR "a lambda can only be used inside a function (not in a global initializer or as the default value of a parameter)"
+.par1:
     mov edi, 1
     call const_binary
     push rax
@@ -4142,6 +4319,20 @@ const_unary:
     call sym_lookup
     test rax, rax
     jnz .id1
+    sub rsp, 128                        ; x => ...  is a lambda, which needs a function
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor ebx, ebx
+    cmp qword [tk], T_FATARROW
+    sete bl
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    test ebx, ebx
+    jz .id0
+    ERR "a lambda can only be used inside a function (not in a global initializer or as the default value of a parameter)"
+.id0:
     jmp fatal_undeclared
 .id1:
     mov r12, rax

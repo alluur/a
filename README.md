@@ -143,6 +143,12 @@ int main() {
 * **Iteration and selection:** `foreach (int x in values)` over arrays, text, ranges (`0..n`, `rev 0..n`), `(pointer, count)` and classes with
   `count()` / `get(i)`; `switch` on text (fast for hundreds of labels), `case 1, 2:` and `case 10..20:`; labeled `break outer;` / `continue outer;`.
 * **Operators:** `||=`, `&&=`, `??=` (short-circuit assignment), `^^`, `<=>`, `??`, operator overloading; `static_assert(cond, "message")`.
+* **Inference, tuples, lambdas, interpolation:** `var n = 5;` (also in `for` and `foreach`); tuples and multiple results
+  (`(int, int) divmod(int a, int b) { return (a / b, a % b); }`, `(int q, int r) = divmod(7, 2);`, `(a, b) = (b, a);`, `t.0`);
+  lambdas (`algo.sortBy(a, n, (int x, int y) => x - y)`, `x => x * 2`; no captures: pass values as parameters) and string interpolation
+  (`$"x = {x}, pi = {pi:.3f}"`) lowered to the same formatter as `printf`, which takes any number of values and prints doubles
+  exactly (`%e %f %g`, correctly rounded, also `%v` for the shortest text that reads back). The exact float formatter gives every program that uses `printf` or
+  `format` about 14 KB more machine code (hello world with one `printf`: a 28.8 KB executable instead of 12.4 KB, files are rounded to 4 KB pages; `print` / `println` alone are unchanged).
 * **Classes:** single inheritance, `virtual`, `abstract` classes and methods, `override` / `final` with signature checks, `static` fields and
   methods (`Counter.count`, `Util.square(3)`), and the run time checks `x is Dog` / `x as Dog`.
 * **No hidden runtime:** the "standard library" is written in A itself (`lib/std.a`) and
@@ -164,6 +170,9 @@ src/            the compiler (NASM assembly)
   expr.asm        types, expressions, constant expressions, calls
   stmt.asm        statements and local variables
   foreach.asm     the foreach statement
+  tuple.asm       tuples: types, literals, patterns
+  lambda.asm      lambdas
+  interp.asm      string interpolation
   switch.asm      the switch statement (integers and text)
   decl.asm        functions, classes, enums, globals, modules
   cg_x86.asm      x86-64 backend
@@ -190,6 +199,8 @@ same programs compiled by GCC, on every target (see [`docs/INTERNALS.md`](docs/I
 `tests/run.sh` compiles every `tests/t*.a`, runs it and compares stdout and the exit code with the
 `.out` / `.exit` files next to it (`.err` files hold the expected text of a compile error).
 `TARGET=windows tests/run.sh`, `TARGET=linux-arm64 tests/run.sh`, … select another target.
+
+`tests/hostile.sh` compiles hostile source text (12000 nested tuples, 3000 nested lambdas, 200000 parentheses ...) with a time limit: the compiler has to answer in milliseconds.
 
 `tests/tui.sh` runs the terminal toolkit's programs in a pseudo terminal and checks the screen with a terminal emulator written in
 Python (typing, menus, mouse, resize, paste, suspend to a shell, signals, `TERM` variants); `tests/gui.sh` tests the graphical stack,

@@ -170,7 +170,9 @@ work on all cursors from the last to the first, inside one undo group. Highlight
 * **Lexers** for A, C, C++, Python, shell, JSON, Markdown, INI, TOML, HTML, XML, Makefile and plain text. The A keywords include the words of
   the second tier of the language: `foreach in rev` (loops), `abstract override final` (classes), `is as` (type checks) and `static_assert`
   (`in`, `rev`, `is`, `as` are only keywords where the compiler reads them as such, so a variable called `in` is highlighted as a keyword
-  anyway; the highlighter does not parse; `t316_asyntax_newkw` checks the lists). `lexLine(lang, state, text,
+  anyway; the highlighter does not parse; `t316_asyntax_newkw` checks the lists), and `var` (type inference; also contextual in the compiler).
+  An interpolated string `$"x = {x}, pi = {pi:.3f}"` is one `String` token: the braces are counted, so strings and characters inside
+  `{...}` do not end it (`$"{f("a")}"`), and `{{` / `}}` are braces; `t329_asyntax_lang2` checks it together with tuples and lambdas. `lexLine(lang, state, text,
   len, tokens, max, &endState)` is a pure function: spans `(start, len, kind)` that cover the line without gaps, kinds from the fixed
   enum `Tok` (`Plain Keyword Type Builtin Constant Number String Char Escape Comment DocComment Preproc Operator Punct Function
   Variable Tag Attribute Heading Emphasis Link Code Quote Error`). The state is a small integer (in block comment, in a triple

@@ -291,6 +291,9 @@ compile_function:
     mov r12, rdi
     mov r13d, [sym_count]
     mov [cur_func], r12
+    mov rax, [r12+SYM_TYPE]
+    mov [ret_type], rax
+    mov dword [lam_depth], 0
     call define_function
     CG prologue
     mov dword [frame_size], 0
@@ -879,7 +882,7 @@ parse_aggregate:
 .notunion:
     ; new field entry
     mov esi, [field_count]
-    cmp esi, FIELD_MAX
+    cmp esi, [field_limit]
     jae err_toobig
     inc dword [field_count]
     mov rdi, rsi
@@ -1276,7 +1279,7 @@ inherit_base:
     mov [r10+ST_FIRST], edi
     ; copy the field entries
     lea edx, [rdi+rcx]
-    cmp edx, FIELD_MAX
+    cmp edx, [field_limit]
     jae err_toobig
     mov [field_count], edx
     mov rdx, rsi
@@ -2039,7 +2042,13 @@ parse_global_vars:
     cmp qword [tk], '{'
     je .glist
     bt rbx, TF_ARRAY_BIT
-    jnc .i0
+    jc .glist
+    cmp qword [tk], '('
+    jne .i0
+    mov rdi, rbx                        ; (int, int) g = (5, 6);  a tuple literal of constants
+    call type_is_tuple
+    test eax, eax
+    jz .i0
 .glist:
     mov rdi, r15
     mov esi, 8
@@ -2054,6 +2063,8 @@ parse_global_vars:
     xor edx, edx
     jmp .reg
 .i0:
+    mov rdi, rbx
+    call struct_global_check
     cmp rbx, TY_DOUBLE
     jne .i0int
     call const_double
@@ -2224,6 +2235,14 @@ parse_items:
     call is_type_start
     test eax, eax
     jnz .decl
+    cmp qword [tk], T_ID
+    jne .topbad
+    mov rdi, w_var
+    call tk_is_word
+    test eax, eax
+    jz .topbad
+    ERR "var can only declare a local variable that has an initializer (var x = value;), not parameters, fields or globals"
+.topbad:
     mov edi, msg_toplevel
     cmp qword [tk], T_ID
     je fatal_error_tok

@@ -447,6 +447,20 @@ x86_lea_func_a:
     pop rdi
     ret
 
+; rdi = a position in the code buffer -> A = its address:  lea rax, [rip + rel32]  (position independent: no relocation)
+x86_lea_code_a:
+    push rax
+    push rdi
+    EM 0x48, 0x8D, 0x05
+    mov rax, rdi
+    sub rax, [code_pos]
+    sub rax, 4
+    mov edi, eax
+    call emit_d
+    pop rdi
+    pop rax
+    ret
+
 x86_call_a:
     EM 0xFF, 0xD0                   ; call rax
     ret

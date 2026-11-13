@@ -36,6 +36,9 @@ linked with `ld`. It uses no libc: it talks to Linux through `syscall` only.
 | `expr.asm` | type parsing, constant expressions, primary/postfix/unary/binary/logical/assignment parsing, calls |
 | `stmt.asm` | blocks, `if`/`while`/`do`/`for`, `break`/`continue` (also labeled), `return`, local declarations, `const`, `static_assert` |
 | `foreach.asm` | the `foreach` statement (arrays, text, ranges, pointer + count, classes with `count()` / `get()`) |
+| `tuple.asm` | tuple types (hidden structs), literals, patterns `(a, b) = value;`, `var (a, b) = value;` |
+| `lambda.asm` | lambdas: the body is compiled inline between a jump and its target; `lambda_ahead` finds `=>` |
+| `interp.asm` | `$"..."`: the raw literal is parsed with the lexer moved into it and lowered to `__interp(fmt, values...)` |
 | `switch.asm` | the `switch` statement: labels, ranges, text, duplicate checks, the dispatch code (compare chain, binary search, hash search) |
 | `decl.asm` | functions, classes/structs, enums, globals, modules, imports, top-level loop |
 | `cg_x86.asm` | x86-64 backend (Linux, Android x86-64, Windows) |
@@ -232,7 +235,8 @@ and `tk_start` of the current token.
 `tests/run.sh [pattern]` compiles and runs each `tests/t*.a`. Expected stdout is `tNN_name.out`,
 the expected exit code `tNN_name.exit` (default 0), stdin `tNN_name.in`, and `tNN_name.err` holds a
 fragment of the message for tests that must fail to compile (`t9x_err_*`). The same suite is run
-for every target (see [TARGETS.md](TARGETS.md)).
+for every target (see [TARGETS.md](TARGETS.md)). `tests/hostile.sh` generates hostile source text (deep nesting of tuples, lambdas, casts and parentheses,
+very long lists) and compiles it with a time limit, so that a lookahead that rescans the nested text (quadratic compile time) is found.
 
 ### Differential fuzzing
 
@@ -285,6 +289,67 @@ and ranges), `t306` / `t307` / `t308` (`||=` `&&=` `??=`, every compound assignm
 `tests/gen/gen_switch_big.py` and `tests/gen/gen_compound_test.py` write `t304` and `t307` (the second compares the compiler with a Python model of the
 rules for the integer types). Measured: a switch with 1000 text labels decides in about 0.09 microseconds (`__swhash` + binary search + one `streq`), the same
 decision as a chain of 1000 `streq` calls takes 3.3 microseconds; compiling `examples/gui/abrowse.a` takes the same time as before these features.
+
+## `var`, tuples, lambdas, interpolation, formatting (stmt.asm, tuple.asm, lambda.asm, interp.asm, lib/std.a)
+
+* **var.** `is_var_start` accepts the word `var` only where nothing of that name is in scope (a local, a global, a field or method of the current class) and a
+  name or `(` follows (one token of lookahead with `lex_save`). `parse_var_decl` parses the initializer *first* (so the new name is not visible in it, and the type is
+  known), then `var_declare` allocates the slot and stores: scalars with `store_local_typed`, struct values with `emit_store_type` (a copy). `foreach` calls it through
+  `fe_decl` (the element type stays "infer").
+* **Tuples** are structs. `tuple_type` looks for an existing struct with the flag `SF_TUPLE` (`st_flags`) and the same field types, else makes one: the name is
+  `<tuple>`, the fields are `#` (a name no identifier can have) at their natural offsets, the size is rounded to 8. The **fields of tuple structs are allocated from the
+  top of `field_tab`** (`field_limit` counts down from `FIELD_MAX`): a tuple type that is made in the middle of a class body (a field of tuple type) must not split the
+  fields of that class, which are consecutive entries from `ST_FIRST`. `parse_type` and `is_type_start` start a tuple type at `(` (`tuple_start_la` looks for
+  `( type ,` so that a cast `(int) x` is none). A literal is evaluated element by element into the target machine's stack (`push_a`), then the tuple type is known,
+  a frame temporary is allocated and the elements are popped into it (last first). The result is the temporary with `e_lval = 1`, like a compound literal.
+  **A literal needs an expectation, because `(a, b)` is the comma operator (`parse_expr`) and old programs use it:** `tup_expect` (the tuple type, or -1 for any tuple) and
+  `tup_expect_tok` (`tk_start` of the token where the expression starts) are set by `tuple_expect_here` / `tuple_expect_any` in `return`, local initializers, assignments,
+  call arguments (the declared parameter type) and `var` / pattern initializers; `parse_primary .paren` makes a tuple only when its own `(` is that token (and
+  `parse_stmt` clears the token, so an expectation cannot leak into a later statement). With a type the elements are `coerce_to` the field types (int to double) and
+  the arity is checked; `tuple_check` makes every other meeting of a tuple with another type an error (return, argument, initialization, assignment; also the fast
+  path of the assignment to a plain local, which once let a tuple address into an `int`). `struct_check` (after `tuple_check`, in local initializers, list elements
+  and assignments) refuses a scalar for a struct target, `struct_global_check` the same for a global / static initializer. `init_elem` calls `tuple_expect_here`, so a literal
+  works as a list element; in a global (`init_mode` 1) a `(` for a tuple type is parsed by `init_local_list` with the closing token `)` (`init_close`, saved and restored by
+  nested lists; the arity must be complete). Patterns: `tuple_stmt_kind` scans to the matching `)` and looks for `=` (one
+  more lookahead for statements that start with `(`); the declaration form computes the value, keeps its address in a hidden local and declares the variables with
+  `var_declare`; the assignment form pushes the addresses of the targets (`parse_unary`, so any lvalue), computes the value, copies it into a temporary and
+  stores element i with the target `i` found by `load_stack_a`. `.0` `.1` are handled in `parse_postfix .member` (and the lexer does not make `1.0` of `t.1.0`).
+* **Lambdas.** `parse_primary .paren` asks `lambda_ahead` (a scan to the first `)` that looks for `=>` or `-> type =>`; the scan stops at any `(`, `;`, `{` or `}`
+  because a parameter list holds only names and types - this keeps the compile time linear for hostile text like `(a, (a, (a, ...`: it was quadratic, 30 s for 12000 levels,
+  see `tests/hostile.sh`) when `(` is followed by `)`, a type or a name
+  followed by `,` / `)`; `.id` checks the characters after an identifier for `=>` (`x => ...`). `parse_lambda` saves the state of the function being compiled (frame size,
+  return chain, labels and their table, loop records, defers and their buffer, `frame_patch`, ... about 7 KB on the compiler's stack), emits `jmp over`, the prologue,
+  the parameters as locals (`16 + slot * (n-1-i)` like `compile_function`), the body (a block with `parse_block`, or one expression), the default return, the epilogue and
+  `set_frame`; restores the state; binds `over` and emits `lea_code_a start`. **`lea_code_a`** is a new back end primitive (`rdi` = a position in the code buffer
+  -> A = its address): `lea rax,[rip+disp]` on x86-64, `adr` (+-1 MiB) on AArch64, `auipc` + `addi` on RISC-V, `pcaddu12i` + `addi.d` on LoongArch64 - all relative to the
+  instruction itself, so no relocation and no symbol are needed and objects / the linker are unaffected. `cur_func` stays the enclosing function (the call graph is
+  the enclosing function's) while `ret_type` (new: `parse_return` reads it instead of the symbol of `cur_func`) and `cur_static` (no `this`) change.
+  Captures are refused in `parse_primary .local`: a local whose symbol index is below `lam_sym_base` (the symbol count at the start of the innermost lambda) is an
+  error, as are `this`, implicit fields and methods, `va_arg` and (through the saved loop records) `break` / `continue` that would leave the lambda.
+* **Interpolation.** The lexer makes `$"..."` one token (`T_ISTR`): `tk_ptr` / `tk_len` are the raw text; braces are counted so that `{f("a")}` and `{'}'}` do not end it.
+  `parse_interp` walks the raw text: literal characters (escapes through `lex_escape`, `%` doubled) go into a format text that has been reserved in the data section
+  (`data_alloc`, filled in at compile time); for `{expr:spec}` it sets `src_ptr` inside the literal, calls `next_token` and `parse_assign` (so any expression works), reads the
+  spec as raw text up to `}`, checks it with a small state machine (flags, width, precision, length, in this order), chooses the conversion letter by the type (see
+  LANGUAGE.md), converts (an integer with a float letter through `__i2f` / `__u2f` of lib/std.a, which work with integer arithmetic: the soft-float runtime is only loaded
+  when the lexer sees `double` or a float literal, and that happens in pass 1, too early for a decision made while parsing the literal in pass 2; `__boolstr` for bool) and pushes the value;
+  at the end it pushes the number of values and calls `__interp` (`vformat` to measure, `alloc(len + 1)`, `vformat` to fill) - the argument order is that of every `...`
+  function: the format first (its address is pushed before any value is evaluated), the values, then their number.
+* **The formatter** (`vformat` in lib/std.a) handles floating point with integer code only: `__fmt_exact` makes the exact decimal digits of `m * 2^k` (a double is
+  `m * 2^k`) with base 10^9 limbs (`m * 2^k` for k >= 0, `m * 5^-k` with the decimal point moved by k places for k < 0: at most 770 digits), `__fmt_roundto` rounds
+  the digit string half to even (exact: the digits are all there), `__fmt_emit_f / _e / _x` write the text, `%g` rounds once to P digits and strips zeros, and `%v`
+  (`__fmt_shortest`) takes the shortest digit string that lies between the midpoints to the neighbouring doubles (the exact decimal values of `(2m +- 1) * 2^(k-1)`, the lower one
+  `(4m - 1) * 2^(k-2)` when m is a power of 2), inclusive when the mantissa is even, nearest to the value first. `printf` / `format` / `fprintf` ... are `...` functions that copy
+  `va_arg(i)` into an array (32 on the stack, more in the buffer of `__fmt_args_take`, one block that only grows) and call `vformat`. Widths and precisions are cut to
+  `__FMT_LIMIT` (100000000) when they are read, and padding goes through `__fmt_fill`, which stores only what fits and otherwise just counts. `float.asm` converts a `uint64`
+  to double with `__u2f` (std.a), every other integer with `itod`.
+* **Tests:** `t320` (var), `t321` / `t322` (tuples), `t323` / `t324` / `t325` (lambdas), `t326` (3400 exact float and integer cases: the expected output of the floats is from Python's `%`, of
+  the integers from glibc's `printf`; `tests/gen/gen_format_test.py`), `t327` (flags, `*`, lengths, many values, truncation, hostile specifications; the first part is the output of a C
+  program), `t328` (interpolation, also every wrong order of the spec), `t329` (highlighter), `t331` (integers with float letters, ints only; Python oracle,
+  `tests/gen/gen_interp_int_test.py`), `t332` (width and precision limits, many values without allocation), `t333` (tuple literals in lists, global tuples, struct targets),
+  `t334` (uint64 to double), `t335` (valid specs), `tests/hostile.sh` (hostile nesting must compile in milliseconds), `tests/link/lambda_tuple` (tuples and lambdas across separately compiled units) and `.err` tests for every error message. The generator's
+  `--stress N SEED PREFIX` mode was run with 130000 random cases (random bit patterns, denormals, ties, powers of two and their neighbours) without a difference; the `%f %e %g` text also agrees with
+  glibc except for the known glibc bug in `%#g` when rounding carries into a new digit (`printf("%#g", 999999.5)` prints `1.e+06`; Python and this formatter print `1.00000e+06`).
+  Compiling `examples/gui/abrowse.a` takes the same time as before (0.19 s).
 
 ## The C library modules
 

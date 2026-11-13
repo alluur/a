@@ -113,6 +113,7 @@ emit_defers:
 
 parse_stmt:
     STACKCHK
+    mov qword [tup_expect_tok], 0       ; (a tuple expectation lives only within the statement that made it)
     mov rax, [pend_lbl_ptr]             ; the label (if any) that stands directly in front of this statement
     mov [stmt_lbl_ptr], rax
     mov eax, [pend_lbl_len]
@@ -205,6 +206,15 @@ parse_stmt:
     call lex_restore
     add rsp, 128
 .notlabel:
+    cmp qword [tk], '('
+    jne .nottuple
+    call tuple_stmt_kind                ; (a, b) = value;   (int a, int b) = value;
+    test eax, eax
+    jnz parse_tuple_stmt
+.nottuple:
+    call is_var_start
+    test eax, eax
+    jnz parse_var_decl
     call is_type_start
     test eax, eax
     jnz parse_local_decl
@@ -323,6 +333,20 @@ parse_for:
     call next_token
     jmp .cond
 .init:
+    cmp qword [tk], '('
+    jne .init0
+    call tuple_stmt_kind                ; for ((a, b) = (0, 1); ...)
+    test eax, eax
+    jz .init0
+    call parse_tuple_stmt               ; (it consumes the ';')
+    jmp .cond
+.init0:
+    call is_var_start
+    test eax, eax
+    jz .init_t
+    call parse_var_decl
+    jmp .cond
+.init_t:
     call is_type_start
     test eax, eax
     jz .initexpr
@@ -354,6 +378,16 @@ parse_for:
     mov [r12+16], rax
     cmp qword [tk], ')'
     je .noinc
+    cmp qword [tk], '('
+    jne .incexpr
+    call tuple_stmt_kind                ; for (...; ...; (a, b) = (b, a + b))
+    test eax, eax
+    jz .incexpr
+    mov dword [tup_noterm], 1
+    call parse_tuple_stmt               ; (the ')' of the for is not consumed)
+    mov dword [tup_noterm], 0
+    jmp .noinc
+.incexpr:
     call parse_expr
     call discard_result
 .noinc:
@@ -379,24 +413,28 @@ parse_return:
     call next_token
     cmp qword [tk], ';'
     je .void
+    cmp qword [cur_func], 0
+    je .nx
+    mov rdi, [ret_type]
+    call tuple_expect_here              ; return (a, b);  in a function that returns a tuple
+.nx:
     call parse_expr
     call to_rvalue
-    mov rax, [cur_func]
-    test rax, rax
-    jz .j
-    mov rdi, [rax+SYM_TYPE]
+    cmp qword [cur_func], 0
+    je .j
+    mov rdi, [ret_type]
     call coerce_to                      ; int <-> double
-    mov rax, [cur_func]
-    cmp qword [rax+SYM_TYPE], TY_BOOL
+    mov rdi, [ret_type]
+    call tuple_check
+    cmp qword [ret_type], TY_BOOL
     jne .notbool
     CG tobool
     jmp .j
 .notbool:
-    mov rdi, [rax+SYM_TYPE]
+    mov rdi, [ret_type]
     call emit_normalize                 ; a narrow result is returned truncated and extended
-    mov rax, [cur_func]
     ; a struct result is copied to the address that the caller passed as the hidden last argument
-    mov rdx, [rax+SYM_TYPE]
+    mov rdx, [ret_type]
     test edx, 0xFF00
     jnz .j
     cmp dl, TY_STRUCT
@@ -617,6 +655,8 @@ parse_local_decl:
     call to_rvalue
     mov rdi, rbx
     call coerce_to
+    mov rdi, rbx
+    call tuple_check
     mov edi, r14d
     mov rsi, rbx
     call store_local_typed
@@ -661,11 +701,18 @@ parse_local_decl:
     mov rdi, rbx
     mov rsi, r14
     xor edx, edx
+    mov ecx, '}'
     call init_local_list
     jmp .next
 .nolist:
+    mov rdi, rbx
+    call tuple_expect_here              ; (int, double) t = (1, 2);
     call parse_assign
     call to_rvalue
+    mov rdi, rbx
+    call tuple_check
+    mov rdi, rbx
+    call struct_check                   ; P p = 5;  used to compile and crash
     mov edi, r14d
     CG lea_local_b
     mov rdi, rbx
@@ -701,6 +748,184 @@ parse_local_decl:
     pop r12
     pop rbx
     ret
+
+
+; ---- var: the type of a local variable is taken from its initializer ------------------------------------------------------
+;   var x = expr;     var a = 1, b = "text";     for (var i = 0; ...)     foreach (var x in values)
+; `var` is not a keyword: it is the declaration word only where a new name can follow it and nothing named var is in scope.
+section .rodata
+w_var: db "var", 0
+section .text
+
+; is_var_start: eax = 1 when the current token is the word var, not declared as anything in the current scope, followed by a name or '('
+is_var_start:
+    cmp qword [tk], T_ID
+    jne .no
+    cmp dword [tk_len], 3
+    jne .no
+    mov rax, [tk_ptr]
+    cmp word [rax], 'va'
+    jne .no
+    cmp byte [rax+2], 'r'
+    jne .no
+    push rbx
+    mov rdi, rax
+    mov esi, 3
+    call sym_lookup
+    test rax, rax
+    jnz .no1
+    cmp dword [cur_class], -1
+    je .look
+    mov edi, [cur_class]                ; a field or method called var of the class being compiled is not the declaration word
+    mov rsi, [tk_ptr]
+    mov edx, 3
+    call struct_find_field
+    test rax, rax
+    jnz .no1
+    mov edi, [cur_class]
+    mov rsi, [tk_ptr]
+    mov edx, 3
+    call struct_find_method
+    test rax, rax
+    jnz .no1
+.look:
+    sub rsp, 128
+    mov rdi, rsp
+    call lex_save
+    call next_token
+    xor ebx, ebx
+    cmp qword [tk], T_ID
+    je .yes
+    cmp qword [tk], '('
+    jne .back
+.yes:
+    mov ebx, 1
+.back:
+    mov rsi, rsp
+    call lex_restore
+    add rsp, 128
+    mov eax, ebx
+    pop rbx
+    ret
+.no1:
+    pop rbx
+.no:
+    xor eax, eax
+    ret
+
+; var_declare: rdi = name pointer, esi = name length, rdx = type of the variable (the value is in A, converted to that type).
+; Creates the local variable and stores A (or, for a struct, the object that A points to) into it.
+var_declare:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12, rdi
+    mov r13d, esi
+    mov rbx, rdx
+    mov rdi, rbx
+    call check_concrete
+    mov rdi, rbx
+    call type_size
+    add rax, 7
+    and rax, -8
+    jnz .sz
+    mov eax, 8
+.sz:
+    add [frame_size], eax
+    mov rdi, r12
+    mov esi, r13d
+    mov edx, S_LOCAL
+    call sym_new
+    mov qword [rax+SYM_EXTRA], 0
+    mov [rax+SYM_TYPE], rbx
+    mov r14d, [frame_size]
+    neg r14
+    mov [rax+SYM_VAL], r14
+    mov rdi, rbx
+    call type_ls
+    test eax, eax
+    jz .agg
+    mov edi, r14d
+    mov rsi, rbx
+    call store_local_typed
+    jmp .out
+.agg:
+    mov edi, r14d                       ; a struct or class value: A is the address of the source object, copy it
+    CG lea_local_b
+    mov rdi, rbx
+    call emit_store_type
+.out:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; parse_var_decl: the current token is `var`; reads  var name = expr {, name = expr} ;
+parse_var_decl:
+    push rbx
+    push r12
+    push r13
+    call next_token
+    cmp qword [tk], '('
+    je .tuple
+.decl:
+    cmp qword [tk], T_ID
+    je .d1
+    ERR "expected a variable name after var"
+.d1:
+    mov r12, [tk_ptr]
+    mov r13d, [tk_len]
+    call next_token
+    cmp qword [tk], '='
+    je .init
+    ERR "var needs an initializer: the type of the variable is taken from it (var x = value;)"
+.init:
+    call next_token
+    cmp qword [tk], '{'
+    jne .i1
+    ERR "cannot infer the type of the variable from a {...} list: write the type"
+.i1:
+    call tuple_expect_any               ; var t = (1, "a");  a parenthesized list that starts the initializer is a tuple
+    xor ebx, ebx
+    cmp qword [tk], K_NULL
+    jne .i2
+    mov ebx, 1                          ; remember a plain null: its type (void*) says nothing
+.i2:
+    call parse_assign
+    call to_rvalue
+    mov rax, [e_type]
+    cmp rax, TY_VOID
+    jne .i3
+    ERR "cannot infer the type of the variable: the initializer has no value (it is void)"
+.i3:
+    test ebx, ebx
+    jz .i4
+    cmp rax, TY_VOID | TY_PTR1
+    jne .i4
+    ERR "cannot infer the type of the variable from null: write the type, for example  char* p = null;"
+.i4:
+    mov rdi, r12
+    mov esi, r13d
+    mov rdx, [e_type]
+    call var_declare
+    cmp qword [tk], ','
+    jne .end
+    call next_token
+    jmp .decl
+.end:
+    mov edi, ';'
+    call expect
+    pop r13
+    pop r12
+    pop rbx
+    ret
+.tuple:
+    pop r13
+    pop r12
+    pop rbx
+    jmp parse_var_tuple
 
 ; ---- const declaration (global when pass 1, local inside functions) -------------
 ; const NAME = expr;   const TYPE NAME = expr;
@@ -872,7 +1097,13 @@ parse_static_local:
     cmp qword [tk], '{'
     je .glist
     bt rbx, TF_ARRAY_BIT
-    jnc .i0
+    jc .glist
+    cmp qword [tk], '('
+    jne .i0
+    mov rdi, rbx                        ; static (int, int) t = (5, 6);  a tuple literal of constants
+    call type_is_tuple
+    test eax, eax
+    jz .i0
 .glist:
     mov rdi, r15
     mov esi, 8
@@ -887,6 +1118,8 @@ parse_static_local:
     xor edx, edx
     jmp .reg
 .i0:
+    mov rdi, rbx
+    call struct_global_check
     call const_expr
     push rax
     push rdx
@@ -1014,6 +1247,7 @@ init_elem:
     mov rdi, rbx
     mov rsi, r12
     mov rdx, r13
+    mov ecx, '}'
     call init_local_list
     jmp .out
 .nobrace:
@@ -1061,16 +1295,37 @@ init_elem:
 .value:
     cmp dword [init_mode], 0
     jne .dvalue
+    mov rdi, rbx
+    call tuple_expect_here              ; (int, int) a[2] = {(1, 2), (3, 4)};  a tuple literal is converted to the element type
     call parse_assign
     call to_rvalue
     mov rdi, rbx
     call coerce_to
+    mov rdi, rbx
+    call tuple_check
+    mov rdi, rbx
+    call struct_check                   ; P a[2] = {5, 6};  used to compile and crash
     mov edi, r12d
     CG lea_local_b
     mov rdi, rbx
     call emit_store_type
     jmp .out
 .dvalue:
+    cmp qword [tk], '('
+    jne .dv0
+    mov rdi, rbx
+    call type_is_tuple
+    test eax, eax
+    jz .dv0
+    mov rdi, rbx                        ; a tuple literal of constants in a global (or static) initializer: (5, 6)
+    mov rsi, r12
+    mov rdx, r13
+    mov ecx, ')'
+    call init_local_list
+    jmp .out
+.dv0:
+    mov rdi, rbx
+    call struct_global_check
     cmp rbx, TY_DOUBLE
     jne .dint
     call const_double
@@ -1119,7 +1374,8 @@ init_elem:
     pop rbx
     ret
 
-; init_local_list: rdi = type (struct or array), rsi = frame offset, rdx = element count (arrays). Current token: '{'
+; init_local_list: rdi = type (struct or array), rsi = frame offset, rdx = element count (arrays), ecx = the closing token ('}' for a
+; {...} list; ')' for the literal (a, b) of a tuple with constant elements in a global initializer). Current token: the opening one
 init_local_list:
     push rbx
     push r12
@@ -1127,6 +1383,8 @@ init_local_list:
     push r14
     push r15
     push rbp
+    push qword [init_close]             ; (nested lists have their own closing token)
+    mov [init_close], rcx
     mov rbx, rdi
     mov r12, rsi
     mov r14, rdx
@@ -1151,7 +1409,8 @@ init_local_list:
     add rax, field_tab
     mov r13, rax
 .sloop:
-    cmp qword [tk], '}'
+    mov rax, [init_close]
+    cmp [tk], rax
     je .close
     cmp qword [tk], '.'
     jne .nodesig
@@ -1231,7 +1490,8 @@ init_local_list:
     mov r13, rax
     xor ebp, ebp
 .aloop:
-    cmp qword [tk], '}'
+    mov rax, [init_close]
+    cmp [tk], rax
     je .close
     cmp qword [tk], '['
     jne .anodesig
@@ -1259,8 +1519,15 @@ init_local_list:
     call next_token
     jmp .aloop
 .close:
-    mov edi, '}'
+    cmp qword [init_close], ')'
+    jne .cl2
+    test r14d, r14d                     ; a tuple literal gives all the elements
+    jz .cl2
+    ERR "this tuple has a different number of elements than the type that is expected here"
+.cl2:
+    mov rdi, [init_close]
     call expect
+    pop qword [init_close]
     pop rbp
     pop r15
     pop r14

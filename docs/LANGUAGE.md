@@ -121,6 +121,7 @@ const int MASK = 0xF0;    // optionally with a type
 const uint8 SMALL = 300;  // a typed constant is cut to its type: 44
 ```
 
+* **`var`** declares a local variable whose type is the type of its initializer (see [`var`](#var-the-type-comes-from-the-initializer) below).
 * **Every variable is zero-initialised** — locals, arrays, structs and heap memory.
 * **Scope:** a variable lives until the end of the block it is declared in; an inner declaration
   may shadow an outer one. A `for` loop variable lives in the loop.
@@ -138,6 +139,34 @@ const uint8 SMALL = 300;  // a typed constant is cut to its type: 44
       static_assert(__ARCH >= 0 && __ARCH <= 3);
 
   (`static_assert` is a word only where a statement or declaration starts; the message has to be a text in quotes.)
+
+### `var`: the type comes from the initializer
+
+```c
+var n = 5;                    // int
+var pi = 3.14;                // double
+var name = "bob";             // char*
+var p = &n;                   // int*
+var f = twice;                // func
+var pt = makePoint(1, 2);     // a copy of the struct that the function returns
+var a = 1, s = "two";         // several declarators, each with its own type
+for (var i = 0; i < 10; i++) { }
+foreach (var x in values) { }                  // the same as foreach (x in values): the type of the elements
+```
+
+`var` always needs an initializer and is for **local variables** only (not parameters, fields or globals). The initializer is
+evaluated *before* the name exists, so `var x = x + 1;` uses an outer `x`. An array becomes a pointer to its first element.
+The compiler says what it cannot know instead of guessing:
+
+| Source | Error |
+|---|---|
+| `var x;` | `var needs an initializer` |
+| `var x = f();` with a `void` function | `cannot infer the type of the variable: the initializer has no value (it is void)` |
+| `var p = null;` | `cannot infer the type of the variable from null: write the type` |
+| `var a = {1, 2};` | `cannot infer the type of the variable from a {...} list` |
+
+`var` is not a keyword: it is the declaration word only where a new name (or a `(`) follows and nothing called `var` is in scope,
+so `var var = 7;` and old programs with a variable named `var` still work.
 
 ## 5. Operators
 
@@ -344,8 +373,7 @@ area(5, 4);         // 20
 area(5, 4, 200);    // 40
 ```
 
-This works for functions, methods and constructors (`new Counter()` / `Counter c;` with `Counter(int start = 1)`), and it is
-how the standard library's `printf(fmt, a, b, c, d, e, f, g, h)` accepts one to eight values.
+This works for functions, methods and constructors (`new Counter()` / `Counter c;` with `Counter(int start = 1)`).
 Text defaults are fine too: `char* sep = ", "`. (A function cannot have default values and `...` together.)
 
 ### Structs by value
@@ -433,6 +461,87 @@ A `func` carries no signature: the arguments are not checked against the functio
 function's result as a 64-bit value). Only ordinary functions have an address (not methods or built-in `__...` functions).
 `qsort`, `bsearch`, `atexit` and `signal` of the C library take `func` arguments.
 
+### Lambdas
+
+A lambda is an anonymous function. It becomes a hidden function of the program and its value is a `func`, so it can be stored,
+passed and called like the address of a named function:
+
+```c
+func twice = (int x) => x * 2;                       // an expression: its value is the result
+func add = (a, b) => a + b;                          // parameters without a type are int
+func inc = x => x + 1;                               // one parameter: no parentheses needed
+func none = () => 77;
+func sum = (int a, int b) => { int s = 0; for (int i = a; i <= b; i++) s += i; return s; };    // a block: use return
+func half = (double x) -> double => x * 0.5;         // -> type: the type of the result (the default is int)
+
+algo.sortBy(items, n, (int a, int b) => a - b);      // where a library function wants a func
+printlnInt(((int a) => a + 100)(5));                 // called where it is written: 105
+```
+
+* **Result:** an expression body returns the value of the expression, a block body uses `return` (and returns 0 when it ends).
+  Like every call through a `func`, a call of a lambda yields an `int`: a `double` result is its 64 bit pattern, read it with
+  `__dbl(f(x))`; doubles that are passed to a lambda arrive correctly (`f(1.5)` passes the bits). A lambda cannot return a
+  struct or tuple by value.
+* **No captures.** A lambda does not see the local variables, parameters or `this` of the function it is written in: that would
+  need an environment that outlives the call, and a `func` is only a code address. Using one is a compile error that tells you
+  what to do: `a lambda cannot use a local variable of the enclosing function (pass it as a parameter, or use a global); this one is 'n'`.
+  (`this`, the fields and the methods of the class around it are refused the same way.) Globals, static locals, constants, enums,
+  functions and types are visible. Lambdas can be nested, each one sees only its own parameters and locals.
+  Even `sizeof(n)` of a local of the enclosing function is refused (it names the variable; conservative, use `sizeof(int)`).
+  *Stretch goal (capturing by value through a heap environment) was not done.*
+* **Only inside functions.** A lambda needs the function it is compiled into: in a global initializer or as the default value of a parameter
+  (`func f = x => x * 2;`, `int g(func h = (a, b) => a)`) it is a compile error (`a lambda can only be used inside a function`); assign it in `main` or use a named function.
+* **How it works:** the code of the lambda is placed inline, jumped over by the enclosing function
+  (`jmp over; prologue; body; epilogue; over:`) and its address is made by the back end primitive `lea_code_a` (position independent,
+  no relocation): lambdas work in objects (`ac -c`), with the linker and on every target. Dead function elimination treats the body as
+  part of the enclosing function. Its own labels, loops (`break` and `continue` cannot reach outside), `defer` and `static` locals work as in a function.
+* **Syntax notes:** `(a, b) => ...` is a lambda only when the parenthesis is followed by `=>` (otherwise it is a tuple or the comma
+  operator); the parameter list may hold types (`int* p`, `char* s`, `func f`, class names). `=>` is a token of its own.
+
+### Tuples and multiple results
+
+A tuple is a fixed list of values of different types. A function returns several values by returning a tuple:
+
+```c
+(int, int) divmod(int a, int b) { return (a / b, a % b); }
+(char*, int) named() { return ("seven", 7); }
+
+(int q, int r) = divmod(7, 2);          // declares q = 3 and r = 1
+var (q2, r2) = divmod(100, 7);          // the same, the types come from the tuple
+(char* s, int n) = named();
+(int only, _) = divmod(17, 5);          // _ throws an element away
+int a = 1, b = 2;
+(a, b) = (b, a);                        // assigns to variables that exist; all values are computed first: a swap
+(arr[0], arr[2]) = (arr[2], arr[0]);    // the targets can be any lvalues: elements, fields, *p ...
+(int, double) t = divmod2(3);           // a tuple is a value: variables, fields, parameters, arrays, pointers
+printlnInt(t.0);                        // .0 .1 ... are the elements (also t.0.1 for a tuple in a tuple)
+t.1 = 2.5;
+var u = (1, "two", 3.5);                // a tuple literal; its type is (int, char*, double)
+```
+
+* **Type:** `(T1, T2, ...)` with two to sixteen element types. The same list of types is always the same type. The compiler makes a hidden
+  struct for it (every element at the alignment of its type, the size rounded to 8), so a tuple is passed, returned and copied by value
+  like a struct: a function that returns a tuple gets the address of the result as a hidden last argument, an argument is copied by the
+  caller. `sizeof((int, int))` is 16. A tuple with two elements of the same type is *not* an array.
+* **A literal needs a context.** `(a, b)` is a tuple literal where a tuple is expected: `return` in a function that returns a tuple, the
+  initializer of a tuple variable or of `var`, the right side of an assignment to a tuple or of a pattern, an argument for a tuple
+  parameter. Everywhere else `(a, b)` is still the **comma operator** (`int c = (a = 5, a + 1);` is 6), so no old program changes. When the
+  context knows the type the elements are converted one by one (`(int, double) t = (1, 2);` makes 2.0; `(uint8, int32) = (300, 5000 * 1000000)`
+  truncates). The elements are evaluated left to right, once each. Other tuple values (a function result, a variable) are used as they are:
+  `divmod(20, 6).0`.
+* **In initializer lists and globals.** A tuple literal works as an element of an array or struct list (`(int, int) a[2] = {(1, 2), (3, 4)};`,
+  `S s = {(1, 2), 3};` for a struct with a tuple field), the elements may be any expressions in a function. A global or `static` tuple is initialized with a literal of
+  constants, `(int, int) g = (5, 6);`, or with a list `{5, 6}`; a literal needs all the elements (`(5)` is an error).
+* **Patterns:** `(T a, T b) = value;`, `var (a, b) = value;` and `(x, y) = value;` need a tuple with the same number of elements; `_`
+  skips one. The variables are created after the value is computed (the initializer cannot see them). The assignment form pushes the
+  addresses of the targets first, copies the value into a temporary, then assigns from left to right: `(i, i) = (1, 2)` leaves 2,
+  `(v[i], i) = (5, 2)` uses the old `i` for the first target. Patterns are statements (also the first and the third part of a `for` head: `for (var (a, b) = (0, 1); a < 100; (a, b) = (b, a + b))`), they cannot be nested
+  (`((a, b), c) = ...` is an error, assign the inner tuple to a variable first) and each side has to match: the value of another tuple type is an error
+  (`tuple types do not match`).
+* **Errors:** `(int, void)` (`a tuple element cannot be void`), 17 elements, `t.2` on a pair (`this tuple has no element with that number`), a pattern with the
+  wrong number of names, a value that is not a tuple on the right of a pattern, and every place where a tuple meets another type
+  (`return`, initialization, assignment, argument).
+
 ### `typedef`, `static` and `union`
 
 ```c
@@ -473,6 +582,9 @@ classes and inside function bodies. Use it with `__ARCH` (0 x64, 1 arm64, 2 risc
 (`if (d)` is true when `d != 0`), `+= -= *= /=`, `?:`, struct fields, arrays, globals, parameters and return values.
 Literals like `1.5`, `2e-3` and `1_000.25` are rounded exactly (to nearest, ties to even, like a C compiler).
 
+A `uint64` (or `size_t`) of 2^63 or more converts to the correct positive double (`double d = 18446744073709551615;` is 1.8446744073709552e19). The other
+direction saturates: a double of 2^63 or more converted to `uint64` gives 2^63 - 1 (a negative one converts like an `int`).
+
 `__bits(d)` returns the 64 raw bits of a double as an `int`; `__dbl(i)` does the reverse.
 
 Arithmetic uses a built-in software implementation (`dfloat`, loaded only when a program uses doubles), so results are bit
@@ -497,6 +609,10 @@ a trailing comma is allowed, lists nest, and a `char` array can be filled from a
 
 Too many values (`int a[2] = {1, 2, 3};`) or a string longer than the array is a compile error. Global and `static` lists
 must be made of constants; local lists may use any expression.
+
+An element, field or variable of struct, class or tuple type is initialized with a `{...}` list or with a value of a struct type (a variable, a call; a pointer to a
+struct is accepted too and the struct is copied from it), never with a number or any other pointer: `Point a[2] = {5, 6};`, `Point p = 5;` and `p = 5;` are
+compile errors (they used to compile and crash: the number was taken for the address of a struct). A global of such a type needs a list, `Point g = 5;` is an error too.
 
 ### `defer`
 
@@ -1011,17 +1127,14 @@ Everything in `lib/std.a` is compiled into your program automatically; no import
 
 **Formatted output**
 
-`format(buf, max, fmt, a, b, ...)` and `printf(fmt, a, b, ...)` take up to eight values (leave out the unused ones;
-text is passed as it is). `vformat(buf, max, fmt, values, count)` takes the values as an array and returns the length the
-complete text has. The formats are those of C: flags `- 0 + space #`, width and precision (also `*`), `h hh l ll z` length
-modifiers, and the conversions `d i u x X o b c s p %` (`%b` is binary). Every value is 64 bits wide; `%u` and `%x` show
-negative numbers as unsigned 64-bit values.
+`format(buf, max, fmt, ...)`, `printf(fmt, ...)` and `$"..."` take **any number of values** (they are the `...` of the function;
+text and pointers are passed as they are, a `double` as its 64 bit pattern). `vformat(buf, max, fmt, values, count)` takes the
+values as an array and returns the length the complete text has (like `snprintf`). The full description is in
+[Text formatting](#text-formatting).
 
 ```c
-printf("%-10s|%5d|%#08x\n", "total", 1600, 255);       // total     | 1600|0x0000ff
+printf("%-10s|%5d|%#08x|%8.3f|%e\n", "total", 1600, 255, 3.14159, 31415.9);   // total     | 1600|0x0000ff|   3.142|3.141590e+04
 ```
-
-Floating point conversions (`%f %e %g %a`) are in `printfd` of the `cfloat` module.
 
 `printRepeat(ch, n)` writes a character `n` times.
 
@@ -1077,6 +1190,91 @@ Floating point conversions (`%f %e %g %a`) are in `printfd` of the `cfloat` modu
 **Process and memory**
 
 `exit(code)`, `alloc(n)` (zeroed heap memory, never freed).
+
+### Text formatting
+
+`printf`, `format`, `vformat`, `fprintf`/`sprintf`/`snprintf`/`dprintf`/`asprintf` (module `cstdio`) and the interpolated strings below all
+use one formatter, `vformat` in `lib/std.a`:
+
+    %[flags][width][.precision][length]conversion
+
+| Part | Meaning |
+|---|---|
+| flags | `-` left-justify, `0` pad with zeros, `+` always a sign, space a space for positive numbers, `#` alternate form (`0x`, `0b`, a leading `0` for octal, the decimal point and the trailing zeros of `%g`) |
+| width | digits, or `*` (the next value; a negative one means `-` and its absolute value). At most 100000000: a larger number, in the text or from a `*`, is cut to that (also the smallest `int`), so a hostile width cannot keep the program busy |
+| precision | `.digits` or `.*`: minimum digits of integers, digits after the point for `%f` `%e`, significant digits for `%g`, maximum length of `%s`. At most 100000000 like the width, a negative `*` value means "none", and for `e E f F g G` it is **cut to 1800 digits** (`%.2000f` prints 1800 digits: a double has at most 767 significant ones, the rest would only be zeros) |
+| length | `h` and `hh` cut an integer to 16 / 8 bits; `l ll z j t q L` are accepted and mean the 64 bits that every value has anyway |
+| `d i` | signed decimal (also `-9223372036854775808`) |
+| `u x X o b` | unsigned decimal, hex, octal, binary: a negative `int` shows its 64 bits |
+| `c s p` | a character, text (`(null)` for a null pointer, precision cuts it), a pointer as `0x...` (`(nil)` for null) |
+| `e E f F g G` | a double, **correctly rounded**: the exact decimal value of the binary number is computed with big numbers and rounded half to even, so `%.30f` of 0.1 prints the true digits, denormals, `1e300` and `5e-324` work, `-0.0` prints `-0.000000`, and `inf` / `nan` print as `inf` / `nan` (`INF` / `NAN` for the capital letters; the `0` flag does not zero-fill them, like C) |
+| `v` | a double as the **shortest text that reads back as the same number** (`0.1`, `1e+22`, `1.5e-07`, `5e-324`, `100`), fixed notation when the exponent is from -4 to 15 (like Python's `repr`), no forced `.0`; the sign, width and `-` `0` `+` space flags work, the precision is ignored. (A name of this language, not of C.) |
+| `%%` | a percent sign |
+
+A specification that is not complete or not known (`%y`, `%5.2` at the end of the text) is printed as it is. Missing values are 0
+(`(null)` for `%s`), extra values are ignored. The values are copied into an array first: up to 32 on the stack; a call with more uses one buffer
+that is kept and only grows (so a loop of such calls does not use more memory with every call; a call that finds the buffer busy, from a signal handler or
+a thread, takes a block of its own from `alloc`, which is never freed).
+`format` and `vformat` never write more than `max - 1` characters and always end the text with a zero. Padding (a huge width) beyond the end of the buffer is
+only counted, not stored one character at a time, so a width of 100000000 into a small buffer is instant; `vformat` still returns the length the whole text would have.
+
+The conversions follow C. Where Python's `%` operator differs (`%#x` of 0 is `0`, not `0x0`; `%#o` is `017`, not `0o17`; `%.0d` of 0 prints nothing;
+the `0` flag does not zero-fill `inf`), C is followed. The tests compare with both: `t326_format_python` has 3400 cases whose expected output Python
+and glibc produced (`tests/gen/gen_format_test.py` writes it and can also write a big random stress test, `--stress N SEED PREFIX`).
+
+**A double in `printf` is its bit pattern.** The language passes a `double` through `...` as the 64 bits it is made of, and
+`%f %e %g %v` read them back, so `printf("%.2f", x)` is right for a `double x`. An `int` is *not* converted: `printf("%f", 3)` prints the
+number whose bits are 3 (a denormal, `0.000000`), as in C it would be undefined; write `(double) n`. And `%d` with a `double` prints its bits:
+cast to int first. (Interpolated strings know the types and convert for you.) A function that takes a `double` parameter needs no care:
+`f(x)` converts the argument to the declared type as always.
+
+**Size.** The exact float formatter is part of `vformat`, so every program that uses `printf` or `format` has about 14 KB more machine code than before (a hello world with one
+`printf`: 24.7 KB of code, 10.8 KB before; the executable is 28.8 KB instead of 12.4 KB because the file is rounded up to 4 KB pages). A program that only uses `print` / `println` is not affected. There is no switch to leave the float code out: a program
+may pass the bits of a double (`cmath`) to `%f` without ever mentioning the type `double`, so the compiler cannot tell that it is not needed.
+
+**Speed.** The exact algorithm is simple, not the fastest: about 1 microsecond for `%f` of an ordinary number, 4 for `%v`, 7 for `1e300` and 28 for
+`5e-324` (a number with 1074 digits), measured on x86-64 (a plain `%d` takes 100 nanoseconds). The code is integer only (base 10^9 limbs), so it needs no
+floating point support and gives the same text on every target.
+
+### String interpolation: `$"..."`
+
+```c
+int x = 42;
+double pi = 3.14159265;
+char* name = "bob";
+println($"x = {x}, pi = {pi:.3f}, name = {name:-8}|, hex = {x:#x}, braces {{ }}");
+//      x = 42, pi = 3.142, name = bob     |, hex = 0x2a, braces { }
+char* s = $"{name} has {x * 2} items";               // any expression; nested strings are fine: {f("a")} {c ? "y" : "n"}
+```
+
+`$"text {expression} text {expression:spec} text"` is a text whose `{...}` parts are replaced by values. `{{` and `}}` are
+braces, `\n` `\t` `\"` and the other escapes work as in a string, and a `%` in the text is just a percent sign. It is **lowered to the
+library formatter**: the compiler builds the format text (`"x = %d, pi = %.3f, ..."`), pushes the values and calls `__interp`
+(in `lib/std.a`), which is `vformat` twice (measure, then fill), so `$"..."` and `format` print exactly the same characters.
+
+* **spec** is the text of a conversion without the `%`: flags, width, precision, length and, optionally, the conversion letter
+  (`{x:5}` is `%5d`, `{x:x}` is `%x`, `{pi:10.2f}` is `%10.2f`, `{name:-10}` is `%-10s`). `*` is not allowed. **The parts have to come in
+  this order**, as in `printf`: flags (`- + space # 0`), then the width, then `.precision`, then the length (`h hh l ll z j t L q`: one letter, or `hh` / `ll`), then
+  the letter. Anything else is a compile error (`{x:5 d}`, `{x:ll d}`, `{x:hhhh5}`, `{x:5.5.5}` and a stray space: `{ x : 5 }` has a space after the 5). Note that a space
+  right after the colon is the space *flag*: `{x: 5}` is `% 5d`.
+* **Without a letter the type chooses it:** `double` is `v`, `bool` prints `true` / `false`, `char` is `c`, `uint64` is `u`, other integers are `d`,
+  `char*` is `s`, other pointers and `func` are `p`. An integer with `e E f F g G v` is converted to double first (`{n:.2f}` prints `3.00` for 3; this is done with integer arithmetic, so it works in
+  a program that never mentions `double`, and a `uint64` of 2^63 or more stays positive: `{big:.0f}` of 2^64-1 prints `18446744073709551616`),
+  a double needs one of those letters (`{d:d}` is an error), `s` and `p` need a pointer. A comparison is an `int`: `{x > 3}` prints `1`; write
+  `{x > 3 ? "yes" : "no"}`. Structs, classes, tuples and `void` cannot be formatted: use their members.
+* **Surprises that follow from the types of the language:** `uint8` is the same type as `char`, so `$"{d}"` for a `uint8` prints the *character* (65 prints `A`):
+  write `{d:d}` for the number. A character literal is an `int`, so `$"{'a'}"` prints `97` (a `char` variable prints `a`; `{'a':c}` does too). `#define` macros are not
+  expanded inside the braces (the text of a string is never preprocessed): use a `const` or a function (`$"{N + 1}"` with `#define N 5` is `undeclared identifier 'N'`).
+* **Lifetime:** the result is a `char*` from `alloc`, the memory of `new`: it lives until the program ends and is never freed. That is
+  fine for messages and titles; a loop that builds millions of texts should use `format` into a buffer. (The cost of one interpolation is the
+  text plus its terminating zero: `alloc(len + 1)`.)
+* A string can have at most 253 `{...}` parts (and a call at most 253 values) on ARM64, RISC-V and LoongArch (`too many arguments in a call`: the stack
+  adjustment of the call is a 12 bit immediate there); on x86-64 and Windows there is no such limit.
+* The expression is parsed by the normal expression parser with the lexer moved inside the literal, so it can contain calls, members,
+  indexing, conditions and lambdas. It cannot span lines (the whole literal is one line) and an interpolated string is only allowed inside functions.
+* Widths and precisions are capped like in `printf` (100000000, see Text formatting); a huge width makes a huge text (the result is `alloc(len + 1)`).
+* Errors: `an empty {}`, `a single } ... write }}`, `the } of an interpolated string is missing`, `bad format in an interpolated string`,
+  `cannot be put into an interpolated string`, `a double needs one of the letters e E f F g G v`.
 
 ## 12a. Networking
 
@@ -1494,7 +1692,8 @@ Typical messages: `undeclared identifier 'x'` (with `(did you mean 'y'?)` when a
 letters or the case: `undeclared identifier 'cuont' (did you mean 'count'?)`), `wrong number of arguments in call`,
 `member is private to its class 'balance'`, `access to private declaration 'helper'`,
 `undefined function 'f'`, `left side of assignment is not assignable`,
-`functions cannot return a struct by value, return a pointer`.
+`functions cannot return a struct by value, return a pointer`; for the second tier of the language see the sections on `var`,
+tuples, lambdas and `$"..."` (every message is listed there with the situation that makes it).
 The process exit code is 1; on success it is 0.
 
 ## 15. Differences from C
@@ -1509,3 +1708,5 @@ The process exit code is 1; on success it is 0.
   variadic functions (`...` with `va_arg`) exist; bit-fields do not. A C-style preprocessor (`#define`, `#include`, `#if` ...) is built in, and units can be compiled separately and linked (`ac -c`).
 * `switch` labels must be constant expressions (like C); a switch can also be on text, a case can have several labels and `lo..hi` ranges, and duplicate labels are errors.
 * `foreach`, labeled `break` / `continue`, `static_assert`, `||=` `&&=` `??=`, abstract classes, `override`, `final`, static class members and `is` / `as` exist.
+* `var x = expr;`, tuples and multiple results (`(int, int) f()`, `(a, b) = (b, a)`), lambdas (`(a, b) => a + b`), `$"..."` interpolated strings, `printf`
+  with any number of values and exact `%f %e %g` exist.

@@ -747,6 +747,33 @@ la64_lea_func_a:
     pop rdi
     ret
 
+; rdi = a position in the code buffer -> A = its address:  pcaddu12i a0, hi20 ; addi.d a0, a0, lo12  (position independent)
+la64_lea_code_a:
+    push rax
+    push rdx
+    push rdi
+    mov rax, rdi
+    sub rax, [code_pos]             ; offset from the pcaddu12i
+    lea rdx, [rax + 0x800]
+    sar rdx, 12                     ; hi20
+    mov rdi, rdx
+    shl rdi, 12
+    sub rax, rdi                    ; lo12, -2048 .. 2047
+    and edx, 0xFFFFF
+    shl edx, 5
+    or edx, LA_PCADDU12I + A0       ; pcaddu12i a0, hi20
+    mov edi, edx
+    call emit_d
+    and eax, 0xFFF
+    shl eax, 10
+    or eax, LA_2RI12(LA_ADDI_D, 0, A0, A0)
+    mov edi, eax
+    call emit_d
+    pop rdi
+    pop rdx
+    pop rax
+    ret
+
 la64_call_a:
     LA LA_2RI16(LA_JIRL, 0, A0, RA)         ; jirl ra, a0, 0
     ret

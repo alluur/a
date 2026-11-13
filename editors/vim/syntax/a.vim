@@ -10,7 +10,7 @@ syn keyword aStructure   struct class enum
 syn keyword aStorage     const static typedef union asm double float defer goto extern
 syn keyword aAccess      public private protected virtual super abstract override final
 syn keyword aModule      module import a_module a_import
-syn keyword aType        int long char byte bool void func
+syn keyword aType        int long char byte bool void func var
 syn keyword aOperatorKw  new sizeof asm is as static_assert
 syn keyword aSelf        this
 syn keyword aBoolean     true false
@@ -47,10 +47,12 @@ syn match  aNumber  "\<0[bB][01_]\+\>"
 syn match  aEscape  contained "\\\([ntre0\\\"']\|x\x\x\)"
 syn match  aBadEsc  contained "\\[^ntre0\\\"'x]"
 syn region aString  start=+"+ skip=+\\\\\|\\"+ end=+"+ oneline contains=aEscape,aBadEsc,@Spell
+" interpolated strings $"text {expr:spec}" (a string inside the braces ends this simple rule early)
+syn region aString  start=+\$"+ skip=+\\\\\|\\"+ end=+"+ oneline contains=aEscape,aBadEsc,@Spell
 syn match  aChar    "'\([^\\']\|\\.\|\\x\x\x\)'" contains=aEscape
 
 " operators
-syn match aOperator "[-+*/%&|^~!<>=?:]\|<<\|>>\|->\|++\|--"
+syn match aOperator "[-+*/%&|^~!<>=?:]\|<<\|>>\|->\|=>\|++\|--"
 syn match aDelim    "[(){}\[\];,.]"
 
 " comments last: they must win over operators and strings
