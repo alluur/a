@@ -90,11 +90,11 @@ Programs that need a window, a terminal or a network are shown with a screenshot
 
 ## What was tested
 
-This book has **551 code samples**. They are the reason you can trust the listings, so here is exactly what was done with them (the list of all samples is in [the code sample index](#chap-samples)):
+This book has **641 code samples**. They are the reason you can trust the listings, so here is exactly what was done with them (the list of all samples is in [the code sample index](#chap-samples)):
 
 * **Every sample was compiled and run** on Linux x86-64, and its output was compared with the output recorded in the book.
 * **Every sample was compiled for all nine targets** of the compiler, Windows and Android included.
-* **The whole set was run again on three other processors**, under QEMU user-mode emulation: ARM64, RISC-V 64 and LoongArch64. Every program printed the same output as on x86-64. Five samples are left out of this comparison on purpose, because their job is to print the name of the processor they run on, so about 546 programs were compared on each processor. As a second check, 13 drawing samples were run on x86-64, ARM64 and RISC-V and produced **byte-identical PNG pictures**.
+* **The whole set was run again on three other processors**, under QEMU user-mode emulation: ARM64, RISC-V 64 and LoongArch64. Every program printed the same output as on x86-64. Five samples are left out of this comparison on purpose, because their job is to print the name of the processor they run on, so about 636 programs were compared on each processor. As a second check, 13 drawing samples were run on x86-64, ARM64 and RISC-V and produced **byte-identical PNG pictures**.
 * **Graphical samples** ran against the headless display server and were photographed there; **terminal samples** ran in a pseudo terminal and their screens were recorded. Samples that use the network talk to themselves over the loopback interface.
 * **The compiler itself** has a regression suite of several hundred programs that runs on Linux x86-64, ARM64, RISC-V 64 and LoongArch64 under QEMU, and on Windows under Wine. For this book a Windows program was started under Wine to show the output in [the compiler chapter](#chap-compiler); the samples were not run on Windows.
 * Every chapter except chapter 21 (written last; its samples were run, but its text was not reviewed separately) was checked a second time by independent reviewers, who tested the claims in the text against the compiler and the library sources. Where a claim could not be tested, the chapter says so.
