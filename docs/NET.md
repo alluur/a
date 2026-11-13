@@ -661,7 +661,7 @@ Rights per user: `P_READ` (RETR, SIZE, MDTM), `P_LIST` (LIST, NLST, MLSD, MLST, 
 anonymous login only if you add an anonymous account. TLS: `AUTH TLS` (a command that follows it in the same read is not run: the connection is closed), `PBSZ`, `PROT`, implicit TLS with `listenTls`, `requireTls` (no USER / PASS before TLS), `requireDataTls` (no transfers without PROT P); after AUTH TLS the session starts again.
 Commands: USER PASS QUIT NOOP FEAT OPTS SYST HELP PWD CWD CDUP TYPE MODE STRU ALLO PASV EPSV (also `EPSV ALL`) PORT EPRT REST RETR STOR APPE LIST NLST MLSD MLST DELE RMD MKD RNFR RNTO SIZE MDTM ABOR STAT; Telnet sequences in front of a command (ABOR after IAC IP IAC SYNCH) are skipped; lines must end with CRLF (a bare LF or a NUL is 500). TYPE A converts line ends.
 Transfers run in the same poll loop as the control connections (a block of at most 8 x 16 KB per turn and connection), so one transfer does not stop the others. Limits: `maxSessions` (`net->maxConns`, 200), `net->maxPerIp`, `idleTimeoutMs` (300 s, not while a transfer runs), `dataTimeoutMs` (30 s: waiting for a data connection, and no byte moving), `maxLoginFailures`, `maxLine` 4096, `maxList` 4 MiB, `maxUpload` (bytes of one upload), passive ports `pasvMin` / `pasvMax`, `pasvAddress` for NAT.
-Not supported: STOU, ACCT, SMNT, REIN, SITE, wildcards in LIST, IPv6, quotas, a log.
+An upload that fails stays as the part that came (like most servers; REST or APPE continue it). Not supported: STOU, ACCT, SMNT, REIN, SITE, wildcards in LIST, IPv6, quotas, a log.
 
 ## pop3 and pop3d
 
@@ -672,7 +672,7 @@ pop3d.Server* s = pop3d.newServer();  s->addUser("ann", "secret", "/var/mail/ann
 
 The client: STLS (`startTls`, plain bytes behind the `+OK` fail the connection), APOP (`useApop`; the password is not sent), USER / PASS **only on TLS** unless `allowPlainLogin` (so a URL with a password needs STLS), message numbers checked, messages over `maxMessage` stop the transfer (the connection is closed), time outs. The server lists `new/` and `cur/` at the login
 (at most `maxMessages` 1000; the file name is the UIDL; names with other characters than 0x21 to 0x7E or over 70 characters are skipped), counts the size as it goes over the wire (CRLF), streams RETR and TOP in blocks of 16 KB under backpressure (the output queue stays small: a message of any size is no problem, and pipelined commands wait their turn),
-makes line ends CRLF and stuffs dots, deletes at QUIT only (a connection that breaks deletes nothing), has `requireTls`, `apop` (off: it needs the password in plain text on the server), 3 login failures, lines over 512 bytes are `-ERR`, `idleTimeoutMs` 10 minutes. The Maildir is not locked.
+makes line ends CRLF and stuffs dots (a flood of pipelined RETRs is served by a loop, not by recursion), deletes at QUIT only (a connection that breaks deletes nothing), has `requireTls`, `apop` (off: it needs the password in plain text on the server), 3 login failures, lines over 512 bytes are `-ERR`, `idleTimeoutMs` 10 minutes. The Maildir is not locked.
 
 ## Tests (mail, SMTP, FTP, POP3)
 
