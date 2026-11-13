@@ -45,6 +45,10 @@ else
   echo "skip redis-server is not installed"
 fi
 
+# ---- redisd against the second review: announced bulk strings take no memory, dead keys are swept
+P=$(port); build/net2/redisd_demo $P > build/net2/redisd3.out 2>&1 & rdpid=$!; pids="$pids $rdpid"; sleep 0.5
+if python3 tests/net2_redisd_limits.py $P $rdpid > build/net2/redisd_limits.out 2>&1; then ok "redisd: 300 announced bulks of 16 MiB cost no memory, 4000 dead keys are swept away by the server loop"; else bad "redisd limits (second review)"; cat build/net2/redisd_limits.out; fi
+
 # ---- syslog: util-linux logger
 if command -v logger > /dev/null; then
   P=$(port); rm -f build/net2/sd.log*; build/net2/syslogd_demo $P build/net2/sd.log > build/net2/syslogd.out 2>&1 & pids="$pids $!"; sleep 0.5
