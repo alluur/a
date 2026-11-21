@@ -54,13 +54,18 @@ make                       # builds build/ac
 ./hello                    # Hello from A!
 ```
 
-Install it system wide (`/usr/local/bin/ac`) or build a Debian package:
+Install it system wide (`/usr/local/bin/ac`) or build the Debian packages:
 
 ```sh
 sudo make install
-make deb                   # -> dist/a-1-release.deb
-sudo dpkg -i dist/a-1-release.deb
+make deb                   # -> dist/a-1-release.deb (amd64: ac, man pages, bash completion)
+                            # -> dist/a-lang-common-1-release.deb (all: book, reference, examples, Vim/nano syntax)
+sudo dpkg -i dist/a-1-release.deb dist/a-lang-common-1-release.deb
 ```
+
+`a-lang` is Architecture: amd64 because `ac` is itself x86-64 code (it cross-compiles to other CPUs,
+but only runs on one). `a-lang-common` is Architecture: all, so it installs on any machine on its
+own, e.g. to read the docs and browse the examples where `ac` cannot run.
 
 ### Compiling for every platform
 

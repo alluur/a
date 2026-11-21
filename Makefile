@@ -7,7 +7,8 @@
 #    make examples   compile every example for every target
 #    make dist       release binary               -> dist/ac-<code>-<release>.elf
 #    make book       the book (HTML + EPUB)       -> dist/a-docs-<code>-<release>.zip, dist/a-book-<code>-<release>.epub
-#    make deb        Debian package               -> dist/a-<code>-<release>.deb
+#    make deb        Debian packages              -> dist/a-<code>-<release>.deb (amd64, the compiler)
+#                                                     dist/a-lang-common-<code>-<release>.deb (all, docs/book/examples)
 #    make install    install to $(PREFIX) (default /usr/local)
 #
 #  Output files follow  {app_name}-{version-code}-{release-type}.{ext}
@@ -56,8 +57,8 @@ dist: build/ac
 
 deb: build/ac
 	@mkdir -p dist
-	packaging/deb/mkdeb.sh dist/a-$(STEM).deb $(VERSION_NAME) $(VERSION_CODE)
-	@ls -l dist/a-$(STEM).deb
+	packaging/deb/mkdeb.sh dist/a-$(STEM).deb dist/a-lang-common-$(STEM).deb $(VERSION_NAME) $(VERSION_CODE)
+	@ls -l dist/a-$(STEM).deb dist/a-lang-common-$(STEM).deb
 
 # the book "The A Programming Language": HTML site and EPUB (docs/book/, needs python3 and pandoc)
 #   build/book/html   the site that goes into the Debian package (links to the EPUB next to it)
@@ -79,9 +80,10 @@ book-samples: build/ac
 	python3 docs/book/tools/samples.py --ac build/ac
 
 install: build/ac
-	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/a $(DESTDIR)$(PREFIX)/share/man/man1
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/a $(DESTDIR)$(PREFIX)/share/man/man1 $(DESTDIR)$(PREFIX)/share/man/man7
 	install -m 0755 build/ac $(DESTDIR)$(PREFIX)/bin/ac
 	gzip -9n -c docs/ac.1 > $(DESTDIR)$(PREFIX)/share/man/man1/ac.1.gz
+	gzip -9n -c docs/a.7 > $(DESTDIR)$(PREFIX)/share/man/man7/a.7.gz
 
 clean:
 	rm -rf build dist
