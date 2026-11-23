@@ -17,10 +17,16 @@ DATE=$(LC_ALL=C date -R -u ${SOURCE_DATE_EPOCH:+-d "@$SOURCE_DATE_EPOCH"})
 MAINTAINER=${MAINTAINER:-"Aytict (https://aytict.fi)"}
 [ -x build/ac ] || { echo "mkdeb: build/ac is missing (run make)" >&2; exit 1; }
 
+# Staged outside the repository: a repo checked out over NFS (or similar) can have directories
+# whose setgid bit the build user cannot chmod away, which dpkg-deb then refuses as "bad
+# permissions" on DEBIAN/. A plain tmpdir never has that problem.
+STAGE_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/a-deb-build.XXXXXX")
+trap 'rm -rf "$STAGE_ROOT"' EXIT
+
 # -----------------------------------------------------------------------------------------------
 # a-lang: the compiler (Architecture: amd64)
 # -----------------------------------------------------------------------------------------------
-STAGE_AC=build/deb
+STAGE_AC=$STAGE_ROOT/deb
 PKG_AC=a-lang
 D_AC=$STAGE_AC/usr/share/doc/$PKG_AC
 
@@ -80,7 +86,7 @@ dpkg-deb --root-owner-group -Zxz --build "$STAGE_AC" "$OUT_AC"
 # a-lang-common: language reference, standard library docs, the book, examples, editor syntax
 # (Architecture: all)
 # -----------------------------------------------------------------------------------------------
-STAGE_CM=build/deb-common
+STAGE_CM=$STAGE_ROOT/deb-common
 PKG_CM=a-lang-common
 D_CM=$STAGE_CM/usr/share/doc/$PKG_CM
 
